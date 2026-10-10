@@ -1,0 +1,26 @@
+{
+  "base_commit": "5185cf3050",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "9da875b4e18fdb10521056a926aa56f439c4848bcbf1c69c5a50162df534cd00",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "159429282f3e114464e532fa01876930e8581ca4ed7f069cf2a2e3140da7e634",
+    "zig/pkg/antfly/src/api/httpx_handler.zig": "7ae49b864d07d4dd96bbded668925a0c01424abc296888709a8dc4c99a655034"
+  },
+  "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build functions-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-provider-parent-cache --summary all",
+  "exit_code": 0,
+  "build_steps": 47,
+  "embedded_tests": 17,
+  "coordinator_tests": 7,
+  "covered": [
+    "real scheduler parent yields and reacquires",
+    "protected control grant enters during provider invocation",
+    "scheduler closure after invocation prevents result consumption and further provider invocation",
+    "finish returns runnable slot, operation and retained byte charges"
+  ],
+  "pending": [
+    "full SQL API fixture gate",
+    "Linux provider gate",
+    "mixed open-loop load",
+    "provider wait suspension",
+    "backend inference scheduling"
+  ]
+}

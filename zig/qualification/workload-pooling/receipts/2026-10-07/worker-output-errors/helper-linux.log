@@ -1,0 +1,5 @@
+Build Summary: 3/3 steps succeeded; 3/3 tests passed
+antfly-inference-worker-output-error-test success
++- run test inference-worker-output-error-tests 3 pass (3 total) 3ms MaxRSS:31M
+   +- compile test inference-worker-output-error-tests safe aarch64-linux-gnu success 9s MaxRSS:400M
+

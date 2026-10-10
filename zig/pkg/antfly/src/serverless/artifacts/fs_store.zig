@@ -181,8 +181,8 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
         return try readFileAllocWithCancellation(alloc, path, cancellation);
     }
 
@@ -199,8 +199,8 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
         return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
     }
 
@@ -278,8 +278,8 @@ pub const FsStore = struct {
         errdefer alloc.free(checksum);
         const artifact_id_copy = try alloc.dupe(u8, artifact_id);
         errdefer alloc.free(artifact_id_copy);
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
 
         var io_impl = threadedIo();
         defer io_impl.deinit();

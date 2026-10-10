@@ -23,10 +23,12 @@ pub const Token = struct {
     io: std.Io,
     requested: ?*const std.atomic.Value(bool) = null,
     cooperative: CancellationToken = .none,
+    deadline_ns: ?u64 = null,
     checkpoint_ptr: ?*anyopaque = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
 
     pub fn check(self: Token) !void {
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         try self.cooperative.check();
         if (self.requested) |requested| {
             if (requested.load(.acquire)) return error.Canceled;

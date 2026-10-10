@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const read_admission = @import("../../common/read_admission.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 const Allocator = std.mem.Allocator;
@@ -247,12 +248,28 @@ pub const RangeReadFuture = struct {
     pub const VTable = struct {
         wait: *const fn (*anyopaque) anyerror![]u8,
         cancel: *const fn (*anyopaque) void,
+        wait_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror![]u8 = null,
     };
 
     /// Complete this one-shot read and transfer the returned bytes to the
     /// caller. After wait or cancel, the future must not be used again.
     pub fn wait(self: *RangeReadFuture) ![]u8 {
         return try self.vtable.wait(self.ptr);
+    }
+
+    /// Consume the one-shot future under the original synchronous authority.
+    /// The allocator must be the one used to begin the read. Compatibility
+    /// providers keep CPU charged; native providers loan it only for the join.
+    pub fn waitWithAdmission(self: *RangeReadFuture, allocator: Allocator, control: read_admission.Port) ![]u8 {
+        if (self.vtable.wait_with_admission) |wait_controlled| return wait_controlled(self.ptr, control);
+        control.checkpoint() catch |err| {
+            self.cancel();
+            return err;
+        };
+        const bytes = try self.wait();
+        errdefer allocator.free(bytes);
+        try control.checkpoint();
+        return bytes;
     }
 
     /// Best-effort cancellation. Synchronous/completed futures just release
@@ -296,9 +313,13 @@ const CompletedRangeReadFuture = struct {
     };
 
     fn create(storage: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        return createControlled(storage, allocator, path, offset, len, null);
+    }
+
+    fn createControlled(storage: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) !RangeReadFuture {
         const self = try allocator.create(CompletedRangeReadFuture);
         self.* = .{ .allocator = allocator };
-        self.bytes = storage.readFileRangeAlloc(allocator, path, offset, len) catch |err| blk: {
+        self.bytes = (if (control) |budget| storage.readFileRangeAllocWithAdmission(allocator, path, offset, len, budget) else storage.readFileRangeAlloc(allocator, path, offset, len)) catch |err| blk: {
             self.err = err;
             break :blk null;
         };
@@ -586,12 +607,18 @@ pub const Storage = struct {
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
+        read_file_alloc_with_admission: ?*const fn (*anyopaque, Allocator, []const u8, usize, read_admission.Port) anyerror![]u8 = null,
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         begin_read_file_range_alloc_with_runtime: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
+        begin_read_file_range_alloc_with_admission: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize, read_admission.Port) anyerror!RangeReadFuture = null,
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
+        /// Native providers loan CPU only for the physical positional read.
+        read_file_range_into_with_admission: ?*const fn (*anyopaque, []const u8, u64, []u8, read_admission.Port) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
+        file_size_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!u64 = null,
+        read_file_trailer_alloc_with_admission: ?*const fn (*anyopaque, Allocator, []const u8, usize, read_admission.Port) anyerror!FileTrailer = null,
         /// Reads an exact suffix and reports the size already observed while
         /// locating it, avoiding a separate metadata operation.
         read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
@@ -656,6 +683,32 @@ pub const Storage = struct {
         return self.vtable.read_file_range_alloc(self.ptr, allocator, path, offset, len);
     }
 
+    pub fn readFileRangeAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) ![]u8 {
+        try control.checkpoint();
+        const out = try allocator.alloc(u8, len);
+        errdefer allocator.free(out);
+        if (self.vtable.read_file_range_into_with_admission) |read| {
+            try read(self.ptr, path, offset, out, control);
+        } else try self.readFileRangeInto(allocator, path, offset, out);
+        try control.checkpoint();
+        return out;
+    }
+
+    pub fn readFileAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+        try control.checkpoint();
+        // Providers bind their own immutable generation. Native opt-in retains
+        // one descriptor across metadata and data; compatibility keeps the
+        // existing complete-file operation instead of re-resolving its pathname.
+        const out = if (self.vtable.read_file_alloc_with_admission) |read|
+            try read(self.ptr, allocator, path, max_bytes, control)
+        else
+            try self.readFileAlloc(allocator, path, max_bytes);
+        errdefer allocator.free(out);
+        try control.checkpoint();
+        if (out.len > max_bytes) return error.StreamTooLong;
+        return out;
+    }
+
     pub fn beginReadFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
         if (self.vtable.begin_read_file_range_alloc) |begin_read_file_range_alloc| {
             return try begin_read_file_range_alloc(self.ptr, allocator, path, offset, len);
@@ -678,6 +731,17 @@ pub const Storage = struct {
         defer allocator.free(loaded);
         if (loaded.len != out.len) return error.EndOfStream;
         @memcpy(out, loaded);
+    }
+
+    pub fn beginReadFileRangeAllocWithAdmission(self: Storage, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+        try control.checkpoint();
+        var future = if (self.vtable.begin_read_file_range_alloc_with_admission) |begin|
+            try begin(self.ptr, read_runtime, allocator, path, offset, len, control)
+        else
+            try CompletedRangeReadFuture.createControlled(self, allocator, path, offset, len, control);
+        errdefer future.cancel();
+        try control.checkpoint();
+        return future;
     }
 
     pub fn readFileRangeAtMostInto(self: Storage, allocator: Allocator, path: []const u8, offset: u64, out: []u8) !usize {
@@ -716,6 +780,27 @@ pub const Storage = struct {
 
     pub fn fileSize(self: Storage, path: []const u8) !u64 {
         return self.vtable.file_size(self.ptr, path);
+    }
+
+    pub fn fileSizeWithAdmission(self: Storage, path: []const u8, control: read_admission.Port) !u64 {
+        try control.checkpoint();
+        const size = if (self.vtable.file_size_with_admission) |stat| try stat(self.ptr, path, control) else try self.fileSize(path);
+        try control.checkpoint();
+        return size;
+    }
+
+    pub fn readFileTrailerAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+        try control.checkpoint();
+        // Compatibility providers retain their existing generation binding;
+        // independently re-resolving size and range would weaken that contract.
+        var trailer = if (self.vtable.read_file_trailer_alloc_with_admission) |read|
+            try read(self.ptr, allocator, path, len, control)
+        else
+            try self.readFileTrailerAlloc(allocator, path, len);
+        errdefer trailer.deinit(allocator);
+        try control.checkpoint();
+        if (trailer.bytes.len != len or trailer.file_size < len) return error.EndOfStream;
+        return trailer;
     }
 
     pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -1247,6 +1332,7 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
+        pub fn reserveDescriptorsWithAdmission(_: *FdCache, _: std.Io, _: usize, _: read_admission.Port) !void {}
         pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) bool {
             return false;
         }
@@ -1385,6 +1471,23 @@ else
             try readAllAtOffset(entry.fd, out, offset);
         }
 
+        fn readRangeIntoWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            const entry = try self.retainControlled(namespace, io, path, control);
+            defer self.release(io, entry);
+            if (out.len == 0) {
+                try control.checkpoint();
+                return;
+            }
+            // Cache preparation and destination allocation run with CPU
+            // charged; only descriptor contention/open and this pread loan it.
+            // Keep the FD use through rejected resumption.
+            if (try control.executionWait()) |boundary| {
+                try boundary.run(readAllAtOffset, .{ entry.fd, out, offset });
+            } else try readAllAtOffset(entry.fd, out, offset);
+            try control.checkpoint();
+        }
+
         fn readRangeAtMostInto(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8) !usize {
             const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
@@ -1395,6 +1498,57 @@ else
             const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             return try fileSizeFromFd(entry.fd);
+        }
+
+        fn fileSizeWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, control: read_admission.Port) !u64 {
+            try control.checkpoint();
+            const entry = try self.retainControlled(namespace, io, path, control);
+            defer self.release(io, entry);
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            return size;
+        }
+
+        fn readFileAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+            try control.checkpoint();
+            const entry = try self.retainControlled(namespace, io, path, control);
+            defer self.release(io, entry);
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            if (size > max_bytes) return error.StreamTooLong;
+            const len = std.math.cast(usize, size) orelse return error.StreamTooLong;
+            const out = try allocator.alloc(u8, len);
+            errdefer allocator.free(out);
+            if (len != 0) {
+                if (try control.executionWait()) |boundary| {
+                    try boundary.run(readAllAtOffset, .{ entry.fd, out, 0 });
+                } else try readAllAtOffset(entry.fd, out, 0);
+            }
+            const final_size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            if (final_size > size) return error.StreamTooLong;
+            if (final_size < size) return error.EndOfStream;
+            try control.checkpoint();
+            return out;
+        }
+
+        fn readTrailerAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+            try control.checkpoint();
+            const entry = try self.retainControlled(namespace, io, path, control);
+            defer self.release(io, entry);
+            // Both metadata and suffix bytes describe this one inode even if
+            // pathname replacement or vacuum retires the cache owner between IOs.
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            if (size < len) return error.EndOfStream;
+            const out = try allocator.alloc(u8, len);
+            errdefer allocator.free(out);
+            if (len != 0) {
+                if (try control.executionWait()) |boundary| {
+                    try boundary.run(readAllAtOffset, .{ entry.fd, out, size - len });
+                } else try readAllAtOffset(entry.fd, out, size - len);
+            }
+            try control.checkpoint();
+            return .{ .bytes = out, .file_size = size };
         }
 
         fn readTrailerAlloc(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -1476,6 +1630,11 @@ else
         }
 
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
+            return self.retainControlled(namespace, io, path, null);
+        }
+
+        fn retainControlled(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, control: ?read_admission.Port) !*Entry {
+            if (control) |budget| try budget.checkpoint();
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
             // Cache hits already own a stable filename and descriptor. Avoid
@@ -1483,7 +1642,7 @@ else
             // page-allocated pool) on every point read. Misses still allocate
             // outside the mutex and recheck both the entry and mutation epoch.
             {
-                const locked = lockAtomic(&shard.mutex);
+                const locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 defer if (locked) shard.mutex.unlock();
                 if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
                     existing.ref_count += 1;
@@ -1498,7 +1657,7 @@ else
 
             while (true) {
                 var observed_invalidation_epoch: u64 = 0;
-                const locked = lockAtomic(&shard.mutex);
+                const locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
                     existing.ref_count += 1;
                     existing.last_access = self.nextAccessLocked();
@@ -1511,24 +1670,30 @@ else
                 observed_invalidation_epoch = shard.invalidation_epoch;
                 if (locked) shard.mutex.unlock();
 
-                try self.reserveDescriptors(io, 1);
+                if (control) |budget| try self.reserveDescriptorsWithAdmission(io, 1, budget) else try self.reserveDescriptors(io, 1);
                 var descriptor_reserved = true;
                 errdefer if (descriptor_reserved) self.releaseDescriptors(io, 1);
 
-                const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{
-                    .ACCMODE = .RDONLY,
-                    .CLOEXEC = true,
-                }, 0);
+                // Open can return a new owned descriptor after authority has
+                // stopped. Discard it under the original owner before exposing
+                // a failed resumption; the reservation errdefer then retires.
+                const fd = if (control) |budget| opened: {
+                    if (try budget.executionWait()) |boundary| {
+                        break :opened try boundary.runOwned(openReadFd, .{owned_path}, closeFd, .{});
+                    }
+                    break :opened try openReadFd(owned_path);
+                } else try openReadFd(owned_path);
                 var fd_open = true;
                 errdefer if (fd_open) closeFd(fd);
 
                 if (builtin.is_test and test_fd_cache_pause_after_open.load(.acquire)) {
                     test_fd_cache_open_paused.store(true, .release);
                     while (!test_fd_cache_release_after_open.load(.acquire)) {
-                        io.sleep(.fromMilliseconds(1), .awake) catch {};
+                        if (control) |budget| try budget.waitForProgress() else io.sleep(.fromMilliseconds(1), .awake) catch {};
                     }
                 }
 
+                if (control) |budget| try budget.checkpoint();
                 const entry = try self.allocator.create(Entry);
                 var entry_active = true;
                 errdefer if (entry_active) self.allocator.destroy(entry);
@@ -1541,7 +1706,7 @@ else
                     .last_access = self.nextAccessLocked(),
                 };
 
-                const insertion_locked = lockAtomic(&shard.mutex);
+                const insertion_locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 errdefer if (insertion_locked) shard.mutex.unlock();
 
                 if (self.findEntryLocked(shard, namespace, path_hash, owned_path)) |existing| {
@@ -1613,10 +1778,10 @@ else
         fn tryReserveDescriptors(self: *FdCache, io: std.Io, count: usize) bool {
             if (count == 0) return true;
             if (count > self.capacity - self.persistent_reserve) return false;
-            self.admission_mutex.lockUncancelable(io);
+            if (!self.admission_mutex.tryLock()) return false;
             defer self.admission_mutex.unlock(io);
             // Do not bypass a queued operation or retain a partial reservation.
-            if (self.admission_head != null or !self.makeCapacityAvailable(count)) return false;
+            if (self.admission_head != null or !self.makeCapacityAvailableWithoutWaiting(count)) return false;
             _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
             return true;
         }
@@ -1666,6 +1831,57 @@ else
             }
         }
 
+        fn reserveDescriptorsWithAdmission(self: *FdCache, io: std.Io, count: usize, control: read_admission.Port) !void {
+            try control.checkpoint();
+            if (count == 0) return;
+            if (count > self.capacity - self.persistent_reserve) return error.DescriptorAdmissionCapacityTooSmall;
+            try @import("../../common/bounded_mutex.zig").lock(&self.admission_mutex, io, control);
+            var locked = true;
+            defer if (locked) self.admission_mutex.unlock(io);
+            // Try-only eviction cannot suspend while holding admission. A
+            // controlled waiter joins the same weighted FIFO as legacy calls.
+            if (self.admission_head == null and self.makeCapacityAvailableWithoutWaiting(count)) {
+                _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                return;
+            }
+            var waiter = AdmissionWaiter{ .count = count };
+            self.enqueueAdmissionWaiter(&waiter);
+            _ = self.admission_waiters.fetchAdd(1, .acq_rel);
+            _ = self.admission_waits.fetchAdd(1, .monotonic);
+            var queued = true;
+            defer if (queued) {
+                // Mandatory retirement must unlink the stack-owned node even
+                // after authority rejection. It never requests a fresh grant.
+                if (!locked) {
+                    self.admission_mutex.lockUncancelable(io);
+                    locked = true;
+                }
+                self.removeAdmissionWaiter(&waiter);
+                _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                self.admission_changed.broadcast(io);
+            };
+            while (true) {
+                try control.checkpoint();
+                if (self.admission_head == &waiter and self.makeCapacityAvailableWithoutWaiting(count)) {
+                    self.removeAdmissionWaiter(&waiter);
+                    queued = false;
+                    _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                    _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                    self.admission_changed.broadcast(io);
+                    return;
+                }
+                if (self.admission_head == &waiter and self.persistentDescriptorsPreventTransientProgress(count)) {
+                    _ = self.persistent_admission_failures.fetchAdd(1, .monotonic);
+                    return error.PersistentDescriptorAdmissionExhausted;
+                }
+                self.admission_mutex.unlock(io);
+                locked = false;
+                try control.waitForProgress();
+                try @import("../../common/bounded_mutex.zig").lock(&self.admission_mutex, io, control);
+                locked = true;
+            }
+        }
+
         fn persistentDescriptorsPreventTransientProgress(self: *FdCache, count: usize) bool {
             const persistent = self.persistent_descriptors.load(.acquire);
             const admitted = self.admitted_descriptors.load(.acquire);
@@ -1682,6 +1898,14 @@ else
         }
 
         fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
+            return self.makeCapacityAvailableMode(count, false);
+        }
+
+        fn makeCapacityAvailableWithoutWaiting(self: *FdCache, count: usize) bool {
+            return self.makeCapacityAvailableMode(count, true);
+        }
+
+        fn makeCapacityAvailableMode(self: *FdCache, count: usize, try_only: bool) bool {
             // The reserve is startup headroom, not a permanent tax. Once
             // lifetime locks consume it, transient leases may use the freed
             // portion while retaining the two-descriptor peak needed by the
@@ -1699,7 +1923,9 @@ else
             const transient_capacity = self.capacity - held_headroom;
             if (count > transient_capacity) return false;
             const available_at = transient_capacity - count;
-            while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
+            while (self.admitted_descriptors.load(.acquire) > available_at) {
+                if (!(if (try_only) self.tryEvictOne() else self.evictOne())) break;
+            }
             return self.admitted_descriptors.load(.acquire) <= available_at;
         }
 
@@ -1786,6 +2012,25 @@ else
                     current = entry.lru_next;
                 }
                 if (locked) shard.mutex.unlock();
+            }
+            return false;
+        }
+        // Optional read windows must not wait behind another storage owner.
+        // Scan the finite shard registry, skipping locks already held elsewhere.
+        fn tryEvictOne(self: *FdCache) bool {
+            const start = self.evict_cursor.fetchAdd(1, .monotonic);
+            for (0..self.shards.len) |offset| {
+                const shard = &self.shards[(start + offset) % self.shards.len];
+                if (!shard.mutex.tryLock()) continue;
+                defer shard.mutex.unlock();
+                var current = shard.lru_head;
+                while (current) |entry| {
+                    if (entry.ref_count == 0) {
+                        self.removeEntryLocked(shard, entry);
+                        return true;
+                    }
+                    current = entry.lru_next;
+                }
             }
             return false;
         }
@@ -1941,6 +2186,11 @@ pub const NativeStoragePool = struct {
     pub fn reserveDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) !void {
         if (!builtin.is_test) unreachable;
         try self.fd_cache.reserveDescriptors(io, count);
+    }
+
+    pub fn reserveDescriptorsWithAdmissionForTest(self: *NativeStoragePool, io: std.Io, count: usize, control: read_admission.Port) !void {
+        if (!builtin.is_test) unreachable;
+        try self.fd_cache.reserveDescriptorsWithAdmission(io, count, control);
     }
 
     pub fn releaseDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) void {
@@ -2126,6 +2376,14 @@ pub const NativeFdPermit = struct {
     }
 };
 
+/// Deterministic physical-worker retirement probes, active only in tests.
+pub const NativeRangeReadTestControl = struct {
+    pub var pause: std.atomic.Value(bool) = .init(false);
+    pub var started: std.atomic.Value(bool) = .init(false);
+    pub var release: std.atomic.Value(bool) = .init(false);
+    pub var completed: std.atomic.Value(bool) = .init(false);
+};
+
 const NativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
     struct {}
 else
@@ -2213,6 +2471,174 @@ else
         }
     };
 
+const ControlledNativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
+    struct {}
+else
+    struct {
+        allocator: Allocator,
+        state: *NativeStorageState,
+        path: []u8,
+        offset: u64,
+        len: usize,
+        io: std.Io,
+        future: ?std.Io.Future(void) = null,
+        entry: if (supports_posix_fd_cache) ?*FdCache.Entry else void = if (supports_posix_fd_cache) null else {},
+        done: std.atomic.Value(bool) = .init(false),
+        bytes: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        const vtable: RangeReadFuture.VTable = .{
+            .wait = wait,
+            .cancel = cancel,
+            .wait_with_admission = waitWithAdmission,
+        };
+
+        fn create(read_runtime: ReadRuntime, state: *NativeStorageState, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+            return createControlled(read_runtime, state, allocator, path, offset, len, null);
+        }
+
+        fn createControlled(read_runtime: ReadRuntime, state: *NativeStorageState, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) !RangeReadFuture {
+            const retained = try state.retain();
+            errdefer retained.release();
+            const self = try allocator.create(ControlledNativeRangeReadFuture);
+            errdefer allocator.destroy(self);
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+            self.* = .{ .allocator = allocator, .state = retained, .path = path_copy, .offset = offset, .len = len, .io = read_runtime.io };
+            // All native POSIX allocations and descriptor/cache preparation
+            // run on the charged caller. The worker receives only a retained
+            // FD and a fixed destination; it never borrows caller authority.
+            self.prepare(control) catch |err| {
+                self.err = err;
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            if (comptime supports_posix_fd_cache) if (len == 0) {
+                self.releaseEntry();
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            self.future = read_runtime.io.concurrent(run, .{self}) catch {
+                // No worker capacity: use the same prepared operation inline.
+                // Only the physical read releases the original runnable slot.
+                if (control) |budget| {
+                    if ((budget.executionWait() catch |err| failed: {
+                        self.err = err;
+                        break :failed null;
+                    })) |boundary| {
+                        boundary.run(perform, .{self}) catch |err| {
+                            self.err = err;
+                        };
+                    } else if (self.err == null) perform(self) catch |err| {
+                        self.err = err;
+                    };
+                } else perform(self) catch |err| {
+                    self.err = err;
+                };
+                self.releaseEntry();
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn prepare(self: *ControlledNativeRangeReadFuture, control: ?read_admission.Port) !void {
+            if (control) |budget| try budget.checkpoint();
+            if (comptime supports_posix_fd_cache) {
+                self.bytes = try self.allocator.alloc(u8, self.len);
+                self.entry = try self.state.fdCache().retainControlled(self.state.cache_namespace, self.state.threaded.io(), self.path, control);
+            }
+            if (control) |budget| try budget.checkpoint();
+        }
+
+        fn run(self: *ControlledNativeRangeReadFuture) void {
+            defer self.done.store(true, .release);
+            // Physical retirement releases descriptor use before a later
+            // prefetch needs capacity. Result buffers remain owned until join.
+            defer self.releaseEntry();
+            if (builtin.is_test and NativeRangeReadTestControl.pause.load(.acquire)) {
+                defer NativeRangeReadTestControl.completed.store(true, .release);
+                NativeRangeReadTestControl.started.store(true, .release);
+                while (!NativeRangeReadTestControl.release.load(.acquire)) {
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                }
+                perform(self) catch |err| {
+                    self.err = err;
+                };
+                return;
+            }
+            perform(self) catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn perform(self: *ControlledNativeRangeReadFuture) !void {
+            if (comptime supports_posix_fd_cache) {
+                if (self.len != 0) try readAllAtOffset(self.entry.?.fd, self.bytes.?, self.offset);
+            } else {
+                self.bytes = try readFileRangeWithIo(self.io, self.allocator, self.path, self.offset, self.len);
+            }
+        }
+
+        fn join(self: *ControlledNativeRangeReadFuture) !void {
+            if (self.future) |*future| future.await(self.io);
+            self.future = null;
+        }
+
+        fn wait(ptr: *anyopaque) ![]u8 {
+            return waitControlled(ptr, null);
+        }
+
+        fn waitWithAdmission(ptr: *anyopaque, control: read_admission.Port) ![]u8 {
+            return waitControlled(ptr, control);
+        }
+
+        fn waitControlled(ptr: *anyopaque, control: ?read_admission.Port) ![]u8 {
+            const self: *ControlledNativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            defer self.retire();
+            if (control) |budget| try budget.checkpoint();
+            if (self.future != null) {
+                if (control) |budget| {
+                    if (!self.done.load(.acquire)) {
+                        if (try budget.executionWait()) |boundary| try boundary.run(join, .{self}) else try self.join();
+                    } else try self.join();
+                } else try self.join();
+            }
+            if (control) |budget| try budget.checkpoint();
+            if (self.err) |err| return err;
+            const bytes = self.bytes orelse return error.CanceledRangeRead;
+            self.bytes = null;
+            return bytes;
+        }
+
+        fn releaseEntry(self: *ControlledNativeRangeReadFuture) void {
+            if (comptime supports_posix_fd_cache) if (self.entry) |entry| {
+                self.state.fdCache().release(self.state.threaded.io(), entry);
+                self.entry = null;
+            };
+        }
+
+        fn retire(self: *ControlledNativeRangeReadFuture) void {
+            // Even a failed begin/checkpoint must physically join before
+            // releasing the buffer, descriptor, state or allocator owner.
+            if (self.future) |*future| future.cancel(self.io);
+            if (self.bytes) |bytes| self.allocator.free(bytes);
+            self.releaseEntry();
+            const allocator = self.allocator;
+            allocator.free(self.path);
+            self.state.release();
+            allocator.destroy(self);
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *ControlledNativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            self.retire();
+        }
+    };
+
 pub const NativeStorage = if (!supports_native_storage)
     struct {
         pub const Lease = struct {
@@ -2272,11 +2698,16 @@ else blk: {
             const native_vtable: Storage.VTable = .{
                 .create_dir_path = createDirPath,
                 .read_file_alloc = readFileAlloc,
+                .read_file_alloc_with_admission = readFileAllocWithAdmission,
                 .read_file_range_alloc = readFileRangeAlloc,
                 .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+                .begin_read_file_range_alloc_with_admission = beginReadFileRangeAllocWithAdmission,
                 .read_file_range_into = readFileRangeInto,
+                .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
                 .read_file_range_at_most_into = readFileRangeAtMostInto,
                 .file_size = fileSize,
+                .file_size_with_admission = fileSizeWithAdmission,
+                .read_file_trailer_alloc_with_admission = readFileTrailerAllocWithAdmission,
                 .read_file_trailer_alloc = readFileTrailerAlloc,
                 .write_file_absolute = writeFileAbsolute,
                 .append_file_absolute = appendFileAbsolute,
@@ -2374,6 +2805,12 @@ else blk: {
                 };
             }
 
+            fn beginReadFileRangeAllocWithAdmission(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                const runtime = read_runtime orelse return CompletedRangeReadFuture.createControlled(self.storage(), allocator, path, offset, len, control);
+                return ControlledNativeRangeReadFuture.createControlled(runtime, self.state, allocator, path, offset, len, control);
+            }
+
             fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 const runtime = read_runtime orelse {
@@ -2394,6 +2831,16 @@ else blk: {
                     .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
                     .evented => |*evented| try readFileRangeWithIoInto(evented.io(), path, offset, out),
                 };
+            }
+
+            fn readFileRangeIntoWithAdmission(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readRangeIntoWithAdmission(state.cache_namespace, state.threaded.io(), path, offset, out, control);
+                }
+                try readFileRangeInto(ptr, path, offset, out);
             }
 
             fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2420,6 +2867,36 @@ else blk: {
                     .threaded => |*threaded| try fileSizeWithIo(threaded.io(), path),
                     .evented => |*evented| try fileSizeWithIo(evented.io(), path),
                 };
+            }
+
+            fn readFileAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readFileAllocWithAdmission(state.cache_namespace, state.threaded.io(), allocator, path, max_bytes, control);
+                }
+                return readFileAlloc(ptr, allocator, path, max_bytes);
+            }
+
+            fn fileSizeWithAdmission(ptr: *anyopaque, path: []const u8, control: read_admission.Port) !u64 {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().fileSizeWithAdmission(state.cache_namespace, state.threaded.io(), path, control);
+                }
+                return fileSize(ptr, path);
+            }
+
+            fn readFileTrailerAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readTrailerAllocWithAdmission(state.cache_namespace, state.threaded.io(), allocator, path, len, control);
+                }
+                return readFileTrailerAlloc(ptr, allocator, path, len);
             }
 
             fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -2573,11 +3050,16 @@ else blk: {
             .acquire_lease = acquireErasedLease,
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
+            .read_file_alloc_with_admission = readFileAllocWithAdmission,
             .read_file_range_alloc = readFileRangeAlloc,
             .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+            .begin_read_file_range_alloc_with_admission = beginReadFileRangeAllocWithAdmission,
             .read_file_range_into = readFileRangeInto,
+            .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
             .read_file_range_at_most_into = readFileRangeAtMostInto,
             .file_size = fileSize,
+            .file_size_with_admission = fileSizeWithAdmission,
+            .read_file_trailer_alloc_with_admission = readFileTrailerAllocWithAdmission,
             .read_file_trailer_alloc = readFileTrailerAlloc,
             .write_file_absolute = writeFileAbsolute,
             .append_file_absolute = appendFileAbsolute,
@@ -2695,6 +3177,13 @@ else blk: {
             return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
         }
 
+        fn beginReadFileRangeAllocWithAdmission(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const sync_storage: Storage = .{ .ptr = state, .vtable = &threaded_only_vtable };
+            const runtime = read_runtime orelse return CompletedRangeReadFuture.createControlled(sync_storage, allocator, path, offset, len, control);
+            return ControlledNativeRangeReadFuture.createControlled(runtime, state, allocator, path, offset, len, control);
+        }
+
         fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             const runtime = read_runtime orelse {
@@ -2712,6 +3201,16 @@ else blk: {
                 return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
             }
             return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
+        }
+
+        fn readFileRangeIntoWithAdmission(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readRangeIntoWithAdmission(retained.cache_namespace, retained.threaded.io(), path, offset, out, control);
+            }
+            try readFileRangeInto(ptr, path, offset, out);
         }
 
         fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2732,6 +3231,36 @@ else blk: {
                 return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
             }
             return try fileSizeWithIo(retained.threaded.io(), path);
+        }
+
+        fn readFileAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readFileAllocWithAdmission(retained.cache_namespace, retained.threaded.io(), allocator, path, max_bytes, control);
+            }
+            return readFileAlloc(ptr, allocator, path, max_bytes);
+        }
+
+        fn fileSizeWithAdmission(ptr: *anyopaque, path: []const u8, control: read_admission.Port) !u64 {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().fileSizeWithAdmission(retained.cache_namespace, retained.threaded.io(), path, control);
+            }
+            return fileSize(ptr, path);
+        }
+
+        fn readFileTrailerAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readTrailerAllocWithAdmission(retained.cache_namespace, retained.threaded.io(), allocator, path, len, control);
+            }
+            return readFileTrailerAlloc(ptr, allocator, path, len);
         }
 
         fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -3990,6 +4519,18 @@ pub const MemoryStorage = struct {
         };
     }
 };
+
+fn openReadFd(path: [*:0]const u8) !std.posix.fd_t {
+    return std.posix.openatZ(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+}
+
+fn lockAtomicWithAdmission(mutex: *std.atomic.Mutex, control: ?read_admission.Port) !bool {
+    if (control) |budget| {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(mutex, budget);
+        return true;
+    }
+    return lockAtomic(mutex);
+}
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     if (builtin.os.tag == .freestanding) return false;
@@ -5361,6 +5902,12 @@ test "weighted native fd admission preserves FIFO progress" {
     try io.sleep(.fromMilliseconds(10), .awake);
     try std.testing.expect(!large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
+    // Optional private-reader batches cannot steal the free slot from the
+    // older weighted waiter, even though one descriptor is available.
+    const optional_reserved = pool.fd_cache.tryReserveDescriptors(io, 1);
+    if (optional_reserved) pool.fd_cache.releaseDescriptors(io, 1);
+    try std.testing.expect(!optional_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
 
     pool.fd_cache.releaseDescriptors(io, 1);
     held_descriptors -= 1;
@@ -5525,6 +6072,98 @@ test "native buffered atomic write sink retains invalidation state past storage 
     const written = try verifier.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("buffered lease", written);
+}
+
+test "native fd admission try skips held admission and eviction locks" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+    inline for (.{ false, true }) |hold_shards| {
+        var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+        defer pool.deinit();
+        const cache = pool.fd_cache;
+        try cache.reserveDescriptors(std.testing.io, 2);
+        defer cache.releaseDescriptors(std.testing.io, 2);
+        if (hold_shards) {
+            for (cache.shards) |*shard| while (!shard.mutex.tryLock()) std.atomic.spinLoopHint();
+        } else cache.admission_mutex.lockUncancelable(std.testing.io);
+        const Rescue = struct {
+            cache: *FdCache,
+            done: std.atomic.Value(bool) = .init(false),
+            rescued: std.atomic.Value(bool) = .init(false),
+            fn run(self: *@This()) void {
+                for (0..100) |_| {
+                    if (self.done.load(.acquire)) break;
+                    std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+                }
+                if (!self.done.load(.acquire)) self.rescued.store(true, .release);
+                if (hold_shards) {
+                    for (self.cache.shards) |*shard| shard.mutex.unlock();
+                } else self.cache.admission_mutex.unlock(std.testing.io);
+            }
+        };
+        var rescue = Rescue{ .cache = cache };
+        var future = try std.testing.io.concurrent(Rescue.run, .{&rescue});
+        defer {
+            rescue.done.store(true, .release);
+            future.await(std.testing.io);
+        }
+        const reserved = cache.tryReserveDescriptors(std.testing.io, 1);
+        rescue.done.store(true, .release);
+        if (reserved) cache.releaseDescriptors(std.testing.io, 1);
+        try std.testing.expect(!reserved);
+        try std.testing.expect(!rescue.rescued.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), cache.admitted_descriptors.load(.acquire));
+    }
+}
+
+test "native fd admission try optional read window evicts idle entries and preserves capacity" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var tmp = try TestDirectory.init("fd-try-window");
+    defer tmp.cleanup();
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    const path = tmp.path();
+    try native.storage().writeFileAbsolute(path, "value");
+    const first = try pool.fd_cache.retain(native.state.cache_namespace, std.testing.io, path);
+    pool.fd_cache.release(std.testing.io, first);
+    const second = try pool.fd_cache.retain(native.state.cache_namespace + 1, std.testing.io, path);
+    pool.fd_cache.release(std.testing.io, second);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_cache_entries);
+    const readers = (try native.storage().tryBeginColdRandomReads(std.testing.allocator, &.{path})) orelse return error.TestExpectedOptionalReaders;
+    defer {
+        for (readers) |*reader| reader.deinit();
+        std.testing.allocator.free(readers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), readers.len);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+    const bytes = try readers[0].readRangeAlloc(std.testing.allocator, 0, 5);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("value", bytes);
+}
+
+test "native fd admission try optional read window allocation failure releases every permit" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var tmp = try TestDirectory.init("fd-try-window-oom");
+    defer tmp.cleanup();
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    try native.storage().writeFileAbsolute(tmp.path(), "value");
+    const Fixture = struct {
+        fn run(allocator: Allocator, storage: Storage, path: []const u8) !void {
+            const readers = (try storage.tryBeginColdRandomReads(allocator, &.{ path, path })) orelse return error.TestExpectedOptionalReaders;
+            defer {
+                for (readers) |*reader| reader.deinit();
+                allocator.free(readers);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ native.storage(), tmp.path() });
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), native.state.refs.load(.acquire));
 }
 
 test "native buffered atomic cleanup removes staging and restores cancellation" {

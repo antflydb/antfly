@@ -1,0 +1,37 @@
+diff --git a/zig/pkg/antfly/src/api/sql_pgwire.zig b/zig/pkg/antfly/src/api/sql_pgwire.zig
+--- a/zig/pkg/antfly/src/api/sql_pgwire.zig
++++ b/zig/pkg/antfly/src/api/sql_pgwire.zig
+@@ -39,15 +39,24 @@
+     alloc: std.mem.Allocator,
+     adapter: Adapter,
+     server: @import("../pgwire/server.zig").Server,
++    transport_io: std.Io.Threaded,
+ 
+     pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
+         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
+         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
+-        const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
++        _ = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
+         const self = try api.owner_alloc.create(Listener);
+         errdefer api.owner_alloc.destroy(self);
+         self.alloc = api.owner_alloc;
+         self.adapter = .{ .server = api };
++        // Main uses a connection owner, session runner and watchdog per peer.
++        // Keep those idle tasks off the shared outbound executor.
++        self.transport_io = std.Io.Threaded.init(self.alloc, .{
++            .async_limit = .nothing,
++            .concurrent_limit = .limited((@as(usize, config.max_connections) + 4) * 3 + 1),
++        });
++        errdefer self.transport_io.deinit();
++        const io = self.transport_io.io();
+         self.server = try @import("../pgwire/server.zig").start(self.alloc, .{
+             .io = io,
+             .backend = self.adapter.backend(),
+@@ -61,6 +70,7 @@
+ 
+     pub fn deinit(self: *Listener) void {
+         self.server.deinit();
++        self.transport_io.deinit();
+         self.alloc.destroy(self);
+     }
+ };

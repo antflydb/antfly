@@ -86,6 +86,17 @@ pub const CatalogProjectionSnapshot = struct {
     ranges: []metadata.RangeRecord,
 };
 
+/// Atomic admission projection: transactions must fence both topology and
+/// in-progress transitions from the same committed storage revision.
+pub const TransactionRoutingProjectionSnapshot = struct {
+    metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
+    catalog_revision: u64,
+    tables: []metadata.TableRecord,
+    ranges: []metadata.RangeRecord,
+    split_transitions: []metadata.SplitTransitionRecord,
+    merge_transitions: []metadata.MergeTransitionRecord,
+};
+
 pub const CatalogCursor = struct {
     metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
     revision: u64,

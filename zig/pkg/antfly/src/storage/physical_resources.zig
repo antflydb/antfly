@@ -28,6 +28,10 @@ pub const PhysicalStorageResources = struct {
     resource_manager: resource_manager_mod.ResourceManager,
     lsm_cache: lsm_backend.Cache,
     hbc_cache: hbc_mod.Cache,
+    // Store a movable identity, never a pointer into the temporary initializer.
+    // Resolve its manager only at release through this receiver's stable address.
+    lsm_metadata_identity: u64 = 0,
+    lsm_metadata_bytes: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) PhysicalStorageResources {
         return initFallible(alloc) catch @panic("OOM");
@@ -38,11 +42,21 @@ pub const PhysicalStorageResources = struct {
     }
 
     pub fn initWithBudgets(alloc: std.mem.Allocator, budgets: memory_budget.SmartResourceBudgets) std.mem.Allocator.Error!PhysicalStorageResources {
+        var manager = resource_manager_mod.ResourceManager.init(budgets.options);
+        errdefer manager.deinit(alloc);
+        const metadata_bytes: u64 = @intCast(lsm_backend.Cache.fixedAllocationBytes());
+        // This private startup manager has no competing owner or parent yet.
+        // Admit the fixed local allocation before constructing any shard array.
+        var metadata = manager.reserveImmediate(.lsm_block_table_cache, metadata_bytes) catch return error.OutOfMemory;
+        errdefer metadata.release();
+        const cache = try lsm_backend.Cache.initFallible(alloc, budgets.lsm_cache_budget_bytes);
         return .{
             .alloc = alloc,
-            .resource_manager = resource_manager_mod.ResourceManager.init(budgets.options),
-            .lsm_cache = try lsm_backend.Cache.initFallible(alloc, budgets.lsm_cache_budget_bytes),
+            .resource_manager = manager,
+            .lsm_cache = cache,
             .hbc_cache = hbc_mod.Cache.init(alloc),
+            .lsm_metadata_identity = metadata.identity,
+            .lsm_metadata_bytes = metadata_bytes,
         };
     }
 
@@ -55,6 +69,15 @@ pub const PhysicalStorageResources = struct {
     pub fn deinit(self: *PhysicalStorageResources) void {
         self.hbc_cache.deinit();
         self.lsm_cache.deinit();
+        if (self.lsm_metadata_identity != 0) {
+            var metadata = resource_manager_mod.Reservation{
+                .manager = &self.resource_manager,
+                .identity = self.lsm_metadata_identity,
+                .slice = .lsm_block_table_cache,
+                .bytes = self.lsm_metadata_bytes,
+            };
+            metadata.release();
+        }
         self.resource_manager.deinit(self.alloc);
         self.* = undefined;
     }

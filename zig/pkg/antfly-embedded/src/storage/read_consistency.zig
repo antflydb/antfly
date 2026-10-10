@@ -48,11 +48,18 @@ pub const ReadIndexRequester = struct {
 pub const ReadSafetyBarrier = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
+
+    const Wait = @import("../common/execution_wait.zig").Boundary;
+    const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
     pub const VTable = struct {
         wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
         capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
         validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!void = null,
+        /// The provider releases execution only at genuine wait points inside
+        /// the barrier. Wrapping its entire callback would release CPU too.
+        wait_read_safe_with_execution: ?*const fn (*anyopaque, u64, []const u8, Wait) anyerror!void = null,
     };
 
     pub const FrozenProof = struct {
@@ -67,7 +74,13 @@ pub const ReadSafetyBarrier = struct {
     };
 
     pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
-        try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
+        try Abi.call("wait_read_safe", self.boundary_dispatch, self.vtable.wait_read_safe, .{ self.ptr, group_id, request_ctx });
+    }
+
+    pub fn waitReadSafeWithExecution(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8, wait: ?Wait) !void {
+        const boundary = wait orelse return self.waitReadSafe(group_id, request_ctx);
+        const callback = self.vtable.wait_read_safe_with_execution orelse return error.ExecutionWaitUnsupported;
+        try Abi.call("wait_read_safe_with_execution", self.boundary_dispatch, callback, .{ self.ptr, group_id, request_ctx, boundary });
     }
 };
 
@@ -106,11 +119,13 @@ pub fn alreadyReadSafeBarrier() ReadSafetyBarrier {
         .ptr = undefined,
         .vtable = &.{
             .wait_read_safe = waitReadSafeNoop,
+            .wait_read_safe_with_execution = waitReadSafeNoopWithExecution,
         },
     };
 }
 
 fn waitReadSafeNoop(_: *anyopaque, _: u64, _: []const u8) !void {}
+fn waitReadSafeNoopWithExecution(_: *anyopaque, _: u64, _: []const u8, _: ReadSafetyBarrier.Wait) !void {}
 
 /// Fail-closed placeholder for a replicated read source whose owner has not
 /// installed its applied-state barrier yet.
@@ -119,11 +134,15 @@ pub fn unavailableReadSafetyBarrier() ReadSafetyBarrier {
         .ptr = undefined,
         .vtable = &.{
             .wait_read_safe = waitReadSafeUnavailable,
+            .wait_read_safe_with_execution = waitReadSafeUnavailableWithExecution,
         },
     };
 }
 
 fn waitReadSafeUnavailable(_: *anyopaque, _: u64, _: []const u8) !void {
+    return error.ReadSafetyBarrierUnavailable;
+}
+fn waitReadSafeUnavailableWithExecution(_: *anyopaque, _: u64, _: []const u8, _: ReadSafetyBarrier.Wait) !void {
     return error.ReadSafetyBarrierUnavailable;
 }
 
@@ -211,8 +230,10 @@ pub const EnrichmentReadGate = struct {
     ) !void {
         _ = from_key;
         _ = to_key;
-        _ = opts;
-        try self.prepare(group_id, .scan, consistency);
+        if (consistency == .stale) return;
+        var buf: [96]u8 = undefined;
+        const request_ctx = try enrichmentRequestContext(&buf, .scan, consistency);
+        try self.barrier.waitReadSafeWithExecution(group_id, request_ctx, opts.execution_wait);
     }
 };
 

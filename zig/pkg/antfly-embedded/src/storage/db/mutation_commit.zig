@@ -96,7 +96,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const RequestPreparationContext = execution_resources.RequestPreparationContext;
         const ShadowState = execution_resources.ShadowState;
         const appendDocumentChildRangeOutboxWrites = D.appendDocumentChildRangeOutboxWrites;
-        const decodeDurableReplicationOutbox = D.decodeDurableReplicationOutbox;
         const durableReplicationOutboxKeyAlloc = D.durableReplicationOutboxKeyAlloc;
         const durableReplicationOutboxKindFromKey = D.durableReplicationOutboxKindFromKey;
         const encodeDurableReplicationOutboxAlloc = D.encodeDurableReplicationOutboxAlloc;
@@ -182,12 +181,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
         pub fn acquireReplicationMutationShared(self: anytype) ?MutationBarrier.SharedLease {
             const barrier = self.replicationMutationBarrier() orelse return null;
+            if (@import("mutation_admission.zig").receiverMutationRoot(self)) |root| {
+                std.debug.assert(root.barrier == barrier);
+                return root.borrow();
+            }
             return barrier.acquireShared();
         }
 
         pub fn batchContext(self: anytype) BatchExecutionContext {
             const resources = self.core.batchExecutionResources();
             return .{
+                .mutation_root = @import("mutation_admission.zig").receiverMutationRoot(self),
                 .alloc = self.alloc,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -221,6 +225,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        pub fn batchContextWithMutationRoot(self: anytype, root: ?*MutationBarrier.RootSharedLease) BatchExecutionContext {
+            var ctx = batchContext(self);
+            ctx.mutation_root = root orelse ctx.mutation_root;
+            return ctx;
+        }
+
         pub fn batchInternalPrepared(
             self: anytype,
             req: types.BatchRequest,
@@ -252,9 +262,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            const mutation_admission = @import("mutation_admission.zig");
+            // A supplied snapshot or policy lease is retained before the
+            // initial replication wait. Keep its original lifetime, with CPU
+            // authority retained until capture holders adopt mandatory reentry.
+            const initial_controls = if (opts.snapshot_mutation != null or opts.row_policy_lease != null)
+                mutation_admission.retainedLeaseControls(opts.admission_controls)
+            else
+                opts.admission_controls;
+            // Startup recovery is a separate durable obligation. Do not wrap
+            // its remote acknowledgement in this batch's primary mutation reader.
+            if (!opts.bypass_replication_write_gate) {
+                const enclosing = opts.enclosing_mutation_retirement;
+                const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
+                if (enclosing) |slot| releaseReplicationMutationShared(slot);
+                try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
+                if (reacquire_enclosing) enclosing.?.* = try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            }
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
@@ -780,7 +806,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
+            const snapshot_controls = if (replication_mutation != null)
+                mutation_admission.retainedLeaseControls(initial_controls)
+            else
+                initial_controls;
+            var snapshot_mutation = if (snapshot_controls) |controls|
+                try self.core.snapshot_admission.acquireMutationControlledIo(
+                    self.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                    controls,
+                    opts.snapshot_mutation,
+                )
+            else if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
             std.debug.assert(snapshot_mutation.admission == self.core.snapshot_admission);
             if (builtin.is_test) {
@@ -796,7 +832,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            try mutation_admission.lockApply(self, mutation_admission.retainedLeaseControls(snapshot_controls));
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (self.local_execution.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -1035,7 +1071,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         },
                     );
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                    if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
+                    const retirement: @import("mutation_admission.zig").MutationRetirement = .{
+                        .current = &replication_mutation,
+                        .enclosing = opts.enclosing_mutation_retirement,
+                    };
+                    if (!opts.bypass_replication_write_gate) {
+                        try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement);
+                    } else retirement.retire();
                     try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                     return;
                 }
@@ -2370,7 +2412,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
-                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
+                var record = try prepareDirectChangeRecord(&batchContextWithMutationRoot(self, opts.mutation_root), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
                 defer change_journal_mod.deinitRecord(self.alloc, &record);
                 const payload = try change_journal_mod.encodeRecord(self.alloc, record);
                 errdefer self.alloc.free(payload);
@@ -2852,7 +2894,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var deferred_replication_gates = ReplicationDeferredCommitGates{};
             defer deferred_replication_gates.releaseTransition();
             if (!opts.bypass_replication_write_gate) {
-                var replication_ctx = self.batchContext();
+                var replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&replication_ctx));
                 if (transaction_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
@@ -2916,7 +2958,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sync_targets.target_identities,
                     sync_targets.target_scope_known,
                 );
-            releaseReplicationMutationShared(&replication_mutation);
+            (@import("mutation_admission.zig").MutationRetirement{
+                .current = &replication_mutation,
+                .enclosing = opts.enclosing_mutation_retirement,
+            }).retire();
             if (builtin.is_test and opts.restore_staging != null and D.test_fail_restore_projection_apply.*) {
                 D.test_fail_restore_projection_apply.* = false;
                 return error.InjectedRestoreProjectionApplyFailure;
@@ -2931,15 +2976,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             }
             if (!opts.bypass_replication_write_gate) {
-                const replication_ctx = self.batchContext();
+                const replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 try deferred_replication_gates.waitForDurabilityAndAuthority(replication_ctx.replication_write_gate);
                 if (opts.transaction_resolution != null or durable_replication_batch_payload != null or durable_replication_replay_payload != null) {
                     // The outbox is cleared only after every appended record has
                     // satisfied durability and the final authority recheck. Keep
                     // the cleanup atomic with other local DB mutations without
                     // retaining the apply lock across the remote wait above.
+                    var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                    defer releaseReplicationMutationShared(&cleanup_mutation);
+                    try self.enforceReplicationWriteGate();
                     lockApply(self);
                     defer self.core.unlockApply();
+                    // Apply acquisition can wait behind another mutation. A
+                    // fence during that wait must retain delivery debt.
+                    try self.enforceReplicationWriteGate();
                     if (opts.transaction_resolution) |resolution| {
                         if (transaction_replication_batch_payload != null)
                             try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
@@ -2964,7 +3015,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
             }
             if (append_derived_replay) {
-                var pressure_ctx = self.batchContext();
+                var pressure_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 const backlog_pressure_start_ns = monotonicTimeNs();
                 try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
                 try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
@@ -3049,8 +3100,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            defer releaseReplicationMutationShared(&mutation);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            // Recovery is repairing the pending-append flag. Check captured
+            // write authority without making that flag reject its own cleanup.
+            try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
             try durable_outbox_store.clearPublished(self.core.store, key);
         }
 
@@ -3149,31 +3205,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
-            // A failed primary append must complete before a later mutation can
-            // overtake its afterimage in the hot-standby tail.
-            while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
-            defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            while (true) {
-                while (self.local_execution.durable_replication_outbox_maybe.load(.acquire))
-                    try self.flushDurableReplicationOutboxesLocked();
-                // Close the race with a policy commit that published its flag just
-                // after the final scan. The same apply fence orders that commit
-                // and the flag clear against subsequent row writers.
-                try self.lockApplyForPortableRuntime();
-                const empty = !self.local_execution.durable_replication_outbox_maybe.load(.acquire);
-                if (empty) {
-                    self.local_execution.durable_replication_startup_barrier_pending.store(false, .release);
-                    self.local_execution.row_policy_replication_outbox_pending.store(false, .release);
-                }
-                self.core.unlockApply();
-                if (empty) return;
-            }
+            try self.ensureDurableReplicationStartupBarrierWithAdmission(null);
+        }
+
+        pub fn ensureDurableReplicationStartupBarrierWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            try @import("replication_startup_admission.zig").ensure(self, controls);
         }
 
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
@@ -3254,20 +3290,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxes(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesWithAdmission(null);
+        }
+
+        pub fn flushDurableReplicationOutboxesWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            const admission = @import("replication_startup_admission.zig");
+            const retained = @import("mutation_admission.zig").retainedLeaseControls(controls);
+            try @import("mutation_admission.zig").checkLifetime(retained);
             if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
             if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
             const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
+            try admission.lockFlush(&self.local_execution.durable_replication_flush_mutex, io, retained);
             defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            try self.flushDurableReplicationOutboxesLocked();
+            try self.flushDurableReplicationOutboxesLockedWithAdmission(retained);
         }
 
         pub fn flushDurableReplicationOutboxesLocked(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesLockedWithAdmission(null);
+        }
+
+        pub fn flushDurableReplicationOutboxesLockedWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            const admission = @import("mutation_admission.zig");
+            const retained = admission.retainedLeaseControls(controls);
+            try admission.checkLifetime(retained);
             if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
-            try self.lockApplyForPortableRuntime();
+            try admission.lockApply(self, retained);
             var apply_held = true;
             errdefer if (apply_held) self.core.unlockApply();
-            var page = try durable_outbox_store.readPending(self.alloc, self.core.store);
+            var read_scope: admission.IntentCollection = .{};
+            const read_control = read_scope.bind(retained, self.backend_runtime.io());
+            var page = if (read_control) |control|
+                try durable_outbox_store.readPendingWithAdmission(self.alloc, self.core.store, control)
+            else
+                try durable_outbox_store.readPending(self.alloc, self.core.store);
             defer page.deinit(self.alloc);
             const batch_raw = page.legacy_batch;
             const replay_raw = page.legacy_replay;
@@ -3283,9 +3338,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             apply_held = false;
             if (!any_pending) return;
 
-            const batch_outbox = if (batch_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const replay_outbox = if (replay_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
+            const batch_outbox = if (batch_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const replay_outbox = if (replay_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const schema_outbox = if (schema_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
 
             if (batch_outbox != null) {
                 const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -3304,24 +3359,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
 
             if (batch_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch, read_control);
                 try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
             }
             if (replay_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay, read_control);
                 try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
             }
             if (schema_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema, read_control);
                 try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
             }
 
             for (pending) |entry| {
+                try admission.checkLifetime(retained);
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
-                const outbox = try decodeDurableReplicationOutbox(entry.value);
+                const outbox = try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(entry.value, read_control);
                 const mirror = switch (kind) {
                     .batch, .restore_batch => self.local_execution.replication_async_batch_mirror,
                     .replay, .primary_effect => self.local_execution.replication_async_effect_mirror,
@@ -3329,7 +3388,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, mirror, outbox, kind, read_control);
                 // The key names this exact mutation, so concurrent publishers cannot
                 // replace the record which this recovery pass is about to remove.
                 try self.clearDurableReplicationOutbox(entry.key);
@@ -3337,13 +3396,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushTransactionReplicationOutbox(self: anytype, txn_id: transactions_mod.TxnId) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            defer releaseReplicationMutationShared(&mutation);
+            try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &mutation });
+        }
+
+        fn flushTransactionReplicationOutboxWithRetirement(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            retirement: @import("mutation_admission.zig").MutationRetirement,
+        ) !void {
             var outbox = try self.core.loadTransactionReplicationOutbox(self.alloc, txn_id);
             defer outbox.deinit(self.alloc);
-            if (outbox.batch_payload == null and outbox.replay_payload == null) return;
-
-            // An outbox entry is a durable synchronous-replication obligation. Do
-            // not silently discard it if a restart temporarily removes or
-            // downgrades the corresponding mirror configuration.
+            if (outbox.batch_payload == null and outbox.replay_payload == null) {
+                retirement.retire();
+                return;
+            }
+            // Durable obligations survive unavailable publishers and uncertain
+            // replies. Append every local tail before surrendering capture protection.
             if (outbox.batch_payload != null) {
                 const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
@@ -3356,18 +3426,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var ctx = self.batchContext();
             if (outbox.batch_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
             if (outbox.replay_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
+            const projected = replicationCommitContext(&ctx);
+            var tails = ReplicationDeferredCommitGates.begin(projected.transition_mutex);
+            defer tails.releaseTransition();
+            const batch_gate = if (outbox.batch_payload) |payload|
+                try appendReplicationEncodedBatchMutationCommitLockedContext(&ctx, payload)
+            else
+                null;
+            const replay_gate = if (outbox.replay_payload) |payload|
+                try appendReplicationReplayPayloadCommitLockedContext(&ctx, payload)
+            else
+                null;
+            tails.releaseTransition();
+            retirement.retire();
 
-            if (outbox.batch_payload) |payload| {
-                try self.mirrorReplicationEncodedBatchMutationCommit(payload);
+            // Preserve per-outbox acknowledgement: an acknowledged batch may be
+            // cleared even when the replay reply is lost. Each completion rechecks
+            // authority, then cleanup takes fresh local capture/apply protection.
+            const gates = [_]?ReplicationDeferredCommitGate{ batch_gate, replay_gate };
+            const present = [_]bool{ outbox.batch_payload != null, outbox.replay_payload != null };
+            for (gates, present, 0..) |gate, has_payload, i| {
+                if (!has_payload) continue;
+                var completion: ReplicationDeferredCommitGates = .{ .transition_mutex = projected.transition_mutex };
+                completion.append(gate);
+                try completion.waitForDurabilityAndAuthority(ctx.replication_write_gate);
+                var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                defer releaseReplicationMutationShared(&cleanup_mutation);
+                try self.enforceReplicationWriteGate();
                 try self.lockApplyForPortableRuntime();
                 defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .batch);
-            }
-            if (outbox.replay_payload) |payload| {
-                try self.mirrorReplicationReplayPayloadCommit(payload);
-                try self.lockApplyForPortableRuntime();
-                defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .replay);
+                try self.enforceReplicationWriteGate();
+                try self.core.clearTransactionReplicationOutbox(txn_id, if (i == 0) .batch else .replay);
             }
         }
 
@@ -3567,10 +3656,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
         ) !void {
+            return self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, null);
+        }
+
+        pub fn resolveTransactionIntentsInternalWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPrepared(
+            self.resolveTransactionIntentsPreparedWithControls(
                 txn_id,
                 status,
                 commit_version,
@@ -3579,6 +3682,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 ordered_receipt,
                 resolved_participant,
                 &preparation.guard,
+                controls,
             ) catch |err| return preparation.mapError(err);
         }
 
@@ -3593,18 +3697,38 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolved_participant: ?[]const u8,
             preparation: *PreparedRowAllocator,
         ) !void {
+            return self.resolveTransactionIntentsPreparedWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, preparation, null);
+        }
+
+        pub fn resolveTransactionIntentsPreparedWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            preparation: *PreparedRowAllocator,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
+            const admission = @import("mutation_admission.zig");
+            try admission.checkLifetime(controls);
+            const retained = admission.retainedLeaseControls(controls);
+            var collection: admission.IntentCollection = .{};
+            const collection_control = collection.bind(retained, self.core.apply_mutex.io);
             const alloc = preparation.allocator();
             var staging_progress = if (self.local_execution.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
             defer if (staging_progress) |*progress| progress.deinit();
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
             const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
             const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
-            var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
+            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxesWithAdmission(retained);
+            var replication_mutation = if (!bypass_replication_write_gate) try admission.acquireReplicationMutationShared(self, controls) else null;
             defer if (replication_mutation) |*lease| lease.release();
             if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
             if (status != .committed) {
-                try self.lockApplyForPortableRuntime();
+                try admission.lockApply(self, retained);
                 defer self.core.unlockApply();
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
@@ -3632,15 +3756,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var attempts: usize = 0;
             while (attempts < 8) : (attempts += 1) {
+                try admission.checkLifetime(retained);
                 const schema_namespace = self.core.schemaNamespaceGeneration();
-                var intents = try self.core.collectTransactionIntentBatch(alloc, txn_id);
+                var intents = try self.core.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
                 defer intents.deinit(alloc);
+                try admission.checkLifetime(retained);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
                 defer alloc.free(intent_keys);
-                for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
-                for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[i] = write.key;
+                }
+                for (intents.deletes, 0..) |key, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[intents.writes.len + i] = key;
+                }
                 if (intents.writes.len == 0 and intents.deletes.len == 0) {
-                    try self.lockApplyForPortableRuntime();
+                    try admission.lockApply(self, retained);
                     if (schema_namespace != self.core.schemaNamespaceGeneration()) {
                         self.core.unlockApply();
                         return error.PreparedGenerationChanged;
@@ -3672,19 +3804,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return err;
                     };
                     self.core.unlockApply();
-                    try self.flushTransactionReplicationOutbox(txn_id);
+                    try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation });
                     try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
                 }
 
                 const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
                 defer alloc.free(writes);
-                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    writes[i] = .{ .key = write.key, .value = write.value };
+                }
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
-                for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
-                    try durable_rows.put(alloc, intents.writes[i].key, row);
-                };
+                for (intents.prepared_rows, 0..) |maybe_row, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    if (maybe_row) |row| try durable_rows.put(alloc, intents.writes[i].key, row);
+                }
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = writes,
                     .deletes = intents.deletes,
@@ -3693,6 +3829,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .restore_staging_scope = restore_scope,
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,
+                    .admission_controls = retained,
+                    .enclosing_mutation_retirement = &replication_mutation,
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
@@ -4693,7 +4831,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             outbox: DurableReplicationOutbox,
             kind: DurableReplicationOutboxKind,
         ) !void {
+            try recoverDurableReplicationOutboxContextWithAdmission(ctx, mirror, outbox, kind, null);
+        }
+
+        pub fn recoverDurableReplicationOutboxContextWithAdmission(
+            ctx: *const BatchExecutionContext,
+            mirror: ReplicationAsyncEffectMirror,
+            outbox: DurableReplicationOutbox,
+            kind: DurableReplicationOutboxKind,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            var mutation_barrier: ?*MutationBarrier = null;
+            inline for (.{ ctx.replication_async_batch_mirror, ctx.replication_async_effect_mirror, ctx.replication_async_metadata_mirror }) |configured| {
+                if (configured) |binding| {
+                    if (binding.mutation_barrier) |barrier| {
+                        if (mutation_barrier) |existing| std.debug.assert(existing == barrier);
+                        mutation_barrier = barrier;
+                    }
+                }
+            }
             try replication_commit.recoverDurableOutbox(.{
+                .mutation_barrier = mutation_barrier,
+                .io = ctx.io,
+                .admission = control,
+                .mutation_root = ctx.mutation_root,
                 .transition_mutex = replicationTransitionMutexFromContext(ctx),
                 .log_mutex = ctx.log_mutex,
                 .namespace = ctx.identity_namespace,

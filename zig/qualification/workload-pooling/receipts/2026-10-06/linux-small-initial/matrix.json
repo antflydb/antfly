@@ -1,0 +1,47 @@
+{
+  "passed": false,
+  "failures": [
+    "linux-small: origin-main",
+    "linux-mixed-load: comparison with candidate-failfast",
+    "linux-mixed-load: comparison with origin-main"
+  ],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-small.json",
+      "variant": "origin-main",
+      "receipt": "/receipts/linux-small-origin-main.json",
+      "exit_code": 1
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-small.json",
+      "variant": "candidate-fixed",
+      "receipt": "/receipts/linux-small-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-small.json",
+      "variant": "candidate-failfast",
+      "receipt": "/receipts/linux-small-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-mixed-load.json",
+      "variant": "origin-main",
+      "receipt": "/receipts/linux-mixed-load-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-mixed-load.json",
+      "variant": "candidate-fixed",
+      "receipt": "/receipts/linux-mixed-load-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/linux-mixed-load.json",
+      "variant": "candidate-failfast",
+      "receipt": "/receipts/linux-mixed-load-candidate-failfast.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false
+}

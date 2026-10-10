@@ -320,14 +320,18 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try cancellation.check();
-        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
+        const body = result.body;
+        result.body = &.{};
+        return body;
     }
 
     fn getBoundedAllocWithCancellation(
@@ -338,8 +342,8 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
         var client = self.client;
         client.allocator = alloc;
         // Fetch the complete body: a prefix Range GET cannot prove object length.
@@ -372,17 +376,21 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var result = self.client.getObject(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{
             .range = .{ .offset = offset, .length = len },
             .skip_metadata_probe = true,
             .max_response_bytes = len,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try cancellation.check();
-        return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
+        const body = result.body;
+        result.body = &.{};
+        return body;
     }
 
     pub fn getVerifiedRangeAllocWithCancellation(
@@ -455,12 +463,14 @@ pub const ObjectStore = struct {
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
-        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        var meta = client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
         }) catch |err| return normalizeCancellationError(err, cancellation);
-        defer meta.deinit(self.client.allocator);
+        defer meta.deinit(alloc);
         try cancellation.check();
         return .{
             .artifact_id = try alloc.dupe(u8, artifact_id),

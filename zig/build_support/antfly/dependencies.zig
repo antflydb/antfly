@@ -343,7 +343,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 3072 * 1024 * 1024;
+    // The macOS cumulative SQL partition peaked at 3.68 GB after the lake
+    // merge. Reserve 4 GiB for compilation; statement runtime limits stay separate.
+    sql_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 4096 else 3072) * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
@@ -386,7 +388,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
-    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    pgwire_tests.step.max_rss = 2 * 1024 * 1024 * 1024;
     run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
@@ -1074,6 +1076,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_execution_control_mod.addImport("antfly_platform", platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", cancellation_mod);
+    inference_execution_control_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     const inference_execution_context_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/execution_context.zig"),
         .target = target,
@@ -1125,6 +1128,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
     inference_host_mod.addImport("antfly_inference_runtime_paths", inference_runtime_paths_mod);
     inference_host_mod.addImport("inference_server", inference_server_mod);
+    inference_host_mod.addImport("inference_linalg", inference_server_mod.import_table.get("inference_linalg").?);
     inference_host_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
     inference_host_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     inference_host_mod.addImport("antfly_platform", platform_mod);

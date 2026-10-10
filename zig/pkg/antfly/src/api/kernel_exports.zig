@@ -46,25 +46,36 @@ const ServerState = struct {
     runtime_io: RuntimeIoReceivers = .{},
 };
 
+const RunnableOwnerState = @import("runnable_owner_execution.zig").State;
+
 const RuntimeIoReceivers = struct {
     api: ?runtime_io_abi.Receiver = null,
     api_network: ?runtime_io_abi.Receiver = null,
     api_filesystem: ?runtime_io_abi.Receiver = null,
     durable: ?runtime_io_abi.Receiver = null,
+    sql_execution: ?runtime_io_abi.Receiver = null,
+    sql_control: ?runtime_io_abi.Receiver = null,
+    sql_workers: ?abi.SqlWorkerFactory = null,
 
     fn init(self: *@This(), borrows: *const abi.RuntimeIoBorrows) !void {
         if (!abi.validContext(abi.RuntimeIoBorrows, borrows.version, borrows.struct_size))
             return error.UnsupportedVersion;
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             @field(self, field) = if (@field(borrows, field)) |borrow| try borrow.receive() else null;
         }
+        self.sql_workers = if (borrows.sql_workers) |producer| blk: {
+            if (!abi.validContext(abi.SqlWorkerFactory, producer.version, producer.struct_size) or producer.capacity < 10)
+                return error.UnsupportedVersion;
+            break :blk producer.*;
+        } else null;
     }
 
     fn views(self: *@This()) server_mod.RuntimeIoViews {
         var result: server_mod.RuntimeIoViews = .{};
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             @field(result, field) = if (@field(self, field)) |*receiver| receiver.io() else null;
         }
+        result.sql_workers = self.sql_workers;
         return result;
     }
 };
@@ -146,6 +157,105 @@ fn output(comptime T: type, context: *const CallContext) *T {
     return @ptrCast(@alignCast(context.output orelse @panic("missing API kernel output")));
 }
 
+pub fn runnableOwnerCreate(context: *const abi.RunnableOwnerCreateContext) callconv(.c) abi.Status {
+    if (validateContext(abi.RunnableOwnerCreateContext, context.abi_version, context.struct_size)) |failure| return failure;
+    if (!context.owner_alloc.valid()) return fail(error.UnsupportedVersion);
+    if (!context.policy_contract.matches(.of(server_mod.RunnableScheduler.Config))) return fail(error.InvalidArgument);
+    const policy: *const server_mod.RunnableScheduler.Config = @ptrCast(@alignCast(context.policy));
+    const owner = server_mod.RunnableScheduler.NodeOwner.init(policy.*) catch return fail(error.InvalidArgument);
+    const alloc = context.owner_alloc.asStd();
+    const state = alloc.create(RunnableOwnerState) catch |err| return fail(err);
+    state.* = .{ .owner_alloc = alloc, .owner = owner, .native_now_ns = @import("antfly_platform").time.monotonicNs };
+    context.out_handle.* = &state.owner;
+    return .ok;
+}
+
+pub fn runnableOwnerExecutionPort(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, abi.runnable_abi.Owner, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    const state: *RunnableOwnerState = @fieldParentPtr("owner", owner);
+    output(abi.runnable_abi.Owner, context).* = state.port();
+    return .ok;
+}
+
+pub fn runnableOwnerClose(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    owner.close();
+    return .ok;
+}
+
+pub fn runnableOwnerDestroy(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    const state: *RunnableOwnerState = @fieldParentPtr("owner", owner);
+    const alloc = state.owner_alloc;
+    owner.tryDeinit() catch |err| return fail(err);
+    alloc.destroy(state);
+    return .ok;
+}
+
+test "runnable scheduler API kernel node owner rejects unsafe creation and destruction" {
+    const allocator = std.testing.allocator;
+    const allocator_abi = abi.memory_abi.Allocator.fromStd(&allocator);
+    const policy: server_mod.RunnableScheduler.Config = .{ .slots = 2 };
+    var handle: ?*anyopaque = null;
+    var context: abi.RunnableOwnerCreateContext = .{
+        .abi_version = abi.abi_version - 1,
+        .owner_alloc = &allocator_abi,
+        .policy = @ptrFromInt(8),
+        .policy_contract = .of(void),
+        .out_handle = &handle,
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.abi_version = abi.abi_version;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.policy = &policy;
+    context.policy_contract = .of(server_mod.RunnableScheduler.Config);
+    const invalid_policy: server_mod.RunnableScheduler.Config = .{ .slots = 1 };
+    context.policy = &invalid_policy;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.policy = &policy;
+    try std.testing.expect(runnableOwnerCreate(&context).isOk());
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(handle.?));
+    const call: CallContext = .{ .abi_version = abi.abi_version, .handle = handle.? };
+    // Reject the wrong output contract before touching an invalid output pointer.
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerExecutionPort(&.{
+        .abi_version = abi.abi_version,
+        .handle = handle.?,
+        .output = @ptrFromInt(8),
+        .output_contract = .of(u64),
+    })));
+    var port: abi.runnable_abi.Owner = undefined;
+    try std.testing.expect(runnableOwnerExecutionPort(&.{
+        .abi_version = abi.abi_version,
+        .handle = handle.?,
+        .output = &port,
+        .output_contract = .of(abi.runnable_abi.Owner),
+    }).isOk());
+    try std.testing.expect(port.valid());
+    try std.testing.expectEqual(handle.?, port.context);
+    try std.testing.expect(port.retain(port.context).isOk());
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    port.release(port.context);
+    try owner.retain();
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    try std.testing.expect(!owner.closed);
+    owner.release();
+    var execution: server_mod.RunnableScheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner.scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    try std.testing.expect(runnableOwnerClose(&call).isOk());
+    try std.testing.expect(runnableOwnerClose(&call).isOk());
+    try std.testing.expectError(error.SchedulerClosed, owner.retain());
+    execution.finish();
+    try std.testing.expect(runnableOwnerDestroy(&call).isOk());
+}
+
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     if (validateContext(CreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     if (context.flags & ~CreateContext.fallible_init != 0)
@@ -186,6 +296,11 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    state.server.startResourceCleanup() catch |err| {
+        std.log.err("API memory cleanup startup failed: error.{s}", .{@errorName(err)});
+        state.server.deinit();
+        return fail(err);
+    };
     state.server.startPgwire() catch |err| {
         std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
         state.server.deinit();
@@ -221,6 +336,12 @@ pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status 
 pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
     output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.writeAdmissionStats();
+    return .ok;
+}
+
+pub fn runnableSchedulingStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, abi.RunnableStats, context)) |failure| return failure;
+    output(abi.RunnableStats, context).* = serverState(context).server.runnableSchedulingStats();
     return .ok;
 }
 
@@ -318,6 +439,12 @@ pub fn authorizeInference(context: *const abi.AuthorizeInferenceContext) callcon
     return .ok;
 }
 
+pub fn configureHttpTransport(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(httpx.ServerConfig, httpx.ServerConfig, context)) |failure| return failure;
+    output(httpx.ServerConfig, context).* = serverState(context).server.configurePublicHttpTransport(input(httpx.ServerConfig, context).*);
+    return .ok;
+}
+
 pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Status {
     if (validateContext(HandlerCreateContext, context.abi_version, context.struct_size)) |failure| return failure;
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
@@ -350,6 +477,7 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     const write = handler.api_server.writeAdmissionStats();
     const inference = handler.api_server.inferenceAdmissionStats();
     const query_body = handler.query_body_admission.stats();
+    const memory = handler.api_server.workloadMemoryStats();
     output(abi.HandlerStats, context).* = .{
         .query_capacity = query.capacity,
         .query_in_flight = query.in_flight,
@@ -367,8 +495,34 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .query_body_in_flight = query_body.in_flight,
         .query_body_peak_in_flight = query_body.peak_in_flight,
         .query_body_rejected_total = query_body.rejected_total,
+        .query_configured_capacity = query.configured_capacity,
+        .query_queued = query.queued,
+        .query_queued_bytes = query.queued_bytes,
+        .query_waited_total = query.waited_total,
+        .query_wait_ns_total = query.wait_ns_total,
+        .query_wait_completed_total = query.wait_completed_total,
+        .query_wait_buckets = query.wait_buckets,
+        .query_expired_total = query.expired_total,
+        .query_cancelled_total = query.cancelled_total,
+        .query_queue_capacity = query.waiting.max_queued_requests,
+        .query_queue_bytes = query.waiting.max_queued_bytes,
+        .query_wait_ms = query.waiting.max_wait_ms,
+        .query_policy_version = query.policy_version,
+        .query_policy_retired_total = query.policy_retired_total,
+        .query_retiring_waiters = query.retiring_waiters,
+        .query_draining = query.draining,
+        .query_suspended = query.suspended,
+        .query_quiescent = query.quiescent,
+        .query_sql_waiting_enabled = query.sql_waiting_enabled orelse false,
+        .runnable = handler.api_server.runnableSchedulingStats(),
+        .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.control), memoryAbi(memory.retained) },
     };
     return .ok;
+}
+
+fn memoryAbi(stats: ?@import("../common/allocation_budget.zig").Shared.Stats) abi.WorkloadMemoryStats {
+    if (stats) |value| return .{ .enabled = true, .limit_bytes = value.limit_bytes, .used_bytes = value.used_bytes, .peak_bytes = value.peak_bytes, .rejected_total = value.rejected_total };
+    return .{ .enabled = false, .limit_bytes = 0, .used_bytes = 0, .peak_bytes = 0, .rejected_total = 0 };
 }
 
 pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.c) abi.Status {
@@ -543,11 +697,15 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress |
+        abi.Capability.node_runnable_owner |
+        abi.Capability.node_runnable_execution,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
+    .configure_http_transport = &configureHttpTransport,
     .query_admission_stats = &queryAdmissionStats,
+    .runnable_scheduling_stats = &runnableSchedulingStats,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHotStandbyExecutor,
@@ -569,6 +727,10 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .runnable_owner_create = &runnableOwnerCreate,
+    .runnable_owner_close = &runnableOwnerClose,
+    .runnable_owner_destroy = &runnableOwnerDestroy,
+    .runnable_owner_execution_port = &runnableOwnerExecutionPort,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -1067,10 +1229,12 @@ test "API kernel runtime I/O receivers validate capability layout and domains" {
         .api_network = &borrow,
         .api_filesystem = &borrow,
         .durable = &borrow,
+        .sql_execution = &borrow,
+        .sql_control = &borrow,
     };
     try receivers.init(&borrows);
     const views = receivers.views();
-    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+    inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
         const io = @field(views, field).?;
         try std.testing.expect(io.userdata == std.testing.io.userdata);
         try std.testing.expect(io.vtable == std.testing.io.vtable);
@@ -1089,7 +1253,7 @@ test "API kernel runtime I/O receiver keeps imported unavailable views null" {
     var receivers: RuntimeIoReceivers = .{};
     try receivers.init(&.{});
     const views = receivers.views();
-    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+    inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
         try std.testing.expect(@field(views, field) == null);
     }
 }
@@ -1141,6 +1305,8 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         .api_network = &borrow,
         .api_filesystem = &borrow,
         .durable = &borrow,
+        .sql_execution = &borrow,
+        .sql_control = &borrow,
     };
     context.runtime_io = &borrows;
     borrow.contract.version +%= 1;
@@ -1178,7 +1344,7 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         const state: *ServerState = @ptrCast(@alignCast(handle.?));
         try std.testing.expect(state.server.cfg.imported_runtime_io != null);
         const views = state.server.cfg.imported_runtime_io.?;
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             const view = @field(views, field).?;
             try std.testing.expect(view.userdata == @as(?*anyopaque, &@field(state.runtime_io, field).?));
             try std.testing.expect(view.vtable != std.testing.io.vtable);
@@ -1190,4 +1356,107 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         handle = null;
         try Probe.run(std.testing.io);
     }
+}
+
+test "API kernel create keeps SQL lanes owner-produced through saturation and shutdown" {
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    const worker = @import("sql_worker_lease.zig");
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    const cfg: server_mod.ApiHttpServerConfig = .{
+        .backend_runtime = runtime.ptr(),
+        .runnable_policy = .{ .slots = 2, .max_operations = 8 },
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_wait_ms = 100, .max_queued_requests = 2, .max_queued_bytes = 1024 * 1024 },
+    };
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+        fn blocked(io: std.Io, gate: *std.Io.Event) void {
+            gate.wait(io) catch {};
+        }
+        fn probe(io: std.Io) anyerror!void {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "/antfly-kernel-sql-lane-missing", .{}));
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    var alloc = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&alloc);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var general = abi.native_abi.IoBorrow.init(&std.testing.io);
+    const producer = worker.factory(runtime.ptr()).?;
+    const borrows: abi.RuntimeIoBorrows = .{ .api = &general, .api_network = &general, .api_filesystem = &general, .durable = &general, .sql_execution = &general, .sql_control = &general, .sql_workers = &producer };
+    try std.testing.expect(create(&.{
+        .abi_version = abi.abi_version,
+        .owner_alloc = &owner_alloc,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .runtime_io = &borrows,
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .flags = CreateContext.fallible_init,
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    }).isOk());
+    defer if (handle) |active| destroy(active);
+    const state: *ServerState = @ptrCast(@alignCast(handle.?));
+    // Explicit imported SQL capabilities must take precedence over raw runtime
+    // state. Restore the pointer before unrelated shutdown paths use it.
+    state.server.cfg.backend_runtime = @ptrFromInt(0x1000);
+    defer if (handle != null) {
+        state.server.cfg.backend_runtime = runtime.ptr();
+    };
+    const control = try state.server.sqlControlIo();
+    const foreground = try state.server.sqlExecutionIo();
+    const cleanup_io = try state.server.sqlCleanupIo();
+    try std.testing.expect(state.server.sqlQueryWaitingEnabled());
+    const reaper = try state.server.sqlCleanupOwner();
+    state.server.cfg.backend_runtime = runtime.ptr();
+    try std.testing.expect(reaper == state.server.sql_cleanup_runtime.?);
+    try std.testing.expect(state.server.sql_workers.?.native == null);
+    try std.testing.expect(state.server.sql_control_workers.?.native == null);
+    try std.testing.expect(state.server.sql_cleanup_workers.?.native == null);
+    try std.testing.expect(state.server.sql_cleanup_reaper_workers.?.native == null);
+    try std.testing.expect(foreground.userdata != cleanup_io.userdata and foreground.userdata != control.userdata);
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    var foreground_gate: std.Io.Event = .unset;
+    var cleanup_gate: std.Io.Event = .unset;
+    var foreground_jobs: std.Io.Group = .init;
+    var foreground_open = true;
+    defer if (foreground_open) {
+        foreground_gate.set(std.testing.io);
+        foreground_jobs.await(foreground) catch {};
+    };
+    var cleanup_jobs: std.Io.Group = .init;
+    var cleanup_open = true;
+    defer if (cleanup_open) {
+        cleanup_gate.set(std.testing.io);
+        cleanup_jobs.await(cleanup_io) catch {};
+    };
+    for (0..state.server.sql_workers.?.capacity) |_| try foreground_jobs.concurrent(foreground, Stub.blocked, .{ foreground, &foreground_gate });
+    for (0..state.server.sql_cleanup_workers.?.capacity) |_| try cleanup_jobs.concurrent(cleanup_io, Stub.blocked, .{ cleanup_io, &cleanup_gate });
+    try std.testing.expectError(error.ConcurrencyUnavailable, foreground.concurrent(Stub.probe, .{foreground}));
+    try std.testing.expectError(error.ConcurrencyUnavailable, cleanup_io.concurrent(Stub.probe, .{cleanup_io}));
+    var control_job = try control.concurrent(Stub.probe, .{control});
+    try control_job.await(control);
+    foreground_gate.set(std.testing.io);
+    foreground_jobs.await(foreground) catch {};
+    foreground_open = false;
+    cleanup_gate.set(std.testing.io);
+    cleanup_jobs.await(cleanup_io) catch {};
+    cleanup_open = false;
+    destroy(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
 }

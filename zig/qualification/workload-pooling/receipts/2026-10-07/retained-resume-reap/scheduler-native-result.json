@@ -1,0 +1,23 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "667700fc629d040e465ba93cc69ae335516a9bb0cea36718c1b0e4519867b721",
+    "zig/pkg/antfly-embedded/src/common/bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732"
+  },
+  "counts": {
+    "selected": 26,
+    "passed": 26,
+    "skipped": 0
+  },
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "test",
+    "-OReleaseSafe",
+    "-lc",
+    "--cache-dir",
+    "/private/tmp/antfly-worker-phase-native-cache",
+    "-Mroot=pkg/antfly-embedded/src/common/runnable_scheduler.zig"
+  ],
+  "hash_capture": "After native completion; matches GNU launch hashes."
+}

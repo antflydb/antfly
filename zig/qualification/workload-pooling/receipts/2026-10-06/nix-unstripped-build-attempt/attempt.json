@@ -1,0 +1,23 @@
+{
+  "baseline_revision": "e6d4ce9bbc716be5e7dc96ac37b9d70dc4d6778c",
+  "passed": false,
+  "qualification": false,
+  "optimization": "ReleaseSafe",
+  "strip": false,
+  "target": "native aarch64-linux-gnu",
+  "cgroup_cpus": 4,
+  "cgroup_memory_bytes": 24696061952,
+  "compiler_maxrss_bytes": 24696061952,
+  "termination": "Intentional docker stop after sampled storage memory exceeded the declared 20 GiB compiler claim. Exit 137; no final storage compiler peak was measured.",
+  "completed_compiler_reported_peak_bytes": {
+    "cli": 3645767680,
+    "api": 12550221824,
+    "distributed": 13191520256
+  },
+  "sampled_compiler_peak_lower_bound_bytes": {
+    "antfly-runtime-api_kernel": 12550344704,
+    "antfly-runtime-distributed": 13192097792,
+    "antfly-storage-kernel": 21494583296
+  },
+  "replacement_profile": "Both Linux variants use stripped ReleaseSafe with the same pinned Nix glibc compiler; runtime limits and workload gates remain unchanged."
+}

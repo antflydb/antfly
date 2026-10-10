@@ -1,0 +1,28 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-owner-handoff-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "23622320128",
+    "--cache-dir",
+    "/private/tmp/antfly-parent-phase-focused-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 78819,
+  "state": "terminal",
+  "started": 1791405654.1451032,
+  "source_sha256": {
+    "zig/pkg/inference/src/server/runnable_execution.zig": "d1e15987ab4e8b4c516b57c2b9be3f313f06b628fd9d1cd2903dc03ed9c3537a",
+    "zig/pkg/inference/src/server/executor_microbatch.zig": "d00014e7df9a2f38083c047e911ecc611e17b051969573da6526b0839783965c",
+    "zig/pkg/inference/src/execution_control.zig": "719d5b409ead3377b70c907fd2a87209677b7bfa098af4fd9428470a9c65cdbc",
+    "zig/pkg/antfly/src/api/runnable_inference_test_root.zig": "b4b30c21722651cbbab4b0d5cae4cfd055e9c2222f45f16222ef5af601c2c424",
+    "zig/pkg/antfly/build/api_tests.zig": "f5c4e28e9d67cc186afc4359039018e4892113ba536973332cd8195c3c6c01b7"
+  },
+  "compiler_pid": 78824,
+  "exit_code": 0,
+  "finished": 1791405666.8793962
+}

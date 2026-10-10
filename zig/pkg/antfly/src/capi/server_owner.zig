@@ -772,6 +772,7 @@ pub fn storageOwnerContextCreateWithRuntime(
 /// an ABI function returns a scalar failure status.
 pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
     const request = services.context;
+    const runnable_owner = if (services.runnable_owner) |owner| try @import("antfly_runtime_abi").runnable_abi.Owner.read(owner) else null;
     const bridge = if (services.allocator) |value| blk: {
         if (!value.valid()) return error.InvalidArgument;
         break :blk value.*;
@@ -802,6 +803,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
         .backend = .manual,
         .borrowed_io = .{ .general = io.io() },
     };
+    runtime_config.runnable_owner = runnable_owner;
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();
@@ -918,6 +920,24 @@ pub fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.Contex
         .waits = stats.waits,
         .used_bytes = @intCast(stats.used_bytes),
     };
+}
+
+/// Borrowed allocation accounting for API heaps sharing this storage owner.
+/// The context must remain alive until all charges have been released.
+pub fn storageOwnerContextReserveExternal(context: ?*anyopaque, bytes: usize) callconv(.c) bool {
+    const owner = asStorageOwnerContext(context) orelse return false;
+    return owner.resources.resource_manager.reserveExternal(bytes);
+}
+
+pub fn storageOwnerContextReleaseExternal(context: ?*anyopaque, bytes: usize) callconv(.c) void {
+    const owner = asStorageOwnerContext(context) orelse unreachable;
+    owner.resources.resource_manager.releaseExternal(bytes);
+}
+
+pub fn storageOwnerContextMemoryParent(context: ?*anyopaque, out_parent: *kernel_owner_abi.MemoryParent) callconv(.c) bool {
+    const owner = asStorageOwnerContext(context) orelse return false;
+    out_parent.* = owner.resources.resource_manager.memoryParentPort();
+    return true;
 }
 
 pub fn storageOwnerContextMetrics(
@@ -1632,6 +1652,36 @@ pub fn metadataApplyStoreBindHotStandby(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const port: ?antfly.capi_dependencies.storage_metadata_hot_standby_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_hot_standby_port.Port, @ptrCast(@alignCast(ptr))).* else null;
     handle.store.bindHotStandbyPort(port) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
+}
+
+pub fn metadataApplyStoreTransactionRouting(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataTransactionRoutingRequest,
+    out_json: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_json.* = .{};
+    if (request.version != kernel_owner_abi.MetadataTransactionRoutingRequest.abi_version or request._reserved != 0) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const BudgetPort = @import("../storage/transaction_routing_budget_port.zig").Port;
+    const raw = request.control orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(BudgetPort) != 0) return .invalid_argument;
+    const control: *const BudgetPort = @ptrCast(@alignCast(raw));
+    control.validate() catch return .invalid_abi;
+    const alloc = @import("../storage/transaction_routing_memory_port.zig").receive(request.allocator) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    const value = handle.store.captureTransactionRoutingProjection(alloc, request.group_id, control.*) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.store.freeTables(alloc, value.tables);
+    defer handle.store.freeRanges(alloc, value.ranges);
+    defer handle.store.freeSplitTransitions(alloc, value.split_transitions);
+    defer handle.store.freeMergeTransitions(alloc, value.merge_transitions);
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    const encoded = @import("../storage/transaction_routing_memory_port.zig").encode(alloc, value) catch |err| return storageOwnerStatusFromError(err);
+    out_json.* = .{ .ptr = if (encoded.len == 0) null else encoded.ptr, .len = @intCast(encoded.len) };
+    control.checkpoint() catch |err| {
+        if (out_json.ptr) |bytes| alloc.free(bytes[0..@intCast(out_json.len)]);
+        out_json.* = .{};
+        return storageOwnerStatusFromError(err);
+    };
     return .ok;
 }
 
@@ -5279,6 +5329,23 @@ pub fn storageOwnerTextStatsJson(
     );
 }
 
+pub fn storageOwnerTextStatsControlledJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledControlledOperation(handle, table_name, request, .text_stats, .text_stats, out_response, out_failure);
+}
+
 pub fn storageOwnerAlgebraicPartialsJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -5319,6 +5386,7 @@ pub fn executeStorageOwnerCompiledQueryOperation(
         @ptrCast(&handle.db),
         table_name,
         request_json,
+        null,
         null,
         null,
         null,
@@ -5412,7 +5480,7 @@ pub fn storageOwnerGraphExpandJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5437,7 +5505,7 @@ pub fn storageOwnerGraphHydrateJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5462,7 +5530,7 @@ pub fn storageOwnerGraphEdgesJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5473,7 +5541,7 @@ pub fn storageOwnerGraphEdgesJson(
     );
 }
 
-pub fn executeStorageOwnerCompiledGraph(
+pub fn executeStorageOwnerCompiledControlledOperation(
     handle: *Handle,
     table_name: []const u8,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,
@@ -5491,6 +5559,7 @@ pub fn executeStorageOwnerCompiledGraph(
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
         request.cancellation_ctx,
         request.cancellation_fn,
+        request.execution_runnable,
         out_failure,
     ) catch |err| {
         // A valid nested provider failure retains its local-query origin and
@@ -5957,7 +6026,8 @@ pub fn storageOwnerMaintenance(
         },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            handle.db.drainSnapshotMaintenance(request.deadline_ns) catch |err| {
+            const lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry = if (request.lifetime_check) |raw| @ptrCast(@alignCast(raw)) else null;
+            handle.db.drainSnapshotMaintenanceWithLifetime(request.deadline_ns, lifetime) catch |err| {
                 std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
             };
@@ -6003,8 +6073,14 @@ pub fn searchStorageKernelQueryJson(
 ) kernel_owner_abi.Status {
     out_failure.* = .{};
     const request_json: capi.Slice = .{ .ptr = request.control.request_json.ptr, .len = @intCast(request.control.request_json.len) };
+    const runnable = if (request.control.execution_runnable) |raw|
+        @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw))) catch |err|
+            return storageOwnerQueryFailure(err, .validate_request, out_failure)
+    else
+        null;
     const controls: db_mod.types.SearchRequest = .{
         .execution_deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .execution_runnable = runnable,
         .cancellation = ownerQueryCancellation(&request.control),
     };
     table_reads_api.checkQueryDeadline(controls) catch |err|
@@ -6022,6 +6098,7 @@ pub fn searchStorageKernelQueryJson(
             controls.execution_deadline_ns,
             request.control.cancellation_ctx,
             request.control.cancellation_fn,
+            request.control.execution_runnable,
             out_failure,
         ) catch |err| {
             // A valid provider failure already carries the exact envelope.
@@ -6052,6 +6129,7 @@ pub fn searchStorageKernelQueryJson(
         owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed| @min(parsed, deadline) else deadline;
     }
     owned.req.cancellation = controls.cancellation;
+    owned.req.execution_runnable = controls.execution_runnable;
     antfly.local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
 
     stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err|

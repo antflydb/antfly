@@ -431,9 +431,68 @@ pub const Cursor = struct {
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,
+    /// Explicit capability for an exclusively owned scan child. The provider
+    /// replaces mutable parent callbacks with this worker's independent CPU/IO
+    /// receiver and closes the cursor before that receiver physically retires.
+    bind_execution: ?*const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void = null,
+    /// Temporary coordinator attachment. The provider owns independent mutable
+    /// receiver state, joins speculative work on release, and never retains a
+    /// request execution between pulls (a named portal may outlive that call).
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
+    fn attach(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !bool {
+        const owner = execution orelse return false;
+        const capability = self.coordinator_execution orelse return false;
+        try capability.bind(self.ptr, owner);
+        return true;
+    }
+    fn detach(self: Cursor, attached: bool) void {
+        if (attached) self.coordinator_execution.?.release(self.ptr);
+    }
+    pub fn nextFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !Page {
+        const attached = try self.attach(execution);
+        const result = self.next(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |page| page.deinit() else |_| {}
+            return err;
+        };
+        return result;
+    }
+    pub fn columnsFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !ColumnPage {
+        const attached = try self.attach(execution);
+        const result = self.next_columns.?(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
+    pub fn splitFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: usize, comptime ordered: bool) !?[]Cursor {
+        const attached = try self.attach(execution);
+        const result = if (ordered) self.split_ordered.?(self.ptr, alloc, maximum) else self.split_scan.?(self.ptr, alloc, maximum);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |cursors| {
+                if (cursors) |owned| {
+                    for (owned) |cursor| cursor.close(cursor.ptr);
+                    alloc.free(owned);
+                }
+            } else |_| {}
+            return err;
+        };
+        return result;
+    }
+    pub fn countFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !?u64 {
+        const attached = try self.attach(execution);
+        const result = self.count_rows.?(self.ptr);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };
@@ -513,9 +572,24 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
+    /// Pages are borrowed from this cursor or allocated in the caller's page
+    /// arena. Failed authority never publishes them; the caller unwinds its arena.
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
     close: *const fn (*anyopaque) void,
+    pub fn nextFor(self: AggregatePartialCursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: u32) !?[]const @import("operators.zig").GroupResult {
+        const capability = self.coordinator_execution;
+        const attached = execution != null and capability != null;
+        if (attached) try capability.?.bind(self.ptr, execution.?);
+        const result = self.next(self.ptr, alloc, maximum);
+        if (attached) capability.?.release(self.ptr);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 pub const Backend = struct {
@@ -527,6 +601,15 @@ pub const Backend = struct {
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
     execution_io: ?std.Io = null,
+    /// Independent scheduler children for pure kernels over immutable columns.
+    /// This does not enable concurrent access to this backend's mutable state.
+    cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
+    /// Serial spill I/O is independent of parallel compute ownership. A
+    /// scheduled single-worker adapter can retain spilling without launching
+    /// children that share its mutable execution capsule.
+    spill_io: ?std.Io = null,
+    /// Single-worker execution handoff around private spill file I/O.
+    spill_wait: ?@import("execution_wait.zig").Boundary = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,

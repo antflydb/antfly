@@ -46,6 +46,8 @@ var test_before_runtime_status_fallback_probe: ?struct {
     observed: *const fn (*anyopaque) void,
 } = null;
 
+// executeOnce allocates the client response with std.testing.allocator;
+// response deinit must use that allocator, independently of server accounting.
 fn executeApiHttpxTestRequest(
     api: *antfly.public_api.http_server.ApiHttpServer,
     req: antfly.raft.transport.http_common.HttpRequest,
@@ -161,7 +163,8 @@ const embedding_activity_protocol_version = antfly.metadata.table_manager.embedd
 const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
-const remote_metadata_http_executor_pool_size: usize = 4;
+// One service-owned concurrent pool keeps endpoint limits authoritative.
+const remote_metadata_http_executor_pool_size: usize = 1;
 // Ordinary catalog callbacks do not carry a request context through their ABI.
 // Give them the same finite envelope as linearizable metadata reads so cache
 // generation churn can retry without either escaping early or waiting forever.
@@ -970,7 +973,7 @@ const DataPublicHttpRuntime = struct {
             .api_server = api_server,
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
             .server = blk: {
-                var server_cfg = publicApiHttpxConfig(cfg, http_runtime);
+                var server_cfg = api_server.configurePublicHttpTransport(publicApiHttpxConfig(cfg, http_runtime));
                 if (!http_runtime.supportsH1DisconnectCancellation()) {
                     if (h1_disconnect_probe) |probe| {
                         server_cfg.h1_disconnect_probe = probe;
@@ -2471,6 +2474,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
         if (self.data_server.backend_runtime) |backend_runtime| {
+            try @import("../api/sql_worker_metrics.zig").append(writer, backend_runtime);
             const lanes = backend_runtime.laneStats();
             try health_metrics.appendPromMetric(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);
@@ -2522,12 +2526,14 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
+            const query_stats = if (self.data_server.http_server) |*api| api.queryAdmissionStats() else antfly.common.request_admission.RequestAdmission.Stats{
                 .capacity = http.max_active_requests,
                 .in_flight = http.active_requests,
                 .peak_in_flight = http.peak_active_requests,
                 .rejected_total = http.rejected_requests_total,
-            });
+            };
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query_stats);
+            try antfly.common.request_admission.runnable_metrics.appendPrometheusMetrics(writer, if (self.data_server.http_server) |*api| api.runnableSchedulingStats() else .{});
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
                 .capacity = http.max_active_writes,
                 .in_flight = http.active_writes,
@@ -5817,10 +5823,16 @@ pub const DataServer = struct {
     /// executor lanes and may be shared by every httpx listener in this role.
     http_observer_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
+    owned_http_runtime_allocator: ?std.mem.Allocator = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
+    distributed_read_http_mutex: std.atomic.Mutex = .unlocked,
+    outbound_memory: ?*@import("../common/allocation_budget.zig").ServiceMemory = null,
+    outbound_memory_mutex: std.atomic.Mutex = .unlocked,
+    raft_forward_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
+    raft_forward_http_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
     dense_publication_future: ?std.Io.Future(void) = null,
@@ -5875,6 +5887,7 @@ pub const DataServer = struct {
     fn hotStandbyStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
         return .{
             .max_response_bytes = hot_standby_replication_default_max_response_bytes,
+            .keep_alive = false,
             .resolve_before_connect = true,
             // DNS and connect are part of the failover transport. Bound that
             // phase without imposing an absolute deadline on a replication
@@ -6230,6 +6243,10 @@ pub const DataServer = struct {
     /// httpx.Server instead of the built-in StdHttpListener.
     fn ensureKernelOwnerSource(self: *DataServer) !*antfly.public_api.ProvisionedKernelOwnerSource {
         if (self.kernel_owner_source) |owner_source| return owner_source;
+        var staged_control_lease: @FieldType(DataServer, "owner_apply_control_lease") = null;
+        // Registered before owner cleanup so its I/O stays alive through the
+        // owner's quiescence, including failure to attach the memory parent.
+        errdefer if (staged_control_lease) |*lease| lease.release();
         const owner_source = try self.alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
         owner_source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(
             self.alloc,
@@ -6257,11 +6274,13 @@ pub const DataServer = struct {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);
             if (self.data_raft != null) {
-                var control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 1 });
-                errdefer control_lease.release();
-                try owner_source.startApplyControl(control_lease.io());
-                self.owner_apply_control_lease = control_lease;
+                staged_control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 1 });
+                try owner_source.startApplyControl(staged_control_lease.?.io());
             }
+        }
+        if (comptime linked_storage) {
+            try owner_source.context.ensure();
+            try self.provisioned_storage.resource_manager.installMemoryParent(try owner_source.context.memoryParent());
         }
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
@@ -6273,6 +6292,7 @@ pub const DataServer = struct {
             apply_sm.attachKernelOwnerSource(owner_source);
             _ = apply_sm.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
         }
+        self.owner_apply_control_lease = staged_control_lease;
         self.kernel_owner_source = owner_source;
         return owner_source;
     }
@@ -6591,10 +6611,20 @@ pub const DataServer = struct {
         return owner_source.contextMetrics() catch null;
     }
 
-    /// Sum the two ledgers using the kernel's limits. Peaks remain an upper
-    /// bound, since independently recorded peaks need not occur together.
+    /// Root memory already owns the child's charges. Merge only the distinct
+    /// slice contributions; their independently observed peaks are upper bounds.
     fn mergeStorageOwnerResourceStats(stats: *resource_manager_mod.Stats, metrics: *const kernel_owner_client.ContextMetricsResult) void {
-        mergeStorageOwnerBudgetStats(&stats.memory, metrics.resource_memory);
+        // Root memory already includes the local child's host charges.
+        const local_errors = stats.memory.accounting_errors;
+        stats.memory.used_bytes = metrics.resource_memory.used_bytes;
+        stats.memory.external_bytes = metrics.resource_memory.external_bytes;
+        stats.memory.peak_bytes = metrics.resource_memory.peak_bytes;
+        stats.memory.soft_limit_bytes = metrics.resource_memory.soft_limit_bytes;
+        stats.memory.hard_limit_bytes = metrics.resource_memory.hard_limit_bytes;
+        stats.memory.soft_limit_events = metrics.resource_memory.soft_limit_events;
+        stats.memory.hard_limit_rejections = metrics.resource_memory.hard_limit_rejections;
+        stats.memory.accounting_errors = metrics.resource_memory.accounting_errors +| local_errors;
+        stats.memory.pressure = resource_manager_mod.pressureFor(.{ .soft_limit_bytes = stats.memory.soft_limit_bytes, .hard_limit_bytes = stats.memory.hard_limit_bytes }, stats.memory.used_bytes);
         const count = @min(@min(stats.slices.len, metrics.resource_slices.len), @as(usize, metrics.resource_slice_count));
         for (stats.slices[0..count], metrics.resource_slices[0..count]) |*slice, kernel| mergeStorageOwnerBudgetStats(slice, kernel);
     }
@@ -6809,6 +6839,14 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        if (self.data_raft != null) {
+            _ = self.write_source.withDistributedTransactionRouting(
+                self.dataReadGroupRouter(),
+                try self.distributedTransactionExecutor(),
+                api_server_cfg.internal_service_secret,
+                api_server_cfg.internal_service_issuer,
+            );
+        }
         _ = self.write_source.withStandaloneSqlRangeGuards(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
@@ -6856,6 +6894,12 @@ pub const DataServer = struct {
         // used by DB internals (c_allocator when libc is linked): search hits
         // adopt index-owned metadata buffers, so a distinct request allocator
         // identity turns those adoptions into cross-allocator frees.
+        api_server_cfg.memory_accounting = .{
+            .ptr = self,
+            .reserve_fn = reserveApiMemory,
+            .release_fn = releaseApiMemory,
+        };
+        _ = try self.ensureOutboundMemory();
         self.http_server = try antfly.public_api.ApiHttpServer.initWithConfig(
             self.alloc,
             api_server_cfg,
@@ -6871,6 +6915,34 @@ pub const DataServer = struct {
         const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
         _ = self.write_source.withCoordinatedTtl(ttl_port);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
+    }
+
+    fn ensureOutboundMemory(self: *DataServer) !*@import("../common/allocation_budget.zig").ServiceMemory {
+        platform_sync.lockYielding(&self.outbound_memory_mutex);
+        defer self.outbound_memory_mutex.unlock();
+        if (self.outbound_memory) |memory| return memory;
+        if (comptime linked_storage) _ = try self.ensureKernelOwnerSource();
+        const Memory = @import("../common/allocation_budget.zig").ServiceMemory;
+        const memory = try self.alloc.create(Memory);
+        errdefer self.alloc.destroy(memory);
+        memory.* = try Memory.init(self.alloc, .{ .ptr = self, .reserve_fn = reserveApiMemory, .release_fn = releaseApiMemory }, @min(64 << 20, self.api_server_cfg.retained_memory_bytes / 4), @min(4 << 20, self.api_server_cfg.request_memory_bytes / 8));
+        self.outbound_memory = memory;
+        return memory;
+    }
+
+    fn reserveApiMemory(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime linked_storage) return self.kernel_owner_source.?.context.reserveExternal(bytes);
+        return self.provisioned_storage.resource_manager.reserveExternal(bytes);
+    }
+
+    fn releaseApiMemory(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime linked_storage) {
+            self.kernel_owner_source.?.context.releaseExternal(bytes);
+        } else {
+            self.provisioned_storage.resource_manager.releaseExternal(bytes);
+        }
     }
 
     fn enqueueArtifactPublication(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8) !void {
@@ -8335,9 +8407,16 @@ pub const DataServer = struct {
     /// The bounded verification inside DB.snapshotWithMaintenanceDeadline closes the remaining
     /// race and converts it into a retryable busy result.
     fn prepareDefaultHotStandbySeedSnapshotMaintenance(self: *DataServer) !void {
+        return self.prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(null);
+    }
+    fn prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(self: *DataServer, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
         if (self.status_source.standalone_hot_standby) |metadata_hot_standby| try metadata_hot_standby.prepareCheckpoint();
+        try original.checkpoint(lifetime);
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        try original.checkpoint(lifetime);
         if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
             return error.HASeedSnapshotIncompleteTopology;
 
@@ -8353,24 +8432,26 @@ pub const DataServer = struct {
         defer terminal_snapshot.deinit();
         var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(self.alloc, registry_io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
         defer native_inventory.deinit();
-        for (native_inventory.owners) |owner| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns);
+        try original.checkpoint(lifetime);
+        for (native_inventory.owners) |owner| {
+            if (lifetime) |control| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshotWithLifetime(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns, control) else try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns);
+        }
         var private = try self.captureHotStandbyPrivateProvisioning(self.alloc, &metadata_snapshot);
         defer if (private) |*value| value.deinit();
         if (private) |value| {
             for (value.value.ranges) |range| {
                 const table = findHotStandbySeedTable(value.value.tables, range.table_id) orelse return error.HASeedSnapshotTableMissingFromTopology;
-                try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
+                try original.checkpoint(lifetime);
+                if (lifetime) |control| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshotWithLifetime(table.name, range.group_id, deadline_ns, control) else try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
             }
         }
         for (metadata_snapshot.ranges) |range| {
             const table = findHotStandbySeedTable(metadata_snapshot.tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
-            try self.write_source.prepareHotStandbySeedReplicaSnapshot(
-                table.name,
-                range.group_id,
-                deadline_ns,
-            );
+            try original.checkpoint(lifetime);
+            if (lifetime) |control| try self.write_source.prepareHotStandbySeedReplicaSnapshotWithLifetime(table.name, range.group_id, deadline_ns, control) else try self.write_source.prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
         }
+        try original.checkpoint(lifetime);
     }
 
     fn hotStandbyRestoreOwnerMetadataRoot(self: *DataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -8619,7 +8700,10 @@ pub const DataServer = struct {
             alloc,
             topology_json,
             .{ .ignore_unknown_fields = false },
-        ) catch return error.InvalidHASeedSnapshotTopology;
+        ) catch |err| {
+            std.log.warn("HA seed snapshot topology parse rejected reason={s}", .{@errorName(err)});
+            return error.InvalidHASeedSnapshotTopology;
+        };
         defer parsed.deinit();
         const topology = parsed.value;
         antfly.hot_standby.seed_topology.validate(
@@ -8630,7 +8714,10 @@ pub const DataServer = struct {
             topology,
         ) catch |err| switch (err) {
             error.SeedLogicalDigestMismatch => return error.HASeedSnapshotLogicalDigestMismatch,
-            else => return error.InvalidHASeedSnapshotTopology,
+            else => {
+                std.log.warn("HA seed snapshot topology validation rejected reason={s}", .{@errorName(err)});
+                return error.InvalidHASeedSnapshotTopology;
+            },
         };
 
         for (topology.replicas, 0..) |replica, index| {
@@ -8740,6 +8827,16 @@ pub const DataServer = struct {
         generation: []const u8,
         binding: antfly.hot_standby.seed_artifact.LifecycleBinding,
     ) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        return captureHotStandbySeedInternal(ptr, alloc, slot_name, generation, binding, null);
+    }
+
+    fn captureHotStandbySeedControlledCallback(ptr: *anyopaque, alloc: std.mem.Allocator, slot_name: []const u8, generation: []const u8, binding: antfly.hot_standby.seed_artifact.LifecycleBinding, control: @import("../storage/hot_standby/operation_admission.zig").Control) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        return captureHotStandbySeedInternal(ptr, alloc, slot_name, generation, binding, control);
+    }
+
+    fn captureHotStandbySeedInternal(ptr: *anyopaque, alloc: std.mem.Allocator, slot_name: []const u8, generation: []const u8, binding: antfly.hot_standby.seed_artifact.LifecycleBinding, control: ?@import("../storage/hot_standby/operation_admission.zig").Control) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        var admission: @import("../storage/hot_standby/operation_admission.zig").Session = .{};
+        if (control) |original| try admission.bind(original);
         const self: *DataServer = @ptrCast(@alignCast(ptr));
 
         if (self.hot_standby_seed_capture_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
@@ -8752,25 +8849,26 @@ pub const DataServer = struct {
         // activity mutex) lets those requests publish completion without a
         // lock cycle, while keeping continuous traffic from reopening the
         // promoted cache-owner race between preflight and the global freeze.
-        var table_request_admission = try self.write_source.acquireHotStandbySeedTableRequestAdmissionLease();
+        var table_request_admission = try self.write_source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(if (control != null) &admission else null);
         defer table_request_admission.release();
 
         // The production provider snapshots live managed DBs. Drain their
         // finite replay/enrichment tail before closing the process-wide
         // mutation barrier; the provider performs a second bounded check after
         // the close. Custom providers own their own immutable source contract.
+        var maintenance_lifetime = if (control != null) admission.lifetime() else null;
         if (self.hot_standby_cfg.seed_snapshot_provider == null)
-            self.prepareDefaultHotStandbySeedSnapshotMaintenance() catch |err| {
+            self.prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(if (maintenance_lifetime) |*original| original else null) catch |err| {
                 std.log.warn("HA seed preparation failed err={s}", .{@errorName(err)});
                 return err;
             };
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
-        var lease = self.hot_standby_mutation_barrier.acquireExclusive();
+        var lease = if (control != null) try admission.acquireExclusive(&self.hot_standby_mutation_barrier) else self.hot_standby_mutation_barrier.acquireExclusive();
         var lease_held = true;
         defer if (lease_held) lease.release();
-        lockAtomic(&self.hot_standby_state_mutex);
+        if (control != null) try admission.lockRetained(&self.hot_standby_state_mutex) else lockAtomic(&self.hot_standby_state_mutex);
         var state_mutex_held = true;
         defer if (state_mutex_held) self.hot_standby_state_mutex.unlock();
 
@@ -8869,6 +8967,7 @@ pub const DataServer = struct {
                     .seed_capture = if (ctx.primary != null and self.hot_standby_cfg.seed_capture_root != null) .{
                         .ptr = self,
                         .run_fn = DataServer.captureHotStandbySeedCallback,
+                        .run_controlled_fn = DataServer.captureHotStandbySeedControlledCallback,
                     } else null,
                     .lifecycle_receipts = if (self.hot_standby_cfg.seed_capture_root != null or self.hot_standby_cfg.seed_activation_root != null) .{
                         .capture_root = self.hot_standby_cfg.seed_capture_root,
@@ -9371,7 +9470,16 @@ pub const DataServer = struct {
         self.provisioned_index_repair_shutdown.store(true, .release);
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        {
+            platform_sync.lockYielding(&self.distributed_read_http_mutex);
+            defer self.distributed_read_http_mutex.unlock();
+            if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        }
+        {
+            platform_sync.lockYielding(&self.raft_forward_http_mutex);
+            defer self.raft_forward_http_mutex.unlock();
+            if (self.raft_forward_http_executor) |executor| executor.beginShutdown();
+        }
         if (self.kernel_owner_source) |source| source.beginApplyControlShutdown();
         self.write_source.beginTeardown();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.beginTeardown();
@@ -9403,8 +9511,9 @@ pub const DataServer = struct {
         self.listener = null;
         if (self.owned_http_runtime) |http_runtime| {
             http_runtime.deinit();
-            self.alloc.destroy(http_runtime);
+            (self.owned_http_runtime_allocator orelse self.alloc).destroy(http_runtime);
             self.owned_http_runtime = null;
+            self.owned_http_runtime_allocator = null;
         }
         if (self.http_observer_lease) |*lease| lease.release();
         self.http_observer_lease = null;
@@ -9499,18 +9608,6 @@ pub const DataServer = struct {
             apply_sm.deinit();
             self.alloc.destroy(apply_sm);
         }
-        // Any explicitly constructed owner belongs to DataServer, independent
-        // of the compiler unit's storage boundary. Native reconciliation does
-        // not construct one, but teardown must honor ownership if present.
-        if (self.kernel_owner_source) |owner_source| {
-            owner_source.deinit();
-            self.alloc.destroy(owner_source);
-        }
-        if (comptime linked_storage) {
-            if (self.owner_apply_control_lease) |*lease| lease.release();
-            self.owner_apply_control_lease = null;
-            if (self.storage_kernel_context) |*context| context.deinit();
-        }
         if (self.data_raft_store) |store| {
             store.deinit();
             self.alloc.destroy(store);
@@ -9550,7 +9647,40 @@ pub const DataServer = struct {
         self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         if (self.restore_terminal_ledger) |*ledger| ledger.deinit();
+        // Service allocators borrow the node manager. Retire every client and
+        // stream before unpinning control bytes or destroying that manager.
+        if (self.raft_forward_http_executor) |executor| {
+            const allocator = executor.alloc;
+            executor.deinit();
+            allocator.destroy(executor);
+            self.raft_forward_http_executor = null;
+        }
+        if (self.distributed_read_http_executor) |executor| {
+            const allocator = executor.alloc;
+            executor.deinit();
+            allocator.destroy(executor);
+            self.distributed_read_http_executor = null;
+        }
+        if (self.outbound_memory) |memory| {
+            memory.deinit();
+            self.alloc.destroy(memory);
+            self.outbound_memory = null;
+        }
         self.provisioned_storage.deinit();
+        // Any explicitly constructed owner belongs to DataServer, independent
+        // of the compiler unit's storage boundary. Native reconciliation does
+        // not construct one, but teardown must honor ownership if present.
+        if (self.kernel_owner_source) |owner_source| {
+            owner_source.deinit();
+            self.alloc.destroy(owner_source);
+        }
+        if (comptime linked_storage) {
+            if (self.owner_apply_control_lease) |*lease| lease.release();
+            self.owner_apply_control_lease = null;
+        }
+        if (comptime linked_storage) {
+            if (self.storage_kernel_context) |*context| context.deinit();
+        }
         self.write_source.deinit();
         // Owner jobs drained before caches; native callbacks have now stopped
         // too, so no admission can race this final assertion/reclamation.
@@ -9561,11 +9691,6 @@ pub const DataServer = struct {
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
-        }
-        if (self.distributed_read_http_executor) |executor| {
-            executor.deinit();
-            self.alloc.destroy(executor);
-            self.distributed_read_http_executor = null;
         }
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
@@ -9599,9 +9724,10 @@ pub const DataServer = struct {
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
         if (self.owned_http_runtime) |runtime| return runtime;
-        const runtime = try self.alloc.create(httpx.HttpRuntime);
-        errdefer self.alloc.destroy(runtime);
-        const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
+        const listener_config = if (self.http_server) |*api| api.configurePublicHttpTransport(publicApiHttpxConfig(self.listener_cfg, null)) else publicApiHttpxConfig(self.listener_cfg, null);
+        const allocator = listener_config.transport_allocator orelse self.alloc;
+        const runtime = try allocator.create(httpx.HttpRuntime);
+        errdefer allocator.destroy(runtime);
         const borrowed_io: ?httpx.HttpRuntime.BorrowedIo = if (self.backend_runtime) |backend_runtime|
             if (backend_runtime.usesBorrowedIo()) .{
                 .listener = backend_runtime.controlIo() orelse backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable,
@@ -9612,7 +9738,7 @@ pub const DataServer = struct {
             null;
         var observer_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{});
         errdefer observer_lease.release();
-        runtime.* = httpx.HttpRuntime.init(self.alloc, .{
+        runtime.* = httpx.HttpRuntime.init(allocator, .{
             .observer_io = observer_lease.io(),
             .max_active_h1_requests = listener_config.max_connections,
             .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
@@ -9621,6 +9747,7 @@ pub const DataServer = struct {
         });
         self.http_observer_lease = observer_lease;
         self.owned_http_runtime = runtime;
+        self.owned_http_runtime_allocator = allocator;
         return runtime;
     }
 
@@ -10234,6 +10361,7 @@ pub const DataServer = struct {
                 .batch_group = localRaftBatchGroup,
                 .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
                 .batch_group_routed_with_cancellation = localRaftBatchGroupRoutedWithCancellation,
+                .batch_group_routed_with_pre_decision_context = localRaftBatchGroupRoutedWithPreDecisionContext,
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
@@ -10263,7 +10391,7 @@ pub const DataServer = struct {
     fn dataReadSafetyBarrier(self: *DataServer) antfly.raft.ReadSafetyBarrier {
         return .{
             .ptr = self,
-            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof },
+            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof, .wait_read_safe_with_execution = waitDataReadSafeWithExecution },
         };
     }
 
@@ -10417,6 +10545,14 @@ pub const DataServer = struct {
         };
     }
 
+    fn waitDataReadSafeWithExecution(ptr: *anyopaque, group_id: u64, request_ctx: []const u8, wait: @import("antfly_local_sources").common_execution_wait.Boundary) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.waitDataReadSafeWithExecutionOptions(group_id, request_ctx, null, .none, wait) catch |err| switch (err) {
+            error.ReadIndexTimeout => return error.Timeout,
+            else => return err,
+        };
+    }
+
     /// Called with data_raft_mutex held. The provider's completion marker is
     /// advanced only after the native delegate and projection finish. Neither
     /// live core applied nor persisted snapshot index proves installation.
@@ -10438,6 +10574,17 @@ pub const DataServer = struct {
         request_ctx: []const u8,
         timeout_ms: ?u32,
         cancellation: antfly.db.types.CancellationToken,
+    ) anyerror!void {
+        return self.waitDataReadSafeWithExecutionOptions(group_id, request_ctx, timeout_ms, cancellation, null);
+    }
+
+    fn waitDataReadSafeWithExecutionOptions(
+        self: *DataServer,
+        group_id: u64,
+        request_ctx: []const u8,
+        timeout_ms: ?u32,
+        cancellation: antfly.db.types.CancellationToken,
+        execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary,
     ) anyerror!void {
         var zig017_return_error: ?anyerror = null;
         const raft = self.data_raft orelse return zig017_failure: {
@@ -10494,7 +10641,7 @@ pub const DataServer = struct {
                 break :zig017_failure error.ReadIndexTimeout;
             };
             if (self.data_raft_mutex.tryLock()) break;
-            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+            ((if (execution_wait) |wait| wait.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else io.sleep(.fromMilliseconds(1), .awake)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -10553,7 +10700,7 @@ pub const DataServer = struct {
                 retry_delay_ns = @min(retry_delay_ns * 2, std.time.ns_per_s);
                 next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
             }
-            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+            ((if (execution_wait) |wait| wait.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else io.sleep(.fromMilliseconds(1), .awake)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -11960,6 +12107,22 @@ pub const DataServer = struct {
         });
     }
 
+    fn localRaftBatchGroupRoutedWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: antfly.metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        visibility_cancellation: antfly.db.types.CancellationToken,
+        context: antfly.public_api.distributed_txn.PreDecisionContext,
+    ) !void {
+        try fence.validate();
+        if (context.route_fence) |existing| if (!std.meta.eql(existing, fence)) return error.TopologyChanged;
+        var routed = context;
+        routed.route_fence = fence;
+        try localRaftBatchGroupWithPreDecisionControls(ptr, alloc, fence.route.group_id, table_name, req, .catalog, visibility_cancellation, routed);
+    }
+
     fn localRaftBatchGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -11968,26 +12131,35 @@ pub const DataServer = struct {
         req: antfly.db.types.BatchRequest,
         context: antfly.public_api.distributed_txn.PreDecisionContext,
     ) !void {
+        try localRaftBatchGroupWithPreDecisionControls(ptr, alloc, group_id, table_name, req, if (context.deadline_ns != null or context.route_fence != null) .catalog else .cached, context.cancellation, context);
+    }
+
+    fn localRaftBatchGroupWithPreDecisionControls(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        discovery: DataRaftMutationDiscovery,
+        visibility_cancellation: antfly.db.types.CancellationToken,
+        context: antfly.public_api.distributed_txn.PreDecisionContext,
+    ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        if (context.deadline_ns == null)
-            return try localRaftBatchGroupLocalWithCancellation(ptr, alloc, group_id, table_name, req, context.cancellation);
-        const leader_wait_ns = preDecisionLeaderWaitNs(context) orelse return error.PreDecisionDeadlineExceeded;
+        try @import("antfly_local_sources").api_local_table_writes.ensurePreDecisionContextActive(context);
+        const clock = antfly.public_api.table_catalog.RoutingBudget.initIo(null, self.dataRaftIo());
+        const deadline = clock.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const leader_wait_ns = if (deadline) |value| preDecisionLeaderWaitNsAt(clock.nowNs(), value) orelse return error.PreDecisionDeadlineExceeded else data_raft_batch_leader_wait_ns;
+        const response_reserve_ns = @as(u64, antfly.public_api.distributed_txn.pre_decision_server_response_reserve_ms) * std.time.ns_per_ms;
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
-        try self.proposeRaftBatchGroupWithLeaderWait(
-            alloc,
-            group_id,
-            table_name,
-            req,
-            .{
-                // This is public 2PC ingress, not an already-forwarded hop.
-                // Use the same leader-aware catalog discovery as ordinary
-                // table writes; topology_epoch still fences the participant.
-                .discovery = .catalog,
-                .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
-                .visibility_cancellation = context.cancellation,
-            },
-            leader_wait_ns,
-        );
+        try self.proposeRaftBatchGroupWithLeaderWait(alloc, group_id, table_name, req, .{
+            .discovery = discovery,
+            .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
+            .visibility_cancellation = visibility_cancellation,
+            .write_route_fence = context.route_fence,
+            // Proposal validation and leader rediscovery share the translated
+            // absolute ceiling rather than receiving another fresh duration.
+            .admission_deadline_ns = if (deadline) |value| value -| response_reserve_ns else null,
+        }, leader_wait_ns);
     }
 
     fn localRaftTxnStatusGroupAuthoritativeLocal(
@@ -12567,7 +12739,72 @@ pub const DataServer = struct {
         }
     }
 
+    /// Reuse a service-owned forwarding transport while the caller retains its
+    /// existing lane reservation. The public-read pool remains an independent
+    /// owner; a foreign/replay Io can never silently replace Raft authority.
+    fn raftForwardTransport(self: *DataServer, io: std.Io) !antfly.common.http.RequestExecutor {
+        platform_sync.lockYielding(&self.raft_forward_http_mutex);
+        defer self.raft_forward_http_mutex.unlock();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.raft_forward_http_executor == null) {
+            const allocator = (try self.ensureOutboundMemory()).memory.allocator(true);
+            const executor = try allocator.create(antfly.common.http.IoHttpExecutor);
+            executor.* = antfly.common.http.IoHttpExecutor.init(allocator, io, .{});
+            self.raft_forward_http_executor = executor;
+        }
+        const executor = self.raft_forward_http_executor.?;
+        if (executor.io.userdata != io.userdata or executor.io.vtable != io.vtable) return error.ForwardTransportAuthorityChanged;
+        return executor.executor();
+    }
+
+    /// The service owns the control heap; each request owns its complete
+    /// forwarding task reservation through the physical response join.
+    fn distributedTransactionExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
+        var lane = try self.acquireDataRaftForwardLane();
+        defer lane.release();
+        const transport = try self.raftForwardTransport(lane.io());
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = executeDistributedTransaction, .supports_concurrent_requests = transactionSupportsConcurrentRequests },
+            .realtime_ns_fn = transactionRealtimeNs,
+            .clock_io = transport.clock_io,
+        };
+    }
+
+    fn executeDistributedTransaction(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (request.delivery_tracker) |tracker| tracker.markNotSent();
+        const clock = self.raft_forward_http_executor.?.executor();
+        const deadline: ?u64 = if (request.timeout_ms) |ms| clock.monotonicNs() +| @as(u64, ms) * std.time.ns_per_ms else null;
+        var lane = try self.acquireHttpForwardLane(request);
+        defer lane.release();
+        const transport = try self.raftForwardTransport(lane.io());
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Cancelled;
+        var bounded = request;
+        if (deadline) |until| {
+            // Admission and setup consume the existing timeout. Rounding down
+            // prevents transport from extending it by a millisecond.
+            const remaining_ms = (until -| transport.monotonicNs()) / std.time.ns_per_ms;
+            if (remaining_ms == 0) return error.Timeout;
+            bounded.timeout_ms = @intCast(@min(remaining_ms, std.math.maxInt(u32)));
+        }
+        return transport.execute(alloc, bounded);
+    }
+
+    fn transactionRealtimeNs(ptr: *anyopaque) i128 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.raft_forward_http_executor.?.executor().realtimeNs().?;
+    }
+
+    fn transactionSupportsConcurrentRequests(ptr: *const anyopaque) bool {
+        const self: *const DataServer = @ptrCast(@alignCast(ptr));
+        return self.raft_forward_http_executor.?.executor().supportsConcurrentRequests();
+    }
+
     fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
+        platform_sync.lockYielding(&self.distributed_read_http_mutex);
+        defer self.distributed_read_http_mutex.unlock();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (self.distributed_read_http_executor == null) {
             const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
             var lane = runtime.acquireRequestForwardLane() catch |err| switch (err) {
@@ -12575,13 +12812,14 @@ pub const DataServer = struct {
                 else => return err,
             };
             defer lane.release();
-            const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
+            const allocator = (try self.ensureOutboundMemory()).memory.allocator(false);
+            const executor = try allocator.create(antfly.common.http.IoHttpExecutor);
             // Query/API workers synchronously await these requests. The HTTP
             // client needs nested request/connect/socket watchdog tasks, so it
             // must not compete with callers on the API lane. Reuse the bounded
             // forwarding lane and one keep-alive client; reserve the complete
             // task graph for each request below, before any bytes are sent.
-            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, lane.io(), .{ .keep_alive = true });
+            executor.* = antfly.common.http.IoHttpExecutor.init(allocator, lane.io(), .{ .keep_alive = true });
             self.distributed_read_http_executor = executor;
         }
         return .{
@@ -12595,14 +12833,14 @@ pub const DataServer = struct {
         };
     }
 
-    fn acquireDistributedReadLane(self: *DataServer, request: antfly.common.http.HttpRequest) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
+    fn acquireHttpForwardLane(self: *DataServer, request: antfly.common.http.HttpRequest) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
         if (request.delivery_tracker) |tracker| tracker.markNotSent();
         if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Cancelled;
         if (request.timeout_ms == 0) return error.Timeout;
         const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
         return runtime.acquireRequestForwardLane() catch |err| switch (err) {
             // Preserve local admission provenance until the caller can drain
-            // sibling reads and reduce its own fanout. This request sent no
+            // sibling requests and reduce its own fanout. This request sent no
             // bytes; remote availability failures use a different error.
             error.RequestForwardCapacityUnavailable => error.ConcurrencyUnavailable,
             else => err,
@@ -12611,14 +12849,14 @@ pub const DataServer = struct {
 
     fn executeDistributedRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        var lane = try self.acquireDistributedReadLane(request);
+        var lane = try self.acquireHttpForwardLane(request);
         defer lane.release();
         return self.distributed_read_http_executor.?.executor().execute(alloc, request);
     }
 
     fn executeDistributedReadStream(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest, writer: antfly.common.http.StreamWriter) !bool {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        var lane = try self.acquireDistributedReadLane(request);
+        var lane = try self.acquireHttpForwardLane(request);
         defer lane.release();
         return (try self.distributed_read_http_executor.?.executor().executeStream(alloc, request, writer)).?;
     }
@@ -13388,15 +13626,9 @@ pub const DataServer = struct {
                                 // the Raft process that selected the route.
                                 var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
                                 defer forward_lane.release();
-                                var executor = antfly.common.http.IoHttpExecutor.init(
-                                    alloc,
-                                    forward_lane.io(),
-                                    .{},
-                                );
-                                defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(
                                     alloc,
-                                    executor.executor(),
+                                    try self.raftForwardTransport(forward_lane.io()),
                                 );
                                 _ = client.withInternalServiceAuth(
                                     self.api_server_cfg.internal_service_secret,
@@ -13614,13 +13846,7 @@ pub const DataServer = struct {
 
         var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
         defer forward_lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(
-            alloc,
-            forward_lane.io(),
-            .{},
-        );
-        defer executor.deinit();
-        var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        var client = antfly.public_api.ApiHttpClient.init(alloc, try self.raftForwardTransport(forward_lane.io()));
         _ = client.withInternalServiceAuth(
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
@@ -15377,9 +15603,7 @@ pub const DataServer = struct {
                     // different Io backend (notably during replay/simulation).
                     var lane = try self.acquireDataRaftForwardLane();
                     defer lane.release();
-                    var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{});
-                    defer executor.deinit();
-                    var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+                    var client = antfly.public_api.ApiHttpClient.init(alloc, try self.raftForwardTransport(lane.io()));
                     _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
                     if (scoped.mode == .merge_copy_receipt) {
                         // This private read ships with the complete v10 native
@@ -25964,6 +26188,8 @@ const RemoteMetadataSource = struct {
             .io = runtime_io_abi.Borrow.init(&self.io),
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
+                .transaction_snapshot_with_budget = remoteTransactionSnapshot,
+                .free_transaction_snapshot = remoteFreeTransactionSnapshot,
                 .export_catalog = remoteExportCatalog,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .catalog_identity = remoteCatalogIdentity,
@@ -26823,6 +27049,31 @@ const RemoteMetadataSource = struct {
             if (self.diagnostic_snapshot) |snapshot| return try cloneAdminSnapshotOwned(self.alloc, snapshot);
         }
         return null;
+    }
+
+    fn remoteTransactionSnapshot(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        budget: antfly.public_api.table_catalog.RoutingBudget,
+    ) !antfly.metadata_api.AdminSnapshot {
+        try budget.checkpoint();
+        // Transactions require ranges and active transition fences from one
+        // authoritative capture. Carry the caller's clock and cancellation
+        // through the bounded metadata read rather than using the diagnostic
+        // cache or falling back to an uncontrolled admin snapshot.
+        var snapshot = (try remoteLinearizableSnapshot(ptr, .{
+            .deadline_ns = budget.deadline_ns,
+            .deadline_io = budget.io,
+            .cancellation = budget.cancellation,
+        })) orelse return error.CatalogRoutingUnavailable;
+        errdefer remoteFreeAdminSnapshot(ptr, &snapshot);
+        try budget.checkpoint();
+        return snapshot;
+    }
+
+    fn remoteFreeTransactionSnapshot(ptr: *anyopaque, _: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
+        // remoteLinearizableSnapshot owns its result with the source allocator.
+        remoteFreeAdminSnapshot(ptr, snapshot);
     }
 
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -30893,6 +31144,20 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
+    // One node owns execution before either storage runtime or the public API
+    // starts work. Both consumers retain the same port through physical joins.
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
+        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
+    const storage_runnable_port = if (runnable_node_owner) |*owner| try owner.executionPort() else null;
+    var node_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .runnable_owner = storage_runnable_port });
+    defer node_backend_runtime.deinit();
+
     var process_storage_kernel_context: ?StorageKernelContext = null;
     defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
@@ -30900,6 +31165,7 @@ pub fn runFromIterator(
         try context.ensureWithRuntime(.{
             .context = .{ .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else "") },
             .memory_limit_bytes = process_memory_limit_bytes,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         process_storage_kernel_context = context;
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
@@ -30988,6 +31254,7 @@ pub fn runFromIterator(
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
         .storage_kernel_context_handle = if (process_storage_kernel_context) |context| context.handle else null,
+        .backend_runtime = node_backend_runtime.ptr(),
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
@@ -31004,6 +31271,10 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .runnable_owner_handle = if (runnable_node_owner) |owner| owner.handle else null,
+            .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
+            .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -31033,6 +31304,9 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    // Startup failure also fences admission before the DataServer joins its
+    // API and storage consumers. The owner itself outlives both runtimes.
+    defer if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
     if (secret_store_initialized) {
         if (secret_store.native_config) |native| {
             const remote = data_server.remote_metadata orelse return error.InvalidConfig;
@@ -31122,6 +31396,9 @@ pub fn runFromIterator(
         try data_server.ensureHttpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    // Fence ordinary work before listeners and provider holders drain, while
+    // the independent control lane and Raft progress driver remain alive.
+    defer if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
 
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
@@ -33831,6 +34108,19 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     },
                 );
             }
+            for (&servers, 0..) |*server, i| {
+                if (!shared.nodeIsRunning(i)) continue;
+                const raft = server.data_raft orelse continue;
+                const group = shared.split_record.destination_group_id;
+                const raw = raft.host.http_host.host.raftStatus(group);
+                std.log.err("multi-owner split destination node={} group={} leader={?} raw_applied={} app_applied={}", .{
+                    i + 1,
+                    group,
+                    shared.leader(group),
+                    if (raw) |status| status.applied_index else 0,
+                    if (server.data_raft_apply) |apply| apply.appliedIndex(group) else 0,
+                });
+            }
             for (enabled.items.items) |candidate| {
                 std.log.err("multi-owner enabled transition name={s} id={}", .{ candidate.name, candidate.id });
             }
@@ -34747,7 +35037,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34786,20 +35076,36 @@ fn consumerTests() type {
                 raft_started += 1;
             }
 
-            var peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+            var peer = try httpx.TestServer.start(alloc, std.testing.io, &.{ .{
                 .method = .POST,
                 .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
                 .respond = .{ .status = 201, .body = "{\"inserted\":1}" },
                 .max_uses = 1,
-            }});
+            }, .{
+                .method = .POST,
+                .path = "/internal/v1/groups/7/tables/docs/txn-resolve",
+                .respond = .{ .status = 200, .body = "{}", .delay_ns = 5 * std.time.ns_per_ms },
+                .max_uses = 1,
+            } });
             defer peer.deinit();
             var serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
             defer serving.cancel(std.testing.io) catch {};
             var forward_lane = try server.acquireDataRaftForwardLane();
             defer forward_lane.release();
-            var executor = antfly.common.http.IoHttpExecutor.init(alloc, forward_lane.io(), .{});
-            defer executor.deinit();
-            var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+            const transport = try server.raftForwardTransport(forward_lane.io());
+            const reused = try server.raftForwardTransport(forward_lane.io());
+            try std.testing.expect(transport.ptr == reused.ptr);
+            try std.testing.expect(server.raft_forward_http_executor != server.distributed_read_http_executor);
+            var foreign_vtable = forward_lane.io().vtable.*;
+            try std.testing.expectError(error.ForwardTransportAuthorityChanged, server.raftForwardTransport(.{ .userdata = forward_lane.io().userdata, .vtable = &foreign_vtable }));
+            // Reusable read-client allocations share the node ledger, but
+            // cannot consume the already-pinned forwarding-client heap.
+            const service_memory = server.outbound_memory.?;
+            var read_pressure = service_memory.memory.foreground.limit - service_memory.memory.foreground.stats().used_bytes;
+            try std.testing.expect(service_memory.memory.foreground.reserve(read_pressure));
+            defer if (read_pressure != 0) service_memory.memory.foreground.release(read_pressure);
+            try std.testing.expectError(error.OutOfMemory, service_memory.memory.allocator(false).alloc(u8, 1));
+            var client = antfly.public_api.ApiHttpClient.init(alloc, transport);
             var response = try client.fetchGroupBatchWithForwarding(
                 peer.baseUrl(),
                 7,
@@ -34814,6 +35120,46 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
             try serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
+            // Transaction RPCs retain their full task lease through the reply
+            // and use control memory while the entire read heap is occupied.
+            const transaction_executor = try server.distributedTransactionExecutor();
+            const LeaseProbe = struct {
+                runtime: *backend_runtime_mod.BackendRuntime,
+                baseline: usize,
+                saw_held: std.atomic.Value(bool) = .init(false),
+                lost_held: std.atomic.Value(bool) = .init(false),
+                fn isCancelled(ptr: *const anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                    if (self.runtime.outstandingRequestForwardLeases() > self.baseline) {
+                        self.saw_held.store(true, .release);
+                    } else if (self.saw_held.load(.acquire)) {
+                        self.lost_held.store(true, .release);
+                    }
+                    return false;
+                }
+            };
+            var probe: LeaseProbe = .{ .runtime = backend_runtime.ptr(), .baseline = backend_runtime.ptr().outstandingRequestForwardLeases() };
+            var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(.{ .ptr = &probe, .is_cancelled_fn = LeaseProbe.isCancelled });
+            const transaction_uri = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/txn-resolve", .{peer.baseUrl()});
+            defer alloc.free(transaction_uri);
+            var transaction_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
+            defer transaction_serving.cancel(std.testing.io) catch {};
+            var transaction_response = try transaction_executor.execute(alloc, .{
+                .method = .POST,
+                .uri = transaction_uri,
+                .timeout_ms = 5_000,
+                .cancellation = &cancellation,
+            });
+            defer transaction_response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), transaction_response.status);
+            try std.testing.expect(probe.saw_held.load(.acquire));
+            try std.testing.expect(!probe.lost_held.load(.acquire));
+            try std.testing.expectEqual(probe.baseline, backend_runtime.ptr().outstandingRequestForwardLeases());
+            try transaction_serving.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 1), peer.route_hits[1]);
+            try std.testing.expect(service_memory.memory.control.stats().peak_bytes > 0);
+            service_memory.memory.foreground.release(read_pressure);
+            read_pressure = 0;
 
             // Strong reads (including FK preflight) await peer lookups from
             // API workers. Fill that lane completely and prove the peer HTTP
@@ -34887,6 +35233,14 @@ fn consumerTests() type {
             }));
             try std.testing.expectEqual(antfly.common.http.http_common.RequestDeliveryTracker.State.not_sent, rejected_delivery.load());
             try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
+            try std.testing.expectError(error.ConcurrencyUnavailable, transaction_executor.execute(alloc, .{
+                .method = .POST,
+                .uri = transaction_uri,
+                .timeout_ms = 5_000,
+                .delivery_tracker = &rejected_delivery,
+            }));
+            try std.testing.expectEqual(antfly.common.http.http_common.RequestDeliveryTracker.State.not_sent, rejected_delivery.load());
+            try std.testing.expectEqual(@as(usize, 1), peer.route_hits[1]);
             {
                 // First-use initialization must expose the same availability
                 // condition as an already initialized client's admission.
@@ -36527,6 +36881,115 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
             try std.testing.expect(server.data_raft_mutex.tryLock());
             server.data_raft_mutex.unlock();
+        }
+
+        test "data raft read safety execution wait retires registration after failed resume" {
+            const runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const Case = enum { canceled, deadline, shutdown, forbidden };
+            const Reader = struct {
+                server: *DataServer,
+                execution: runnable.Execution = .{},
+                canceled: std.atomic.Value(bool) = .init(false),
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
+                revoked: bool = false,
+                begins: usize = 0,
+                ends: usize = 0,
+                failure: ?anyerror = null,
+
+                fn requested(raw: *const anyopaque) bool {
+                    const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return flag.load(.acquire);
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.execution.park(.resource_blocked);
+                    self.begins += 1;
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    // The production owner's real polling sleep has finished.
+                    // Hold resumption so the fixture can exercise other work
+                    // and failures while the Raft owner lock remains occupied.
+                    self.entered.set(std.testing.io);
+                    try self.release.wait(std.testing.io);
+                    try self.execution.enter(.query);
+                    if (self.revoked) return error.Forbidden;
+                }
+                fn run(self: *@This()) void {
+                    defer self.execution.finish();
+                    self.server.dataReadSafetyBarrier().waitReadSafeWithExecution(7001, "scheduled-owner-admission", .{
+                        .ptr = self,
+                        .begin = begin,
+                        .end = end,
+                    }) catch |err| {
+                        self.failure = err;
+                    };
+                }
+            };
+            const alloc = std.testing.allocator;
+            const io = std.testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/scheduled-read-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .replica_root_dir = root,
+                .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://127.0.0.1:1" },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+            for (std.enums.values(Case)) |case| {
+                var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 10, .max_wait_ms = 2000 });
+                defer scheduler.close();
+                var reader: Reader = .{ .server = &server };
+                defer reader.execution.finish();
+                const deadline: u64 = @intCast(std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(if (case == .deadline) 100 else 5000)).nanoseconds);
+                try reader.execution.start(&scheduler, .{ .io = io, .retained_bytes = 17, .deadline_ns = deadline, .cancellation = .{ .ptr = &reader.canceled, .requested = Reader.requested } }, .query);
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                var group: std.Io.Group = .init;
+                defer group.cancel(io);
+                defer reader.release.set(io);
+                try group.concurrent(io, Reader.run, .{&reader});
+                try reader.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+                try std.testing.expectEqual(@as(usize, 1), server.data_raft_apply.?.read_barriers.pendingCount());
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+                try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+                try std.testing.expectEqual(@as(?u64, deadline), reader.execution.entry.?.options.deadline_ns);
+                var other: runnable.Execution = .{};
+                defer other.finish();
+                try other.start(&scheduler, .{ .io = io }, .query);
+                var control: runnable.Execution = .{};
+                defer control.finish();
+                try control.start(&scheduler, .{ .io = io }, .control);
+                try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+                switch (case) {
+                    .canceled => reader.canceled.store(true, .release),
+                    .deadline => try io.sleep(.fromMilliseconds(200), .awake),
+                    .shutdown => scheduler.close(),
+                    .forbidden => reader.revoked = true,
+                }
+                control.finish();
+                other.finish();
+                reader.release.set(io);
+                try group.await(io);
+                const expected: anyerror = switch (case) {
+                    .canceled => error.Canceled,
+                    .deadline => error.DeadlineExceeded,
+                    .shutdown => error.SchedulerClosed,
+                    .forbidden => error.Forbidden,
+                };
+                try std.testing.expectEqual(@as(?anyerror, expected), reader.failure);
+                try std.testing.expectEqual(@as(usize, 1), reader.begins);
+                try std.testing.expectEqual(@as(usize, 1), reader.ends);
+                try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+                std.debug.print("data read-index owner wait case {s}: pending=0 operations=0 slots=0\n", .{@tagName(case)});
+            }
         }
 
         test "data raft native snapshot requires an install completion receipt" {
@@ -41299,7 +41762,7 @@ fn consumerTests() type {
             server.data_raft_apply = apply_sm;
 
             var status_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
-            defer status_resp.deinit(server.http_server.?.alloc);
+            defer status_resp.deinit(std.testing.allocator);
 
             const items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
             items[0] = .{
@@ -42369,7 +42832,7 @@ fn consumerTests() type {
                 .content_type = "application/json",
                 .body = "{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"new_timeline_id\":2,\"new_epoch\":2,\"generation\":1,\"required_lsn\":1,\"observed_lsn\":1,\"force\":false,\"reason\":\"data-server-test\"}",
             });
-            defer fence_response.deinit(server.http_server.?.alloc);
+            defer fence_response.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), fence_response.status);
             try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"node_id\":\"primary-a\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, fence_response.body, "\"required_lsn\":2") != null);
@@ -42751,7 +43214,7 @@ fn consumerTests() type {
                 .uri = antfly.admin.routes.hot_standby_standby_status,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer admin_status.deinit(server.http_server.?.alloc);
+            defer admin_status.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), admin_status.status);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_success_ns\":") != null);
@@ -43120,7 +43583,7 @@ fn consumerTests() type {
                 .uri = antfly.internal.routes.hot_standby_replication_identify,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer before.deinit(server.http_server.?.alloc);
+            defer before.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 404), before.status);
 
             lockAtomic(&server.hot_standby_state_mutex);
@@ -43150,7 +43613,7 @@ fn consumerTests() type {
                 .uri = "/backup",
                 .body = "{}",
             });
-            defer backup.deinit(server.http_server.?.alloc);
+            defer backup.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 503), backup.status);
             try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"code\":\"ha_mutation_not_replicated\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"surface\":\"backup\"") != null);
@@ -43162,7 +43625,7 @@ fn consumerTests() type {
                 .content_type = "application/json",
                 .body = "{\"role\":\"standby\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
             });
-            defer write_check.deinit(server.http_server.?.alloc);
+            defer write_check.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), write_check.status);
             try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"role\":\"promoted_standby\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, write_check.body, "\"action\":\"open_promoted_primary\"") != null);
@@ -43175,7 +43638,7 @@ fn consumerTests() type {
                 .content_type = "application/json",
                 .body = "{\"role\":\"standby\",\"kind\":\"retention_advance\",\"expected_identity\":{\"cluster_id\":100,\"shard_id\":77,\"table_id\":7,\"timeline_id\":2,\"epoch\":2}}",
             });
-            defer owner_job_check.deinit(server.http_server.?.alloc);
+            defer owner_job_check.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), owner_job_check.status);
             try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"role\":\"promoted_standby\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, owner_job_check.body, "\"action\":\"open_promoted_primary\"") != null);
@@ -43185,7 +43648,7 @@ fn consumerTests() type {
                 .uri = antfly.internal.routes.hot_standby_replication_identify,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer internal_resp.deinit(server.http_server.?.alloc);
+            defer internal_resp.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
             try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"timeline_id\":2") != null);
         }
@@ -43956,7 +44419,7 @@ fn consumerTests() type {
                 .uri = antfly.admin.routes.hot_standby_standby_status,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer admin_status.deinit(server.http_server.?.alloc);
+            defer admin_status.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), admin_status.status);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"NoAddressReturned\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_attempt_ns\":") != null);
@@ -44163,7 +44626,7 @@ fn consumerTests() type {
                 .uri = antfly.admin.routes.hot_standby_standby_status,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer admin_status.deinit(server.http_server.?.alloc);
+            defer admin_status.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), admin_status.status);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"last_error\":\"HAReplicationRecordMissingTableId\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, admin_status.body, "\"replication_failures_total\":1") != null);
@@ -45126,6 +45589,57 @@ fn consumerTests() type {
                 } else try expectUnpublished(&source);
             }
         };
+
+        test "remote transaction catalog carries original budgets through authoritative capture" {
+            const Mode = enum { success, expired, canceled, response_expired, response_canceled, unsupported };
+            inline for (std.meta.tags(Mode)) |mode| {
+                var source_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 2 * std.time.ns_per_s });
+                defer source_clock.deinit();
+                var caller_clock = try SnapshotDeadlineTest.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+                defer caller_clock.deinit();
+                const caller_io = caller_clock.io();
+                var signal = std.atomic.Value(bool).init(mode == .canceled);
+                var fixture: SnapshotDeadlineTest = .{
+                    .clock = if (mode == .response_expired) &caller_clock else null,
+                    .advance_ns = 20 * std.time.ns_per_ms,
+                    .cancellation = if (mode == .response_canceled) &signal else null,
+                };
+                var source = try fixture.initSource(std.testing.allocator, source_clock.io());
+                defer source.deinit();
+                // A positively identified unsupported peer must fail closed
+                // without using the available diagnostic snapshot (epoch 7).
+                if (mode == .unsupported) source.noteLinearizableSnapshotUnsupported(0, source.awakeNs());
+                const catalog = source.catalogSource();
+                const capture = catalog.vtable.transaction_snapshot_with_budget orelse return error.MissingTransactionCapture;
+                const release = catalog.vtable.free_transaction_snapshot orelse return error.MissingTransactionRelease;
+                const budget: antfly.public_api.table_catalog.RoutingBudget = .{
+                    .deadline_ns = 10 * std.time.ns_per_s + (if (mode == .expired) @as(u64, 0) else 10 * std.time.ns_per_ms),
+                    .io = runtime_io_abi.Borrow.init(&caller_io),
+                    .cancellation = .fromAtomic(&signal),
+                };
+                const result = capture(catalog.ptr, std.heap.page_allocator, budget);
+                defer if (result) |value| {
+                    var owned = value;
+                    // The source allocator owns this capture even when the
+                    // coordinator supplies a different scratch allocator.
+                    release(catalog.ptr, std.heap.page_allocator, &owned);
+                } else |_| {};
+                switch (mode) {
+                    .success => {
+                        const snapshot = try result;
+                        try std.testing.expectEqual(@as(u64, 8), snapshot.status.metadata_epoch);
+                        try std.testing.expectEqual(@as(u64, 8), source.cached_snapshot.?.status.metadata_epoch);
+                    },
+                    .expired => try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, result),
+                    .canceled, .response_canceled => try std.testing.expectError(error.Canceled, result),
+                    .response_expired => try std.testing.expectError(error.DeadlineExceeded, result),
+                    .unsupported => try std.testing.expectError(error.CatalogRoutingUnavailable, result),
+                }
+                try std.testing.expectEqual(@as(usize, if (mode == .expired or mode == .canceled or mode == .unsupported) 0 else 1), fixture.calls);
+                if (fixture.calls != 0) try std.testing.expectEqual(@as(?u32, 10), fixture.timeout_ms);
+                if (mode != .success) try SnapshotDeadlineTest.expectUnpublished(&source);
+            }
+        }
 
         test "remote metadata deadline preserves a caller clock ahead of source" {
             try SnapshotDeadlineTest.distinctClock(2);
@@ -54476,7 +54990,7 @@ fn implementationTests() type {
                 .method = .GET,
                 .uri = antfly.admin.routes.hot_standby_primary_status,
             });
-            defer admin_unauthorized.deinit(server.http_server.?.alloc);
+            defer admin_unauthorized.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 401), admin_unauthorized.status);
 
             var admin_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{
@@ -54484,7 +54998,7 @@ fn implementationTests() type {
                 .uri = antfly.admin.routes.hot_standby_primary_status,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer admin_resp.deinit(server.http_server.?.alloc);
+            defer admin_resp.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
             try std.testing.expect(std.mem.indexOf(u8, admin_resp.body, "\"current_lsn\"") != null);
 
@@ -54496,7 +55010,7 @@ fn implementationTests() type {
                 .content_type = "application/json",
                 .body = capture_body,
             });
-            defer capture_resp.deinit(alloc);
+            defer capture_resp.deinit(std.testing.allocator);
             if (capture_resp.status != 200) std.debug.print("HA seed capture failed: {s}\n", .{capture_resp.body});
             try std.testing.expectEqual(@as(u16, 200), capture_resp.status);
             try std.testing.expect(std.mem.indexOf(u8, capture_resp.body, "\"action_kind\":\"seed_capture\"") != null);
@@ -54634,7 +55148,7 @@ fn implementationTests() type {
                 .content_type = "application/json",
                 .body = capture_body,
             });
-            defer capture_retry.deinit(alloc);
+            defer capture_retry.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), capture_retry.status);
             try std.testing.expect(std.mem.indexOf(u8, capture_retry.body, "\"state\":\"already_applied\"") != null);
             var capture_retry_response = try std.json.parseFromSlice(CaptureDigestResponse, alloc, capture_retry.body, .{ .ignore_unknown_fields = true });
@@ -54911,7 +55425,7 @@ fn implementationTests() type {
                 .uri = antfly.internal.routes.hot_standby_replication_identify,
                 .authorization = "Bearer runtime-secret-token",
             });
-            defer internal_resp.deinit(server.http_server.?.alloc);
+            defer internal_resp.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
             try std.testing.expect(std.mem.indexOf(u8, internal_resp.body, "\"record_format_version\"") != null);
 

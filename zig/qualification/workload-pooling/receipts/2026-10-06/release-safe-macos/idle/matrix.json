@@ -1,0 +1,76 @@
+{
+  "passed": false,
+  "failures": [
+    "macos-authenticated-cursors-r01: origin-main",
+    "macos-authenticated-cursors-r02: origin-main",
+    "macos-authenticated-cursors-r03: origin-main"
+  ],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "origin-main",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r01-origin-main.json",
+      "exit_code": 1
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-fixed",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r01-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-failfast",
+      "repetition": 1,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r01-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-fixed",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r02-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-failfast",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r02-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "origin-main",
+      "repetition": 2,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r02-origin-main.json",
+      "exit_code": 1
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-failfast",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r03-candidate-failfast.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "origin-main",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r03-origin-main.json",
+      "exit_code": 1
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-authenticated-cursors.json",
+      "variant": "candidate-fixed",
+      "repetition": 3,
+      "receipt": "/private/tmp/antfly-pooling-release-safe-macos-idle/macos-authenticated-cursors-r03-candidate-fixed.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false,
+  "repetitions": 3,
+  "order": "rotated each repetition"
+}

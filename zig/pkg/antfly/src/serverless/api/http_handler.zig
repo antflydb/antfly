@@ -94,12 +94,17 @@ const SyncWaitCancellation = struct {
     deadline_ns: u64,
 
     fn token(self: *const @This()) CancellationToken {
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 
     fn isCancelled(ptr: *const anyopaque) bool {
+        check(ptr) catch return true;
+        return false;
+    }
+    fn check(ptr: *const anyopaque) !void {
         const state: *const @This() = @ptrCast(@alignCast(ptr));
-        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+        try state.upstream.check();
+        if (platform_time.monotonicNs() >= state.deadline_ns) return error.DeadlineExceeded;
     }
 };
 const json_helpers = @import("antfly_local_sources").api_json_helpers;
@@ -13792,6 +13797,7 @@ test "serverless sync wait cancellation combines request cancellation and deadli
         .deadline_ns = 0,
     };
     try std.testing.expect(expired.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.token().check());
 
     const upstream_only = SyncWaitCancellation{
         .upstream = CancellationToken.fromAtomic(&upstream_signal),

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const read_admission = @import("../../common/read_admission.zig");
 const Crc32 = @import("antfly_hash").Crc32;
 const bloom = @import("bloom");
 const byte_copy = @import("../../common/byte_copy.zig");
@@ -1862,7 +1863,11 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !Decoded {
 }
 
 pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !BorrowedDecoded {
-    var index = try decodeIndexAlloc(allocator, raw);
+    return decodeBorrowedOwnedAllocWithAdmission(allocator, raw, null);
+}
+
+pub fn decodeBorrowedOwnedAllocWithAdmission(allocator: std.mem.Allocator, raw: []u8, control: ?read_admission.Port) !BorrowedDecoded {
+    var index = try decodeIndexAllocWithAdmission(allocator, raw, control);
     errdefer index.deinit(allocator);
     if (index.prefix_filter) |*filter| {
         filter.deinit(allocator);
@@ -1870,7 +1875,7 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
     }
 
     if (indexHasCompressedBlocks(&index)) {
-        const logical_raw = try materializeLogicalEntryDataRawAlloc(allocator, raw, &index);
+        const logical_raw = try materializeLogicalEntryDataRawAlloc(allocator, raw, &index, control);
         allocator.free(raw);
         return .{
             .raw = logical_raw,
@@ -2017,6 +2022,54 @@ fn decodePrefixCompressedBlockAlloc(
     payload: []const u8,
     expected_len: usize,
 ) ![]u8 {
+    return decodePrefixCompressedBlockAllocWithAdmission(allocator, scratch, payload, expected_len, null);
+}
+
+fn appendSliceWithAdmission(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8, control: ?read_admission.Port) !void {
+    if (control == null) return out.appendSlice(allocator, bytes);
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        try control.?.checkpoint();
+        const end = cursor + @min(bytes.len - cursor, 64 * 1024);
+        try out.appendSlice(allocator, bytes[cursor..end]);
+        cursor = end;
+    }
+}
+
+fn copyWithAdmission(dst: []u8, src: []const u8, control: ?read_admission.Port) !void {
+    if (control == null) {
+        @memcpy(dst, src);
+        return;
+    }
+    var cursor: usize = 0;
+    while (cursor < src.len) {
+        try control.?.checkpoint();
+        const end = cursor + @min(src.len - cursor, 64 * 1024);
+        @memcpy(dst[cursor..end], src[cursor..end]);
+        cursor = end;
+    }
+}
+
+fn appendEntryBytesWithAdmission(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: Entry, control: ?read_admission.Port) !void {
+    if (control == null) return appendEntryBytesToList(allocator, out, entry);
+    try control.?.checkpoint();
+    try out.append(allocator, @intFromBool(entry.tombstone));
+    try appendU32(allocator, out, if (entry.namespace_name) |name| try checkedU32(name.len) else 0);
+    try appendU32(allocator, out, try checkedU32(entry.key.len));
+    try appendU32(allocator, out, try checkedU32(entry.value.len));
+    if (entry.namespace_name) |name| try appendSliceWithAdmission(allocator, out, name, control);
+    try appendSliceWithAdmission(allocator, out, entry.key, control);
+    try appendSliceWithAdmission(allocator, out, entry.value, control);
+}
+
+fn decodePrefixCompressedBlockAllocWithAdmission(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    payload: []const u8,
+    expected_len: usize,
+    control: ?read_admission.Port,
+) ![]u8 {
+    if (control) |budget| try budget.checkpoint();
     const view = try parsePrefixBlockPayload(payload);
 
     // The final buffer never moves. Each key shares its prefix directly from
@@ -2029,6 +2082,7 @@ fn decodePrefixCompressedBlockAlloc(
 
     var entries_cursor: usize = 0;
     for (0..view.entry_count) |entry_index| {
+        if (control) |budget| try budget.checkpoint();
         const restart = entry_index % view.restart_interval == 0;
         if (restart) {
             const expected_restart = try view.restartOffset(entry_index / view.restart_interval);
@@ -2054,15 +2108,16 @@ fn decodePrefixCompressedBlockAlloc(
         try appendU32(allocator, &out, @intCast(namespace_len));
         try appendU32(allocator, &out, @intCast(key_len));
         try appendU32(allocator, &out, @intCast(value_len));
-        out.appendSliceAssumeCapacity(namespace);
+        try appendSliceWithAdmission(allocator, &out, namespace, control);
         const key_start = out.items.len;
-        out.appendSliceAssumeCapacity(previous_key[0..shared_len]);
-        out.appendSliceAssumeCapacity(suffix);
+        try appendSliceWithAdmission(allocator, &out, previous_key[0..shared_len], control);
+        try appendSliceWithAdmission(allocator, &out, suffix, control);
         previous_key = out.items[key_start..];
-        out.appendSliceAssumeCapacity(value);
+        try appendSliceWithAdmission(allocator, &out, value, control);
     }
     if (entries_cursor != view.encoded_entries.len) return error.InvalidTableFile;
     if (out.items.len != expected_len) return error.InvalidTableFile;
+    if (control) |budget| try budget.checkpoint();
     return out.toOwnedSliceAssert();
 }
 
@@ -2114,6 +2169,18 @@ fn readPrefixBlockEntryInPlace(
     key: *std.ArrayListUnmanaged(u8),
     max_key_bytes: usize,
 ) !Entry {
+    return readPrefixBlockEntryInPlaceWithAdmission(allocator, encoded_entries, cursor, key, max_key_bytes, null);
+}
+
+fn readPrefixBlockEntryInPlaceWithAdmission(
+    allocator: std.mem.Allocator,
+    encoded_entries: []const u8,
+    cursor: *usize,
+    key: *std.ArrayListUnmanaged(u8),
+    max_key_bytes: usize,
+    control: ?read_admission.Port,
+) !Entry {
+    if (control) |budget| try budget.checkpoint();
     const tombstone = switch (try readByte(encoded_entries, cursor)) {
         0 => false,
         1 => true,
@@ -2129,9 +2196,10 @@ fn readPrefixBlockEntryInPlace(
     const namespace = try readSlice(encoded_entries, cursor, namespace_len);
     const suffix = try readSlice(encoded_entries, cursor, suffix_len);
     const value = try readSlice(encoded_entries, cursor, value_len);
+    if (control) |budget| try budget.checkpoint();
     try key.ensureTotalCapacity(allocator, key_len);
     key.items.len = shared_len;
-    key.appendSliceAssumeCapacity(suffix);
+    try appendSliceWithAdmission(allocator, key, suffix, control);
     return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key.items, .value = value, .tombstone = tombstone };
 }
 
@@ -2190,10 +2258,11 @@ pub const PrefixPointReader = struct {
         self.* = undefined;
     }
 
-    fn seek(self: *@This(), namespace_name: ?[]const u8, key: []const u8) !void {
+    fn seek(self: *@This(), namespace_name: ?[]const u8, key: []const u8, control: ?read_admission.Port) !void {
         var lo: usize = 0;
         var hi = self.view.restart_count;
         while (lo < hi) {
+            if (control) |budget| try budget.checkpoint();
             const mid = lo + (hi - lo) / 2;
             if (compareEntryTo(try prefixRestartEntry(self.view, mid), namespace_name, key) != .gt) lo = mid + 1 else hi = mid;
         }
@@ -2209,24 +2278,32 @@ pub const PrefixPointReader = struct {
     }
 
     pub fn find(self: *@This(), scratch: std.mem.Allocator, namespace_name: ?[]const u8, key: []const u8) !?BorrowedDecoded.PositionedEntry {
+        return self.findWithAdmission(scratch, namespace_name, key, null);
+    }
+
+    /// Admission is borrowed only for this lookup, including restart search
+    /// and bounded key reconstruction. A stopped reader can retry from a restart.
+    pub fn findWithAdmission(self: *@This(), scratch: std.mem.Allocator, namespace_name: ?[]const u8, key: []const u8, control: ?read_admission.Port) !?BorrowedDecoded.PositionedEntry {
         // A failed allocation may leave the byte cursor advanced. Retry from
         // the restart index, preserving only the reusable key capacity.
         errdefer self.current = null;
+        if (control) |budget| try budget.checkpoint();
         if (self.view.entry_count == 0) return null;
         if (self.current) |current| {
             switch (compareEntryTo(current.entry, namespace_name, key)) {
                 .eq => {
                     if (try tableEntryEncodedLen(current.entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    if (control) |budget| try budget.checkpoint();
                     return current;
                 },
-                .gt => try self.seek(namespace_name, key),
+                .gt => try self.seek(namespace_name, key, control),
                 .lt => if (self.upper_restart) |upper| {
-                    if (compareEntryTo(upper, namespace_name, key) != .gt) try self.seek(namespace_name, key);
+                    if (compareEntryTo(upper, namespace_name, key) != .gt) try self.seek(namespace_name, key, control);
                 },
             }
-        } else try self.seek(namespace_name, key);
+        } else try self.seek(namespace_name, key, control);
         while (self.next_entry_index < self.interval_end_index) {
-            const entry = try readPrefixBlockEntryInPlace(scratch, self.view.encoded_entries, &self.cursor, &self.key_bytes, self.max_result_bytes);
+            const entry = try readPrefixBlockEntryInPlaceWithAdmission(scratch, self.view.encoded_entries, &self.cursor, &self.key_bytes, self.max_result_bytes, control);
             self.next_entry_index += 1;
             if (self.cursor > self.interval_end_cursor or (self.next_entry_index == self.interval_end_index and self.cursor != self.interval_end_cursor)) return error.InvalidTableFile;
             const current: BorrowedDecoded.PositionedEntry = .{ .index = self.first_entry_index + self.next_entry_index - 1, .entry = entry };
@@ -2234,6 +2311,7 @@ pub const PrefixPointReader = struct {
             switch (compareEntryTo(entry, namespace_name, key)) {
                 .eq => {
                     if (try tableEntryEncodedLen(entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    if (control) |budget| try budget.checkpoint();
                     return current;
                 },
                 .gt => return null,
@@ -2323,7 +2401,11 @@ fn commonPrefixLen(lhs: []const u8, rhs: []const u8) usize {
 /// Expand previously checksum-validated prefix records into immutable raw rows.
 /// The caller owns admission and the compressed source's integrity check.
 pub fn expandValidatedPrefixRecordsAlloc(allocator: std.mem.Allocator, records: []const u8, expected_len: usize) ![]u8 {
-    return decodePrefixCompressedBlockAlloc(allocator, allocator, records, expected_len);
+    return expandValidatedPrefixRecordsAllocWithAdmission(allocator, records, expected_len, null);
+}
+
+pub fn expandValidatedPrefixRecordsAllocWithAdmission(allocator: std.mem.Allocator, records: []const u8, expected_len: usize, control: ?read_admission.Port) ![]u8 {
+    return decodePrefixCompressedBlockAllocWithAdmission(allocator, allocator, records, expected_len, control);
 }
 
 pub fn decodeBlockPayloadAlloc(
@@ -2333,7 +2415,7 @@ pub fn decodeBlockPayloadAlloc(
     expected_len: usize,
     expected_checksum: u32,
 ) ![]u8 {
-    return decodeBlockPayloadWithScratchAlloc(allocator, allocator, compression, payload, expected_len, expected_checksum);
+    return decodeBlockPayloadAllocWithAdmission(allocator, compression, payload, expected_len, expected_checksum, null);
 }
 
 pub fn decodeBlockPayloadWithScratchAlloc(
@@ -2344,27 +2426,56 @@ pub fn decodeBlockPayloadWithScratchAlloc(
     expected_len: usize,
     expected_checksum: u32,
 ) ![]u8 {
-    try validateBlockPayload(payload, expected_checksum);
-    return switch (compression) {
+    return decodeBlockPayloadWithScratchAllocWithAdmission(allocator, scratch, compression, payload, expected_len, expected_checksum, null);
+}
+
+pub fn decodeBlockPayloadAllocWithAdmission(
+    allocator: std.mem.Allocator,
+    compression: BlockCompression,
+    payload: []const u8,
+    expected_len: usize,
+    expected_checksum: u32,
+    control: ?read_admission.Port,
+) ![]u8 {
+    return decodeBlockPayloadWithScratchAllocWithAdmission(allocator, allocator, compression, payload, expected_len, expected_checksum, control);
+}
+
+pub fn decodeBlockPayloadWithScratchAllocWithAdmission(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    compression: BlockCompression,
+    payload: []const u8,
+    expected_len: usize,
+    expected_checksum: u32,
+    control: ?read_admission.Port,
+) ![]u8 {
+    if (try checksumWithAdmission(payload, control) != expected_checksum) return error.TableBlockChecksumMismatch;
+    const decoded = switch (compression) {
         .none => blk: {
             if (payload.len != expected_len) return error.InvalidTableFile;
-            break :blk try allocator.dupe(u8, payload);
+            const bytes = try allocator.alloc(u8, payload.len);
+            errdefer allocator.free(bytes);
+            try copyWithAdmission(bytes, payload, control);
+            break :blk bytes;
         },
         .snappy => blk: {
             if (try snappy.decodedLen(payload) != expected_len) return error.InvalidTableFile;
-            const decoded = try snappy.decode(allocator, payload);
-            errdefer allocator.free(decoded);
-            if (decoded.len != expected_len) return error.InvalidTableFile;
-            break :blk decoded;
+            const bytes = try snappy.decodeWithAdmission(allocator, payload, control);
+            errdefer allocator.free(bytes);
+            if (bytes.len != expected_len) return error.InvalidTableFile;
+            break :blk bytes;
         },
-        .prefix => try decodePrefixCompressedBlockAlloc(allocator, scratch, payload, expected_len),
+        .prefix => try decodePrefixCompressedBlockAllocWithAdmission(allocator, scratch, payload, expected_len, control),
         .prefix_snappy => blk: {
             try validatePrefixDecodedSize(payload, expected_len);
-            const prefix_payload = try snappy.decode(scratch, payload);
+            const prefix_payload = try snappy.decodeWithAdmission(scratch, payload, control);
             defer scratch.free(prefix_payload);
-            break :blk try decodePrefixCompressedBlockAlloc(allocator, scratch, prefix_payload, expected_len);
+            break :blk try decodePrefixCompressedBlockAllocWithAdmission(allocator, scratch, prefix_payload, expected_len, control);
         },
     };
+    errdefer allocator.free(decoded);
+    if (control) |budget| try budget.checkpoint();
+    return decoded;
 }
 
 pub fn decodeWindowFromRawAlloc(
@@ -2373,29 +2484,44 @@ pub fn decodeWindowFromRawAlloc(
     index: *const TableIndex,
     window: EntryDataWindow,
 ) ![]u8 {
+    return decodeWindowFromRawAllocWithAdmission(allocator, raw, index, window, null);
+}
+
+pub fn decodeWindowFromRawAllocWithAdmission(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    index: *const TableIndex,
+    window: EntryDataWindow,
+    control: ?read_admission.Port,
+) ![]u8 {
     const physical_start = index.entry_data_start + @as(usize, window.physicalRelativeOffset());
     const physical_len: usize = @intCast(window.physicalLen());
     if (physical_start > raw.len or physical_len > raw.len - physical_start) return error.InvalidTableFile;
-    return try decodeBlockPayloadAlloc(
+    return try decodeBlockPayloadAllocWithAdmission(
         allocator,
         window.compression,
         raw[physical_start..][0..physical_len],
         window.len,
         window.checksum,
+        control,
     );
 }
 
 pub fn validateBlockPayload(payload: []const u8, expected_checksum: u32) !void {
-    if (Crc32.hash(payload) != expected_checksum) return error.TableBlockChecksumMismatch;
+    return validateBlockPayloadWithAdmission(payload, expected_checksum, null);
 }
 
-fn validateRawBlockChecksums(raw: []const u8, index: *const TableIndex) !void {
+pub fn validateBlockPayloadWithAdmission(payload: []const u8, expected_checksum: u32, control: ?read_admission.Port) !void {
+    if (try checksumWithAdmission(payload, control) != expected_checksum) return error.TableBlockChecksumMismatch;
+}
+
+fn validateRawBlockChecksums(raw: []const u8, index: *const TableIndex, control: ?read_admission.Port) !void {
     for (0..index.blocks.len) |block_index| {
         const window = index.blockWindow(block_index);
         const physical_start = index.entry_data_start + @as(usize, window.physicalRelativeOffset());
         const physical_len: usize = @intCast(window.physicalLen());
         if (physical_start > raw.len or physical_len > raw.len - physical_start) return error.InvalidTableFile;
-        try validateBlockPayload(raw[physical_start..][0..physical_len], window.checksum);
+        if (try checksumWithAdmission(raw[physical_start..][0..physical_len], control) != window.checksum) return error.TableBlockChecksumMismatch;
     }
 }
 
@@ -2403,30 +2529,56 @@ fn materializeLogicalEntryDataRawAlloc(
     allocator: std.mem.Allocator,
     raw: []const u8,
     index: *const TableIndex,
+    control: ?read_admission.Port,
 ) ![]u8 {
+    if (control) |budget| try budget.checkpoint();
     const logical_len = index.entry_data_start + index.entry_data_len;
     const logical_raw = try allocator.alloc(u8, logical_len);
     errdefer allocator.free(logical_raw);
     if (index.entry_data_start > raw.len) return error.InvalidTableFile;
-    @memcpy(logical_raw[0..index.entry_data_start], raw[0..index.entry_data_start]);
+    try copyWithAdmission(logical_raw[0..index.entry_data_start], raw[0..index.entry_data_start], control);
     for (index.blocks, 0..) |_, block_index| {
+        if (control) |budget| try budget.checkpoint();
         const window = index.blockWindow(block_index);
-        const decoded = try decodeWindowFromRawAlloc(allocator, raw, index, window);
+        const decoded = try decodeWindowFromRawAllocWithAdmission(allocator, raw, index, window, control);
         defer allocator.free(decoded);
         const logical_start = index.entry_data_start + @as(usize, window.relative_offset);
         if (logical_start > logical_raw.len or decoded.len > logical_raw.len - logical_start) return error.InvalidTableFile;
-        @memcpy(logical_raw[logical_start..][0..decoded.len], decoded);
+        if (control) |budget| try budget.checkpoint();
+        try copyWithAdmission(logical_raw[logical_start..][0..decoded.len], decoded, control);
     }
+    if (control) |budget| try budget.checkpoint();
     return logical_raw;
 }
 
 pub fn decodeIndexAlloc(allocator: std.mem.Allocator, raw: []const u8) !TableIndex {
+    return decodeIndexAllocWithAdmission(allocator, raw, null);
+}
+
+pub fn decodeIndexAllocWithAdmission(allocator: std.mem.Allocator, raw: []const u8, control: ?read_admission.Port) !TableIndex {
+    if (control) |budget| try budget.checkpoint();
     var cursor: usize = 0;
     const header = try decodeHeader(raw, &cursor);
     return switch (header.version) {
-        version => decodeVersionedIndexAlloc(allocator, raw, header),
+        version => decodeVersionedIndexAlloc(allocator, raw, header, control),
         else => error.UnsupportedVersion,
     };
+}
+
+// Check cancellation between finite checksum chunks, without changing on-disk
+// framing or keeping a borrow beyond the synchronous decode operation.
+fn checksumWithAdmission(bytes: []const u8, control: ?read_admission.Port) !u32 {
+    if (control == null) return Crc32.hash(bytes);
+    var crc: Crc32 = .init();
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        try control.?.checkpoint();
+        const end = offset + @min(bytes.len - offset, 64 * 1024);
+        crc.update(bytes[offset..end]);
+        offset = end;
+    }
+    try control.?.checkpoint();
+    return crc.final();
 }
 
 pub fn decodeHeader(raw: []const u8, cursor: *usize) !Header {
@@ -2488,22 +2640,18 @@ pub fn decodeFooterBytes(raw: []const u8) !Footer {
     };
 }
 
-pub fn decodeIndexFromFooterAlloc(
-    allocator: std.mem.Allocator,
-    footer: Footer,
-    metadata: []const u8,
-) !TableIndex {
+pub fn decodeIndexFromFooterAlloc(allocator: std.mem.Allocator, footer: Footer, metadata: []const u8) !TableIndex {
+    return decodeIndexFromFooterAllocWithAdmission(allocator, footer, metadata, null);
+}
+
+pub fn decodeIndexFromFooterAllocWithAdmission(allocator: std.mem.Allocator, footer: Footer, metadata: []const u8, control: ?read_admission.Port) !TableIndex {
+    if (control) |budget| try budget.checkpoint();
     if (metadata.len != footer.metadata_len) return error.InvalidTableFile;
-    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
-    return try decodeFooterMetadataAlloc(
-        allocator,
-        metadata,
-        header_len,
-        footer.entry_count,
-        footer.entry_data_len,
-        footer.metadata_offset - header_len,
-        null,
-    );
+    if (try checksumWithAdmission(metadata, control) != footer.metadata_checksum) return error.InvalidTableFile;
+    var index = try decodeFooterMetadataAlloc(allocator, metadata, header_len, footer.entry_count, footer.entry_data_len, footer.metadata_offset - header_len, null, control);
+    errdefer index.deinit(allocator);
+    if (control) |budget| try budget.checkpoint();
+    return index;
 }
 
 pub fn decodeSequentialIndexFromFooterAlloc(
@@ -2829,6 +2977,7 @@ fn decodeVersionedIndexAlloc(
     allocator: std.mem.Allocator,
     raw: []const u8,
     header: Header,
+    control: ?read_admission.Port,
 ) !TableIndex {
     const footer = try decodeFooter(raw);
     if (footer.entry_count != header.entry_count) return error.InvalidTableFile;
@@ -2837,7 +2986,7 @@ fn decodeVersionedIndexAlloc(
     if (footer.metadata_offset > footer_offset or footer.metadata_len != footer_offset - footer.metadata_offset)
         return error.InvalidTableFile;
     const metadata = raw[footer.metadata_offset..footer_offset];
-    if (Crc32.hash(metadata) != footer.metadata_checksum) return error.InvalidTableFile;
+    if (try checksumWithAdmission(metadata, control) != footer.metadata_checksum) return error.InvalidTableFile;
     var index = try decodeFooterMetadataAlloc(
         allocator,
         metadata,
@@ -2846,9 +2995,11 @@ fn decodeVersionedIndexAlloc(
         footer.entry_data_len,
         footer.metadata_offset - header.entry_data_start,
         header.version,
+        control,
     );
     errdefer index.deinit(allocator);
-    try validateRawBlockChecksums(raw, &index);
+    try validateRawBlockChecksums(raw, &index, control);
+    if (control) |budget| try budget.checkpoint();
     return index;
 }
 
@@ -2860,7 +3011,9 @@ fn decodeFooterMetadataAlloc(
     entry_data_len: usize,
     physical_entry_data_len: usize,
     expected_version: ?u32,
+    control: ?read_admission.Port,
 ) !TableIndex {
+    if (control) |budget| try budget.checkpoint();
     var cursor: usize = 0;
     try consumePackedOffsetsMarker(metadata, &cursor);
     if (expected_version) |expected| if (expected != version) return error.UnsupportedVersion;
@@ -2870,22 +3023,25 @@ fn decodeFooterMetadataAlloc(
     if (entry_count > (metadata.len - cursor) / @sizeOf(u16))
         return error.InvalidTableFile;
     block_offsets = try allocator.alloc(u16, entry_count);
-    for (block_offsets) |*offset| offset.* = try readU16(metadata, &cursor);
+    for (block_offsets, 0..) |*offset, i| {
+        if (i % 256 == 0) if (control) |budget| try budget.checkpoint();
+        offset.* = try readU16(metadata, &cursor);
+    }
 
     const bloom_len: usize = @intCast(try readU32(metadata, &cursor));
     const encoded_filter = try readSlice(metadata, &cursor, bloom_len);
     var filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
     errdefer filter.deinit(allocator);
-    const blocks = try decodeBlockMetasAlloc(allocator, metadata, &cursor, entry_count, entry_data_len);
+    const blocks = try decodeBlockMetasAlloc(allocator, metadata, &cursor, entry_count, entry_data_len, control);
     errdefer {
         for (blocks) |*block| block.deinit(allocator);
         allocator.free(blocks);
     }
-    try decodeBlockFiltersAlloc(allocator, metadata, &cursor, blocks);
-    try skipBlockHashSlots(metadata, &cursor, blocks);
-    try decodeBlockPhysicalMetas(metadata, &cursor, blocks);
+    try decodeBlockFiltersAlloc(allocator, metadata, &cursor, blocks, control);
+    try skipBlockHashSlots(metadata, &cursor, blocks, control);
+    try decodeBlockPhysicalMetas(metadata, &cursor, blocks, control);
     try validateBlockPhysicalCoverage(blocks, physical_entry_data_len);
-    try decodeBlockSmallestKeysAlloc(allocator, metadata, &cursor, blocks);
+    try decodeBlockSmallestKeysAlloc(allocator, metadata, &cursor, blocks, control);
     var prefix_extractor: PrefixExtractor = .none;
     var prefix_filter: ?bloom.OwnedFilter = null;
     errdefer if (prefix_filter) |*filter_ptr| filter_ptr.deinit(allocator);
@@ -2894,10 +3050,10 @@ fn decodeFooterMetadataAlloc(
     if (prefix_filter_len > 0) {
         prefix_filter = try bloom.OwnedFilter.decodeAlloc(allocator, try readSlice(metadata, &cursor, prefix_filter_len));
     }
-    try decodeBlockPrefixFiltersAlloc(allocator, metadata, &cursor, blocks);
+    try decodeBlockPrefixFiltersAlloc(allocator, metadata, &cursor, blocks, control);
     if (cursor != metadata.len) return error.InvalidTableFile;
 
-    try validateEntryOffsets(offsets, block_offsets, blocks, entry_data_len);
+    try validateEntryOffsets(offsets, block_offsets, blocks, entry_data_len, control);
 
     return .{
         .entry_offsets = offsets,
@@ -2916,6 +3072,7 @@ fn validateEntryOffsets(
     block_offsets: []const u16,
     blocks: []const TableIndex.BlockMeta,
     entry_data_len: usize,
+    control: ?read_admission.Port,
 ) !void {
     const entry_count = @max(offsets.len, block_offsets.len);
     if (offsets.len != 0 and block_offsets.len != 0) return error.InvalidTableFile;
@@ -2927,11 +3084,13 @@ fn validateEntryOffsets(
 
     var expected_entry_index: usize = 0;
     for (blocks) |block| {
+        if (control) |budget| try budget.checkpoint();
         if (@as(usize, block.first_entry_index) != expected_entry_index) return error.InvalidTableFile;
         const block_end = @as(usize, block.first_entry_index) + block.entry_count;
         if (block_end > entry_count) return error.InvalidTableFile;
         var previous_local: u32 = 0;
         for (block.first_entry_index..block_end, 0..) |entry_index, local_index| {
+            if (local_index % 256 == 0) if (control) |budget| try budget.checkpoint();
             const local = if (offsets.len != 0) blk: {
                 if (offsets[entry_index] < block.relative_offset) return error.InvalidTableFile;
                 break :blk offsets[entry_index] - block.relative_offset;
@@ -2958,6 +3117,7 @@ fn decodeBlockMetasAlloc(
     cursor: *usize,
     entry_count: usize,
     entry_data_len: usize,
+    control: ?read_admission.Port,
 ) ![]TableIndex.BlockMeta {
     const block_count: usize = @intCast(try readU32(metadata, cursor));
     const minimum_block_metadata_bytes = @sizeOf(u32) * 6;
@@ -2977,6 +3137,7 @@ fn decodeBlockMetasAlloc(
     var expected_entry_index: usize = 0;
     var expected_offset: usize = 0;
     for (blocks, 0..) |*block, block_index| {
+        if (control) |budget| try budget.checkpoint();
         const relative_offset = try readU32(metadata, cursor);
         const len = try readU32(metadata, cursor);
         const first_entry_index = try readU32(metadata, cursor);
@@ -3025,10 +3186,12 @@ fn decodeBlockFiltersAlloc(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
+    control: ?read_admission.Port,
 ) !void {
     const filter_count: usize = @intCast(try readU32(metadata, cursor));
     if (filter_count != blocks.len) return error.InvalidTableFile;
     for (blocks) |*block| {
+        if (control) |budget| try budget.checkpoint();
         const filter_len: usize = @intCast(try readU32(metadata, cursor));
         const encoded_filter = try readSlice(metadata, cursor, filter_len);
         block.filter = try bloom.OwnedFilter.decodeAlloc(allocator, encoded_filter);
@@ -3039,10 +3202,12 @@ fn skipBlockHashSlots(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
+    control: ?read_admission.Port,
 ) !void {
     const hash_count: usize = @intCast(try readU32(metadata, cursor));
     if (hash_count != blocks.len) return error.InvalidTableFile;
     for (blocks) |_| {
+        if (control) |budget| try budget.checkpoint();
         const slot_count: usize = @intCast(try readU32(metadata, cursor));
         // v9 readers never consulted this open-addressed lookup structure;
         // exact reads binary-search entry_offsets. Preserve old-run framing
@@ -3057,11 +3222,13 @@ fn decodeBlockPhysicalMetas(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
+    control: ?read_admission.Port,
 ) !void {
     const physical_count: usize = @intCast(try readU32(metadata, cursor));
     if (physical_count != blocks.len) return error.InvalidTableFile;
     var expected_physical_offset: usize = 0;
     for (blocks) |*block| {
+        if (control) |budget| try budget.checkpoint();
         const physical_relative_offset = try readU32(metadata, cursor);
         const physical_len = try readU32(metadata, cursor);
         const compression_raw = try readU32(metadata, cursor);
@@ -3098,10 +3265,12 @@ fn decodeBlockSmallestKeysAlloc(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
+    control: ?read_admission.Port,
 ) !void {
     const smallest_count: usize = @intCast(try readU32(metadata, cursor));
     if (smallest_count != blocks.len) return error.InvalidTableFile;
     for (blocks) |*block| {
+        if (control) |budget| try budget.checkpoint();
         const smallest_namespace_len = try readU32(metadata, cursor);
         const smallest_key_len: usize = @intCast(try readU32(metadata, cursor));
         const smallest_namespace_name = if (smallest_namespace_len == std.math.maxInt(u32))
@@ -3132,10 +3301,12 @@ fn decodeBlockPrefixFiltersAlloc(
     metadata: []const u8,
     cursor: *usize,
     blocks: []TableIndex.BlockMeta,
+    control: ?read_admission.Port,
 ) !void {
     const filter_count: usize = @intCast(try readU32(metadata, cursor));
     if (filter_count != blocks.len) return error.InvalidTableFile;
     for (blocks) |*block| {
+        if (control) |budget| try budget.checkpoint();
         const filter_len: usize = @intCast(try readU32(metadata, cursor));
         if (filter_len == 0) {
             block.prefix_filter = null;
@@ -4353,4 +4524,45 @@ test "indexed point reader adapts dense sparse backwards repeated and missing pr
             try std.testing.expectEqual(row.entry.tombstone, found.?.entry.tombstone);
         }
     }
+}
+
+pub fn qualifyControlledPrefixPointReader(control: read_admission.Port) !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    var entries: [97]Entry = undefined;
+    var key_bytes: [96][32]u8 = undefined;
+    for (entries[0..96], 0..) |*entry, i| {
+        entry.* = .{ .namespace_name = if (i < 64) "docs" else "graph", .key = try std.fmt.bufPrint(&key_bytes[i], "shared-key:{d:0>4}", .{i}), .value = "exact", .tombstone = i % 13 == 0 };
+        try appendEntryBytesToList(a, &raw, entry.*);
+    }
+    const wide_key: [128 * 1024]u8 = @splat('z');
+    entries[96] = .{ .namespace_name = "graph", .key = &wide_key, .value = "wide" };
+    try appendEntryBytesToList(a, &raw, entries[96]);
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    var reader = try PrefixPointReader.init(payload, 700, raw.items.len);
+    defer reader.deinit(a);
+    for ([_]usize{ 0, 1, 1, 15, 16, 47, 48, 63, 64, 95, 96, 0, 83, 5, 96 }) |i| {
+        const entry = entries[i];
+        const result = reader.findWithAdmission(a, entry.namespace_name, entry.key, control);
+        const found = result catch |err| {
+            // Rejection invalidates the interrupted cursor. A fresh call can
+            // restart from the same retained payload without a dangling key.
+            try std.testing.expect(reader.current == null);
+            const retried = (try reader.find(a, entry.namespace_name, entry.key)).?;
+            try std.testing.expectEqual(700 + i, retried.index);
+            try std.testing.expectEqualStrings(entry.key, retried.entry.key);
+            try std.testing.expectEqualStrings(entry.value, retried.entry.value);
+            return err;
+        };
+        try std.testing.expectEqual(700 + i, found.?.index);
+        try std.testing.expectEqualStrings(entry.key, found.?.entry.key);
+        try std.testing.expectEqualStrings(entry.value, found.?.entry.value);
+        try std.testing.expectEqual(entry.tombstone, found.?.entry.tombstone);
+    }
+    try std.testing.expect(try reader.findWithAdmission(a, "aaa", "shared-key:0001", control) == null);
+    try std.testing.expect(try reader.findWithAdmission(a, "zzz", "shared-key:0001", control) == null);
+    try std.testing.expect(try reader.findWithAdmission(a, "docs", "shared-key:0005~", control) == null);
 }

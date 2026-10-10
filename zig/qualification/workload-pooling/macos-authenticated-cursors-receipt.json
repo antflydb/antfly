@@ -1,0 +1,133 @@
+{
+  "manifest": {
+    "version": 1,
+    "name": "macos-native-authenticated-cursors-small",
+    "http_connections": 32,
+    "pgwire_connections": 32,
+    "samples": 5,
+    "sample_interval_seconds": 0.2,
+    "recovery_seconds": 3,
+    "thresholds": {
+      "idle_rss_growth_bytes": 134217728,
+      "idle_thread_growth": 160,
+      "idle_fd_growth": 80,
+      "control_latency_seconds": 2,
+      "recovery_fd_growth": 8,
+      "recovery_rss_growth_bytes": 134217728
+    },
+    "pgwire_mode": "authenticated",
+    "held_cursors": 16,
+    "fixture_rows": 9
+  },
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "pid": 55708,
+  "baseline": {
+    "rss_bytes": 179290112,
+    "virtual_bytes": 1600884588544,
+    "threads": 26,
+    "fds": 20
+  },
+  "retained_pgwire_clients": 32,
+  "retained_http_clients": 32,
+  "idle_samples": [
+    {
+      "rss_bytes": 181633024,
+      "virtual_bytes": 1601961607168,
+      "threads": 90,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 182452224,
+      "virtual_bytes": 1601978433536,
+      "threads": 91,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 182452224,
+      "virtual_bytes": 1601978433536,
+      "threads": 91,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 182452224,
+      "virtual_bytes": 1601978433536,
+      "threads": 91,
+      "fds": 84
+    },
+    {
+      "rss_bytes": 182452224,
+      "virtual_bytes": 1601978433536,
+      "threads": 91,
+      "fds": 84
+    }
+  ],
+  "control_latencies_seconds": [
+    0.19523637499999857,
+    0.19556270800000064,
+    0.1973737499999988,
+    0.195318125,
+    0.19698487500000184
+  ],
+  "verified_held_cursors": 16,
+  "verified_authenticated_sessions": 32,
+  "memory_map_summary": "Process:         antfly [55708]\nPath:            /private/tmp/*/antfly\nLoad Address:    0x104adc000\nIdentifier:      antfly\nVersion:         0\nCode Type:       ARM64\nPlatform:        macOS\nParent Process:  Python [55706]\nTarget Type:     live task\n\nDate/Time:       2026-10-06 09:40:20.122 -0700\nLaunch Time:     2026-10-06 09:40:02.729 -0700\nOS Version:      macOS 27.0.1 (26A434)\nReport Version:  7\nAnalysis Tool:   /usr/bin/vmmap\n\nPhysical footprint:         105.7M\nPhysical footprint (peak):  105.7M\nIdle exit:                  untracked\n----\n\nReadOnly portion of Libraries: Total=2.3G resident=337.2M(14%) swapped_out_or_unallocated=2.0G(86%)\nWritable regions: Total=1.6G written=100.9M(6%) resident=46.2M(3%) swapped_out=54.7M(3%) unallocated=1.5G(94%)\n\n                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION \nREGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) \n===========                     ======= ========    =====  ======= ========   ======    =====  ======= \nDeferred Reclaim                  64.0M      16K      16K       0K       0K       0K       0K        1 \nGuard                            385.0G       0K       0K       0K       0K       0K       0K        1 \nMalloc Guard Page                 3920K       0K       0K       0K       0K       0K       0K        4         see MALLOC ZONE table below\nMalloc Metadata                    224K      32K      32K     192K       0K       0K       0K        3         see MALLOC ZONE table below\nMalloc Metadata metadata          1248K     464K     464K     176K       0K       0K       0K        2         see MALLOC ZONE table below\nMalloc Nano metadata               160K     144K     144K      16K       0K       0K       0K        5         see MALLOC ZONE table below\nMalloc Small                      92.0M    22.2M    22.2M    46.1M       0K       0K       0K       25         see MALLOC ZONE table below\nMalloc Small (empty)              4080K       0K       0K       0K       0K       0K       0K        1         see MALLOC ZONE table below\nMalloc Tiny                       4096K     112K     112K      80K       0K       0K       0K        1         see MALLOC ZONE table below\nOS Alloc Once                       32K       0K       0K      16K       0K       0K       0K        1 \nStack                              1.4G    21.0M    21.0M    7504K       0K       0K       0K       91 \nStack Guard                       1456K       0K       0K       0K       0K       0K       0K       91 \nUntagged                           1.0T     120K     120K     832K       0K       0K       0K       13 \n__AUTH                            1494K     789K       0K       48       0K       0K       0K      168 \n__AUTH_CONST                      18.7M    10.0M       0K       0K       0K       0K       0K      327 \n__CTF                               824      824       0K       0K       0K       0K       0K        1 \n__DATA                            12.3M    3560K    1560K    3629K       0K       0K       0K      336 \n__DATA_CONST                      17.6M    8965K      16K       0K       0K       0K       0K      325 \n__DATA_DIRTY                      1297K     717K      96K     220K       0K       0K       0K      286 \n__FONT_DATA                        2352     2352       0K       0K       0K       0K       0K        1 \n__LINKEDIT                         1.6G    86.6M       0K       0K       0K       0K       0K        2 \n__OBJC_RO                        118.0M    54.8M       0K       0K       0K       0K       0K        1 \n__OBJC_RW                         2735K    2288K       0K      47K       0K       0K       0K        1 \n__TEXT                           702.3M   250.6M       0K       0K       0K       0K       0K      390 \n__TPRO_CONST                       132K      52K      16K      32K       0K       0K       0K        4 \nmapped file                         12K      12K       0K       0K       0K       0K       0K        1 \npage table in kernel              1346K    1346K    1346K       0K       0K       0K       0K        1 \nshared memory                       32K      32K      32K       0K       0K       0K       0K        1 \nunused but dirty shlib __DATA       88K      32K      32K      55K       0K       0K       0K       46 \n===========                     ======= ========    =====  ======= ========   ======    =====  ======= \nTOTAL                              1.4T   463.4M    47.1M    58.6M       0K       0K       0K     2130 \n\n                                 VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION\nMALLOC ZONE                         SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT\n===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======\nDefaultMallocZone_0x12215c000     101.3M      22.9M      22.9M      46.3M       3353      65.7M      3648K      6%      32\nobjc-class_rw_t_0x122218000          32K         0K         0K        32K        404         9K        23K     71%       2\n===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======\nTOTAL                             101.4M      22.9M      22.9M      46.4M       3757      65.7M      3670K      6%      34\n\n",
+  "recovery": {
+    "rss_bytes": 169967616,
+    "virtual_bytes": 1601978433536,
+    "threads": 91,
+    "fds": 20
+  },
+  "idle_peak": {
+    "rss_bytes": 182452224,
+    "virtual_bytes": 1601978433536,
+    "threads": 91,
+    "fds": 84
+  },
+  "checks": {
+    "idle_rss_growth_bytes": 3162112,
+    "idle_thread_growth": 65,
+    "idle_fd_growth": 64,
+    "control_latency_seconds": 0.1973737499999988,
+    "recovery_fd_growth": 0,
+    "recovery_rss_growth_bytes": -9322496
+  },
+  "failures": [],
+  "passed": true,
+  "binary_sha256": "2b83ade59f9f9f003f7d85191715ec0601a477536d3ec187b5fac27002e122bb",
+  "configuration": {
+    "pgwire": {
+      "enabled": true,
+      "bind_port": 51236,
+      "max_connections": 32
+    },
+    "admission": {
+      "max_request_memory_bytes": 67108864
+    }
+  },
+  "server_exit_code": 0,
+  "server_log": "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/server.log",
+  "command": [
+    "/private/tmp/antfly-default-pooling-install/bin/antfly",
+    "standalone",
+    "--config",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/config.json",
+    "--auth",
+    "true",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "51235",
+    "--health",
+    "false",
+    "--data-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/data",
+    "--models-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/models",
+    "--ml-dir",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/ml",
+    "--storage-engine",
+    "lite",
+    "--storage-path",
+    "/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-pooling-qualification-a2no1fhq/data.aflite"
+  ]
+}

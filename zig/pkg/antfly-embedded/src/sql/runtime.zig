@@ -192,8 +192,8 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
-    if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
-        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
+    if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io orelse backend.spill_io) |io| {
+        manager = .{ .alloc = alloc, .io = io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);
@@ -256,23 +256,23 @@ pub const Context = struct {
         }
         pub fn page(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| return cursor.next(cursor.ptr, alloc, request.limit);
+            if (self.cursor) |cursor| return cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
             return context.backend.vtable.scan(context.backend.ptr, alloc, table, request);
         }
         pub fn count(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !?u64 {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.count_rows) |count_rows| return try count_rows(cursor.ptr);
+            if (self.cursor) |cursor| if (cursor.count_rows != null) return try cursor.countFor(if (context.backend.cpu_scope) |scope| scope.execution else null);
             return null;
         }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.next_columns) |next| return try next(cursor.ptr, alloc, request.limit);
+            if (self.cursor) |cursor| if (cursor.next_columns != null) return try cursor.columnsFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
             return null;
         }
 
         pub fn partitions(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, maximum: usize) !?[]catalog.Cursor {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.split_scan) |split| return try split(cursor.ptr, alloc, maximum);
+            if (self.cursor) |cursor| if (cursor.split_scan != null) return try cursor.splitFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, maximum, false);
             return null;
         }
 
@@ -4459,7 +4459,11 @@ test "SQL runtime executes spilled order group distinct and join under a small s
         defer compiled.deinit();
         var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
         defer std.debug.assert(quota.live == 0);
-        var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        var result = execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 }) catch |err| {
+            std.debug.print("SQL small-budget failure: sql={s} error={s} outer_peak={d}\n", .{ case.sql, @errorName(err), quota.peak });
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            return err;
+        };
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         try std.testing.expectEqualStrings(case.first, result.output.rows[0][0].string);
@@ -4843,6 +4847,24 @@ test "SQL filtered LIMIT hints require a complete bound predicate and remain adv
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         try std.testing.expectEqual(case.goal, backend.row_goal);
     }
+}
+
+test "SQL constrained partition join preserves every row after shared allocation denial" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 2000 };
+    var backend = fixture.coordinated();
+    backend.pinned_statement_snapshot = true;
+    backend.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*) AS n, SUM(CAST(a._id AS BIGINT)) AS total FROM things a JOIN things b ON a._id = b._id", .{});
+    defer compiled.deinit();
+    var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+    defer std.debug.assert(quota.live == 0);
+    var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("2000", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("1999000", result.output.rows[0][1].string);
+    try std.testing.expect(result.state.budget.peak <= 256 * 1024);
 }
 
 test "SQL special floats retain PostgreSQL comparison ordering" {

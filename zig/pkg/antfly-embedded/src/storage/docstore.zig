@@ -496,6 +496,9 @@ pub const DocStore = struct {
     pub const BackendStore = backend_adapter.Store(DocStore, Txn, Txn, Batch, .{
         .capabilities = backendCapabilities,
         .begin_read = beginReadTxn,
+        .begin_read_with_admission = beginReadTxnWithAdmission,
+        .begin_probe_with_admission = beginProbeTxnWithAdmission,
+        .begin_current_scan_with_admission = beginCurrentScanTxnWithAdmission,
         .begin_probe = beginProbeTxn,
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
@@ -690,6 +693,25 @@ pub const DocStore = struct {
             };
         }
 
+        pub fn getManySortedWithAdmission(self: *Txn, keys: []const []const u8, values: []?[]const u8, control: @import("../common/read_admission.zig").Port) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+            if (self.write != null or self.current_scan != null) return error.ExecutionWaitUnsupported;
+            if (self.probe) |*probe| {
+                try probe.getManySortedWithAdmission(keys, values, control);
+            } else try self.read.?.getManySortedWithAdmission(keys, values, control);
+            // Artifact reconstruction has a separate physical I/O owner. Do
+            // not silently cross into that owner without admission transport.
+            for (keys, values) |key, value| if (value) |raw| {
+                try control.checkpoint();
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
+                    return error.ExecutionWaitUnsupported;
+            };
+            try control.checkpoint();
+        }
+
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
@@ -708,6 +730,22 @@ pub const DocStore = struct {
             }
             if (self.current_scan != null) return error.Unsupported;
             return try self.read.?.getManySorted(keys, values);
+        }
+
+        /// Batch physical values from the admitted snapshot. The borrow lives
+        /// only for this call; unsupported transaction modes never fall back to
+        /// an unbudgeted point loop or a live probe.
+        pub fn getManySortedPhysicalWithBudget(self: *Txn, keys: []const []const u8, values: []?[]const u8, budget: anytype) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try budget.checkpoint();
+            if (self.write != null or self.probe != null or self.current_scan != null) return error.ExecutionWaitUnsupported;
+            const admission = @import("../common/read_admission.zig");
+            var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
+            const payload = adapter.payload();
+            try self.read.?.getManySortedWithAdmission(keys, values, admission.Port.init(&payload));
+            try budget.checkpoint();
         }
 
         /// Fetch values without admitting their source data blocks to the LSM
@@ -819,6 +857,25 @@ pub const DocStore = struct {
 
         pub fn openCursor(self: *Txn) !CursorAdapter {
             return try self.openCursorAdapter();
+        }
+
+        pub fn openCursorWithBudget(self: *Txn, budget: anytype) !CursorAdapter {
+            const admission = @import("../common/read_admission.zig");
+            var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
+            const payload = adapter.payload();
+            return self.openCursorWithAdmission(admission.Port.init(&payload));
+        }
+
+        pub fn openCursorWithAdmission(self: *Txn, control: @import("../common/read_admission.zig").Port) !CursorAdapter {
+            try control.checkpoint();
+            if (self.write != null or self.probe != null) return error.ExecutionWaitUnsupported;
+            var physical = if (self.current_scan) |*current|
+                try current.openCursorWithAdmission(control)
+            else
+                try self.read.?.openCursorWithAdmission(control);
+            errdefer physical.close();
+            try control.checkpoint();
+            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.current_scan != null);
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
@@ -1249,6 +1306,16 @@ pub const DocStore = struct {
         pub fn next(self: *@This()) !?backend_erased.Entry {
             return self.resolve(try self.physical.next());
         }
+        pub fn nextWithAdmission(self: *@This(), control: @import("../common/read_admission.zig").Port) !?backend_erased.Entry {
+            const result = try self.resolve(try self.physical.nextWithAdmission(control));
+            try control.checkpoint();
+            return result;
+        }
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: @import("../common/read_admission.zig").Port) !?backend_erased.Entry {
+            const result = try self.resolve(try self.physical.seekAtOrAfterWithAdmission(key, control));
+            try control.checkpoint();
+            return result;
+        }
         pub fn prev(self: *@This()) !?backend_erased.Entry {
             return self.resolve(try self.physical.prev());
         }
@@ -1337,6 +1404,68 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
         txn.portable_import_reader_owner = self;
         return txn;
+    }
+
+    /// These scopes retain payload policy ownership while admitting the
+    /// backend. CPU release requires the complete capture dependency graph.
+    fn checkRetainedReadAdmission(control: @import("../common/read_admission.zig").Port) !void {
+        try control.checkpoint();
+        if (try control.executionWait() != null) return error.ExecutionWaitUnsupported;
+    }
+
+    pub fn beginReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
+        try checkRetainedReadAdmission(control);
+        return self.beginReadTxnWithBudget(admission, control);
+    }
+
+    pub fn beginProbeTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
+        return self.beginLiveReadTxnWithAdmission(admission, control, false);
+    }
+
+    pub fn beginCurrentScanTxnWithAdmission(self: *DocStore, control: @import("../common/read_admission.zig").Port) !Txn {
+        return self.beginLiveReadTxnWithAdmission(.retain, control, true);
+    }
+
+    fn beginLiveReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port, current: bool) !Txn {
+        try checkRetainedReadAdmission(control);
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), control);
+        defer self.unlockPayloadPolicy();
+        const payload_session = try self.createPayloadSession();
+        var session_transferred = false;
+        errdefer if (!session_transferred) {
+            if (payload_session) |session| session.release();
+        };
+        var txn: Txn = .{ .payload_session = payload_session, .alloc = self.alloc };
+        if (current) {
+            txn.current_scan = try self.runtime_store.beginCurrentScanWithAdmission(control);
+        } else txn.probe = try self.runtime_store.beginProbeWithAdmission(admission, control);
+        session_transferred = true;
+        errdefer txn.abort();
+        try control.checkpoint();
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    /// Retain the original admission authority while acquiring the payload
+    /// policy and backend snapshot locks. Cursor and file I/O need separate support.
+    pub fn beginReadTxnWithBudget(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, budget: anytype) !Txn {
+        try budget.checkpoint();
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), budget);
+        defer self.unlockPayloadPolicy();
+        const payload_session = try self.createPayloadSession();
+        errdefer if (payload_session) |session| session.release();
+        try budget.checkpoint();
+        const admission_mod = @import("../common/read_admission.zig");
+        var adapter = admission_mod.Adapter(@TypeOf(budget)){ .budget = budget };
+        const payload = adapter.payload();
+        var read = try self.runtime_store.beginReadWithAdmission(admission, admission_mod.Port.init(&payload));
+        errdefer read.abort();
+        try budget.checkpoint();
+        return .{ .payload_session = payload_session, .alloc = self.alloc, .read = read, .portable_import_reader_owner = self };
     }
 
     fn beginReadTxnUnchecked(self: *DocStore) !Txn {
@@ -6243,4 +6372,36 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+pub fn qualifyBudgetedPhysicalBatch(budget: anytype) !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.putBatch(&.{
+        .{ .key = "a", .value = "old-a" },
+        .{ .key = "b", .value = "old-b" },
+    }, &.{});
+    var txn = try store.beginReadTxnWithBudget(.retain, budget);
+    defer txn.abort();
+    try store.putBatch(&.{
+        .{ .key = "a", .value = "new-a" },
+        .{ .key = "c", .value = "new-c" },
+    }, &.{"b"});
+    const before = backend.snapshotMaintenanceStats();
+    const keys: []const []const u8 = &.{ "a", "a", "b", "c", "missing" };
+    var values: [5]?[]const u8 = @splat(null);
+    txn.getManySortedPhysicalWithBudget(keys, &values, budget) catch |err| {
+        for (values) |value| try std.testing.expect(value == null);
+        return err;
+    };
+    try std.testing.expectEqualStrings("old-a", values[0].?);
+    try std.testing.expectEqualStrings("old-a", values[1].?);
+    try std.testing.expectEqualStrings("old-b", values[2].?);
+    try std.testing.expect(values[3] == null and values[4] == null);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

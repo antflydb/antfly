@@ -863,6 +863,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalControlledRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .graph_expand_group_local = graphExpandGroupLocal,
@@ -913,6 +915,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
                 .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
+                .prepare_hot_standby_seed_snapshot_group_local_with_lifetime = prepareHotStandbySeedSnapshotGroupLocalWithLifetime,
                 .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
@@ -1424,6 +1427,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         defer lease.deinit();
         try lease.owner().prepareHotStandbySeedSnapshot(table_name, deadline_ns);
+        return {};
+    }
+
+    fn prepareHotStandbySeedSnapshotGroupLocalWithLifetime(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
+        // Retain CPU during the native owner/cache dependency graph. This
+        // fallible token preserves the original error in descriptor waits.
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .cancellation = original.cancellation(lifetime) });
+        defer lease.deinit();
+        try original.checkpoint(lifetime);
+        try lease.owner().prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, lifetime);
+        try original.checkpoint(lifetime);
         return {};
     }
 
@@ -2992,6 +3015,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const ReadControls = struct {
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
@@ -2999,7 +3023,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
-            return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+            return .{ .execution_runnable = if (@hasField(@TypeOf(req), "execution_runnable")) req.execution_runnable else null, .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
         }
 
         fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
@@ -3009,6 +3033,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         fn check(self: ReadControls) !void {
+            if (self.execution_runnable) |borrow| {
+                try borrow.validate();
+                try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+            }
             const context: request_operation.RequestContext = .{
                 .deadline_ns = self.execution_deadline_ns,
                 .deadline_io = self.execution_io,
@@ -3801,7 +3829,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (true) {
             try controls.check();
-            try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try @import("runnable_fanout_owner.zig").sleepForProgress(controls.execution_runnable, wait_io, .fromMilliseconds(1));
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
                 error.StorageKernelOwnerStaleDescriptor => return err,
@@ -4228,6 +4256,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (req.execution_runnable) |*borrow| borrow else null,
             .execution = execution,
         });
         errdefer response.deinit();
@@ -4680,6 +4709,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
         return try textStatsGroupLocal(ptr, alloc, group_id, table_name, body);
+    }
+
+    fn textStatsGroupLocalControlledRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try textStatsGroupLocalControlled(ptr, alloc, group_id, table_name, body, controls);
     }
 
     fn algebraicPartialsGroupLocalRouted(
@@ -6098,6 +6142,32 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .json = try alloc.dupe(u8, response.bytes()) };
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controls));
+        defer lease.deinit();
+        try table_reads.checkQueryDeadline(controls);
+        var cancellation = controls.cancellation;
+        var borrow = controls.execution_runnable;
+        var response = try lease.owner().textStatsJsonWithOptions(table_name, body, .{
+            .execution_deadline_ns = controls.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation) |*token| token else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (borrow) |*value| value else null,
+        });
+        defer response.deinit();
+        try table_reads.checkQueryDeadline(controls);
+        return .{ .json = try alloc.dupe(u8, response.bytes()) };
+    }
+
     fn algebraicPartialsGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6138,6 +6208,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphExpandResponse(alloc, response.bytes());
@@ -6168,6 +6239,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphHydrateResponse(alloc, response.bytes());
@@ -6198,6 +6270,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphEdgesResponse(alloc, response.bytes());

@@ -7458,6 +7458,12 @@ pub const MetadataService = struct {
         return current_status;
     }
 
+    pub fn transactionRoutingProjection(self: *MetadataService, alloc: std.mem.Allocator, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !metadata_storage.raft_apply_store.TransactionRoutingProjectionSnapshot {
+        try budget.checkpoint();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureTransactionRoutingProjection(alloc, self.metadata_group_id, budget);
+    }
+
     pub fn adminSnapshot(self: *MetadataService) !metadata_api.AdminSnapshot {
         return try metadata_api.captureSnapshot(self.alloc, self);
     }
@@ -11480,6 +11486,12 @@ pub const MetadataHttpService = struct {
                 ready.has_more_ready,
             },
         );
+    }
+
+    pub fn transactionRoutingProjection(self: *MetadataHttpService, alloc: std.mem.Allocator, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget) !metadata_storage.raft_apply_store.TransactionRoutingProjectionSnapshot {
+        try budget.checkpoint();
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.captureTransactionRoutingProjection(alloc, self.metadata_group_id, budget);
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {

@@ -138,6 +138,9 @@ pub const RequestContext = struct {
     /// Execution capability for bounded request fanout. Independent of the
     /// deadline clock: native-monotonic HTTP budgets can still schedule Io.
     fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+    /// Trusted request-lifetime execution team. Local callbacks may borrow it
+    /// only until their children join. Never reconstruct this from wire data.
+    execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
     /// Borrowed request identity used for correlation. An empty value means
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",

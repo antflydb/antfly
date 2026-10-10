@@ -47,6 +47,8 @@ pub const Method = enum {
 /// must never outlive the request that supplied it.
 pub const RequestCancellation = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Original platform-clock deadline, including admission wait.
+    execution_deadline_ns: ?u64 = null,
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.
     borrowed: ?*const std.atomic.Value(bool) = null,
@@ -124,6 +126,9 @@ pub const HttpRequest = struct {
     body: []const u8 = &.{},
     cancellation: ?*const RequestCancellation = null,
     delivery_tracker: ?*RequestDeliveryTracker = null,
+    /// Borrowed through physical transport joining. Executors may park only
+    /// actual IO waits; authentication, encoding and decoding keep CPU.
+    execution_wait: ?@import("../execution_wait.zig").Boundary = null,
 
     pub fn header(self: HttpRequest, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {

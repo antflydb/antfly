@@ -25,6 +25,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
+const read_control = @import("../common/read_admission.zig");
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
@@ -1217,6 +1218,11 @@ pub const TxnManager = struct {
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
+        return self.collectIntentBatchWithAdmission(alloc, txn_id, null);
+    }
+
+    pub fn collectIntentBatchWithAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !IntentBatch {
+        if (control) |owner| try owner.checkpoint();
         // Read the revision before scanning. Intent writes publish the record
         // revision and intent rows in one backend batch, so validation under
         // the DB apply lock detects any prepare that raced with this snapshot.
@@ -1228,11 +1234,12 @@ pub const TxnManager = struct {
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
+        const intent_entries = try self.loadIntentEntriesWithAdmission(alloc, txn_id, scan_prefix, control);
         errdefer backend_scan.freeResults(alloc, intent_entries);
 
         var write_count: usize = 0;
         for (intent_entries) |entry| {
+            if (control) |owner| try owner.checkpoint();
             if ((try IntentValue.decode(entry.value)).value != null) write_count += 1;
         }
         const writes = try alloc.alloc(docstore.KVPair, write_count);
@@ -1245,6 +1252,7 @@ pub const TxnManager = struct {
         var deletes_initialized: usize = 0;
 
         for (intent_entries) |entry| {
+            if (control) |owner| try owner.checkpoint();
             const user_key = entry.key[intents_prefix.len + 17 ..];
             const intent = try IntentValue.decode(entry.value);
             if (intent.value == null) {
@@ -1256,6 +1264,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
+        if (control) |owner| try owner.checkpoint();
         return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
     }
 
@@ -2377,6 +2386,11 @@ pub const TxnManager = struct {
     }
 
     fn loadIntentKeysOptional(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[][]u8 {
+        return self.loadIntentKeysOptionalWithAdmission(alloc, txn_id, null);
+    }
+
+    fn loadIntentKeysOptionalWithAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?[][]u8 {
+        if (control) |owner| try owner.checkpoint();
         if (try self.loadIntentAdmission(alloc, txn_id)) |admission| {
             const prefix = try makeIntentMemberKey(alloc, txn_id, "");
             defer alloc.free(prefix);
@@ -2385,17 +2399,20 @@ pub const TxnManager = struct {
                 for (keys.items) |key| alloc.free(key);
                 keys.deinit(alloc);
             }
-            var scan = try self.store.beginCurrentScan();
+            var scan = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
             defer scan.abort();
-            var cursor = try scan.openCursor();
+            var cursor = if (control) |owner| try scan.openCursorWithAdmission(owner) else try scan.openCursor();
             defer cursor.close();
-            var entry = try cursor.seekAtOrAfter(prefix);
+            var entry = if (control) |owner| try cursor.seekAtOrAfterWithAdmission(prefix, owner) else try cursor.seekAtOrAfter(prefix);
             while (entry) |item| {
                 if (!std.mem.startsWith(u8, item.key, prefix)) break;
-                const key = try alloc.dupe(u8, item.key[prefix.len..]);
-                errdefer alloc.free(key);
-                try keys.append(alloc, key);
-                entry = try cursor.next();
+                {
+                    const key = try backend_scan.dupeWithAdmission(alloc, item.key[prefix.len..], control);
+                    errdefer alloc.free(key);
+                    try keys.append(alloc, key);
+                }
+                if (control) |owner| try owner.checkpoint();
+                entry = if (control) |owner| try cursor.nextWithAdmission(owner) else try cursor.next();
             }
             if (keys.items.len != admission.count) return error.IntentSnapshotChanged;
             return try keys.toOwnedSlice(alloc);
@@ -2406,7 +2423,7 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        return try decodeParticipantList(alloc, raw);
+        return try decodeParticipantListWithAdmission(alloc, raw, control);
     }
 
     fn loadIntentAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?IntentAdmission {
@@ -2430,10 +2447,21 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         scan_prefix: []const u8,
     ) ![]backend_scan.OwnedKVPair {
-        const intent_keys = (try self.loadIntentKeysOptional(alloc, txn_id)) orelse
-            return try self.scanPrefix(alloc, scan_prefix);
+        return self.loadIntentEntriesWithAdmission(alloc, txn_id, scan_prefix, null);
+    }
+
+    fn loadIntentEntriesWithAdmission(
+        self: *TxnManager,
+        alloc: Allocator,
+        txn_id: TxnId,
+        scan_prefix: []const u8,
+        control: ?read_control.Port,
+    ) ![]backend_scan.OwnedKVPair {
+        if (control) |owner| try owner.checkpoint();
+        const intent_keys = (try self.loadIntentKeysOptionalWithAdmission(alloc, txn_id, control)) orelse
+            return try backend_scan.scanPrefixWithAdmission(alloc, &self.store, scan_prefix, control);
         defer freeParticipantList(alloc, intent_keys);
-        return try self.loadIntentEntriesByKeys(alloc, scan_prefix, intent_keys);
+        return try self.loadIntentEntriesByKeysWithAdmission(alloc, scan_prefix, intent_keys, control);
     }
 
     fn loadIntentRetirementEntries(self: *TxnManager, alloc: Allocator, txn_id: TxnId, prefix: []const u8) ![]backend_scan.OwnedKVPair {
@@ -2450,6 +2478,17 @@ pub const TxnManager = struct {
         scan_prefix: []const u8,
         user_keys: []const []const u8,
     ) ![]backend_scan.OwnedKVPair {
+        return self.loadIntentEntriesByKeysWithAdmission(alloc, scan_prefix, user_keys, null);
+    }
+
+    fn loadIntentEntriesByKeysWithAdmission(
+        self: *TxnManager,
+        alloc: Allocator,
+        scan_prefix: []const u8,
+        user_keys: []const []const u8,
+        control: ?read_control.Port,
+    ) ![]backend_scan.OwnedKVPair {
+        if (control) |owner| try owner.checkpoint();
         if (user_keys.len == 0) return try alloc.alloc(backend_scan.OwnedKVPair, 0);
 
         const full_keys = try alloc.alloc([]u8, user_keys.len);
@@ -2459,24 +2498,38 @@ pub const TxnManager = struct {
             alloc.free(full_keys);
         }
         for (user_keys, 0..) |user_key, i| {
-            full_keys[i] = try std.mem.concat(alloc, u8, &.{ scan_prefix, user_key });
+            if (control) |owner| try owner.checkpoint();
+            const combined = try alloc.alloc(u8, try std.math.add(usize, scan_prefix.len, user_key.len));
+            errdefer alloc.free(combined);
+            @memcpy(combined[0..scan_prefix.len], scan_prefix);
+            var offset: usize = 0;
+            while (offset < user_key.len) {
+                if (control) |owner| try owner.checkpoint();
+                const end = offset + @min(user_key.len - offset, 64 * 1024);
+                @memcpy(combined[scan_prefix.len + offset ..][0 .. end - offset], user_key[offset..end]);
+                offset = end;
+            }
+            full_keys[i] = combined;
             full_keys_initialized += 1;
         }
-        std.mem.sort([]u8, full_keys, {}, struct {
+        try read_control.sort([]u8, full_keys, {}, struct {
             fn lessThan(_: void, left: []u8, right: []u8) bool {
                 return std.mem.order(u8, left, right) == .lt;
             }
-        }.lessThan);
+        }.lessThan, control);
 
         const key_refs = try alloc.alloc([]const u8, full_keys.len);
         defer alloc.free(key_refs);
-        for (full_keys, 0..) |key, i| key_refs[i] = key;
+        for (full_keys, 0..) |key, i| {
+            if (i % 64 == 0) if (control) |owner| try owner.checkpoint();
+            key_refs[i] = key;
+        }
         const values = try alloc.alloc(?[]const u8, full_keys.len);
         defer alloc.free(values);
         @memset(values, null);
-        var probe = try self.store.beginProbe();
+        var probe = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
         defer probe.abort();
-        try probe.getManySorted(key_refs, values);
+        if (control == null) try probe.getManySorted(key_refs, values);
 
         const entries = try alloc.alloc(backend_scan.OwnedKVPair, full_keys.len);
         var initialized: usize = 0;
@@ -2487,17 +2540,29 @@ pub const TxnManager = struct {
             }
             alloc.free(entries);
         }
-        for (values, 0..) |maybe_value, i| {
-            const value = maybe_value orelse return error.IntentSnapshotChanged;
-            const owned_key = try alloc.dupe(u8, key_refs[i]);
-            errdefer alloc.free(owned_key);
-            const owned_value = try alloc.dupe(u8, value);
-            entries[i] = .{
-                .key = owned_key,
-                .value = owned_value,
-            };
-            initialized += 1;
+        var start: usize = 0;
+        while (start < values.len) {
+            const end = if (control != null) start + @min(values.len - start, 64) else values.len;
+            if (control) |owner| {
+                try owner.checkpoint();
+                try probe.getManySortedWithAdmission(key_refs[start..end], values[start..end], owner);
+                try owner.checkpoint();
+            }
+            // Copy each probe batch before another probe can reuse scratch.
+            for (values[start..end], start..) |maybe_value, i| {
+                const value = maybe_value orelse return error.IntentSnapshotChanged;
+                const owned_key = try backend_scan.dupeWithAdmission(alloc, key_refs[i], control);
+                errdefer alloc.free(owned_key);
+                const owned_value = try backend_scan.dupeWithAdmission(alloc, value, control);
+                entries[i] = .{
+                    .key = owned_key,
+                    .value = owned_value,
+                };
+                initialized += 1;
+            }
+            start = end;
         }
+        if (control) |owner| try owner.checkpoint();
         return entries;
     }
 
@@ -3110,6 +3175,11 @@ fn encodeParticipantList(alloc: Allocator, participants: []const []const u8) ![]
 }
 
 fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
+    return decodeParticipantListWithAdmission(alloc, raw, null);
+}
+
+fn decodeParticipantListWithAdmission(alloc: Allocator, raw: []const u8, control: ?read_control.Port) ![][]u8 {
+    if (control) |owner| try owner.checkpoint();
     if (raw.len < 4) return TxnError.InvalidTxnRecord;
     var count_buf: [4]u8 = undefined;
     @memcpy(&count_buf, raw[0..4]);
@@ -3124,13 +3194,14 @@ fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
     var offset: usize = 4;
     var i: usize = 0;
     while (i < count) : (i += 1) {
+        if (control) |owner| try owner.checkpoint();
         if (offset + 4 > raw.len) return TxnError.InvalidTxnRecord;
         var len_buf: [4]u8 = undefined;
         @memcpy(&len_buf, raw[offset .. offset + 4]);
         const len = std.mem.readInt(u32, &len_buf, .little);
         offset += 4;
         if (offset + len > raw.len) return TxnError.InvalidTxnRecord;
-        result[i] = try alloc.dupe(u8, raw[offset .. offset + len]);
+        result[i] = try backend_scan.dupeWithAdmission(alloc, raw[offset .. offset + len], control);
         initialized += 1;
         offset += len;
     }
@@ -3284,6 +3355,155 @@ test "retained transaction reservations survive LSM reopen and guarantee committ
         try std.testing.expectEqual(@as(u64, 1234), effect.timestamp);
         try std.testing.expect(try reader.next() == null);
     }
+}
+
+test "workload accepted transactions preserve intents on node pressure and retry durably" {
+    const alloc = std.testing.allocator;
+    const ResourceManager = @import("resource_manager.zig").ResourceManager;
+    var resources = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    const path = try tempTestPath(alloc, "txn-node-pressure");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const committed: TxnId = @splat(91);
+    const aborted: TxnId = @splat(92);
+    const committed_key = try internal_keys.documentKeyAlloc(alloc, "accepted");
+    defer alloc.free(committed_key);
+    const aborted_key = try internal_keys.documentKeyAlloc(alloc, "discarded");
+    defer alloc.free(aborted_key);
+    {
+        // Release competing ownership only after backend shutdown has joined.
+        var pressure: u64 = 0;
+        defer if (pressure != 0) resources.releaseExternal(pressure);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(committed, 1);
+        try manager.writeIntents(committed, &.{.{ .key = "accepted", .value = "durable" }}, &.{});
+        try manager.initTransaction(aborted, 2);
+        try manager.writeIntents(aborted, &.{.{ .key = "discarded", .value = "never visible" }}, &.{});
+        var committed_batch = try manager.collectIntentBatch(alloc, committed);
+        defer committed_batch.deinit(alloc);
+        var aborted_batch = try manager.collectIntentBatch(alloc, aborted);
+        defer aborted_batch.deinit(alloc);
+        const snapshot = resources.snapshot().memory;
+        pressure = snapshot.hard_limit_bytes - snapshot.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+        try std.testing.expect(!resources.reserveExternal(1));
+        // A captured intent list alone does not reserve downstream cursors or
+        // publication memory. Preserve this failure as a regression until a
+        // typed completion reservation spans the entire storage operation.
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = committed_batch.owned_entries, .expected_intent_revision = committed_batch.revision }));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(committed));
+        resources.releaseExternal(pressure);
+        pressure = 0;
+        _ = try manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = committed_batch.owned_entries, .expected_intent_revision = committed_batch.revision });
+        _ = try manager.resolveIntentsWithExtraBatch(aborted, .aborted, 101, .{ .captured_intents = aborted_batch.owned_entries, .expected_intent_revision = aborted_batch.revision });
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.lsm_wal_write_working_set).used_bytes);
+        const after = resources.snapshot().memory;
+        pressure = after.hard_limit_bytes - after.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+    }
+    // Check persisted mutations and transaction decisions after all owners close.
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, "durable", try read.get(committed_key));
+    try std.testing.expectError(error.NotFound, read.get(aborted_key));
+    try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+    try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+}
+
+test "workload accepted transactions recover durable decisions after pressured shutdown" {
+    const alloc = std.testing.allocator;
+    const ResourceManager = @import("resource_manager.zig").ResourceManager;
+    var resources = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    const path = try tempTestPath(alloc, "txn-decided-node-pressure");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const committed: TxnId = @splat(93);
+    const aborted: TxnId = @splat(94);
+    const committed_key = try internal_keys.documentKeyAlloc(alloc, "accepted");
+    defer alloc.free(committed_key);
+    const aborted_key = try internal_keys.documentKeyAlloc(alloc, "discarded");
+    defer alloc.free(aborted_key);
+    {
+        var pressure: u64 = 0;
+        // Keep competing ownership held until the backend joins shutdown.
+        defer if (pressure != 0) resources.releaseExternal(pressure);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(committed, 1);
+        try manager.writeIntents(committed, &.{.{ .key = "accepted", .value = "durable" }}, &.{});
+        try manager.initTransaction(aborted, 2);
+        try manager.writeIntents(aborted, &.{.{ .key = "discarded", .value = "never visible" }}, &.{});
+        // Model a participant that has persisted an externally learned decision
+        // but has not yet published or removed its intents. Preserve the real
+        // intent revision and current record encoding for restart recovery.
+        for ([_]TxnId{ committed, aborted }, [_]TxnStatus{ .committed, .aborted }) |id, status| {
+            var record = try manager.loadTransactionRecord(id);
+            try applyResolveDecision(&record, status, 100);
+            record.retain_terminal = true;
+            try manager.saveTransactionRecord(makeRecordKey(id), record);
+        }
+        var batch = try manager.collectIntentBatch(alloc, committed);
+        defer batch.deinit(alloc);
+        const snapshot = resources.snapshot().memory;
+        pressure = snapshot.hard_limit_bytes - snapshot.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+        try std.testing.expect(!resources.reserveExternal(1));
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = batch.owned_entries, .expected_intent_revision = batch.revision }));
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        try std.testing.expect(!(try manager.loadTransactionRecord(committed)).intents_resolved);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        const recovered = try manager.recoverTransactions(0, 101);
+        try std.testing.expectEqual(@as(u64, 2), recovered.resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 0), recovered.auto_aborted);
+        try std.testing.expect(!try manager.hasAnyIntents(committed));
+        try std.testing.expect(!try manager.hasAnyIntents(aborted));
+        try std.testing.expectEqual(@as(u64, 0), (try manager.recoverTransactions(0, 102)).resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.lsm_wal_write_working_set).used_bytes);
+    }
+    // A second reopen proves recovery durably published the chosen outcomes.
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, "durable", try read.get(committed_key));
+    try std.testing.expectError(error.NotFound, read.get(aborted_key));
+    try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+    try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+    try std.testing.expect((try manager.loadTransactionRecord(committed)).intents_resolved);
+    try std.testing.expect((try manager.loadTransactionRecord(aborted)).intents_resolved);
 }
 
 test "retained transaction reservations admit existing prepares release abort and fence untracked roots" {
@@ -5026,4 +5246,393 @@ test "transaction participant batch releases migration allocations on every fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transaction intent collection original admission rejects every phase and retries exact owned data" {
+    try testIntentCollectionOriginalAdmission(false);
+    try testIntentCollectionOriginalAdmission(true);
+}
+
+fn testIntentCollectionOriginalAdmission(persisted: bool) !void {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-collection-controls");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = if (persisted) 1024 else 64 * 1024 * 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(0x87);
+    try manager.initTransaction(id, 100);
+    const payload = try alloc.alloc(u8, 192 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'q');
+    var writes: [71]WriteIntent = undefined;
+    var keys: [70][8]u8 = undefined;
+    for (writes[0..70], &keys, 0..) |*write, *buffer, i| {
+        const key = try std.fmt.bufPrint(buffer, "k{d:0>4}", .{i});
+        write.* = .{ .key = key, .value = if (i == 0) payload else "small" };
+    }
+    writes[70] = .{ .key = "deleted", .value = null };
+    try manager.writeIntents(id, &writes, &.{});
+    if (persisted) try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+    try std.testing.expectEqual(persisted, backend.runs.count() > 0);
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    var completed: State = .{ .stop_at = std.math.maxInt(usize) };
+    var source: read_control.Payload = .{ .ptr = &completed, .vtable = &.{ .checkpoint = State.check } };
+    var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+
+    try std.testing.expectEqual(@as(usize, 70), snapshot.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
+    try std.testing.expectEqualSlices(u8, payload, snapshot.writes[0].value);
+    try std.testing.expectEqual(snapshot.owned_entries.?[1].value.ptr + 1, snapshot.writes[0].value.ptr);
+    const revision = snapshot.revision;
+    snapshot.deinit(alloc);
+    // Current-scan rotation and cold index/block admission happen only on the
+    // first pass. Warm the physical view before enumerating a stable path.
+    completed.checks = 0;
+    var warmed = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+    const checks = completed.checks;
+    try std.testing.expect(checks > 70);
+    warmed.deinit(alloc);
+    // Fail at every reachable lifetime check, including after probe batches
+    // and partial large copies. TestingAllocator proves exact rollback ownership.
+    for (1..checks + 1) |stop_at| {
+        var stopped: State = .{ .stop_at = stop_at };
+        source.ptr = &stopped;
+        try std.testing.expectError(error.DeadlineExceeded, manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source)));
+        try std.testing.expectEqual(stop_at, stopped.checks);
+    }
+    completed.checks = 0;
+    source.ptr = &completed;
+    var retry = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(revision, retry.revision);
+    try std.testing.expectEqualSlices(u8, payload, retry.writes[0].value);
+    try std.testing.expectEqualSlices(u8, "deleted", retry.deletes[0]);
+}
+
+test "transaction intent collection original admission retains legacy sidecars and prefix scan ownership" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-legacy-collection-controls");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(0x88);
+    try manager.initTransaction(id, 100);
+    try manager.writeIntents(id, &.{ .{ .key = "a", .value = "value-a" }, .{ .key = "b", .value = "value-b" }, .{ .key = "deleted", .value = null } }, &.{});
+    const admission_key = makeSidecarKey(intent_admission_prefix, id);
+    const legacy_key = makeSidecarKey(intent_keys_prefix, id);
+    const legacy = try encodeParticipantList(alloc, &.{ "a", "b", "deleted" });
+    defer alloc.free(legacy);
+    try manager.applyBatch(&.{.{ .key = &legacy_key, .value = legacy }}, &.{&admission_key}, null);
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    // Both pre-admission-format key lists and databases without a sidecar
+    // preserve the same intent revision and payload ownership.
+    for (0..2) |mode| {
+        if (mode == 1) try manager.applyBatch(&.{}, &.{&legacy_key}, null);
+        var state: State = .{};
+        var source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+        var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+
+        try std.testing.expectEqual(@as(usize, 2), snapshot.writes.len);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
+        try std.testing.expectEqualSlices(u8, "value-a", snapshot.writes[0].value);
+        snapshot.deinit(alloc);
+        state.checks = 0;
+        var warmed = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+        const checks = state.checks;
+        warmed.deinit(alloc);
+        for (1..checks + 1) |stop_at| {
+            var stopped: State = .{ .stop_at = stop_at };
+            source.ptr = &stopped;
+            try std.testing.expectError(error.DeadlineExceeded, manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source)));
+        }
+        const Allocation = struct {
+            fn run(failing: Allocator, owner: *TxnManager, txn: TxnId, control: read_control.Port) !void {
+                var owned = try owner.collectIntentBatchWithAdmission(failing, txn, control);
+                defer owned.deinit(failing);
+            }
+        };
+        state.checks = 0;
+        source.ptr = &state;
+        try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ &manager, id, read_control.Port.init(&source) });
+    }
+}
+
+test "transaction intent collection original admission scopes bound payload and backend contention" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-scope-admission");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(alloc, path, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const Target = enum { payload, backend };
+    const Kind = enum { read, probe, current };
+    const State = struct {
+        store: *DocStore,
+        backend: *lsm_backend.Backend,
+        target: Target,
+        expire: bool,
+        expired: bool = false,
+        waits: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            if (self.expire) {
+                self.expired = true;
+            } else self.release();
+        }
+        fn release(self: *@This()) void {
+            switch (self.target) {
+                .payload => self.store.payload_policy_mutex.unlock(std.testing.io),
+                .backend => self.backend.mu.unlock(),
+            }
+        }
+        fn open(owner: *backend_erased.Store, kind: Kind, control: read_control.Port) !void {
+            switch (kind) {
+                .read => {
+                    var scope = try owner.beginReadWithAdmission(.retain, control);
+                    defer scope.abort();
+                },
+                .probe => {
+                    var scope = try owner.beginProbeWithAdmission(.retain, control);
+                    defer scope.abort();
+                },
+                .current => {
+                    var scope = try owner.beginCurrentScanWithAdmission(control);
+                    defer scope.abort();
+                },
+            }
+        }
+    };
+    for (std.enums.values(Target)) |target| for (std.enums.values(Kind)) |kind| for ([_]bool{ false, true }) |expire| {
+        var state: State = .{ .store = &store, .backend = &backend, .target = target, .expire = expire };
+        const locked = switch (target) {
+            .payload => store.payload_policy_mutex.tryLock(),
+            .backend => backend.mu.tryLock(),
+        };
+        try std.testing.expect(locked);
+        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+        if (expire) {
+            try std.testing.expectError(error.DeadlineExceeded, State.open(&manager.store, kind, read_control.Port.init(&source)));
+            // A rejected waiter cannot release the fixture's lock ownership.
+            const stolen = switch (target) {
+                .payload => store.payload_policy_mutex.tryLock(),
+                .backend => backend.mu.tryLock(),
+            };
+            try std.testing.expect(!stolen);
+            state.release();
+        } else try State.open(&manager.store, kind, read_control.Port.init(&source));
+        try std.testing.expectEqual(@as(usize, 1), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    };
+
+    // An already-open live probe must use the same bounded backend capture
+    // lock. Its output references are discarded on expiry, with no fresh scope.
+    try store.put("probe:scope", "value");
+    for ([_]bool{ false, true }) |expire| {
+        {
+            var state: State = .{ .store = &store, .backend = &backend, .target = .backend, .expire = expire };
+            const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+            const control = read_control.Port.init(&source);
+            var probe = try manager.store.beginProbeWithAdmission(.retain, control);
+            defer probe.abort();
+            try std.testing.expect(backend.mu.tryLock());
+            var values: [1]?[]const u8 = .{null};
+            if (expire) {
+                try std.testing.expectError(error.DeadlineExceeded, probe.getManySortedWithAdmission(&.{"probe:scope"}, &values, control));
+                try std.testing.expect(values[0] == null);
+                try std.testing.expect(!backend.mu.tryLock());
+                state.release();
+            } else {
+                try probe.getManySortedWithAdmission(&.{"probe:scope"}, &values, control);
+                try std.testing.expectEqualStrings("value", values[0].?);
+            }
+            try std.testing.expectEqual(@as(usize, 1), state.waits);
+        }
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    }
+    // Reject unsupported CPU transfer before taking any payload/backend lease.
+    const Cpu = struct {
+        fn transfer(_: *anyopaque) !void {
+            @panic("CPU ownership transferred under an incomplete service graph");
+        }
+    };
+    var state: State = .{ .store = &store, .backend = &backend, .target = .backend, .expire = false };
+    const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait }, .execution_wait = .{ .ptr = &state, .begin = Cpu.transfer, .end = Cpu.transfer } };
+    for (std.enums.values(Kind)) |kind| {
+        try std.testing.expectError(error.ExecutionWaitUnsupported, State.open(&manager.store, kind, read_control.Port.init(&source)));
+        try std.testing.expectEqual(@as(usize, 0), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    }
+}
+
+test "transaction intent collection original admission lazy layout builder wait preserves pinned epoch" {
+    const alloc = std.testing.allocator;
+    const runtime = @import("lsm_backend/runtime.zig");
+    const storage = @import("lsm_backend/storage_io.zig");
+    for ([_]bool{ false, true }) |with_io| for ([_]bool{ false, true }) |expire| {
+        const path = try tempTestPath(alloc, "txn-layout-builder");
+        defer alloc.free(path);
+        defer cleanupTestDir(path);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .read_runtime = if (with_io) storage.ReadRuntime.init(std.testing.io) else null });
+        defer backend.close();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "before", "old");
+            try write.commit();
+        }
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.unlockWithReclamation();
+        const version = try backend.createReadVersionFromDirectory();
+        _ = version.references.fetchAdd(1, .monotonic);
+        defer version.release(&backend);
+        const captured_count = version.directory.?.count();
+        const locked = if (with_io) version.build_mu.tryLock() else version.build_fallback_mu.tryLock();
+        try std.testing.expect(locked);
+        const State = struct {
+            backend: *lsm_backend.Backend,
+            version: *runtime.ReadVersion,
+            with_io: bool,
+            expire: bool,
+            expired: bool = false,
+            waits: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expired) return error.DeadlineExceeded;
+            }
+            fn unlock(self: *@This()) void {
+                if (self.with_io) self.version.build_mu.unlock(std.testing.io) else self.version.build_fallback_mu.unlock();
+            }
+            fn wait(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.waits += 1;
+                // The actual builder lock wait has released the backend lock.
+                try std.testing.expect(self.backend.mu.tryLock());
+                self.backend.mu.unlock();
+                if (self.expire) {
+                    self.expired = true;
+                } else {
+                    var write = try self.backend.beginWrite();
+                    errdefer write.abort();
+                    try write.put(.{}, "after", "new");
+                    try write.commit();
+                    try self.backend.flushBufferedWritesWithOptions(.{ .compact = false });
+                    self.unlock();
+                }
+            }
+        };
+        var state: State = .{ .backend = &backend, .version = version, .with_io = with_io, .expire = expire };
+        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+        if (expire) {
+            try std.testing.expectError(error.DeadlineExceeded, backend.prepareReadVersionWithAdmission(version, read_control.Port.init(&source)));
+            try std.testing.expect(!version.prepared);
+            state.unlock();
+        } else {
+            try backend.prepareReadVersionWithAdmission(version, read_control.Port.init(&source));
+            try std.testing.expect(version.prepared);
+            try std.testing.expectEqual(captured_count, version.runs.len);
+            try std.testing.expect(backend.runs.count() > captured_count);
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        // Even rejected preparation returns the caller's backend lock.
+        try std.testing.expect(!backend.mu.tryLock());
+    };
+}
+
+test "transaction intent collection original admission lazy projection rejects every checkpoint and allocation" {
+    const alloc = std.testing.allocator;
+    const runtime = @import("lsm_backend/runtime.zig");
+    const path = try tempTestPath(alloc, "txn-layout-projection");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .compact_threshold_runs = 1024, .l0_soft_limit_runs = 1024, .l0_hard_limit_runs = 2048 });
+    defer backend.close();
+    for (0..8) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+    }
+    try std.testing.expect(backend.runs.count() >= 8);
+    try std.testing.expect(backend.mu.tryLock());
+    const version = try backend.createReadVersionFromDirectory();
+    _ = version.references.fetchAdd(1, .monotonic);
+    backend.mu.unlock();
+    defer {
+        const locked = runtime.lockBackend(lsm_backend.Backend, &backend);
+        version.release(&backend);
+        runtime.unlockBackend(lsm_backend.Backend, &backend, locked);
+    }
+    const directory = version.directory.?;
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    var state: State = .{};
+    var source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const projection = try runtime.ReadVersion.createFromDirectoryWithAdmission(alloc, directory, read_control.Port.init(&source));
+    const checks = state.checks;
+    try std.testing.expect(checks > directory.count());
+    try std.testing.expectEqual(directory.count(), projection.runs.len);
+    projection.discardProjection();
+    for (1..checks + 1) |stop_at| {
+        var stopped: State = .{ .stop_at = stop_at };
+        source.ptr = &stopped;
+        try std.testing.expectError(error.DeadlineExceeded, runtime.ReadVersion.createFromDirectoryWithAdmission(alloc, directory, read_control.Port.init(&source)));
+        try std.testing.expectEqual(stop_at, stopped.checks);
+        try std.testing.expectEqual(@as(usize, 8), directory.count());
+    }
+    const Allocation = struct {
+        fn run(failing: Allocator, root: *@import("lsm_backend/run_directory.zig").Directory, control: read_control.Port) !void {
+            const result = try runtime.ReadVersion.createFromDirectoryWithAdmission(failing, root, control);
+            defer result.discardProjection();
+        }
+    };
+    state.checks = 0;
+    source.ptr = &state;
+    try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ directory, read_control.Port.init(&source) });
 }

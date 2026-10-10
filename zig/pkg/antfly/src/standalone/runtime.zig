@@ -674,11 +674,29 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
+        try antfly.common.request_admission.runnable_metrics.appendPrometheusMetrics(writer, handler.runnable);
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
             .capacity = handler.query_capacity,
             .in_flight = handler.query_in_flight,
             .peak_in_flight = handler.query_peak_in_flight,
             .rejected_total = handler.query_rejected_total,
+            .configured_capacity = handler.query_configured_capacity,
+            .queued = handler.query_queued,
+            .queued_bytes = handler.query_queued_bytes,
+            .waited_total = handler.query_waited_total,
+            .wait_ns_total = handler.query_wait_ns_total,
+            .wait_completed_total = handler.query_wait_completed_total,
+            .wait_buckets = handler.query_wait_buckets,
+            .expired_total = handler.query_expired_total,
+            .cancelled_total = handler.query_cancelled_total,
+            .waiting = .{ .max_queued_requests = handler.query_queue_capacity, .max_queued_bytes = handler.query_queue_bytes, .max_wait_ms = handler.query_wait_ms },
+            .policy_version = handler.query_policy_version,
+            .policy_retired_total = handler.query_policy_retired_total,
+            .retiring_waiters = handler.query_retiring_waiters,
+            .draining = handler.query_draining,
+            .suspended = handler.query_suspended,
+            .quiescent = handler.query_quiescent,
+            .sql_waiting_enabled = handler.query_sql_waiting_enabled,
         });
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
             .capacity = handler.write_capacity,
@@ -692,6 +710,15 @@ const StandaloneHealthSource = struct {
             .peak_in_flight = handler.inference_peak_in_flight,
             .rejected_total = handler.inference_rejected_total,
         });
+        inline for (.{ "foreground", "control", "retained" }, 0..) |name, index| {
+            const memory = handler.memory[index];
+            const prefix = "antfly_api_memory_" ++ name;
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_enabled", "gauge", "API allocation envelope installed", @intFromBool(memory.enabled));
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_limit_bytes", "gauge", "API allocation envelope ceiling", memory.limit_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_used_bytes", "gauge", "Currently reserved API allocation bytes", memory.used_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_peak_bytes", "gauge", "Peak API allocation reservations", memory.peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_rejected_total", "counter", "API allocation reservations rejected by ceiling", memory.rejected_total);
+        }
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
@@ -4634,6 +4661,15 @@ pub fn runFromIterator(
         return err;
     };
     const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
+        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
+    const storage_runnable_port = if (runnable_node_owner) |*owner| try owner.executionPort() else null;
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
@@ -4645,6 +4681,7 @@ pub fn runFromIterator(
                 .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
             },
             .memory_limit_bytes = process_memory_limit_bytes,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -4655,7 +4692,7 @@ pub fn runFromIterator(
         try storage_kernel_context.configureNativeQueries(retained_setup);
     }
 
-    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{ .runnable_owner = storage_runnable_port });
     defer node_backend_runtime.deinit();
     var native_query_repository: ?@import("../api/native_query_repository.zig").Repository = null;
     defer if (native_query_repository) |*repository| {
@@ -5281,6 +5318,10 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .runnable_owner_handle = if (runnable_node_owner) |owner| owner.handle else null,
+            .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
+            .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -5384,6 +5425,7 @@ pub fn runFromIterator(
         // embedded provider. Drain them while the node is valid, then release
         // tokenizer reservations while DataServer's ResourceManager is valid.
         // The earlier data_server.deinit defer performs final storage teardown.
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         data_server.quiesceExternalProviderUsersWithDeadline(supervisor.deadline()) catch |err| {
             std.log.err("standalone provider shutdown barrier failed err={s}", .{@errorName(err)});
             @panic("standalone provider shutdown barrier failed");
@@ -5441,10 +5483,15 @@ pub fn runFromIterator(
         .observe_prompt_cache = observeInferencePromptCache,
         .observe_tokenizer_cache = observeInferenceTokenizerCache,
     };
+    var inference_runnable_port = if (runnable_node_owner) |*owner|
+        try owner.executionPort()
+    else
+        null;
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
         .handle = antfly_node,
         .resource_budget = &inference_resource_budget,
+        .runnable_owner = if (inference_runnable_port) |*port| port else null,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
@@ -5521,7 +5568,7 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
-    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    const public_http_config = api_server.configurePublicHttpTransport(publicHttpServerConfig(bind_host, bind_port));
     var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
     defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
@@ -5576,6 +5623,7 @@ pub fn runFromIterator(
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
+            inference_runnable_port,
         })
     else
         control_io.concurrent(serveUnifiedWithLinkedInference, .{
@@ -5591,12 +5639,14 @@ pub fn runFromIterator(
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
+            inference_runnable_port,
         })) catch |err| {
         std.log.err("standalone startup failed step=schedule_unified_http err={}", .{err});
         return err;
     };
     var future_awaited = false;
     defer if (!future_awaited) {
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         unified_lifecycle.stop();
         _ = unified_future.await(control_io);
     };
@@ -5644,6 +5694,7 @@ pub fn runFromIterator(
     }
 
     const process_shutdown_deadline = supervisor.deadline();
+    if (runnable_node_owner) |*owner| try owner.close();
     unified_lifecycle.shutdown(process_shutdown_deadline);
     _ = unified_future.await(control_io);
     future_awaited = true;
@@ -5734,8 +5785,9 @@ fn serveUnifiedWithInference(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -5758,8 +5810,9 @@ fn serveUnifiedWithLinkedInference(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, register_inference_routes, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime, runnable_owner) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -5783,9 +5836,13 @@ fn serveUnifiedInner(
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) !void {
+    var cleanup_owner = if (runnable_owner) |port| try @import("antfly_runtime_abi").http_cleanup.Owner.init(port) else null;
+    defer if (cleanup_owner) |*owner| owner.deinit();
     var server_config = public_http_config;
     server_config.http_runtime = http_runtime;
+    if (cleanup_owner) |*owner| server_config.cleanup_execution = owner.view();
     var server = httpx.Server.initWithConfig(alloc, io, server_config);
     defer server.deinit();
     var route_context = StandaloneHttpContext{
@@ -5816,6 +5873,7 @@ fn serveUnifiedInner(
                 antfly_node,
                 functions,
                 &linked_inference_routes,
+                runnable_owner,
             );
         }
     }
@@ -5885,6 +5943,7 @@ const LinkedInferenceRoute = struct {
     kernel_route_handle: *anyopaque,
     request_body: runtime_http_abi.RequestBodyMode,
     streaming_response: bool,
+    runnable_owner: ?inference_bridge.runnable_abi.Owner = null,
 };
 
 fn registerLinkedInferenceManifest(
@@ -5893,6 +5952,7 @@ fn registerLinkedInferenceManifest(
     inference_handle: *anyopaque,
     functions: *const inference_bridge.FunctionTable,
     owned_routes: *std.ArrayListUnmanaged(*LinkedInferenceRoute),
+    runnable_owner: ?inference_bridge.runnable_abi.Owner,
 ) !void {
     var entries_ptr: ?[*]const inference_bridge.RouteManifestEntry = null;
     var entries_len: usize = 0;
@@ -5912,6 +5972,7 @@ fn registerLinkedInferenceManifest(
             .kernel_route_handle = entry.route_handle,
             .request_body = entry.request_body,
             .streaming_response = entry.streaming_response != 0,
+            .runnable_owner = runnable_owner,
         };
         try owned_routes.append(alloc, route);
         errdefer _ = owned_routes.pop();
@@ -5925,9 +5986,91 @@ fn registerLinkedInferenceManifest(
     }
 }
 
+const LinkedInferenceHttpOutputControl = struct {
+    fn now(context: *const httpx.Context) u64 {
+        if (context.application_deadline_io) |clock_io| return @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
+        return platform_time.monotonicNs();
+    }
+    fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+        if (context.isCancellationRequested()) return error.Canceled;
+        if (context.application_deadline_ns) |deadline| if (now(context) >= deadline) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        const context: *const httpx.Context = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        const deadline = context.application_deadline_ns orelse return null;
+        const ns = deadline -| now(context);
+        return @divTrunc(ns, std.time.ns_per_ms) + @intFromBool(ns % std.time.ns_per_ms != 0);
+    }
+    fn view(context: *httpx.Context) httpx.socket.WriteControl {
+        return .{ .ptr = context, .check_fn = check, .remaining_ms_fn = remaining };
+    }
+};
+
+fn linkedInferenceHttpNativeDeadline(context: *const httpx.Context) ?u64 {
+    const deadline = context.application_deadline_ns orelse return null;
+    const clock_io = context.application_deadline_io orelse return deadline;
+    const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
+    // Convert the remaining original budget once at the native ABI boundary.
+    // Keep the original clock on the owner; never refresh its absolute fence.
+    return platform_time.monotonicNs() +| (deadline -| now);
+}
+
 fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const route: *const LinkedInferenceRoute = @ptrCast(@alignCast(context.route_data orelse return error.InferenceRuntimeUnavailable));
     const source_headers = context.request.headers.iterator();
+    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context, .write_control = LinkedInferenceHttpOutputControl.view(context) };
+    const native_deadline_ns = linkedInferenceHttpNativeDeadline(context);
+    var execution_handle: ?*anyopaque = null;
+    const io_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&context.io);
+    const clock_borrow = if (context.application_deadline_io) |clock_io| @import("antfly_runtime_abi").native_abi.IoBorrow.init(&clock_io) else null;
+    if (route.runnable_owner) |owner| {
+        var retained_bytes: u64 = @sizeOf(LinkedInferenceRoute);
+        retained_bytes +|= context.request.uri.path.len;
+        if (context.request.uri.query) |query| retained_bytes +|= query.len;
+        if (context.request.body) |body| retained_bytes +|= body.len;
+        for (source_headers) |header| {
+            retained_bytes +|= header.name.len;
+            retained_bytes +|= header.value.len;
+            retained_bytes +|= @sizeOf(runtime_http_abi.HeaderView);
+        }
+        for (context.params) |param| {
+            retained_bytes +|= param.name.len;
+            retained_bytes +|= param.value.len;
+            retained_bytes +|= @sizeOf(runtime_http_abi.RouteParamView);
+        }
+        const status = owner.start(owner.context, &.{
+            .io = &io_borrow,
+            .clock_io = if (clock_borrow) |*clock| clock else null,
+            .class = @backingInt(inference_bridge.runnable_abi.Class.inference),
+            .slots = 1,
+            .deadline_ns = context.application_deadline_ns orelse 0,
+            .has_deadline = @intFromBool(context.application_deadline_ns != null),
+            .native_deadline = @intFromBool(context.application_deadline_io == null),
+            .cancellation = transport.cancellation(),
+            .retained_bytes = retained_bytes,
+            .out_handle = &execution_handle,
+        });
+        if (!status.isOk()) {
+            const err = inference_bridge.errorFromStatus(status);
+            if (err == error.QueueFull or err == error.ResourceTemporarilyUnavailable) {
+                var overloaded = httpx.Response.init(context.allocator, 503);
+                errdefer overloaded.deinit();
+                try overloaded.headers.append("Content-Type", "application/json");
+                try overloaded.headers.append("Retry-After", "1");
+                overloaded.body = "{\"error\":\"inference execution capacity exceeded\"}";
+                return overloaded;
+            }
+            return err;
+        }
+        if (execution_handle == null) return error.RuntimeBoundaryFailure;
+    }
+    defer if (execution_handle) |handle| route.runnable_owner.?.finish(handle);
+    var runnable = if (execution_handle) |handle|
+        try inference_bridge.runnable_abi.Borrowed.fromOwner(route.runnable_owner.?, handle, 1, .inference)
+    else
+        null;
     const headers = try context.allocator.alloc(runtime_http_abi.HeaderView, source_headers.len);
     defer context.allocator.free(headers);
     for (source_headers, 0..) |header, i| {
@@ -5964,7 +6107,6 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .authorization = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Authorization")),
         .content_type = runtime_http_abi.OptionalBytes.init(context.request.headers.get("Content-Type")),
     };
-    var transport = @import("antfly_runtime_abi").http_bridge.Outbound{ .context = context };
     const body_source = if (route.request_body == .buffered) transport.bodySource() else runtime_http_abi.RequestBodySource{};
     var response_handle: ?*anyopaque = null;
     var response_view: runtime_http_abi.HttpResponseView = undefined;
@@ -5977,6 +6119,9 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .stream = if (route.streaming_response) transport.stream() else .{},
         .out_response_handle = &response_handle,
         .out_response = &response_view,
+        .deadline_ns = native_deadline_ns orelse 0,
+        .has_deadline = @intFromBool(native_deadline_ns != null),
+        .runnable = if (runnable) |*borrow| borrow else null,
     });
     if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
@@ -5994,6 +6139,10 @@ fn linkedInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     }
     response.body = try context.allocator.dupe(u8, response_view.body.slice());
     response.body_owned = true;
+    if (execution_handle) |handle| {
+        const completion = route.runnable_owner.?.checkpoint(handle);
+        if (!completion.isOk()) return inference_bridge.errorFromStatus(completion);
+    }
     return response;
 }
 
@@ -14739,6 +14888,365 @@ test "system catalog offline migration publishes rows and fences server startup"
     defer reopened.deinit();
     try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
+}
+
+test "standalone inference response cancellation retires host ownership" {
+    const Consumer = struct {
+        fn invoke(handle: *anyopaque, cancellation: runtime_http_abi.CancellationView) !void {
+            var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle };
+            defer std.debug.assert(lifetime.activeCallCount() == 0);
+            const response = try inference_provider.invokeEmbeddedInferenceRoute(&lifetime, std.testing.allocator, .post, "generate", "{}", 0, cancellation, .{});
+            defer std.testing.allocator.free(response.body);
+        }
+    };
+    try inference_host.testCanceledHttpResponseConsumer(Consumer.invoke);
+}
+
+test "runnable execution context adapters preserve parent authority" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    const create = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .init("."),
+        .ml_dir = .init("."),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = std.math.maxInt(usize),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
+        .executor = .init(&io),
+        .out_handle = &handle,
+    };
+    handle = try inference_host.linkedInferenceCreate(&create);
+    defer inference_host.linkedInferenceDestroy(handle.?);
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle.? };
+    const Parent = struct {
+        checks: usize = 0,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+        }
+        fn park(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not park");
+        }
+        fn enter(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not transfer");
+        }
+    };
+    var parent = Parent{};
+    const context = antfly.inference.RequestContext{
+        .io = io,
+        .deadline_ns = null,
+        .runnable = .{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter },
+    };
+    const embedding = antfly.inference.managed_embedder.EmbeddingRequestContext{ .request = context };
+    const parts = [_]antfly.template.ContentPart{.{ .binary = .{ .mime_type = "image/png", .data = &.{1} } }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseTextsWithContext(&lifetime, alloc, "unused", &.{"text"}, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDensePartsWithContext(&lifetime, alloc, "unused", &parts, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankTextsWithContext(&lifetime, alloc, "unused", "query", &.{"text"}, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankDocumentsWithContext(&lifetime, alloc, "unused", "query", &.{&parts}, context));
+    const config = chunking_types.Config{ .provider = .antfly };
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .text = "text" }, config, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .binary = .{ .mime_type = "audio/wav", .data = &.{1} } }, config, context));
+    const rasters = [_]antfly.readers.RasterImage{.{ .bytes = &.{ 0, 0, 0, 255 }, .width = 1, .height = 1, .stride_bytes = 4 }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseRasters(&lifetime, alloc, "unused", &rasters, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{}", context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{}", context));
+    try std.testing.expectEqual(@as(usize, 9), parent.checks);
+    const AllowedParent = struct {
+        class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
+        parked: bool = false,
+        checks: usize = 0,
+        parks: usize = 0,
+        enters: usize = 0,
+        reject_return: bool = false,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.checks += 1;
+            return .{};
+        }
+        fn park(raw: *anyopaque, wait: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked and wait == @backingInt(inference_bridge.runnable_abi.Wait.resource));
+            self.parked = true;
+            self.parks += 1;
+            return .{};
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.enters += 1;
+            if (class == @backingInt(inference_bridge.runnable_abi.Class.query) and self.reject_return)
+                return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+            self.parked = false;
+            self.class = class;
+            return .{};
+        }
+    };
+    for ([_]bool{ false, true }) |reject_return| {
+        for ([_]bool{ false, true }) |decide| {
+            var allowed = AllowedParent{ .reject_return = reject_return };
+            const granted = antfly.inference.RequestContext{
+                .io = io,
+                .deadline_ns = null,
+                .runnable = .{ .context = &allowed, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = AllowedParent.check, .park = AllowedParent.park, .enter = AllowedParent.enter },
+            };
+            // Malformed requests reach the real HTTP handler through the new
+            // provider operation. Preserve its status mapping, then require
+            // parent authority before publishing even this error response.
+            if (decide) {
+                try std.testing.expectError(if (reject_return) error.Forbidden else error.DecisionUpstreamFailure, inference_provider.inferenceProviderDecideJson(&lifetime, alloc, "{", granted));
+            } else {
+                try std.testing.expectError(if (reject_return) error.Forbidden else error.GenerateRequestFailed, inference_provider.inferenceProviderGenerateJson(&lifetime, alloc, "{", granted));
+            }
+            try std.testing.expectEqual(@as(usize, 2), allowed.parks);
+            try std.testing.expectEqual(@as(usize, 2), allowed.enters);
+            try std.testing.expectEqual(reject_return, allowed.parked);
+            try std.testing.expect(allowed.checks >= 2);
+            try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+}
+
+test "runnable execution context adapters install immutable production broker admission" {
+    const Ports = struct {
+        refs: usize = 0,
+        starts: usize = 0,
+        finishes: usize = 0,
+        active: bool = false,
+        parked: bool = false,
+        reject_start: bool = false,
+        reject_return: bool = false,
+        parks: usize = 0,
+        enters: usize = 0,
+        deadline_ns: ?u64 = null,
+        native_deadline: bool = false,
+        has_clock_io: bool = false,
+        fn retain(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return .ok;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn budgetRetain(raw: *anyopaque) callconv(.c) u8 {
+            _ = retain(raw);
+            return 1;
+        }
+        fn start(raw: *anyopaque, options: *const inference_bridge.runnable_abi.Start) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            options.validate() catch |err| return inference_bridge.statusFromError(err);
+            std.debug.assert(!self.active and options.slots == 1 and options.class == @backingInt(inference_bridge.runnable_abi.Class.inference));
+            self.deadline_ns = if (options.has_deadline != 0) options.deadline_ns else null;
+            self.native_deadline = options.native_deadline != 0;
+            self.has_clock_io = options.clock_io != null;
+            if (options.clock_io) |clock| _ = clock.receive() catch |err| return inference_bridge.statusFromError(err);
+            if (self.reject_start) return inference_bridge.statusFromError(error.QueueFull);
+            self.active = true;
+            self.starts += 1;
+            options.out_handle.* = self;
+            return .ok;
+        }
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, kind: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active and !self.parked and kind == @backingInt(inference_bridge.runnable_abi.Wait.resource));
+            self.parked = true;
+            self.parks += 1;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active and self.parked and class == @backingInt(inference_bridge.runnable_abi.Class.inference));
+            self.enters += 1;
+            if (self.reject_return and self.enters == 2)
+                return inference_bridge.statusFromError(error.Forbidden);
+            self.parked = false;
+            return .ok;
+        }
+        fn finish(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            self.active = false;
+            self.parked = false;
+            self.finishes += 1;
+        }
+        fn reserve(_: *anyopaque, _: *const inference_bridge.AdmissionAmounts, out: *usize) callconv(.c) inference_bridge.Status {
+            out.* = 1;
+            return .ok;
+        }
+        fn retainAdmission(_: *anyopaque, _: usize, _: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+            return .ok;
+        }
+        fn releaseAdmission(_: *anyopaque, _: usize) callconv(.c) void {}
+        fn observe(_: *anyopaque, _: usize, _: u64, _: u64) callconv(.c) u8 {
+            return 1;
+        }
+    };
+    var ports = Ports{};
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    const create = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .init("."),
+        .ml_dir = .init("."),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = std.math.maxInt(usize),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
+        .executor = .init(&io),
+        .out_handle = &handle,
+    };
+    handle = try inference_host.linkedInferenceCreate(&create);
+    var destroyed = false;
+    defer if (!destroyed) inference_host.linkedInferenceDestroy(handle.?);
+    var budget = inference_bridge.ResourceBudget{ .abi_version = inference_bridge.abi_version, .context = &ports, .retain_context = Ports.budgetRetain, .release_context = Ports.release, .reserve_admission = Ports.reserve, .retain_admission = Ports.retainAdmission, .release_admission = Ports.releaseAdmission, .observe_prompt_cache = Ports.observe, .observe_tokenizer_cache = Ports.observe };
+    var owner = inference_bridge.runnable_abi.Owner{ .context = &ports, .retain = Ports.retain, .release = Ports.release, .start = Ports.start, .checkpoint = Ports.check, .park = Ports.park, .enter = Ports.enter, .finish = Ports.finish };
+    const context = inference_bridge.ConfigureContext{ .abi_version = inference_bridge.abi_version, .handle = handle.?, .resource_budget = &budget, .runnable_owner = &owner };
+    try inference_host.linkedInferenceConfigure(&context);
+    const state: *inference_host.LinkedInferenceState = @ptrCast(@alignCast(handle.?));
+    try std.testing.expect(state.executor_admission_provider != null and state.runnable_owner != null);
+    try state.node.testExecutorAdmission();
+    try std.testing.expectEqual(@as(usize, 2), ports.starts);
+    try std.testing.expectEqual(@as(usize, 2), ports.finishes);
+    try std.testing.expect(!ports.active);
+    try std.testing.expectError(error.InvalidRunnableTransition, state.node.configureExecutorAdmission(state.executor_admission_provider.?.admission()));
+    try std.testing.expectError(error.ExternalResourceBudgetsAlreadyConfigured, inference_host.linkedInferenceConfigure(&context));
+    // Exercise the actual public frontend and linked archive handler, including
+    // root admission before marshalling and authority before response copying.
+    const functions = try linkedInferenceApi(inference_bridge.Capability.route_manifest);
+    // Opaque handles belong to the module which created them. The inline
+    // broker fixture above has a different concrete Node layout from the
+    // production archive, so create the frontend handle through that archive.
+    var frontend_handle: ?*anyopaque = null;
+    var frontend_create = create;
+    frontend_create.out_handle = &frontend_handle;
+    const frontend_create_status = functions.create(&frontend_create);
+    if (!frontend_create_status.isOk()) return inference_bridge.errorFromStatus(frontend_create_status);
+    var frontend_destroyed = false;
+    defer if (!frontend_destroyed) functions.destroy(frontend_handle.?);
+    var frontend_configure = context;
+    frontend_configure.handle = frontend_handle.?;
+    const frontend_configure_status = functions.configure(&frontend_configure);
+    if (!frontend_configure_status.isOk()) return inference_bridge.errorFromStatus(frontend_configure_status);
+    var entries: ?[*]const inference_bridge.RouteManifestEntry = null;
+    var entries_len: usize = 0;
+    const manifest_status = functions.route_manifest(&.{ .abi_version = inference_bridge.abi_version, .handle = frontend_handle.?, .out_entries = &entries, .out_len = &entries_len });
+    if (!manifest_status.isOk()) return inference_bridge.errorFromStatus(manifest_status);
+    const generate = found: {
+        for (entries.?[0..entries_len]) |entry| {
+            if (entry.method == .post and std.mem.eql(u8, entry.path.slice(), "/ai/v1/generate")) break :found entry;
+        }
+        return error.MissingGenerateRoute;
+    };
+    var route = LinkedInferenceRoute{ .functions = functions, .kernel_route_handle = generate.route_handle, .request_body = generate.request_body, .streaming_response = generate.streaming_response != 0, .runnable_owner = owner };
+    var request = try httpx.Request.init(alloc, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    try request.headers.append("Content-Type", "application/json");
+    request.body = "{";
+    var http_context = httpx.Context.init(alloc, io, &request);
+    defer http_context.deinit();
+    http_context.route_data = &route;
+    http_context.application_deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s;
+    ports.reject_start = true;
+    var overloaded = try linkedInferenceHttpHandler(&http_context);
+    defer overloaded.deinit();
+    try std.testing.expectEqual(@as(u16, 503), overloaded.status.code);
+    try std.testing.expectEqualStrings("1", overloaded.headers.get("Retry-After").?);
+    try std.testing.expectEqual(@as(usize, 2), ports.starts);
+    try std.testing.expect(!ports.active);
+    ports.reject_start = false;
+    for ([_]bool{ false, true }) |reject_return| {
+        ports.reject_return = reject_return;
+        ports.parks = 0;
+        ports.enters = 0;
+        if (reject_return) {
+            try std.testing.expectError(error.Forbidden, linkedInferenceHttpHandler(&http_context));
+        } else {
+            var response = try linkedInferenceHttpHandler(&http_context);
+            defer response.deinit();
+            try std.testing.expect(response.status.code >= 400);
+            try std.testing.expect(response.body != null and response.body.?.len > 0);
+        }
+        try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
+        try std.testing.expect(ports.native_deadline and !ports.has_clock_io);
+        try std.testing.expectEqual(@as(usize, 2), ports.parks);
+        try std.testing.expectEqual(@as(usize, 2), ports.enters);
+        try std.testing.expectEqual(ports.starts, ports.finishes);
+        try std.testing.expect(!ports.active);
+    }
+    ports.reject_return = false;
+    ports.parks = 0;
+    ports.enters = 0;
+    http_context.application_deadline_ns = 1;
+    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    try std.testing.expect(!ports.active);
+    // An executor-clock deadline has its original authority on the owner,
+    // while the native provider ABI receives only the remaining budget.
+    http_context.application_deadline_io = io;
+    http_context.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 60 * std.time.ns_per_s;
+    ports.parks = 0;
+    ports.enters = 0;
+    const before_native = platform_time.monotonicNs();
+    const converted = linkedInferenceHttpNativeDeadline(&http_context).?;
+    try std.testing.expect(converted > before_native);
+    try std.testing.expect(converted <= platform_time.monotonicNs() +| 60 * std.time.ns_per_s);
+    var clock_response = try linkedInferenceHttpHandler(&http_context);
+    defer clock_response.deinit();
+    try std.testing.expect(clock_response.status.code >= 400);
+    try std.testing.expectEqual(http_context.application_deadline_ns, ports.deadline_ns);
+    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
+    try std.testing.expectEqual(@as(usize, 2), ports.parks);
+    try std.testing.expectEqual(@as(usize, 2), ports.enters);
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    http_context.application_deadline_ns = 1;
+    ports.parks = 0;
+    ports.enters = 0;
+    try std.testing.expect(linkedInferenceHttpNativeDeadline(&http_context).? <= platform_time.monotonicNs());
+    try std.testing.expectError(error.Timeout, linkedInferenceHttpHandler(&http_context));
+    try std.testing.expect(!ports.native_deadline and ports.has_clock_io);
+    try std.testing.expectEqual(ports.starts, ports.finishes);
+    try std.testing.expect(!ports.active);
+    functions.destroy(frontend_handle.?);
+    frontend_destroyed = true;
+    inference_host.linkedInferenceDestroy(handle.?);
+    destroyed = true;
+    try std.testing.expectEqual(@as(usize, 0), ports.refs);
 }
 
 test "standalone table storage defaults persist for object tables across reopen and recreate" {

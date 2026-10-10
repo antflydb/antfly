@@ -16,6 +16,7 @@
 const embedded = @import("embedded_db_surface");
 
 pub const OpenOptions = embedded.OpenOptions;
+pub const OperationContext = embedded.OperationContext;
 pub const types = embedded.types;
 pub const Profile = embedded.Profile;
 pub const Capabilities = embedded.Capabilities;

@@ -22,6 +22,7 @@ const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
 
@@ -462,6 +463,12 @@ pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
+    /// The node owner is retained before any runtime work can start and
+    /// released after every lane, recurring callback and durable job joins.
+    /// Callbacks must explicitly adopt CPU stages and mandatory reentry.
+    runnable_owner: ?runnable_abi.Owner = null,
+    /// Includes pending construction and detached callbacks until physical join.
+    maintenance_registration_limit: usize = MaintenanceScheduler.default_max_registrations,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Value-semantic executor limits. Separate lanes preserve isolation for
     /// nested submissions; validation keeps their simultaneously activatable
@@ -957,6 +964,7 @@ const OwnerRegistry = struct {
 };
 
 pub const BackendRuntime = struct {
+    runnable_owner_lease: ?runnable_abi.Lease = null,
     /// Borrowed until every physical owner and retained reader has closed.
     query_cut_repository: ?@import("db/native_query_cut_repository.zig").Port = null,
     alloc: Allocator,
@@ -976,6 +984,8 @@ pub const BackendRuntime = struct {
     threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
+    maintenance_registration_limit: usize,
+    shared_sql_workers: [3]SharedSqlPool = @splat(.{}),
     /// Specialized executor lanes are activated on first use. The runtime is
     /// their sole owner; this mutex serializes first publication and teardown
     /// never starts until the corresponding public lease gates are closed.
@@ -1016,8 +1026,12 @@ pub const BackendRuntime = struct {
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
         try config.lane_limits.validate();
+        if (config.maintenance_registration_limit == 0) return error.InvalidMaintenanceCapacity;
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
+
+        var runnable_owner_lease = if (config.runnable_owner) |owner| try runnable_abi.Lease.init(owner) else null;
+        errdefer if (runnable_owner_lease) |*lease| lease.deinit();
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
@@ -1033,9 +1047,11 @@ pub const BackendRuntime = struct {
         errdefer native_storage_pool.deinit();
 
         var runtime = BackendRuntime{
+            .runnable_owner_lease = runnable_owner_lease,
             .alloc = alloc,
             .backend = config.backend,
             .lane_limits = config.lane_limits,
+            .maintenance_registration_limit = config.maintenance_registration_limit,
             .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
@@ -1072,6 +1088,12 @@ pub const BackendRuntime = struct {
         return runtime;
     }
 
+    /// Borrow only while the runtime is retained through the consumer join.
+    /// Independently started capsules retain their own node-owner lease.
+    pub fn runnableOwner(self: *const BackendRuntime) ?runnable_abi.Owner {
+        return if (self.runnable_owner_lease) |lease| lease.owner else null;
+    }
+
     pub fn maintenanceScheduler(self: *BackendRuntime) !*MaintenanceScheduler {
         lockAtomic(&self.lane_init_mutex);
         defer self.lane_init_mutex.unlock();
@@ -1081,7 +1103,11 @@ pub const BackendRuntime = struct {
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
         const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
-        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)));
+        const scheduler = try MaintenanceScheduler.createWithConfig(self.alloc, scheduler_io, .{
+            .max_active = MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)),
+            .max_registrations = self.maintenance_registration_limit,
+            .runnable_owner = self.runnableOwner(),
+        });
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }
@@ -1098,7 +1124,11 @@ pub const BackendRuntime = struct {
         // directions, whose callers obey the runtime lifetime contract).
         lockAtomic(&self.lane_init_mutex);
         self.lanes_closing = true;
+        const maintenance = self.maintenance_scheduler.load(.acquire);
         self.lane_init_mutex.unlock();
+        // Recurring work must close before lease draining can block shutdown.
+        // Keep its registered handles and active capacity until physical join.
+        if (maintenance) |scheduler| scheduler.closeAdmission();
         // Close every lane before waiting for any one of them. Otherwise a
         // borrower could continue entering a later lane while teardown drains
         // an earlier one. These waits are production lifetime enforcement,
@@ -1161,6 +1191,7 @@ pub const BackendRuntime = struct {
         self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
+        if (self.runnable_owner_lease) |*lease| lease.deinit();
         self.* = undefined;
     }
 
@@ -1479,6 +1510,11 @@ pub const BackendRuntime = struct {
         };
     }
 
+    /// Includes every admitted forwarding task until its physical I/O joins.
+    pub fn outstandingRequestForwardLeases(self: *const BackendRuntime) usize {
+        return self.request_forward_lane_gate.active();
+    }
+
     pub fn outstandingApiLeases(self: *const BackendRuntime) usize {
         return self.api_lane_gate.active();
     }
@@ -1730,6 +1766,114 @@ pub const BackendRuntime = struct {
             runtime.worker_lane_gate.release(runtime.io());
         }
     };
+
+    pub const SharedSqlRole = enum { execution, control, cleanup };
+    const SharedSqlPool = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        workers: ?WorkerLease = null,
+        borrowers: usize = 0,
+        retiring: bool = false,
+        peak_borrowers: usize = 0,
+        acquisitions_total: u64 = 0,
+        rejections_total: std.atomic.Value(u64) = .init(0),
+    };
+    pub const SharedSqlStats = struct {
+        capacity: usize,
+        retained_capacity: usize,
+        borrowers: usize,
+        peak_borrowers: usize,
+        retiring: bool,
+        acquisitions_total: u64,
+        rejections_total: u64,
+    };
+    fn sharedSqlCapacity(self: *const BackendRuntime, role: SharedSqlRole) usize {
+        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) return 0;
+        return switch (role) {
+            .execution => (self.lane_limits.worker_capacity / 2) -| 5,
+            .control => 5,
+            .cleanup => self.lane_limits.worker_capacity / 4,
+        };
+    }
+    /// Each role is sampled under its mutex. Different roles and the aggregate
+    /// worker counters are independent observations, not a transactional view.
+    pub fn sharedSqlStats(self: *const BackendRuntime, role: SharedSqlRole) SharedSqlStats {
+        const pool = &@constCast(self).shared_sql_workers[@backingInt(role)];
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        const capacity = self.sharedSqlCapacity(role);
+        return .{
+            .capacity = capacity,
+            // Retirement still owns the executor until its physical join and
+            // all role bookkeeping have completed, even with zero borrowers.
+            .retained_capacity = if (pool.workers != null or pool.retiring) capacity else 0,
+            .borrowers = pool.borrowers,
+            .peak_borrowers = pool.peak_borrowers,
+            .retiring = pool.retiring,
+            .acquisitions_total = pool.acquisitions_total,
+            .rejections_total = pool.rejections_total.load(.monotonic),
+        };
+    }
+    pub const SharedSqlLease = struct {
+        runtime: ?*BackendRuntime,
+        role: SharedSqlRole,
+        capacity: usize,
+        executor_io: Io,
+        pub fn io(self: *const SharedSqlLease) Io {
+            return self.executor_io;
+        }
+        /// Each consumer joins its submissions before release. Peers retain
+        /// the shared executor; the final release physically joins it.
+        pub fn release(self: *SharedSqlLease) void {
+            const runtime = self.runtime orelse return;
+            const pool = &runtime.shared_sql_workers[@backingInt(self.role)];
+            lockAtomic(&pool.mutex);
+            std.debug.assert(pool.borrowers != 0);
+            pool.borrowers -= 1;
+            var retired: ?WorkerLease = null;
+            if (pool.borrowers == 0) {
+                pool.retiring = true;
+                retired = pool.workers;
+                pool.workers = null;
+            }
+            pool.mutex.unlock();
+            // Keep this borrower's runtime gate until all pool bookkeeping is
+            // complete, even after the physical executor's gate is released.
+            if (retired) |*workers| {
+                workers.release();
+                lockAtomic(&pool.mutex);
+                pool.retiring = false;
+                pool.mutex.unlock();
+            }
+            self.runtime = null;
+            runtime.worker_lane_gate.release(runtime.io());
+        }
+    };
+    pub fn acquireSharedSqlWorkers(self: *BackendRuntime, role: SharedSqlRole, minimum: usize) !SharedSqlLease {
+        const pool = &self.shared_sql_workers[@backingInt(role)];
+        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeUnavailable;
+        }
+        const capacity = self.sharedSqlCapacity(role);
+        if (minimum == 0 or minimum > capacity) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.InvalidWorkerCapacity;
+        }
+        _ = self.worker_lane_gate.tryAcquire() orelse {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        };
+        errdefer self.worker_lane_gate.release(self.io());
+        errdefer _ = pool.rejections_total.fetchAdd(1, .monotonic);
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        if (pool.retiring) return error.WorkerCapacityExceeded;
+        if (pool.workers == null) pool.workers = try self.acquireWorkers(.{ .capacity = capacity });
+        pool.borrowers += 1;
+        pool.peak_borrowers = @max(pool.peak_borrowers, pool.borrowers);
+        pool.acquisitions_total +|= 1;
+        return .{ .runtime = self, .role = role, .capacity = capacity, .executor_io = pool.workers.?.io() };
+    }
 
     pub fn acquireWorkers(self: *BackendRuntime, options: WorkerOptions) !WorkerLease {
         if (comptime builtin.os.tag == .freestanding) return error.BackendRuntimeUnavailable;
@@ -4237,4 +4381,171 @@ test "backend runtime worker allocation failure returns its capacity and lifetim
     failing.fail_index = std.math.maxInt(usize);
     var lease = try handle.ptr().acquireWorkers(.{});
     defer lease.release();
+}
+
+test "maintenance runtime closes all callback classes before waiting for an API lease" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    const runtime = handle.ptr();
+    const io = runtime.io().?;
+    const scheduler = try runtime.maintenanceScheduler();
+    var lease = try runtime.acquireApiLane();
+    const Probe = struct {
+        io: Io,
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn step(self: *@This()) ?u64 {
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            return 0;
+        }
+    };
+    var probe: Probe = .{ .io = io };
+    var registration = try scheduler.register(&probe, Probe.step);
+    var joined = false;
+    var deinitialized = std.atomic.Value(bool).init(false);
+    var shutdown: ?std.Thread = null;
+    defer {
+        // This cleanup also runs after failed bounded observations. The
+        // runtime cannot free its scheduler while the API lease is retained.
+        probe.release.set(io);
+        if (!joined) registration.await(io);
+        lease.release();
+        if (shutdown) |thread| thread.join() else handle.deinit();
+    }
+    try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = Io.Duration.fromSeconds(5), .clock = .awake } });
+    shutdown = try std.Thread.spawn(.{}, struct {
+        fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
+            h.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &handle, &deinitialized });
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!runtime.api_lane_gate.isClosed() and platform.time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(runtime.api_lane_gate.isClosed());
+    try std.testing.expect(!deinitialized.load(.acquire));
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.maintenanceScheduler());
+    for (std.enums.values(MaintenanceScheduler.Class)) |class|
+        try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.registerClass(class, &probe, Probe.step));
+    scheduler.wake(&probe);
+    scheduler.closeAdmission(); // Closing is idempotent while handles drain.
+    const held = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), held.registrations);
+    try std.testing.expectEqual(@as(usize, 1), held.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    probe.release.set(io);
+    registration.await(io);
+    joined = true;
+    const retired = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), retired.registrations);
+    try std.testing.expectEqual(@as(usize, 0), retired.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    try std.testing.expect(!deinitialized.load(.acquire));
+}
+
+const TestRunnableOwner = struct {
+    const errors = @import("antfly_runtime_abi").error_abi;
+    references: std.atomic.Value(usize) = .init(0),
+    reject: bool = false,
+    fn retain(raw: *anyopaque) callconv(.c) errors.Status {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject) return errors.statusFromError(error.SchedulerClosed);
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return .ok;
+    }
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.references.fetchSub(1, .acq_rel) > 0);
+    }
+    fn unsupported(_: *anyopaque) callconv(.c) errors.Status {
+        return errors.statusFromError(error.ExecutionWaitUnsupported);
+    }
+    fn transition(raw: *anyopaque, _: c_int) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn start(raw: *anyopaque, _: *const runnable_abi.Start) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn finish(_: *anyopaque) callconv(.c) void {
+        @panic("test consumer must not manufacture a CPU grant");
+    }
+    fn port(self: *@This()) runnable_abi.Owner {
+        return .{ .context = self, .retain = retain, .release = release, .start = start, .checkpoint = unsupported, .park = transition, .enter = transition, .finish = finish };
+    }
+};
+
+test "maintenance runtime retains its node owner until physical lane retirement" {
+    var owner: TestRunnableOwner = .{};
+    var port = owner.port();
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io }, .runnable_owner = port });
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    port.version = 0;
+    try std.testing.expect(runtime.ptr().runnableOwner().?.valid());
+    var lane = try runtime.ptr().acquireApiLane();
+    var draining = try std.testing.io.concurrent(struct {
+        fn run(handle: *BackendRuntimeHandle) void {
+            handle.deinit();
+        }
+    }.run, .{&runtime});
+    var released = false;
+    var joined = false;
+    defer {
+        if (!released) lane.release();
+        if (!joined) draining.cancel(std.testing.io);
+    }
+    // This exact lane lease pins the runtime while destruction waits for it.
+    const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1));
+    while (runtime.ptr().api_lane_gate.state.load(.acquire) & LaneLeaseGate.closed_bit == 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    lane.release();
+    released = true;
+    draining.await(std.testing.io);
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime owner rejection and allocation rollback preserve exact ownership" {
+    var owner: TestRunnableOwner = .{ .reject = true };
+    try std.testing.expectError(error.SchedulerClosed, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    owner.reject = false;
+    var port = owner.port();
+    port.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = port }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    for (0..3) |allocation| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = allocation });
+        try std.testing.expectError(error.OutOfMemory, BackendRuntime.init(failing.allocator(), .{ .backend = .manual, .runnable_owner = owner.port() }));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    }
+    var runtime = try BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() });
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime applies finite recurring registration policy at birth" {
+    try std.testing.expectError(error.InvalidMaintenanceCapacity, BackendRuntime.init(std.testing.allocator, .{ .maintenance_registration_limit = 0 }));
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .maintenance_registration_limit = 1 });
+    defer handle.deinit();
+    const scheduler = try handle.ptr().maintenanceScheduler();
+    const Probe = struct {
+        fn step(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{};
+    var registration = try scheduler.register(&probe, Probe.step);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().max_registrations);
+    try std.testing.expectError(error.ResourceBudgetExceeded, scheduler.registerClass(.producer, &probe, Probe.step));
+    registration.await(handle.ptr().io().?);
+    var replacement = try scheduler.registerClass(.derived, &probe, Probe.step);
+    replacement.await(handle.ptr().io().?);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
 }

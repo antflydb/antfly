@@ -75,6 +75,41 @@ pub fn main() !void {
         return error.InvalidLinkedInferenceBinaryContract;
     if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
 
+    // Validate the new tail at the independently compiled C boundary before
+    // dereferencing any node or process-local borrowed descriptor.
+    var old_tail = invoke_context;
+    old_tail.handle = @ptrFromInt(8);
+    old_tail.struct_size = @offsetOf(bridge.ProviderInvokeContext, "admitted_cpu_slots");
+    if (bridge.errorFromStatus(table.invoke_provider(&old_tail)) != error.UnsupportedVersion)
+        return error.InvalidLinkedInferenceCpuBudgetPrefix;
+    var invalid_demand = invoke_context;
+    invalid_demand.handle = @ptrFromInt(8);
+    invalid_demand.admitted_cpu_slots = 65536;
+    if (bridge.errorFromStatus(table.invoke_provider(&invalid_demand)) != error.InvalidRunnableDemand)
+        return error.InvalidLinkedInferenceCpuBudgetValidation;
+
+    // A worker receives a scalar budget, never the parent's callback pointers.
+    // This executes the production archive's scoped invocation path through
+    // argument validation, then confirms no response ownership leaked.
+    var delegated = invoke_context;
+    delegated.admitted_cpu_slots = 1;
+    if (bridge.errorFromStatus(table.invoke_provider(&delegated)) != error.InvalidArguments)
+        return error.InvalidLinkedInferenceDelegatedExecution;
+    if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
+
+    var parent = Parent{};
+    const borrowed = bridge.runnable_abi.Borrowed{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter };
+    var local = invoke_context;
+    local.runnable = &borrowed;
+    if (bridge.errorFromStatus(table.invoke_provider(&local)) != error.InvalidArguments)
+        return error.InvalidLinkedInferenceBorrowedExecution;
+    if (parent.enters != 2 or parent.parked or parent.class != @backingInt(bridge.runnable_abi.Class.query))
+        return error.InvalidLinkedInferenceParentRestoration;
+    parent.reject_return = true;
+    if (bridge.errorFromStatus(table.invoke_provider(&local)) != error.Forbidden)
+        return error.InvalidLinkedInferenceParentAuthority;
+    if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
+
     const embedding_request_json =
         \\{"model":"unused","parts":[{"binary":{"mime_type":"image/png","data":[]}}],"attachment_count":2}
     ;
@@ -119,6 +154,32 @@ pub fn main() !void {
         return error.InvalidLinkedInferenceChunkBinaryContract;
     if (response_handle != null) return error.UnexpectedLinkedInferenceResponse;
 }
+
+const Parent = struct {
+    class: c_int = @backingInt(bridge.runnable_abi.Class.query),
+    parked: bool = false,
+    enters: usize = 0,
+    reject_return: bool = false,
+    fn check(_: *anyopaque) callconv(.c) bridge.Status {
+        return .ok;
+    }
+    fn park(raw: *anyopaque, _: c_int) callconv(.c) bridge.Status {
+        const self: *Parent = @ptrCast(@alignCast(raw));
+        if (self.parked) return bridge.statusFromError(error.InvalidRunnableTransition);
+        self.parked = true;
+        return .ok;
+    }
+    fn enter(raw: *anyopaque, class: c_int) callconv(.c) bridge.Status {
+        const self: *Parent = @ptrCast(@alignCast(raw));
+        if (!self.parked) return bridge.statusFromError(error.InvalidRunnableTransition);
+        self.parked = false;
+        self.class = class;
+        self.enters += 1;
+        if (self.reject_return and class == @backingInt(bridge.runnable_abi.Class.query))
+            return bridge.statusFromError(error.Forbidden);
+        return .ok;
+    }
+};
 
 fn createContext(io: *const std.Io, out_handle: *?*anyopaque) bridge.CreateContext {
     return .{

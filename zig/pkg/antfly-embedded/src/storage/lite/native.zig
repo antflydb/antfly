@@ -20,6 +20,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const read_admission = @import("../../common/read_admission.zig");
+const bounded_mutex = @import("../../common/bounded_mutex.zig");
 const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
@@ -518,6 +520,7 @@ pub const DocumentIndexEntry = struct {
 /// Validated immutable index page. Inline keys borrow the retained page;
 /// overflow comparisons use one reusable record buffer, never a key array.
 const IndexReadFrame = struct {
+    control: ?read_admission.Port = null,
     raw: ?[]u8 = null,
     payload: []const u8 = &.{},
     offsets: std.ArrayListUnmanaged(u16) = .empty,
@@ -536,7 +539,7 @@ const IndexReadFrame = struct {
     fn load(self: *IndexReadFrame, file: *NativeFile, checkpoint: CheckpointSlot, page: u64) !void {
         self.payload = &.{};
         if (self.raw == null) self.raw = try file.allocator.alloc(u8, file.header.page_size);
-        const payload = try decodePagePayload(try file.readPageInto(page, checkpoint, self.raw.?), .document_index);
+        const payload = try decodePagePayload(try file.readPageIntoWithAdmission(page, checkpoint, self.raw.?, self.control), .document_index);
         try self.decode(file.allocator, payload);
     }
 
@@ -557,6 +560,7 @@ const IndexReadFrame = struct {
         try self.offsets.ensureTotalCapacity(allocator, count);
         var previous_inline: ?[]const u8 = null;
         for (0..count) |_| {
+            if (self.control) |budget| try budget.checkpoint();
             if (pos + 10 > payload.len) return error.InvalidDocumentIndex;
             const offset: u16 = @intCast(pos);
             const len = std.mem.readInt(u16, payload[pos..][0..2], .little);
@@ -601,7 +605,7 @@ const IndexReadFrame = struct {
         self.overflow_reference = 0;
         self.overflow_key = &.{};
         if (self.overflow == null) self.overflow = try file.allocator.alloc(u8, file.header.page_size);
-        const raw = try file.readPageInto(reference, checkpoint, self.overflow.?);
+        const raw = try file.readPageIntoWithAdmission(reference, checkpoint, self.overflow.?, self.control);
         const bytes = switch (raw[4]) {
             @backingInt(PageKind.catalog) => (try decodeCatalogEntry(try decodePagePayload(raw, .catalog))).key,
             @backingInt(PageKind.document) => (try decodeDocumentEntry(try decodePagePayload(raw, .document))).key,
@@ -624,6 +628,7 @@ const IndexReadFrame = struct {
         var low: usize = 0;
         var high = self.offsets.items.len;
         while (low < high) {
+            if (self.control) |budget| try budget.checkpoint();
             if (builtin.is_test) _ = file.test_index_comparisons.fetchAdd(1, .monotonic);
             const mid = low + (high - low) / 2;
             const order = std.mem.order(u8, try self.key(file, checkpoint, mid), wanted);
@@ -645,6 +650,7 @@ const IndexReadFrame = struct {
         var high = count;
         var stride: usize = 1;
         while (low < count) : (stride *= 2) {
+            if (self.control) |budget| try budget.checkpoint();
             const probe = @min(start + stride, count - 1);
             const order = std.mem.order(u8, try self.key(file, checkpoint, probe), wanted);
             if (order == .gt or (!upper and order == .eq)) {
@@ -654,6 +660,7 @@ const IndexReadFrame = struct {
             low = probe + 1;
         }
         while (low < high) {
+            if (self.control) |budget| try budget.checkpoint();
             const mid = low + (high - low) / 2;
             const order = std.mem.order(u8, try self.key(file, checkpoint, mid), wanted);
             if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
@@ -665,6 +672,7 @@ const IndexReadFrame = struct {
 /// Reuse buffers by depth across siblings and seeks. Frame addresses remain
 /// stable when the path grows, including during recursive batch traversal.
 const IndexReadPath = struct {
+    control: ?read_admission.Port = null,
     frames: std.ArrayListUnmanaged(*IndexReadFrame) = .empty,
 
     pub fn deinit(self: *IndexReadPath, allocator: Allocator) void {
@@ -676,6 +684,7 @@ const IndexReadPath = struct {
     }
 
     fn load(self: *IndexReadPath, file: *NativeFile, checkpoint: CheckpointSlot, depth: usize, page: u64) !*IndexReadFrame {
+        if (self.control) |budget| try budget.checkpoint();
         if (depth > 64) return error.InvalidDocumentIndex;
         if (depth == self.frames.items.len) {
             const frame = try file.allocator.create(IndexReadFrame);
@@ -684,6 +693,7 @@ const IndexReadPath = struct {
             try self.frames.append(file.allocator, frame);
         }
         const frame = self.frames.items[depth];
+        frame.control = self.control;
         try frame.load(file, checkpoint, page);
         return frame;
     }
@@ -844,6 +854,7 @@ pub const DocumentIndexCursor = struct {
 /// scratch. Payload slices remain valid until the next physical page is loaded.
 /// The caller must keep the file generation and checkpoint pinned for its life.
 pub const RecordPageReader = struct {
+    control: ?read_admission.Port = null,
     raw: ?[]u8 = null,
     lease: ?*PageCache.RawView = null,
     lease_file: ?*NativeFile = null,
@@ -867,6 +878,7 @@ pub const RecordPageReader = struct {
     /// Only callers with sorted, known references supply a multi-page run.
     /// The window is allocated lazily and admits pages only when requested.
     fn readWithWindow(self: *RecordPageReader, comptime windowed: bool, window: ?*RecordReadWindow, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, reference: u64, expected: PageKind, ahead: usize) ![]const u8 {
+        if (self.control) |budget| try budget.checkpoint();
         const page = physicalPage(reference);
         if (page == 0 or page >= checkpoint.page_count) return error.InvalidPageId;
         const bundled = reference & packed_record_flag != 0;
@@ -885,7 +897,7 @@ pub const RecordPageReader = struct {
             self.lease = null;
             self.lease_file = null;
             if (file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0) {
-                self.lease = try file.page_cache.acquirePayload(file.allocator, page, file.header.page_size);
+                self.lease = try file.page_cache.acquirePayloadWithAdmission(file.allocator, page, file.header.page_size, self.control);
                 if (self.lease != null) self.lease_file = file;
             }
             if (self.lease) |lease| {
@@ -903,16 +915,17 @@ pub const RecordPageReader = struct {
                     const raw = try window.?.read(file, allocator, checkpoint, page, ahead);
                     if (builtin.is_test) _ = file.test_page_reads.fetchAdd(1, .monotonic);
                     self.payload = try decodePagePayload(raw, kind);
-                    if (file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0 and file.admitPageToCache(raw)) file.page_cache.put(file.allocator, page, raw);
+                    if (file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0 and file.admitPageToCache(raw)) try file.page_cache.putWithAdmission(file.allocator, page, raw, self.control);
                 } else {
                     if (self.raw == null) self.raw = try allocator.alloc(u8, file.header.page_size);
-                    _ = try file.readPageInto(page, checkpoint, self.raw.?);
+                    _ = try file.readPageIntoWithAdmission(page, checkpoint, self.raw.?, self.control);
                     self.payload = try decodePagePayload(self.raw.?, kind);
                 }
             }
             if (bundled and (self.lease == null or self.lease.?.record_offsets == null)) {
                 var offset: usize = 0;
                 while (offset < self.payload.len) {
+                    if (self.control) |budget| try budget.checkpoint();
                     const record = try packedRecordAtOffset(self.payload, offset);
                     try self.offsets.append(allocator, @intCast(offset));
                     offset += 4 + record.bytes.len;
@@ -960,7 +973,7 @@ pub const RecordPageReader = struct {
         if (!std.mem.eql(u8, entry.key, indexed.key)) return error.InvalidDocumentIndex;
         if (entry.is_delete) return null;
         return if (entry.external_value_root_page != 0)
-            try file.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+            try file.readValuePagesAtCheckpointAllocWithAdmission(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint, self.control)
         else
             try allocator.dupe(u8, entry.value);
     }
@@ -970,6 +983,7 @@ pub const RecordPageReader = struct {
 /// layout and compile a path with no window checks or storage. Only proven
 /// adjacent requests use this lazily allocated, bounded buffer.
 const RecordReadWindow = struct {
+    control: ?read_admission.Port = null,
     bytes: ?[]u8 = null,
     file: ?*NativeFile = null,
     first: u64 = 0,
@@ -986,6 +1000,7 @@ const RecordReadWindow = struct {
     }
 
     fn read(self: *RecordReadWindow, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, page: u64, ahead: usize) ![]const u8 {
+        if (self.control) |budget| try budget.checkpoint();
         const bypass = file.page_cache_bypass.load(.monotonic) != 0;
         const size: usize = file.header.page_size;
         if (!bypass and self.contains(file, page)) return self.bytes.?[@as(usize, @intCast(page - self.first)) * size ..][0..size];
@@ -1006,13 +1021,13 @@ const RecordReadWindow = struct {
         }
         count = @min(count, self.bytes.?.len / size);
         const use_cache = file.page_cache_enabled.load(.monotonic) and !bypass;
-        if (use_cache and file.page_cache.copyInto(page, self.bytes.?[0..size])) {
+        if (use_cache and try file.page_cache.copyIntoWithAdmission(page, self.bytes.?[0..size], self.control)) {
             self.first = page;
             self.file = file;
             self.count = 1;
             return self.bytes.?[0..size];
         }
-        try file.readBackingPages(self.bytes.?[0 .. count * size], page * size);
+        try file.readBackingPagesWithAdmission(self.bytes.?[0 .. count * size], page * size, self.control);
         self.first = page;
         self.file = file;
         self.count = if (bypass) 0 else count;
@@ -2174,7 +2189,11 @@ const PageCache = struct {
     }
 
     fn copyInto(self: *PageCache, page_id: u64, out: []u8) bool {
-        platform_sync.lockYielding(&self.mutex);
+        return self.copyIntoWithAdmission(page_id, out, null) catch unreachable;
+    }
+
+    fn copyIntoWithAdmission(self: *PageCache, page_id: u64, out: []u8, control: ?read_admission.Port) !bool {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.mutex, budget) else platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const cached = self.pages.getPtr(page_id) orelse return false;
         if (cached.bytes.len != out.len) return false;
@@ -2221,7 +2240,10 @@ const PageCache = struct {
     }
 
     fn acquirePayload(self: *PageCache, allocator: Allocator, page_id: u64, size: usize) !?*RawView {
-        platform_sync.lockYielding(&self.mutex);
+        return self.acquirePayloadWithAdmission(allocator, page_id, size, null);
+    }
+    fn acquirePayloadWithAdmission(self: *PageCache, allocator: Allocator, page_id: u64, size: usize, control: ?read_admission.Port) !?*RawView {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.mutex, budget) else platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const before_bytes = self.total_bytes;
         defer if (self.total_bytes != before_bytes) self.refreshPageResourceUsageLocked();
@@ -2396,6 +2418,17 @@ const PageCache = struct {
     fn put(self: *PageCache, allocator: Allocator, page_id: u64, page: []const u8) void {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        self.putLocked(allocator, page_id, page);
+    }
+
+    fn putWithAdmission(self: *PageCache, allocator: Allocator, page_id: u64, page: []const u8, control: ?read_admission.Port) !void {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.mutex, budget) else platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.putLocked(allocator, page_id, page);
+        if (control) |budget| try budget.checkpoint();
+    }
+
+    fn putLocked(self: *PageCache, allocator: Allocator, page_id: u64, page: []const u8) void {
         // Replacement must invalidate the old bytes even if admission fails.
         if (self.pages.fetchSwapRemove(page_id)) |old| {
             self.freePageLocked(allocator, old.value);
@@ -3939,19 +3972,34 @@ pub const NativeFile = struct {
     }
 
     fn readBackingPages(self: *NativeFile, out: []u8, offset: u64) !void {
+        return self.readBackingPagesWithAdmission(out, offset, null);
+    }
+
+    fn readBackingPagesWithAdmission(self: *NativeFile, out: []u8, offset: u64, control: ?read_admission.Port) !void {
         if (builtin.is_test) {
             _ = self.test_backing_read_calls.fetchAdd(1, .monotonic);
             _ = self.test_backing_read_bytes.fetchAdd(out.len, .monotonic);
         }
-        try readExactAt(self.file, self.runtimeIo(), out, offset);
+        if (control) |budget| {
+            try budget.checkpoint();
+            if (try budget.executionWait()) |boundary| {
+                try boundary.run(readExactAt, .{ self.file, self.runtimeIo(), out, offset });
+            } else try readExactAt(self.file, self.runtimeIo(), out, offset);
+            try budget.checkpoint();
+        } else try readExactAt(self.file, self.runtimeIo(), out, offset);
     }
 
     /// Bounded scratch reads for point lookups avoid allocating decoded keys
     /// and page copies at every level of the catalog/document B-tree.
     fn readPageInto(self: *NativeFile, page_id: u64, checkpoint: CheckpointSlot, scratch: []u8) ![]const u8 {
+        return self.readPageIntoWithAdmission(page_id, checkpoint, scratch, null);
+    }
+
+    fn readPageIntoWithAdmission(self: *NativeFile, page_id: u64, checkpoint: CheckpointSlot, scratch: []u8, control: ?read_admission.Port) ![]const u8 {
+        if (control) |budget| try budget.checkpoint();
         if (scratch.len < self.header.page_size) return error.InvalidNativePageLength;
         if (page_id & packed_record_flag != 0) {
-            _ = try self.readPageInto(physicalPage(page_id), checkpoint, scratch);
+            _ = try self.readPageIntoWithAdmission(physicalPage(page_id), checkpoint, scratch, control);
             try unpackRecordPage(scratch[0..self.header.page_size], page_id);
             return scratch[0..self.header.page_size];
         }
@@ -3959,9 +4007,10 @@ pub const NativeFile = struct {
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
         const page = scratch[0..self.header.page_size];
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
-        if (use_cache and self.page_cache.copyInto(page_id, page)) return page;
-        try self.readBackingPages(page, page_id * @as(u64, self.header.page_size));
-        if (use_cache and self.admitPageToCache(page)) self.page_cache.put(self.allocator, page_id, page);
+        if (use_cache and try self.page_cache.copyIntoWithAdmission(page_id, page, control)) return page;
+        try self.readBackingPagesWithAdmission(page, page_id * @as(u64, self.header.page_size), control);
+        if (use_cache and self.admitPageToCache(page)) try self.page_cache.putWithAdmission(self.allocator, page_id, page, control);
+        if (control) |budget| try budget.checkpoint();
         return page;
     }
 
@@ -5805,17 +5854,26 @@ pub const NativeFile = struct {
     /// independently owned; errors release and clear every output.
     pub fn getDocumentsAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, values: []?[]const u8) !void {
         // Working storage must not be retained in a caller's result arena.
-        return self.getDocumentsAtCheckpointWithScratch(allocator, self.allocator, checkpoint, keys, null, values);
+        return self.getDocumentsAtCheckpointAllocWithAdmission(allocator, checkpoint, keys, values, null);
+    }
+
+    pub fn getDocumentsAtCheckpointAllocWithAdmission(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, values: []?[]const u8, control: ?read_admission.Port) !void {
+        return self.getDocumentsAtCheckpointWithScratchAndAdmission(allocator, self.allocator, checkpoint, keys, null, values, control);
     }
 
     /// Output buffers must not overlap each other or the input keys.
     /// Temporary allocations never escape this call. Caller buffers, when
     /// supplied, own every returned slice; partial output is cleared on errors.
     pub fn getDocumentsAtCheckpointWithScratch(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8) !void {
+        return self.getDocumentsAtCheckpointWithScratchAndAdmission(allocator, temporary, checkpoint, keys, buffers, values, null);
+    }
+
+    pub fn getDocumentsAtCheckpointWithScratchAndAdmission(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, control: ?read_admission.Port) !void {
         if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         for (keys, 0..) |key, i| {
+            if (control) |budget| try budget.checkpoint();
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
         errdefer {
@@ -5826,20 +5884,21 @@ pub const NativeFile = struct {
         const references = try temporary.alloc(u64, keys.len);
         defer temporary.free(references);
         @memset(references, 0);
-        try self.readDocumentBatchNode(checkpoint, checkpoint.document_index_root_page, keys, references);
+        try self.readDocumentBatchNodeWithAdmission(checkpoint, checkpoint.document_index_root_page, keys, references, control);
         const order = try temporary.alloc(usize, keys.len);
         defer temporary.free(order);
         for (order, 0..) |*position, i| position.* = i;
-        std.mem.sort(usize, order, references, struct {
+        try read_admission.sort(usize, order, references, struct {
             fn less(refs: []const u64, lhs: usize, rhs: usize) bool {
                 return recordReferenceLessThan(refs[lhs], refs[rhs]);
             }
-        }.less);
-        var reader = RecordPageReader{};
+        }.less, control);
+        var reader = RecordPageReader{ .control = control };
         defer reader.deinit(temporary);
-        var window = RecordReadWindow{};
+        var window = RecordReadWindow{ .control = control };
         defer window.deinit(temporary);
         for (order, 0..) |i, position| {
+            if (control) |budget| try budget.checkpoint();
             const reference = references[i];
             if (reference == 0) continue;
             const ahead = if (reader.page_id == physicalPage(reference) or window.contains(self, physicalPage(reference))) 1 else recordRunAhead(references, order, position);
@@ -5851,18 +5910,23 @@ pub const NativeFile = struct {
                 const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
                 if (length > out[i].len) return error.BufferTooSmall;
                 if (entry.external_value_root_page != 0) {
-                    try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[i][0..length], checkpoint);
+                    try self.readValuePagesRangeIntoWithAdmission(entry.external_value_root_page, length, 0, out[i][0..length], checkpoint, control);
                 } else @memcpy(out[i][0..length], entry.value);
                 values[i] = out[i][0..length];
             } else values[i] = if (entry.external_value_root_page != 0)
-                try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+                try self.readValuePagesAtCheckpointAllocWithAdmission(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint, control)
             else
                 try allocator.dupe(u8, entry.value);
         }
+        if (control) |budget| try budget.checkpoint();
     }
 
     fn readDocumentBatchNode(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64) !void {
-        var path = IndexReadPath{};
+        return self.readDocumentBatchNodeWithAdmission(checkpoint, page, keys, references, null);
+    }
+
+    fn readDocumentBatchNodeWithAdmission(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64, control: ?read_admission.Port) !void {
+        var path = IndexReadPath{ .control = control };
         defer path.deinit(self.allocator);
         try self.readDocumentBatchWithPath(checkpoint, page, keys, references, &path, 0);
     }
@@ -5873,6 +5937,7 @@ pub const NativeFile = struct {
         var group_child: usize = 0;
         var previous_bound: usize = 0;
         for (keys, 0..) |key, i| {
+            if (path.control) |budget| try budget.checkpoint();
             const low = if (i == 0) try node.bound(self, checkpoint, key, node.kind == .internal) else try node.boundFrom(self, checkpoint, key, node.kind == .internal, previous_bound);
             previous_bound = low;
             if (node.kind == .leaf) {
@@ -6016,6 +6081,7 @@ pub const NativeFile = struct {
     /// linked chains grow read-ahead only while physical adjacency persists.
     /// Admit requested pages according to policy, never speculative neighbors.
     const ValuePageReader = struct {
+        control: ?read_admission.Port = null,
         bytes: [64 * 1024]u8 = undefined,
         lease: ?*PageCache.RawView = null,
         first: u64 = 0,
@@ -6029,6 +6095,7 @@ pub const NativeFile = struct {
         fn init(self: *@This()) void {
             // Initialize control state in place: copying a default aggregate
             // also copies its 64 KiB undefined scratch in optimized builds.
+            self.control = null;
             self.lease = null;
             self.first = 0;
             self.count = 0;
@@ -6045,7 +6112,7 @@ pub const NativeFile = struct {
             self.admitted = 0;
         }
 
-        fn requested(self: *@This(), file: *NativeFile, index: usize) []const u8 {
+        fn requested(self: *@This(), file: *NativeFile, index: usize) ![]const u8 {
             const size: usize = file.header.page_size;
             const page = self.bytes[index * size ..][0..size];
             const bit = @as(u16, 1) << @as(u4, @intCast(index));
@@ -6053,13 +6120,14 @@ pub const NativeFile = struct {
                 file.page_cache_bypass.load(.monotonic) == 0 and
                 (self.cache_payload or page[4] != @backingInt(PageKind.value)) and file.admitPageToCache(page))
             {
-                file.page_cache.put(file.allocator, self.first + index, page);
+                try file.page_cache.putWithAdmission(file.allocator, self.first + index, page, self.control);
                 self.admitted |= bit;
             }
             return page;
         }
 
         pub fn read(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, page: u64, ahead: usize) ![]const u8 {
+            if (self.control) |budget| try budget.checkpoint();
             if (page == 0 or page >= checkpoint.page_count) return error.InvalidPageId;
             if (builtin.is_test) _ = file.test_page_reads.fetchAdd(1, .monotonic);
             const size: usize = file.header.page_size;
@@ -6067,8 +6135,10 @@ pub const NativeFile = struct {
                 return if (self.lease) |lease| lease.bytes else self.requested(file, @intCast(page - self.first));
             self.deinit(file);
             const use_cache = file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0;
-            if (use_cache) {
-                if (try file.page_cache.acquirePayload(file.allocator, page, size)) |lease| {
+            // Controlled reads keep the bounded copy path: raw lease retirement
+            // still requires an unconditional cache lock on final release.
+            if (use_cache and self.control == null) {
+                if (try file.page_cache.acquirePayloadWithAdmission(file.allocator, page, size, self.control)) |lease| {
                     self.lease = lease;
                     self.first = page;
                     self.count = 1;
@@ -6077,7 +6147,7 @@ pub const NativeFile = struct {
                     return lease.bytes;
                 }
             }
-            if (use_cache and file.page_cache.copyInto(page, self.bytes[0..size])) {
+            if (use_cache and try file.page_cache.copyIntoWithAdmission(page, self.bytes[0..size], self.control)) {
                 if (builtin.is_test) _ = file.test_value_cache_copy_bytes.fetchAdd(size, .monotonic);
                 self.first = page;
                 self.count = 1;
@@ -6089,7 +6159,7 @@ pub const NativeFile = struct {
                 _ = file.test_value_read_calls.fetchAdd(1, .monotonic);
                 _ = file.test_value_read_bytes.fetchAdd(count * size, .monotonic);
             }
-            try file.readBackingPages(self.bytes[0 .. count * size], page * size);
+            try file.readBackingPagesWithAdmission(self.bytes[0 .. count * size], page * size, self.control);
             self.first = page;
             self.count = count;
             return self.requested(file, 0);
@@ -6233,14 +6303,24 @@ pub const NativeFile = struct {
         }
 
         fn initWithCacheIntent(file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool) !ValueChunkCursor {
+            return initWithCacheIntentAndAdmission(file, root, len, checkpoint, cache_payload, null);
+        }
+
+        fn initWithCacheIntentAndAdmission(file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool, control: ?read_admission.Port) !ValueChunkCursor {
+            if (control) |budget| try budget.checkpoint();
+            if (len == 0) return error.InvalidNativeValueChain;
             var cursor: ValueChunkCursor = undefined;
-            try cursor.initInto(file, root, len, checkpoint, cache_payload);
+            try cursor.initIntoWithAdmission(file, root, len, checkpoint, cache_payload, control);
             return cursor;
         }
 
         // Initialize control state directly in caller storage. Returning this
         // aggregate by value can copy its large, uninitialized page scratch.
         fn initInto(cursor: *ValueChunkCursor, file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool) !void {
+            return cursor.initIntoWithAdmission(file, root, len, checkpoint, cache_payload, null);
+        }
+        fn initIntoWithAdmission(cursor: *ValueChunkCursor, file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool, control: ?read_admission.Port) !void {
+            if (control) |budget| try budget.checkpoint();
             if (len == 0) return error.InvalidNativeValueChain;
             cursor.file = file;
             cursor.checkpoint = checkpoint;
@@ -6256,6 +6336,7 @@ pub const NativeFile = struct {
             cursor.skip = 0;
             cursor.reader.init();
             cursor.reader.cache_payload = cache_payload;
+            cursor.reader.control = control;
             errdefer cursor.deinit();
             const raw = try cursor.reader.read(file, checkpoint, root, 1);
             if (raw[4] == @backingInt(PageKind.value_extent)) {
@@ -6341,6 +6422,7 @@ pub const NativeFile = struct {
         /// on every page, including internal nodes of large extent trees.
         fn next(self: *ValueChunkCursor, cancel: ?*const maintenance.CancelToken) !?[]const u8 {
             while (true) {
+                if (self.reader.control) |budget| try budget.checkpoint();
                 if (cancel) |token| try token.check();
                 if (self.chain_page != 0) {
                     const value: ValuePage = if (self.initial_leaf) |first| blk: {
@@ -7836,17 +7918,23 @@ pub const NativeFile = struct {
     }
 
     fn readValuePagesAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot) ![]u8 {
+        return self.readValuePagesAtCheckpointAllocWithAdmission(allocator, root_page_id, value_len, checkpoint, null);
+    }
+
+    fn readValuePagesAtCheckpointAllocWithAdmission(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot, control: ?read_admission.Port) ![]u8 {
         var cursor: ValueChunkCursor = undefined;
-        try cursor.initInto(self, root_page_id, value_len, checkpoint, true);
+        try cursor.initIntoWithAdmission(self, root_page_id, value_len, checkpoint, true, control);
         defer cursor.deinit();
         const out = try allocator.alloc(u8, value_len);
         errdefer allocator.free(out);
         var offset: usize = 0;
         while (try cursor.next(null)) |chunk| {
+            if (control) |budget| try budget.checkpoint();
             @memcpy(out[offset..][0..chunk.len], chunk);
             offset += chunk.len;
         }
         if (offset != value_len) return error.InvalidNativeValueChain;
+        if (control) |budget| try budget.checkpoint();
         return out;
     }
 
@@ -7868,6 +7956,10 @@ pub const NativeFile = struct {
     }
 
     fn readValuePagesRangeInto(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot) !void {
+        return self.readValuePagesRangeIntoWithAdmission(root_page_id, value_len, range_start, out, checkpoint, null);
+    }
+    fn readValuePagesRangeIntoWithAdmission(self: *NativeFile, root_page_id: u64, value_len: usize, range_start: usize, out: []u8, checkpoint: CheckpointSlot, control: ?read_admission.Port) !void {
+        if (control) |budget| try budget.checkpoint();
         const range_len = out.len;
         if (range_start > value_len or range_len > value_len - range_start) return error.EndOfStream;
         if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
@@ -7875,6 +7967,7 @@ pub const NativeFile = struct {
 
         var reader: ValuePageReader = undefined;
         reader.init();
+        reader.control = control;
         defer reader.deinit(self);
         const root_raw = try reader.read(self, checkpoint, root_page_id, 1);
         if (root_raw[4] == @backingInt(PageKind.value_extent)) {
@@ -16422,6 +16515,69 @@ test "lite native immutable value traversal needs no heap scratch for ordinary e
     }
     try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
     std.debug.print("LITE_CURSOR_TRAVERSAL bytes=1048576 traversals=24 heap_allocations={d}\n", .{budget.alloc_calls});
+}
+
+/// Native batch qualification shares the same grouped reader used by Lite
+/// transaction scopes, including overflow keys and external value chains.
+pub fn qualifyControlledBatch(control: read_admission.Port) !void {
+    return qualifyControlledBatchOutputs(control, false, false);
+}
+pub fn qualifyControlledBufferedBatch(control: read_admission.Port) !void {
+    return qualifyControlledBatchOutputs(control, true, false);
+}
+pub fn qualifyControlledRecordWindow(control: read_admission.Port) !void {
+    return qualifyControlledBatchOutputs(control, true, true);
+}
+fn qualifyControlledBatchOutputs(control: read_admission.Port, buffered: bool, records_only: bool) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "controlled-native-batch.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    var key_bytes: [128][128]u8 = undefined;
+    var mutations: [129]DocumentMutation = undefined;
+    for (&key_bytes, mutations[0..128], 0..) |*key, *mutation, i| mutation.* = .{
+        .key = try std.fmt.bufPrint(key, "native-lite-controlled-batch-long-overflow-index-key-with-shared-document-prefix-{d:0>8}", .{i}),
+        .value = "small",
+    };
+    var external: [16384]u8 = undefined;
+    for (&external, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    mutations[128] = .{ .key = "zz-external", .value = &external };
+    try file.putDocumentBatch(&mutations);
+    file.page_cache_enabled.store(false, .monotonic);
+    var requested: [131][]const u8 = undefined;
+    requested[0] = mutations[0].key;
+    for (mutations, requested[1..130]) |mutation, *key| key.* = mutation.key;
+    requested[130] = "zzz-missing";
+    var values: [131]?[]const u8 = @splat(null);
+    if (buffered) {
+        // Keep index/navigation pages warm while record pages remain cold.
+        // The first physical loan then exercises the new record window,
+        // rather than rejecting earlier in the index planner.
+        file.page_cache_enabled.store(true, .monotonic);
+        file.page_cache.clear(a);
+        var references: [131]u64 = @splat(0);
+        const checkpoint = file.activeCheckpoint();
+        try file.readDocumentBatchNode(checkpoint, checkpoint.document_index_root_page, &requested, &references);
+    }
+    const output = if (buffered) try a.alloc(u8, requested.len * external.len) else null;
+    defer if (output) |bytes| a.free(bytes);
+    var buffers: [131][]u8 = undefined;
+    if (output) |bytes| for (&buffers, 0..) |*buffer, i| {
+        buffer.* = bytes[i * external.len ..][0..external.len];
+    };
+    const count: usize = if (records_only) 129 else requested.len;
+    file.getDocumentsAtCheckpointWithScratchAndAdmission(a, a, file.activeCheckpoint(), requested[0..count], if (buffered) buffers[0..count] else null, values[0..count], control) catch |err| {
+        for (values) |value| try std.testing.expect(value == null);
+        return err;
+    };
+    defer if (!buffered) for (values) |value| if (value) |bytes| a.free(bytes);
+    for (values[0..129]) |value| try std.testing.expectEqualStrings("small", value.?);
+    if (!records_only) try std.testing.expectEqualSlices(u8, &external, values[129].?);
+    try std.testing.expect(values[130] == null);
 }
 
 test "lite sustained writers reclaim bounded retirement pressure before admission" {

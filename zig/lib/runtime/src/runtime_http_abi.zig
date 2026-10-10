@@ -131,11 +131,21 @@ pub const CancellationView = extern struct {
 /// Transport-owned response sink used by independently generated handlers.
 /// `start` publishes streaming response headers, `write` transfers one body chunk,
 /// and `close` commits the terminating frame. Callbacks are request-scoped.
+pub const ExecutionWait = extern struct {
+    context: ?*anyopaque = null,
+    begin: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+    end: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+};
+
 pub const StreamSink = extern struct {
     context: ?*anyopaque = null,
     start: ?*const fn (?*anyopaque, u16, Bytes, HeaderList) callconv(.c) CallbackStatus = null,
     write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
     close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+    /// Synchronously installs borrowed caller-task ownership callbacks. The
+    /// caller clears them after its acknowledged worker call joins or fences.
+    /// Transport monitors must never invoke these execution transitions.
+    set_execution_wait: ?*const fn (?*anyopaque, ?*const ExecutionWait) callconv(.c) CallbackStatus = null,
 };
 
 pub const HttpResponseView = extern struct {

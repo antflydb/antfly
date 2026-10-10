@@ -1223,6 +1223,40 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     try std.testing.expectError(error.RestoreStagingScopeChanged, client.Owner.open(options));
 }
 
+test "HA seed maintenance lifetime crosses the compiled owner boundary and remains reusable" {
+    const runtime = @import("antfly_runtime_abi");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 7001, .identity_range_id = 7001, .schema_json = .fromSlice("{}") });
+    defer owner.deinit();
+    const Check = struct {
+        calls: usize = 0,
+        cause: ?anyerror,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // First check is in the client; reject only after the native
+            // provider received this exact borrowed invocation capability.
+            if (self.calls >= 2) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.SchedulerFull, error.RunnableWaitTimeout, error.ExecutionWaitUnsupported }) |cause| {
+        var check: Check = .{ .cause = cause };
+        const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, owner.prepareHotStandbySeedSnapshotWithLifetime("docs", std.math.maxInt(u64), &lifetime));
+        try std.testing.expect(check.calls >= 2);
+        check.cause = null;
+        try owner.prepareHotStandbySeedSnapshotWithLifetime("docs", std.math.maxInt(u64), &lifetime);
+    }
+}
+
 test "HA seed storage-owner boundary preserves exact operational errors" {
     try std.testing.expectError(
         error.InvalidArgument,
@@ -2545,6 +2579,8 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
     const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_text_stats_controlled_json(null, &invalid_controlled, &response, &query_failure));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));
@@ -2699,6 +2735,20 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    try std.testing.expect(!abi.antfly_storage_context_reserve_external(null, 1));
+    const original_used = metrics.resource_memory.used_bytes;
+    const original_external = metrics.resource_memory.external_bytes;
+    var parent: abi.MemoryParent = undefined;
+    try std.testing.expect(!abi.antfly_storage_context_memory_parent(null, &parent));
+    try std.testing.expect(abi.antfly_storage_context_memory_parent(context, &parent));
+    try std.testing.expectEqual(original_used, parent.snapshot().used_bytes);
+    try std.testing.expect(abi.antfly_storage_context_reserve_external(context, 4096));
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(original_used + 4096, metrics.resource_memory.used_bytes);
+    try std.testing.expectEqual(original_external + 4096, metrics.resource_memory.external_bytes);
+    abi.antfly_storage_context_release_external(context, 4096);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(original_used, metrics.resource_memory.used_bytes);
     for (71..abi.abi_version) |version| {
         const old_version: u32 = @intCast(version);
         // Reject every earlier layout, including main's independent ABI
@@ -3589,6 +3639,104 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque transaction routing capture preserves original clock and fallible admission controls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(91, .{ .upsert_table = .{ .table_id = 9, .name = "rows" } });
+    try store.applyStandaloneCommand(91, .{ .upsert_range = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" } });
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{ .deadline_ns = 8 * std.time.ns_per_s, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()) };
+    {
+        const captured = try store.captureTransactionRoutingProjection(alloc, 91, budget);
+        defer store.freeTables(alloc, captured.tables);
+        defer store.freeRanges(alloc, captured.ranges);
+        defer store.freeSplitTransitions(alloc, captured.split_transitions);
+        defer store.freeMergeTransitions(alloc, captured.merge_transitions);
+        try std.testing.expectEqual(@as(usize, 1), captured.tables.len);
+        try std.testing.expectEqual(@as(usize, 1), captured.ranges.len);
+        try std.testing.expectEqual(@as(usize, 0), captured.split_transitions.len);
+        try std.testing.expectEqual(@as(usize, 0), captured.merge_transitions.len);
+        try std.testing.expectEqualStrings("rows", captured.tables[0].name);
+        try std.testing.expectEqual(@as(u64, 301), captured.ranges[0].group_id);
+    }
+    clock.monotonic_ns = budget.deadline_ns.?;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureTransactionRoutingProjection(alloc, 91, budget));
+    // Zero is an expired absolute deadline, never an alias for no deadline.
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureTransactionRoutingProjection(alloc, 91, .{ .deadline_ns = 0 }));
+
+    const Scoped = struct {
+        checks: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checks += 1;
+            // Fail after some owned records have already been accumulated.
+            if (self.checks >= 16) return error.GenerationPublicationChanged;
+        }
+    };
+    var scoped = Scoped{};
+    try std.testing.expectError(error.GenerationPublicationChanged, store.captureTransactionRoutingProjection(alloc, 91, .{ .cancellation = .{ .ptr = &scoped, .check_fn = Scoped.check } }));
+    try std.testing.expectEqual(@as(usize, 16), scoped.checks);
+
+    const port = @import("transaction_routing_budget_port.zig");
+    const Never = struct {
+        fn checkpoint(_: *anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var state: u8 = 0;
+    const payload = port.Payload{ .ptr = &state, .vtable = &.{ .checkpoint = Never.checkpoint } };
+    var invalid = port.Port.init(&payload);
+    invalid.contract.layout_id +%= 1;
+    var response: abi.OwnedBytes = .{};
+    defer if (response.ptr) |bytes| alloc.free(bytes[0..@intCast(response.len)]);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .group_id = 91, .control = &invalid }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    invalid = port.Port.init(&payload);
+    // A valid control cannot opt into unbounded storage-owner allocation.
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .group_id = 91, .control = &invalid }, &response));
+    // Earlier uncommitted request layouts are rejected before the new field.
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .version = abi.abi_version, .group_id = 91, .control = &invalid }, &response));
+}
+
+test "opaque transaction routing capture bounds all caller allocations and cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(91, .{ .upsert_table = .{ .table_id = 9, .name = "rows" } });
+    try store.applyStandaloneCommand(91, .{ .upsert_range = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" } });
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, source: *metadata_apply_client.RaftApplyStore) !void {
+            const snapshot = try source.captureTransactionRoutingProjection(allocator, 91, .{});
+            defer source.freeTables(allocator, snapshot.tables);
+            defer source.freeRanges(allocator, snapshot.ranges);
+            defer source.freeSplitTransitions(allocator, snapshot.split_transitions);
+            defer source.freeMergeTransitions(allocator, snapshot.merge_transitions);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.ranges.len);
+            try std.testing.expectEqualStrings("rows", snapshot.tables[0].name);
+        }
+    };
+    // The producer's first record allocation must use the invocation's
+    // allocator. A process-allocator fallback would hide this injected failure.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Check.run(failing.allocator(), &store));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    // Sweep every physical record, response, parse, and clone allocation,
+    // requiring cleanup after each induced failure through the real C ABI.
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+}
+
 test "opaque metadata relation reconciliation work retains owned cuts across progress and reopen" {
     const a = std.testing.allocator;
     const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
@@ -4203,6 +4351,10 @@ test "opaque context rejects invalid runtime contracts before allocation" {
     const services = @import("kernel_runtime_services.zig");
     var context = client.Context{};
     try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = services.abi_version + 1 }));
+    // Reject the old request prefix before inspecting its appended owner port.
+    const Owner = @import("antfly_runtime_abi").runnable_abi.Owner;
+    // An aligned, inaccessible sentinel can compile but must never be read.
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = 1, .runnable_owner = @ptrFromInt(@alignOf(Owner)) }));
     try std.testing.expect(context.handle == null);
     const alloc = std.testing.allocator;
     var bridge = services.memory.Allocator.fromStd(&alloc);
@@ -4389,4 +4541,56 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "opaque context retains the node runnable owner across runtime birth and destruction" {
+    const runtime = @import("antfly_runtime_abi");
+    const services = @import("kernel_runtime_services.zig");
+    const Probe = struct {
+        references: usize = 0,
+        rejected: bool = false,
+        fn retain(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return runtime.error_abi.statusFromError(error.SchedulerClosed);
+            self.references += 1;
+            return .ok;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.references != 0);
+            self.references -= 1;
+        }
+        fn unavailable(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.ExecutionWaitUnsupported);
+        }
+        fn transition(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return unavailable(raw);
+        }
+        fn start(raw: *anyopaque, _: *const runtime.runnable_abi.Start) callconv(.c) runtime.error_abi.Status {
+            return unavailable(raw);
+        }
+        fn finish(_: *anyopaque) callconv(.c) void {
+            @panic("birth does not grant CPU");
+        }
+    };
+    var probe: Probe = .{ .rejected = true };
+    var port: runtime.runnable_abi.Owner = .{ .context = &probe, .retain = Probe.retain, .release = Probe.release, .start = Probe.start, .checkpoint = Probe.unavailable, .park = Probe.transition, .enter = Probe.transition, .finish = Probe.finish };
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    const alloc = std.testing.allocator;
+    var bridge = services.memory.Allocator.fromStd(&alloc);
+    var context = client.Context{};
+    try std.testing.expectError(error.SchedulerClosed, context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port }));
+    try std.testing.expect(context.handle == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+    probe.rejected = false;
+    port.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port }));
+    try std.testing.expect(context.handle == null);
+    port.version += 1;
+    try context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port });
+    defer if (context.handle != null) context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    port.version = 0; // Provider retained its own copy of the checked port.
+    context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
 }

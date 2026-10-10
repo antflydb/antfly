@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 75;
+pub const abi_version: u32 = 89;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -287,6 +287,10 @@ pub const LocalQueryRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     execution_deadline_ns: u64 = 0,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
@@ -432,6 +436,7 @@ pub const ContextResourceBudgetStats = extern struct {
     hard_limit_rejections: u64 = 0,
     oversized_single_grants: u64 = 0,
     accounting_errors: u64 = 0,
+    external_bytes: u64 = 0,
 
     /// Project aggregate or slice counters without importing the storage
     /// implementation across this ABI. Inapplicable counters remain zero.
@@ -445,6 +450,7 @@ pub const ContextResourceBudgetStats = extern struct {
             .hard_limit_rejections = stats.hard_limit_rejections,
             .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
             .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+            .external_bytes = if (@hasField(@TypeOf(stats), "external_bytes")) stats.external_bytes else 0,
         };
     }
 };
@@ -1371,6 +1377,9 @@ pub const MaintenanceRequest = extern struct {
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
     destination_root: BorrowedBytes = .{},
+    /// Synchronous borrowed runtime_runnable_abi.Reentry lifetime check.
+    /// Never serialized or retained beyond this maintenance invocation.
+    lifetime_check: ?*const anyopaque = null,
 };
 
 pub const MaintenanceResult = extern struct {
@@ -1603,6 +1612,10 @@ pub const ControlledJsonOperationRequest = extern struct {
     _reserved1: [7]u8 = @splat(0),
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Prepare one scoped restore step inside an already leased physical owner.
@@ -1681,6 +1694,16 @@ pub extern fn antfly_storage_context_configure_remote_content_security(
     context: ?*anyopaque,
     security_json: BorrowedBytes,
 ) callconv(.c) Status;
+
+/// Allocation-free borrowed accounting. The caller must release all charges
+/// before destroying the context; reservation failure leaves ownership unchanged.
+pub extern fn antfly_storage_context_reserve_external(context: ?*anyopaque, bytes: usize) callconv(.c) bool;
+pub extern fn antfly_storage_context_release_external(context: ?*anyopaque, bytes: usize) callconv(.c) void;
+
+/// Borrows the context's node accounting/pressure owner. Every child must
+/// release its final observer balance before context destruction.
+pub const MemoryParent = @import("runtime_memory_abi").Parent;
+pub extern fn antfly_storage_context_memory_parent(context: ?*anyopaque, out_parent: *MemoryParent) callconv(.c) bool;
 
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
@@ -1776,6 +1799,27 @@ pub extern fn antfly_metadata_apply_prepared_snapshot_materialize(
 ) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_prepared_snapshot_cancel(prepared: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_prepared_snapshot_destroy(prepared: ?*anyopaque) callconv(.c) void;
+/// A synchronous checked native control borrow. The port retains the exact
+/// caller budget; no duration is reconstructed at the storage boundary.
+pub const MetadataTransactionRoutingRequest = extern struct {
+    /// Independent version rejects earlier capture requests before reading
+    /// the newly required allocator field.
+    pub const abi_version: u32 = 1;
+    version: u32 = MetadataTransactionRoutingRequest.abi_version,
+    _reserved: u32 = 0,
+    group_id: u64,
+    control: ?*const anyopaque,
+    /// runtime_memory_abi.Allocator, borrowed synchronously through return.
+    allocator: ?*const anyopaque = null,
+};
+/// Returned bytes use request.allocator. Release them through that allocator;
+/// antfly_storage_owner_buffer_destroy must never receive this result.
+pub extern fn antfly_metadata_apply_store_transaction_routing(
+    store: ?*anyopaque,
+    request: *const MetadataTransactionRoutingRequest,
+    out_json: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_metadata_apply_store_projection(
     store: ?*anyopaque,
     request: *const MetadataProjectionRequest,
@@ -2136,6 +2180,14 @@ pub extern fn antfly_storage_owner_preflight_json(
 pub extern fn antfly_storage_owner_text_stats_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Trusted synchronous statistics controls; borrowed authority is never JSON.
+pub extern fn antfly_storage_owner_text_stats_controlled_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;

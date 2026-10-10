@@ -1,0 +1,17 @@
+{
+  "base_commit": "81ac6b544f",
+  "exit_code": 0,
+  "build_steps": 47,
+  "embedded_tests": 17,
+  "coordinator_tests": 7,
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "846bb7d2003bf89020d2fd84f9b265a040cbfc08a9fad6e880ca54122d2581e4",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "a1238cd7df2045fbdf9402e6cea7f55771bcbd97441e197a66747159e74cd04c"
+  },
+  "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build functions-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-provider-parent-cache --summary all",
+  "tested": "provider runtime returns distinct ordered answers and accounts four input tokens",
+  "not_covered": [
+    "new httpx SQL adapter assertions: full API gate pending",
+    "Linux provider gate"
+  ]
+}

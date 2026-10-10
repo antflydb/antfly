@@ -175,6 +175,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",
+        "data raft read safety execution wait retires registration after failed resume",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft native snapshot requires an install completion receipt",
         "data runtime native FK retirement preserves source ownership and exact cold path",
@@ -247,6 +248,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "remote transaction catalog carries original budgets through authoritative capture",
         "remote metadata deadline ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
@@ -257,10 +259,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
-        // The broad macOS ReleaseFast runtime root has measured at 12.12 GiB.
-        // Keep normal aggregate parallelism while giving the scheduler an
-        // honest reservation instead of forcing this root through -j1.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+        // Full ReleaseSafe qualification peaked above 13 GiB on macOS.
+        // Reserve codegen headroom for this broad root and its implementation
+        // pair; this is compiler admission, not a server runtime limit.
+        // Pinned native GNU ARM64 ReleaseSafe implementation compilation
+        // measured 10,839,859,200 bytes. Fourteen GiB exceeds that peak by
+        // 25%; preserve existing claims for other host/target profiles.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and
+            target.result.os.tag == .linux and target.result.cpu.arch == .aarch64 and
+            target.result.abi == .gnu and data_runtime_test_mod.optimize.? == .safe) 14 else 7) * 1024 * 1024 * 1024,
     });
     const implementation_tests = b.addTest(.{
         .name = "data-runtime-implementation-tests",
@@ -269,6 +276,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = lib_data_runtime_tests.object.step.max_rss,
     });
+    // These independent broad test closures each exceeded the previous
+    // compiler reservation. Keep their compilation serial on bounded hosts.
+    implementation_tests.step.dependOn(&lib_data_runtime_tests.object.step);
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);

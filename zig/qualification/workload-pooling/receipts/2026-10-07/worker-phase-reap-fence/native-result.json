@@ -1,0 +1,33 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-worker-rpc-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "2147483648",
+    "--cache-dir",
+    "/private/tmp/antfly-worker-phase-native-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 149,
+  "state": "terminal",
+  "started": 1791409999.780979,
+  "source_sha256": {
+    "zig/pkg/inference/src/host/worker_rpc.zig": "e24227242600940a554bd81efbeea02d982545bb5ca4b67894a4babd60670a98",
+    "zig/pkg/inference/src/host/worker_wire.zig": "fc57441e4dd2f9f2a7346f48850a87c14046d97503d861419fe8ae92f17fe978",
+    "zig/pkg/inference/src/host/worker.zig": "672058f85f8740e2a6d6c79b7b2c8de36d61c8fa8d30a7a26c729d3ffdf0fee8",
+    "zig/pkg/inference/src/execution_control.zig": "fa7887ea5963ed3557ef572ad8de8bc6ed7e609b7532094cba9e1b320d6a1512",
+    "zig/pkg/antfly/build/tests.zig": "8d4b676ee6011b08678d11d4e86efa10a1eeba4313537a35c3bd12b7fabdbdf1"
+  },
+  "compiler_pid": 153,
+  "exit_code": 0,
+  "finished": 1791410039.027888,
+  "compiled_source_sha256": {
+    "zig/pkg/inference/src/host/worker_rpc.zig": "e24227242600940a554bd81efbeea02d982545bb5ca4b67894a4babd60670a98",
+    "zig/pkg/inference/src/host/worker_wire.zig": "fc57441e4dd2f9f2a7346f48850a87c14046d97503d861419fe8ae92f17fe978",
+    "zig/pkg/antfly/build/tests.zig": "8d4b676ee6011b08678d11d4e86efa10a1eeba4313537a35c3bd12b7fabdbdf1"
+  }
+}

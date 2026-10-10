@@ -1518,6 +1518,9 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Request-local, single-worker execution owner. Never serialize or forward
+    /// this callback to another process or concurrently executing child.
+    execution_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
@@ -1819,6 +1822,10 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted local coordinator authority. Never serialized or reconstructed
+    /// from public JSON. Independent graph fanout tasks reserve owned children.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2018,6 +2025,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "resolved_doc_filter_wire_context",
     "identity_read_generation",
     "execution_deadline_ns",
+    "execution_runnable",
     "cancellation",
     "graph_execution_limits",
     "graph_physical_scan_observation",

@@ -1,0 +1,42 @@
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=164 ends=164
+REAL_SINK await peer EOF
+failed command: /cache/o/a590f1020bbc922862f9378e56b7c286/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x6af73af5 --listen=-
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/9bf16f89f3433ec838cfd99923302c07/http-cleanup-owner-tests --cache-dir=/cache --seed=0x6af73af5 --listen=-
+
+Build Summary: 15/15 steps succeeded; 37/37 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 263ms MaxRSS:33M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 12s MaxRSS:742M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 24 pass (24 total) 4ms MaxRSS:33M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 11s MaxRSS:937M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:33M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 12s MaxRSS:706M
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 6 pass (6 total) 2ms MaxRSS:33M
+   +- compile test sql-write-team-tests safe aarch64-linux-gnu success 10s MaxRSS:633M
+antfly-completion-task-test success
++- run test completion-task-tests 3 pass (3 total) 205ms MaxRSS:33M
+   +- compile test completion-task-tests safe aarch64-linux-gnu success 10s MaxRSS:639M
+

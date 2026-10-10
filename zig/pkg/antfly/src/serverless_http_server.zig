@@ -110,6 +110,7 @@ pub const ServerlessHttpServer = struct {
             .path = path,
             .body = req.body,
             .cancellation = if (req.cancellation) |value| value.token() else .none,
+            .deadline_ns = if (req.cancellation) |value| value.execution_deadline_ns else null,
         });
         defer resp.deinit(self.alloc);
 
@@ -217,9 +218,11 @@ pub const ServerlessHttpServer = struct {
             else => return try ctx.status(405).text("method not allowed"),
         };
         const body = (try ctx.body()) orelse "";
+        const context = try (@import("antfly_local_sources").api_operation.RequestContext{ .deadline_ns = ctx.application_deadline_ns, .deadline_io = if (ctx.application_deadline_io) |clock_io| @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io) else null }).platformDeadline();
         var response = try self.handler.handle(.{
             .method = method,
             .path = ctx.request.uri.path,
+            .deadline_ns = context.deadline_ns,
             .body = body,
             .cancellation = .{
                 .ptr = ctx,

@@ -73,6 +73,16 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
     const normalized = try request.platformDeadline();
     var context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    var execution: local.common_request_admission.runnable_scheduler.Execution = .{};
+    defer execution.finish();
+    var execution_bridge: ?@import("runnable_native_borrow.zig").Bridge = if (normalized.execution_team) |team|
+        try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, team.allocator)
+    else
+        null;
+    if (execution_bridge) |*bridge| {
+        try bridge.bind(&execution);
+        context = context.withExecution(&execution);
+    }
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
@@ -947,7 +957,7 @@ const Execution = struct {
                 try self.execution.context.ensureActive();
                 if (self.position == self.page.len) {
                     _ = self.window.reset(.retain_capacity);
-                    self.page = try self.predicate.next(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))));
+                    self.page = try self.predicate.nextFor(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))), self.execution.context.execution);
                     self.position = 0;
                     if (self.page.len == 0) return null;
                 }
@@ -1001,7 +1011,7 @@ const Execution = struct {
             if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
             try conditions.append(ca, condition);
         }
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        var predicate = (try sql_rows.tryOpenOrderedPredicateFor(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc }, self.context.execution)) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
         owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };

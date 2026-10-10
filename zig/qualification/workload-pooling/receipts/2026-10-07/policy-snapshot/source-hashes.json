@@ -1,0 +1,6 @@
+{
+  "zig/build.zig": "23aec190effb2c1a352a2c0074ae8e64557ed6807702f5dc4112c30cc9400612",
+  "zig/lib/casbin/src/mod.zig": "072fc0619f3ba825e47e7956e1689a6431bda1261f777fcb9811cda3ff08f6cf",
+  "zig/pkg/antfly-embedded/src/usermgr/user_manager.zig": "d125f608629dce1d6709f7f1398cdbeee811d7435290cdbe00453c766d980bdc",
+  "zig/pkg/antfly/src/usermgr/mod.zig": "d5308eb3c61040858fa48fe377c0c22093203b804cbf5a25ce4e4981619c70c7"
+}

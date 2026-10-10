@@ -2319,6 +2319,12 @@ pub const DBCore = struct {
         return try manager.collectIntentBatch(alloc, txn_id);
     }
 
+    pub fn collectTransactionIntentBatchWithAdmission(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.IntentBatch {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return manager.collectIntentBatchWithAdmission(alloc, txn_id, control);
+    }
+
     pub fn transactionHasIntents(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
         var manager = try self.initTxnManager();
         defer manager.deinit();

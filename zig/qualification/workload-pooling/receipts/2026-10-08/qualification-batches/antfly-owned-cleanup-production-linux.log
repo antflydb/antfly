@@ -1,0 +1,259 @@
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /cache/o/53fd9376c8f387203a3212a2faf2c53e/inference-worker-rpc-contract-tests --cache-dir=/cache --seed=0x2390bab0 --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=164 ends=164
+REAL_SINK await peer EOF
+failed command: /cache/o/f79325232c77eca1d16050e39a002c97/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x2390bab0 --listen=-
+
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=168 ends=168
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=164 ends=164
+PROCESS_SINK await peer EOF
+failed command: cd /cache/o/68da6a99ed24f396648d4f03166bef90 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /cache/o/6a92cabf2c12c2a77a0b620a4eec58cc/inference-worker-process-output-tests --cache-dir=/cache --seed=0x2390bab0 --listen=-
+
+antfly-workload-pooling-test
++- run test default-workload-pooling-tests
+   +- run test default-workload-pooling-tests-local
+      +- run python3
+         +- run test default-workload-pooling-tests
+            +- compile test default-workload-pooling-tests safe aarch64-linux-gnu failure
+error: process terminated with signal KILL
+failed command: /nix/store/ms802lv410k52rd15fxpg4qllfw57baw-zig-0.17.0/bin/zig test @/cache/args/d2933b9dfc564a438398144ac951c5adc20b90e4d694ca32bdb013f92ead6f3a
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/b9497fa7058be002d6292bb0b739eb40/http-cleanup-owner-tests --cache-dir=/cache --seed=0x2390bab0 --listen=-
+
+antfly-inference-provider-context-test
++- run test inference-provider-context-tests w
+1/2 standalone.runtime.test.runnable execution context adapters preserve parent authority...OK
+2/2 standalone.runtime.test.runnable execution context adapters install immutable production broker admission...info: standalone inference paths models_dir=. ml_dir=.
+info: inference resource policy ownership=external_required process_memory_limit_bytes=18446744073709551615 process_memory_limit_provenance=automatic
+error: standalone inference bridge failed operation=handle_http err=error.Forbidden
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+OK
+2 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /cache/o/4a3b00f41c78e20ce607cda126a190f3/inference-provider-context-tests --suite-filter "runnable execution context adapters" --allow-empty-test-filter --allow-empty-owner
+
+Build Summary: 89/95 steps succeeded (1 failed); 40/40 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 258ms MaxRSS:35M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 13s MaxRSS:734M
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:34M
+   +- compile test inference-worker-process-output-tests safe aarch64-linux-gnu success 11s MaxRSS:683M
+   +- compile exe inference-worker-output-fixture safe aarch64-linux-gnu success 10s MaxRSS:400M
+antfly-inference-worker-output-error-test success
++- run test inference-worker-output-error-tests 3 pass (3 total) 1ms MaxRSS:34M
+   +- compile test inference-worker-output-error-tests safe aarch64-linux-gnu success 9s MaxRSS:396M
+antfly-workload-pooling-test transitive failure
++- run test default-workload-pooling-tests transitive failure
+   +- compile test default-workload-pooling-tests safe aarch64-linux-gnu failure
+   |  +- options cached
+   |  +- options cached
+   |  +- options success
+   |  +- options cached
+   |  +- WriteFile tokenizer.json success
+   |  +- translate-c lmdb success 197ms
+   |  |  +- compile exe translate-c debug native cached 82ms MaxRSS:57M
+   |  |     +- options cached
+   |  |     +- options cached
+   |  |     +- options cached
+   |  |     +- run exe generate-def (aarch64.zig) cached
+   |  |     |  +- compile exe generate-def debug native cached 7ms MaxRSS:57M
+   |  |     +- run exe generate-def (amdgcn.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (arm.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (bpf.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (common.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (hexagon.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (loongarch.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (mips.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (neon.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (nvptx.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (powerpc.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (riscv.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (s390x.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (ve.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (wasm.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (x86_64.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (x86.zig) cached
+   |  |     |  +- compile exe generate-def debug native (reused)
+   |  |     +- run exe generate-def (xcore.zig) cached
+   |  |        +- compile exe generate-def debug native (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf success
+   |  +- options cached
+   |  +- options cached
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 11ms
+   |     +- compile exe patch_sentencepiece_proto safe native cached 7ms MaxRSS:57M
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) success 11ms
+   |     |  +- compile exe protoc-zig safe native cached 25ms MaxRSS:59M
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+   +- run test default-workload-pooling-tests-local transitive failure
+      +- compile test default-workload-pooling-tests-local safe aarch64-linux-gnu success 54s MaxRSS:2G
+      |  +- options success
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+1 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 transitive failure
+         +- run test default-workload-pooling-tests transitive failure
+         |  +- compile test default-workload-pooling-tests safe aarch64-linux-gnu (+12 more reused dependencies)
+         +- run test default-workload-pooling-tests-local success 3ms
+            +- compile test default-workload-pooling-tests-local safe aarch64-linux-gnu (+12 more reused dependencies)
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 411ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe aarch64-linux-gnu success 10s MaxRSS:439M
++- run test 6 pass (6 total) 42ms MaxRSS:33M
+   +- compile test safe aarch64-linux-gnu success 10s MaxRSS:476M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:33M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 14s MaxRSS:965M
+antfly-inference-provider-context-test success
++- run test inference-provider-context-tests success 7ms
+   +- compile test inference-provider-context-tests safe aarch64-linux-gnu success 8m MaxRSS:9G
+   |  +- WriteFile cached
+   |  +- compile obj antfly-build-info safe aarch64-linux-gnu cached 14ms MaxRSS:57M
+   |  |  +- options cached
+   |  +- WriteFile cached
+   |  +- compile lib antfly-storage-kernel safe aarch64-linux-gnu success 18m MaxRSS:21G
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- WriteFile tokenizer.json (reused)
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  |  +- options (reused)
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-enrichment_compute safe aarch64-linux-gnu success 40s MaxRSS:1G
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-inference safe aarch64-linux-gnu success 11m MaxRSS:14G
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- WriteFile tokenizer.json (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   |  +- compile obj antfly-build-info safe aarch64-linux-gnu (+1 more reused dependencies)
+   |  +- compile lib antfly-storage-kernel safe aarch64-linux-gnu (+10 more reused dependencies)
+   |  +- compile lib antfly-runtime-enrichment_compute safe aarch64-linux-gnu (+5 more reused dependencies)
+   |  +- compile lib antfly-runtime-inference safe aarch64-linux-gnu (+9 more reused dependencies)
+   |  +- options (reused)
+   |  +- options (reused)
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile tokenizer.json (reused)
+   |  +- translate-c lmdb (+1 more reused dependencies)
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- options (reused)
+   |  +- options (reused)
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   +- run test inference-provider-context-tests-local success 1ms
+      +- compile test inference-provider-context-tests-local safe aarch64-linux-gnu success 10s MaxRSS:897M
+      |  +- compile obj antfly-build-info safe aarch64-linux-gnu (+1 more reused dependencies)
+      |  +- compile lib antfly-storage-kernel safe aarch64-linux-gnu (+10 more reused dependencies)
+      |  +- compile lib antfly-runtime-enrichment_compute safe aarch64-linux-gnu (+5 more reused dependencies)
+      |  +- compile lib antfly-runtime-inference safe aarch64-linux-gnu (+9 more reused dependencies)
+      |  +- options cached
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+1 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile obj antfly-build-info safe aarch64-linux-gnu (+1 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-storage-kernel safe aarch64-linux-gnu (+10 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-enrichment_compute safe aarch64-linux-gnu (+5 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-inference safe aarch64-linux-gnu (+9 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 success 47ms
+         +- run test inference-provider-context-tests success 20ms
+         |  +- compile test inference-provider-context-tests safe aarch64-linux-gnu (+24 more reused dependencies)
+         +- run test inference-provider-context-tests-local success 3ms
+            +- compile test inference-provider-context-tests-local safe aarch64-linux-gnu (+24 more reused dependencies)
+

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "macos-native-idle-small",
+  "http_connections": 32,
+  "pgwire_connections": 32,
+  "samples": 5,
+  "sample_interval_seconds": 0.2,
+  "recovery_seconds": 3,
+  "thresholds": {
+    "idle_rss_growth_bytes": 134217728,
+    "idle_thread_growth": 160,
+    "idle_fd_growth": 80,
+    "control_latency_seconds": 2,
+    "recovery_fd_growth": 8,
+    "recovery_rss_growth_bytes": 134217728
+  }
+}

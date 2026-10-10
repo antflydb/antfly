@@ -88,6 +88,23 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Retaining an existing operation lease bypasses reader admission. A
+    /// pending capture must not deadlock a nested helper behind its own lease.
+    pub fn acquireMutationControlledIo(self: *@This(), io: std.Io, acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition, retained: ?*const MutationLease) !MutationLease {
+        if (retained) |lease| {
+            std.debug.assert(lease.active and lease.admission == self);
+            try acquisition.lifetime.check();
+            return lease.retain();
+        }
+        try self.lock.lockSharedControlledIo(io, acquisition);
+        return .{ .admission = self };
+    }
+
+    pub fn acquireCaptureControlledIo(self: *@This(), io: std.Io, acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition) !CaptureLease {
+        try self.lock.lockExclusiveControlledIo(io, acquisition);
+        return .{ .admission = self };
+    }
+
     pub fn acquireCapture(self: *@This()) CaptureLease {
         self.lock.lockExclusive();
         return .{ .admission = self };
@@ -281,4 +298,122 @@ test "storage.db snapshot admission lease can be released by another Io worker" 
     task.await(std.testing.io);
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
+}
+
+test "storage.db snapshot admission controlled waits resume the original fence holder" {
+    const native = @import("../../common/runnable_scheduler.zig");
+    for ([_]bool{ false, true }) |capture_waits| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var holder: native.Execution = .{};
+        defer holder.finish();
+        var waiter: native.Execution = .{};
+        defer waiter.finish();
+        try holder.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+        var admission: SnapshotAdmission = .{};
+        var mutation: ?SnapshotAdmission.MutationLease = if (capture_waits) admission.acquireMutation() else null;
+        defer if (mutation) |*lease| lease.release();
+        var capture: ?SnapshotAdmission.CaptureLease = if (capture_waits) null else admission.acquireCapture();
+        defer if (capture) |*lease| lease.release();
+        try holder.park(.resource_blocked);
+        try waiter.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+        const State = struct {
+            scheduler: *native.Scheduler,
+            holder: *native.Execution,
+            waiter: *native.Execution,
+            mutation: *?SnapshotAdmission.MutationLease,
+            capture: *?SnapshotAdmission.CaptureLease,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *const anyopaque) !void {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                try self.waiter.checkLifetime();
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                try self.waiter.park(.resource_blocked);
+                try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 40), self.scheduler.stats().retained_bytes);
+                try self.holder.enter(.query);
+                if (self.mutation.*) |*lease| lease.release();
+                if (self.capture.*) |*lease| lease.release();
+                self.holder.finish();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                try self.waiter.enter(.write);
+            }
+        };
+        var state: State = .{ .scheduler = &scheduler, .holder = &holder, .waiter = &waiter, .mutation = &mutation, .capture = &capture };
+        const controls: apply_rw_lock_mod.ApplyRwLock.Acquisition = .{
+            .lifetime = .{ .context = &state, .check_fn = State.check },
+            .execution_wait = .{ .ptr = &state, .begin = State.begin, .end = State.end },
+        };
+        if (capture_waits) {
+            var lease = try admission.acquireCaptureControlledIo(std.testing.io, controls);
+            try std.testing.expect(!admission.lock.tryLockShared());
+            lease.release();
+            lease.release();
+        } else {
+            var lease = try admission.acquireMutationControlledIo(std.testing.io, controls, null);
+            try std.testing.expect(!admission.lock.tryLockExclusive());
+            lease.release();
+            lease.release();
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(state.begins, state.ends);
+        waiter.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expect(admission.lock.tryLockExclusive());
+        admission.lock.unlockExclusive();
+    }
+}
+
+test "storage.db snapshot admission controlled nested retain keeps the original lease and lifetime" {
+    const State = struct {
+        checks: usize = 0,
+        failure: ?anyerror = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.failure) |err| return err;
+        }
+        fn unexpectedWait(_: *anyopaque) !void {
+            return error.UnexpectedNestedAdmissionWait;
+        }
+    };
+    for ([_]bool{ false, true }) |capture_owned| {
+        var admission: SnapshotAdmission = .{};
+        var capture: ?SnapshotAdmission.CaptureLease = if (capture_owned) admission.acquireCapture() else null;
+        defer if (capture) |*lease| lease.release();
+        var outer = if (capture) |*lease| lease.borrowMutation() else admission.acquireMutation();
+        defer outer.release();
+        // A queued capture closes unrelated shared admission. Retaining the
+        // active mutation must bypass it without acquiring another CPU owner.
+        if (!capture_owned) admission.lock.exclusive_waiters.store(1, .release);
+        defer if (!capture_owned) admission.lock.exclusive_waiters.store(0, .release);
+        var state: State = .{};
+        const controls: apply_rw_lock_mod.ApplyRwLock.Acquisition = .{
+            .lifetime = .{ .context = &state, .check_fn = State.check },
+            .execution_wait = .{ .ptr = &state, .begin = State.unexpectedWait, .end = State.unexpectedWait },
+        };
+        var inner = try admission.acquireMutationControlledIo(std.testing.io, controls, &outer);
+        try std.testing.expectEqual(@as(usize, 1), state.checks);
+        inner.release();
+        for ([_]anyerror{ error.Timeout, error.Canceled, error.SchedulerClosed }) |cause| {
+            state.failure = cause;
+            try std.testing.expectError(cause, admission.acquireMutationControlledIo(std.testing.io, controls, &outer));
+            try std.testing.expect(outer.active);
+        }
+        if (!capture_owned) admission.lock.exclusive_waiters.store(0, .release);
+        outer.release();
+        if (capture) |*lease| lease.release();
+        try std.testing.expect(admission.lock.tryLockExclusive());
+        admission.lock.unlockExclusive();
+    }
 }

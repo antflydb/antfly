@@ -170,7 +170,7 @@ components:
           description: Literal path to an externally managed secret file. Never written by the API.
     PgwireConfig:
       type: object
-      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      description: Optional PostgreSQL wire listener. Requires authentication. Supports native transactions. Remote bindings require externally protected transport.
       properties:
         enabled:
           type: boolean
@@ -183,6 +183,34 @@ components:
           minimum: 1
           maximum: 65535
           default: 5432
+        max_session_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: |
+            Aggregate bytes allocated through pgwire connection budgets, covering
+            protocol messages, prepared state, portals, and caller-owned response
+            arenas. Zero preserves the sum of the per-connection ceilings. This
+            is separate from global backend plan/cache and process memory budgets.
+        max_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: Aggregate pgwire retained-state allocation ceiling for prepared plans, portals, cursor state/spools, and settings. Charged within max_session_bytes. Zero uses the sum of per-connection retained ceilings.
+        retained_bytes_per_connection:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          default: 8388608
+          description: Per-connection retained-state allocation ceiling, separate from transient frames and response pages.
+        idle_transaction_timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          default: 30000
+          description: Maximum wait for the next message in an active or failed transaction, capped by the ordinary connection idle timeout. Expiry disconnects the owner and runs normal cleanup; durable decisions remain recoverable.
         max_connections:
           type: integer
           minimum: 1
@@ -1003,12 +1031,97 @@ components:
       additionalProperties: false
       description: Node-local foreground database request admission settings.
       properties:
+        max_retained_memory_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+          default: 268435456
+          description: Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes.
+        max_request_memory_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+          default: 268435456
+          description: Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes.
+        runnable:
+          $ref: "#/components/schemas/RunnableSchedulingConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RunnableSchedulingConfig:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: Opt-in fixed runnable scheduling across execution classes. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+      properties:
+        slots:
+          type: integer
+          minimum: 3
+          maximum: 65535
+          default: 8
+          description: Total CPU slots including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves.
+        control_slots:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
+        cleanup_slots:
+          type: integer
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
+        weights:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          default: [4, 2, 1, 1]
+          description: Query, write, inference and background slot-service weights.
+        max_operations:
+          type: integer
+          minimum: 4
+          default: 128
+          description: Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 8388608
+          description: Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
+        control_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 65536
+          description: Protected scheduling metadata bytes reserved within max_bytes. Up to four operation entries, capped at half max_operations, are also reserved for controls.
+        max_wait_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 250
+        max_backfills:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 8
+        quantum_ms:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 2
+        checkpoint_budget:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 64
 
     GraphExecutionConfig:
       type: object
@@ -1096,10 +1209,38 @@ components:
           default: 3600
           description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
+    QueryAdmissionWaiting:
+      type: object
+      additionalProperties: false
+      description: |
+        Opt-in bounded waiting for contextual REST and native SQL reads. Waiting
+        retains a runtime task and owned input; existing executor and transport
+        bounds still apply. Write, inference, MCP, and legacy direct calls remain
+        fail-fast. All three limits must be positive to enable waiting, or all
+        zero to disable it. These are queued input limits, not total heap limits.
+      properties:
+        max_queued_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 0
+        max_queued_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+
     QueryAdmissionConfig:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/QueryAdmissionWaiting"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -1115,7 +1256,8 @@ components:
             scans consume it. Point lookups and operational/control-plane reads
             remain outside it. Excess HTTP work is rejected immediately with
             HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
-            response. Excess work is not queued. Set to 0 to disable query
+            response. Contextual REST and native SQL reads can opt into bounded
+            waiting using admission.query.waiting. Set to 0 to disable query
             admission. This budget is independent of transport safeguards,
             write admission, and
             admission.inference.max_concurrent_requests.

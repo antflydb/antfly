@@ -50,7 +50,7 @@ fn callError(status: abi.Status) !void {
 }
 
 fn validateFunctionTable() !*const abi.FunctionTable {
-    const table = antfly_api_kernel_get_function_table();
+    const table = if (direct_codegen) @import("kernel_exports.zig").getFunctionTable() else antfly_api_kernel_get_function_table();
     if (!abi.validFunctionTable(
         table,
         abi.Capability.core | abi.Capability.inference_admission_stats,
@@ -61,6 +61,72 @@ fn validateFunctionTable() !*const abi.FunctionTable {
 
 pub const ApiHttpServer = if (direct_codegen) server_mod.ApiHttpServer else OpaqueApiHttpServer;
 pub const HttpxHandler = if (direct_codegen) handler_mod.AntflyApiHandler else OpaqueHttpxHandler;
+
+/// Node lifetime owns this handle independently of each borrowing API. Closing
+/// precedes consumer joins; destruction follows all API/inference/background joins.
+pub const NodeRunnableOwner = struct {
+    handle: *anyopaque,
+    functions: *const abi.FunctionTable,
+    boundary_allocator: *BoundaryAllocator,
+
+    pub fn init(alloc: std.mem.Allocator, policy: server_mod.RunnableScheduler.Config) !NodeRunnableOwner {
+        const functions = if (direct_codegen) @import("kernel_exports.zig").getFunctionTable() else try validateFunctionTable();
+        if (!abi.validFunctionTable(functions, abi.Capability.node_runnable_owner)) return error.UnsupportedVersion;
+        const boundary_allocator = try alloc.create(BoundaryAllocator);
+        errdefer alloc.destroy(boundary_allocator);
+        boundary_allocator.allocator = alloc;
+        boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
+        var handle: ?*anyopaque = null;
+        try callError(functions.runnable_owner_create(&.{
+            .abi_version = abi.abi_version,
+            .owner_alloc = &boundary_allocator.abi_allocator,
+            .policy = &policy,
+            .policy_contract = .of(server_mod.RunnableScheduler.Config),
+            .out_handle = &handle,
+        }));
+        return .{ .handle = handle orelse return error.ApiKernelOperationFailed, .functions = functions, .boundary_allocator = boundary_allocator };
+    }
+
+    /// Borrowed port: consumers retain before storing it and release after joins.
+    pub fn executionPort(self: *const NodeRunnableOwner) !abi.runnable_abi.Owner {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.node_runnable_execution)) return error.UnsupportedVersion;
+        var port: abi.runnable_abi.Owner = undefined;
+        try callError(self.functions.runnable_owner_execution_port(&.{
+            .abi_version = abi.abi_version,
+            .handle = self.handle,
+            .output = &port,
+            .output_contract = .of(abi.runnable_abi.Owner),
+        }));
+        if (!port.valid()) return error.UnsupportedVersion;
+        return port;
+    }
+
+    pub fn close(self: *const NodeRunnableOwner) !void {
+        try callError(self.functions.runnable_owner_close(&.{ .abi_version = abi.abi_version, .handle = self.handle }));
+    }
+
+    pub fn deinit(self: *NodeRunnableOwner) !void {
+        try callError(self.functions.runnable_owner_destroy(&.{ .abi_version = abi.abi_version, .handle = self.handle }));
+        const alloc = self.boundary_allocator.allocator;
+        alloc.destroy(self.boundary_allocator);
+        self.* = undefined;
+    }
+};
+
+test "runnable scheduler opaque node owner retains its allocator after refused destruction" {
+    var owner = try NodeRunnableOwner.init(std.testing.allocator, .{ .slots = 2 });
+    const port = try owner.executionPort();
+    try std.testing.expectEqual(owner.handle, port.context);
+    try std.testing.expect(port.retain(port.context).isOk());
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.deinit());
+    port.release(port.context);
+    const implementation: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(owner.handle));
+    try implementation.retain();
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.deinit());
+    implementation.release();
+    try owner.close();
+    try owner.deinit();
+}
 
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
@@ -117,9 +183,22 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    pub fn configurePublicHttpTransport(self: *const OpaqueApiHttpServer, config: httpx.ServerConfig) httpx.ServerConfig {
+        var out: httpx.ServerConfig = undefined;
+        var value = config;
+        callInfallible(httpx.ServerConfig, httpx.ServerConfig, self.functions.configure_http_transport, self.opaque_handle, &value, &out);
+        return out;
+    }
+
     pub fn queryAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
         var out: AdmissionStats = undefined;
         callInfallible(void, AdmissionStats, self.functions.query_admission_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
+    pub fn runnableSchedulingStats(self: *const OpaqueApiHttpServer) abi.RunnableStats {
+        var out: abi.RunnableStats = undefined;
+        callInfallible(void, abi.RunnableStats, self.functions.runnable_scheduling_stats, self.opaque_handle, null, &out);
         return out;
     }
 
@@ -217,19 +296,27 @@ fn createOpaqueServer(
 ) !OpaqueApiHttpServer {
     const functions = try validateFunctionTable();
     var cfg_copy = cfg;
-    const api_io = if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
-    const api_network_io = if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
-    const api_filesystem_io = if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
-    const durable_io = if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const api_io = if (cfg.imported_runtime_io) |views| views.api else if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
+    const api_network_io = if (cfg.imported_runtime_io) |views| views.api_network else if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
+    const api_filesystem_io = if (cfg.imported_runtime_io) |views| views.api_filesystem else if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
+    const durable_io = if (cfg.imported_runtime_io) |views| views.durable else if (cfg.backend_runtime) |runtime| runtime.io() else null;
     const api_borrow: ?abi.native_abi.IoBorrow = if (api_io) |io| .init(&io) else null;
     const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
     const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
     const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const sql_execution_io = if (cfg.imported_runtime_io) |views| views.sql_execution else if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const sql_control_io = if (cfg.imported_runtime_io) |views| views.sql_control else if (cfg.backend_runtime) |runtime| runtime.controlIo() else null;
+    const sql_execution_borrow: ?abi.native_abi.IoBorrow = if (sql_execution_io) |io| .init(&io) else null;
+    const sql_control_borrow: ?abi.native_abi.IoBorrow = if (sql_control_io) |io| .init(&io) else null;
+    const sql_worker_factory = if (cfg.imported_runtime_io) |views| views.sql_workers else if (cfg.backend_runtime) |runtime| @import("sql_worker_lease.zig").factory(runtime) else null;
     const runtime_io: abi.RuntimeIoBorrows = .{
         .api = if (api_borrow) |*borrow| borrow else null,
         .api_network = if (api_network_borrow) |*borrow| borrow else null,
         .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
         .durable = if (durable_borrow) |*borrow| borrow else null,
+        .sql_execution = if (sql_execution_borrow) |*borrow| borrow else null,
+        .sql_control = if (sql_control_borrow) |*borrow| borrow else null,
+        .sql_workers = if (sql_worker_factory) |*producer| producer else null,
     };
     var source_copy = source;
     var reads_copy = read_source;
@@ -245,7 +332,7 @@ fn createOpaqueServer(
         .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
         .cfg_contract = .of(server_mod.ApiHttpServerConfig),
-        .runtime_io = if (cfg.backend_runtime != null) &runtime_io else null,
+        .runtime_io = if (cfg.backend_runtime != null or cfg.imported_runtime_io != null) &runtime_io else null,
         .source = &source_copy,
         .source_contract = .of(server_mod.StatusSource),
         .table_reads = &reads_copy,
@@ -587,6 +674,7 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
         const write = handler.api_server.writeAdmissionStats();
         const inference = handler.api_server.inferenceAdmissionStats();
         const query_body = handler.query_body_admission.stats();
+        const memory = handler.api_server.workloadMemoryStats();
         return .{
             .query_capacity = query.capacity,
             .query_in_flight = query.in_flight,
@@ -604,6 +692,27 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,
             .query_body_rejected_total = query_body.rejected_total,
+            .query_configured_capacity = query.configured_capacity,
+            .query_queued = query.queued,
+            .query_queued_bytes = query.queued_bytes,
+            .query_waited_total = query.waited_total,
+            .query_wait_ns_total = query.wait_ns_total,
+            .query_wait_completed_total = query.wait_completed_total,
+            .query_wait_buckets = query.wait_buckets,
+            .query_expired_total = query.expired_total,
+            .query_cancelled_total = query.cancelled_total,
+            .query_queue_capacity = query.waiting.max_queued_requests,
+            .query_queue_bytes = query.waiting.max_queued_bytes,
+            .query_wait_ms = query.waiting.max_wait_ms,
+            .query_policy_version = query.policy_version,
+            .query_policy_retired_total = query.policy_retired_total,
+            .query_retiring_waiters = query.retiring_waiters,
+            .query_draining = query.draining,
+            .query_suspended = query.suspended,
+            .query_quiescent = query.quiescent,
+            .query_sql_waiting_enabled = query.sql_waiting_enabled orelse false,
+            .runnable = handler.api_server.runnableSchedulingStats(),
+            .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.control), memoryAbi(memory.retained) },
         };
     }
     return handler.stats();
@@ -611,6 +720,11 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
 
 pub fn deinitHandler(handler: *HttpxHandler) void {
     if (comptime direct_codegen) handler.deinitRuntime() else handler.deinit();
+}
+
+fn memoryAbi(stats: anytype) abi.WorkloadMemoryStats {
+    if (stats) |value| return .{ .enabled = true, .limit_bytes = value.limit_bytes, .used_bytes = value.used_bytes, .peak_bytes = value.peak_bytes, .rejected_total = value.rejected_total };
+    return .{ .enabled = false, .limit_bytes = 0, .used_bytes = 0, .peak_bytes = 0, .rejected_total = 0 };
 }
 
 pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {
@@ -791,4 +905,27 @@ test "linked transport admits a streaming body before the kernel pulls it" {
     try std.testing.expect(FakeKernel.saw_streaming_source);
     try std.testing.expect(FakeKernel.saw_body);
     try std.testing.expectEqual(@as(usize, 1), body_state.calls);
+}
+
+test "API kernel create host bridge supplies SQL worker capabilities and retires startup reservation" {
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    var server = try OpaqueApiHttpServer.initWithConfig(std.testing.allocator, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 2, .max_operations = 8 } }, source, null, null);
+    var live = true;
+    defer if (live) server.deinit();
+    // Force the real opaque producer/receiver setup even in test builds, where
+    // the ordinary ApiHttpServer alias otherwise chooses direct codegen.
+    try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    server.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
 }

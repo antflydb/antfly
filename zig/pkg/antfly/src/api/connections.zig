@@ -1090,8 +1090,12 @@ fn resolveModels(
 
     const now_ns = platform_time.monotonicNs();
 
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(arena, sources.network_io orelse std.Io.Threaded.global_single_threaded.io(), 64 << 20);
+    defer fanout_memory.deinit();
     // Pending live fetches after cache lookups and local fast paths.
     var pending = std.ArrayListUnmanaged(struct { index: usize, job: *ModelsJob }).empty;
+    defer for (pending.items) |item| item.job.arena_state.deinit();
 
     for (instances, 0..) |instance, i| {
         if (instance.provider == .mock) {
@@ -1153,7 +1157,7 @@ fn resolveModels(
                 .credentials_path = instance.credentials_path,
             },
             .timeout_ms = opts.timeout_ms,
-            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena_state = std.heap.ArenaAllocator.init(fanout_memory.allocator()),
             .cache = cache,
             .cache_key = instance.key,
             .request_started_ns = now_ns,
@@ -1206,7 +1210,6 @@ fn resolveModels(
         } else {
             outcome = .{ .ok = false, .err_name = item.job.cached_err_name orelse @errorName(item.job.err orelse error.Unknown) };
         }
-        item.job.arena_state.deinit();
         outcomes[item.index] = outcome;
 
         if (cache) |c| {
@@ -1304,6 +1307,9 @@ fn resolveExternalIoProbes(
         cache_key: []const u8,
         job: *ObjectProbeJob,
     };
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(arena, network_io orelse std.Io.Threaded.global_single_threaded.io(), 64 << 20);
+    defer fanout_memory.deinit();
     var pending = std.ArrayListUnmanaged(Pending).empty;
     defer for (pending.items) |item| item.job.arena_state.deinit();
     const now_ns = platform_time.monotonicNs();
@@ -1355,7 +1361,7 @@ fn resolveExternalIoProbes(
         job.* = .{
             .cfg = cfg,
             .timeout_ms = @max(opts.timeout_ms, 1),
-            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena_state = std.heap.ArenaAllocator.init(fanout_memory.allocator()),
             .cache = cache,
             .cache_key = cache_key,
             .request_started_ns = now_ns,

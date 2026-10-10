@@ -2665,6 +2665,7 @@ pub const InvertedIndexReader = struct {
 };
 
 pub const TermIterator = struct {
+    work: @import("../search/work_authority.zig").Poller = .{},
     alloc: Allocator,
     reader: *const InvertedIndexReader,
     block_iter: fst.FSTIterator,
@@ -2702,6 +2703,7 @@ pub const TermIterator = struct {
 
     fn nextInternal(self: *TermIterator, comptime track_decoded: bool, decoded_count: ?*u64) !?Entry {
         while (true) {
+            try self.work.tick();
             if (self.current_block_remaining == 0) {
                 if (!try self.loadNextBlock()) return null;
             }
@@ -2745,6 +2747,7 @@ pub const TermIterator = struct {
 
     fn loadNextBlock(self: *TermIterator) !bool {
         while (true) {
+            try self.work.tick();
             const current = self.block_iter.current() orelse return false;
             const block_offset: usize = @intCast(current.val);
             if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
@@ -5159,11 +5162,29 @@ pub const PostingsIterator = struct {
         bound_table: ?*const BM25BoundTable,
         allow_equal_prune: bool,
     ) !CompetitiveBlockAdvance {
+        return self.advanceToCompetitiveBlockWithAuthority(block_max, threshold, scorer, idf, bound_table, allow_equal_prune, null);
+    }
+
+    pub fn advanceToCompetitiveBlockWithAuthority(
+        self: *PostingsIterator,
+        block_max: BlockMaxInfo,
+        threshold: f32,
+        scorer: BM25TermScorer,
+        idf: f32,
+        bound_table: ?*const BM25BoundTable,
+        allow_equal_prune: bool,
+        authority: ?@import("../search/work_authority.zig").Authority,
+    ) !CompetitiveBlockAdvance {
+        var authority_steps: u8 = 0;
         if (self.impactChunkIds().len > 0) {
             const current = self.currentBlockCursor() orelse return .{ .hit = null, .chunks_skipped = 0 };
             var ordinal = current.ordinal + 1;
             var skipped: u32 = 1;
             while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
+                if (authority) |owner| {
+                    if (authority_steps == 0) try owner.check();
+                    authority_steps = (authority_steps + 1) % 64;
+                }
                 const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
                 if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                     const target = self.impactChunkIds()[ordinal] * impact_range_doc_count;
@@ -5179,6 +5200,10 @@ pub const PostingsIterator = struct {
         var ordinal = self.current_chunk_index + 1;
         var skipped: u32 = 1; // remainder of the current non-competitive chunk
         while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
+            if (authority) |owner| {
+                if (authority_steps == 0) try owner.check();
+                authority_steps = (authority_steps + 1) % 64;
+            }
             const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
             if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                 try self.loadChunk(ordinal);
@@ -9558,6 +9583,13 @@ pub const ScopedInvertedIndexReader = struct {
         contiguous: TermIterator,
         ranges: RangeIterator,
 
+        pub fn setAuthority(self: *Iterator, authority: ?@import("../search/work_authority.zig").Authority) void {
+            switch (self.*) {
+                .contiguous => |*iterator| iterator.work = .{ .authority = authority },
+                .ranges => |*iterator| iterator.work = .{ .authority = authority },
+            }
+        }
+
         pub fn blocksPruned(self: *const Iterator) u64 {
             return switch (self.*) {
                 .contiguous => |*iterator| iterator.blocks_pruned,
@@ -9589,6 +9621,7 @@ pub const ScopedInvertedIndexReader = struct {
     };
 
     const RangeIterator = struct {
+        work: @import("../search/work_authority.zig").Poller = .{},
         context: *Context,
         scratch: @import("../segment_source.zig").Scratch,
         block: u32 = 0,
@@ -9627,6 +9660,7 @@ pub const ScopedInvertedIndexReader = struct {
             }
             const a = self.context.allocator;
             while (!self.done) {
+                try self.work.tick();
                 if (self.remaining == 0 and !try self.loadBlock()) return null;
                 const shared = try readVarintU32(self.bytes, &self.cursor);
                 const leaf_length = try readVarintU32(self.bytes, &self.cursor);
@@ -9662,6 +9696,7 @@ pub const ScopedInvertedIndexReader = struct {
 
         fn loadBlock(self: *RangeIterator) !bool {
             while (true) {
+                try self.work.tick();
                 const reader = &self.context.native;
                 if (self.block >= reader.block_count) {
                     self.done = true;
@@ -11226,4 +11261,45 @@ test "mapping windows use linear lookahead for moderately sparse chunks" {
     try std.testing.expectEqual(@as(usize, 125), state.reads);
     try std.testing.expectEqual(@as(u64, 1), iterator.mapping_window_refills);
     try std.testing.expect(iterator.test_mapping_scan_steps <= 128);
+}
+
+test "controlled dictionary iterators observe lifetime while rejecting every decoded term" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..193) |doc| {
+        var name: [16]u8 = undefined;
+        try builder.addDocument(@intCast(doc), &.{.{ .term = try std.fmt.bufPrint(&name, "a{d:0>4}", .{doc}), .freq = 1 }});
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var regex = try @import("../search/regex.zig").compile(a, "a....x");
+    defer regex.deinit();
+    const State = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 2) return error.Timeout;
+        }
+    };
+    for ([_]bool{ false, true }) |ranged| {
+        const View = @import("../segment_source.zig").View;
+        var reader = if (ranged)
+            try ScopedInvertedIndexReader.initRanges(a, try View.init(.{ .contiguous = bytes }, 0, bytes.len), .{})
+        else
+            try ScopedInvertedIndexReader.initContiguous(a, bytes);
+        defer reader.deinit();
+        var iter = try reader.fstSearchIterator(regex.automaton());
+        defer iter.deinit();
+        var state: State = .{};
+        iter.setAuthority(.{ .context = &state, .check_fn = State.check });
+        // No accepted entry is ever exposed. Both implementations must check
+        // original lifetime inside next(), rather than only between outputs.
+        try std.testing.expectError(error.Timeout, iter.next());
+        try std.testing.expectEqual(@as(usize, 2), state.calls);
+        var clean = try reader.fstSearchIterator(regex.automaton());
+        defer clean.deinit();
+        try std.testing.expect((try clean.next()) == null);
+    }
 }

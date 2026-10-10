@@ -18,6 +18,8 @@
 //! supplied the allocator; consumers only borrow this C-layout callback table.
 
 const std = @import("std");
+pub const Parent = @import("storage/memory_parent.zig").Port;
+pub const ParentSnapshot = @import("storage/memory_parent.zig").Snapshot;
 
 pub const Bytes = extern struct {
     ptr: ?[*]const u8 = null,

@@ -143,6 +143,41 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const text_statistics_controls_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/text_statistics_controls_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_imports.configure(b, text_statistics_controls_mod, true, true);
+    const text_statistics_controls_tests = b.addTest(.{
+        .root_module = text_statistics_controls_mod,
+        .filters = &.{"text statistics trusted controls"},
+        // Linux shared-navigation compilation peaked at 3.33 GB.
+        .max_rss = @as(usize, if (target.result.os.tag == .linux) 4 else 3) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-text-statistics-controls-test", "Verify trusted statistics controls retain original authority and deadline")
+        .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);
+    const runnable_config_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runnable_config_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_imports.configure(b, runnable_config_mod, true, true);
+    const runnable_config_tests = b.addTest(.{
+        .root_module = runnable_config_mod,
+        .filters = &.{"config runnable scheduler"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-config-test", "Verify public runnable policy parsing and managed cleanup capacity")
+        .dependOn(&b.addRunArtifact(runnable_config_tests).step);
+    const text_statistics_storage_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "text stats use postings when segment source is omitted", "statistics ownership survives every allocation failure", "statistics frequency result retires", "statistics background labels retire", "db statistics controlled primary hydration", "statistics primary hydration adapter" },
+    });
+    b.step("antfly-text-statistics-storage-test", "Verify exact statistics and retirement after rejected snapshot acquisition")
+        .dependOn(&addFilteredTestRunArtifact(b, text_statistics_storage_tests).step);
     const producer_readiness_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/producer_readiness_test_root.zig"),
         .target = target,
@@ -483,6 +518,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_test_mod.addImport("antfly_root", antfly_test_mod);
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     antfly_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
+
+    const worker_rpc_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    worker_rpc_test_mod.addImport("httpx", httpx_mod);
+    const worker_rpc_tests = b.addTest(.{
+        .name = "inference-worker-rpc-contract-tests",
+        .root_module = worker_rpc_test_mod,
+        .filters = &.{"inference worker"},
+        .max_rss = 1024 * 1024 * 1024,
+    });
+    const worker_rpc_step = b.step("antfly-inference-worker-rpc-test", "Run actual worker RPC transport and phase handoff contracts");
+    worker_rpc_step.dependOn(&b.addRunArtifact(worker_rpc_tests).step);
+    worker_rpc_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .root_module = test_imports.runtime.inference_worker_wire,
+        .filters = &.{"inference worker"},
+        .max_rss = 1024 * 1024 * 1024,
+    })).step);
 
     const common_http_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
@@ -1038,6 +1094,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = embedded_db_mod,
         .filters = &.{
             "embedded custom storage owns its physical namespace",
+            "embedded workload deadline rejects work before DB handoff and preserves cancellation",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",
@@ -2577,6 +2634,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, serverless_manifest_test_mod, true, true);
     serverless_manifest_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const artifact_read_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{ "artifact identities", "artifact store", "artifact reads", "verified empty artifacts", "external lake aggregate", "native aggregate", "external lake reader", "external lake native reader", "external lake cold reader", "external lake native text", "external lake packed text", "external lake physical", "external lake text", "external lake seekable text", "external lake required pack", "external lake ordered" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-read-test", "Run artifact integrity and request-owned provider wait contracts").dependOn(&b.addRunArtifact(artifact_read_tests).step);
+    const sql_worker_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{ "SQL imported worker", "SQL worker capacity error" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_worker_run = b.addRunArtifact(sql_worker_tests);
+    sql_worker_run.addArg("--require-no-skips");
+    b.step("antfly-sql-worker-capability-test", "Run actual imported SQL lane ownership, saturation and failure retirement").dependOn(&sql_worker_run.step);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
         .filters = &.{
@@ -3052,6 +3123,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capacity percentage safety floor is capped on large volumes",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
+        "resource manager external allocator shares storage ceiling and preserves pinned control",
+        "resource manager parent",
+        "workload accepted transactions",
         "budgeted allocator admits before allocation and releases exact live bytes",
         "budgeted allocator reclamation is opt in and retries without raising limits",
         "budgeted allocator reclaim denial does not retry a busy cache",
@@ -4739,6 +4813,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "standalone inference response cancellation",
+
+            "runnable execution context adapters",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
@@ -4835,6 +4912,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Linux retains the measured aggregate default.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const inference_response_cleanup_tests = b.addTest(.{
+        .name = "inference-response-cleanup-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &.{"standalone inference response cancellation"},
+        .max_rss = 20 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-response-cleanup-test", "Verify post-dispatch cancellation retires host response ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, inference_response_cleanup_tests).step);
+
+    const provider_context_filters = [_][]const u8{"runnable execution context adapters"};
+    const provider_context_tests = b.addTest(.{
+        .name = "inference-provider-context-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &provider_context_filters,
+        .max_rss = 20 * 1024 * 1024 * 1024,
+    });
+    const provider_context_step = b.step("antfly-inference-provider-context-test", "Run full request context propagation through provider adapters");
+    provider_context_step.dependOn(&addFilteredTestRunArtifact(b, provider_context_tests).step);
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);
@@ -5195,6 +5290,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     }));
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
+    vector_payload_test_mod.addImport("runtime_memory_abi", antfly_imports.storage_boundary.memory);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     vector_payload_test_mod.addImport("antfly-json", json_mod);

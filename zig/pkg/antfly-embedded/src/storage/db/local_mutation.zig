@@ -246,10 +246,13 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const enforceReplicationWriteGate = commit.enforceReplicationWriteGate;
         pub const enforceRowPolicyMutationLocked = commit.enforceRowPolicyMutationLocked;
         pub const ensureDurableReplicationStartupBarrier = commit.ensureDurableReplicationStartupBarrier;
+        pub const ensureDurableReplicationStartupBarrierWithAdmission = commit.ensureDurableReplicationStartupBarrierWithAdmission;
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
+        pub const flushDurableReplicationOutboxesWithAdmission = commit.flushDurableReplicationOutboxesWithAdmission;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
+        pub const flushDurableReplicationOutboxesLockedWithAdmission = commit.flushDurableReplicationOutboxesLockedWithAdmission;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
@@ -279,7 +282,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
         pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
+        pub const resolveTransactionIntentsInternalWithControls = commit.resolveTransactionIntentsInternalWithControls;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
+        pub const resolveTransactionIntentsPreparedWithControls = commit.resolveTransactionIntentsPreparedWithControls;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
         pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
@@ -750,6 +755,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const vectorIndexConsumesChunkKey = materialization.vectorIndexConsumesChunkKey;
         pub const waitForCachedBool = commit.waitForCachedBool;
         pub const Execution = struct {
+            mutation_root: ?*execution_resources.MutationBarrier.RootSharedLease = null,
             local_execution: *LocalExecutionState,
             rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
             rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
@@ -813,10 +819,13 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const enforceReplicationWriteGate = Implementation.enforceReplicationWriteGate;
             pub const enforceRowPolicyMutationLocked = Implementation.enforceRowPolicyMutationLocked;
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
+            pub const ensureDurableReplicationStartupBarrierWithAdmission = Implementation.ensureDurableReplicationStartupBarrierWithAdmission;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
+            pub const flushDurableReplicationOutboxesWithAdmission = Implementation.flushDurableReplicationOutboxesWithAdmission;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
+            pub const flushDurableReplicationOutboxesLockedWithAdmission = Implementation.flushDurableReplicationOutboxesLockedWithAdmission;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
             pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
             pub const lockApplyForPortableRuntime = Implementation.lockApplyForPortableRuntime;
@@ -833,7 +842,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalWithControls = Implementation.resolveTransactionIntentsInternalWithControls;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
+            pub const resolveTransactionIntentsPreparedWithControls = Implementation.resolveTransactionIntentsPreparedWithControls;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
             pub const unchangedDerivedReplayTargetsServiceable = Implementation.unchangedDerivedReplayTargetsServiceable;
@@ -891,6 +902,7 @@ pub fn ImplementationFor(comptime D: type) type {
             }
         };
         pub const Context = struct {
+            mutation_root: ?*execution_resources.MutationBarrier.RootSharedLease = null,
             local_execution: *LocalExecutionState,
             alloc: Allocator,
             runtime_alloc: Allocator,
@@ -913,6 +925,7 @@ pub fn ImplementationFor(comptime D: type) type {
 
             pub fn borrow(db: anytype) @This() {
                 return .{
+                    .mutation_root = @import("mutation_admission.zig").receiverMutationRoot(db),
                     .local_execution = db.local_execution,
                     .alloc = db.alloc,
                     .runtime_alloc = db.runtime_alloc,
@@ -940,6 +953,7 @@ pub fn ImplementationFor(comptime D: type) type {
             /// Its scratch allocations are released before returning to the driver.
             pub fn mutation(self: *const @This()) Execution {
                 return .{
+                    .mutation_root = self.mutation_root,
                     .local_execution = self.local_execution,
                     .alloc = self.alloc,
                     .runtime_alloc = self.runtime_alloc,

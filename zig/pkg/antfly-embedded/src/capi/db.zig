@@ -669,6 +669,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
             req.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (req.execution_runnable) |*borrow| borrow else null,
             &failure,
         );
         defer handle.alloc.free(response.json);
@@ -5131,6 +5132,7 @@ pub fn searchPublicQueryJson(
                 request_json.bytes(),
                 .public,
                 .{},
+                null,
                 null,
                 null,
                 null,

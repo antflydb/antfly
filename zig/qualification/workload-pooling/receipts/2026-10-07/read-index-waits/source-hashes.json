@@ -1,0 +1,15 @@
+{
+  "build_support/antfly/dependencies.zig": "9f0b7dc16c27b0d34739f859806243b57f2f1d9ec6dcab4df2bf27eecfefb8de",
+  "lib/runtime/src/runtime_error_abi.zig": "fd7c1b6d4e4ddef4553b19f7ca42d389930eaf86ee286a0b84d6ebbb2cce1e83",
+  "pkg/antfly-embedded/src/common/execution_wait.zig": "4e944e0d84bae83cb1bb84f18d33ac3e2a91c32f9e20bb55b6451624cf8895d4",
+  "pkg/antfly-embedded/src/source_catalog_control.zig": "2f24faaa4edd577115c78ecf0fc626aa4157183083a3c3fb8bd1b0ec4a24a59c",
+  "pkg/antfly-embedded/src/storage/db/types.zig": "130a908d975d1eb02a912b62c54ad56134e436fb1ad611b1f9f4417b67842264",
+  "pkg/antfly-embedded/src/storage/read_consistency.zig": "3d337694a690fc589faf521cb76adcc1c942a99214c89e7dbb6b0cf6fa9e416a",
+  "pkg/antfly/build/data_tests.zig": "dd6dd88fc00fc2a176f548edb6d926ad46d1dd8203b19897c94263ed89c6158a",
+  "pkg/antfly/src/api/retained_read_owner.zig": "0245824d26dd9d804e6ba5ad432dcfc14dee4ac3c56bd0fab6f0a992f8b0ac94",
+  "pkg/antfly/src/api/sql_execution.zig": "3169b3c9b2256053a94d7384747b845c691394acbde33eabf8b523860b2470b6",
+  "pkg/antfly/src/api/table_reads.zig": "b7020ec5753746e592fd990f393c705fc1aca36cbda6444b7da9bb51d72f0380",
+  "pkg/antfly/src/data/runtime.zig": "1c30ecd84549424206d09432b1b238364f4d61891c091651b67d58b41573845e",
+  "pkg/antfly/src/raft/read_gate.zig": "2de31df58eccfe20d1c31a474e47e5b78f75c4b37a9a4d535983ce08d679a07d",
+  "pkg/antfly/src/serverless/runtime/bootstrap.zig": "3bee3cdf86fe24888b59aa8cc6acb17abdf5d61b4f35ddf2c784c2d8f278a93b"
+}

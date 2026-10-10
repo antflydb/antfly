@@ -46,6 +46,54 @@ pub const PreDecisionContext = struct {
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
+    /// Per-call worker authority retained through this synchronous participant
+    /// operation. Concurrent participants require independently owned children;
+    /// never forward the coordinator token to multiple workers or serialize it.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
+    /// Clamp an existing budget into the destination clock domain. Sampling
+    /// that clock first prevents translation from extending the caller's
+    /// remaining time. Preserve all identity and cancellation fences.
+    pub fn boundDeadline(self: PreDecisionContext, ceiling_ns: u64, clock_io: ?@import("antfly_runtime_abi").io_abi.Borrow) PreDecisionContext {
+        const routing = @import("routing_budget.zig");
+        const target: routing.RoutingBudget = .{ .io = clock_io };
+        var result = self;
+        result.deadline_ns = @min(ceiling_ns, target.deadlineFrom(.{ .deadline_ns = self.deadline_ns, .io = self.deadline_io }) orelse ceiling_ns);
+        result.deadline_io = clock_io;
+        return result;
+    }
+
+    /// A legacy callback cannot carry these admission fences or hidden-owner
+    /// identity. Even an inactive/incomplete supplied token must not be silently
+    /// discarded: its caller requires this context-aware operation contract.
+    pub fn requiresAwareCallback(self: PreDecisionContext) bool {
+        return self.route_fence != null or self.restore_staging_scope != null or self.restore_staging_plan_id != null or
+            self.deadline_ns != null or self.deadline_io != null or self.execution_runnable != null or self.cancellation.ptr != null or
+            self.cancellation.is_cancelled_fn != null or self.cancellation.check_fn != null;
+    }
+};
+
+/// Invocation-owned commit authority. The original pre-decision fences are
+/// separate from post-commit response cancellation; neither may replace the
+/// independent authority needed to finish or recover accepted mutations.
+pub const CommitControl = struct {
+    team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+    pre_decision: PreDecisionContext = .{},
+
+    pub fn requiresAwareCallback(self: CommitControl) bool {
+        return self.team != null or self.pre_decision.requiresAwareCallback();
+    }
+
+    pub fn fromRequest(request: @import("operation.zig").RequestContext) CommitControl {
+        return .{
+            .team = request.execution_team,
+            .pre_decision = .{
+                .deadline_ns = request.deadline_ns,
+                .deadline_io = request.deadline_io,
+                .cancellation = request.cancellation,
+            },
+        };
+    }
 };
 
 /// Authenticated private recovery observation. A locator is never authority by

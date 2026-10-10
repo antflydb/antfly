@@ -44,7 +44,7 @@ pub const HttpRequest = struct {
     /// Borrowed from the listener and valid only while `handle` is running.
     /// Application work must not retain this callback beyond the request.
     cancellation: cancellation_mod.CancellationToken = .none,
-
+    /// Original native monotonic deadline; nested work may shorten it.
     deadline_ns: ?u64 = null,
     deadline_io: @FieldType(@import("antfly_local_sources").api_operation.RequestContext, "deadline_io") = null,
     pub fn context(self: HttpRequest) @import("antfly_local_sources").api_operation.RequestContext {
@@ -67,3 +67,11 @@ pub const HttpResponse = struct {
         self.* = undefined;
     }
 };
+
+test "serverless workload deadline retains original deadline and cancellation error" {
+    const expired: HttpRequest = .{ .method = .get, .path = "/status", .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
+    var signal = std.atomic.Value(bool).init(true);
+    const canceled: HttpRequest = .{ .method = .get, .path = "/status", .cancellation = cancellation_mod.CancellationToken.fromAtomic(&signal) };
+    try std.testing.expectError(error.Canceled, canceled.ensureActive());
+}

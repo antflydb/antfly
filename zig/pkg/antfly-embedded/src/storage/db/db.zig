@@ -3499,14 +3499,18 @@ pub const DB = struct {
     /// only for rolling-upgrade recovery. A changed/missing mirror cannot
     /// silently discard a durability obligation.
     pub const flushDurableReplicationOutboxes = local_mutation.flushDurableReplicationOutboxes;
+    pub const flushDurableReplicationOutboxesWithAdmission = local_mutation.flushDurableReplicationOutboxesWithAdmission;
 
     pub const ensureDurableReplicationStartupBarrier = local_mutation.ensureDurableReplicationStartupBarrier;
+
+    pub const ensureDurableReplicationStartupBarrierWithAdmission = local_mutation.ensureDurableReplicationStartupBarrierWithAdmission;
 
     /// The caller owns `durable_replication_flush_mutex`. Recovery may overlap foreground
     /// acknowledgement, but the apply fence ensures a committed outbox is not
     /// visible until its WAL record was appended, and WAL matching makes such
     /// overlap idempotent.
     pub const flushDurableReplicationOutboxesLocked = local_mutation.flushDurableReplicationOutboxesLocked;
+    pub const flushDurableReplicationOutboxesLockedWithAdmission = local_mutation.flushDurableReplicationOutboxesLockedWithAdmission;
 
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
@@ -5946,6 +5950,12 @@ pub const DB = struct {
         self.closed = true;
     }
 
+    /// Check policy before a recovery pass. Physical mutation leases belong to
+    /// each local stage and must not span remote participant notifications.
+    pub fn checkTransactionRecoveryAdmission(self: *DB) !void {
+        try self.enforceReplicationWriteGate();
+    }
+
     /// Admit an external recovery pass without exposing write-gate policy.
     pub fn admitTransactionRecovery(self: *DB) !?MutationBarrier.SharedLease {
         var lease = self.acquireReplicationMutationShared();
@@ -5959,6 +5969,9 @@ pub const DB = struct {
     }
 
     pub fn recoverLocalTransactionRecords(self: *DB, cutoff_ns: u64, now_ns: u64) !transactions_mod.RecoveryStats {
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.recoverTransactions(cutoff_ns, now_ns);
@@ -6885,9 +6898,9 @@ pub const DB = struct {
     fn graphCleanupPort(self: *DB) @import("graph_cleanup_owner.zig").Owner.Port {
         return .{ .ptr = self, .runtime = self.backend_runtime, .run = graphCleanupPage };
     }
-    fn graphCleanupPage(ptr: *anyopaque) !bool {
+    fn graphCleanupPage(ptr: *anyopaque, pass: *const @import("graph_cleanup_owner.zig").Pass) !bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.runStandaloneGraphEndpointCleanupStep();
+        return self.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime());
     }
     fn stopGraphEndpointCleanupWorker(self: *DB) void {
         self.graph_cleanup_owner.stop(self.backend_runtime.io());
@@ -6899,19 +6912,32 @@ pub const DB = struct {
     /// Every enqueue path is serviced independently of subsequent foreground
     /// writes. Each scheduler turn commits at most one bounded page.
     fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
+        return self.runStandaloneGraphEndpointCleanupStepWithLifetime(null);
+    }
+    fn runStandaloneGraphEndpointCleanupStepWithLifetime(self: *DB, lifetime: ?@import("../../search/work_authority.zig").Authority) !bool {
+        const controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = if (lifetime) |original| .{ .lifetime = original } else null;
+        if (lifetime) |original| try original.check();
         if (!try self.canRunLocalGraphEndpointCleanup()) return false;
         if (!try self.core.store.hasGraphEndpointCleanup()) {
             // A ready directory needs no work. Idle owners must not contend
             // with user mutations for the apply lock every scheduler turn.
             if (try self.core.store.graphIncomingDirectoryReady()) return false;
-            try self.lockApplyForPortableRuntime();
+            // Directory migration publishes persistent metadata just like a
+            // cleanup page. Admit capture before apply using the same pass.
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, controls);
+            defer if (mutation) |*lease| lease.release();
+            try @import("mutation_admission.zig").lockApply(self, controls);
             defer self.core.unlockApply();
+            if (lifetime) |original| try original.check();
             if (!try self.canRunLocalGraphEndpointCleanup()) return false;
             if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
                 return !try self.core.store.backfillGraphIncomingDirectoryPage();
             return false;
         }
-        try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{});
+        // Admission restrictions stop only pre-decision work. The existing
+        // mutation pipeline retains accepted durability and mandatory cleanup.
+        if (lifetime) |original| try original.check();
+        try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{ .admission_controls = controls });
         return true;
     }
 
@@ -6964,6 +6990,24 @@ pub const DB = struct {
             logBatchProfile(req, profile);
         } else {
             try self.batchInternal(req, null, .{});
+        }
+    }
+
+    /// Synchronous native mutation admission using the caller's original
+    /// lifetime and CPU owner. Controls are not serialized or used to cancel
+    /// an already durable write. Post-commit visibility has its own token.
+    pub fn batchWithAdmissionControls(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken) anyerror!void {
+        try controls.lifetime.check();
+        const opts: BatchExecutionOptions = .{
+            .admission_controls = controls,
+            .visibility_cancellation = visibility_cancellation,
+        };
+        if (benchMetricsEnabled()) {
+            var profile: BatchProfile = .{};
+            try self.batchInternal(req, &profile, opts);
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, opts);
         }
     }
 
@@ -19133,28 +19177,34 @@ pub const DB = struct {
     /// so callers must drain before taking an exclusive mutation barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn drainSnapshotMaintenance(self: *DB, deadline_ns: u64) !void {
+        return self.drainSnapshotMaintenanceWithLifetime(deadline_ns, null);
+    }
+    pub fn drainSnapshotMaintenanceWithLifetime(self: *DB, deadline_ns: u64, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
         while (true) {
-            self.runMaintenanceUntilWithCancellation(
+            try original.checkpoint(lifetime);
+            self.runMaintenanceUntilWithCancellationAndLifetime(
                 self.currentMaintenanceTargetSequence(),
                 .{},
-                .none,
+                original.cancellation(lifetime),
                 deadline_ns,
-            ) catch |err| switch (err) {
-                // A retryable provider failure has already committed its
-                // source mutation. Seed preflight is the safe place to absorb
-                // that finite retry: returning it to the operator adds a full
-                // reconciliation round trip, while waiting after the global
-                // barrier closes would deadlock its eventual publication.
-                error.EnrichmentRetryInProgress => {
-                    const wait_clock = self.backend_runtime.monotonicClock();
-                    const now_ns = wait_clock.nowRealtimeNs();
-                    if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-                    const sleep_ns = @min(25 * std.time.ns_per_ms, deadline_ns - now_ns);
-                    wait_clock.sleepMs(@max(1, @divTrunc(sleep_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms)));
-                    continue;
-                },
-                else => return err,
+                lifetime,
+            ) catch |err| {
+                try original.checkpoint(lifetime);
+                switch (err) {
+                    // A retryable provider failure has already committed its
+                    // source mutation. Seed preflight is the safe place to absorb
+                    // that finite retry: returning it to the operator adds a full
+                    // reconciliation round trip, while waiting after the global
+                    // barrier closes would deadlock its eventual publication.
+                    error.EnrichmentRetryInProgress => {
+                        try original.retryWait(self.backend_runtime.monotonicClock(), deadline_ns, lifetime, if (lifetime != null) self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo else null);
+                        continue;
+                    },
+                    else => return err,
+                }
             };
+            try original.checkpoint(lifetime);
             return;
         }
     }
@@ -19340,13 +19390,17 @@ pub const DB = struct {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+        return self.captureQueryCutInternalWithDeadline(request, cancellation, publish, null);
+    }
+    fn captureQueryCutInternalWithDeadline(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool, original_deadline: ?u64) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const remaining = request.expires_ms -| @import("native_query_cut.zig").nowMs();
         const expiry_deadline = monotonicTimeNs() +| remaining * std.time.ns_per_ms;
-        const deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
+        const request_deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
+        const deadline = @min(original_deadline orelse request_deadline, request_deadline);
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
@@ -19376,7 +19430,9 @@ pub const DB = struct {
             try repository.publish(io, root, request, self.core.identity_namespace, token);
         };
     }
-    fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+    fn warmNativeCheckpoint(raw: *anyopaque, pass: *const @import("native_query_warming.zig").Pass) !bool {
+        try pass.check();
+        const cancellation = pass.token();
         const self: *DB = @ptrCast(@alignCast(raw));
         const cut = @import("native_query_cut.zig");
         const repository = self.backend_runtime.query_cut_repository orelse return true;
@@ -19394,6 +19450,7 @@ pub const DB = struct {
             error.FileNotFound => null,
             else => return err,
         };
+        try pass.check();
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
@@ -19413,12 +19470,16 @@ pub const DB = struct {
             state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
-            try self.captureQueryCutInternal(state.?.request, cancellation, false);
+            try pass.check();
+            try self.captureQueryCutInternalWithDeadline(state.?.request, cancellation, false, pass.deadline_ns);
+            try pass.check();
             _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
         }
+        try pass.check();
         const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
-        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = pass.deadline_ns };
         const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        try pass.check();
         if (completed) {
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
@@ -23068,13 +23129,26 @@ pub const DB = struct {
         return self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null);
     }
 
+    pub fn beginTransactionWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null, controls);
+    }
+
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null);
+    }
+
+    fn beginTransactionScopedInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        if (controls) |original| try original.lifetime.check();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var replication_mutation = self.acquireReplicationMutationShared();
+        const admission = @import("mutation_admission.zig");
+        // Publication may need CPU to retire this policy lease. Keep the
+        // original lifetime without transferring CPU inside that dependency.
+        const retained_controls = admission.retainedLeaseControls(controls);
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, retained_controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
+        try admission.lockApply(self, retained_controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -23217,12 +23291,24 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        return self.writeTransactionWithOptionalAdmissionControls(txn_id, req, null);
+    }
+
+    /// Borrowed original owner governs pre-decision intent admission. A caller
+    /// which has accepted BEGIN still owns mandatory abort on any rejection.
+    pub fn writeTransactionWithAdmissionControls(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        return self.writeTransactionWithOptionalAdmissionControls(txn_id, req, controls);
+    }
+
+    fn writeTransactionWithOptionalAdmissionControls(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        if (controls) |original| try original.lifetime.check();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
+        const admission = @import("mutation_admission.zig");
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null);
+        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -23232,7 +23318,7 @@ pub const DB = struct {
         identity: OrderedApplyReceipt,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.writeTransactionInternal(txn_id, req, identity);
+        try self.writeTransactionInternal(txn_id, req, identity, null);
     }
 
     fn writeTransactionInternal(
@@ -23240,6 +23326,7 @@ pub const DB = struct {
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
     ) !void {
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
@@ -23270,7 +23357,12 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            if (controls) |original| try original.lifetime.check();
+            const prepared_controls = if (row_policy_lease != null)
+                @import("mutation_admission.zig").retainedLeaseControls(controls)
+            else
+                controls;
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -23290,6 +23382,7 @@ pub const DB = struct {
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -23487,7 +23580,7 @@ pub const DB = struct {
             }
         }
 
-        try self.lockApplyForPortableRuntime();
+        try @import("mutation_admission.zig").lockApply(self, controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -23983,6 +24076,14 @@ pub const DB = struct {
         );
     }
 
+    /// The synchronous completion caller owns this token through physical
+    /// resolution. Preserve its finite lifetime without minting another owner.
+    pub fn resolveTransactionIntentsWithSyncLevelAndExecution(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, sync_level: types.SyncLevel, cancellation: types.CancellationToken, borrow: @import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+        const admission = @import("../../api/mutation_admission_controls.zig");
+        var budget = admission.init(.{ .cancellation = cancellation }, borrow, self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, cancellation, null, null, admission.acquisition(&budget));
+    }
+
     pub fn resolveReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -24005,8 +24106,10 @@ pub const DB = struct {
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
+    pub const resolveTransactionIntentsInternalWithControls = local_mutation.resolveTransactionIntentsInternalWithControls;
 
     pub const resolveTransactionIntentsPrepared = local_mutation.resolveTransactionIntentsPrepared;
+    pub const resolveTransactionIntentsPreparedWithControls = local_mutation.resolveTransactionIntentsPreparedWithControls;
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
         try self.resolveTransactionIntents(txn_id, .aborted, timestamp_ns);
@@ -26293,13 +26396,9 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
+        try self.checkTransactionRecoveryAdmission();
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
+        var recovery_stats = try self.recoverLocalTransactionRecords(cutoff_timestamp, resolution_timestamp);
         recovery_stats.resolved_finalized += resolved_finalized;
         return recovery_stats;
     }
@@ -29487,20 +29586,34 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: u64,
     ) !void {
+        return self.runMaintenanceUntilWithCancellationAndLifetime(sequence, sync_targets, cancellation, deadline_ns, null);
+    }
+    fn runMaintenanceUntilWithCancellationAndLifetime(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        cancellation: types.CancellationToken,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
             .clock = self.backend_runtime.monotonicClock(),
         };
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         var stable_target = sequence;
         while (true) {
+            try original.checkpoint(lifetime);
             try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            try original.checkpoint(lifetime);
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
-                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                _ = try self.runArtifactRepairMetadataMaintenancePassWithLifetime(lifetime);
                 return;
             }
             stable_target = next_target;
@@ -29776,24 +29889,57 @@ pub const DB = struct {
     }
 
     fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
+        return self.runArtifactRepairMetadataMaintenancePassWithLifetime(null);
+    }
+    fn runArtifactRepairMetadataMaintenancePassWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         // The mark owns immutable primary/ANN/source leases. Scan before
         // taking apply; only setup, planning, and publication need that fence.
-        if (self.local_execution.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
-        return self.runArtifactRepairMetadataMaintenanceAfterScan();
+        if (self.local_execution.source_vectors.load(.acquire)) |source| {
+            if (lifetime) |control| {
+                const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                try source.advanceMarkingSnapshotWithLifetime(io, control);
+            } else try source.advanceMarkingSnapshot();
+        }
+        try original.checkpoint(lifetime);
+        return self.runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(lifetime);
     }
 
     fn runArtifactRepairMetadataMaintenanceAfterScan(self: *DB) !bool {
-        try self.lockApplyForPortableRuntime();
+        return self.runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(null);
+    }
+    fn runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
+        if (lifetime) |control| {
+            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+            try self.enforcePortableRuntimeGate();
+            while (!self.core.tryLockApplyExclusive()) {
+                try control.checkpoint();
+                io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    try control.checkpoint();
+                    return err;
+                };
+            }
+            errdefer self.core.unlockApply();
+            try control.checkpoint();
+            try self.enforcePortableRuntimeGate();
+        } else try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
+        try original.checkpoint(lifetime);
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
+        try original.checkpoint(lifetime);
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.local_execution.source_vectors.load(.acquire)) |source| {
             const step_bytes = source.backgroundCollectionStepBytes();
             if (step_bytes != 0) {
+                try original.checkpoint(lifetime);
                 try self.refreshSourceVectorOwnershipScopes();
+                try original.checkpoint(lifetime);
                 const prior_generation = source.currentGeneration();
                 if (try source.collectBackgroundStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
                     if (source.currentGeneration() != prior_generation) try self.core.index_manager.refreshSourcePayloadGeneration();
@@ -29801,6 +29947,7 @@ pub const DB = struct {
                 if (source.collectionPending()) more = true;
             }
         }
+        try original.checkpoint(lifetime);
         return more;
     }
 
@@ -39740,6 +39887,7 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        try db_query_search.checkSearchRequestDeadline(req);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -39830,14 +39978,25 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        return self.collectExplicitTextStatsWithControls(alloc, requests, .{});
+    }
+
+    pub fn collectExplicitTextStatsWithControls(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitTextStatRequest,
+        controls: types.SearchRequest,
+    ) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        try db_query_search.checkSearchRequestDeadline(controls);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
+            .controls = controls,
             .text_index_entry = textIndexEntryCallback,
-            .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .load_many_stored_controlled = loadStoredSearchDocumentManyControlledCallback,
         });
     }
 
@@ -39846,12 +40005,23 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        return self.collectExplicitBackgroundTextStatsWithControls(alloc, requests, .{});
+    }
+
+    pub fn collectExplicitBackgroundTextStatsWithControls(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        controls: types.SearchRequest,
+    ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        try db_query_search.checkSearchRequestDeadline(controls);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
+            .controls = controls,
             .text_index_entry = textIndexEntryCallback,
         });
     }
@@ -43287,6 +43457,17 @@ fn loadStoredSearchDocumentsMany(
     keys: []const []const u8,
     direct_fields: ?[]const []const u8,
 ) ![]?[]u8 {
+    return loadStoredSearchDocumentsManyControlled(self, alloc, keys, direct_fields, null);
+}
+
+fn loadStoredSearchDocumentsManyControlled(
+    self: *DB,
+    alloc: Allocator,
+    keys: []const []const u8,
+    direct_fields: ?[]const []const u8,
+    controls: ?types.SearchRequest,
+) ![]?[]u8 {
+    if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
     const bench_profile = benchQueryProfileEnabled();
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var key_ns: u64 = 0;
@@ -43471,6 +43652,11 @@ fn loadStoredSearchDocumentsMany(
     }
 
     errdefer freeOptionalOwnedBytes(alloc, loaded);
+    const bounded = if (controls) |request| request.execution_runnable != null or request.execution_deadline_ns != null or request.cancellation != null else false;
+    var wait_io: ?std.Io.Threaded = if (bounded) .init(alloc, .{}) else null;
+    defer if (wait_io) |*io| io.deinit();
+    const ReadBudget = @import("../../common/read_execution_budget.zig").Budget(types.SearchRequest, db_query_search.checkSearchRequestDeadline);
+    var budget: ?ReadBudget = if (bounded) .{ .controls = controls.?, .io = wait_io.?.io() } else null;
 
     // Pin the active keyspace once for the whole batch. This both avoids one
     // schema-registry acquisition per hit and prevents a mixed key encoding if
@@ -43480,39 +43666,27 @@ fn loadStoredSearchDocumentsMany(
 
     const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (keys, 0..) |key, i| {
-        try pending.append(alloc, .{
-            .original_index = i,
-            .store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view),
-        });
+        if (i % 64 == 0) if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
+        errdefer alloc.free(store_key);
+        try pending.append(alloc, .{ .original_index = i, .store_key = store_key });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
 
     const sort_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    std.mem.sort(PendingStoredSearchLoad, pending.items, {}, struct {
+    const PendingOrder = struct {
         fn lessThan(_: void, lhs: PendingStoredSearchLoad, rhs: PendingStoredSearchLoad) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
-    }.lessThan);
+    };
+    if (budget) |*original| {
+        const admission = @import("../../common/read_admission.zig");
+        var adapter = admission.Adapter(*ReadBudget){ .budget = original };
+        const payload = adapter.payload();
+        try admission.sort(PendingStoredSearchLoad, pending.items, {}, PendingOrder.lessThan, admission.Port.init(&payload));
+    } else std.mem.sort(PendingStoredSearchLoad, pending.items, {}, PendingOrder.lessThan);
     if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
-    @memset(read_values, null);
-
-    for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
-
-    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    var txn = try self.core.store.beginProbeTxn();
-    defer txn.abort();
-    if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
-    const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    try txn.getManySorted(read_keys, read_values);
-    if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
-
-    const materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const values_authenticated = self.core.store.valuesAreAuthenticated();
     var schema_plans = SearchSchemaPlans{
         .db = self,
         .alloc = alloc,
@@ -43520,13 +43694,43 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
-    for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse continue;
-        loaded[item.original_index] = try schema_plans.materialize(
-            item.store_key,
-            value,
-            values_authenticated,
-        );
+    const values_authenticated = self.core.store.valuesAreAuthenticated();
+    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+
+    var materialize_start_ns: u64 = 0;
+    const read_keys = try alloc.alloc([]const u8, pending.items.len);
+    defer alloc.free(read_keys);
+    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+    defer alloc.free(read_values);
+    @memset(read_values, null);
+    for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
+    if (budget) |*original| {
+        // Keep one admitted snapshot and the backend's grouped batch plan.
+        var txn = try self.core.store.beginReadTxnWithBudget(.retain, original);
+        defer txn.abort();
+        if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+        const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        try txn.getManySortedPhysicalWithBudget(read_keys, read_values, original);
+        if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
+        materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        for (pending.items, read_values) |item, value| {
+            try original.checkpoint();
+            const raw = value orelse continue;
+            loaded[item.original_index] = try schema_plans.materialize(item.store_key, raw, values_authenticated);
+        }
+        try original.checkpoint();
+    } else {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+        const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        try txn.getManySorted(read_keys, read_values);
+        if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
+        materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        for (pending.items, 0..) |item, i| {
+            const value = read_values[i] orelse continue;
+            loaded[item.original_index] = try schema_plans.materialize(item.store_key, value, values_authenticated);
+        }
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - materialize_start_ns;
     if (bench_profile) {
@@ -43535,7 +43739,54 @@ fn loadStoredSearchDocumentsMany(
             .{ (platform_time.monotonicNs() - total_start_ns) / 1000, key_ns / 1000, sort_ns / 1000, txn_ns / 1000, get_many_ns / 1000, dupe_ns / 1000, keys.len },
         );
     }
+    if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
     return loaded;
+}
+
+test "db statistics controlled primary hydration preserves ordering duplicates absence and allocation ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("statistics-primary-controls");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    for ([_][]const u8{ "doc:a", "doc:b" }) |id| {
+        const key = try encodeStoreLookupKeyAlloc(&db, alloc, id);
+        defer alloc.free(key);
+        try db.core.store.put(key, "{\"body\":\"alpha\"}");
+    }
+    const keys = [_][]const u8{ "doc:b", "missing", "doc:a", "doc:b" };
+    const expected = try loadStoredSearchDocumentsMany(&db, alloc, &keys, null);
+    defer freeOptionalOwnedBytes(alloc, expected);
+    try std.testing.expect(expected[0] != null and expected[1] == null and expected[2] != null and expected[3] != null);
+    const Signal = struct {
+        checks: usize = 0,
+        fail_at: ?usize = null,
+        fn requested(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.fail_at == self.checks;
+        }
+    };
+    var signal: Signal = .{};
+    const controls: types.SearchRequest = .{ .cancellation = .{ .ptr = &signal, .is_cancelled_fn = Signal.requested } };
+    const actual = try loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, controls);
+    defer freeOptionalOwnedBytes(alloc, actual);
+    for (expected, actual) |want, got| {
+        if (want) |bytes| try std.testing.expectEqualStrings(bytes, got.?) else try std.testing.expect(got == null);
+    }
+    const AllocationCase = struct {
+        fn run(a: Allocator, database: *DB, read_keys: []const []const u8, request: types.SearchRequest) !void {
+            const rows = try loadStoredSearchDocumentsManyControlled(database, a, read_keys, null, request);
+            defer freeOptionalOwnedBytes(a, rows);
+            try std.testing.expect(rows[0] != null and rows[1] == null and rows[2] != null and rows[3] != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCase.run, .{ &db, &keys, controls });
+    for (1..7) |fail_at| {
+        signal = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.Cancelled, loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, controls));
+    }
+    try std.testing.expectError(error.Timeout, loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, .{ .execution_deadline_ns = 1 }));
 }
 
 fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
@@ -48499,6 +48750,10 @@ fn replicationMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*Mu
 
 fn acquireReplicationMutationSharedContext(ctx: *const BatchExecutionContext) ?MutationBarrier.SharedLease {
     const barrier = replicationMutationBarrierFromContext(ctx) orelse return null;
+    if (ctx.mutation_root) |root| {
+        std.debug.assert(root.barrier == barrier);
+        return root.borrow();
+    }
     return barrier.acquireShared();
 }
 
@@ -58961,6 +59216,138 @@ test "db split modeled sim workloads stay green" {
     const alloc = std.testing.allocator;
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-default", 0xA17F_E301, 8);
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-reopen-heavy", 0xA17F_E302, 10);
+}
+
+test "db controlled mutation admission BEGIN and prepare preserve terminal cleanup" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-controlled-txn-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const State = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return self.cause;
+        }
+    };
+    var state: State = .{};
+    const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.check } };
+    const created_at_ns = platform_time.monotonicNs();
+    const baseline: types.TxnId = @splat(1);
+    _ = try db.beginTransactionWithAdmissionControls(baseline, 1, created_at_ns, &.{}, true, true, controls);
+    const begin_checks = state.checks;
+    try std.testing.expect(begin_checks >= 4);
+    try db.resolveTransactionIntents(baseline, .aborted, 2);
+    var ordinal: u8 = 2;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for (1..begin_checks + 1) |fail_at| {
+            const id: types.TxnId = @splat(ordinal);
+            ordinal += 1;
+            state = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, db.beginTransactionWithAdmissionControls(id, 1, created_at_ns, &.{}, true, true, controls));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+        }
+    }
+    const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "prepared", .value = "{}" }} };
+    const prepared_baseline: types.TxnId = @splat(ordinal);
+    ordinal += 1;
+    _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(prepared_baseline, 1, created_at_ns, &.{}, true, true);
+    state = .{};
+    try db.writeTransactionWithAdmissionControls(prepared_baseline, request, controls);
+    const prepare_checks = state.checks;
+    try std.testing.expect(prepare_checks >= 5);
+    try db.resolveTransactionIntents(prepared_baseline, .aborted, 2);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for (1..prepare_checks + 1) |fail_at| {
+            const id: types.TxnId = @splat(ordinal);
+            ordinal += 1;
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(id, 1, created_at_ns, &.{}, true, true);
+            state = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, db.writeTransactionWithAdmissionControls(id, request, controls));
+            try std.testing.expectEqual(types.TxnStatus.pending, try db.getTransactionStatus(id));
+            // The foreground authority remains rejected. Mandatory terminal
+            // cleanup must still complete under its independent ownership.
+            try db.resolveTransactionIntents(id, .aborted, 2);
+            try std.testing.expectEqual(types.TxnStatus.aborted, try db.getTransactionStatus(id));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            try std.testing.expect(try db.get(alloc, "prepared") == null);
+        }
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "prepared", .value = "{}" }} });
+    const recovered = (try db.get(alloc, "prepared")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{}", recovered);
+}
+
+test "db controlled mutation admission rejects before effects and releases service fences" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-controlled-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    // Measure per-mutation checkpoints after one-time startup recovery. Cold
+    // startup admission has its own physical fixture; counting its checks here
+    // would make later warm mutations appear to miss a lifetime inspection.
+    try db.ensureDurableReplicationStartupBarrier();
+    const State = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Timeout,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return self.cause;
+        }
+        fn unexpectedWait(_: *anyopaque) !void {
+            return error.UnexpectedUncontendedAdmissionWait;
+        }
+    };
+    var state: State = .{};
+    const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{
+        .lifetime = .{ .context = &state, .check_fn = State.check },
+        .execution_wait = .{ .ptr = &state, .begin = State.unexpectedWait, .end = State.unexpectedWait },
+    };
+    try db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "accepted", .value = "{}" }} }, controls, .none);
+    const checkpoints = state.checks;
+    // Entry, snapshot acquisition and exclusive apply acquisition all retain
+    // the same borrowed authority, including revalidation after acquisition.
+    try std.testing.expect(checkpoints >= 5);
+    const accepted = (try db.get(alloc, "accepted")).?;
+    defer alloc.free(accepted);
+    try std.testing.expectEqualStrings("{}", accepted);
+    for ([_]anyerror{ error.Timeout, error.Canceled, error.SchedulerClosed }) |cause| {
+        for (1..checkpoints + 1) |fail_at| {
+            state = .{ .fail_at = fail_at, .cause = cause };
+            try std.testing.expectError(cause, db.batchWithAdmissionControls(
+                .{ .writes = &.{.{ .key = "rejected", .value = "{}" }} },
+                controls,
+                .none,
+            ));
+            const rejected = try db.get(alloc, "rejected");
+            defer if (rejected) |value| alloc.free(value);
+            try std.testing.expect(rejected == null);
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            capture.release();
+        }
+    }
+    state = .{};
+    try db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "rejected", .value = "{}" }} }, controls, .none);
+    const recovered = (try db.get(alloc, "rejected")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{}", recovered);
 }
 
 test "db batch get match_all search and index registry" {
@@ -127398,6 +127785,16 @@ fn loadStoredSearchDocumentManyCallback(
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
 }
 
+fn loadStoredSearchDocumentManyControlledCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    keys: []const []const u8,
+    controls: types.SearchRequest,
+) anyerror![]?[]u8 {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return loadStoredSearchDocumentsManyControlled(self, alloc, keys, null, controls);
+}
+
 fn completeVectorMigrationForTest(db: *DB, job_id: []const u8) !void {
     const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
     while (true) {
@@ -131172,6 +131569,135 @@ test "db graph endpoint cleanup pages batch unrelated deletes without blocking g
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
 }
 
+test "db graph endpoint cleanup pages preserve original pass through rejected apply and healthy retry" {
+    const GraphPass = @import("graph_cleanup_owner.zig").Pass;
+    const Clock = struct {
+        var apply: *@import("apply_rw_lock.zig").ApplyRwLock = undefined;
+        var stopping: *std.atomic.Value(bool) = undefined;
+        var value: u64 = 0;
+        var reject: bool = true;
+        var cancel: bool = false;
+        fn now() u64 {
+            if (reject and apply.exclusive_waiters.load(.acquire) != 0) {
+                if (cancel) stopping.store(true, .release) else value = 10;
+            }
+            return value;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var directory = try TestDirectory.init("graph-cleanup-pass-lifetime");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+        defer alloc.free(job);
+        try db.core.store.put(job, "hub");
+        var stopping: std.atomic.Value(bool) = .init(false);
+        Clock.apply = &db.core.apply_mutex;
+        Clock.stopping = &stopping;
+        Clock.cancel = cancel;
+        Clock.reject = true;
+        Clock.value = 0;
+        const pass: GraphPass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
+        db.core.apply_mutex.lockShared();
+        var held = true;
+        defer if (held) db.core.apply_mutex.unlockShared();
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expectEqual(@as(u64, 10), pass.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), db.core.apply_mutex.exclusive_waiters.load(.acquire));
+        try std.testing.expect(!db.core.apply_mutex.tryLockExclusive());
+        try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+        // An original rejected pass publishes nothing and preserves its durable
+        // cleanup obligation. A fresh healthy pass can complete it exactly once.
+        db.core.apply_mutex.unlockShared();
+        held = false;
+        Clock.reject = false;
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, pass.check());
+        var healthy_stopping: std.atomic.Value(bool) = .init(false);
+        const healthy: GraphPass = .{ .stopping = &healthy_stopping, .deadline_ns = 20, .now_ns = Clock.now };
+        try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
+        try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
+    }
+}
+
+test "db graph endpoint cleanup pages directory migration preserves original capture admission" {
+    const GraphPass = @import("graph_cleanup_owner.zig").Pass;
+    const contract = @import("replication_contract.zig");
+    const Outbox = @import("durable_outbox.zig");
+    const Fixture = struct {
+        barrier: *MutationBarrier,
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: Outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    const Clock = struct {
+        var barrier: *MutationBarrier = undefined;
+        var stopping: *std.atomic.Value(bool) = undefined;
+        var value: u64 = 0;
+        var cancel: bool = false;
+        fn now() u64 {
+            if (barrier.pendingSharedAcquisitions() != 0) {
+                if (cancel) stopping.store(true, .release) else value = 10;
+            }
+            return value;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var directory = try TestDirectory.init("graph-migration-capture-admission");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.core.store.delete(internal_keys.graph_incoming_ready_key);
+        var barrier: MutationBarrier = .{};
+        var fixture: Fixture = .{ .barrier = &barrier };
+        db.local_execution.replication_async_effect_mirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier };
+        defer db.local_execution.replication_async_effect_mirror = null;
+        var stopping: std.atomic.Value(bool) = .init(false);
+        Clock.barrier = &barrier;
+        Clock.stopping = &stopping;
+        Clock.value = 0;
+        Clock.cancel = cancel;
+        const pass: GraphPass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
+        var capture = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+        var held = true;
+        defer if (held) capture.release();
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expectEqual(@as(u64, 10), pass.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.graph_incoming_cursor_key));
+        capture.release();
+        held = false;
+        var healthy_stopping: std.atomic.Value(bool) = .init(false);
+        const healthy: GraphPass = .{ .stopping = &healthy_stopping, .deadline_ns = 20, .now_ns = Clock.now };
+        _ = try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime());
+        try std.testing.expect(try db.core.store.graphIncomingDirectoryReady());
+        var after = barrier.tryAcquireExclusive() orelse return error.MigrationLeakedMutationReader;
+        after.release();
+    }
+}
+
 test "db graph endpoint cleanup pages respect raft ownership before first applied marker" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("raft-cleanup-authority");
@@ -131521,7 +132047,9 @@ pub const test_support = if (builtin.is_test) struct {
     pub const batchContext = fixture_owner.DB.batchContext;
     pub const applyRelationalTopologyControlWithReplication = fixture_owner.DB.applyRelationalTopologyControlWithReplication;
     pub const ensureDurableReplicationStartupBarrier = fixture_owner.DB.ensureDurableReplicationStartupBarrier;
+    pub const ensureDurableReplicationStartupBarrierWithAdmission = fixture_owner.DB.ensureDurableReplicationStartupBarrierWithAdmission;
     pub const flushDurableReplicationOutboxes = fixture_owner.DB.flushDurableReplicationOutboxes;
+    pub const flushDurableReplicationOutboxesWithAdmission = fixture_owner.DB.flushDurableReplicationOutboxesWithAdmission;
 } else struct {};
 
 test "document extraction catalog snapshot releases every allocation on failure" {

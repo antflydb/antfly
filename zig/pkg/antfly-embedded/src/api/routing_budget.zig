@@ -74,6 +74,15 @@ pub const RoutingBudget = struct {
         }
     }
 
+    /// One cooperative retry wait, always charged to this original absolute
+    /// deadline. A scoped executor may reject waiting before physical work.
+    pub fn waitForProgress(self: RoutingBudget) !void {
+        try self.checkpoint();
+        const duration = if (self.deadline_ns) |deadline| @min(std.time.ns_per_ms, deadline -| self.nowNs()) else std.time.ns_per_ms;
+        if (duration != 0) try self.sleepNs(duration);
+        try self.checkpoint();
+    }
+
     pub fn checkpointIndex(self: RoutingBudget, index: usize) !void {
         if (index % checkpoint_stride == 0) try self.checkpoint();
     }

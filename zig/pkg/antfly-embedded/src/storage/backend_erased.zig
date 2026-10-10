@@ -21,6 +21,7 @@ const backend_adapter = @import("backend_adapter.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const read_admission = @import("../common/read_admission.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const types = backend_types;
@@ -179,6 +180,8 @@ pub const Cursor = struct {
         seek_at_or_after: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
+        next_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror!?Entry = null,
+        seek_at_or_after_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!?Entry = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -197,6 +200,18 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !?Entry {
         return try BoundaryAbi.call("next", self.boundary_dispatch, self.vtable.next, .{self.ptr});
+    }
+
+    /// Admission is borrowed only during the call, and is never retained.
+    pub fn nextWithAdmission(self: *Cursor, control: read_admission.Port) !?Entry {
+        try control.checkpoint();
+        const next_controlled = self.vtable.next_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("next_with_admission", self.boundary_dispatch, next_controlled, .{ self.ptr, control });
+    }
+    pub fn seekAtOrAfterWithAdmission(self: *Cursor, key: []const u8, control: read_admission.Port) !?Entry {
+        try control.checkpoint();
+        const seek = self.vtable.seek_at_or_after_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("seek_at_or_after_with_admission", self.boundary_dispatch, seek, .{ self.ptr, key, control });
     }
 
     pub fn prev(self: *Cursor) !?Entry {
@@ -237,8 +252,10 @@ pub const ReadScope = struct {
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
+        get_many_sorted_into_with_admission: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         get_many_sorted_into: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
@@ -288,7 +305,47 @@ pub const ReadScope = struct {
         };
     }
 
+    pub fn getManySortedIntoWithAdmission(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len or keys.len != buffers.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+        if (self.vtable.get_many_sorted_into_with_admission) |read| {
+            try read(self.ptr, keys, buffers, values, control);
+        } else {
+            try self.getManySortedWithAdmission(keys, values, control);
+            for (buffers, values) |buffer, *value| if (value.*) |bytes| {
+                if (bytes.len > buffer.len) return error.BufferTooSmall;
+                var offset: usize = 0;
+                while (offset < bytes.len) {
+                    try control.checkpoint();
+                    const end = @min(bytes.len, offset + 64 * 1024);
+                    @memcpy(buffer[offset..end], bytes[offset..end]);
+                    offset = end;
+                }
+                value.* = buffer[0..bytes.len];
+            };
+        }
+        try control.checkpoint();
+    }
+
     /// Invalidates scope values and releases pins; keeps bounded reusable scratch.
+    /// Borrows authority only for this call. Results remain owned by the
+    /// existing snapshot/scope; failed calls publish no partial output.
+    pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+        for (keys, 0..) |key, i| {
+            try control.checkpoint();
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        }
+        const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
+        try get_many(self.ptr, keys, values, control);
+        try control.checkpoint();
+    }
+
     pub fn reset(self: *@This()) !void {
         const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
         try reset_scope(self.ptr);
@@ -316,6 +373,14 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySorted(keys, values);
         }
+        pub fn getManySortedWithAdmission(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySortedWithAdmission(keys, values, control);
+        }
+        fn getManySortedIntoWithAdmission(ptr: *anyopaque, keys: []const []const u8, buffers: []const []u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySortedIntoWithAdmission(keys, buffers, values, control);
+        }
         fn getManySortedInto(ptr: *anyopaque, keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySortedInto(keys, buffers, values);
@@ -339,7 +404,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try alloc.create(State);
     state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .get_many_sorted_with_admission = if (@hasDecl(@TypeOf(handle), "getManySortedWithAdmission")) State.getManySortedWithAdmission else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into_with_admission = if (@hasDecl(@TypeOf(handle), "getManySortedIntoWithAdmission")) State.getManySortedIntoWithAdmission else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -374,9 +439,11 @@ pub const ReadTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        open_cursor_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!Cursor = null,
     };
 
     pub fn abort(self: *ReadTxn) void {
@@ -402,8 +469,30 @@ pub const ReadTxn = struct {
         }
     }
 
+    /// Borrows authority only for this call. Results remain owned by the
+    /// existing snapshot/scope; failed calls publish no partial output.
+    pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+
+        const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
+        try get_many(self.ptr, keys, values, control);
+        try control.checkpoint();
+    }
+
     pub fn openCursor(self: *ReadTxn) !Cursor {
         return try self.vtable.open_cursor(self.allocator, self.ptr);
+    }
+
+    pub fn openCursorWithAdmission(self: *ReadTxn, control: read_admission.Port) !Cursor {
+        try control.checkpoint();
+        const open = self.vtable.open_cursor_with_admission orelse return error.ExecutionWaitUnsupported;
+        var cursor = try open(self.allocator, self.ptr, control);
+        errdefer cursor.close();
+        try control.checkpoint();
+        return cursor;
     }
 
     /// Owns the same immutable snapshot, with independent read/cursor scratch.
@@ -439,6 +528,7 @@ pub const ProbeTxn = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
     };
 
@@ -471,6 +561,16 @@ pub const ProbeTxn = struct {
         }
     }
 
+    pub fn getManySortedWithAdmission(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+        const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
+        try get_many(self.ptr, keys, values, control);
+        try control.checkpoint();
+    }
+
     pub fn getManySortedWithBlockCacheAdmission(
         self: *ProbeTxn,
         keys: []const []const u8,
@@ -495,6 +595,7 @@ pub const CurrentScanTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        open_cursor_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!Cursor = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -505,6 +606,11 @@ pub const CurrentScanTxn = struct {
 
     pub fn openCursor(self: *CurrentScanTxn) !Cursor {
         return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
+    }
+    pub fn openCursorWithAdmission(self: *CurrentScanTxn, control: read_admission.Port) !Cursor {
+        try control.checkpoint();
+        const open = self.vtable.open_cursor_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("open_cursor_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, control });
     }
 };
 
@@ -910,6 +1016,8 @@ pub const Store = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
         begin_read: *const fn (Allocator, *anyopaque) anyerror!ReadTxn,
+        begin_probe_with_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission, read_admission.Port) anyerror!ProbeTxn = null,
+        begin_current_scan_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!CurrentScanTxn = null,
         begin_probe: ?*const fn (Allocator, *anyopaque) anyerror!ProbeTxn = null,
         begin_current_scan: ?*const fn (Allocator, *anyopaque) anyerror!CurrentScanTxn = null,
         begin_write: *const fn (Allocator, *anyopaque) anyerror!WriteTxn,
@@ -936,6 +1044,8 @@ pub const Store = struct {
         /// Open one stable, range-scoped replay-lane view. The returned
         /// transaction may outlive multiple bounded derived-index windows.
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
+        /// Required control never falls back to an unbounded legacy read.
+        begin_read_with_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission, read_admission.Port) anyerror!ReadTxn = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -952,11 +1062,30 @@ pub const Store = struct {
         return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
     }
 
+    /// The caller retains the control payload only until this call returns.
+    pub fn beginReadWithAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !ReadTxn {
+        try control.checkpoint();
+        const begin = self.vtable.begin_read_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_read_with_admission", self.boundary_dispatch, begin, .{ self.allocator, self.ptr, admission, control });
+    }
+
     pub fn beginReadWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ReadTxn {
         if (self.vtable.begin_read_with_block_cache_admission) |begin_read| {
             return try BoundaryAbi.call("begin_read_with_block_cache_admission", self.boundary_dispatch, begin_read, .{ self.allocator, self.ptr, admission });
         }
         return try self.beginRead();
+    }
+
+    pub fn beginProbeWithAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !ProbeTxn {
+        try control.checkpoint();
+        const open = self.vtable.begin_probe_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_probe_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, admission, control });
+    }
+
+    pub fn beginCurrentScanWithAdmission(self: *Store, control: read_admission.Port) !CurrentScanTxn {
+        try control.checkpoint();
+        const open = self.vtable.begin_current_scan_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_current_scan_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, control });
     }
 
     pub fn beginProbe(self: *Store) !ProbeTxn {
@@ -1292,6 +1421,19 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
+        pub fn nextWithAdmission(ptr: *anyopaque, control: read_admission.Port) anyerror!?Entry {
+            return unbox(ptr).handle.nextWithAdmission(control) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+        }
+        pub fn seekAtOrAfterWithAdmission(ptr: *anyopaque, key: []const u8, control: read_admission.Port) anyerror!?Entry {
+            return unbox(ptr).handle.seekAtOrAfterWithAdmission(key, control) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+        }
+
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
             unbox(ptr).handle.setUpperBound(upper);
         }
@@ -1302,6 +1444,8 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
         .ptr = box_ptr,
         .vtable = &.{
             .close = vt.close,
+            .next_with_admission = if (@hasDecl(Handle, "nextWithAdmission")) vt.nextWithAdmission else null,
+            .seek_at_or_after_with_admission = if (@hasDecl(Handle, "seekAtOrAfterWithAdmission")) vt.seekAtOrAfterWithAdmission else null,
             .first = vt.first,
             .last = vt.last,
             .next = vt.next,
@@ -1349,11 +1493,27 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             }
         }
 
+        pub fn getManySortedWithAdmission(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            defer parent.releaseChild();
+            return parent.handle.getManySortedWithAdmission(keys, values, control);
+        }
+
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
             var cursor = try parent.handle.openCursor();
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
+        }
+
+        pub fn openCursorWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!Cursor {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursorWithAdmission(control);
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
@@ -1390,6 +1550,8 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .get_many_sorted_with_admission = if (@hasDecl(Handle, "getManySortedWithAdmission")) vt.getManySortedWithAdmission else null,
+            .open_cursor_with_admission = if (@hasDecl(Handle, "openCursorWithAdmission")) vt.openCursorWithAdmission else null,
             .open_cursor = vt.openCursor,
             .fork_read = if (@hasDecl(Handle, "forkBorrowedRead")) vt.forkRead else null,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
@@ -1436,6 +1598,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             }
         }
 
+        pub fn getManySortedWithAdmission(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            return try unbox(ptr).handle.getManySortedWithAdmission(keys, values, control);
+        }
+
         pub fn getManySortedWithBlockCacheAdmission(
             ptr: *anyopaque,
             keys: []const []const u8,
@@ -1458,6 +1624,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             .get = vt.get,
             .get_leased = vt.getLeased,
             .get_many_sorted = vt.getManySorted,
+            .get_many_sorted_with_admission = if (@hasDecl(Handle, "getManySortedWithAdmission")) vt.getManySortedWithAdmission else null,
             .get_many_sorted_with_block_cache_admission = vt.getManySortedWithBlockCacheAdmission,
         },
     };
@@ -1485,6 +1652,14 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+        pub fn openCursorWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!Cursor {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursorWithAdmission(control);
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
+        }
     };
 
     return .{
@@ -1493,6 +1668,7 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
         .vtable = &.{
             .abort = vt.abort,
             .open_cursor = vt.openCursor,
+            .open_cursor_with_admission = if (@hasDecl(Handle, "openCursorWithAdmission")) vt.openCursorWithAdmission else null,
         },
     };
 }
@@ -1891,11 +2067,32 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
+        pub fn beginReadWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ReadTxn {
+            if (Handle == Store) return try unbox(ptr).handle.beginReadWithAdmission(admission, control);
+            var txn = try unbox(ptr).handle.beginReadWithAdmission(admission, control);
+            errdefer txn.abort();
+            return try readTxnFrom(alloc, txn);
+        }
+
         pub fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission);
             }
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission));
+        }
+
+        pub fn beginProbeWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ProbeTxn {
+            if (Handle == Store) return unbox(ptr).handle.beginProbeWithAdmission(admission, control);
+            var txn = try unbox(ptr).handle.beginProbeWithAdmission(admission, control);
+            errdefer txn.abort();
+            return probeTxnFrom(alloc, txn);
+        }
+
+        pub fn beginCurrentScanWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!CurrentScanTxn {
+            if (Handle == Store) return unbox(ptr).handle.beginCurrentScanWithAdmission(control);
+            var txn = try unbox(ptr).handle.beginCurrentScanWithAdmission(control);
+            errdefer txn.abort();
+            return currentScanTxnFrom(alloc, txn);
         }
 
         pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
@@ -2144,8 +2341,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_read_with_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithAdmission")) vt.beginReadWithAdmission else null,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
+            .begin_probe_with_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithAdmission")) vt.beginProbeWithAdmission else null,
+            .begin_current_scan_with_admission = if (Handle == Store or @hasDecl(Handle, "beginCurrentScanWithAdmission")) vt.beginCurrentScanWithAdmission else null,
             .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,
             .begin_current_scan = if (Handle == Store or @hasDecl(Handle, "beginCurrentScan")) vt.beginCurrentScan else null,
             .begin_replay_lane_scan = if (Handle == Store or @hasDecl(Handle, "beginReplayLaneScan")) vt.beginReplayLaneScan else null,

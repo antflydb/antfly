@@ -24,6 +24,41 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "runnable demand error remains append-only and rejects forged behavior" {
+    try std.testing.expectEqual(@backingInt(Detail.backend_runtime_unavailable) + 1, @backingInt(Detail.invalid_runnable_demand));
+    const value = statusFromError(error.InvalidRunnableDemand);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(error.InvalidRunnableDemand, errorFromStatus(value));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
+}
+
+test "execution wait scheduling details are append-only and preserve behavior classes" {
+    // Keep the newer main-branch detail identities before the appended
+    // scheduling extension. No merge may renumber those published IDs.
+    try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.metric_not_ready));
+    try std.testing.expectEqual(@backingInt(Detail.metric_not_ready) + 1, @backingInt(Detail.metric_stale));
+    try std.testing.expectEqual(@backingInt(Detail.metric_stale) + 1, @backingInt(Detail.invalid_generated_tool_arguments));
+    try std.testing.expectEqual(@backingInt(Detail.invalid_generated_tool_arguments) + 1, @backingInt(Detail.sql_feature_not_supported));
+    try std.testing.expectEqual(@backingInt(Detail.sql_feature_not_supported) + 1, @backingInt(Detail.catalog_publication_proof_pending));
+    try std.testing.expectEqual(@as(c_int, 0x10000), @backingInt(Detail.runnable_wait_timeout));
+    const cases = [_]struct { err: anyerror, code: Code }{
+        .{ .err = error.RunnableWaitTimeout, .code = .timeout },
+        .{ .err = error.SchedulerClosed, .code = .unavailable },
+        .{ .err = error.SchedulerFull, .code = .retryable },
+        .{ .err = error.InvalidRunnableTransition, .code = .internal },
+        .{ .err = error.InvalidReadFenceTransition, .code = .internal },
+        .{ .err = error.ExecutionWaitUnsupported, .code = .unsupported },
+        .{ .err = error.ReadSafetyBarrierUnavailable, .code = .unavailable },
+        .{ .err = error.BackendRuntimeUnavailable, .code = .unavailable },
+    };
+    for (cases) |case| {
+        const transported = statusFromError(case.err);
+        try std.testing.expectEqual(@backingInt(case.code), transported.code);
+        try std.testing.expectEqual(case.err, errorFromStatus(transported));
+        try std.testing.expect(errorHasStableDetail(case.err));
+    }
+}
+
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
@@ -728,6 +763,18 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    // Reserve a separate range for the unpublished pooling extension so future
+    // main-branch additions cannot renumber either set of detail identities.
+    runnable_wait_timeout = 0x10000,
+    scheduler_closed,
+    scheduler_full,
+    invalid_runnable_transition,
+    invalid_read_fence_transition,
+    execution_wait_unsupported,
+    read_safety_barrier_unavailable,
+    backend_runtime_unavailable,
+    invalid_runnable_demand,
+    sql_write_capacity_unavailable,
 };
 
 pub const Status = extern struct {
@@ -745,6 +792,16 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.RunnableWaitTimeout => status(.timeout, .runnable_wait_timeout),
+        error.SchedulerClosed => status(.unavailable, .scheduler_closed),
+        error.SchedulerFull => status(.retryable, .scheduler_full),
+        error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
+        error.InvalidRunnableDemand => status(.invalid_argument, .invalid_runnable_demand),
+        error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
+        error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
+        error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
+        error.ReadSafetyBarrierUnavailable => status(.unavailable, .read_safety_barrier_unavailable),
+        error.BackendRuntimeUnavailable => status(.unavailable, .backend_runtime_unavailable),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -1443,6 +1500,16 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .runnable_wait_timeout => "RunnableWaitTimeout",
+        .scheduler_closed => "SchedulerClosed",
+        .scheduler_full => "SchedulerFull",
+        .invalid_runnable_transition => "InvalidRunnableTransition",
+        .invalid_runnable_demand => "InvalidRunnableDemand",
+        .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
+        .invalid_read_fence_transition => "InvalidReadFenceTransition",
+        .execution_wait_unsupported => "ExecutionWaitUnsupported",
+        .read_safety_barrier_unavailable => "ReadSafetyBarrierUnavailable",
+        .backend_runtime_unavailable => "BackendRuntimeUnavailable",
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
@@ -2374,5 +2441,21 @@ test "external lake and spill errors retain exact identity across runtime archiv
     }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "SQL worker capacity error preserves append-only identity and unavailable behavior" {
+    try std.testing.expectEqual(@backingInt(Detail.invalid_runnable_demand) + 1, @backingInt(Detail.sql_write_capacity_unavailable));
+    const value = statusFromError(error.SqlWriteCapacityUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), value.code);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, errorFromStatus(value));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
+}
+
+test "pre-merge pooling detail collisions fail closed" {
+    const first = @backingInt(Detail.invalid_generated_tool_arguments) + 1;
+    const codes = [_]Code{ .timeout, .unavailable, .retryable, .internal, .internal, .unsupported, .unavailable, .unavailable, .invalid_argument, .unavailable };
+    for (codes, 0..) |code, index| {
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(code), .detail = first + @as(c_int, @intCast(index)) }));
     }
 }

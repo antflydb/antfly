@@ -2484,6 +2484,7 @@ pub const BoundTableReadSource = struct {
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .join_partition_group_local = null,
                 .join_rows_group_local = null,
@@ -3087,6 +3088,19 @@ pub const BoundTableReadSource = struct {
         return try collectBoundLocalTextStats(self, alloc, table_name, body);
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectBoundLocalTextStatsControlled(self, alloc, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3654,6 +3668,7 @@ pub const ProvisionedTableReadSource = struct {
                 .query_group_local = queryGroupLocalPhysical,
                 .search_result_group_local = searchResultGroupLocalPhysical,
                 .text_stats_group_local = textStatsGroupLocalPhysical,
+                .text_stats_group_local_controlled = textStatsGroupLocalPhysicalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
                 .graph_expand_group_local = graphExpandGroupLocalPhysical,
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
@@ -4130,7 +4145,9 @@ pub const ProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupCoordinator,
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalRoutedControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 // Route only the remote half of exact-group join work. Local
                 // routes return a typed sentinel so distributed_join executes
@@ -4266,7 +4283,8 @@ pub const ProvisionedTableReadSource = struct {
         const allow_stale_fallback = !strict_relational and !(consistency == .read_index and request == .lookup and
             self.source().strict_read_index_absence);
         const plan = planFanout(.query, self.io_impl, group_ids.len);
-        if (!plan.parallel) {
+        const single_execution_owner = request == .scan and request.scan.opts.execution_wait != null;
+        if (!plan.parallel or single_execution_owner) {
             for (group_ids) |group_id| {
                 try prepareProvisionedGroupConsistency(self.read_safety_barrier, group_id, request, consistency, allow_stale_fallback);
             }
@@ -5222,6 +5240,16 @@ pub const ProvisionedTableReadSource = struct {
         return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalRoutedControlled(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, controls: db_mod.types.SearchRequest) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocalControlled(&routed, alloc, group_id, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5819,6 +5847,35 @@ pub const ProvisionedTableReadSource = struct {
         unreachable;
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            try checkQueryDeadline(controls);
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = controls }, .stale, .general, 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            return self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
     fn textStatsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5828,6 +5885,19 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.callerReadActivityHeld());
+    }
+
+    fn textStatsGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectProvisionedHostedLocalTextStatsControlled(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.callerReadActivityHeld(), controls);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -6617,6 +6687,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .query_group_local = queryGroupLocalPhysical,
                 .search_result_group_local = searchResultGroupLocalPhysical,
                 .text_stats_group_local = textStatsGroupLocalPhysical,
+                .text_stats_group_local_controlled = textStatsGroupLocalPhysicalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
                 .graph_expand_group_local = graphExpandGroupLocalPhysical,
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
@@ -6791,6 +6862,16 @@ pub const HostedProvisionedTableReadSource = struct {
         return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalRoutedControlled(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, controls: db_mod.types.SearchRequest) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocalControlled(&routed, alloc, group_id, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -6894,7 +6975,9 @@ pub const HostedProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalRoutedControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
@@ -7794,6 +7877,19 @@ pub const HostedProvisionedTableReadSource = struct {
         return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{}, null)).textStatsGroupLocal(alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = controls.execution_deadline_ns }, controls.cancellation)).textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls);
+    }
+
     fn textStatsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7803,6 +7899,19 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false);
+    }
+
+    fn textStatsGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectProvisionedHostedLocalTextStatsControlled(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false, controls);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -8172,15 +8281,17 @@ const TextStatsFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
     fields: []const distributed_stats_mod.TextFieldStats = &.{},
     err: ?anyerror = null,
+    owner: @import("runnable_fanout_owner.zig").Owner = .{},
 
-    fn init() TextStatsFanoutSlot {
+    fn init(alloc: std.mem.Allocator) TextStatsFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(alloc),
         };
     }
 
     pub fn deinit(self: *TextStatsFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -8189,15 +8300,17 @@ const SearchFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
     result: ?db_mod.types.SearchResult = null,
     err: ?anyerror = null,
+    owner: @import("runnable_fanout_owner.zig").Owner = .{},
 
-    fn init() SearchFanoutSlot {
+    fn init(alloc: std.mem.Allocator) SearchFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(alloc),
         };
     }
 
     pub fn deinit(self: *SearchFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -8206,15 +8319,17 @@ const PreflightFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
     summary: ?db_mod.RuntimePreflightSummary = null,
     err: ?anyerror = null,
+    owner: @import("runnable_fanout_owner.zig").Owner = .{},
 
-    fn init() PreflightFanoutSlot {
+    fn init(alloc: std.mem.Allocator) PreflightFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(alloc),
         };
     }
 
     pub fn deinit(self: *PreflightFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -8222,7 +8337,7 @@ const PreflightFanoutSlot = struct {
 fn initTextStatsFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]TextStatsFanoutSlot {
     const slots = try alloc.alloc(TextStatsFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(alloc);
     return slots;
 }
 
@@ -8234,7 +8349,7 @@ fn deinitTextStatsFanoutSlots(alloc: std.mem.Allocator, slots: []TextStatsFanout
 fn initSearchFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]SearchFanoutSlot {
     const slots = try alloc.alloc(SearchFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(alloc);
     return slots;
 }
 
@@ -8246,7 +8361,7 @@ fn deinitSearchFanoutSlots(alloc: std.mem.Allocator, slots: []SearchFanoutSlot) 
 fn initPreflightFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]PreflightFanoutSlot {
     const slots = try alloc.alloc(PreflightFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(alloc);
     return slots;
 }
 
@@ -8263,10 +8378,14 @@ fn collectProvisionedSearchRequestTextStatsParallel(
     group_ids: []const u64,
     table_name: []const u8,
     body: []const u8,
+    req: db_mod.types.SearchRequest,
 ) ![]const distributed_stats_mod.TextFieldStats {
     const start_ns = platform_time.monotonicNs();
-    const slots = try initTextStatsFanoutSlots(alloc, group_ids.len);
-    defer deinitTextStatsFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initTextStatsFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitTextStatsFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8275,13 +8394,21 @@ fn collectProvisionedSearchRequestTextStatsParallel(
             group_id: u64,
             table_name_inner: []const u8,
             body_inner: []const u8,
+            req_inner: db_mod.types.SearchRequest,
         ) void {
+            var worker_req = req_inner;
+            worker_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
-            var response = source.groupLocalSource().textStatsGroupLocal(
+            var response = source.groupLocalSource().textStatsGroupLocalWithControls(
                 arena,
                 group_id,
                 table_name_inner,
                 body_inner,
+                worker_req,
             ) catch |err| {
                 slot.err = err;
                 return;
@@ -8300,11 +8427,15 @@ fn collectProvisionedSearchRequestTextStatsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(TextStatsFanoutSlot)) +| table_name.len +| 1024 +| body.len);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, body });
+            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, body, req });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -8349,8 +8480,11 @@ fn collectHostedSearchRequestTextStatsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initTextStatsFanoutSlots(alloc, group_ids.len);
-    defer deinitTextStatsFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initTextStatsFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitTextStatsFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8362,15 +8496,22 @@ fn collectHostedSearchRequestTextStatsParallel(
             body_inner: []const u8,
             req_inner: db_mod.types.SearchRequest,
         ) void {
+            var worker_req = req_inner;
+            worker_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
             var response = switch (route) {
-                .local => source.groupLocalSource().textStatsGroupLocal(
+                .local => source.groupLocalSource().textStatsGroupLocalWithControls(
                     arena,
                     group_id,
                     table_name_inner,
                     body_inner,
+                    worker_req,
                 ),
-                .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
+                .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, worker_req),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -8389,11 +8530,15 @@ fn collectHostedSearchRequestTextStatsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(TextStatsFanoutSlot)) +| table_name.len +| 1024 +| body.len);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, body, req });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -8423,8 +8568,11 @@ fn queryProvisionedAcrossGroupsParallel(
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     std.debug.assert(req.graph_queries.len == 0);
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
-    defer deinitSearchFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initSearchFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitSearchFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8438,6 +8586,11 @@ fn queryProvisionedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            group_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8462,12 +8615,16 @@ fn queryProvisionedAcrossGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(SearchFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -8509,8 +8666,11 @@ fn queryHostedAcrossGroupsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
-    defer deinitSearchFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initSearchFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitSearchFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8525,6 +8685,11 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            group_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8553,12 +8718,16 @@ fn queryHostedAcrossGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(SearchFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -9007,8 +9176,11 @@ fn preflightProvisionedGroupsParallel(
     max_work: u32,
 ) !?db_mod.RuntimePreflightSummary {
     const start_ns = platform_time.monotonicNs();
-    const slots = try initPreflightFanoutSlots(alloc, group_ids.len);
-    defer deinitPreflightFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initPreflightFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitPreflightFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -9020,12 +9192,18 @@ fn preflightProvisionedGroupsParallel(
             consistency_inner: raft_mod.ReadConsistency,
             max_work_inner: u32,
         ) void {
+            var worker_req = req_inner.*;
+            worker_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
             slot.summary = source.groupLocalSource().preflightQueryGroupLocal(
                 arena,
                 group_id,
                 table_name_inner,
-                req_inner.*,
+                worker_req,
                 consistency_inner,
                 max_work_inner,
             ) catch |err| {
@@ -9039,11 +9217,15 @@ fn preflightProvisionedGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(PreflightFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, &req, consistency, max_work });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -9074,8 +9256,11 @@ fn preflightHostedGroupsParallel(
     const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initPreflightFanoutSlots(alloc, group_ids.len);
-    defer deinitPreflightFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initPreflightFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitPreflightFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -9088,13 +9273,19 @@ fn preflightHostedGroupsParallel(
             consistency_inner: raft_mod.ReadConsistency,
             max_work_inner: u32,
         ) void {
+            var worker_req = req_inner.*;
+            worker_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
             switch (route) {
                 .local => slot.summary = source.groupLocalSource().preflightQueryGroupLocal(
                     arena,
                     group_id,
                     table_name_inner,
-                    req_inner.*,
+                    worker_req,
                     consistency_inner,
                     max_work_inner,
                 ) catch |err| {
@@ -9107,7 +9298,7 @@ fn preflightHostedGroupsParallel(
                     remote.base_uri,
                     group_id,
                     table_name_inner,
-                    req_inner.*,
+                    worker_req,
                     max_work_inner,
                 ) catch |err| {
                     slot.err = err;
@@ -9121,11 +9312,15 @@ fn preflightHostedGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(PreflightFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, &req, consistency, max_work });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -13037,20 +13232,23 @@ fn collectProvisionedAlgebraicDistributedPartials(
     captured_first_db: ?*db_mod.DB,
     required_identity_generations: ?[]const ?u64,
 ) !?db_mod.algebraic.distributed.MergeSet {
+    try checkQueryDeadline(req);
+    if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
+    // This helper owns a native DB lease. The control-only consumer reaches
+    // distributed aggregation through its query kernel, never this shortcut.
+    // Preserve deadline and identity validation before rejecting native access.
+    if (comptime control_only_storage_sources) return error.UnsupportedQueryRequest;
     var partials = std.ArrayListUnmanaged(db_mod.algebraic.distributed.Partial).empty;
-    errdefer {
-        for (partials.items) |partial| {
-            alloc.free(@constCast(partial.canonical_axis));
-            if (partial.metric.len > 0) alloc.free(@constCast(partial.metric));
-            alloc.free(@constCast(partial.value));
-        }
-        partials.deinit(alloc);
-    }
+    // Capability fallback is a successful null return, so cleanup must run
+    // on every exit, including after earlier shards supplied owned values.
+    defer algebraic_partial_ownership.deinitList(alloc, &partials);
 
     for (group_ids, 0..) |group_id, group_index| {
+        try checkQueryDeadline(req);
+        if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
         const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
@@ -13081,8 +13279,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
             error.HllCardinalityUnavailable => return null,
             else => return err,
         };
-        defer if (shard_partials.len > 0) alloc.free(shard_partials);
-        for (shard_partials) |partial| try partials.append(alloc, partial);
+        try algebraic_partial_ownership.appendOwned(alloc, &partials, shard_partials);
     }
 
     const partial_slice = try partials.toOwnedSlice(alloc);
@@ -14157,22 +14354,21 @@ fn collectHostedAlgebraicDistributedPartials(
     consistency: raft_mod.ReadConsistency,
     required_identity_generations: ?[]const ?u64,
 ) !?db_mod.algebraic.distributed.MergeSet {
+    try checkQueryDeadline(req);
+    if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     var partials = std.ArrayListUnmanaged(db_mod.algebraic.distributed.Partial).empty;
-    errdefer {
-        for (partials.items) |partial| {
-            alloc.free(@constCast(partial.canonical_axis));
-            if (partial.metric.len > 0) alloc.free(@constCast(partial.metric));
-            alloc.free(@constCast(partial.value));
-        }
-        partials.deinit(alloc);
-    }
+    // Capability fallback is a successful null return, so cleanup must run
+    // on every exit, including after earlier shards supplied owned values.
+    defer algebraic_partial_ownership.deinitList(alloc, &partials);
 
     const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
     defer deinitHostedShardRoutes(alloc, routes);
     for (group_ids, 0..) |group_id, group_index| {
+        try checkQueryDeadline(req);
+        if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
         const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
@@ -14180,18 +14376,29 @@ fn collectHostedAlgebraicDistributedPartials(
         const route = routes[group_index];
         const shard_partials = switch (route) {
             .local => blk: {
-                var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch return null;
+                var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch {
+                    try checkQueryDeadline(group_req);
+                    if (group_req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+                    return null;
+                };
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
+                var authority_rejection: ?anyerror = null;
+                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req, &authority_rejection) catch {
+                    if (authority_rejection) |cause| return cause;
+                    // Capability/transport fallback is permitted only while
+                    // the original query still owns execution and its budget.
+                    try checkQueryDeadline(group_req);
+                    if (group_req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+                    return null;
+                }) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
         };
-        defer if (shard_partials.len > 0) alloc.free(shard_partials);
-        for (shard_partials) |partial| try partials.append(alloc, partial);
+        try algebraic_partial_ownership.appendOwned(alloc, &partials, shard_partials);
     }
 
     const partial_slice = try partials.toOwnedSlice(alloc);
@@ -14963,6 +15170,17 @@ fn collectBoundLocalTextStats(
     return .{ .json = try executeStorageKernelTextStats(alloc, self.db, table_name, body) };
 }
 
+fn collectBoundLocalTextStatsControlled(
+    self: *BoundTableReadSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    controls: db_mod.types.SearchRequest,
+) !?query_api.QueryResponse {
+    if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+    return .{ .json = try physical_local_query.executeStorageKernelTextStatsWithControls(alloc, self.db, table_name, body, controls) };
+}
+
 pub const executeStorageKernelTextStats = physical_local_query.executeStorageKernelTextStats;
 
 fn collectBoundLocalAlgebraicPartials(
@@ -15008,6 +15226,40 @@ fn collectProvisionedHostedLocalTextStats(
     };
 }
 
+fn collectProvisionedHostedLocalTextStatsControlled(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    body: []const u8,
+    read_activity_held: bool,
+    controls: db_mod.types.SearchRequest,
+) !?query_api.QueryResponse {
+    try checkQueryDeadline(controls);
+    var parsed = try parseTextStatsRequest(alloc, table_name, body);
+    defer parsed.deinit(alloc);
+    var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
+    defer owner.deinit();
+    try checkQueryDeadline(controls);
+    return switch (parsed) {
+        .background_fields => blk: {
+            const stats = try physical_local_query.collectBackgroundTextStatsFromDbForRequestWithControls(alloc, owner.db(), parsed, controls);
+            defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, stats);
+            break :blk .{ .json = try encodeBackgroundTextStatsResponse(alloc, stats) };
+        },
+        else => blk: {
+            const stats = try physical_local_query.collectTextStatsFromDbForRequestWithControls(alloc, owner.db(), parsed, controls);
+            defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
+            break :blk .{ .json = try encodeTextStatsResponse(alloc, stats) };
+        },
+    };
+}
+
 fn collectProvisionedHostedLocalAlgebraicPartials(
     resident_db: ?ResidentDbSource,
     cache: ?*ProvisionedTableReadCache,
@@ -15023,6 +15275,9 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
 ) !?query_api.QueryResponse {
     var parsed = try parseAlgebraicPartialsRequest(alloc, body);
     defer parsed.deinit(alloc);
+    // The control consumer executes aggregation through its query kernel.
+    // Do not instantiate or open a native DB shortcut in that profile.
+    if (comptime control_only_storage_sources) return error.UnsupportedQueryRequest;
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
     const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, owner.db(), parsed);
@@ -15053,11 +15308,12 @@ fn collectProvisionedSearchRequestTextStats(
             group_req.identity_read_generation = generation.?;
             const body = try encodeQueryTextStatsRequest(alloc, group_req);
             defer alloc.free(body);
-            var response = (try self.groupLocalSource().textStatsGroupLocal(
+            var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(
                 alloc,
                 group_id,
                 table_name,
                 body,
+                req,
             )) orelse return error.TableNotFound;
             defer response.deinit(alloc);
             shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -15071,7 +15327,7 @@ fn collectProvisionedSearchRequestTextStats(
     const plan = planFanout(.text_stats, self.io_impl, group_ids.len);
     recordFanoutPlan(.text_stats, plan);
     if (plan.parallel) {
-        return try collectProvisionedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body);
+        return try collectProvisionedSearchRequestTextStatsParallel(self, alloc, self.io_impl.?.io(), plan.width, group_ids, table_name, body, req);
     }
     if (plan.reason == .no_io) recordParallelFanoutFallback(.text_stats);
 
@@ -15083,7 +15339,7 @@ fn collectProvisionedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15120,11 +15376,12 @@ fn collectHostedSearchRequestTextStats(
             defer alloc.free(body);
             const route = routes[i];
             var response = switch (route) {
-                .local => (try self.groupLocalSource().textStatsGroupLocal(
+                .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(
                     alloc,
                     group_id,
                     table_name,
                     body,
+                    req,
                 )) orelse return error.TableNotFound,
                 .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
             };
@@ -15156,7 +15413,7 @@ fn collectHostedSearchRequestTextStats(
     for (group_ids, 0..) |group_id, i| {
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15199,7 +15456,7 @@ fn collectProvisionedAggregationTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeExplicitTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15239,7 +15496,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeBackgroundTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15284,7 +15541,7 @@ fn collectHostedAggregationTextStats(
         defer alloc.free(body);
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15331,7 +15588,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer alloc.free(body);
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15534,6 +15791,12 @@ fn queryRemote(
     return parsed;
 }
 
+/// Stable for the entire synchronous RPC, including physical cancellation
+/// joining. The transport borrows the existing child/root and restores its
+/// actual phase between leaf waits; it never creates fresh query authority.
+const RemoteQueryWait = @import("runnable_fanout_owner.zig").RemoteWait;
+const algebraic_partial_ownership = @import("algebraic_partial_ownership.zig");
+
 fn queryResponseRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -15547,6 +15810,8 @@ fn queryResponseRemote(
         req.native_query_cut = try cut.forGroup(group_id);
     };
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    var request_wait: RemoteQueryWait = .{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
     client.prepared_query_routing = prepared;
@@ -15585,6 +15850,8 @@ fn preflightRemote(
         req.native_query_cut = try cut.forGroup(group_id);
     };
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    var request_wait = RemoteQueryWait{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
     client.prepared_query_routing = prepared;
@@ -15612,6 +15879,8 @@ fn textStatsRemote(
     defer if (bound) |bytes| alloc.free(bytes);
     const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    var request_wait = RemoteQueryWait{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
     const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
@@ -15628,15 +15897,32 @@ fn algebraicPartialsRemote(
     table_name: []const u8,
     input: []const u8,
     req: db_mod.types.SearchRequest,
+    authority_rejection: *?anyerror,
 ) !?query_api.QueryResponse {
+    authority_rejection.* = null;
     const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
     defer if (bound) |bytes| alloc.free(bytes);
     const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var request_wait = RemoteQueryWait{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
+    const timeout_ms = queryRemainingTimeoutMs(req) catch |err| {
+        authority_rejection.* = err;
+        return err;
+    };
     var cancellation = queryRequestCancellation(req);
     const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
-    var result = try client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
+    var result = client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr) catch |err| {
+        if (request_wait.rejection) |cause| {
+            authority_rejection.* = cause;
+            return cause;
+        }
+        if (req.execution_runnable) |borrow| borrow.checkLifetime() catch |cause| {
+            authority_rejection.* = cause;
+            return cause;
+        };
+        return err;
+    };
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -17347,10 +17633,11 @@ fn consumerTests() type {
 
             const FakeRouter = struct {
                 var batch_calls: usize = 0;
+                var expected_groups: []const u64 = &.{ 7, 8 };
                 fn routes(_: *anyopaque, allocator: std.mem.Allocator, groups: []const u64, _: table_router.RoutePolicy, budget: table_router.RouteBudget) !?[]table_router.GroupRoute {
                     try budget.check();
                     batch_calls += 1;
-                    try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, groups);
+                    try std.testing.expectEqualSlices(u64, expected_groups, groups);
                     const result = try allocator.alloc(table_router.GroupRoute, groups.len);
                     var initialized: usize = 0;
                     errdefer {
@@ -17398,11 +17685,45 @@ fn consumerTests() type {
                 }
             };
 
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
             const Capture = struct {
+                scheduler: ?*native.Scheduler = null,
+                phase: enum { candidate, preflight, text_stats, algebraic } = .candidate,
                 keys_seen: std.atomic.Value(usize) = .init(0),
                 calls: std.atomic.Value(usize) = .init(0),
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.scheduler) |scheduler| {
+                        const stats = scheduler.stats();
+                        const fanout = self.phase != .algebraic;
+                        try std.testing.expect(stats.operations >= @as(usize, if (fanout) 3 else 1));
+                        // Other workers may use protected control while this
+                        // child owns ordinary CPU. Stats includes both lanes.
+                        try std.testing.expect(stats.control_slots <= scheduler.config.control_slots);
+                        try std.testing.expect(stats.runnable_slots - stats.control_slots <= scheduler.config.slots - scheduler.config.control_slots);
+                        if (fanout) try std.testing.expect(stats.resource_blocked >= 1);
+                        const wait = req.execution_wait orelse return error.TestUnexpectedResult;
+                        try wait.beginWait();
+                        const parked = scheduler.stats();
+                        try std.testing.expect(parked.operations >= @as(usize, if (fanout) 3 else 1));
+                        try std.testing.expect(parked.resource_blocked >= @as(usize, if (fanout) 2 else 1));
+                        var control: native.Execution = .{};
+                        defer control.finish();
+                        try control.start(scheduler, .{ .io = std.testing.io, .retained_bytes = 7 }, .control);
+                        try control.checkpoint();
+                        control.finish();
+                        if (self.phase == .algebraic) {
+                            _ = self.calls.fetchAdd(1, .monotonic);
+                            scheduler.close();
+                            try std.testing.expectError(error.SchedulerClosed, wait.endWait());
+                            return error.SchedulerClosed;
+                        }
+                        try wait.endWait();
+                    }
+                    if (self.phase != .candidate) {
+                        _ = self.calls.fetchAdd(1, .monotonic);
+                        return error.InvalidQueryRequest;
+                    }
                     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, req.body, .{});
                     defer parsed.deinit();
                     const keys = parsed.value.object.get("native_doc_id_constraints").?.object.get("include_doc_ids").?.array.items;
@@ -17417,23 +17738,76 @@ fn consumerTests() type {
                     return error.InvalidQueryRequest;
                 }
             };
-            FakeRouter.batch_calls = 0;
-            var capture = Capture{};
-            var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
-            defer routing.deinit();
-            var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
-            _ = hosted.withIo(&io_impl);
-            const req: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
-            try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
-            var generations = [_]?u64{ null, null };
-            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
-            try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
-            try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
-            try std.testing.expectEqual(@as(usize, 1), FakeRouter.batch_calls);
-            // The sequential phase must also pin all routes before dispatch.
-            hosted.io_impl = null;
-            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
-            try std.testing.expectEqual(@as(usize, 2), FakeRouter.batch_calls);
+            for ([_]usize{ 0, 2, 3 }) |capacity| {
+                FakeRouter.batch_calls = 0;
+                FakeRouter.expected_groups = &.{ 7, 8 };
+                var scheduler = try native.Scheduler.init(.{ .slots = @max(capacity, 2), .control_slots = 1 });
+                defer scheduler.close();
+                var parent: native.Execution = .{};
+                defer parent.finish();
+                if (capacity != 0) try parent.start(&scheduler, .{ .io = io_impl.io(), .retained_bytes = 23 }, .query);
+                var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = alloc };
+                const team = if (capacity != 0) try read.team() else null;
+                var capture = Capture{ .scheduler = if (capacity != 0) &scheduler else null };
+                var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
+                defer routing.deinit();
+                var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                _ = hosted.withIo(&io_impl);
+                const req: db_mod.types.SearchRequest = .{ .execution_runnable = if (team) |value| value.borrow else null, .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
+                try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
+                var generations = [_]?u64{ null, null };
+                try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+                try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 1), FakeRouter.batch_calls);
+                if (capacity != 0) {
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+                    try parent.checkLifetime();
+                }
+                // A sequential phase owns the root rather than two child slots.
+                capture.scheduler = null;
+                // The sequential phase must also pin all routes before dispatch.
+                hosted.io_impl = null;
+                try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+                try std.testing.expectEqual(@as(usize, 2), FakeRouter.batch_calls);
+                // The same real parallel dispatcher must own preflight and
+                // text-statistics children independently, including at C1.
+                _ = hosted.withIo(&io_impl);
+                capture.scheduler = if (capacity != 0) &scheduler else null;
+                capture.phase = .preflight;
+                const before_preflight = capture.calls.load(.monotonic);
+                try std.testing.expectError(error.InvalidQueryRequest, preflightHostedGroupsParallel(&hosted, alloc, io_impl.io(), 2, &.{ 7, 8 }, "docs", req, .read_index, 0));
+                try std.testing.expectEqual(before_preflight + 2, capture.calls.load(.monotonic));
+                capture.phase = .text_stats;
+                const before_stats = capture.calls.load(.monotonic);
+                try std.testing.expectError(error.InvalidQueryRequest, collectHostedSearchRequestTextStatsParallel(&hosted, alloc, io_impl.io(), 2, &.{ 7, 8 }, "docs", "{}", req, .read_index));
+                try std.testing.expectEqual(before_stats + 2, capture.calls.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 4), FakeRouter.batch_calls);
+                if (capacity != 0) {
+                    try std.testing.expectEqual(native.Class.query, try parent.retainedClass());
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+                    try parent.checkLifetime();
+                }
+                capture.phase = .algebraic;
+                FakeRouter.expected_groups = &.{7};
+                const before_algebraic = capture.calls.load(.monotonic);
+                const algebraic = collectHostedAlgebraicDistributedPartials(&hosted, alloc, &.{7}, "docs", req, "alg", &.{}, .{ .output = .{ .input = 0 } }, .read_index, null);
+                if (capacity == 0) {
+                    // An ordinary capability/transport failure can still
+                    // select the original planner's fallback while it owns CPU.
+                    try std.testing.expect((try algebraic) == null);
+                } else {
+                    // Losing authority during the remote wait is terminal;
+                    // it must never turn into a successful null fallback.
+                    try std.testing.expectError(error.SchedulerClosed, algebraic);
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+                }
+                try std.testing.expectEqual(before_algebraic + 1, capture.calls.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 5), FakeRouter.batch_calls);
+            }
         }
         test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
             const Case = struct {
@@ -23659,6 +24033,11 @@ fn consumerTests() type {
             try std.testing.expect((try collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, "alg", &.{}, .{
                 .output = .{ .input = 0 },
             }, null, null)) == null);
+            if (comptime control_only_storage_sources) {
+                try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", .{}, "alg", &.{}, .{
+                    .output = .{ .input = 0 },
+                }, null, null));
+            }
             try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits, &text_analysis, null));
             try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits, &text_analysis, null));
 
@@ -24208,9 +24587,12 @@ fn consumerTests() type {
 
         test "remote shard query phases propagate deadline and request cancellation" {
             const alloc = std.testing.allocator;
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
 
             const ExecutorState = struct {
                 signal: *std.atomic.Value(bool),
+                scheduler: *native.Scheduler,
+                wait_calls: usize = 0,
                 calls: usize = 0,
                 algebraic_base64_header_seen: bool = false,
 
@@ -24234,6 +24616,18 @@ fn consumerTests() type {
                         );
                         self.algebraic_base64_header_seen = true;
                     }
+                    if (req.execution_wait) |wait| {
+                        self.wait_calls += 1;
+                        try wait.beginWait();
+                        try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                        try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().resource_blocked);
+                        var control = native.Execution{};
+                        defer control.finish();
+                        try control.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 7 }, .control);
+                        try control.checkpoint();
+                        control.finish();
+                        try wait.endWait();
+                    } else return error.TestExpectedExecutionWait;
                     const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
                     try std.testing.expect(!cancellation.isCancelled());
                     self.signal.store(true, .release);
@@ -24244,8 +24638,16 @@ fn consumerTests() type {
             };
 
             var cancelled = std.atomic.Value(bool).init(false);
-            var state = ExecutorState{ .signal = &cancelled };
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var root = native.Execution{};
+            defer root.finish();
+            try root.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .inference);
+            var read = @import("runnable_local_read.zig").Read{ .execution = &root, .allocator = alloc };
+            const team = try read.team();
+            var state = ExecutorState{ .signal = &cancelled, .scheduler = &scheduler };
             const controlled_request = db_mod.types.SearchRequest{
+                .execution_runnable = team.borrow,
                 .execution_deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
                 .cancellation = db_mod.types.CancellationToken.fromAtomic(&cancelled),
             };
@@ -24287,6 +24689,7 @@ fn consumerTests() type {
                 "{}",
                 controlled_request,
             ));
+            var algebraic_rejection: ?anyerror = null;
             try std.testing.expectError(error.Timeout, algebraicPartialsRemote(
                 state.iface(),
                 alloc,
@@ -24295,9 +24698,15 @@ fn consumerTests() type {
                 "docs",
                 "{}",
                 controlled_request,
+                &algebraic_rejection,
             ));
+            try std.testing.expect(algebraic_rejection == null);
             try std.testing.expectEqual(@as(usize, 5), state.calls);
             try std.testing.expect(state.algebraic_base64_header_seen);
+            try std.testing.expectEqual(@as(usize, 5), state.wait_calls);
+            try std.testing.expectEqual(native.Class.inference, try root.retainedClass());
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
         }
 
         test "remote query returns the shard-selected identity generation" {

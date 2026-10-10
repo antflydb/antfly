@@ -58,6 +58,9 @@ pub const ErrorReason = enum {
 /// Incremental HTTP message parser.
 pub const Parser = struct {
     allocator: Allocator,
+    body_allocator: ?Allocator = null,
+    body_memory_context: ?*anyopaque = null,
+    body_memory_resolver: ?*const fn (*anyopaque, types.Method, []const u8, ?u64) @import("body_budget.zig").BodyMemory = null,
     state: ParserState = .start,
     mode: ParserMode = .request,
     error_reason: ErrorReason = .none,
@@ -123,7 +126,7 @@ pub const Parser = struct {
     pub fn deinit(self: *Self) void {
         self.releaseBodyBudget();
         self.headers.deinit();
-        self.body_buffer.deinit(self.allocator);
+        self.body_buffer.deinit(self.body_allocator orelse self.allocator);
         self.line_buffer.deinit(self.allocator);
         if (self.path_owned) {
             if (self.path) |p| self.allocator.free(p);
@@ -224,7 +227,7 @@ pub const Parser = struct {
         // Release oversized buffers to prevent permanent memory inflation
         // from occasional large requests on long-lived keep-alive connections.
         if (self.body_buffer.capacity > max_retained_capacity) {
-            self.body_buffer.deinit(self.allocator);
+            self.body_buffer.deinit(self.body_allocator orelse self.allocator);
             self.body_buffer = .empty;
         } else {
             self.body_buffer.clearRetainingCapacity();
@@ -507,6 +510,18 @@ pub const Parser = struct {
             return;
         }
 
+        if (self.body_memory_resolver) |resolve| {
+            if (self.body_memory_context) |context| if (self.method) |method| if (self.path) |path| {
+                const memory = resolve(context, method, path, self.content_length);
+                const previous = self.body_allocator orelse self.allocator;
+                if (previous.ptr != memory.allocator.ptr or previous.vtable != memory.allocator.vtable) {
+                    self.body_buffer.deinit(previous);
+                    self.body_buffer = .empty;
+                }
+                self.body_allocator = memory.allocator;
+                self.body_budget = memory.budget;
+            };
+        }
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {
@@ -516,7 +531,7 @@ pub const Parser = struct {
                     try self.reserveBodyBytes(body_len);
                     // Pre-allocate the body buffer to avoid repeated reallocs
                     // during incremental parsing of fixed-length bodies.
-                    try self.body_buffer.ensureTotalCapacity(self.allocator, body_len);
+                    try self.body_buffer.ensureTotalCapacity(self.body_allocator orelse self.allocator, body_len);
                 }
                 self.state = .body;
             } else {
@@ -538,7 +553,7 @@ pub const Parser = struct {
             const remaining = len - self.bytes_read;
             const to_read = @min(data.len, @as(usize, @intCast(remaining)));
             if (self.store_body) {
-                try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+                try self.body_buffer.appendSlice(self.body_allocator orelse self.allocator, data[0..to_read]);
             }
             self.bytes_read += to_read;
 
@@ -556,7 +571,7 @@ pub const Parser = struct {
         }
         if (self.store_body) {
             try self.reserveBodyBytes(data.len);
-            try self.body_buffer.appendSlice(self.allocator, data);
+            try self.body_buffer.appendSlice(self.body_allocator orelse self.allocator, data);
         }
         return data.len;
     }
@@ -608,7 +623,7 @@ pub const Parser = struct {
 
         if (self.store_body) {
             try self.reserveBodyBytes(to_read);
-            try self.body_buffer.appendSlice(self.allocator, data[0..to_read]);
+            try self.body_buffer.appendSlice(self.body_allocator orelse self.allocator, data[0..to_read]);
         }
         self.bytes_read += to_read;
 

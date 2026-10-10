@@ -1,0 +1,30 @@
+{
+  "state": "terminal",
+  "pid": 69667,
+  "started": 1791405053.9255989,
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "linked-inference-abi-integration-test",
+    "linked-inference-worker-integration-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "23622320128",
+    "--cache-dir",
+    "/private/tmp/antfly-default-pooling-cache",
+    "--summary",
+    "all"
+  ],
+  "source_sha256": {
+    "zig/pkg/inference/src/server/executor_microbatch.zig": "a303286d198fa75797918c8953d7466bc91fd7df14ec5ae937024e1eaaa5941d",
+    "zig/pkg/inference/src/server/server.zig": "cfde61609bc895bd65a2a7105e72c612b75755fea43fbd0df8861c98ea8a8ad9",
+    "zig/pkg/inference/src/server/tensor_microbatch.zig": "9fefb59e53f169f8125cf36a0ee0d360906909238994246575b6fd8e42928acf",
+    "zig/pkg/inference/src/pipelines/embedding.zig": "5184b2ae45188af4b690d9643a8464c715381551f9110fb2d1310b21858d1a59",
+    "zig/pkg/inference/src/host/host.zig": "81ccfea971ecfae8172873238a48a39e0fbc8573e007f13891b51dc664a6d3b0",
+    "zig/pkg/inference/src/execution_control.zig": "719d5b409ead3377b70c907fd2a87209677b7bfa098af4fd9428470a9c65cdbc"
+  },
+  "compiler_pid": 69669,
+  "exit_code": 0,
+  "finished": 1791405508.3086011
+}

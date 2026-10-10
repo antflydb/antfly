@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 62;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -735,6 +735,17 @@ pub const Status = enum(u32) {
     invalid_generated_tool_arguments = 775,
     sql_feature_not_supported = 776,
     catalog_publication_proof_pending = 777,
+
+    // Unreleased pooling identities use a separate append-only range so
+    // subsequent main additions cannot renumber already published statuses.
+    scheduler_closed = 0x10000,
+    scheduler_full = 0x10001,
+    runnable_wait_timeout = 0x10002,
+    execution_wait_unsupported = 0x10003,
+    invalid_runnable_demand = 0x10004,
+    invalid_runnable_policy = 0x10005,
+    invalid_runnable_transition = 0x10006,
+    manager_cleanup_capacity_unavailable = 0x10007,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

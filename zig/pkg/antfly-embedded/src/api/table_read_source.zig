@@ -421,6 +421,8 @@ pub const TableReadSource = struct {
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
         text_stats_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8) anyerror!?query_api.QueryResponse = null,
+        text_stats_group_local_controlled: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8, db_types.SearchRequest) anyerror!?query_api.QueryResponse = null,
+        text_stats_group_local_controlled_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, db_types.SearchRequest) anyerror!?query_api.QueryResponse = null,
         algebraic_partials_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -959,6 +961,33 @@ pub const TableReadSource = struct {
         }
         const fn_ptr = self.vtable.text_stats_group_local orelse return null;
         return try BoundaryAbi.call("text_stats_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
+    }
+
+    pub fn textStatsGroupLocalWithControls(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkStatisticsControls(controls);
+        var response = result: {
+            if (self.route_fence) |fence| {
+                if (self.vtable.text_stats_group_local_controlled_routed) |routed|
+                    break :result try BoundaryAbi.call("text_stats_group_local_controlled_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, controls });
+            } else if (self.vtable.text_stats_group_local_controlled) |callback| {
+                break :result try BoundaryAbi.call("text_stats_group_local_controlled", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body, controls });
+            }
+            // Legacy adapters may serve uncontrolled callers but cannot erase
+            // trusted authority, cancellation or an absolute deadline.
+            if (controls.execution_runnable != null or controls.execution_deadline_ns != null or controls.cancellation != null)
+                return error.UnsupportedQueryRequest;
+            break :result try self.textStatsGroupLocal(alloc, group_id, table_name, body);
+        };
+        errdefer if (response) |*owned| owned.deinit(alloc);
+        try checkStatisticsControls(controls);
+        return response;
     }
 
     pub fn algebraicPartialsGroupLocal(
@@ -1521,4 +1550,14 @@ test "scan stream preserves chunk backpressure without buffered fallback" {
     try std.testing.expectEqual(@as(usize, 0), fake.buffered_calls);
 }
 
+fn checkStatisticsControls(controls: db_types.SearchRequest) !void {
+    if (controls.execution_runnable) |borrow| {
+        try borrow.validate();
+        const status = borrow.checkpoint(borrow.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
+    if (controls.cancellation) |token| try token.check();
+    if (controls.execution_deadline_ns) |deadline|
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+}
 pub const bindNativeCutBodyAlloc = @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc;

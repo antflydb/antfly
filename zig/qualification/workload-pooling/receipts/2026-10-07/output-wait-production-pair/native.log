@@ -1,0 +1,176 @@
+antfly-inference-provider-context-test
++- run test inference-provider-context-tests w
+1/2 standalone.runtime.test.runnable execution context adapters preserve parent authority...OK
+2/2 standalone.runtime.test.runnable execution context adapters install immutable production broker admission...info: standalone inference paths models_dir=. ml_dir=.
+info: inference resource policy ownership=external_required process_memory_limit_bytes=18446744073709551615 process_memory_limit_provenance=automatic
+error: standalone inference bridge failed operation=handle_http err=error.Forbidden
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+error: standalone inference bridge failed operation=handle_http err=error.Timeout
+OK
+2 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/6241efd78bc769c4d5df342fd4f07f3e/inference-provider-context-tests --suite-filter "runnable execution context adapters" --allow-empty-test-filter --allow-empty-owner
+
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /private/tmp/antfly-default-pooling-cache/o/6db69c6eadbe1603bc53eccf10139b8a/inference-worker-rpc-contract-tests --cache-dir=/private/tmp/antfly-default-pooling-cache --seed=0xf226ae6c --listen=-
+
+Build Summary: 77/77 steps succeeded; 33/33 tests passed
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 279ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe native success 6s MaxRSS:421M
+|     +- WriteFile macos-sdk-libc.txt cached
++- run test 6 pass (6 total) 117ms MaxRSS:5M
+   +- compile test safe native success 7s MaxRSS:439M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 1 pass (1 total) 229ms MaxRSS:3M
+   +- compile test inference-worker-owner-handoff-tests safe native success 10s MaxRSS:615M
+      +- WriteFile macos-sdk-libc.txt (reused)
+antfly-inference-provider-context-test success
++- run test inference-provider-context-tests success 6ms
+   +- compile test inference-provider-context-tests safe native success 4m MaxRSS:5G
+   |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- WriteFile cached
+   |  +- compile obj antfly-build-info safe native cached 37ms MaxRSS:31M
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  +- WriteFile cached
+   |  +- compile lib antfly-storage-kernel safe native success 21m MaxRSS:4G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- WriteFile tokenizer.json success
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf success
+   |  |  +- options cached
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 6ms
+   |  |     +- compile exe patch_sentencepiece_proto safe native cached 39ms MaxRSS:31M
+   |  |     |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |     +- run exe protoc-zig (sentencepiece_proto_raw) success 7ms
+   |  |     |  +- compile exe protoc-zig safe native cached 43ms MaxRSS:31M
+   |  |     |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  |     +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-enrichment_compute safe native success 31s MaxRSS:1G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options cached
+   |  |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- WriteFile cached
+   |  +- compile lib antfly-runtime-inference safe native success 8m MaxRSS:6G
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- options (reused)
+   |  |  +- run exe jit-source-identity (metal_identity.zig) success 6ms
+   |  |  |  +- compile exe jit-source-identity safe native cached 34ms MaxRSS:31M
+   |  |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  +- options cached
+   |  |  +- WriteFile tokenizer.json (reused)
+   |  |  +- options cached
+   |  |  +- options cached
+   |  |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+   |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+   |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+   |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+   |  +- options (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile tokenizer.json (reused)
+   |  +- translate-c lmdb success 313ms
+   |  |  +- compile exe translate-c debug native success 5s MaxRSS:845M
+   |  |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- run exe generate-def (aarch64.zig) success 37ms
+   |  |  |  |  +- compile exe generate-def debug native cached 42ms MaxRSS:31M
+   |  |  |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- run exe generate-def (amdgcn.zig) success 158ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (arm.zig) success 26ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (bpf.zig) success 4ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (common.zig) success 153ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (hexagon.zig) success 213ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (loongarch.zig) success 111ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (mips.zig) success 49ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (neon.zig) success 132ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (nvptx.zig) success 106ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (powerpc.zig) success 52ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (riscv.zig) success 11ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (s390x.zig) success 19ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (ve.zig) success 163ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (wasm.zig) success 33ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86_64.zig) success 34ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86.zig) success 269ms
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (xcore.zig) success 3ms
+   |  |  |     +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options (reused)
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+   |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+   |  +- options (reused)
+   |  +- options cached
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+   +- run test inference-provider-context-tests-local success 5ms
+      +- compile test inference-provider-context-tests-local safe native success 14s MaxRSS:1G
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+      |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+      |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+      |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+      |  +- options cached
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+2 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+      |  +- WriteFile (reused)
+      |  +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 success 62ms
+         +- run test inference-provider-context-tests success 389ms
+         |  +- compile test inference-provider-context-tests safe native (+26 more reused dependencies)
+         +- run test inference-provider-context-tests-local success 115ms
+            +- compile test inference-provider-context-tests-local safe native (+26 more reused dependencies)
+

@@ -117,7 +117,23 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
 const cancellable_rerank_batch_size: usize = 8;
 const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
+const borrowed_http_control_key = "antfly.inference.borrowed_execution_control";
+
+/// The caller owns this control until the synchronous handler has joined. It
+/// carries progress and the serial executor without adding a second HTTP ABI.
+pub fn installHttpExecutionControl(ctx: *httpx.Context, control: *const InferenceExecutionControl) !void {
+    try ctx.setData(borrowed_http_control_key, @constCast(control), null);
+}
+
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
+    if (ctx.getData(borrowed_http_control_key)) |raw| {
+        const borrowed: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+        var control = borrowed.*;
+        if (control.hard_cancellation == null) {
+            if (node.hard_cancellation_watchdog) |watchdog| control.hard_cancellation = watchdog.boundary();
+        }
+        return control;
+    }
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
             const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
@@ -3711,6 +3727,10 @@ test "direct generation rejects non-generator manifests before execution" {
     );
 }
 
+pub fn ExecutorAdmissionProvider(comptime RuntimeAbi: type) type {
+    return @import("runnable_execution.zig").ProviderFor(@import("../execution_control.zig"), RuntimeAbi);
+}
+
 fn usesDeclaredSpanV2Route(manifest: manifest_mod.ModelManifest) bool {
     return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
 }
@@ -3887,6 +3907,7 @@ pub const Node = struct {
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
     executor_microbatch_broker: ?executor_microbatch.Broker = null,
+    executor_admission: ?executor_microbatch.ExecutionAdmission = null,
     executor_microbatch_init_mutex: std.atomic.Mutex = .unlocked,
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
@@ -4166,11 +4187,44 @@ pub const Node = struct {
         self.compatibility_cache.deinit(self.allocator);
     }
 
+    /// Startup-only installation. The host retains the provider/owner until
+    /// all requests join and Node teardown disposes the broker.
+    pub fn configureExecutorAdmission(self: *Node, admission: executor_microbatch.ExecutionAdmission) !void {
+        if (self.request_surfaces_published or self.executor_admission != null)
+            return error.InvalidRunnableTransition;
+        // Preload calls may have created an unscheduled broker. Warmup has
+        // joined before installation; replace it before request publication.
+        if (self.executor_microbatch_broker) |*broker| broker.deinit();
+        self.executor_microbatch_broker = null;
+        self.executor_admission = admission;
+    }
+
+    pub fn testExecutorAdmission(self: *Node) !void {
+        if (!builtin.is_test) @compileError("test-only executor admission fixture");
+        const Executor = struct {
+            fn run(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+                std.debug.assert(@import("inference_linalg").pool.scopedWorkerLimit() == 1);
+                for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
+            }
+        };
+        const payload: usize = 42;
+        const broker = self.executorMicrobatchBroker();
+        const result = try broker.submit(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, null, &payload, self, Executor.run);
+        try std.testing.expectEqual(payload, result.result.value);
+        const values = [_]usize{ 1, 2 };
+        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &.{ .{}, .{} }, &.{ .{}, .{} }, null, .{}, &values, self, Executor.run);
+        defer std.testing.allocator.free(results);
+        for (results, values) |value, expected| try std.testing.expectEqual(expected, value.result.value);
+    }
+
     fn executorMicrobatchBroker(self: *Node) *executor_microbatch.Broker {
         spinLock(&self.executor_microbatch_init_mutex);
         defer self.executor_microbatch_init_mutex.unlock();
         if (self.executor_microbatch_broker == null)
-            self.executor_microbatch_broker = executor_microbatch.Broker.init(self.allocator);
+            self.executor_microbatch_broker = if (self.executor_admission) |admission|
+                executor_microbatch.Broker.initWithAdmission(self.allocator, admission)
+            else
+                executor_microbatch.Broker.init(self.allocator);
         return &self.executor_microbatch_broker.?;
     }
 
@@ -6761,7 +6815,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))), shared, free);
         }
     }
 
@@ -6782,6 +6836,11 @@ pub const Node = struct {
         var pipeline = embedding_mod.EmbeddingPipeline.init(allocator, model.session, model.getTokenizer(), .{ .text_prefix = model.manifest.embedding_profile.document.prefix });
         const owned = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = task_type, .instruction = instruction });
         return .{ .prefix = pipeline.config.text_prefix, .owned = owned };
+    }
+
+    fn freeReadRow(allocator: std.mem.Allocator, result: readers_api.Result) void {
+        var owned = result;
+        readers_api.deinitResult(allocator, &owned);
     }
 
     fn freeDenseRow(allocator: std.mem.Allocator, row: []f32) void {
@@ -6884,7 +6943,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeSparseRow);
         }
     }
 
@@ -6919,7 +6978,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeDenseRow);
         }
     }
 
@@ -7006,7 +7065,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)));
+            item.slot.setOwnedValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)), shared, freeDenseRow);
         }
     }
 
@@ -7197,11 +7256,11 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, switch (batch.execution) {
+            item.slot.setOwnedValue([]f32, vector, switch (batch.execution) {
                 .native_batch => .native_batch,
                 .serial => .serial,
                 .fallback => .fallback,
-            });
+            }, alloc, freeDenseRow);
         }
         alloc.free(vectors);
     }
@@ -8262,7 +8321,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 
@@ -8370,7 +8429,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 
@@ -19807,7 +19866,7 @@ pub const Node = struct {
         const request = public_request.inner;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const io = self.inferenceIo(a, null, &owned_io);
+        const io = (if (control) |active| active.io else null) orelse self.inferenceIo(a, null, &owned_io);
         const path = self.resolveRequestModelPath(a, io, request.model, "extractors") catch |err| switch (err) {
             error.ModelNotFound => try self.resolveRequestModelPath(a, io, request.model, "embedders"),
             else => return err,

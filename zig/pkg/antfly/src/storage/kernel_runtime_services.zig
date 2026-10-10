@@ -20,7 +20,7 @@ const abi = @import("kernel_owner_abi");
 pub const memory = @import("runtime_memory_abi");
 pub const executor = @import("antfly_runtime_abi").io_abi;
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Request = extern struct {
     version: u32 = abi_version,
     _reserved: u32 = 0,
@@ -34,6 +34,9 @@ pub const Request = extern struct {
     /// A borrowed executor supplies storage, clock, scheduling, and
     /// cancellation together. Its runtime must outlive context destruction.
     io: ?*const executor.Borrow = null,
+    /// Copied and retained at runtime birth, released after physical joins.
+    /// The request and this port value may disappear after creation returns.
+    runnable_owner: ?*const @import("antfly_runtime_abi").runnable_abi.Owner = null,
 };
 
 pub extern fn antfly_storage_context_create_with_runtime(

@@ -32,6 +32,7 @@ pub const Request = struct {
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     body: []const u8 = "",
+    admission: ?@import("operation_admission.zig").Control = null,
 };
 
 pub const OwnedResponse = struct {
@@ -82,4 +83,46 @@ test "storage.ha HTTP executor preserves error identity across a foreign runtime
     };
     const executor: Executor = .{ .ptr = undefined, .vtable = &.{ .execute = Fake.execute }, .boundary_dispatch = Fake.dispatch };
     try std.testing.expectError(error.OutOfMemory, executor.execute(.{ .method = .get, .target = "/admin/v1/ha/primary/status" }));
+}
+
+test "HA original admission carries lifetime through typed foreign executor dispatch" {
+    const runtime = @import("antfly_runtime_abi");
+    const Fake = struct {
+        checks: usize = 0,
+        cause: ?anyerror = null,
+        fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return if (self.cause) |cause| runtime.error_abi.statusFromError(cause) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            @panic("unexpected yielding checkpoint");
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("unexpected CPU transfer");
+        }
+        fn execute(raw: *anyopaque, request: Request) !OwnedResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const original = request.admission orelse return error.MissingAdmission;
+            if (original.execution.context != @as(*anyopaque, self)) return error.WrongAdmissionOwner;
+            var admission: @import("operation_admission.zig").Session = .{};
+            try admission.bind(original);
+            return error.OutOfMemory;
+        }
+        fn dispatch(contract: *const runtime.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime.error_abi.Status {
+            return Executor.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var state: Fake = .{};
+    const io = std.testing.io;
+    const request: Request = .{ .method = .post, .target = "/admin/v1/ha/primary/fence", .admission = .{
+        .io = runtime.io_abi.Borrow.init(&io),
+        .execution = .{ .context = &state, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.background), .checkpoint = Fake.checkpoint, .check_lifetime = Fake.life, .park = Fake.phase, .enter = Fake.phase },
+    } };
+    const executor: Executor = .{ .ptr = &state, .vtable = &.{ .execute = Fake.execute }, .boundary_dispatch = Fake.dispatch };
+    try std.testing.expectError(error.OutOfMemory, executor.execute(request));
+    try std.testing.expectEqual(@as(usize, 1), state.checks);
+    state.cause = error.DeadlineExceeded;
+    try std.testing.expectError(error.DeadlineExceeded, executor.execute(request));
+    try std.testing.expectEqual(@as(usize, 2), state.checks);
 }

@@ -213,12 +213,15 @@ pub const OpenedObjectStore = struct {
         fs.* = try object_storage.FilesystemObjectStorage.init(alloc, path);
 
         var owned_client = fs.client();
+        errdefer owned_client.deinit();
         if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .fs_client = fs,
-            .bucket = try alloc.dupe(u8, bucket),
+            .bucket = owned_bucket,
             .prefix = try alloc.dupe(u8, ""),
         };
     }
@@ -249,16 +252,21 @@ pub const OpenedObjectStore = struct {
             try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(alloc, token, null)
         else
             try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
-        errdefer cfg.deinit(alloc);
+        var cfg_owned = true;
+        errdefer if (cfg_owned) cfg.deinit(alloc);
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
+        cfg_owned = false;
 
         var owned_client = gcs.client();
+        errdefer owned_client.deinit();
         if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .gcs_client = gcs,
-            .bucket = try alloc.dupe(u8, bucket),
+            .bucket = owned_bucket,
             .prefix = try alloc.dupe(u8, prefix),
         };
     }
@@ -398,11 +406,13 @@ pub const OpenedObjectStore = struct {
     ) !OpenedObjectStore {
         var owned_client = client;
         if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
         return .{
             .alloc = alloc,
             .client = owned_client,
             .owns_client = false,
-            .bucket = try alloc.dupe(u8, bucket),
+            .bucket = owned_bucket,
             .prefix = try alloc.dupe(u8, prefix),
         };
     }
@@ -453,4 +463,58 @@ test "storage.hot_standby cleanup object store does not create a missing bucket 
     );
     defer opened.deinit();
     try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+}
+
+test "lake store opening retires filesystem client at every allocation failure" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://.zig-cache/tmp/{s}", .{directory.sub_path});
+    defer std.testing.allocator.free(uri);
+    const Fixture = struct {
+        fn open(allocator: Allocator, source: []const u8) !void {
+            var store = try OpenedObjectStore.initFileUriWithOptions(allocator, source, "existing", .{ .ensure_bucket = false });
+            defer store.deinit();
+            try std.testing.expectEqualStrings("existing", store.bucket);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.open, .{uri});
+}
+
+test "lake store opening retires GCS client and transferred config at every allocation failure" {
+    const Fixture = struct {
+        fn open(allocator: Allocator) !void {
+            var store = try OpenedObjectStore.initGcsUriWithBearerTokenAndOptions(allocator, "existing", "lake/prefix", "test-token", .{ .ensure_bucket = false });
+            defer store.deinit();
+            try std.testing.expectEqualStrings("lake/prefix", store.prefix);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.open, .{});
+}
+
+test "lake store opening retires S3 client at every allocation failure" {
+    const Fixture = struct {
+        fn open(allocator: Allocator) !void {
+            var store = try OpenedObjectStore.initS3UriWithOverridesAndOptions(allocator, "existing", "lake/prefix", .{ .endpoint = "http://127.0.0.1:1", .use_ssl = false, .region = "us-east-1", .access_key_id = "test-id", .secret_access_key = "test-secret" }, .{ .ensure_bucket = false });
+            defer store.deinit();
+            try std.testing.expectEqualStrings("lake/prefix", store.prefix);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.open, .{});
+}
+
+test "lake store opening frees partial names without destroying borrowed client" {
+    var memory = object_storage.MemoryObjectStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("existing");
+    const Fixture = struct {
+        fn open(allocator: Allocator, borrowed: object_storage.ObjectStorage) !void {
+            var store = try OpenedObjectStore.initWithClientOptions(allocator, borrowed, "existing", "lake/prefix", .{ .ensure_bucket = false });
+            defer store.deinit();
+            try std.testing.expect(!store.owns_client);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.open, .{client});
+    // A rejected opening must neither destroy nor replace its producer.
+    try std.testing.expect(try client.bucketExists("existing"));
 }

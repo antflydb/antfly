@@ -1,0 +1,19 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/lib/httpx/src/net/socket.zig": "b0b89716b4a861fb8c0ebc0b00ed7b3cd6e5bc43f9b8b38ce20a68ba310fdc52",
+    "zig/lib/httpx/src/util/common.zig": "5baac932275002d819ae55d201f0ec9dff1b28b7f684f6c7df0824dac059b76a",
+    "zig/lib/httpx/src/server/server.zig": "e972862be85f4fdbaaccde7a9bb2875f0a99de10848f6af84058c93f0f1414da",
+    "zig/lib/httpx/src/protocol/h2_connection.zig": "086090602a3f370706fdab1d35892972e8adbc0cc2a00cb2a79624c1f86be8fc",
+    "zig/lib/runtime/src/runtime_http_bridge.zig": "76b04fe0baf5a14a902152a3e5595f49ff8bcbffb90bb42ba80b737e8f11b117",
+    "zig/build.zig": "23aec190effb2c1a352a2c0074ae8e64557ed6807702f5dc4112c30cc9400612",
+    "zig/lib/httpx/src/httpx.zig": "277ffdac9b9aaf0c5da757496dd5566ceae613e40b3ab57fd2a3ec43033d4600",
+    "zig/lib/json/src/mod.zig": "63867c1f746b5dbb6dcf0945bd938fd8f5d5b4a5548b578d31ad422b40ac20d3",
+    "zig/pkg/antfly/src/standalone/runtime.zig": "bccf5b59f0ffa704ad228e0fa578940a88b41ca9cd4b8edc344855400d3fb2fa"
+  },
+  "hash_capture": "after completion; matches Linux launch hashes",
+  "zig": "/Users/ajroetker/bin/zig-0.17.0/zig",
+  "summary": "149 passed, 13 skipped, 0 failed; all server tests plus selected socket/H2 contracts",
+  "log": "native.log"
+}

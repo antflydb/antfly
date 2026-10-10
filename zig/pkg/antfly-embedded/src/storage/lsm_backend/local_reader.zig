@@ -16,6 +16,8 @@
 const std = @import("std");
 const platform = @import("antfly_platform");
 const resources = @import("../resource_manager.zig");
+const read_admission = @import("../../common/read_admission.zig");
+const bounded_mutex = @import("../../common/bounded_mutex.zig");
 const RecyclingWorkspace = @import("recycling_workspace.zig").RecyclingWorkspace;
 const SharedBytes = @import("shared_bytes.zig").SharedBytes;
 
@@ -154,16 +156,37 @@ pub const Pool = struct {
     /// Ordinary operations share the byte ceiling. One operation larger than
     /// the ceiling runs alone, preserving support for legitimate large rows.
     pub fn acquire(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize) Workspace {
-        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false);
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, null) catch unreachable;
+    }
+
+    fn lockWithAdmission(self: *Pool, control: ?read_admission.Port) !void {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.mutex, budget) else platform.sync.lockYielding(&self.mutex);
+    }
+
+    /// Scoped waiters borrow the original operation only for this call. They
+    /// register no stack event that could outlive cancellation.
+    fn waitLockedWithAdmission(self: *Pool, io: ?std.Io, control: ?read_admission.Port) !void {
+        if (control) |budget| {
+            self.mutex.unlock();
+            try budget.waitForProgress();
+        } else self.waitLocked(io);
+    }
+
+    pub fn acquireWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, control: ?read_admission.Port) !Workspace {
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, control);
     }
 
     pub fn acquireRecycled(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize) Workspace {
-        return self.acquireMode(backing, manager, io, bytes, limit, 0, true);
+        return self.acquireRecycledWithAdmission(backing, manager, io, bytes, limit, null) catch unreachable;
     }
 
-    fn acquireMode(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, recycled_mode: bool) Workspace {
+    pub fn acquireRecycledWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, control: ?read_admission.Port) !Workspace {
+        return self.acquireMode(backing, manager, io, bytes, limit, 0, true, control);
+    }
+
+    fn acquireMode(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, recycled_mode: bool, control: ?read_admission.Port) !Workspace {
         while (true) {
-            platform.sync.lockYielding(&self.mutex);
+            try self.lockWithAdmission(control);
             if (self.active == 0 or bytes <= limit -| self.active_bytes) {
                 for (&self.slots) |*slot| if (!slot.busy) {
                     slot.busy = true;
@@ -199,7 +222,7 @@ pub const Pool = struct {
                     return .{ .pool = self, .slot = slot, .bytes = bytes };
                 };
             }
-            self.waitLocked(io);
+            try self.waitLockedWithAdmission(io, control);
         }
     }
 
@@ -207,8 +230,12 @@ pub const Pool = struct {
     /// Called without the writer mutex. Flight exhaustion waits for a bounded
     /// record instead of allocating an unbounded coordination structure.
     pub fn begin(self: *Pool, backing: std.mem.Allocator, io: ?std.Io, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool) !Ticket {
+        return self.beginWithAdmission(backing, io, path, run_id, offset, len, admit, null);
+    }
+
+    pub fn beginWithAdmission(self: *Pool, backing: std.mem.Allocator, io: ?std.Io, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool, control: ?read_admission.Port) !Ticket {
         while (true) {
-            platform.sync.lockYielding(&self.mutex);
+            try self.lockWithAdmission(control);
             for (&self.flights) |*flight| {
                 if (flight.refs != 0 and flight.run_id == run_id and flight.offset == offset and flight.len == len and flight.admit == admit and std.mem.eql(u8, flight.path, path)) {
                     flight.refs += 1;
@@ -227,11 +254,15 @@ pub const Pool = struct {
                 self.mutex.unlock();
                 return .{ .flight = flight, .leader = true };
             };
-            self.waitLocked(io);
+            try self.waitLockedWithAdmission(io, control);
         }
     }
     pub fn join(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool) ?*Flight {
-        platform.sync.lockYielding(&self.mutex);
+        return self.joinWithAdmission(path, run_id, offset, len, admit, null) catch unreachable;
+    }
+
+    pub fn joinWithAdmission(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool, control: ?read_admission.Port) !?*Flight {
+        try self.lockWithAdmission(control);
         defer self.mutex.unlock();
         for (&self.flights) |*flight| {
             if (flight.refs != 0 and flight.run_id == run_id and flight.offset == offset and flight.len == len and flight.admit == admit and std.mem.eql(u8, flight.path, path)) {
@@ -249,6 +280,22 @@ pub const Pool = struct {
         if (flight.io) |io| flight.done.set(io);
         self.mutex.unlock();
     }
+    pub fn waitWithAdmission(self: *Pool, flight: *Flight, control: ?read_admission.Port) !*SharedBytes {
+        const budget = control orelse return self.wait(flight);
+        while (true) {
+            try self.lockWithAdmission(budget);
+            if (flight.completed) {
+                defer self.mutex.unlock();
+                if (flight.failure) |err| return err;
+                // The caller's flight reference keeps the result alive. No
+                // admission borrow escapes with the returned payload.
+                return flight.result.?.retain();
+            }
+            self.mutex.unlock();
+            try budget.waitForProgress();
+        }
+    }
+
     pub fn wait(self: *Pool, flight: *Flight) !*SharedBytes {
         if (flight.io) |io| flight.done.waitUncancelable(io) else {
             while (true) {
@@ -400,6 +447,71 @@ test "lsm local waiter keeps stack alive until notifier unlocks with and without
         worker.returned.waitUncancelable(std.testing.io);
         try std.testing.expect(!returned_early);
     }
+}
+
+test "lsm local decoder admission cancellation preserves producer and healthy follower" {
+    var pool: Pool = .{};
+    defer pool.deinit();
+    const leader = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
+    defer pool.releaseFlight(leader.flight);
+    const follower = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
+    var follower_held = true;
+    defer if (follower_held) pool.releaseFlight(follower.flight);
+    const healthy = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
+    defer pool.releaseFlight(healthy.flight);
+    const Budget = struct {
+        waits: usize = 0,
+        canceled: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.canceled) return error.Canceled;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.canceled = true;
+        }
+    };
+    var budget = Budget{};
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    try std.testing.expectError(error.Canceled, pool.waitWithAdmission(follower.flight, .init(&payload)));
+    pool.releaseFlight(follower.flight);
+    follower_held = false;
+    try std.testing.expectEqual(@as(usize, 2), leader.flight.refs);
+    try std.testing.expect(!leader.flight.completed);
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+    const result = try SharedBytes.create(std.testing.allocator, try std.testing.allocator.dupe(u8, "decoded"));
+    defer result.release();
+    pool.finish(leader.flight, result);
+    const retained = try pool.wait(healthy.flight);
+    defer retained.release();
+    try std.testing.expectEqualStrings("decoded", retained.bytes);
+}
+
+test "lsm local decoder admission progress releases workspace before retry" {
+    var pool: Pool = .{};
+    defer pool.deinit();
+    var held = pool.acquire(std.testing.allocator, null, null, 128, 64, 0);
+    var held_live = true;
+    defer if (held_live) held.release();
+    const Budget = struct {
+        held: *Pool.Workspace,
+        held_live: *bool,
+        waits: usize = 0,
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.held.release();
+            self.held_live.* = false;
+        }
+    };
+    var budget = Budget{ .held = &held, .held_live = &held_live };
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    var admitted = try pool.acquireWithAdmission(std.testing.allocator, null, null, 64, 64, 0, .init(&payload));
+    defer admitted.release();
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+    try std.testing.expectEqual(@as(usize, 1), pool.active);
+    try std.testing.expect(pool.waiters == null);
 }
 
 test "lsm local decoder frees oversized scratch when reset allocation fails" {

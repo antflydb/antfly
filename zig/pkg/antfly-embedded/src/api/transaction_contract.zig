@@ -20,6 +20,7 @@ pub const TableCommitRequest = contract.TableCommitRequest;
 pub const CommitConflict = contract.CommitConflict;
 pub const CommitOutcome = contract.CommitOutcome;
 pub const PreDecisionContext = contract.PreDecisionContext;
+pub const CommitControl = contract.CommitControl;
 pub fn participantIdForGroup(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) ![]u8 {
     if (table_name.len > std.math.maxInt(u32)) return error.TableNameTooLong;
     return try std.fmt.allocPrint(alloc, "{s}{x:0>8}:{s}:{d}", .{ table_participant_v2_prefix, table_name.len, table_name, group_id });

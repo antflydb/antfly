@@ -51,21 +51,37 @@ pub const Listener = struct {
     alloc: std.mem.Allocator,
     adapter: Adapter,
     server: @import("../pgwire/server.zig").Server,
+    transport_io: std.Io.Threaded,
 
     pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
-        const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
-        const self = try api.owner_alloc.create(Listener);
-        errdefer api.owner_alloc.destroy(self);
-        self.alloc = api.owner_alloc;
+        _ = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
+        // Raw protocol/frame/runtime allocations must remain possible after
+        // foreground node memory is full, before a control can be classified.
+        // Prepared execution state still follows the adapter's API owners.
+        const transport_alloc = if (api.transport_memory) |memory| memory.allocator() else api.state_alloc;
+        const self = try transport_alloc.create(Listener);
+        errdefer transport_alloc.destroy(self);
+        self.alloc = transport_alloc;
         self.adapter = .{ .server = api };
+        // Long-lived idle sessions must not consume the shared outbound lane.
+        // One session task per connection plus accept, deadline and cancel slots.
+        self.transport_io = @import("../pgwire/server.zig").initTransport(self.alloc, config.max_connections);
+        errdefer self.transport_io.deinit();
+        const io = self.transport_io.io();
         self.server = try @import("../pgwire/server.zig").start(self.alloc, .{
             .io = io,
             .backend = self.adapter.backend(),
             .bind_host = config.bind_host orelse "127.0.0.1",
             .bind_port = config.bind_port,
             .max_connections = config.max_connections,
+            .max_session_bytes = config.max_session_bytes,
+            .max_retained_bytes = config.max_retained_bytes,
+            .protected_frame_allocator = if (api.parser_memory) |memory| memory.allocator() else null,
+            .control_allocator = api.controlAllocator(),
+            .is_protected_control = @import("sql_control.zig").classify,
+            .limits = .{ .retained_bytes = config.retained_bytes_per_connection, .idle_transaction_timeout_ms = config.idle_transaction_timeout_ms },
             .allow_insecure_non_loopback = config.externally_protected_transport,
         });
         return self;
@@ -73,6 +89,7 @@ pub const Listener = struct {
 
     pub fn deinit(self: *Listener) void {
         self.server.deinit();
+        self.transport_io.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -219,6 +236,9 @@ pub const Adapter = struct {
     }
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
+        // Protocol probes streams before execute, including for COMMIT. A
+        // control must reach its protected execution path without fresh slots.
+        if (@import("sql_control.zig").classify(request.statement)) return null;
         const self: *Adapter = @ptrCast(@alignCast(raw));
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
@@ -259,7 +279,13 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const id = @import("distributed_txn.zig").parseTxnIdHex(session_id orelse return) catch return;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
-        const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return;
+        var io = self.server.sqlControlIo() catch {
+            // Cleanup is local owner release, never durable mutation replay.
+            // Scheduling exhaustion must not silently abandon an idle session.
+            const access = self.server.txn_sessions.principalAccess(self.server.alloc, id, credential.sessionPrincipal()) catch return;
+            if (access == .allowed) _ = self.server.txn_sessions.removeBeforeExecution(self.server.alloc, id);
+            return;
+        };
         const network_io = self.server.sharedApiNetworkIo() orelse return;
         const Cleanup = struct {
             server: *http.ApiHttpServer,
@@ -278,7 +304,10 @@ pub const Adapter = struct {
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io };
-        var future = io.concurrent(Cleanup.run, .{&job}) catch return;
+        var future = io.concurrent(Cleanup.run, .{&job}) catch {
+            Cleanup.run(&job);
+            return;
+        };
         job.done.waitUncancelable(network_io);
         @import("protected_future.zig").wait(io, &future);
     }
@@ -286,16 +315,27 @@ pub const Adapter = struct {
     fn dispatch(self: *Adapter, job: *Job) !void {
         try validateRequest(job.request);
         if (self.server.cfg.user_manager != job.credential.manager) return error.Unauthorized;
-        const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
+        const protected = @import("sql_control.zig").classify(job.request.statement);
+        var io = if (protected) try self.server.sqlControlIo() else try self.server.sqlExecutionIo();
         var future = io.concurrent(Job.run, .{job}) catch return error.SqlWriteCapacityUnavailable;
         // Keep borrowed request storage alive through a durable decision. The
         // listener sets cancellation/deadline on shutdown, native checkpoints
         // observe it, and this adapter joins rather than abandoning the job.
         job.done.waitUncancelable(job.request.io);
         @import("protected_future.zig").wait(io, &future);
-        if (job.failure) |err| return err;
+        if (job.failure) |err| return wireFailure(job.request, err);
     }
 };
+
+// Admission's external cancellation retires the waiter with Canceled. That
+// must become a statement error, not the protocol's transport shutdown signal.
+fn wireFailure(request: wire.Request, failure: anyerror) anyerror {
+    if (failure == error.Canceled and request.cancel_requested.load(.acquire)) {
+        request.io.checkCancel() catch return error.Canceled;
+        return error.QueryCanceled;
+    }
+    return failure;
+}
 
 const Pull = @import("antfly_local_sources").sql_read_stream;
 
@@ -306,6 +346,27 @@ fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfl
         if (entry.value == .string) out.value = .{ .string = try alloc.dupe(u8, entry.value.string) };
     }
     return result;
+}
+
+fn requestDeadlineNs(request: wire.Request) ?u64 {
+    if (request.deadline.raw.nanoseconds == std.math.maxInt(i96)) return null;
+    // A finite timestamp outside the native clock range remains a finite
+    // ceiling. It must neither trap nor become an absent deadline.
+    return std.math.cast(u64, @max(@as(i96, 0), request.deadline.raw.nanoseconds)) orelse std.math.maxInt(u64);
+}
+
+fn admissionOptions(request: wire.Request) @import("antfly_local_sources").common_bounded_admission.Options {
+    return .{
+        .io = request.io,
+        .deadline_ns = requestDeadlineNs(request),
+        .cancellation = .{ .ptr = request.cancel_requested, .requested = struct {
+            fn call(raw: *const anyopaque) bool {
+                const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                return signal.load(.acquire);
+            }
+        }.call },
+        .retained_bytes = @as(u64, request.statement.len) +| @import("antfly_local_sources").common_bounded_admission.parameterBytes(request.parameters) +| 1024,
+    };
 }
 
 test "pgwire native array page delivery preserves dimensions NULLs and exact integers" {
@@ -337,12 +398,14 @@ test "pgwire native array page delivery preserves dimensions NULLs and exact int
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
+    retained_lease: wire.RetainedLifetime.Lease,
     alloc: std.mem.Allocator,
     adapter: *Adapter,
     arena: std.heap.ArenaAllocator,
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    runnable: http.RunnableScheduler.Execution,
     decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -353,27 +416,59 @@ const OwnedRead = struct {
     stream: *Pull.Stream,
     columns: []const wire.Column,
     policies: []const Policy,
-    detached: bool = false,
+    lifetime: @import("runnable_read_lifetime.zig").Lifetime,
+    cleanup: ?@import("runnable_cleanup_owner.zig").Registry.Reservation = null,
+    cleanup_started: bool = false,
+    physical_retired: bool = false,
     const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
         var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
+        var preparation_runnable: http.RunnableScheduler.Execution = .{};
+        defer preparation_runnable.finish();
+        try server.startSqlRunnable(&preparation_runnable, admissionOptions(request), .query);
         var diagnostic: compiler.Diagnostic = .{};
         var plan = try server.sqlPlanCache().acquire(server.sqlPlanCacheIo(), .{ .statement = request.statement, .principal = credential.principal, .database = request.database orelse "default", .namespace = request.namespace orelse "public" }, &diagnostic);
         var moved = false;
-        defer if (!moved) plan.release(server.sqlPlanCacheIo());
+        var plan_in_setup = false;
+        defer if (!moved and !plan_in_setup) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select) return null;
-        var admission = try server.acquireSqlExecution(false);
+        preparation_runnable.finish();
+        preparation.release();
+        var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(request));
         defer if (!moved) admission.release();
+        var retained_lease = if (request.retained_lifetime) |lifetime| lifetime.retain() else wire.RetainedLifetime.Lease{};
+        defer retained_lease.release();
         const self = try alloc.create(OwnedRead);
         errdefer alloc.destroy(self);
         self.alloc = alloc;
+        self.runnable = .{};
+        // Later setup guards retire readers, fences and allocations first.
+        // This guard then retires the plan before returning execution capacity.
+        errdefer {
+            plan.release(server.sqlPlanCacheIo());
+            self.runnable.finish();
+        }
+        plan_in_setup = true;
+        // Install the stable request before retaining its cancellation/I/O
+        // borrows in an execution entry. Setup allocations then run admitted.
+        self.identity = null;
+        self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
+        try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
+        // A retained cursor must not borrow connection-owned credential memory.
+        // Its copy uses the API allocator and still observes live revocation.
+        const owned_credential = try credential.cloneOwned(server.alloc);
+        errdefer Credential.release(owned_credential, server.alloc);
+        self.authority.credential = owned_credential;
         self.session_id = null;
         self.staged = .{};
         self.range_guards = .{};
-        self.detached = false;
+        self.lifetime = .{ .context = self, .retire = retirePhysical, .destroy = destroy };
+        self.cleanup = null;
+        self.cleanup_started = false;
+        self.physical_retired = false;
         self.adapter = adapter;
         self.arena = std.heap.ArenaAllocator.init(alloc);
         errdefer self.arena.deinit();
@@ -384,11 +479,10 @@ const OwnedRead = struct {
         errdefer if (self.session_id) |id| server.alloc.free(id);
         // Native catalog resolution extends this identity with aliases using
         // server.alloc; every allocation in the mutable identity must share it.
-        self.identity = try credential.identity(server.alloc);
+        self.identity = try owned_credential.identity(server.alloc);
         errdefer self.identity.?.deinit(server.alloc);
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
-        self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
         self.authority.request.statement = try arena.dupe(u8, request.statement);
         self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
@@ -396,7 +490,21 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .lake_visibility = @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .lake_visibility = @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        if (self.native_adapter.runnable != null) {
+            // Async closure borrows the connection's allocator and listener
+            // adapter. A production session supplies the lifetime fence that
+            // holds both through physical cleanup and joined task metadata.
+            if (request.retained_lifetime == null) return error.SqlWriteCapacityUnavailable;
+            const owner = try server.sqlCleanupOwner();
+            const cleanup_io = try server.sqlCleanupIo();
+            const cleanup_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&cleanup_io);
+            const borrow = self.native_adapter.providerRunnable() orelse return error.ExecutionWaitUnsupported;
+            self.cleanup = try owner.registry.reserve(cleanup_io, borrow, &.{ .io = &cleanup_borrow, .activation_budget = 1, .deadline_ns = 30 * std.time.ns_per_s }, self, cleanupCallbacks);
+        }
+        errdefer if (self.cleanup) |*reserved| reserved.abort() catch unreachable;
+        if (self.native_adapter.runnable != null) try self.native_adapter.beginReadFence();
+        errdefer self.native_adapter.endReadFence();
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -416,7 +524,7 @@ const OwnedRead = struct {
         }
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .cleanup = &self.runnable };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
@@ -425,11 +533,25 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
-            self.identity.?.deinit(server.alloc);
-            self.arena.deinit();
+            if (transaction_lease) |lease| {
+                lease.release();
+                transaction_lease = null;
+            }
+            if (self.cleanup) |*reserved| reserved.abort() catch unreachable;
+            self.cleanup = null;
+            self.native_adapter.endReadFence();
             self.staged.deinit(alloc);
             self.range_guards.deinit(server.alloc);
+            self.identity.?.deinit(server.alloc);
             if (self.session_id) |id| server.alloc.free(id);
+            self.arena.deinit();
+            Credential.release(owned_credential, server.alloc);
+            // No stream was published. Retire setup ownership before returning
+            // its execution capacity, including the temporary plan lease.
+            plan.release(server.sqlPlanCacheIo());
+            self.runnable.finish();
+            admission.release();
+            moved = true;
             alloc.destroy(self);
             return null;
         }
@@ -460,12 +582,20 @@ const OwnedRead = struct {
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
+        try self.runnable.park(.output_blocked);
+        if (self.cleanup) |*reserved| reserved.publish() catch unreachable;
+        self.retained_lease = retained_lease;
+        retained_lease = .{};
+        // This borrowed acquisition handle must not outlive open().
+        self.authority.request.retained_lifetime = null;
         moved = true;
         return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
     }
 
     pub fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        self.lifetime.retain();
+        defer self.lifetime.release();
         var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .validate_only = true };
         try job.dispatch();
     }
@@ -473,7 +603,7 @@ const OwnedRead = struct {
     fn validateCursor(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
         try request.check();
         try self.authority.credential.validate();
-        var admission: ?http.RequestAdmission.Lease = if (self.detached) try self.adapter.server.acquireSqlExecution(false) else null;
+        var admission: ?http.RequestAdmission.Lease = if (self.lifetime.detached.load(.acquire) and !request.completion_drain) try self.adapter.server.acquireSqlExecutionWithOptions(false, admissionOptions(request)) else null;
         defer if (admission) |*lease| lease.release();
         const original = self.authority.request;
         if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
@@ -496,13 +626,20 @@ const OwnedRead = struct {
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        // StreamJob dispatch physically joins the foreground child before this
+        // borrow releases, including on failure or concurrent logical detach.
+        try self.lifetime.retainResource();
+        defer self.lifetime.releaseResource();
         var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .limit = limit };
         try job.dispatch();
         return job.page.?;
     }
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
-        if (self.detached) return error.InvalidSqlBackendResponse;
+        const state_alloc = if (request.completion_drain) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
+        if (self.lifetime.detached.load(.acquire)) return error.InvalidSqlBackendResponse;
+        try self.runnable.enter(if (request.completion_drain) .control else .query);
+        defer self.runnable.park(.output_blocked) catch {};
         try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
         // later Execute messages carry a newer per-request deadline.
@@ -510,18 +647,21 @@ const OwnedRead = struct {
         try self.authority.credential.validate();
         if (self.session_id) |id_hex| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
-            var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(self.adapter.server.alloc);
+            if (try self.adapter.server.txn_sessions.principalAccess(state_alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
+            var state = (try self.adapter.server.txn_sessions.getSqlState(state_alloc, id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(state_alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
         }
-        var fresh = try self.authority.credential.identity(alloc);
-        defer fresh.deinit(alloc);
-        try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
+        try self.validateCurrentPolicies(alloc);
         var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
+        // Buffered column pages can wait on spill or catalog work too.
+        try request.check();
+        try self.validateCurrentPolicies(alloc);
         const owner = try alloc.create(PageOwner);
-        owner.* = .{ .alloc = alloc, .page = page };
+        errdefer alloc.destroy(owner);
+        try self.lifetime.retainResource();
+        owner.* = .{ .alloc = alloc, .page = page, .read = self };
         return .{ .exhausted = page.exhausted, .result = .{
             .columns = self.columns,
             .cells = .{ .context = owner, .count = page.values.len(), .width = self.columns.len, .read = PageOwner.cell },
@@ -530,7 +670,18 @@ const OwnedRead = struct {
         } };
     }
 
+    fn validateCurrentPolicies(self: *OwnedRead, alloc: std.mem.Allocator) !void {
+        try self.authority.request.check();
+        try self.native_adapter.validateReadFence(true);
+        var fresh = try self.authority.credential.identity(alloc);
+        defer fresh.deinit(alloc);
+        try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
+    }
+
     fn validatePolicies(alloc: std.mem.Allocator, fresh: *http.AuthenticatedIdentity, admitted: http.AuthenticatedIdentity, policies: []const Policy) !void {
+        if (admitted.user_instance_id) |instance| {
+            if (fresh.user_instance_id == null or !std.mem.eql(u8, &instance, &fresh.user_instance_id.?)) return error.Forbidden;
+        }
         // The catalog resolves logical resources to private physical names.
         // Reapply only the pinned aliases to fresh authority, never its old
         // permissions or filters. Buffered operator rows need this check too:
@@ -547,13 +698,16 @@ const OwnedRead = struct {
 
     fn releasePage(raw: *anyopaque) void {
         const owner: *PageOwner = @ptrCast(@alignCast(raw));
+        const read = owner.read;
         owner.page.deinit();
         owner.alloc.destroy(owner);
+        read.lifetime.releaseResource();
     }
 
     const PageOwner = struct {
         alloc: std.mem.Allocator,
         page: Pull.BatchPage,
+        read: *OwnedRead,
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const value = try self.page.values.cell(alloc, row, column);
@@ -575,22 +729,79 @@ const OwnedRead = struct {
 
     fn detach(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
-        if (self.detached) return;
-        self.detached = true;
-        self.stream.close();
-        self.plan.release(self.adapter.server.sqlPlanCacheIo());
+        self.lifetime.detach();
+    }
+
+    const cleanupCallbacks: @import("runnable_cleanup_owner.zig").Registry.Callbacks = .{
+        .retain = retainCleanup,
+        .release = releaseCleanup,
+        .cleanup = cleanupNative,
+        .retire = retireCleanup,
+    };
+
+    fn retainCleanup(raw: *anyopaque) anyerror!void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        self.lifetime.retain();
+    }
+    fn releaseCleanup(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        if (self.cleanup_started) {
+            std.debug.assert(self.physical_retired);
+            // Registry releases only after its future joins and its task/slot
+            // metadata physically frees. Keep the execution root through it.
+            self.runnable.finish();
+            self.admission.release();
+        }
+        self.lifetime.release();
+    }
+    fn cleanupNative(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) anyerror!void {
+        retireNative(raw);
+    }
+    fn retireCleanup(raw: *anyopaque) anyerror!void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        // Successful cleanup is already physically retired. Failure remains
+        // owned until an explicit reaper retirement request invokes this path.
+        if (!self.physical_retired) retireNative(raw);
+    }
+    fn retirePhysical(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        if (self.cleanup) |*reserved| {
+            self.cleanup_started = true;
+            reserved.start() catch unreachable;
+            reserved.transfer() catch unreachable;
+            return;
+        }
+        retireNative(raw);
+        self.runnable.finish();
         self.admission.release();
+    }
+    fn retireNative(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        std.debug.assert(!self.physical_retired);
+        self.stream.close();
+        self.native_adapter.endReadFence();
+        self.plan.release(self.adapter.server.sqlPlanCacheIo());
+        // Retire invocation-owned buffers before releasing its retained root.
+        // Portal identity/arena storage has a separate retained lifetime.
         self.staged.deinit(self.alloc);
         self.range_guards.deinit(self.adapter.server.alloc);
+        self.physical_retired = true;
     }
 
     fn close(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
-        detach(raw);
+        self.lifetime.close();
+    }
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
         self.identity.?.deinit(self.adapter.server.alloc);
         if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
+        Credential.release(self.authority.credential, self.adapter.server.alloc);
+        var retained_lease = self.retained_lease;
         self.alloc.destroy(self);
+        retained_lease.release();
     }
 };
 
@@ -611,11 +822,11 @@ const StreamJob = struct {
     fn dispatch(self: *StreamJob) !void {
         try validateRequest(self.request);
         if (self.adapter.server.cfg.user_manager != self.credential.manager) return error.Unauthorized;
-        const io = http.ApiHttpServer.configuredDurableIo(self.adapter.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
+        const io = if (self.owner != null and self.request.completion_drain) try self.adapter.server.sqlControlIo() else try self.adapter.server.sqlExecutionIo();
         var future = io.concurrent(run, .{self}) catch return error.SqlWriteCapacityUnavailable;
         self.done.waitUncancelable(self.request.io);
         @import("protected_future.zig").wait(io, &future);
-        if (self.failure) |err| return err;
+        if (self.failure) |err| return wireFailure(self.request, err);
     }
     fn run(self: *StreamJob) void {
         defer self.done.set(self.request.io);
@@ -629,6 +840,8 @@ const StreamJob = struct {
         };
     }
     fn runInner(self: *StreamJob) !void {
+        var control = if (self.owner != null and self.request.completion_drain) try self.adapter.server.acquireSqlControl() else @as(?http.RequestAdmission.Lease, null);
+        defer if (control) |*lease| lease.release();
         if (self.namespace_only) {
             const server = self.adapter.server;
             const domain = @import("antfly_local_sources").system_catalog_domain;
@@ -641,11 +854,11 @@ const StreamJob = struct {
             const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(self.alloc, .{ .kind = .namespace, .database = database, .name = namespace });
             defer self.alloc.free(resource);
             if (!http.permissionsAllow(identity.?.permissions, .namespace, resource, .read)) return error.Forbidden;
-            var admission = try server.acquireSqlExecution(false);
+            var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(self.request));
             defer admission.release();
             var authority: Authority = .{ .credential = self.credential, .identity = &identity, .request = self.request };
-            const call = server.source.vtable.system_catalog orelse return error.UnsupportedSqlExecution;
-            const response = try call(server.source.ptr, self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
+            if (server.source.vtable.system_catalog == null) return error.UnsupportedSqlExecution;
+            const response = try server.source.systemCatalog(self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
             self.alloc.free(response);
             return;
         }
@@ -687,6 +900,24 @@ const Credential = struct {
         return self;
     }
 
+    /// Own the authenticated capsule without retaining a connection allocator,
+    /// password or verifier hash. UserManager remains service-owned and must
+    /// outlive every capsule; validate/identity continue to read live authority.
+    fn cloneOwned(self: *const Credential, alloc: std.mem.Allocator) !*Credential {
+        try self.validate();
+        const copy = try alloc.create(Credential);
+        errdefer alloc.destroy(copy);
+        const name = try alloc.dupe(u8, self.username);
+        errdefer alloc.free(name);
+        const principal = try alloc.dupe(u8, self.principal);
+        errdefer alloc.free(principal);
+        copy.* = .{ .manager = self.manager, .username = name, .principal = principal, .verifier_mac = self.verifier_mac };
+        errdefer std.crypto.secureZero(u8, &copy.verifier_mac);
+        // Rotation during allocation must not publish a stale credential.
+        try copy.validate();
+        return copy;
+    }
+
     pub fn validate(self: *const Credential) !void {
         const current = self.manager.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
@@ -702,32 +933,18 @@ const Credential = struct {
 
     fn identity(self: *Credential, alloc: std.mem.Allocator) !http.AuthenticatedIdentity {
         try self.validate();
-        var lease = try self.manager.acquireSnapshotLease();
-        // Copy credentials and policies under one lease without recursively
-        // acquiring the user-manager mutex or retaining a login-time grant.
-        const result = blk: {
-            defer lease.release();
-            var user = try lease.getUser(self.username);
-            defer user.deinit(self.manager.alloc);
-            const permissions = try self.manager.getPermissionsForUser(self.username);
-            defer http.freePermissions(self.manager.alloc, permissions);
-            const filters = try self.manager.getRowFilters(self.username);
-            defer http.freeRowFilters(self.manager.alloc, filters);
-            const roles = try self.manager.getRolesForUser(self.username);
-            defer {
-                for (roles) |role| self.manager.alloc.free(role);
-                self.manager.alloc.free(roles);
-            }
-            break :blk (try http.cloneCatalogIdentity(alloc, .{
-                .username = user.username,
-                .credential_principal = self.principal,
-                .permissions = permissions,
-                .row_filter = filters,
-                .metadata_json = user.metadata_json,
-                .roles = roles,
-                .live_user_manager = self.manager,
-            })).?;
-        };
+        var snapshot = try self.manager.snapshotCredentialPolicies(self.principal);
+        defer snapshot.deinit(self.manager.alloc);
+        const result = (try http.cloneCatalogIdentity(alloc, .{
+            .user_instance_id = snapshot.instance_id,
+            .username = snapshot.policy.username,
+            .credential_principal = self.principal,
+            .permissions = snapshot.policy.permissions,
+            .row_filter = snapshot.policy.row_filter,
+            .metadata_json = snapshot.policy.metadata_json,
+            .roles = snapshot.policy.roles,
+            .live_user_manager = self.manager,
+        })).?;
         var owned = result;
         errdefer owned.deinit(alloc);
         try self.validate();
@@ -779,14 +996,19 @@ const Job = struct {
 
     fn runInner(self: *Job) !void {
         try validateRequest(self.request);
-        var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+        const protected = @import("sql_control.zig").classify(self.request.statement);
+        const preparation_owner = if (protected) &self.adapter.server.sql_control_preparation else &self.adapter.server.sql_preparation_admission;
+        var preparation = preparation_owner.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
-        var lease = self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{
+        var preparation_runnable: http.RunnableScheduler.Execution = .{};
+        defer preparation_runnable.finish();
+        try self.adapter.server.startSqlRunnable(&preparation_runnable, admissionOptions(self.request), if (protected) .control else .query);
+        var lease = @import("sql_control.zig").Plan.acquire(self.alloc, self.adapter.server.sqlPlanCache(), self.adapter.server.sqlPlanCacheIo(), .{
             .statement = self.request.statement,
             .principal = self.credential.principal,
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
-        }, &self.compile_diagnostic) catch |err| {
+        }, &self.compile_diagnostic, protected) catch |err| {
             self.compile_diagnostic_valid = err != error.SqlPlanCacheBusy and err != error.InvalidSqlPlanCacheConfig;
             return err;
         };
@@ -797,14 +1019,33 @@ const Job = struct {
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
-        var admission = try server.acquireSqlExecution(write);
-        defer admission.release();
+        preparation_runnable.finish();
         preparation.release();
-        var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
-        defer identity.?.deinit(server.alloc);
+        var admission = if (protected) try server.acquireSqlControl() else try server.acquireSqlExecutionWithOptions(write, admissionOptions(self.request));
+        defer admission.release();
+        var runnable: http.RunnableScheduler.Execution = .{};
+        defer runnable.finish();
+        // Writes retain this grant through durable completion. Do not expose
+        // the read suspension hooks to an accepted ordinary write.
+        try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else if (write) .write else .query);
+        const identity_alloc = if (protected) server.controlAllocator() else server.alloc;
+        var identity: ?http.AuthenticatedIdentity = try self.credential.identity(identity_alloc);
+        defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
+        // Stable local completion receivers outlive the root's deferred finish.
+        var write_completion: ?@import("runnable_write_team.zig").Completion = null;
+        if (write) {
+            if (runnable.entry) |entry| {
+                const memory = server.request_memory orelse return error.ExecutionWaitUnsupported;
+                write_completion = try @import("runnable_write_team.zig").Completion.init(&runnable, memory.allocator(entry.class == .control));
+            }
+        }
         var native_adapter = execution.Adapter{
+            .runnable = if ((!write or protected) and runnable.entry != null) &runnable else null,
+            .write_execution = if (write and runnable.entry != null) &runnable else null,
+            .write_completion = if (write_completion) |*bridge| bridge else null,
+            .serial_execution = runnable.entry != null,
             .server = server,
             .identity = &identity,
             .context = context,
@@ -947,13 +1188,20 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
         .cancel_requested = &canceled,
     };
     for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
-        api.cfg.imported_runtime_io.?.durable = executor;
+        api.cfg.imported_runtime_io.?.durable = raw_io;
+        api.cfg.imported_runtime_io.?.sql_execution = executor;
+        api.cfg.imported_runtime_io.?.sql_control = executor;
         var job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request, .kind = .execute };
         try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&job));
         var stream: StreamJob = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request };
         try std.testing.expectError(error.SqlWriteCapacityUnavailable, stream.dispatch());
         try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
-        try std.testing.expectEqual(i * 2, imported_probe.attempts);
+        var control_request = request;
+        control_request.statement = "ROLLBACK";
+        var control_job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = control_request, .kind = .execute };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&control_job));
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i * 3, imported_probe.attempts);
     }
 }
 
@@ -1045,25 +1293,14 @@ const Authority = struct {
     fn context(self: *Authority) !operation.RequestContext {
         try self.checkpoint();
         try self.credential.validate();
-        // Normalize once at ingress before catalog/storage owner boundaries,
-        // which carry native absolute deadlines rather than an Io clock borrow.
-        // Unrepresentable positive deadlines are effectively unbounded; check()
-        // above still rejects expired requests and explicit cancellation.
-        const deadline = std.math.cast(u64, self.request.deadline.raw.nanoseconds);
-        const native_context: operation.RequestContext = .{
-            .deadline_ns = deadline,
-            .deadline_io = if (deadline != null) io_abi.Borrow.init(&self.request.io) else null,
-            .fanout_io = io_abi.Borrow.init(&self.request.io),
-            .cancellation = operation.CancellationToken.fromAtomic(self.request.cancel_requested),
-            .principal = .{ .kind = .user, .subject = self.identity.*.?.username },
-            .destination_authorization_principal = self.credential.principal,
-            // The authenticated, credential-fenced identity is borrowed for
-            // this statement only; owner write proofs are minted before the
-            // durable transaction plan is sealed.
-            .row_policy_credential = self.identity,
-            .table_write_authorization = .{ .ptr = self, .allows = allowsWrite },
-        };
-        return native_context.platformDeadline();
+        var result = try nativeRequestContext(&self.request);
+        result.principal = .{ .kind = .user, .subject = self.identity.*.?.username };
+        result.destination_authorization_principal = self.credential.principal;
+        // The identity is borrowed only for this statement. Owner write proofs
+        // are minted before a durable transaction plan is sealed.
+        result.row_policy_credential = self.identity;
+        result.table_write_authorization = .{ .ptr = self, .allows = allowsWrite };
+        return result;
     }
 
     fn allowsWrite(raw: *const anyopaque, table: []const u8) bool {
@@ -1078,6 +1315,7 @@ const GuardedCatalog = struct {
     authority: *Authority,
     revision: *const ?u64,
     expected_guard: ?[]const u8,
+    cleanup: ?*http.RunnableScheduler.Execution = null,
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
@@ -1099,8 +1337,19 @@ const GuardedCatalog = struct {
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        if (self.cleanup) |execution_owner| if (execution_owner.entry) |entry| if (entry.cleanup_active) {
+            // Logical detach fenced foreground readers before activation.
+            // Physical cleanup uses the authorized native deadline, including
+            // after request cancellation or credential revocation.
+            try self.native.vtable.checkpoint(self.native.ptr);
+            return;
+        };
         try self.authority.checkpoint();
         try self.native.vtable.checkpoint(self.native.ptr);
+        // A native checkpoint may relinquish execution and wait. Authority
+        // checked before that wait cannot authorize the resumed operation.
+        try self.authority.checkpoint();
+        try self.authority.credential.validate();
     }
     fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1432,17 +1681,68 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try std.testing.expectError(error.InvalidPassword, Credential.authenticate(alloc, &manager, "alice", "wrong"));
     const credential = try Credential.authenticate(alloc, &manager, "alice", "secret");
     defer Credential.release(credential, alloc);
+    const CloneAllocation = struct {
+        fn check(failing: std.mem.Allocator, original: *Credential) !void {
+            const copy = try original.cloneOwned(failing);
+            defer Credential.release(copy, failing);
+            try std.testing.expect(copy.username.ptr != original.username.ptr);
+            try std.testing.expect(copy.principal.ptr != original.principal.ptr);
+            try std.testing.expectEqualStrings(original.username, copy.username);
+            try std.testing.expectEqualStrings(original.principal, copy.principal);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, CloneAllocation.check, .{credential});
+    const retained_credential = retained: {
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        const connection_alloc = connection_arena.allocator();
+        const connection_credential = try credential.cloneOwned(connection_alloc);
+        defer Credential.release(connection_credential, connection_alloc);
+        break :retained try connection_credential.cloneOwned(alloc);
+    };
+    defer Credential.release(retained_credential, alloc);
+    // The connection credential and its allocator are gone; the retained
+    // capsule still owns its names and retains the original verifier fence.
+    try retained_credential.validate();
+    try std.testing.expectEqualStrings("alice", retained_credential.sessionPrincipal());
+    var retained_identity = try retained_credential.identity(alloc);
+    defer retained_identity.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, retained_identity.user_instance_id.?);
     var admitted = try credential.identity(alloc);
     defer admitted.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, admitted.user_instance_id.?);
     try std.testing.expect(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read));
     var projected = (try http.cloneCatalogIdentity(alloc, admitted)).?;
     defer projected.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, projected.user_instance_id.?);
     try http.projectCatalogIdentity(alloc, &projected, "docs", "private-table-17");
     const retained_policies = [_]OwnedRead.Policy{.{ .table = "private-table-17", .filter = null }};
     {
         var current = try credential.identity(alloc);
         defer current.deinit(alloc);
         try OwnedRead.validatePolicies(alloc, &current, projected, &retained_policies);
+        // A row-filter change during execution invalidates buffered rows even
+        // when table permission remains granted. Restoring it restores access.
+        try manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed\"}}");
+        var after_wait = try credential.identity(alloc);
+        defer after_wait.deinit(alloc);
+        try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &after_wait, projected, &retained_policies));
+        try manager.removeRowFilter("alice", "docs");
+        var restored = try credential.identity(alloc);
+        defer restored.deinit(alloc);
+        try OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies);
+        restored.user_instance_id = @splat(0);
+        try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies));
+        try manager.setRowFilter("alice", "*", "{\"term\":{\"tenant\":\"wildcard\"}}");
+        try manager.setRowFilter("alice", "docs", "null");
+        var override = try credential.identity(alloc);
+        defer override.deinit(alloc);
+        try std.testing.expect(http.effectiveRowFilterJson(override, "docs") == null);
+        try http.projectCatalogIdentity(alloc, &override, "docs", "private-table-17");
+        try std.testing.expect(http.effectiveRowFilterJson(override, "private-table-17") == null);
+        try OwnedRead.validatePolicies(alloc, &override, projected, &retained_policies);
+        try manager.removeRowFilter("alice", "*");
+        try manager.removeRowFilter("alice", "docs");
     }
     const NativeCursor = struct {
         pages: usize = 0,
@@ -1451,6 +1751,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         counts: usize = 0,
         splits: usize = 0,
         closes: usize = 0,
+        rotate_manager: ?*usermgr.UserManager = null,
         fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
             return cursor(ptr);
         }
@@ -1488,7 +1789,13 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.closes += 1;
         }
-        fn checkpoint(_: *anyopaque) !void {}
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.rotate_manager) |rotation_store| {
+                self.rotate_manager = null;
+                try rotation_store.updatePassword("alice", "rotated-during-checkpoint");
+            }
+        }
     };
     var native_cursor: NativeCursor = .{};
     var identity: ?http.AuthenticatedIdentity = admitted;
@@ -1605,11 +1912,19 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try manager.updatePassword("alice", "new-secret");
     try std.testing.expectError(error.Unauthorized, credential.validate());
     try std.testing.expectError(error.Unauthorized, credential.identity(alloc));
+    try std.testing.expectError(error.Unauthorized, retained_credential.validate());
+    try std.testing.expectError(error.Unauthorized, retained_credential.identity(alloc));
+    try std.testing.expectError(error.Unauthorized, retained_credential.cloneOwned(alloc));
     const replacement = try Credential.authenticate(alloc, &manager, "alice", "new-secret");
     defer Credential.release(replacement, alloc);
     var replacement_identity = try replacement.identity(alloc);
     defer replacement_identity.deinit(alloc);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
+    authority.credential = replacement;
+    native_cursor.rotate_manager = &manager;
+    try std.testing.expectError(error.Unauthorized, backend.vtable.checkpoint(backend.ptr));
+    try std.testing.expect(native_cursor.rotate_manager == null);
+    try std.testing.expectError(error.Unauthorized, replacement.validate());
 }
 
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {
@@ -1679,4 +1994,273 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
     try std.testing.expectError(error.InvalidSqlBackendResponse, datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" }));
+}
+
+test "SQL query waiting pgwire preserves deadline cancellation and typed parameters" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const request: wire.Request = .{
+        .statement = "select $1",
+        .parameters = &.{ .{ .string = "value" }, .{ .integer = 42 } },
+        .limit = 1,
+        .io = std.testing.io,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_s } },
+        .cancel_requested = &cancel,
+    };
+    const options = admissionOptions(request);
+    try std.testing.expectEqual(@as(u64, @intCast(request.deadline.raw.nanoseconds)), options.deadline_ns.?);
+    try std.testing.expect(options.retained_bytes >= request.statement.len + 5 + 2 * @sizeOf(std.json.Value));
+    try options.check();
+    cancel.store(true, .release);
+    try std.testing.expectError(error.Canceled, options.check());
+}
+
+/// Normalize once at pgwire ingress. Native metadata/storage owners consume
+/// platform monotonic deadlines; Io awake has a different epoch on macOS.
+fn nativeRequestContext(request: *const wire.Request) !operation.RequestContext {
+    try request.check();
+    const context: operation.RequestContext = .{
+        .deadline_ns = requestDeadlineNs(request.*),
+        .deadline_io = io_abi.Borrow.init(&request.io),
+        .fanout_io = io_abi.Borrow.init(&request.io),
+        .cancellation = operation.CancellationToken.fromAtomic(request.cancel_requested),
+    };
+    return context.platformDeadline();
+}
+
+test "workload deadline normalizes pgwire clock before native metadata handoff" {
+    var canceled = std.atomic.Value(bool).init(false);
+    var request: wire.Request = .{ .statement = "SELECT 1", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1)) }, .cancel_requested = &canceled };
+    const before = @import("antfly_platform").time.monotonicNs();
+    const context = try nativeRequestContext(&request);
+    const after = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expect(context.deadline_io == null);
+    try std.testing.expect(context.fanout_io != null);
+    try std.testing.expect(context.deadline_ns.? <= after + std.time.ns_per_s);
+    try std.testing.expect(context.deadline_ns.? >= before);
+    try context.ensureActive();
+    request.deadline.raw.nanoseconds = std.math.maxInt(i96);
+    const unlimited = try nativeRequestContext(&request);
+    try std.testing.expect(unlimited.deadline_ns == null);
+    try std.testing.expect(admissionOptions(request).deadline_ns == null);
+    request.deadline.raw.nanoseconds = @as(i96, std.math.maxInt(u64)) + 1;
+    const distant = try nativeRequestContext(&request);
+    try std.testing.expect(distant.deadline_ns != null);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), admissionOptions(request).deadline_ns);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, context.ensureActive());
+    try std.testing.expectError(error.QueryCanceled, nativeRequestContext(&request));
+}
+
+test "SQL pgwire retained lease releases after detached capsule physical cleanup" {
+    const Budget = @import("../pgwire/budget.zig").Budget;
+    const Fence = struct {
+        connection: *Budget,
+        service: *Budget,
+        references: usize = 0,
+        retired_before_release: bool = false,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired_before_release = self.connection.used.load(.acquire) == 0 and self.service.used.load(.acquire) == 0;
+            self.references -= 1;
+        }
+    };
+    var connection: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var service: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var fence: Fence = .{ .connection = &connection, .service = &service };
+    const alloc = connection.allocator();
+    const service_alloc = service.allocator();
+    var server: http.ApiHttpServer = undefined;
+    server.alloc = service_alloc;
+    var adapter: Adapter = .{ .server = &server };
+    const credential = try service_alloc.create(Credential);
+    credential.* = .{ .manager = undefined, .username = try service_alloc.dupe(u8, "alice"), .principal = try service_alloc.dupe(u8, "basic:alice"), .verifier_mac = @splat(0) };
+    const owner = try alloc.create(OwnedRead);
+    owner.* = undefined;
+    owner.alloc = alloc;
+    owner.adapter = &adapter;
+    owner.cleanup = null;
+    owner.cleanup_started = false;
+    owner.physical_retired = false;
+    owner.lifetime = .{ .context = owner, .retire = OwnedRead.retirePhysical, .destroy = OwnedRead.destroy, .detached = .init(true), .retirement_started = true };
+    owner.arena = std.heap.ArenaAllocator.init(alloc);
+    _ = try owner.arena.allocator().alloc(u8, 4096);
+    owner.session_id = try service_alloc.dupe(u8, "retained-session");
+    owner.identity = .{ .username = try service_alloc.dupe(u8, "alice"), .credential_principal = try service_alloc.dupe(u8, "basic:alice") };
+    owner.authority = .{ .credential = credential, .identity = &owner.identity, .request = undefined };
+    owner.retained_lease = (wire.RetainedLifetime{ .context = &fence, .retain_fn = Fence.retain, .release_fn = Fence.release }).retain();
+    try std.testing.expect(connection.used.load(.acquire) > 0 and service.used.load(.acquire) > 0);
+    OwnedRead.close(owner);
+    try std.testing.expect(fence.retired_before_release);
+    try std.testing.expectEqual(@as(usize, 0), fence.references);
+}
+
+test "SQL pgwire supervised cleanup retains native stream allocator root and parents through returned pages and task join" {
+    const Budget = @import("../pgwire/budget.zig").Budget;
+    const Fence = struct {
+        connection: *Budget,
+        service: *Budget,
+        references: std.atomic.Value(usize) = .init(0),
+        retired_before_release: std.atomic.Value(bool) = .init(false),
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired_before_release.store(self.connection.used.load(.acquire) == 0 and self.service.used.load(.acquire) == 0, .release);
+            _ = self.references.fetchSub(1, .release);
+        }
+    };
+    var cleanup_threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    defer cleanup_threads.deinit();
+    var reaper_threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer reaper_threads.deinit();
+    var cleanup_memory: @import("../common/allocation_budget.zig").Shared = .{ .child = std.heap.smp_allocator, .limit = 1 << 16 };
+    const cleanup_runtime = try @import("runnable_cleanup_owner.zig").Runtime.create(cleanup_memory.allocator(), reaper_threads.io(), 2);
+    defer cleanup_runtime.deinit();
+    var connection: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var service: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var fence: Fence = .{ .connection = &connection, .service = &service };
+    const alloc = connection.allocator();
+    const service_alloc = service.allocator();
+    var server: http.ApiHttpServer = undefined;
+    server.alloc = service_alloc;
+    server.cfg = .{};
+    server.sql_plan_cache = @import("../sql/plan_cache.zig").Cache.init(std.testing.allocator, .{});
+    const cache_io = server.sqlPlanCacheIo();
+    defer server.sql_plan_cache.deinit(cache_io);
+    var adapter: Adapter = .{ .server = &server };
+    var scheduling = try http.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduling.close();
+    var admission = http.RequestAdmission.init(1);
+    const credential = try service_alloc.create(Credential);
+    credential.* = .{ .manager = undefined, .username = try service_alloc.dupe(u8, "alice"), .principal = try service_alloc.dupe(u8, "basic:alice"), .verifier_mac = @splat(0) };
+    const owner = try alloc.create(OwnedRead);
+    owner.* = undefined;
+    owner.alloc = alloc;
+    owner.adapter = &adapter;
+    owner.cleanup = null;
+    owner.cleanup_started = false;
+    owner.physical_retired = false;
+    owner.lifetime = .{ .context = owner, .retire = OwnedRead.retirePhysical, .destroy = OwnedRead.destroy };
+    owner.arena = std.heap.ArenaAllocator.init(alloc);
+    _ = try owner.arena.allocator().alloc(u8, 1024);
+    owner.session_id = try service_alloc.dupe(u8, "retained-session");
+    owner.identity = .{ .username = try service_alloc.dupe(u8, "alice"), .credential_principal = try service_alloc.dupe(u8, "basic:alice") };
+    owner.authority = .{ .credential = credential, .identity = &owner.identity, .request = undefined };
+    owner.retained_lease = (wire.RetainedLifetime{ .context = &fence, .retain_fn = Fence.retain, .release_fn = Fence.release }).retain();
+    owner.runnable = .{};
+    try owner.runnable.start(&scheduling, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    owner.native_adapter = .{ .server = &server, .identity = &owner.identity, .context = .{}, .runnable = &owner.runnable };
+    owner.staged = .{};
+    owner.range_guards = .{};
+    owner.admission = admission.tryAcquireLease().?;
+    var diagnostic: compiler.Diagnostic = .{};
+    owner.plan = try server.sql_plan_cache.acquire(cache_io, .{ .statement = "SELECT 1" }, &diagnostic);
+    // Construct the native stream's real teardown surface. The page arenas
+    // below borrow this actual stream budget, exactly as next() pages do.
+    owner.stream = try alloc.create(Pull.Stream);
+    owner.stream.* = undefined;
+    owner.stream.budget = .{ .backing = alloc, .limit = 1 << 16 };
+    owner.stream.arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
+    _ = try owner.stream.arena.allocator().alloc(u8, 1024);
+    owner.stream.parallel = null;
+    owner.stream.pending_columns = null;
+    owner.stream.spool = null;
+    owner.stream.cursor = null;
+    owner.stream.after = null;
+    owner.stream.settings = null;
+    owner.stream.stream_manager = null;
+    var pages: [2]*OwnedRead.PageOwner = undefined;
+    for (&pages) |*page| {
+        page.* = try alloc.create(OwnedRead.PageOwner);
+        var arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
+        _ = try arena.allocator().alloc(u8, 4096);
+        try owner.lifetime.retainResource();
+        page.*.* = .{ .alloc = alloc, .read = owner, .page = .{ .arena = arena, .columns = &.{}, .values = .{ .rows = &.{} }, .exhausted = false } };
+    }
+    const cleanup_io = cleanup_threads.io();
+    const cleanup_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&cleanup_io);
+    owner.cleanup = try cleanup_runtime.registry.reserve(cleanup_io, owner.native_adapter.providerRunnable().?, &.{ .io = &cleanup_borrow, .activation_budget = 1, .deadline_ns = 30 * std.time.ns_per_s }, owner, OwnedRead.cleanupCallbacks);
+    try owner.cleanup.?.publish();
+    try owner.runnable.park(.output_blocked);
+    OwnedRead.close(owner);
+    try std.testing.expect(owner.lifetime.detached.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), owner.lifetime.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fence.references.load(.acquire));
+    try std.testing.expect(connection.used.load(.acquire) > 0 and service.used.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_plan_cache.stats(cache_io).leases);
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduling.stats().runnable_slots);
+    var control: http.RunnableScheduler.Execution = .{};
+    try control.start(&scheduling, .{ .io = std.testing.io }, .control);
+    control.finish();
+    OwnedRead.releasePage(pages[0]);
+    try std.testing.expectEqual(@as(usize, 2), owner.lifetime.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
+    // Last page deinit physically frees its arena and wrapper before stream
+    // close, native plan/root retirement and final connection parent release.
+    OwnedRead.releasePage(pages[1]);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (cleanup_runtime.registry.retained() != 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(fence.retired_before_release.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fence.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), connection.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), service.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_plan_cache.stats(cache_io).leases);
+    try std.testing.expectEqual(@as(usize, 0), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduling.stats().retained_bytes);
+}
+
+test "SQL pgwire guarded cleanup checkpoint preserves independent deadline after foreground cancellation" {
+    const runtime = @import("antfly_runtime_abi");
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    Clock.current = 0;
+    var scheduling = try http.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduling.close();
+    var owner: http.RunnableScheduler.Execution = .{};
+    defer owner.finish();
+    try owner.start(&scheduling, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17 }, .query);
+    var server: http.ApiHttpServer = undefined;
+    server.embedding_provider_runtime.io = std.testing.io;
+    var identity: ?http.AuthenticatedIdentity = null;
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var credential: Credential = undefined;
+    const request: wire.Request = .{ .statement = "SELECT 1", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1)) }, .cancel_requested = &canceled };
+    var authority: Authority = .{ .credential = &credential, .identity = &identity, .request = request };
+    var native_adapter: execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &owner };
+    var guarded: GuardedCatalog = .{ .native = native_adapter.backend(), .authority = &authority, .revision = &native_adapter.revision, .expected_guard = null, .cleanup = &owner };
+    const borrow = native_adapter.providerRunnable().?;
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    const reserved = borrow.reserve_cleanup.?(borrow.context, &.{ .io = &io_borrow, .native_deadline = 1, .activation_budget = 1, .deadline_ns = 10 });
+    if (!reserved.isOk()) return runtime.error_abi.errorFromStatus(reserved);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.QueryCanceled, GuardedCatalog.checkpoint(&guarded));
+    Clock.current = 1000;
+    var cleanup_slots: usize = 0;
+    const activated = borrow.activate_cleanup.?(borrow.context, &cleanup_slots);
+    if (!activated.isOk()) return runtime.error_abi.errorFromStatus(activated);
+    try GuardedCatalog.checkpoint(&guarded);
+    Clock.current = 1010;
+    try std.testing.expectError(error.DeadlineExceeded, GuardedCatalog.checkpoint(&guarded));
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
 }

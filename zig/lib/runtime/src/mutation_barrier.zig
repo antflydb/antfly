@@ -42,8 +42,16 @@ pub const MutationBarrier = struct {
     pub const SharedLease = struct {
         barrier: *MutationBarrier,
         nested: bool = false,
+        root: ?*RootSharedLease = null,
 
         pub fn release(self: *@This()) void {
+            if (self.root) |root| {
+                std.debug.assert(root.barrier == self.barrier);
+                const previous = root.borrowers.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 0);
+                self.* = undefined;
+                return;
+            }
             std.debug.assert(shared_barrier == self.barrier);
             std.debug.assert(shared_depth > 0);
             shared_depth -= 1;
@@ -55,6 +63,48 @@ pub const MutationBarrier = struct {
             self.* = undefined;
         }
     };
+
+    /// One independently owned root. Its physical reader is not thread-local
+    /// nesting state. Nested consumers must borrow this root explicitly and
+    /// physically join before release; they must not reacquire behind a writer.
+    pub const RootSharedLease = struct {
+        barrier: *MutationBarrier,
+        borrowers: std.atomic.Value(usize) = .init(0),
+
+        /// The root must stay at a stable address until every borrower has
+        /// physically joined and released. Borrowing never enters reader_gate.
+        pub fn borrow(self: *@This()) SharedLease {
+            _ = self.borrowers.fetchAdd(1, .acq_rel);
+            return .{ .barrier = self.barrier, .nested = true, .root = self };
+        }
+
+        pub fn borrowControlled(self: *@This(), controls: anytype) !SharedLease {
+            try controls.checkpoint();
+            var lease = self.borrow();
+            errdefer lease.release();
+            try controls.checkpoint();
+            return lease;
+        }
+
+        pub fn release(self: *@This()) void {
+            std.debug.assert(self.borrowers.load(.acquire) == 0);
+            self.barrier.unlockShared();
+            self.* = undefined;
+        }
+    };
+
+    /// Fresh-operation acquisition. This never borrows another operation's
+    /// same-thread legacy marker. Original controls outlive acquisition.
+    pub fn acquireSharedRootControlled(self: *@This(), io: std.Io, controls: anytype) !RootSharedLease {
+        try controls.checkpoint();
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
+        while (!self.tryLockShared()) try waitControlled(io, controls);
+        var lease: RootSharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
 
     pub const ExclusiveLease = struct {
         barrier: *MutationBarrier,
@@ -75,6 +125,65 @@ pub const MutationBarrier = struct {
         shared_barrier = self;
         shared_depth = 1;
         return .{ .barrier = self };
+    }
+
+    /// Original non-yielding controls provide checkpoint() and an optional
+    /// executionBoundary(). Keep their owner alive through physical acquisition.
+    pub fn acquireSharedControlled(self: *@This(), io: std.Io, controls: anytype) !SharedLease {
+        try controls.checkpoint();
+        if (shared_barrier) |held| {
+            if (held != self) return error.InvalidArgument;
+            shared_depth += 1;
+            var lease: SharedLease = .{ .barrier = self, .nested = true };
+            errdefer lease.release();
+            try controls.checkpoint();
+            return lease;
+        }
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
+        while (!self.tryLockShared()) try waitControlled(io, controls);
+        shared_barrier = self;
+        shared_depth = 1;
+        var lease: SharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
+
+    /// Close reader admission before waiting for existing mutations. The
+    /// writer intent survives CPU parking, but every rejection releases it.
+    pub fn acquireExclusiveControlled(self: *@This(), io: std.Io, controls: anytype) !ExclusiveLease {
+        try controls.checkpoint();
+        if (shared_barrier == self) return error.InvalidArgument;
+        return self.acquireExclusiveRootControlled(io, controls);
+    }
+
+    /// A fresh operation owns no mutation lease of its own. Another Io
+    /// operation on the same OS thread may own a legacy shared lease; its
+    /// thread-local marker is not this capture's nesting authority. Callers
+    /// must preserve the root identity and all controls through acquisition.
+    pub fn acquireExclusiveRootControlled(self: *@This(), io: std.Io, controls: anytype) !ExclusiveLease {
+        try controls.checkpoint();
+        _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
+        while (!self.reader_gate.tryLock()) try waitControlled(io, controls);
+        errdefer self.reader_gate.unlock();
+        while (!self.resource_mutex.tryLock()) try waitControlled(io, controls);
+        errdefer self.resource_mutex.unlock();
+        try controls.checkpoint();
+        return .{ .barrier = self };
+    }
+
+    fn waitControlled(io: std.Io, controls: anytype) !void {
+        try controls.checkpoint();
+        const boundary = controls.executionBoundary();
+        if (boundary) |wait| try wait.beginWait();
+        // Finite owner-Io polling avoids a CPU spin without introducing a
+        // second clock/deadline. Reentry is mandatory even after I/O rejection.
+        const result = io.sleep(.fromMilliseconds(1), .awake);
+        if (boundary) |wait| try wait.endWait();
+        try result;
+        try controls.checkpoint();
     }
 
     pub fn tryAcquireShared(self: *@This()) ?SharedLease {

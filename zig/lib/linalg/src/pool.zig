@@ -22,6 +22,35 @@ const builtin = @import("builtin");
 
 pub const max_workers: usize = 8;
 pub const supports_sync_parallelism = !builtin.single_threaded and builtin.os.tag == .linux;
+threadlocal var scoped_worker_limit: ?usize = null;
+
+/// Synchronous CPU work borrows this many admitted workers. Scope lifetime
+/// stays on one OS thread; dispatched children receive a one-worker scope so
+/// nested kernels cannot multiply the parent's admitted team.
+pub const WorkerScope = struct {
+    previous: ?usize,
+    limit: usize,
+    thread: if (builtin.single_threaded) void else std.Thread.Id,
+
+    pub fn init(workers: usize) !WorkerScope {
+        if (workers == 0) return error.InvalidRunnableDemand;
+        const previous = scoped_worker_limit;
+        const limit = @min(workers, previous orelse workers);
+        scoped_worker_limit = limit;
+        return .{ .previous = previous, .limit = limit, .thread = if (comptime builtin.single_threaded) {} else std.Thread.getCurrentId() };
+    }
+
+    pub fn deinit(self: *WorkerScope) void {
+        if (comptime !builtin.single_threaded) std.debug.assert(self.thread == std.Thread.getCurrentId());
+        std.debug.assert(scoped_worker_limit == self.limit);
+        scoped_worker_limit = self.previous;
+        self.* = undefined;
+    }
+};
+
+pub fn scopedWorkerLimit() ?usize {
+    return scoped_worker_limit;
+}
 pub const Job = struct {
     fn_ptr: *const fn (*anyopaque) void,
     ctx: *anyopaque,
@@ -80,6 +109,12 @@ var pool_initialized: std.atomic.Value(bool) = .init(false);
 var pool_init_mutex: std.Io.Mutex = .init;
 
 pub inline fn cachedCpuCount() usize {
+    return @min(processCpuCount(), scoped_worker_limit orelse std.math.maxInt(usize));
+}
+
+/// Process capacity is independent of whichever request initializes a shared
+/// pool or native library first.
+pub inline fn processCpuCount() usize {
     const Once = struct {
         var value: std.atomic.Value(usize) = .{ .raw = 0 };
     };
@@ -94,23 +129,25 @@ pub inline fn cachedCpuCount() usize {
 /// Individual async launches may still fall back inline on resource pressure.
 pub fn ensurePool(worker_count: usize) usize {
     if (comptime !supports_sync_parallelism) return 0;
-    if (worker_count == 0) return 0;
+    if (worker_count == 0 or scoped_worker_limit == 1) return 0;
     if (!pool_initialized.load(.acquire)) {
         const io = std.Io.Threaded.global_single_threaded.io();
         pool_init_mutex.lockUncancelable(io);
         defer pool_init_mutex.unlock(io);
         if (!pool_initialized.load(.monotonic)) {
-            pool_storage = SyncPool.init(cachedCpuCount() -| 1);
+            pool_storage = SyncPool.init(processCpuCount() -| 1);
             pool_initialized.store(true, .release);
         }
     }
-    return @min(worker_count, pool_storage.capacity);
+    return @min(worker_count, pool_storage.capacity, (scoped_worker_limit orelse std.math.maxInt(usize)) -| 1);
 }
 
 /// Async wrapper that std.Io.Group.async can dispatch.  The `Job.fn_ptr`
 /// signature is `fn(*anyopaque) void`, but io.async needs a function it
 /// can pass arguments to and that matches a Cancelable error union.
-fn jobRunner(fn_ptr: *const fn (*anyopaque) void, ctx: *anyopaque) std.Io.Cancelable!void {
+fn jobRunner(fn_ptr: *const fn (*anyopaque) void, ctx: *anyopaque, scoped: bool) std.Io.Cancelable!void {
+    var scope = if (scoped) WorkerScope.init(1) catch unreachable else null;
+    defer if (scope) |*active| active.deinit();
     fn_ptr(ctx);
 }
 
@@ -122,19 +159,32 @@ fn jobRunner(fn_ptr: *const fn (*anyopaque) void, ctx: *anyopaque) std.Io.Cancel
 /// caller has an `Io` available (server requests, plumbed CLI calls);
 /// use `dispatchJobs` (Sync) for tests, leaf utilities, and benchmarks.
 pub fn dispatchJobsIo(io: std.Io, jobs: []const Job) std.Io.Cancelable!void {
+    if (scoped_worker_limit) |limit| {
+        var begin: usize = 0;
+        while (begin < jobs.len) {
+            const end = begin + @min(limit, jobs.len - begin);
+            try dispatchWave(io, jobs[begin..end], true);
+            begin = end;
+        }
+        return;
+    }
+    try dispatchWave(io, jobs, false);
+}
+
+fn dispatchWave(io: std.Io, jobs: []const Job, scoped: bool) std.Io.Cancelable!void {
     if (jobs.len == 0) return;
     if (jobs.len == 1) {
-        jobs[0].fn_ptr(jobs[0].ctx);
+        try jobRunner(jobs[0].fn_ptr, jobs[0].ctx, scoped);
         return;
     }
     var g: std.Io.Group = .init;
     errdefer g.cancel(io);
     for (jobs[0 .. jobs.len - 1]) |j| {
-        g.async(io, jobRunner, .{ j.fn_ptr, j.ctx });
+        g.async(io, jobRunner, .{ j.fn_ptr, j.ctx, scoped });
     }
     // Run the last job inline on the calling thread so a single-CPU
     // runtime still makes forward progress.
-    jobs[jobs.len - 1].fn_ptr(jobs[jobs.len - 1].ctx);
+    try jobRunner(jobs[jobs.len - 1].fn_ptr, jobs[jobs.len - 1].ctx, scoped);
     try g.await(io);
 }
 
@@ -146,6 +196,8 @@ pub fn dispatchJobs(jobs: []const Job) void {
         return;
     }
     if (jobs.len <= 1 or ensurePool(jobs.len - 1) < jobs.len - 1) {
+        var scope = if (scoped_worker_limit != null) WorkerScope.init(1) catch unreachable else null;
+        defer if (scope) |*active| active.deinit();
         for (jobs) |job| job.fn_ptr(job.ctx);
         return;
     }
@@ -161,6 +213,69 @@ const TestCtx = struct {
         _ = self.counter.fetchAdd(self.contribution, .acq_rel);
     }
 };
+
+test "admitted worker scope rejects zero demand and restores nested limits" {
+    try std.testing.expect(scopedWorkerLimit() == null);
+    try std.testing.expectError(error.InvalidRunnableDemand, WorkerScope.init(0));
+    try std.testing.expect(scopedWorkerLimit() == null);
+    var outer = try WorkerScope.init(2);
+    defer outer.deinit();
+    try std.testing.expectEqual(@as(?usize, 2), scopedWorkerLimit());
+    try std.testing.expect(cachedCpuCount() <= 2);
+    const process_capacity = processCpuCount();
+    var wider = try WorkerScope.init(8);
+    try std.testing.expectEqual(@as(?usize, 2), scopedWorkerLimit());
+    wider.deinit();
+    var narrower = try WorkerScope.init(1);
+    try std.testing.expectEqual(@as(?usize, 1), scopedWorkerLimit());
+    try std.testing.expectEqual(@as(usize, 1), cachedCpuCount());
+    try std.testing.expectEqual(process_capacity, processCpuCount());
+    try std.testing.expectEqual(@as(usize, 0), ensurePool(7));
+    narrower.deinit();
+    try std.testing.expectEqual(@as(?usize, 2), scopedWorkerLimit());
+}
+
+test "admitted worker scope bounds actual dispatch and nested kernel fanout" {
+    const State = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        invalid_scope: std.atomic.Value(bool) = .init(false),
+
+        fn leaf(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (scopedWorkerLimit() != 1) self.invalid_scope.store(true, .release);
+            const count = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(count, .acq_rel);
+            for (0..1000) |_| std.atomic.spinLoopHint();
+            _ = self.completed.fetchAdd(1, .acq_rel);
+            _ = self.active.fetchSub(1, .acq_rel);
+        }
+        fn nested(raw: *anyopaque) void {
+            // A child cannot expand its one-worker allowance even if a nested
+            // kernel requests a wider team or explicitly submits many jobs.
+            var scope = WorkerScope.init(8) catch unreachable;
+            defer scope.deinit();
+            const jobs: [3]Job = @splat(.{ .fn_ptr = leaf, .ctx = raw });
+            dispatchJobs(&jobs);
+            dispatchJobsIo(std.testing.io, &jobs) catch unreachable;
+        }
+    };
+    for ([_]usize{ 1, 2 }) |limit| {
+        var state: State = .{};
+        const jobs: [7]Job = @splat(.{ .fn_ptr = State.nested, .ctx = &state });
+        var scope = try WorkerScope.init(limit);
+        try dispatchJobsIo(std.testing.io, &jobs);
+        dispatchJobs(&jobs);
+        scope.deinit();
+        try std.testing.expect(scopedWorkerLimit() == null);
+        try std.testing.expect(!state.invalid_scope.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 84), state.completed.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), state.active.load(.acquire));
+        try std.testing.expect(state.peak.load(.acquire) >= 1);
+        try std.testing.expect(state.peak.load(.acquire) <= limit);
+    }
+}
 
 test "dispatchJobs runs every submitted job exactly once" {
     var counter: std.atomic.Value(u32) = .{ .raw = 0 };

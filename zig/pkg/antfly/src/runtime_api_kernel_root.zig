@@ -18,6 +18,11 @@
 pub const antfly_sources = @import("source_owner_common.zig");
 
 const std = @import("std");
+// The final native link owns one pthread signal stack. Keep crash handlers.
+pub const std_options: std.Options = .{
+    .signal_stack_size = if (@import("builtin").link_libc and
+        (@import("builtin").os.tag == .macos or (@import("builtin").os.tag == .linux and @import("builtin").abi.isGnu()))) null else 1 << 18,
+};
 
 const bridge = @import("runtime_bridge.zig");
 

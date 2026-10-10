@@ -613,6 +613,8 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
@@ -979,6 +981,14 @@ pub const RelationalPriorMembership = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Resolver-owned reader, borrowed until the batch orders its local tails.
+    /// The batch retires its nested reader first and nulls this slot before waits.
+    enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
+    /// Borrowed only during pre-decision snapshot/apply acquisition. This
+    /// authority never cancels mandatory retirement after primary durability.
+    admission_controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = null,
     row_policy_principal: ?*const row_policy_authority_mod.Payload = null,
     row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease = null,
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,

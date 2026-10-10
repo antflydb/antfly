@@ -36,6 +36,12 @@ pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
 pub const Context = struct {
     handle: ?*anyopaque = null,
 
+    pub fn memoryParent(self: *const Context) !abi.MemoryParent {
+        var result: abi.MemoryParent = undefined;
+        if (!abi.antfly_storage_context_memory_parent(self.handle, &result)) return error.StorageContextUnavailable;
+        return result;
+    }
+
     pub fn reclaimBackupPinJson(self: *Context, request: abi.BackupPinReclaimRequest) !Response {
         try self.ensure();
         var response: Response = .{};
@@ -90,6 +96,14 @@ pub const Context = struct {
             self.handle,
             .fromSlice(security_json),
         ));
+    }
+
+    pub fn reserveExternal(self: *Context, bytes: usize) bool {
+        return abi.antfly_storage_context_reserve_external(self.handle, bytes);
+    }
+
+    pub fn releaseExternal(self: *Context, bytes: usize) void {
+        abi.antfly_storage_context_release_external(self.handle, bytes);
     }
 
     pub fn metrics(self: *Context) !abi.ContextMetricsResult {
@@ -661,6 +675,7 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64 = null,
         cancellation_ctx: ?*anyopaque = null,
         cancellation_fn: ?abi.CancellationCheckFn = null,
+        execution_runnable: ?*const anyopaque = null,
         execution: abi.LocalQueryExecutionOptions = .{},
     };
 
@@ -671,10 +686,12 @@ pub const Owner = struct {
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
         var response: QueryResponse = .{};
         var failure: abi.FailureIdentity = .{};
+        var control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        control.execution_runnable = options.execution_runnable;
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
             &.{
-                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+                .control = control,
                 .execution_options = options.execution,
             },
             &response.response,
@@ -817,6 +834,16 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn textStatsJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        var request = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        request.execution_runnable = options.execution_runnable;
+        const status = abi.antfly_storage_owner_text_stats_controlled_json(self.handle, &request, &response.buffer, &failure);
+        try acceptStorageOwnerFailure(status, failure, "storage-owner controlled text stats");
+        return response;
+    }
+
     pub fn algebraicPartialsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
@@ -840,10 +867,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_expand_json(
             self.handle,
             &request,
@@ -861,10 +890,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_hydrate_json(
             self.handle,
             &request,
@@ -882,10 +913,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_edges_json(
             self.handle,
             &request,
@@ -1050,6 +1083,15 @@ pub const Owner = struct {
         table_name: []const u8,
         deadline_ns: u64,
     ) !void {
+        return self.prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, null);
+    }
+    pub fn prepareHotStandbySeedSnapshotWithLifetime(
+        self: *Owner,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
+        if (lifetime) |original| try original.checkpoint();
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
@@ -1057,10 +1099,12 @@ pub const Owner = struct {
                 .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
+                .lifetime_check = lifetime,
             },
             &result,
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        if (lifetime) |original| try original.checkpoint();
     }
 };
 

@@ -27,6 +27,11 @@ const db_mod = @import("../storage/db/control_root.zig");
 pub const algebraic_ir = db_mod.algebraic.ir;
 
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    if (req.execution_runnable) |grant| {
+        try grant.validate();
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
     if (req.cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
     }
@@ -209,6 +214,7 @@ pub fn graphHydrateSearchRequest(req: distributed_graph.GraphHydrateRequest) db_
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .identity_read_generation = req.identity_read_generation,
         .execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_runnable = req.execution_runnable,
         .cancellation = req.cancellation,
     };
 }

@@ -21,12 +21,12 @@ const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-// The merged ABI includes both CUDA preload precision and raster embedding
-// asset pins/output dimensions. Each parent independently used version 28
-// for a different layout, so neither can interoperate with this runtime.
-pub const abi_version: u32 = 29;
+// Includes runnable execution control, CUDA preload precision, and raster
+// embedding asset pins/output dimensions. Mixed runtime versions fail closed.
+pub const abi_version: u32 = 35;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -121,6 +121,9 @@ pub const ConfigureContext = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
     resource_budget: *const ResourceBudget,
+    /// Borrowed during configure; the inference host retains its own lease
+    /// through worker and node teardown. Null preserves unconfigured execution.
+    runnable_owner: ?*const runnable_abi.Owner = null,
 };
 
 pub const AdmissionAmounts = extern struct {
@@ -177,6 +180,10 @@ pub const ProviderOperation = enum(c_int) {
     /// Documents as ordered content parts; binary parts travel as payloads
     /// whose refs index the parts flattened in document order.
     rerank_documents = 22,
+    /// Raw JSON routes preserve the HTTP status and body contract while using
+    /// the provider request context and private-worker CPU grant transport.
+    generate_json = 23,
+    decide_json = 24,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -294,6 +301,12 @@ pub const ProviderInvokeContext = extern struct {
     cancellation: http_abi.CancellationView = .{},
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},
+    /// Borrowed through this synchronous invocation only. The receiver copies
+    /// the descriptor and never publishes callbacks to cancellation monitors.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// Private worker-protocol CPU demand. Zero means no delegated grant.
+    /// The parent keeps ownership; process-local callbacks never enter IPC.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const RouteManifestEntry = extern struct {
@@ -322,6 +335,12 @@ pub const HttpHandleContext = extern struct {
     stream: http_abi.StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,
+    deadline_ns: u64 = 0,
+    has_deadline: u8 = 0,
+    /// Synchronous HTTP dispatch borrows its caller's execution capsule.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// A worker receives only scalar CPU demand, never parent callbacks.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const Capability = struct {
@@ -435,6 +454,19 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
 }
 
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
+
+test "linked inference configure rejects old layouts before borrowing the runnable owner" {
+    try std.testing.expectEqual(.@"extern", @typeInfo(ConfigureContext).@"struct".layout);
+    const context: ConfigureContext = .{
+        .abi_version = abi_version,
+        .handle = @ptrFromInt(8),
+        .resource_budget = @ptrFromInt(8),
+        .runnable_owner = @ptrFromInt(8),
+    };
+    try std.testing.expect(validContext(ConfigureContext, context.abi_version, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version - 1, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version, @offsetOf(ConfigureContext, "runnable_owner")));
+}
 
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expectEqual(@as(u8, 0), @backingInt(ProcessMemoryLimitProvenance.automatic));

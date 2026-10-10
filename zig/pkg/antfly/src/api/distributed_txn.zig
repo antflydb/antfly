@@ -14,6 +14,9 @@
 // limitations.
 
 const std = @import("std");
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
+const runnable_fanout = @import("runnable_fanout_owner.zig");
+const participant_window = @import("runnable_participant_window.zig");
 const platform_time = @import("antfly_platform").time;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const transactions_mod = @import("antfly_local_sources").storage_transactions;
@@ -150,7 +153,10 @@ pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, a
         try cancellation.check();
         return result;
     }
-    return writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
+    try cancellation.check();
+    const result = try writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
+    try cancellation.check();
+    return result;
 }
 
 fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
@@ -199,6 +205,7 @@ pub const CommitConflict = @import("antfly_local_sources").api_local_transaction
 pub const ParticipantPhase = contract.ParticipantPhase;
 pub const CommitOutcome = @import("antfly_local_sources").api_local_transaction_contract.CommitOutcome;
 
+pub const CommitControl = contract.CommitControl;
 pub const PreDecisionContext = @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext;
 
 pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
@@ -206,8 +213,27 @@ pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// One call-local worker authority. Parallel tasks replace this with their
+    /// independent child token; the original coordinator is never shared.
+    execution_runnable: ?runnable_abi.Borrowed = null,
+
+    fn checkExecution(self: ParticipantWorker) !void {
+        if (self.execution_runnable) |borrow| try borrow.checkLifetime();
+    }
+
+    fn supportsIndependent(self: ParticipantWorker) bool {
+        return self.vtable.begin_group_with_execution != null and self.vtable.prepare_group_with_execution != null and
+            self.vtable.resolve_group_with_execution != null;
+    }
 
     pub const VTable = struct {
+        status_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnStatusRequest, ?u64, runnable_abi.Borrowed) anyerror!db_mod.types.TxnStatus = null,
+        resolve_group_until_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, u64, runnable_abi.Borrowed) anyerror!void = null,
+        acknowledge_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeRequest, runnable_abi.Borrowed) anyerror!void = null,
+        acknowledge_many_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeManyRequest, runnable_abi.Borrowed) anyerror!void = null,
+        begin_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnBeginRequest, runnable_abi.Borrowed) anyerror!void = null,
+        prepare_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnPrepareRequest, runnable_abi.Borrowed) anyerror!void = null,
+        resolve_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, db_mod.types.CancellationToken, runnable_abi.Borrowed) anyerror!void = null,
         status_group_scoped: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) anyerror!db_mod.types.TxnStatus = null,
         begin_group: *const fn (
             ptr: *anyopaque,
@@ -276,30 +302,55 @@ pub const ParticipantWorker = struct {
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
+        try self.checkExecution();
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.begin_group_with_execution orelse return error.UnsupportedOperation;
+            return callback(self.ptr, alloc, group_id, table_name, req, borrow);
+        }
+
         try self.vtable.begin_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn prepareGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+        try self.checkExecution();
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.prepare_group_with_execution orelse return error.UnsupportedOperation;
+            return callback(self.ptr, alloc, group_id, table_name, req, borrow);
+        }
+
         try self.vtable.prepare_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn resolveGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
+        if (self.execution_runnable != null) return self.resolveGroupWithCancellation(alloc, group_id, table_name, req, .none);
         try self.vtable.resolve_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn resolveGroupWithCancellation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken) !void {
+        try self.checkExecution();
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.resolve_group_with_execution orelse return error.UnsupportedOperation;
+            return callback(self.ptr, alloc, group_id, table_name, req, cancellation, borrow);
+        }
         const resolve = self.vtable.resolve_group_with_cancellation orelse
             return try self.resolveGroup(alloc, group_id, table_name, req);
         try resolve(self.ptr, alloc, group_id, table_name, req, cancellation);
     }
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+        try self.checkExecution();
+        if (self.execution_runnable != null) return self.statusGroupWithRequest(alloc, group_id, table_name, .{ .txn_id = txn_id }, null);
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
     }
 
     pub fn statusGroupWithRequest(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, deadline_ns: ?u64) !db_mod.types.TxnStatus {
+        try self.checkExecution();
         try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.status_group_with_execution orelse return error.CommitDecisionUnknown;
+            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns, borrow);
+        }
         if (req.restore_staging_scope != null) {
             if (req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
             const callback = self.vtable.status_group_scoped orelse return error.CommitDecisionUnknown;
@@ -309,7 +360,12 @@ pub const ParticipantWorker = struct {
     }
 
     pub fn resolveGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
+        try self.checkExecution();
         try ensureDecisionRecoveryDeadline(deadline_ns);
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.resolve_group_until_with_execution orelse return error.CommitDecisionUnknown;
+            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns, borrow);
+        }
         // A legacy implementation cannot prove that its routing or transport
         // honors this deadline. Fail closed instead of turning a bounded
         // recovery operation back into an unbounded request.
@@ -318,18 +374,37 @@ pub const ParticipantWorker = struct {
     }
 
     pub fn statusGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+        try self.checkExecution();
         try ensureDecisionRecoveryDeadline(deadline_ns);
+        if (self.execution_runnable != null) return self.statusGroupWithRequest(alloc, group_id, table_name, .{ .txn_id = txn_id }, deadline_ns);
         const status = self.vtable.status_group_until orelse return error.CommitDecisionUnknown;
         return try status(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
+        try self.checkExecution();
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.acknowledge_group_with_execution orelse return error.UnsupportedOperation;
+            return callback(self.ptr, alloc, group_id, table_name, req, borrow);
+        }
         const acknowledge = self.vtable.acknowledge_group orelse return;
         try acknowledge(self.ptr, alloc, group_id, table_name, req);
     }
     pub fn acknowledgeManyGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        try self.checkExecution();
         if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
-        if (self.vtable.acknowledge_many_group) |callback| {
+        if (self.execution_runnable) |borrow| {
+            if (self.vtable.acknowledge_many_group_with_execution) |callback| {
+                const delivered = delivered: {
+                    callback(self.ptr, alloc, group_id, table_name, req, borrow) catch |err| switch (err) {
+                        error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :delivered false,
+                        else => return err,
+                    };
+                    break :delivered true;
+                };
+                if (delivered) return;
+            }
+        } else if (self.vtable.acknowledge_many_group) |callback| {
             const delivered = delivered: {
                 callback(self.ptr, alloc, group_id, table_name, req) catch |err| switch (err) {
                     // Acknowledgements are idempotent. Mixed-version hosts retain
@@ -407,12 +482,14 @@ pub const HostedParticipantWorker = struct {
     executor: http_common.RequestExecutor,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
-    /// One process-local deadline covers routing, serialization, and every
-    /// candidate contacted by a single begin/prepare operation. Individual
-    /// attempts are capped so one black-holed peer cannot consume the entire
-    /// rediscovery window before another replica is tried.
+    /// One process-local deadline covers this worker's entire pre-decision
+    /// lifetime: routing, all participants, BEGIN, PREPARE and replica retries.
+    /// Per-attempt caps leave time for another replica after a black-holed peer.
+    pre_decision_context: PreDecisionContext = .{},
     pre_decision_timeout_ms: u32 = default_pre_decision_timeout_ms,
     pre_decision_attempt_timeout_ms: u32 = default_pre_decision_attempt_timeout_ms,
+    execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary = null,
+    execution_deadline_ns: ?u64 = null,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -420,11 +497,25 @@ pub const HostedParticipantWorker = struct {
         writes: table_writes.TableWriteSource,
         executor: http_common.RequestExecutor,
     ) HostedParticipantWorker {
+        return initWithPreDecisionBudget(catalog, router, writes, executor, .{});
+    }
+
+    pub fn initWithPreDecisionBudget(
+        catalog: table_catalog.CatalogSource,
+        router: table_router.HostedGroupRouter,
+        writes: table_writes.TableWriteSource,
+        executor: http_common.RequestExecutor,
+        budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget,
+    ) HostedParticipantWorker {
+        // Freeze before catalog routing or any participant contact. Every
+        // operation receives this same ceiling; later work cannot reset it.
+        const deadline = executor.monotonicNs() +| @as(u64, default_pre_decision_timeout_ms) * std.time.ns_per_ms;
         return .{
             .catalog = catalog,
             .router = router,
             .writes = writes,
             .executor = executor,
+            .pre_decision_context = (@as(PreDecisionContext, .{ .deadline_ns = budget.deadline_ns, .deadline_io = budget.io, .cancellation = budget.cancellation })).boundDeadline(deadline, executor.clock_io),
         };
     }
 
@@ -436,6 +527,7 @@ pub const HostedParticipantWorker = struct {
 
     fn httpClient(self: *HostedParticipantWorker, alloc: std.mem.Allocator) http_client_mod.ApiHttpClient {
         var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+        client.execution_wait = self.execution_wait;
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         return client;
     }
@@ -444,6 +536,12 @@ pub const HostedParticipantWorker = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .status_group_with_execution = statusGroupWithExecution,
+                .resolve_group_until_with_execution = resolveGroupUntilWithExecution,
+                .acknowledge_group_with_execution = acknowledgeGroupWithExecution,
+                .begin_group_with_execution = beginGroupWithExecution,
+                .prepare_group_with_execution = prepareGroupWithExecution,
+                .resolve_group_with_execution = resolveGroupWithExecution,
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
@@ -454,8 +552,79 @@ pub const HostedParticipantWorker = struct {
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
                 .acknowledge_many_group = acknowledgeManyGroup,
+                .acknowledge_many_group_with_execution = acknowledgeManyGroupWithExecution,
             },
         };
+    }
+
+    fn statusGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, maximum: ?u64, borrow: runnable_abi.Borrowed) !db_mod.types.TxnStatus {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        const result = try statusGroupWithin(&view, alloc, group_id, table_name, req, try completionDeadline(borrow, maximum));
+        try borrow.checkLifetime();
+        return result;
+    }
+
+    fn resolveGroupUntilWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, maximum: u64, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
+        try resolveGroupWithin(&view, alloc, group_id, table_name, req, .none, try completionDeadline(borrow, maximum));
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.execution_deadline_ns = try completionDeadline(borrow, null);
+        try acknowledgeGroup(&view, alloc, group_id, table_name, req);
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeManyGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.execution_deadline_ns = try completionDeadline(borrow, null);
+        try acknowledgeManyGroup(&view, alloc, group_id, table_name, req);
+        try borrow.checkLifetime();
+    }
+
+    fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
+        try beginGroup(&view, alloc, group_id, table_name, req);
+    }
+
+    fn prepareGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
+        try prepareGroup(&view, alloc, group_id, table_name, req);
+    }
+
+    fn resolveGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        // Sample the destination clock first. The original remaining duration
+        // cannot be extended by translating it or beginning another RPC.
+        const deadline = try completionDeadline(borrow, null);
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
+        try resolveGroupWithin(&view, alloc, group_id, table_name, req, cancellation, deadline);
     }
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -467,7 +636,7 @@ pub const HostedParticipantWorker = struct {
         var route = (table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader) catch |err|
             return preDecisionSetupNotProposed(group_id, "initial-route", err)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        self.checkPreDecisionDeadline(deadline_ns) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -525,7 +694,7 @@ pub const HostedParticipantWorker = struct {
         const deadline_ns = try self.preDecisionDeadlineNs();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try self.checkPreDecisionDeadline(deadline_ns);
         const attempted_node_id = switch (route) {
             .local => self.router.localNodeId(),
             .remote => |remote| remote.node_id,
@@ -577,7 +746,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        self.checkPreDecisionDeadline(deadline_ns) catch |err| {
             if (err == error.Timeout) return error.PreDecisionNotProposed;
             return err;
         };
@@ -621,7 +790,7 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs()) catch |err| {
+        self.checkPreDecisionDeadline(deadline_ns) catch |err| {
             if (err == error.Timeout) return false;
             return err;
         };
@@ -682,7 +851,7 @@ pub const HostedParticipantWorker = struct {
         encoded_body: ?[]const u8,
         deadline_ns: u64,
     ) !void {
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try self.checkPreDecisionDeadline(deadline_ns);
         const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
         defer alloc.free(node_ids);
         var owned_body: ?[]u8 = null;
@@ -717,7 +886,7 @@ pub const HostedParticipantWorker = struct {
         body: []const u8,
         deadline_ns: u64,
     ) !bool {
-        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
+        try self.checkPreDecisionDeadline(deadline_ns);
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
             var context = try self.localPreDecisionContext(deadline_ns);
@@ -755,10 +924,19 @@ pub const HostedParticipantWorker = struct {
         if (self.pre_decision_timeout_ms == 0 or self.pre_decision_attempt_timeout_ms == 0)
             return error.Timeout;
         const duration_ns = @as(u64, self.pre_decision_timeout_ms) *| std.time.ns_per_ms;
-        return self.executor.monotonicNs() +| duration_ns;
+        const context = self.pre_decision_context.boundDeadline(self.executor.monotonicNs() +| duration_ns, self.executor.clock_io);
+        const deadline = context.deadline_ns.?;
+        try self.checkPreDecisionDeadline(deadline);
+        return deadline;
+    }
+
+    fn checkPreDecisionDeadline(self: *const HostedParticipantWorker, deadline_ns: u64) !void {
+        try self.pre_decision_context.cancellation.check();
+        try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
     }
 
     fn remainingPreDecisionAttemptBudget(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionAttemptBudget {
+        try self.pre_decision_context.cancellation.check();
         const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns, self.executor.monotonicNs());
         const client_timeout_ms = @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
         if (client_timeout_ms <= pre_decision_response_reserve_ms + contract.pre_decision_server_response_reserve_ms)
@@ -773,9 +951,10 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn localPreDecisionContext(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionContext {
+        const now = self.executor.monotonicNs();
         const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
         const duration_ns = @as(u64, budget.server_budget_ms) *| std.time.ns_per_ms;
-        return .{ .deadline_ns = self.executor.monotonicNs() +| duration_ns, .deadline_io = self.executor.clock_io };
+        return self.pre_decision_context.boundDeadline(@min(deadline_ns, now +| duration_ns), self.executor.clock_io);
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -793,13 +972,24 @@ pub const HostedParticipantWorker = struct {
     fn resolveGroupWithin(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, deadline_ns: ?u64) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
-        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns orelse 0 };
+        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns orelse 0, .cancellation = cancellation };
         const operation_cancellation = if (deadline_ns != null) deadline_cancellation.token() else cancellation;
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         switch (route) {
-            .local => _ = (try resolveGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, operation_cancellation)) orelse return error.UnknownGroup,
+            .local => {
+                const result = if (self.pre_decision_context.execution_runnable) |borrow|
+                    try self.writes.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, .{
+                        .execution_runnable = borrow,
+                        .cancellation = operation_cancellation,
+                        .restore_staging_scope = req.restore_staging_scope,
+                        .restore_staging_plan_id = req.restore_staging_plan_id,
+                    })
+                else
+                    try resolveGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, operation_cancellation);
+                _ = result orelse return error.UnknownGroup;
+            },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -885,13 +1075,19 @@ pub const HostedParticipantWorker = struct {
         try validateAcknowledgementMany(req);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        var deadline_control: DecisionRecoveryCancellation = .{ .deadline_ns = self.execution_deadline_ns orelse 0 };
+        const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
+        try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
+                var response = if (self.execution_deadline_ns) |deadline|
+                    try client.fetchGroupTxnAcknowledgeManyWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline))
+                else
+                    try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -901,13 +1097,19 @@ pub const HostedParticipantWorker = struct {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        var deadline_control: DecisionRecoveryCancellation = .{ .deadline_ns = self.execution_deadline_ns orelse 0 };
+        const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
+        try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                var response = if (self.execution_deadline_ns) |deadline|
+                    try client.fetchGroupTxnAcknowledgeWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline))
+                else
+                    try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -1006,12 +1208,19 @@ fn ensurePreDecisionDeadline(deadline_ns: u64, now_ns: u64) !void {
     if (now_ns >= deadline_ns) return error.Timeout;
 }
 
+fn completionDeadline(borrow: runnable_abi.Borrowed, maximum: ?u64) !u64 {
+    const before = platform_time.monotonicNs();
+    const inherited = before +| try borrow.completionRemainingNs();
+    return if (maximum) |limit| @min(inherited, limit) else inherited;
+}
+
 fn ensureDecisionRecoveryDeadline(deadline_ns: u64) !void {
     if (platform_time.monotonicNs() >= deadline_ns) return error.CommitDecisionUnknown;
 }
 
 const DecisionRecoveryCancellation = struct {
     deadline_ns: u64,
+    cancellation: db_mod.types.CancellationToken = .none,
 
     fn token(self: *const DecisionRecoveryCancellation) db_mod.types.CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = isCancelled };
@@ -1019,7 +1228,7 @@ const DecisionRecoveryCancellation = struct {
 
     fn isCancelled(ptr: *const anyopaque) bool {
         const self: *const DecisionRecoveryCancellation = @ptrCast(@alignCast(ptr));
-        return platform_time.monotonicNs() >= self.deadline_ns;
+        return self.cancellation.isCancelled() or platform_time.monotonicNs() >= self.deadline_ns;
     }
 };
 
@@ -1039,6 +1248,7 @@ fn remainingPreDecisionTimeoutMs(deadline_ns: u64, now_ns: u64) !u32 {
 
 pub const LocalTableWriteParticipantWorker = struct {
     writes: table_writes.TableWriteSource,
+    pre_decision_context: PreDecisionContext = .{},
 
     pub fn init(writes: table_writes.TableWriteSource) LocalTableWriteParticipantWorker {
         return .{ .writes = writes };
@@ -1048,6 +1258,12 @@ pub const LocalTableWriteParticipantWorker = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .status_group_with_execution = statusGroupWithExecution,
+                .resolve_group_until_with_execution = resolveGroupUntilWithExecution,
+                .acknowledge_group_with_execution = acknowledgeGroupWithExecution,
+                .begin_group_with_execution = beginGroupWithExecution,
+                .prepare_group_with_execution = prepareGroupWithExecution,
+                .resolve_group_with_execution = resolveGroupWithExecution,
                 .begin_group = beginGroup,
                 .prepare_group = prepareGroup,
                 .resolve_group = resolveGroup,
@@ -1061,13 +1277,76 @@ pub const LocalTableWriteParticipantWorker = struct {
         };
     }
 
+    fn statusGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, maximum: ?u64, borrow: runnable_abi.Borrowed) !db_mod.types.TxnStatus {
+        const deadline = try completionDeadline(borrow, maximum);
+        const result = if (req.restore_staging_scope != null)
+            try statusGroupScoped(ptr, alloc, group_id, table_name, req, deadline)
+        else
+            try statusGroupUntil(ptr, alloc, group_id, table_name, req.txn_id, deadline);
+        try borrow.checkLifetime();
+        return result;
+    }
+
+    fn resolveGroupUntilWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, maximum: u64, borrow: runnable_abi.Borrowed) !void {
+        var deadline: DecisionRecoveryCancellation = .{ .deadline_ns = try completionDeadline(borrow, maximum) };
+        try resolveGroupWithExecution(ptr, alloc, group_id, table_name, req, deadline.token(), borrow);
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var control: CompletionCancellation = .{ .borrow = borrow, .foreground = .none };
+        _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .{ .ptr = &control, .check_fn = CompletionCancellation.check })) orelse return error.UnknownGroup;
+        try borrow.checkLifetime();
+    }
+
+    fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        view.pre_decision_context.execution_runnable = borrow;
+        try beginGroup(&view, alloc, group_id, table_name, req);
+    }
+
+    fn prepareGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        view.pre_decision_context.execution_runnable = borrow;
+        try prepareGroup(&view, alloc, group_id, table_name, req);
+    }
+
+    const CompletionCancellation = struct {
+        borrow: runnable_abi.Borrowed,
+        foreground: db_mod.types.CancellationToken,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.borrow.checkLifetime();
+            try self.foreground.check();
+        }
+    };
+    fn resolveGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var control: CompletionCancellation = .{ .borrow = borrow, .foreground = cancellation };
+        try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+        _ = (try self.writes.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, .{
+            .execution_runnable = borrow,
+            .cancellation = .{ .ptr = &control, .check_fn = CompletionCancellation.check },
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+        })) orelse return error.UnknownGroup;
+    }
+
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
+        var context = self.pre_decision_context;
+        context.restore_staging_scope = req.restore_staging_scope;
+        context.restore_staging_plan_id = req.restore_staging_plan_id;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context)) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var context = self.pre_decision_context;
+        context.route_fence = req.route_fence;
         _ = (try self.writes.txnPrepareGroupLocalWithPreDecisionContext(
             alloc,
             group_id,
@@ -1075,7 +1354,7 @@ pub const LocalTableWriteParticipantWorker = struct {
             req.txn_id,
             req.topology_epoch,
             req.req,
-            .{ .route_fence = req.route_fence },
+            context,
         )) orelse return error.UnknownGroup;
     }
 
@@ -1190,9 +1469,26 @@ pub const ExecuteOptions = struct {
     /// prepare, and phase-two delivery use bounded concurrent windows.
     fanout_io: ?std.Io = null,
     max_parallel_participants: usize = 8,
+    /// Borrowed invocation-owned CPU team and bounded child allocator. Reserve
+    /// before any participant contact; retain through commit/abort and joins.
+    team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
     /// Consulted only by participant implementations after a committed
     /// transaction mutation is durable, never during begin or prepare.
     post_commit_cancellation: db_mod.types.CancellationToken = .none,
+    /// Original admission authority used by coordinator metadata capture.
+    pre_decision_context: PreDecisionContext = .{},
+    /// Internal invocation-owned state, populated before participant contact.
+    independent_participants: bool = false,
+    participant_owners: ?[]runnable_fanout.Owner = null,
+    reusable_participants: bool = false,
+
+    fn participantOwner(self: ExecuteOptions, index: usize, start: usize) ?*runnable_fanout.Owner {
+        return if (self.participant_owners) |owners| &owners[index - start] else null;
+    }
+
+    fn participantAllocator(self: ExecuteOptions) std.mem.Allocator {
+        return if (self.team) |team| team.allocator else std.heap.page_allocator;
+    }
 };
 
 const ParticipantFanoutSlot = struct {
@@ -1230,9 +1526,54 @@ fn isTerminalVisibilityRepair(err: anyerror) bool {
     return err == error.EnrichmentWorkerFailed;
 }
 
+fn reserveParticipantTeam(options: *ExecuteOptions, participants: usize) !void {
+    if (options.team) |team| {
+        if (options.independent_participants) {
+            try team.reserveIndependent();
+            return;
+        }
+        const children = if (options.fanout_io != null) @min(@max(options.max_parallel_participants, 1), participants) else 0;
+        try team.reserve(children);
+        if (team.childCapacity() == 0) options.fanout_io = null;
+    }
+}
+
 fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
     if (options.fanout_io == null or participant_count <= 1) return 1;
-    return @min(@max(options.max_parallel_participants, 1), participant_count);
+    const requested = @min(@max(options.max_parallel_participants, 1), participant_count);
+    if (options.independent_participants) return requested;
+    return if (options.team) |team| @min(requested, @max(team.childCapacity(), 1)) else requested;
+}
+
+fn reserveFanoutWindow(options: ExecuteOptions, start: usize, end: usize) !?participant_window.Window {
+    if (!options.independent_participants) return null;
+    const owners = options.participant_owners orelse return error.InvalidRunnableTransition;
+    if (end - start > owners.len) return error.InvalidRunnableTransition;
+    const team = options.team orelse return error.InvalidRunnableTransition;
+    var window = if (options.reusable_participants)
+        try participant_window.Window.reuse(team, owners[0 .. end - start])
+    else
+        try participant_window.Window.reserve(team, owners[0 .. end - start], options.fanout_io orelse return error.InvalidRunnableTransition, 0);
+    errdefer window.retire();
+    try window.park();
+    return window;
+}
+
+fn joinFanoutWindow(window: *?participant_window.Window, group: *std.Io.Group, io: std.Io, slots: []ParticipantFanoutSlot, committed: bool) void {
+    if (window.*) |*owned| {
+        owned.join(group, io) catch |err| {
+            for (slots) |*slot| {
+                if (slot.err == null) slot.err = err;
+                if (committed) slot.propagation_pending = true;
+            }
+        };
+    } else awaitFanout(group, io);
+}
+
+fn activateParticipant(worker: ParticipantWorker, owner: ?*runnable_fanout.Owner) !ParticipantWorker {
+    var view = worker;
+    if (owner) |child| view.execution_runnable = (try child.activate()) orelse return error.InvalidRunnableTransition;
+    return view;
 }
 
 fn awaitFanout(group: *std.Io.Group, io: std.Io) void {
@@ -1335,28 +1676,38 @@ pub fn executeMultiTableCommitWithOptions(
 fn executeMultiTableCommitOnce(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
-    worker: ParticipantWorker,
+    original_worker: ParticipantWorker,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     commit_version: u64,
     tables: []const TableCommitRequest,
     sync_level: db_mod.types.SyncLevel,
     trace_writer: ?tracing.AntflyTraceWriter,
-    options: ExecuteOptions,
+    requested_options: ExecuteOptions,
 ) !CommitOutcome {
+    var options = requested_options;
+    var worker = original_worker;
+    options.independent_participants = false;
+    options.participant_owners = null;
+    options.reusable_participants = false;
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
     defer {
         for (participants.items) |*participant| participant.deinit(alloc);
         participants.deinit(alloc);
     }
 
+    const routing_budget: table_catalog.RoutingBudget = .{ .deadline_ns = options.pre_decision_context.deadline_ns, .io = options.pre_decision_context.deadline_io, .cancellation = options.pre_decision_context.cancellation };
+    var routing_work_index: usize = 0;
     for (tables) |table| {
-        var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
+        try routing_budget.checkpoint();
+        var routing = (try table_catalog.transactionRoutingSnapshotWithBudget(alloc, catalog, table.table_name, routing_budget)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
 
         try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const fence = owner.fence;
             if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
                 !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
@@ -1376,31 +1727,43 @@ fn executeMultiTableCommitOnce(
         }
 
         for (table.writes) |write| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.writes.append(alloc, write);
         }
         for (table.deletes) |key| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.deletes.append(alloc, key);
         }
         for (table.predicates) |predicate| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(predicate.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.predicates.append(alloc, predicate);
         }
         for (table.transforms) |transform| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(transform.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.transforms.append(alloc, transform);
         }
         for (table.integrity) |operation| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(operation.routing_key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.integrity.append(alloc, operation);
         }
         for (table.integrity_commands) |command| {
+            try routing_budget.checkpointIndex(routing_work_index);
+            routing_work_index += 1;
             const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
@@ -1480,6 +1843,37 @@ fn executeMultiTableCommitOnce(
     defer alloc.free(fanout_slots);
     for (fanout_slots) |*slot| slot.reset();
 
+    // This is before the first participant RPC and before registering abort
+    // obligations. A denied team never falls back to unscheduled child work.
+    if (options.team) |team| {
+        if (options.fanout_io != null and worker.supportsIndependent() and team.borrow.reserve_child != null and
+            try team.borrow.currentClass() != .control)
+        {
+            _ = try team.borrow.completionRemainingNs();
+            options.independent_participants = true;
+            const owners = try team.allocator.alloc(runnable_fanout.Owner, @min(@max(options.max_parallel_participants, 1), participants.items.len));
+            @memset(owners, .{});
+            options.participant_owners = owners;
+            options.reusable_participants = true;
+        }
+    }
+    defer if (options.participant_owners) |owners| {
+        for (owners) |*owner| {
+            std.debug.assert(!owner.running);
+            owner.retire();
+        }
+        options.participantAllocator().free(owners);
+    };
+    try reserveParticipantTeam(&options, participants.items.len);
+    defer if (options.team) |team| team.finish();
+    if (options.independent_participants) {
+        worker.execution_runnable = options.team.?.borrow;
+        // Reserve all reusable packets before coordinator BEGIN. A denied
+        // operation/byte/allocator budget cannot create transaction state.
+        for (options.participant_owners.?) |*owner| try owner.reserve(options.team.?.borrow, options.fanout_io.?, 0);
+    }
+
+    var recovery_budget: @import("decision_recovery_budget.zig").Budget = .{ .now = platform_time.monotonicNs, .maximum_ns = coordinator_resolution_timeout_ns };
     var begun_count: usize = 0;
     var abort_on_error = true;
     var resume_committed = false;
@@ -1492,6 +1886,7 @@ fn executeMultiTableCommitOnce(
         }
     }
 
+    try routing_budget.checkpoint();
     if (participants.items.len > 0) coordinator_begin: {
         const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
@@ -1512,15 +1907,22 @@ fn executeMultiTableCommitOnce(
                 // attempting abort or reporting a terminal conflict.
                 // Resume commit-only propagation instead of treating that
                 // terminal record as a failed fresh begin.
+                const recovery_deadline = recovery_budget.deadline(if (options.team) |team| team.borrow else null) catch {
+                    abort_on_error = false;
+                    return error.CommitDecisionUnknown;
+                };
                 const status = worker.statusGroupWithRequest(
                     alloc,
                     participant.group_id,
                     participant.table_name,
                     participant.statusRequest(txn_id),
-                    null,
+                    recovery_deadline,
                 ) catch |status_err| switch (status_err) {
                     error.TxnNotFound => null,
-                    else => return error.CommitDecisionUnknown,
+                    else => {
+                        abort_on_error = false;
+                        return error.CommitDecisionUnknown;
+                    },
                 };
                 if (status) |observed| switch (observed) {
                     .committed => {
@@ -1738,7 +2140,7 @@ fn executeMultiTableCommitOnce(
                 // (for example while mirroring or waiting for an index). Read
                 // the participant record before deciding whether abort is
                 // still legal.
-                const durable_status = resolveCoordinatorDecisionAfterFailure(
+                const durable_status = resolveCoordinatorDecisionAfterFailureWithinBudget(
                     alloc,
                     worker,
                     participant,
@@ -1746,7 +2148,8 @@ fn executeMultiTableCommitOnce(
                     commit_version,
                     coordinator_sync_level,
                     err,
-                    options.post_commit_cancellation,
+                    &recovery_budget,
+                    if (options.team) |team| team.borrow else null,
                 ) catch |status_err| {
                     // The outcome is uncertain. Recovery will consult the
                     // participant record; aborting here could contradict a
@@ -1908,16 +2311,22 @@ fn resolveCoordinatorDecisionAfterFailure(
     cancellation: db_mod.types.CancellationToken,
 ) !db_mod.types.TxnStatus {
     _ = cancellation;
-    return try resolveCoordinatorDecisionAfterFailureUntil(
-        alloc,
-        worker,
-        participant,
-        txn_id,
-        commit_version,
-        sync_level,
-        initial_resolve_error,
-        platform_time.monotonicNs() +| coordinator_resolution_timeout_ns,
-    );
+    var budget: @import("decision_recovery_budget.zig").Budget = .{ .now = platform_time.monotonicNs, .maximum_ns = coordinator_resolution_timeout_ns };
+    return resolveCoordinatorDecisionAfterFailureWithinBudget(alloc, worker, participant, txn_id, commit_version, sync_level, initial_resolve_error, &budget, null);
+}
+
+fn resolveCoordinatorDecisionAfterFailureWithinBudget(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    participant: ParticipantTxn,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    sync_level: db_mod.types.SyncLevel,
+    initial_resolve_error: anyerror,
+    budget: *@import("decision_recovery_budget.zig").Budget,
+    completion: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+) !db_mod.types.TxnStatus {
+    return resolveCoordinatorDecisionAfterFailureChecked(alloc, worker, participant, txn_id, commit_version, sync_level, initial_resolve_error, try budget.deadline(completion), budget, completion);
 }
 
 fn resolveCoordinatorDecisionAfterFailureUntil(
@@ -1930,10 +2339,27 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
     initial_resolve_error: anyerror,
     deadline_ns: u64,
 ) !db_mod.types.TxnStatus {
+    return resolveCoordinatorDecisionAfterFailureChecked(alloc, worker, participant, txn_id, commit_version, sync_level, initial_resolve_error, deadline_ns, null, null);
+}
+
+fn resolveCoordinatorDecisionAfterFailureChecked(
+    alloc: std.mem.Allocator,
+    worker: ParticipantWorker,
+    participant: ParticipantTxn,
+    txn_id: db_mod.types.TxnId,
+    commit_version: u64,
+    sync_level: db_mod.types.SyncLevel,
+    initial_resolve_error: anyerror,
+    initial_deadline_ns: u64,
+    budget: ?*@import("decision_recovery_budget.zig").Budget,
+    completion: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+) !db_mod.types.TxnStatus {
+    var deadline_ns = initial_deadline_ns;
     var attempts: usize = 1;
     var last_resolve_error = initial_resolve_error;
     var last_status_error: ?anyerror = null;
     while (true) {
+        if (budget) |retained| deadline_ns = try retained.deadline(completion);
         const status: ?db_mod.types.TxnStatus = worker.statusGroupWithRequest(
             alloc,
             participant.group_id,
@@ -1958,6 +2384,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
             });
             return error.CommitDecisionUnknown;
         }
+        if (budget) |retained| deadline_ns = try retained.deadline(completion);
         attempts += 1;
         // Do not inherit request cancellation after an ambiguous submission:
         // cancellation cannot prove the first commit was not accepted. This
@@ -1974,7 +2401,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
         }, deadline_ns) catch |retry_err| {
             last_resolve_error = retry_err;
             const now_ns = platform_time.monotonicNs();
-            if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
+            if (now_ns < deadline_ns) try sleepRecoveryNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns), completion);
             continue;
         };
         return .committed;
@@ -2024,15 +2451,22 @@ const ParticipantTxn = struct {
 
 const BeginFanoutTask = struct {
     fn run(
-        worker: ParticipantWorker,
+        allocator: std.mem.Allocator,
+        original_worker: ParticipantWorker,
         participant: *const ParticipantTxn,
         participant_ids: []const []const u8,
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
         retain_terminal: bool,
         slot: *ParticipantFanoutSlot,
+        owner: ?*runnable_fanout.Owner,
     ) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const worker = activateParticipant(original_worker, owner) catch |err| {
+            slot.err = err;
+            return;
+        };
+        defer if (owner) |child| child.park();
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         worker.beginGroup(arena.allocator(), participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
@@ -2067,10 +2501,18 @@ fn runBeginFanout(
     var start: usize = 1;
     while (start < participants.len) : (start += width) {
         const end = @min(start + width, participants.len);
+        var window = reserveFanoutWindow(options, start, end) catch |err| {
+            for (slots[start..end]) |*slot| {
+                slot.err = err;
+            }
+            return;
+        };
+        defer if (window) |*owned| owned.retire();
         if (options.fanout_io) |io| {
             var group: std.Io.Group = .init;
             for (start..end) |i| {
                 group.concurrent(io, BeginFanoutTask.run, .{
+                    options.participantAllocator(),
                     worker,
                     &participants[i],
                     participant_ids,
@@ -2078,7 +2520,9 @@ fn runBeginFanout(
                     begin_timestamp,
                     options.retain_terminal,
                     &slots[i],
+                    options.participantOwner(i, start),
                 }) catch BeginFanoutTask.run(
+                    options.participantAllocator(),
                     worker,
                     &participants[i],
                     participant_ids,
@@ -2086,11 +2530,13 @@ fn runBeginFanout(
                     begin_timestamp,
                     options.retain_terminal,
                     &slots[i],
+                    options.participantOwner(i, start),
                 );
             }
-            awaitFanout(&group, io);
+            joinFanoutWindow(&window, &group, io, slots[start..end], false);
         } else {
             for (start..end) |i| BeginFanoutTask.run(
+                options.participantAllocator(),
                 worker,
                 &participants[i],
                 participant_ids,
@@ -2098,6 +2544,7 @@ fn runBeginFanout(
                 begin_timestamp,
                 options.retain_terminal,
                 &slots[i],
+                options.participantOwner(i, start),
             );
         }
         if (firstFanoutError(slots[start..end]) != null) break;
@@ -2106,12 +2553,19 @@ fn runBeginFanout(
 
 const PrepareFanoutTask = struct {
     fn run(
-        worker: ParticipantWorker,
+        allocator: std.mem.Allocator,
+        original_worker: ParticipantWorker,
         participant: *const ParticipantTxn,
         txn_id: db_mod.types.TxnId,
         slot: *ParticipantFanoutSlot,
+        owner: ?*runnable_fanout.Owner,
     ) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const worker = activateParticipant(original_worker, owner) catch |err| {
+            slot.err = err;
+            return;
+        };
+        defer if (owner) |child| child.park();
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         worker.prepareGroup(arena.allocator(), participant.group_id, participant.table_name, .{
             .route_fence = participant.route_fence,
@@ -2157,15 +2611,22 @@ fn runPrepareFanout(
     var start: usize = 0;
     while (start < participants.len) : (start += width) {
         const end = @min(start + width, participants.len);
+        var window = reserveFanoutWindow(options, start, end) catch |err| {
+            for (slots[start..end]) |*slot| {
+                slot.err = err;
+            }
+            return;
+        };
+        defer if (window) |*owned| owned.retire();
         if (options.fanout_io) |io| {
             var group: std.Io.Group = .init;
             for (start..end) |i| {
-                group.concurrent(io, PrepareFanoutTask.run, .{ worker, &participants[i], txn_id, &slots[i] }) catch
-                    PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+                group.concurrent(io, PrepareFanoutTask.run, .{ options.participantAllocator(), worker, &participants[i], txn_id, &slots[i], options.participantOwner(i, start) }) catch
+                    PrepareFanoutTask.run(options.participantAllocator(), worker, &participants[i], txn_id, &slots[i], options.participantOwner(i, start));
             }
-            awaitFanout(&group, io);
+            joinFanoutWindow(&window, &group, io, slots[start..end], false);
         } else {
-            for (start..end) |i| PrepareFanoutTask.run(worker, &participants[i], txn_id, &slots[i]);
+            for (start..end) |i| PrepareFanoutTask.run(options.participantAllocator(), worker, &participants[i], txn_id, &slots[i], options.participantOwner(i, start));
         }
         if (firstFanoutError(slots[start..end]) != null) break;
     }
@@ -2173,7 +2634,8 @@ fn runPrepareFanout(
 
 const ResolveFollowerFanoutTask = struct {
     fn run(
-        worker: ParticipantWorker,
+        allocator: std.mem.Allocator,
+        original_worker: ParticipantWorker,
         coordinator: *const ParticipantTxn,
         participant: *const ParticipantTxn,
         participant_id: []const u8,
@@ -2183,8 +2645,15 @@ const ResolveFollowerFanoutTask = struct {
         resume_committed: bool,
         cancellation: db_mod.types.CancellationToken,
         slot: *ParticipantFanoutSlot,
+        owner: ?*runnable_fanout.Owner,
     ) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const worker = activateParticipant(original_worker, owner) catch |err| {
+            slot.err = err;
+            slot.propagation_pending = true;
+            return;
+        };
+        defer if (owner) |child| child.park();
+        var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         worker.resolveGroupWithCancellation(arena.allocator(), participant.group_id, participant.table_name, .{
             .restore_staging_scope = participant.restore_staging_scope,
@@ -2238,10 +2707,19 @@ fn runResolveFollowerFanout(
     var start: usize = 1;
     while (start < participants.len) : (start += width) {
         const end = @min(start + width, participants.len);
+        var window = reserveFanoutWindow(options, start, end) catch |err| {
+            for (slots[start..]) |*slot| {
+                slot.err = err;
+                slot.propagation_pending = true;
+            }
+            return;
+        };
+        defer if (window) |*owned| owned.retire();
         if (options.fanout_io) |io| {
             var group: std.Io.Group = .init;
             for (start..end) |i| {
                 group.concurrent(io, ResolveFollowerFanoutTask.run, .{
+                    options.participantAllocator(),
                     worker,
                     &participants[0],
                     &participants[i],
@@ -2252,7 +2730,9 @@ fn runResolveFollowerFanout(
                     resume_committed,
                     options.post_commit_cancellation,
                     &slots[i],
+                    options.participantOwner(i, start),
                 }) catch ResolveFollowerFanoutTask.run(
+                    options.participantAllocator(),
                     worker,
                     &participants[0],
                     &participants[i],
@@ -2263,11 +2743,13 @@ fn runResolveFollowerFanout(
                     resume_committed,
                     options.post_commit_cancellation,
                     &slots[i],
+                    options.participantOwner(i, start),
                 );
             }
-            awaitFanout(&group, io);
+            joinFanoutWindow(&window, &group, io, slots[start..end], true);
         } else {
             for (start..end) |i| ResolveFollowerFanoutTask.run(
+                options.participantAllocator(),
                 worker,
                 &participants[0],
                 &participants[i],
@@ -2278,9 +2760,10 @@ fn runResolveFollowerFanout(
                 resume_committed,
                 options.post_commit_cancellation,
                 &slots[i],
+                options.participantOwner(i, start),
             );
         }
-        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, true);
+        acknowledgeFollowerWindow(options.participantAllocator(), worker, txn_id, participants, participant_ids, slots, start, end, true);
     }
 }
 
@@ -3504,7 +3987,8 @@ fn abortParticipantsWithContactMask(
 
 const AbortFollowerFanoutTask = struct {
     fn run(
-        worker: ParticipantWorker,
+        allocator: std.mem.Allocator,
+        original_worker: ParticipantWorker,
         coordinator: *const ParticipantTxn,
         participant: *const ParticipantTxn,
         participant_id: []const u8,
@@ -3513,10 +3997,16 @@ const AbortFollowerFanoutTask = struct {
         resolve: bool,
         allow_missing_state: bool,
         slot: *ParticipantFanoutSlot,
+        owner: ?*runnable_fanout.Owner,
     ) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
         slot.reset();
+        const worker = activateParticipant(original_worker, owner) catch |err| {
+            slot.err = err;
+            return;
+        };
+        defer if (owner) |child| child.park();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
         if (resolve) worker.resolveGroup(arena.allocator(), participant.group_id, participant.table_name, .{
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
@@ -3538,8 +4028,8 @@ const AbortFollowerFanoutTask = struct {
     }
 };
 
-fn acknowledgeFollowerWindow(worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+fn acknowledgeFollowerWindow(allocator: std.mem.Allocator, worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, slots: []ParticipantFanoutSlot, start: usize, end: usize, committed: bool) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var ids: [64][]const u8 = undefined;
     var indexes: [64]usize = undefined;
@@ -3584,19 +4074,26 @@ fn runAbortFollowerFanout(
     var start: usize = 1;
     while (start < participants.len) : (start += width) {
         const end = @min(start + width, participants.len);
+        var window = reserveFanoutWindow(options, start, end) catch |err| {
+            for (slots[start..end]) |*slot| {
+                slot.err = err;
+            }
+            return;
+        };
+        defer if (window) |*owned| owned.retire();
         var group: std.Io.Group = .init;
         for (start..end) |i| {
             // Copy contact evidence before the worker resets its result slot.
             const resolve = if (attempted_count) |count| i < count else slots[i].may_have_transaction_state;
             if (options.fanout_io) |io| {
-                group.concurrent(io, AbortFollowerFanoutTask.run, .{ worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i] }) catch
-                    AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+                group.concurrent(io, AbortFollowerFanoutTask.run, .{ options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i], options.participantOwner(i, start) }) catch
+                    AbortFollowerFanoutTask.run(options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i], options.participantOwner(i, start));
             } else {
-                AbortFollowerFanoutTask.run(worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i]);
+                AbortFollowerFanoutTask.run(options.participantAllocator(), worker, &participants[0], &participants[i], participant_ids[i], txn_id, timestamp, resolve, allow_missing_state, &slots[i], options.participantOwner(i, start));
             }
         }
-        if (options.fanout_io) |io| awaitFanout(&group, io);
-        acknowledgeFollowerWindow(worker, txn_id, participants, participant_ids, slots, start, end, false);
+        if (options.fanout_io) |io| joinFanoutWindow(&window, &group, io, slots[start..end], false);
+        acknowledgeFollowerWindow(options.participantAllocator(), worker, txn_id, participants, participant_ids, slots, start, end, false);
     }
     for (slots[1..], 1..) |slot, i| {
         if (slot.err) |err| std.log.warn("transaction abort delivery failed table={s} group_id={} err={s}", .{ participants[i].table_name, participants[i].group_id, @errorName(err) });
@@ -3690,6 +4187,15 @@ fn participantTornStateConflict(participant: ParticipantTxn, phase: ParticipantP
     };
 }
 
+fn sleepRecoveryNs(duration_ns: u64, completion: ?runnable_abi.Borrowed) !void {
+    var wait: runnable_fanout.RemoteWait = .{ .borrow = completion };
+    if (wait.boundary()) |boundary| {
+        try boundary.beginWait();
+        sleepNs(duration_ns);
+        try boundary.endWait();
+    } else sleepNs(duration_ns);
+}
+
 fn sleepNs(duration_ns: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
@@ -3741,12 +4247,12 @@ fn implementationTests() type {
             var slots: [132]ParticipantFanoutSlot = @splat(.{ .acknowledgement_ready = true });
             slots[2] = .{ .err = error.GroupLeaderUnavailable };
             const txn: db_mod.types.TxnId = @splat(1);
-            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
+            acknowledgeFollowerWindow(std.testing.allocator, recorder.worker(), txn, &participants, &ids, &slots, 1, slots.len, true);
             try std.testing.expectEqual(@as(usize, 3), recorder.batches);
             try std.testing.expectEqual(@as(usize, 130), recorder.members);
             try std.testing.expectEqual(@as(usize, 0), recorder.singles);
             recorder.failure = error.ConnectionRefused;
-            acknowledgeFollowerWindow(recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
+            acknowledgeFollowerWindow(std.testing.allocator, recorder.worker(), txn, &participants, &ids, &slots, 1, 4, true);
             try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), slots[1].acknowledgement_err);
             try std.testing.expect(slots[1].propagation_pending and slots[3].propagation_pending);
             try std.testing.expect(slots[2].acknowledgement_err == null);
@@ -4134,6 +4640,30 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u32, 1_000), (try worker.remainingPreDecisionAttemptBudget(deadline)).server_budget_ms);
             vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
             try std.testing.expectError(error.Timeout, worker.remainingPreDecisionAttemptBudget(deadline));
+        }
+
+        test "hosted participant shares one pre-decision budget across begin prepare and fanout" {
+            var io = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+            defer io.deinit();
+            const borrow = @import("antfly_runtime_abi").io_abi.Borrow.init(&io.io());
+            const executor: http_common.RequestExecutor = .{ .ptr = undefined, .vtable = undefined, .clock_io = borrow };
+            var worker = HostedParticipantWorker.init(undefined, undefined, undefined, executor);
+            const deadline = try worker.preDecisionDeadlineNs();
+            io.monotonic_ns += 10 * std.time.ns_per_s;
+            try std.testing.expectEqual(deadline, try worker.preDecisionDeadlineNs());
+            try std.testing.expect((try worker.localPreDecisionContext(deadline)).deadline_ns.? <= deadline);
+            io.monotonic_ns += 11 * std.time.ns_per_s;
+            // Both operations must reject before accessing routing or contacts.
+            try std.testing.expectError(error.PreDecisionNotProposed, worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
+            try std.testing.expectError(error.Timeout, worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{ .txn_id = @splat(1), .req = .{} }));
+            var canceled = std.atomic.Value(bool).init(false);
+            var bounded = HostedParticipantWorker.initWithPreDecisionBudget(undefined, undefined, undefined, executor, .{ .deadline_ns = @as(u64, @intCast(io.monotonic_ns)) + 3 * std.time.ns_per_s, .io = borrow, .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) });
+            const parent_deadline = try bounded.preDecisionDeadlineNs();
+            io.monotonic_ns += std.time.ns_per_s;
+            try std.testing.expectEqual(parent_deadline, try bounded.preDecisionDeadlineNs());
+            canceled.store(true, .seq_cst);
+            try std.testing.expectError(error.Canceled, bounded.worker().beginGroup(std.testing.allocator, 7, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
+            try std.testing.expectError(error.Canceled, bounded.worker().prepareGroup(std.testing.allocator, 7, "docs", .{ .txn_id = @splat(1), .req = .{} }));
         }
 
         test "distributed txn classifies local and transported visibility outcomes identically" {
@@ -4690,6 +5220,8 @@ fn consumerTests() type {
                         .batch = batch,
                         .txn_begin_group_local = begin,
                         .txn_prepare_group_local = prepare,
+                        .txn_begin_group_local_with_pre_decision_context = beginWithContext,
+                        .txn_prepare_group_local_with_pre_decision_context = prepareWithContext,
                     } };
                 }
 
@@ -4698,10 +5230,20 @@ fn consumerTests() type {
                 }
 
                 fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
-                    return null;
+                    return error.TestExpectedContextAwareBegin;
                 }
 
                 fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+                    return error.TestExpectedContextAwarePrepare;
+                }
+                fn beginWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: PreDecisionContext) anyerror!?void {
+                    try std.testing.expect(context.deadline_ns != null);
+                    try context.cancellation.check();
+                    return null;
+                }
+                fn prepareWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, context: PreDecisionContext) anyerror!?void {
+                    try std.testing.expect(context.deadline_ns != null);
+                    try context.cancellation.check();
                     return null;
                 }
             };
@@ -4841,7 +5383,7 @@ fn consumerTests() type {
 
             var legacy_deadline_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
             var legacy_deadline_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), LegacyDeadlineWrites.source(), legacy_deadline_begin_executor.iface());
-            try std.testing.expectError(error.DeadlineExceeded, legacy_deadline_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+            try std.testing.expectError(error.UnsupportedOperation, legacy_deadline_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
                 .txn_id = txn_id,
                 .begin_timestamp = 42,
                 .participants = &.{"table2:docs:group:7"},
@@ -4850,7 +5392,7 @@ fn consumerTests() type {
 
             var legacy_deadline_prepare_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
             var legacy_deadline_prepare_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), LegacyDeadlineWrites.source(), legacy_deadline_prepare_executor.iface());
-            try std.testing.expectError(error.DeadlineExceeded, legacy_deadline_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+            try std.testing.expectError(error.UnsupportedOperation, legacy_deadline_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
                 .txn_id = txn_id,
                 .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
             }));
@@ -5215,6 +5757,85 @@ fn consumerTests() type {
                 }
                 try sim.ensureNoCapabilityViolation();
             }
+        }
+
+        test "distributed txn participant team bounds CPU and child allocations" {
+            const runtime = @import("antfly_runtime_abi");
+            const execution = @import("runnable_owner_execution.zig");
+            const Recorder = struct {
+                owner: *execution.State,
+                minimum_slots: usize,
+                active: std.atomic.Value(usize) = .init(0),
+                peak: std.atomic.Value(usize) = .init(0),
+                calls: std.atomic.Value(usize) = .init(0),
+                fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+                fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    return .pending;
+                }
+                fn prepare(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.minimum_slots, self.owner.owner.scheduler.stats().runnable_slots);
+                    _ = self.calls.fetchAdd(1, .monotonic);
+                    const current = self.active.fetchAdd(1, .acq_rel) + 1;
+                    defer _ = self.active.fetchSub(1, .acq_rel);
+                    var peak = self.peak.load(.monotonic);
+                    while (current > peak) peak = self.peak.cmpxchgWeak(peak, current, .monotonic, .monotonic) orelse break;
+                    const allocation = try allocator.alloc(u8, 32);
+                    defer allocator.free(allocation);
+                    sleepNs(10 * std.time.ns_per_ms);
+                }
+                fn worker(self: *@This()) ParticipantWorker {
+                    return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status } };
+                }
+                fn now() u64 {
+                    return 0;
+                }
+            };
+            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            var owner: execution.State = .{ .owner_alloc = std.testing.allocator, .owner = try @import("antfly_local_sources").common_request_admission.runnable_scheduler.NodeOwner.init(.{ .slots = 4, .max_operations = 8 }), .native_now_ns = Recorder.now };
+            defer owner.owner.tryDeinit() catch @panic("owner leaked");
+            const port = owner.port();
+            const borrow = runtime.native_abi.IoBorrow.init(&io);
+            var handle: ?*anyopaque = null;
+            try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.write), .retained_bytes = 71, .out_handle = &handle }).isOk());
+            defer port.finish(handle.?);
+            const retained = owner.owner.scheduler.stats().retained_bytes;
+            const participants = [_]ParticipantTxn{
+                .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 1 },
+                .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 1 },
+                .{ .table_name = "docs", .group_id = 7003, .topology_epoch = 1 },
+                .{ .table_name = "docs", .group_id = 7004, .topology_epoch = 1 },
+            };
+            var slots: [participants.len]ParticipantFanoutSlot = undefined;
+            var team: runtime.runnable_abi.Team = .{ .borrow = try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 3, .allocator = std.testing.allocator };
+            var options: ExecuteOptions = .{ .fanout_io = io, .max_parallel_participants = 8, .team = &team };
+            try reserveParticipantTeam(&options, participants.len);
+            var recorder: Recorder = .{ .owner = &owner, .minimum_slots = 3 };
+            runPrepareFanout(recorder.worker(), @splat(1), &participants, &slots, options);
+            try std.testing.expectEqual(@as(usize, 4), recorder.calls.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 2), recorder.peak.load(.monotonic));
+            for (slots) |slot| try std.testing.expectEqual(@as(?anyerror, null), slot.err);
+            try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+            try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+            team.finish();
+            try port.resizeTeam(handle.?, 1);
+            // A zero-capacity owned child allocator must fail rather than use
+            // the previous page-allocator fallback. Single-slot teams execute
+            // serially on the parent, with no unscheduled task submission.
+            var storage: [0]u8 = .{};
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            var serial: runtime.runnable_abi.Team = .{ .borrow = try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 1, .allocator = fixed.allocator() };
+            options = .{ .fanout_io = io, .max_parallel_participants = 8, .team = &serial };
+            try reserveParticipantTeam(&options, participants.len);
+            try std.testing.expect(options.fanout_io == null);
+            recorder.minimum_slots = 1;
+            runPrepareFanout(recorder.worker(), @splat(2), &participants, &slots, options);
+            try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), slots[0].err);
+            try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+            serial.finish();
         }
 
         test "distributed txn participant fanout is bounded and concurrent" {
@@ -5876,6 +6497,8 @@ fn consumerTests() type {
             };
 
             const Recorder = struct {
+                completion_ns: u64 = 0,
+                expected_txn: ?db_mod.types.TxnId = null,
                 begin_error: anyerror = error.DecisionConflict,
                 failed_begin_group: u64 = 7001,
                 status_error: ?anyerror = null,
@@ -5897,6 +6520,7 @@ fn consumerTests() type {
                             .prepare_group = prepare,
                             .resolve_group = resolve,
                             .status_group = status,
+                            .status_group_until = statusUntil,
                             .acknowledge_group = acknowledge,
                         },
                     };
@@ -5905,6 +6529,7 @@ fn consumerTests() type {
                 fn begin(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.begin_calls += 1;
+                    if (self.expected_txn) |expected| try std.testing.expectEqualSlices(u8, &expected, &req.txn_id);
                     try std.testing.expect(req.retain_terminal);
                     if (group == self.failed_begin_group) return self.begin_error;
                 }
@@ -5937,6 +6562,26 @@ fn consumerTests() type {
                     }
                 }
 
+                fn check(_: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                    return .ok;
+                }
+                fn phase(_: *anyopaque, _: c_int) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                    return .ok;
+                }
+                fn resize(_: *anyopaque, slots: usize) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                    return if (slots == 1) .ok else @import("antfly_runtime_abi").error_abi.statusFromError(error.InvalidRunnableDemand);
+                }
+                fn remaining(raw: *anyopaque, out: *u64) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    out.* = self.completion_ns;
+                    return .ok;
+                }
+
+                fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, txn: db_mod.types.TxnId, deadline: u64) !db_mod.types.TxnStatus {
+                    try ensureDecisionRecoveryDeadline(deadline);
+                    return status(ptr, alloc, group, table, txn);
+                }
+
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
@@ -5944,6 +6589,32 @@ fn consumerTests() type {
                     return self.observed_status;
                 }
             };
+
+            // An ambiguous coordinator BEGIN must never fall back to an
+            // unbounded probe when accepted completion authority is missing or
+            // exhausted, and must retain the exact original transaction ID.
+            for ([_]?u64{ null, 0, 20 * std.time.ns_per_s }) |remaining_ns| {
+                const runtime = @import("antfly_runtime_abi");
+                const txn_id: db_mod.types.TxnId = @splat(9);
+                var recorder: Recorder = .{ .completion_ns = remaining_ns orelse 0, .expected_txn = txn_id };
+                var team: runtime.runnable_abi.Team = .{
+                    .borrow = .{ .context = &recorder, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Recorder.check, .park = Recorder.phase, .enter = Recorder.phase, .resize_team = Recorder.resize, .completion_remaining_ns = if (remaining_ns != null) Recorder.remaining else null },
+                    .maximum_slots = 1,
+                    .allocator = std.testing.allocator,
+                };
+                const outcome = executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), txn_id, 10_000, 10_001, &.{.{ .table_name = "docs", .transforms = &.{ .{ .key = "doc:a", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} }, .{ .key = "doc:z", .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }} } } }}, .write, null, .{ .retain_terminal = true, .team = &team });
+                if (remaining_ns != null and remaining_ns.? > 0) {
+                    try std.testing.expect((try outcome) == .committed);
+                    try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+                    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+                } else {
+                    try std.testing.expectError(error.CommitDecisionUnknown, outcome);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+                }
+                try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+            }
 
             for ([_]anyerror{ error.DecisionConflict, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
                 var recorder = Recorder{ .begin_error = begin_error };
@@ -6983,4 +7654,607 @@ test "distributed txn prepare JSON null and insert preconditions survive allocat
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "distributed txn independently scheduled windows retain physical children in all four phases" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const allocation = @import("../common/allocation_budget.zig");
+    const writes = @import("runnable_write_team.zig");
+    const Clock = struct {
+        var current: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return current.load(.acquire);
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Recorder = struct {
+        scheduler: *native.Scheduler,
+        root_context: *anyopaque,
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        health_checked: std.atomic.Value(bool) = .init(false),
+        acknowledgements: std.atomic.Value(usize) = .init(0),
+        expire_on_second_return: bool = false,
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+        fn beginControlled(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
+            try perform(raw, allocator, borrow);
+        }
+        fn prepareControlled(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest, borrow: runnable_abi.Borrowed) !void {
+            try perform(raw, allocator, borrow);
+        }
+        fn resolveControlled(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest, _: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+            try std.testing.expect(req.status == .committed or req.status == .aborted);
+            try perform(raw, allocator, borrow);
+        }
+        fn acknowledgeControlled(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+            try borrow.checkLifetime();
+            try acknowledge(raw, alloc, group, table, req);
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.acknowledgements.fetchAdd(1, .monotonic);
+        }
+        fn perform(raw: *anyopaque, allocator: std.mem.Allocator, borrow: runnable_abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(borrow.context != self.root_context);
+            try std.testing.expectEqual(@as(usize, 1), borrow.cpu_slots);
+            try std.testing.expectEqual(runnable_abi.Class.write, try borrow.currentClass());
+            const stats = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots - stats.control_slots);
+            try std.testing.expect(stats.child_operations > 0);
+            const call = self.calls.fetchAdd(1, .acq_rel) + 1;
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            var peak = self.peak.load(.monotonic);
+            while (active > peak) peak = self.peak.cmpxchgWeak(peak, active, .monotonic, .monotonic) orelse break;
+            const scratch = try allocator.dupe(u8, "bounded participant RPC");
+            defer allocator.free(scratch);
+            var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+            const boundary = wait.boundary().?;
+            try boundary.beginWait();
+            if (!self.health_checked.swap(true, .acq_rel)) {
+                var health: native.Execution = .{};
+                defer health.finish();
+                try health.start(self.scheduler, .{ .io = self.io, .allow_wait = false }, .control);
+                try health.checkpoint();
+                health.finish();
+            }
+            const slept = self.io.sleep(.fromMilliseconds(10), .awake);
+            try boundary.endWait();
+            try slept;
+            try borrow.checkLifetime();
+            if (self.expire_on_second_return and call == 2) Clock.current.store(20 * std.time.ns_per_s, .release);
+        }
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .acknowledge_group_with_execution = acknowledgeControlled, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
+        }
+    };
+    for ([_]bool{ false, true }) |expire| {
+        Clock.current.store(0, .release);
+        defer Clock.current.store(0, .release);
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var memory: allocation.Shared = .{ .child = std.testing.allocator, .limit = 64 * 1024 };
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var root: native.Execution = .{};
+        defer root.finish();
+        try root.start(&scheduler, .{ .io = io, .retained_bytes = 256, .native_now_ns = Clock.now, .deadline_ns = 5 * std.time.ns_per_s, .cancellation = .{ .ptr = &canceled, .requested = Clock.canceled } }, .write);
+        var bridge = try writes.Completion.init(&root, memory.allocator());
+        var team = try bridge.team();
+        try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 20 * std.time.ns_per_s });
+        try team.borrow.activateCompletion();
+        Clock.current.store(6 * std.time.ns_per_s, .release);
+        canceled.store(true, .release);
+        const participants = [_]ParticipantTxn{
+            .{ .table_name = "docs", .group_id = 7001, .topology_epoch = 1 },
+            .{ .table_name = "docs", .group_id = 7002, .topology_epoch = 1 },
+            .{ .table_name = "docs", .group_id = 7003, .topology_epoch = 1 },
+        };
+        const ids = [_][]const u8{ "coordinator", "follower-1", "follower-2" };
+        var owners: [3]runnable_fanout.Owner = @splat(.{});
+        var slots: [3]ParticipantFanoutSlot = undefined;
+        var options: ExecuteOptions = .{ .team = &team, .fanout_io = io, .max_parallel_participants = 2, .independent_participants = true, .participant_owners = &owners, .reusable_participants = true };
+        try reserveParticipantTeam(&options, participants.len);
+        defer team.finish();
+        for (&owners) |*owner| try owner.reserve(team.borrow, io, 0);
+        defer for (&owners) |*owner| owner.retire();
+        const retained_receivers = memory.used.load(.acquire);
+        var recorder: Recorder = .{ .scheduler = &scheduler, .root_context = team.borrow.context, .io = io, .expire_on_second_return = expire };
+        var worker = recorder.worker();
+        worker.execution_runnable = team.borrow;
+        runBeginFanout(worker, @splat(1), 1, &participants, &ids, &slots, options);
+        try std.testing.expectEqual(@as(usize, 2), recorder.calls.load(.acquire));
+        for (slots[1..]) |slot| try std.testing.expect(slot.may_have_transaction_state);
+        if (expire) {
+            for (slots[1..]) |slot| try std.testing.expectEqual(@as(?anyerror, error.DeadlineExceeded), slot.err);
+            try std.testing.expectError(error.DeadlineExceeded, worker.resolveGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .aborted, .commit_version = 2 }));
+        } else {
+            for (slots[1..]) |slot| try std.testing.expect(slot.err == null);
+            try std.testing.expectEqual(@as(usize, 2), recorder.peak.load(.acquire));
+            runPrepareFanout(worker, @splat(1), &participants, &slots, options);
+            for (slots) |slot| try std.testing.expect(slot.err == null);
+            try std.testing.expectEqual(@as(usize, 5), recorder.calls.load(.acquire));
+            runResolveFollowerFanout(worker, @splat(1), 2, &participants, &ids, .write, false, &slots, options);
+            for (slots[1..]) |slot| try std.testing.expect(slot.err == null and !slot.propagation_pending);
+            try std.testing.expectEqual(@as(usize, 7), recorder.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), recorder.acknowledgements.load(.acquire));
+            runAbortFollowerFanout(worker, @splat(1), 3, &participants, &ids, participants.len, false, &slots, options);
+            for (slots[1..]) |slot| try std.testing.expect(slot.err == null);
+            try std.testing.expectEqual(@as(usize, 9), recorder.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 4), recorder.acknowledgements.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        }
+        try std.testing.expectEqual(@as(usize, 3), root.entry.?.children);
+        try std.testing.expectEqual(retained_receivers, memory.used.load(.acquire));
+        for (&owners) |*owner| owner.retire();
+        try std.testing.expectEqual(@as(usize, 0), root.entry.?.children);
+        for (owners) |owner| try std.testing.expect(owner.child == null and !owner.running);
+        try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
+    }
+}
+
+test "distributed txn independently scheduled local worker preserves call authority and original admission context" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const writes = @import("runnable_write_team.zig");
+    const Fake = struct {
+        child_context: ?*anyopaque = null,
+        calls: usize = 0,
+        expected: PreDecisionContext = .{},
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedLegacyMutation;
+        }
+        fn begin(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: PreDecisionContext) !?void {
+            return check(raw, context);
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, context: PreDecisionContext) !?void {
+            return check(raw, context);
+        }
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, context: PreDecisionContext) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.child_context, context.execution_runnable.?.context);
+            // Completion authority is not reconstructed from the foreground fence.
+            try std.testing.expect(context.deadline_ns == null and context.deadline_io == null);
+            try context.execution_runnable.?.checkLifetime();
+            try context.cancellation.check();
+            self.calls += 1;
+            return {};
+        }
+        fn check(raw: *anyopaque, context: PreDecisionContext) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.child_context, context.execution_runnable.?.context);
+            try std.testing.expectEqualDeep(self.expected.deadline_ns, context.deadline_ns);
+            try std.testing.expectEqualDeep(self.expected.deadline_io, context.deadline_io);
+            try std.testing.expectEqualDeep(self.expected.cancellation, context.cancellation);
+            try context.execution_runnable.?.checkLifetime();
+            try context.cancellation.check();
+            self.calls += 1;
+            return {};
+        }
+    };
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+    defer scheduler.close();
+    var root: native.Execution = .{};
+    defer root.finish();
+    try root.start(&scheduler, .{ .io = io }, .write);
+    var bridge = try writes.Completion.init(&root, std.testing.allocator);
+    var team = try bridge.team();
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s });
+    try team.borrow.activateCompletion();
+    var child: runnable_abi.Child = undefined;
+    try team.borrow.reserveChild(&.{ .io = &io_borrow, .out_child = &child });
+    defer child.deinit();
+    try child.activate();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var fake: Fake = .{ .child_context = child.borrow.context, .expected = .{ .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s, .deadline_io = io_borrow, .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) } };
+    var local: LocalTableWriteParticipantWorker = .{ .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_begin_group_local_with_pre_decision_context = Fake.begin, .txn_prepare_group_local_with_pre_decision_context = Fake.prepare, .txn_resolve_group_local_with_execution = Fake.resolve } }, .pre_decision_context = fake.expected };
+    var worker = local.worker();
+    worker.execution_runnable = child.borrow;
+    try worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} });
+    try worker.prepareGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .req = .{} });
+    try worker.resolveGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 });
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expect(local.pre_decision_context.execution_runnable == null);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "distributed txn independently scheduled hosted worker rejects stopped coordinator before routing" {
+    const runtime = @import("antfly_runtime_abi");
+    const Fake = struct {
+        fn lifetime(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.DeadlineExceeded);
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            @panic("stopped coordinator must not acquire CPU");
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("stopped coordinator must not transfer CPU");
+        }
+    };
+    var marker: u8 = 0;
+    var hosted: HostedParticipantWorker = .{ .catalog = undefined, .router = undefined, .writes = undefined, .executor = undefined };
+    var worker = hosted.worker();
+    try std.testing.expect(worker.supportsIndependent());
+    worker.execution_runnable = .{ .context = &marker, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .check_lifetime = Fake.lifetime, .checkpoint = Fake.checkpoint, .park = Fake.transition, .enter = Fake.transition };
+    try std.testing.expectError(error.DeadlineExceeded, worker.beginGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
+    try std.testing.expectError(error.DeadlineExceeded, worker.prepareGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .req = .{} }));
+    try std.testing.expectError(error.DeadlineExceeded, worker.resolveGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .status = .aborted, .commit_version = 2 }));
+    try std.testing.expectError(error.DeadlineExceeded, worker.statusGroup(std.testing.allocator, 1, "docs", @splat(1)));
+    try std.testing.expectError(error.DeadlineExceeded, worker.acknowledgeGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participant = "follower" }));
+}
+
+test "distributed txn independently scheduled coordinator reserves reusable packets before first contact" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const allocation = @import("../common/allocation_budget.zig");
+    const writes = @import("runnable_write_team.zig");
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        root: *native.Execution,
+        memory: *allocation.Shared,
+        root_context: *anyopaque,
+        begins: std.atomic.Value(usize) = .init(0),
+        prepares: std.atomic.Value(usize) = .init(0),
+        resolves: std.atomic.Value(usize) = .init(0),
+        acknowledgements: usize = 0,
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            return error.TestUnscheduledParticipant;
+        }
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+        fn check(self: *@This(), borrow: runnable_abi.Borrowed) !void {
+            try borrow.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 1), borrow.cpu_slots);
+            try std.testing.expectEqual(runnable_abi.Class.write, try borrow.currentClass());
+            try std.testing.expectEqual(@as(usize, 2), self.root.entry.?.children);
+            try std.testing.expect(self.memory.used.load(.acquire) > 0);
+        }
+        fn beginControlled(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.check(borrow);
+            try std.testing.expectEqual(group == 7001, borrow.context == self.root_context);
+            _ = self.begins.fetchAdd(1, .acq_rel);
+        }
+        fn prepareControlled(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest, borrow: runnable_abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.check(borrow);
+            try std.testing.expect(borrow.context != self.root_context);
+            _ = self.prepares.fetchAdd(1, .acq_rel);
+        }
+        fn resolveControlled(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnResolveRequest, _: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.check(borrow);
+            try std.testing.expectEqual(group == 7001, borrow.context == self.root_context);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            _ = self.resolves.fetchAdd(1, .acq_rel);
+        }
+        fn acknowledgeControlled(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+            try borrow.checkLifetime();
+            try acknowledge(raw, alloc, group, table, req);
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 7001), group);
+            try std.testing.expectEqual(@as(usize, 2), self.root.entry.?.children);
+            self.acknowledgements += 1;
+        }
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .acknowledge_group_with_execution = acknowledgeControlled, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
+        }
+    };
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    const Case = enum { success, allocator_denied, operation_denied };
+    for (std.enums.values(Case)) |case| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = if (case == .operation_denied) 4 else 16 });
+        defer scheduler.close();
+        var memory: allocation.Shared = .{ .child = std.testing.allocator, .limit = if (case == .allocator_denied) 0 else 64 * 1024 };
+        var root: native.Execution = .{};
+        defer root.finish();
+        try root.start(&scheduler, .{ .io = io, .retained_bytes = 256 }, .write);
+        var bridge = try writes.Completion.init(&root, memory.allocator());
+        var team = try bridge.team();
+        try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s });
+        try team.borrow.activateCompletion();
+        var recorder: Recorder = .{ .root = &root, .memory = &memory, .root_context = team.borrow.context };
+        const outcome = executeMultiTableCommitWithOptions(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), @splat(1), 10000, 10001, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, .write, null, .{ .team = &team, .fanout_io = io, .max_parallel_participants = 2 });
+        if (case == .success) {
+            const result = try outcome;
+            try std.testing.expect(result == .committed);
+            try std.testing.expect(!result.committed.propagation_pending);
+            try std.testing.expectEqual(@as(usize, 2), result.committed.participant_count);
+            try std.testing.expectEqual(@as(usize, 2), recorder.begins.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), recorder.prepares.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 2), recorder.resolves.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), recorder.acknowledgements);
+            try std.testing.expect(team.state == .joined);
+        } else {
+            try std.testing.expectError(if (case == .allocator_denied) error.OutOfMemory else error.SchedulerFull, outcome);
+            try std.testing.expectEqual(@as(usize, 0), recorder.begins.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), recorder.prepares.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), recorder.resolves.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), recorder.acknowledgements);
+            if (case == .allocator_denied) {
+                try std.testing.expect(team.state == .fresh);
+            } else {
+                try std.testing.expect(team.state == .joined);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), root.entry.?.children);
+        try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
+    }
+}
+
+test "distributed txn independently scheduled hosted coordinator waits preserve original budget and health progress" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const writes = @import("runnable_write_team.zig");
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    const Executor = struct {
+        scheduler: *native.Scheduler,
+        root: *native.Execution,
+        ceiling_ms: u32 = 14000,
+        calls: usize = 0,
+        many: usize = 0,
+        fail_resume: bool = false,
+        uncertain_many: bool = false,
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const timeout = request.timeout_ms orelse return error.TestMissingTimeout;
+            try std.testing.expect(timeout > 0 and timeout <= self.ceiling_ms);
+            const wait = request.execution_wait orelse return error.TestMissingExecutionWait;
+            try wait.beginWait();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            var health: native.Execution = .{};
+            defer health.finish();
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try health.checkpoint();
+            health.finish();
+            if (self.fail_resume) Clock.current = 20 * std.time.ns_per_s;
+            try wait.endWait();
+            try std.testing.expectEqual(native.Class.write, try self.root.retainedClass());
+            if (std.mem.endsWith(u8, request.uri, "/txn-acknowledge-many")) {
+                self.many += 1;
+                if (self.uncertain_many) return http_route_helpers.textResponseWithHeaders(alloc, 404, "write outcome unknown", &.{.{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_unknown_v1 }});
+                return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+            }
+            return .{ .status = 200, .body = try alloc.dupe(u8, if (std.mem.endsWith(u8, request.uri, "/txn-status")) "{\"status\":\"committed\"}" else "") };
+        }
+    };
+    Clock.current = 0;
+    defer Clock.current = 0;
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var root: native.Execution = .{};
+    defer root.finish();
+    try root.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 5 * std.time.ns_per_s, .retained_bytes = 256 }, .write);
+    var bridge = try writes.Completion.init(&root, std.testing.allocator);
+    var team = try bridge.team();
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 20 * std.time.ns_per_s });
+    try team.borrow.activateCompletion();
+    Clock.current = 6 * std.time.ns_per_s;
+    var executor: Executor = .{ .scheduler = &scheduler, .root = &root };
+    var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+    var worker = hosted.worker();
+    worker.execution_runnable = team.borrow;
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try worker.statusGroup(std.testing.allocator, 7001, "docs", @splat(1)));
+    Clock.current = 10 * std.time.ns_per_s;
+    executor.ceiling_ms = 10000;
+    try worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{ "table2:00000004:docs:7002", "table2:00000004:docs:7003" } });
+    try std.testing.expectEqual(@as(usize, 1), executor.many);
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.uncertain_many = true;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7002"} }));
+    // An uncertain batch cannot be converted into claimed per-participant ACKs.
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    executor.uncertain_many = false;
+    const retry_limit = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    executor.ceiling_ms = 2000;
+    try worker.resolveGroupUntil(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 }, retry_limit);
+    try std.testing.expect(hosted.execution_wait == null and hosted.execution_deadline_ns == null);
+    try sleepRecoveryNs(std.time.ns_per_ms, team.borrow);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    executor.ceiling_ms = 10000;
+    executor.fail_resume = true;
+    try std.testing.expectError(error.DeadlineExceeded, worker.acknowledgeGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:7002" }));
+    const before = executor.calls;
+    try std.testing.expectError(error.DeadlineExceeded, worker.statusGroup(std.testing.allocator, 7001, "docs", @splat(1)));
+    try std.testing.expectEqual(before, executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    root.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "distributed txn independently scheduled recovery backoff attempts original resumption exactly once" {
+    const runtime = @import("antfly_runtime_abi");
+    const Probe = struct {
+        parks: usize = 0,
+        enters: usize = 0,
+        fn ok(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            out.* = @backingInt(runnable_abi.Class.write);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(reason == @backingInt(runnable_abi.Wait.resource));
+            self.parks += 1;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(class == @backingInt(runnable_abi.Class.write));
+            self.enters += 1;
+            return runtime.error_abi.statusFromError(error.SchedulerClosed);
+        }
+    };
+    var probe: Probe = .{};
+    const borrow: runnable_abi.Borrowed = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Probe.ok, .check_lifetime = Probe.ok, .current_class = Probe.current, .park = Probe.park, .enter = Probe.enter };
+    try std.testing.expectError(error.SchedulerClosed, sleepRecoveryNs(0, borrow));
+    try std.testing.expectEqual(@as(usize, 1), probe.parks);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+}
+
+test "distributed txn independently scheduled coordinator rejects legacy unscoped callback fallback" {
+    const runtime = @import("antfly_runtime_abi");
+    const Probe = struct {
+        calls: usize = 0,
+        fn ok(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("unexpected CPU transition");
+        }
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            @panic("unexpected legacy BEGIN");
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            @panic("unexpected legacy prepare");
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            @panic("unexpected legacy resolve");
+        }
+        fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .pending;
+        }
+        fn ack(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn ackMany(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeManyRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{};
+    const worker: ParticipantWorker = .{ .ptr = &probe, .execution_runnable = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Probe.ok, .check_lifetime = Probe.ok, .park = Probe.transition, .enter = Probe.transition }, .vtable = &.{ .begin_group = Probe.begin, .prepare_group = Probe.prepare, .resolve_group = Probe.resolve, .status_group = Probe.status, .acknowledge_group = Probe.ack, .acknowledge_many_group = Probe.ackMany } };
+    const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.statusGroup(std.testing.allocator, 1, "docs", @splat(1)));
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.statusGroupUntil(std.testing.allocator, 1, "docs", @splat(1), deadline));
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.resolveGroupUntil(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 }, deadline));
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:2" }));
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeManyGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:2"} }));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
 }
