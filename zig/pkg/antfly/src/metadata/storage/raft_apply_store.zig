@@ -374,6 +374,23 @@ test "system catalog relation namespace transaction ALTER naming pins exact tabl
     defer plan.deinit();
     try std.testing.expectEqualStrings("items_id_check2", plan.admission.names[0].name);
     try plan.admission.validateSchema(a, plan.schema_json);
+    var named_guard = guard;
+    named_guard.constraint_name_admission = plan.admission;
+    const expected: metadata.TableRecord = .{ .table_id = 7, .name = "items", .schema_json = base };
+    var replacement = expected;
+    replacement.schema_json = plan.schema_json;
+    const command: TransitionCommand = .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement, .relation_guard = named_guard } };
+    const encoded = try encodeTransitionCommand(a, command);
+    defer a.free(encoded);
+    var decoded = (try decodeTransitionCommand(a, encoded)).?;
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("items_id_check2", decoded.compare_and_replace_table.relation_guard.?.constraint_name_admission.?.names[0].name);
+    const canonical = try encodeTransitionCommand(a, decoded);
+    defer a.free(canonical);
+    try std.testing.expectEqualSlices(u8, encoded, canonical);
+    const before = try store.standaloneRevision();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, decoded));
+    try std.testing.expectEqual(before, try store.standaloneRevision());
     var wrong_kind = guard;
     wrong_kind.owner.kind = .index;
     try std.testing.expectError(error.SqlWrongObjectType, store.prepareGeneratedConstraintAddition(a, group, wrong_kind, fragment, &.{"anonymous"}, .{}));
@@ -20681,7 +20698,7 @@ pub const RaftApplyStore = struct {
             },
             .compare_and_replace_table => |replacement| {
                 if (replacement.relation_guard) |guard| self.validateRelationMutationTxn(txn, group_id, guard, replacement.expected, replacement.replacement) catch |err| switch (err) {
-                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject => return,
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject => return,
                     else => return err,
                 };
                 try self.applyTableCompareAndReplaceTxn(
@@ -22874,8 +22891,9 @@ pub const RaftApplyStore = struct {
     ) !void {
         try guard.validate();
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.relation_mutation_version);
-        if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
+        const required = if (guard.constraint_name_admission != null) topology_protocol.constraint_occupancy_version else topology_protocol.relation_mutation_version;
+        const activation = try self.standbyRelationActivationTxn(txn, group_id, required);
+        if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
         const epoch = try relationSourceEpochTxn(txn, group_id);
         if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
         var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
@@ -22884,6 +22902,8 @@ pub const RaftApplyStore = struct {
         const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
         const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
         if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
+        if (guard.constraint_name_admission) |admission|
+            try self.validateConstraintNameOccupancyTxn(self.alloc, txn, group_id, admission, namespace_id, replacement.schema_json);
         var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
         defer if (binding) |*value| value.deinit();
         if (binding) |value| {
@@ -28804,7 +28824,8 @@ fn readBackupCohortSeal(alloc: std.mem.Allocator, encoded: []const u8, pos: *usi
 
 fn readRelationMutationGuard(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !system_catalog.RelationMutationGuard {
     const len = try readInt(encoded, pos, u32);
-    // Four bounded names, owner fields and JSON escaping fit within 8 KiB.
+    // Four route names, one optional selected name, owner fields and JSON
+    // escaping fit within 8 KiB. Guard validation bounds additive proofs.
     // Check before allocating or parsing, including hostile persisted frames.
     if (len == 0 or len > 8192 or len > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
     const json = encoded[pos.*..][0..len];

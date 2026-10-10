@@ -3395,9 +3395,33 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// New wire shapes must never be appended merely because the leader can
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
+fn carriesConstraintNameAdmission(bytes: []const u8) bool {
+    return @import("constraint_name_wire.zig").requiresOccupancy(bytes, relation_catalog.max_command_bytes);
+}
+
+test "relation mutation admission projects naming capability without materializing schema bytes" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 64 * 1024);
+    defer a.free(large);
+    @memset(large, '"');
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .child = .{ .schema_json = large }, .constraint_name_admission = @as(?u64, null) } }, .{});
+    defer a.free(legacy);
+    try std.testing.expect(!carriesConstraintNameAdmission(legacy));
+    const named = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .child = .{ .schema_json = large }, .constraint_name_admission = .{ .namespace_id = 2, .names = &.{"unused projection"} } } }, .{});
+    defer a.free(named);
+    try std.testing.expect(carriesConstraintNameAdmission(named));
+    try std.testing.expect(!carriesConstraintNameAdmission("{\"version\":1,\"constraint_name_admission\":null}"));
+    for ([_][]const u8{ "{", "{\"version\":2}", "{\"plan\":{\"constraint_name_admission\":{}}}" }) |invalid|
+        try std.testing.expect(carriesConstraintNameAdmission(invalid));
+}
+
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
-        return metadata_topology_protocol.relation_mutation_version;
+    if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_fk_initial_create and carriesConstraintNameAdmission(command.apply_fk_initial_create))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard|
+        return if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();
@@ -3536,8 +3560,8 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
 
 /// Capability observation alone does not install the apply-side barrier. Own
 /// and observe its durable receipt before admitting the user's guarded write.
-fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext) !void {
-    const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.relation_mutation_version);
+fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext, required_version: u16) !void {
+    const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     const activation: metadata_topology_protocol.Activation = .{
         .version = readiness.required_version,
         .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
@@ -6829,7 +6853,7 @@ pub const MetadataService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context);
+        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -9875,7 +9899,7 @@ pub const MetadataHttpService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureRelationMutationActivation(self, context);
+        try ensureRelationMutationActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -13411,6 +13435,24 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{});
     try relation_service.propose(&.{relation_mutation_command});
     try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    var naming_command = relation_mutation_command;
+    naming_command.compare_and_replace_table.relation_guard.?.owner.kind = .table;
+    naming_command.compare_and_replace_table.relation_guard.?.target.name = plain.name;
+    naming_command.compare_and_replace_table.relation_guard.?.constraint_name_admission = .{ .namespace_id = 2, .names = &.{.{ .name = "items_id_check", .kind = .check }} };
+    const naming_version = metadata_topology_protocol.constraint_occupancy_version;
+    try naming_command.compare_and_replace_table.relation_guard.?.validate();
+    try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(naming_command));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&relation_service, naming_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{naming_command}));
+    try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    const naming_catalog: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"version\":2,\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}" };
+    const naming_fk: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}" };
+    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk }) |named| {
+        try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(named));
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{named}));
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{ legacy, named }));
+        try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
+    }
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
     const root_bound_store: metadata_table_manager.StoreRecord = .{
@@ -13495,11 +13537,12 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     mixed.cache.cached.?.readiness.term += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
     try std.testing.expectEqual(@as(usize, 4), mixed.appended);
+    const adoption_readiness = try Fake.proof(metadata_topology_protocol.relation_reconciliation_version);
     const relation_bytes = try (@import("relation_reconciliation_command.zig").Command{ .adopt = .{
-        .version = metadata_topology_protocol.relation_reconciliation_version,
-        .incarnation = "0123456789abcdef0123456789abcdef".*,
-        .member_count = 3,
-        .membership_fingerprint = @splat(7),
+        .version = adoption_readiness.required_version,
+        .incarnation = adoption_readiness.metadata_incarnation.?,
+        .member_count = adoption_readiness.protected_member_count,
+        .membership_fingerprint = adoption_readiness.protected_membership_fingerprint,
     } }).encodeAlloc(std.testing.allocator);
     defer std.testing.allocator.free(relation_bytes);
     const relation_command: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = relation_bytes };

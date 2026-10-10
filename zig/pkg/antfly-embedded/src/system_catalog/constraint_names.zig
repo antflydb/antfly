@@ -181,6 +181,12 @@ pub const Admission = struct {
         return .{ .namespace_id = self.namespace_id, .names = result };
     }
 
+    pub fn deinitOwned(self: *Admission, a: std.mem.Allocator) void {
+        for (self.names) |entry| a.free(entry.name);
+        a.free(self.names);
+        self.* = undefined;
+    }
+
     /// Match each predicate once to its actual final schema declaration.
     /// Hash lookup keeps validation linear, rather than rescanning the schema
     /// once for every selected name. Explicit declarations need no predicate.

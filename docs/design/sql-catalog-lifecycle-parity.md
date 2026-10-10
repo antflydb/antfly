@@ -528,7 +528,9 @@ baseline schema. It checks incarnation, namespace binding, relation kind and
 the exact current owner in one read transaction, then loads that owner's schema
 by table identity. Changes to unrelated owners use current occupancy without a
 global captured-source-epoch CAS. Native regressions cover stale owners, wrong
-incarnations/kinds and schema-only changes; their fresh gate is running.
+incarnations/kinds, schema-only changes and physical schema substitution. The
+native gate passes 48 tests, using a schema projection whose digest is checked
+against the pinned owner rather than decoding unrelated table settings.
 
 The shared naming gate passes eleven tests in Debug and ReleaseFast, including
 deterministic allocation-fault sweeps. The sweeps also exposed and fixed an
@@ -593,3 +595,34 @@ lower-capability preflight rejection and committed nonreservation followed by
 successful legacy admission; that gate and the forwarding/coordinator gate
 are still running at this checkpoint. Public activation remains disabled,
 and no original case disposition is credited by these component tests.
+
+### Atomic relation-mutation name predicates and final decoder admission
+
+The existing relation mutation guard now carries one optional additive-name
+predicate with owned cloning, decoding and destruction. Absent predicates retain
+the previous JSON bytes. Guard shape validation keeps the existing 8 KiB frame
+bound, rejects index-owner/multi-action misuse, and validates names before
+allocation. The native replacement guard requires durable occupancy capability
+and checks the selected name against the current covered namespace inside the
+same transaction as owner/binding validation, before replacement writes.
+
+Naming-enabled relation replacements, catalog commands and hidden FK CREATE
+commands now require capability 34 at the final single/batch proposal boundary,
+not only the workflow's earlier readiness probe. JSON command classification
+projects the capability marker with a fixed 4 KiB allocator; large escaped schema
+strings are skipped rather than materialized. Malformed, future and exhausted
+projections fail closed to the newer admission requirement. Ordinary legacy
+frames keep their predecessor classification.
+
+The native catalog gate passes 48 tests including named-guard codec roundtrip
+and lower-capability nonadmission without revision changes. Two guard ownership,
+legacy-wire and allocation-fault tests pass in Debug and ReleaseFast. The pure
+wire projection gate also passes in both modes with a 64 KiB escaped schema.
+An earlier coordinator run exposed a fixture using a synthetic adoption
+fingerprint instead of its readiness proof. The fixture now uses the exact
+protected count/fingerprint; stale-count and moved-fingerprint rejection tests
+remain. The corrected coordinator gate is running, and no pass is claimed yet.
+
+Public ALTER still needs the preparation RPC and publication wiring for ordinary
+schema changes, rewrite jobs and FK generation transitions. Advertised capability
+remains 33; no original case disposition changes at this checkpoint.

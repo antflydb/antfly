@@ -909,12 +909,27 @@ pub const RelationMutationGuard = struct {
     logical_table: []const u8,
     owner: @import("relation_names.zig").Owner,
     incarnation: [16]u8,
+    constraint_name_admission: ?@import("constraint_names.zig").Admission = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.constraint_name_admission == null) return writer.write(.{ .target = self.target, .logical_table = self.logical_table, .owner = self.owner, .incarnation = self.incarnation });
+        try writer.write(.{ .target = self.target, .logical_table = self.logical_table, .owner = self.owner, .incarnation = self.incarnation, .constraint_name_admission = self.constraint_name_admission });
+    }
 
     pub fn validate(self: @This()) !void {
         try self.target.validate();
         try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
         try self.owner.validate();
         if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+        if (self.constraint_name_admission) |admission| {
+            // One additive ALTER constraint fits the existing bounded guard
+            // frame. Multi-action DDL requires its own bounded plan contract.
+            if (self.owner.kind != .table or !std.mem.eql(u8, self.target.name, self.logical_table) or
+                admission.namespace_id == 0 or admission.names.len != 1) return error.InvalidCatalogMutation;
+            const name = admission.names[0].name;
+            if (name.len == 0 or name.len > @import("constraint_names.zig").max_name_bytes or
+                std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidCatalogMutation;
+        }
     }
 
     pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
@@ -922,6 +937,7 @@ pub const RelationMutationGuard = struct {
         alloc.free(self.target.namespace);
         alloc.free(self.target.name);
         alloc.free(self.logical_table);
+        if (self.constraint_name_admission) |*admission| admission.deinitOwned(alloc);
         self.* = undefined;
     }
 
@@ -933,9 +949,58 @@ pub const RelationMutationGuard = struct {
         errdefer alloc.free(namespace);
         const name = try alloc.dupe(u8, self.target.name);
         errdefer alloc.free(name);
-        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+        const logical_table = try alloc.dupe(u8, self.logical_table);
+        errdefer alloc.free(logical_table);
+        const admission = if (self.constraint_name_admission) |value| try value.dupe(alloc) else null;
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = logical_table, .owner = self.owner, .incarnation = self.incarnation, .constraint_name_admission = admission };
     }
 };
+
+fn relationGuardOwnershipCase(a: std.mem.Allocator) !void {
+    const guard: RelationMutationGuard = .{
+        .target = .{ .name = "items" },
+        .logical_table = "items",
+        .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(1),
+        .constraint_name_admission = .{ .namespace_id = 2, .names = &.{.{ .name = "items_id_check", .kind = .check }} },
+    };
+    var owned = try guard.clone(a);
+    defer owned.deinitOwned(a);
+    try std.testing.expect(owned.constraint_name_admission.?.names.ptr != guard.constraint_name_admission.?.names.ptr);
+    try std.testing.expect(owned.constraint_name_admission.?.names[0].name.ptr != guard.constraint_name_admission.?.names[0].name.ptr);
+    const bytes = try std.json.Stringify.valueAlloc(a, owned, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(RelationMutationGuard, a, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try std.testing.expectEqualStrings("items_id_check", parsed.value.constraint_name_admission.?.names[0].name);
+}
+
+test "system catalog relation guard owns additive name predicates across decoding and allocation faults" {
+    try relationGuardOwnershipCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, relationGuardOwnershipCase, .{});
+}
+
+test "system catalog relation guard preserves legacy JSON and rejects oversized additive proofs" {
+    const a = std.testing.allocator;
+    var guard: RelationMutationGuard = .{
+        .target = .{ .name = "items" },
+        .logical_table = "items",
+        .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(1),
+    };
+    const legacy = try std.json.Stringify.valueAlloc(a, .{ .target = guard.target, .logical_table = guard.logical_table, .owner = guard.owner, .incarnation = guard.incarnation }, .{});
+    defer a.free(legacy);
+    const bytes = try std.json.Stringify.valueAlloc(a, guard, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(legacy, bytes);
+    const selected = @import("constraint_names.zig").Selected{ .name = "items_id_check", .kind = .check };
+    guard.constraint_name_admission = .{ .namespace_id = 2, .names = &.{ selected, selected } };
+    try std.testing.expectError(error.InvalidCatalogMutation, guard.validate());
+    guard.constraint_name_admission = .{ .namespace_id = 2, .names = &.{selected} };
+    guard.owner.kind = .index;
+    try std.testing.expectError(error.InvalidCatalogMutation, guard.validate());
+}
 
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
