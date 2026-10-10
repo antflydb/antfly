@@ -1,0 +1,52 @@
+{
+  "project": "antfly-dev-01",
+  "bucket": "colony-import-sources-antfly-dev-01",
+  "prefix": "hn-poc/20261009-full-portability-2b1f7524d047/archive",
+  "object_count": 334,
+  "bytes": 21195813507,
+  "rows": 47717307,
+  "note": "Generation-fenced footer inventory; source bodies were not downloaded.",
+  "inventory_sha256": "411937231d695319998b41ba8d0f822be6a98bcac96443f1f40e3357811e7042",
+  "max_row_group_rows": 145186,
+  "archive_latency_qualified": false,
+  "date": "2026-10-10",
+  "baseline": {
+    "revision": "083142678ceda2b11fdc352e5991af0ecfed55f9",
+    "harness_revision": "6a6467b650",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast",
+    "binary_sha256": "275ea8fb119cfb052c19295bdd2c2069a58450c65450b294410e203e188d0442",
+    "resources": {
+      "cpu": 8,
+      "memory_gib": 48,
+      "disk_gib": 10
+    },
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "ParquetRowGroupTooLarge",
+    "table_registration_ms": 49582.25,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 36,
+    "derived_bytes_deleted": 102278
+  },
+  "fix": {
+    "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
+    "shape": "Decode column vectors without per-column physical row-reference arrays; aligned cursors generate references once per output batch.",
+    "parquet_tests_passed": 132,
+    "lake_sql_tests_passed": 31,
+    "wide_page_rows": 145186,
+    "wide_page_columns": 12,
+    "output_batch_max_rows": 4096,
+    "single_column_measured_peak_bytes": 4065504,
+    "single_column_allocator_budget_bytes": 5592404,
+    "regional_rerun_status": "building_optimized_binary"
+  },
+  "budget": {
+    "approved_ceiling_usd": 150,
+    "prior_work_reserved_usd": 25,
+    "first_attempt_reserved_usd": 20,
+    "second_attempt_reserved_usd": 0,
+    "note": "Reservations are conservative allowances, not measured cloud billing."
+  }
+}

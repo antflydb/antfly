@@ -628,3 +628,21 @@ or latency gates fail. Never interpret an index-build failure as successful
 archive qualification. The configuration targets the pinned 47,717,307-row
 export; an expired or changed source requires a newly reviewed inventory/config.
 The temporary bucket is unsuitable for the public service's durable storage.
+
+### October 10 full-archive baseline
+
+[archive-results-20261010.json](archive-results-20261010.json) records the pinned
+47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
+took 49.6 seconds, then publication failed with `ParquetRowGroupTooLarge` before
+SQL counts or search timings could be measured. The temporary pod and its 36
+small derived objects were deleted; the source export was preserved.
+
+The follow-up decoder separates column-vector ownership from physical row
+references. Streaming cursors create references once per bounded output batch
+instead of retaining a complete reference array for each column page. Existing
+materialization limits remain in force. A 12-column, 145,186-row regression
+covers cached/uncached reads and correct references across 4,096-row batches;
+one column's measured allocation peak was 4,065,504 bytes within its combined
+5,592,404-byte payload/structure allowance. The 132 focused Parquet and 31 lake
+SQL tests passed. The optimized cloud rerun must complete before archive latency
+can be claimed.

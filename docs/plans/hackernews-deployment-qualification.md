@@ -14,7 +14,8 @@ Use `examples/hackernews/archive-qualification.json` and
 `--execute` verifies the live GCS object generations, reserves a run allowance,
 and launches one temporary same-region pod through `regional.py`. Results retain
 the source inventory, binary digest/revision, admitted pod, raw samples, logs,
-and a verdict. Index construction failure fails the gate before query latency
+and a verdict. Registration plus publication is included in the initial build-time gate.
+Index construction failure fails the gate before query latency
 can be qualified. An interrupted run also consumes its reservation.
 
 The existing immutable export contains 47,717,307 live story/comment rows in 334

@@ -92,6 +92,10 @@ class ArchiveQualificationTest(unittest.TestCase):
         self.regional["runs"]["indexed"][0]["warm_samples_ms"] = [100]
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
 
+    def test_registration_is_part_of_the_initial_publication_gate(self):
+        self.regional["runs"]["indexed"][0]["registration_seconds"] = 3000
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+
     def test_source_mismatch_fails_before_cloud_work(self):
         self.inventory["rows"] -= 1
         with self.assertRaisesRegex(ValueError, "rows differs"):

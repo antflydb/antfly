@@ -182,7 +182,8 @@ def assess(regional, config):
                 "concurrent_max_ms": max(report["concurrent_search_ms"]),
                 "restart_ms": report["after_restart_ms"],
                 "cold_ms": report["first_search_ms"],
-                "build_seconds": report["ready_seconds"],
+                "build_seconds": report["ready_seconds"]
+                + report.get("registration_seconds", 0),
             }
             if len(report["concurrent_search_ms"]) != config["concurrency"]:
                 failures.append(f"{label}: insufficient concurrency coverage")

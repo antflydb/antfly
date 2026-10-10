@@ -264,7 +264,9 @@ def main():
     try:
         start()
         existing = call("GET", "/tables")
+        registration_seconds = 0
         if "hn_archive_poc" not in json.dumps(existing):
+            registration_started = time.monotonic()
             call(
                 "POST",
                 "/tables/hn_archive_poc",
@@ -287,6 +289,7 @@ def main():
                     "indexes": {"body_text": {"type": "full_text", "field": "body"}},
                 },
             )
+            registration_seconds = round(time.monotonic() - registration_started, 2)
         phase = "index_build"
         started = time.monotonic()
         build_before = resource_counters()
@@ -619,6 +622,7 @@ def main():
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
+            "registration_seconds": registration_seconds,
             "build_profile": build_profile,
             "build_peak_rss_bytes": peak_rss_bytes,
             "first_search_ms": first_ms,
@@ -658,6 +662,14 @@ def main():
     except Exception as exc:
         # Do not persist arbitrary provider error bodies or credentials.
         failure = {"phase": phase, "exception": type(exc).__name__}
+        if "started" in locals():
+            failure["elapsed_since_build_start_seconds"] = round(
+                time.monotonic() - started, 2
+            )
+        if "registration_seconds" in locals():
+            failure["registration_seconds"] = registration_seconds
+        if "peak_rss_bytes" in locals():
+            failure["build_peak_rss_bytes"] = peak_rss_bytes
         if phase == "index_build" and "status" in locals():
             failure["index_status"] = status
         (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
