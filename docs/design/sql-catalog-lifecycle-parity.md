@@ -1,6 +1,6 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: follow-up to merged PR #1048, merged with `origin/main` at `c0562216e1`.
+Status: follow-up to merged PR #1048, merged with `origin/main` at `b7e4f43a30`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -536,3 +536,28 @@ and the native catalog gate passed 45 tests. The broader SQL gate passed
 703 local and 226 native tests before this admission integration. After
 merging main at b7e4f43a30, the focused naming gate passes again; the fresh
 native catalog gate is still running at this checkpoint.
+
+### Hidden FK CREATE prepared-name integration
+
+Hidden FK CREATE now carries trusted compiler provenance through its private
+preparation request. Metadata selects names from the same read transaction
+as the catalog identity and child placement, before witness generation and
+plan fingerprinting. The returned owned schema and exact name predicates are
+retained in the initial plan. Begin revalidates the predicates inside its
+reservation transaction, before any hidden identity or support work is written.
+The coordinator requires occupancy capability for naming-enabled plans; apply
+independently checks durable capability. Defeated admission predicates are
+safe committed begin no-ops, while malformed records and storage failures
+remain errors. Preparation honors request cancellation and preserves definite
+naming diagnostics across the private read-only HTTP call.
+
+Absent provenance/predicates are omitted from legacy request, preparation and
+plan JSON. A byte-for-byte legacy plan regression protects existing durable
+digest inputs. Native tests cover covered-root preparation, CHECK/FK collision
+policy, namespace binding, and preparation without catalog revision changes.
+The native catalog gate passes 47 tests, including the final pre-write-only
+no-op guard refinement and schema-only competing-writer regression. A separate initial-FK gate exercises
+lower-capability preflight rejection and committed nonreservation followed by
+successful legacy admission; that gate and the forwarding/coordinator gate
+are still running at this checkpoint. Public activation remains disabled,
+and no original case disposition is credited by these component tests.

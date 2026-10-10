@@ -122,6 +122,18 @@ pub fn build(
     target: domain.Target,
     request: tables.CreateTableRequest,
 ) !publication.InitialCreatePlan {
+    return buildWithGeneratedNames(server, alloc, context, identity, target, request, &.{});
+}
+
+pub fn buildWithGeneratedNames(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+) !publication.InitialCreatePlan {
     try context.ensureActive();
     const logical_child = try target.resourceNameAlloc(alloc);
     defer alloc.free(logical_child);
@@ -143,6 +155,7 @@ pub fn build(
         .tablespace_name = request.tablespace_name,
         .min_ranges_explicit = request.num_shards != null,
         .candidate = candidate,
+        .generated_constraint_names = generated_constraint_names,
     } });
     const prepared = try std.json.parseFromSliceLeaky(publication.InitialCreatePrepare, alloc, prepare_bytes, .{ .allocate = .alloc_always });
     var child = prepared.child;
@@ -247,8 +260,10 @@ pub fn build(
         .logical_name = try alloc.dupe(u8, target.table),
         .namespace_id = namespace_id,
     };
-    try plan.validate(alloc);
-    return plan;
+    var named_plan = plan;
+    named_plan.constraint_name_admission = prepared.constraint_name_admission;
+    try named_plan.validate(alloc);
+    return named_plan;
 }
 
 /// Seal a durable support reservation only after every touched parent has

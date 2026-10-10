@@ -347,6 +347,96 @@ test "system catalog relation namespace transaction prepared names pin native co
     defer explicit.deinit();
 }
 
+test "system catalog relation namespace transaction hidden FK legacy plan digests retain their wire shape" {
+    const a = std.testing.allocator;
+    const plan: fk_generation_publication.InitialCreatePlan = .{
+        .id = @splat(1),
+        .retirement_scope = .local_owner,
+        .catalog_id = 3,
+        .expected_catalog_revision = 0,
+        .child = .{ .table_id = 7, .name = "table:3", .schema_json = "{}" },
+        .child_ranges = &.{},
+        .parents = &.{},
+        .logical_name = "t",
+        .namespace_id = system_catalog.default_namespace_id,
+    };
+    const legacy = .{
+        .id = plan.id,
+        .retirement_scope = plan.retirement_scope,
+        .catalog_id = plan.catalog_id,
+        .expected_catalog_revision = plan.expected_catalog_revision,
+        .tablespace_id = plan.tablespace_id,
+        .min_ranges_explicit = plan.min_ranges_explicit,
+        .child = plan.child,
+        .child_ranges = plan.child_ranges,
+        .parents = plan.parents,
+        .support_pending = plan.support_pending,
+        .self_transitions = plan.self_transitions,
+        .logical_name = plan.logical_name,
+        .namespace_id = plan.namespace_id,
+    };
+    const old_bytes = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    defer a.free(old_bytes);
+    const new_bytes = try std.json.Stringify.valueAlloc(a, plan, .{});
+    defer a.free(new_bytes);
+    try std.testing.expectEqualStrings(old_bytes, new_bytes);
+    var named = plan;
+    named.constraint_name_admission = .{ .namespace_id = plan.namespace_id, .names = &.{.{ .name = "t_id_fkey", .kind = .foreign_key }} };
+    const named_bytes = try std.json.Stringify.valueAlloc(a, named, .{});
+    defer a.free(named_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, named_bytes, "constraint_name_admission") != null);
+    var decoded = try std.json.parseFromSlice(fk_generation_publication.InitialCreatePlan, a, named_bytes, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("t_id_fkey", decoded.value.constraint_name_admission.?.names[0].name);
+}
+
+test "system catalog relation namespace transaction hidden FK prepares names before fingerprinting" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-fk-names", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    const request: fk_generation_publication.InitialCreatePrepareRequest = .{
+        .namespace_id = system_catalog.default_namespace_id,
+        .logical_name = "t",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = "{\"checks\":[{\"name\":\"anonymous_check\",\"expression\":{\"op\":\"column\",\"column\":\"id\"}}],\"foreign_keys\":[{\"name\":\"anonymous_fk\",\"child_columns\":[\"id\"],\"parent_table\":\"parent\",\"parent_columns\":[\"id\"]}]}" },
+        .generated_constraint_names = &.{ "anonymous_check", "anonymous_fk" },
+    };
+    try std.testing.expectError(error.CatalogOccupancyNotReady, store.fkInitialCreatePrepareJson(a, group, request));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "t_id_check", .schema_json = "{\"version\":1}" } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "holder", .schema_json = "{\"version\":1,\"checks\":[{\"name\":\"t_id_fkey\"}]}" } });
+    try adoptRelationWriterForTest(&store, a, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+    const before = try store.systemCatalogMeta(a, group);
+    const bytes = try store.fkInitialCreatePrepareJson(a, group, request);
+    defer a.free(bytes);
+    var prepared = try std.json.parseFromSlice(fk_generation_publication.InitialCreatePrepare, a, bytes, .{});
+    defer prepared.deinit();
+    const admission = prepared.value.constraint_name_admission.?;
+    try std.testing.expectEqualStrings("t_id_check", admission.names[0].name);
+    try std.testing.expectEqualStrings("t_id_fkey1", admission.names[1].name);
+    try admission.validateSchema(a, prepared.value.child.schema_json);
+    try std.testing.expectEqual(before.revision, prepared.value.expected_catalog_revision);
+    try std.testing.expectEqual(before.revision, (try store.systemCatalogMeta(a, group)).revision);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try store.validateConstraintNameOccupancyTxn(a, &txn, group, admission, request.namespace_id, prepared.value.child.schema_json);
+        try std.testing.expectError(error.InvalidCatalogRecord, store.validateConstraintNameOccupancyTxn(a, &txn, group, admission, request.namespace_id + 1, prepared.value.child.schema_json));
+    }
+    // A schema-only competing writer can claim the chosen name without
+    // changing catalog revision. The frozen predicate must still lose.
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "holder", .schema_json = "{\"version\":2,\"checks\":[{\"name\":\"t_id_fkey\"},{\"name\":\"t_id_fkey1\"}]}" } });
+    try std.testing.expectEqual(before.revision, (try store.systemCatalogMeta(a, group)).revision);
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.CatalogGenerationChanged, store.validateConstraintNameOccupancyTxn(a, &txn, group, admission, request.namespace_id, prepared.value.child.schema_json));
+}
+
 test "system catalog relation namespace transaction bulk resolution requires a live root and follows schema ownership" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -4148,6 +4238,17 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     try plan.validate(alloc);
     const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
     defer alloc.free(begin);
+    // A prepared predicate is not permission to use a new wire/occupancy
+    // capability. Both preflight and committed apply must reject before any
+    // hidden identity is reserved; the legacy begin below must still succeed.
+    var named_plan = plan;
+    named_plan.constraint_name_admission = .{ .namespace_id = plan.namespace_id, .names = &.{.{ .name = "self_fk", .kind = .foreign_key }} };
+    const named_begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.InitialCommand{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = named_plan }, .{});
+    defer alloc.free(named_begin);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.preflightFkInitialCreateCommand(group_id, named_begin));
+    const before_named = try store.systemCatalogMeta(alloc, group_id);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = named_begin });
+    try std.testing.expectEqual(before_named.revision, (try store.systemCatalogMeta(alloc, group_id)).revision);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin });
     const hidden_group_id = prepared.value.child_ranges[0].group_id;
     try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
@@ -13057,6 +13158,11 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
+        return self.fkInitialCreatePrepareJsonWithContext(alloc, group_id, request, .{});
+    }
+
+    pub fn fkInitialCreatePrepareJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
         if (request.namespace_id == 0 or request.logical_name.len == 0 or request.logical_name.len > 256 or
             request.candidate.table_id != 0 or request.candidate.name.len != 0 or
             !try fk_generation_publication.schemaHasForeignKeys(self.alloc, request.candidate.schema_json))
@@ -13083,6 +13189,13 @@ pub const RaftApplyStore = struct {
             return error.GenerationPublicationChanged;
         const physical_name = try std.fmt.allocPrint(a, "table:{d}", .{meta.next_id});
         var child = request.candidate;
+        var name_admission: ?relation_names.constraint_naming.Admission = null;
+        if (request.generated_constraint_names.len != 0) {
+            var names = try self.prepareGeneratedConstraintNamesTxn(a, &txn, group_id, request.namespace_id, request.logical_name, child.schema_json, request.generated_constraint_names, context);
+            defer names.deinit();
+            child.schema_json = try a.dupe(u8, names.schema_json);
+            name_admission = try names.admission.dupe(a);
+        }
         child.name = physical_name;
         const derived_id = std.hash.Wyhash.hash(0x54424c45, physical_name);
         child.table_id = if (derived_id == 0) 1 else derived_id;
@@ -13120,6 +13233,7 @@ pub const RaftApplyStore = struct {
         const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch return error.InvalidMetadataIncarnation;
         const incarnation = (try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation;
         const result: fk_generation_publication.InitialCreatePrepare = .{
+            .constraint_name_admission = name_admission,
             .catalog_id = meta.next_id,
             .expected_catalog_revision = meta.revision,
             .tablespace_id = explicit_tablespace_id,
@@ -13624,7 +13738,7 @@ pub const RaftApplyStore = struct {
             return error.InitialChildRootReceiptChanged;
     }
 
-    fn applyFkInitialCreateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+    fn applyFkInitialCreateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8, committed: bool) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -13648,6 +13762,18 @@ pub const RaftApplyStore = struct {
             if (plan.catalog_id != meta.next_id or plan.expected_catalog_revision != meta.revision or
                 plan.child.table_id != command.child_table_id or meta.next_id == std.math.maxInt(u64))
                 return error.GenerationPublicationChanged;
+            if (plan.constraint_name_admission) |admission| {
+                self.validateInitialConstraintNameAdmissionTxn(a, txn, group_id, admission, plan) catch |err| {
+                    // Only this pre-write guard may classify a new admission
+                    // failure as a committed no-op. The same error emitted by
+                    // later storage/publication work must still abort apply.
+                    switch (err) {
+                        error.CatalogGenerationChanged, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired => if (committed) return error.StaleInitialConstraintNameAdmission,
+                        else => {},
+                    }
+                    return err;
+                };
+            }
             // Prepare is a read-index hint, not authority. Re-evaluate the
             // namespace and placement policy in this same Raft transaction so
             // a stale or forged plan cannot reserve a differently placed table.
@@ -13853,7 +13979,7 @@ pub const RaftApplyStore = struct {
             self.active_outcome = null;
             discarded.deinit();
         }
-        self.applyFkInitialCreateTxn(&txn, group_id, bytes) catch |err| switch (err) {
+        self.applyFkInitialCreateTxn(&txn, group_id, bytes, false) catch |err| switch (err) {
             error.StaleInitialFkCreateCommand => return error.GenerationPublicationChanged,
             else => return err,
         };
@@ -13876,7 +14002,8 @@ pub const RaftApplyStore = struct {
             try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, publication_arena.allocator(), try txn.get(publication_key), .{})
         else
             null;
-        self.applyFkInitialCreateTxn(txn, group_id, bytes) catch |err| {
+        self.applyFkInitialCreateTxn(txn, group_id, bytes, true) catch |err| {
+            if (err == error.StaleInitialConstraintNameAdmission) return;
             if (err == error.StaleInitialFkCreateCommand) return;
             // Attestation is checked before any writes. A placement/reporter
             // replacement between preflight and apply is a stale receipt, not
@@ -14211,7 +14338,13 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         if (meta.revision != expected_revision) return error.CatalogGenerationChanged;
-        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) orelse return error.CatalogOccupancyNotReady;
+        return self.prepareGeneratedConstraintNamesTxn(alloc, &txn, group_id, namespace_id, logical_name, schema_json, generated, context);
+    }
+
+    fn prepareGeneratedConstraintNamesTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, namespace_id: u64, logical_name: []const u8, schema_json: []const u8, generated: []const []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !relation_names.constraint_naming.Plan {
+        _ = self;
+        try context.ensureActive();
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogOccupancyNotReady;
         if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
         const Namespace = struct {
             live: *relation_reconciliation.LiveStore(docstore.DocStore.Txn),
@@ -14246,10 +14379,20 @@ pub const RaftApplyStore = struct {
         _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.constraint_occupancy_version);
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta };
         const namespace = try view.namespaceFor(command.mutation.database, command.mutation.namespace);
-        if (admission.namespace_id != namespace.id) return error.InvalidCatalogRecord;
-        try admission.validateSchema(a, topology.create.table.schema_json);
+        try self.validateConstraintNameOccupancyTxn(a, txn, group_id, admission, namespace.id, topology.create.table.schema_json);
+    }
+
+    fn validateConstraintNameOccupancyTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, admission: relation_names.constraint_naming.Admission, namespace_id: u64, schema_json: []const u8) !void {
+        _ = self;
+        if (admission.namespace_id != namespace_id) return error.InvalidCatalogRecord;
+        try admission.validateSchema(a, schema_json);
         var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogOccupancyNotReady;
-        for (admission.names) |name| if (try live.nameOccupied(namespace.id, name.name, name.kind.includesRelationNames())) return error.CatalogGenerationChanged;
+        for (admission.names) |name| if (try live.nameOccupied(namespace_id, name.name, name.kind.includesRelationNames())) return error.CatalogGenerationChanged;
+    }
+
+    fn validateInitialConstraintNameAdmissionTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, admission: relation_names.constraint_naming.Admission, plan: fk_generation_publication.InitialCreatePlan) !void {
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.constraint_occupancy_version);
+        try self.validateConstraintNameOccupancyTxn(a, txn, group_id, admission, plan.namespace_id, plan.child.schema_json);
     }
 
     pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: SystemCatalogCommand) !void {

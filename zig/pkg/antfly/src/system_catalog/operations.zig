@@ -375,7 +375,8 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_initial_create_version);
+    const naming = if (command.plan) |plan| plan.constraint_name_admission != null else false;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (naming) @max(protocol.fk_initial_create_version, protocol.constraint_occupancy_version) else protocol.fk_initial_create_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -520,9 +521,11 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
+            if (request.generated_constraint_names.len != 0)
+                _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            break :blk store.fkInitialCreatePrepareJson(alloc, svc.metadata_group_id, request);
+            break :blk store.fkInitialCreatePrepareJsonWithContext(alloc, svc.metadata_group_id, request, context);
         },
         .fk_initial_child_decision => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;

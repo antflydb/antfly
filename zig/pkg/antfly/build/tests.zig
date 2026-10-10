@@ -318,7 +318,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(relation_worker_tests).step);
     const relation_coordinator_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement" },
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement", "system catalog hidden FK prepare preserves definite naming diagnostics" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")

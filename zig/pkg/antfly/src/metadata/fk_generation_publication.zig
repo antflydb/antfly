@@ -537,7 +537,24 @@ pub const InitialCreatePlan = struct {
     logical_name: []const u8,
     namespace_id: u64,
 
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: InitialCreatePlan, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePlan).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
+
     pub fn validate(self: InitialCreatePlan, alloc: std.mem.Allocator) !void {
+        if (self.constraint_name_admission) |admission| {
+            if (admission.namespace_id != self.namespace_id) return error.InvalidGenerationPublication;
+            try admission.validateSchema(alloc, self.child.schema_json);
+        }
         if (std.mem.allEqual(u8, &self.id, 0) or self.catalog_id < 3 or self.namespace_id == 0 or
             self.logical_name.len == 0 or self.logical_name.len > 256 or
             self.child.table_id == 0 or self.child.name.len == 0 or
@@ -815,6 +832,19 @@ pub const InitialCreatePrepareRequest = struct {
     /// Fully normalized create definition; metadata assigns physical identity
     /// and computes owner ranges from its current catalog/fence cut.
     candidate: records.TableRecord,
+    /// Trusted compiler provenance, never a flag inside the public schema.
+    generated_constraint_names: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: InitialCreatePrepareRequest, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePrepareRequest).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "generated_constraint_names") or self.generated_constraint_names.len != 0) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const InitialCreatePrepare = struct {
@@ -827,6 +857,18 @@ pub const InitialCreatePrepare = struct {
     transition_generation: u64,
     metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: InitialCreatePrepare, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(InitialCreatePrepare).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "constraint_name_admission") or self.constraint_name_admission != null) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const InitialChildDecision = struct {

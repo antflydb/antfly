@@ -534,7 +534,8 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
             defer parsed.deinit(alloc);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
-                const plan = @import("fk_initial_create_plan_builder.zig").build(server, a, context, identity, target, parsed) catch |err| switch (err) {
+                const generated = if (@import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").constraint_occupancy_version) create.generated_constraint_names else &.{};
+                const plan = @import("fk_initial_create_plan_builder.zig").buildWithGeneratedNames(server, a, context, identity, target, parsed, generated) catch |err| switch (err) {
                     error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,
                     else => return err,
                 };

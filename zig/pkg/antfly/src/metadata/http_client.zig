@@ -1150,6 +1150,9 @@ pub const MetadataHttpClient = struct {
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
+        if (input == .fk_initial_create_prepare and response.status != 200) {
+            if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
+        }
         if (response.status != 200) return switch (response.status) {
             400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
@@ -4630,6 +4633,38 @@ test "system catalog FK decision preserves absent publication for initial-parent
     executor.body = "InvalidGenerationPublication";
     try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", decision, 25, null));
     try std.testing.expectError(error.InvalidCatalogName, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+}
+
+test "system catalog hidden FK prepare preserves definite naming diagnostics" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        status: u16 = 409,
+        body: []const u8 = "SqlIndexAlreadyExists",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("fk-name-test-secret", "fk-name-test");
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .fk_initial_create_prepare = .{
+        .namespace_id = 2,
+        .logical_name = "t",
+        .candidate = .{ .table_id = 0, .name = "", .schema_json = "{}" },
+        .generated_constraint_names = &.{"anonymous"},
+    } };
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.body = "SqlConstraintAlreadyExists";
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.status = 400;
+    executor.body = "ProgramLimitExceeded";
+    try std.testing.expectError(error.ProgramLimitExceeded, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    executor.status = 503;
+    executor.body = "CatalogOccupancyNotReady";
+    try std.testing.expectError(error.CatalogOccupancyNotReady, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
 }
 
 test "system catalog initial FK retirement page requires a store-bound transport" {
