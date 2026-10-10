@@ -10239,8 +10239,12 @@ test "parquet wide large pages retain columns without duplicate row identities" 
     const share = 32 * 1024 * 1024 / chunks.len;
     // Complete batches still account for their physical row-reference arrays.
     try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share }));
-    var decoded = try buildSupportedColumnsAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share });
-    defer decoded.deinit(a);
+    // Decoded payload and structural allocations have independent 32 MiB limits.
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = share * 2 };
+    var decoded = try buildSupportedColumnsAllocWithLimits(budget.allocator(), inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share });
+    defer decoded.deinit(budget.allocator());
+    try std.testing.expect(budget.peak <= share * 2);
+    std.debug.print("Column page: rows={d} peak_bytes={d} per_column_budget={d}\n", .{ row_count, budget.peak, share * 2 });
     try std.testing.expectEqual(@as(usize, row_count), decoded.row_count);
     try std.testing.expectEqual(@as(i64, row_count - 1), try decoded.columns[0].integerAt(row_count - 1));
     try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedColumnsAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = 1024 }));
