@@ -2472,6 +2472,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
 
+    const shared_sql_worker_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/shared_sql_workers_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, shared_sql_worker_root, true, true);
+    shared_sql_worker_root.addImport("antfly_source_root", shared_sql_worker_root);
+    const shared_sql_worker_tests = b.addTest(.{
+        .name = "shared-sql-worker-tests",
+        .root_module = shared_sql_worker_root,
+        .filters = &.{ "SQL imported worker", "SQL shared worker" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-shared-sql-worker-test", "Verify SQL instances share node worker roles and retire leases after owned joins")
+        .dependOn(&b.addRunArtifact(shared_sql_worker_tests).step);
+
     const maintenance_shutdown_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/maintenance_shutdown_admission_test_root.zig"),
         .target = target,

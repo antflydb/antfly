@@ -974,6 +974,7 @@ pub const BackendRuntime = struct {
     threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
+    shared_sql_workers: [3]SharedSqlPool = @splat(.{}),
     /// Specialized executor lanes are activated on first use. The runtime is
     /// their sole owner; this mutex serializes first publication and teardown
     /// never starts until the corresponding public lease gates are closed.
@@ -1737,6 +1738,67 @@ pub const BackendRuntime = struct {
             runtime.worker_lane_gate.release(runtime.io());
         }
     };
+
+    pub const SharedSqlRole = enum { execution, control, cleanup };
+    const SharedSqlPool = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        workers: ?WorkerLease = null,
+        borrowers: usize = 0,
+        retiring: bool = false,
+    };
+    pub const SharedSqlLease = struct {
+        runtime: ?*BackendRuntime,
+        role: SharedSqlRole,
+        capacity: usize,
+        executor_io: Io,
+        pub fn io(self: *const SharedSqlLease) Io {
+            return self.executor_io;
+        }
+        /// Each consumer joins its submissions before release. Peers retain
+        /// the shared executor; the final release physically joins it.
+        pub fn release(self: *SharedSqlLease) void {
+            const runtime = self.runtime orelse return;
+            const pool = &runtime.shared_sql_workers[@backingInt(self.role)];
+            lockAtomic(&pool.mutex);
+            std.debug.assert(pool.borrowers != 0);
+            pool.borrowers -= 1;
+            var retired: ?WorkerLease = null;
+            if (pool.borrowers == 0) {
+                pool.retiring = true;
+                retired = pool.workers;
+                pool.workers = null;
+            }
+            pool.mutex.unlock();
+            // Keep this borrower's runtime gate until all pool bookkeeping is
+            // complete, even after the physical executor's gate is released.
+            if (retired) |*workers| {
+                workers.release();
+                lockAtomic(&pool.mutex);
+                pool.retiring = false;
+                pool.mutex.unlock();
+            }
+            self.runtime = null;
+            runtime.worker_lane_gate.release(runtime.io());
+        }
+    };
+    pub fn acquireSharedSqlWorkers(self: *BackendRuntime, role: SharedSqlRole, minimum: usize) !SharedSqlLease {
+        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) return error.BackendRuntimeUnavailable;
+        const capacity: usize = switch (role) {
+            .execution => (self.lane_limits.worker_capacity / 2) -| 5,
+            .control => 5,
+            .cleanup => self.lane_limits.worker_capacity / 4,
+        };
+        if (minimum == 0 or minimum > capacity) return error.InvalidWorkerCapacity;
+        _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+        errdefer self.worker_lane_gate.release(self.io());
+        const pool = &self.shared_sql_workers[@backingInt(role)];
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        if (pool.retiring) return error.WorkerCapacityExceeded;
+        if (pool.workers == null) pool.workers = try self.acquireWorkers(.{ .capacity = capacity });
+        pool.borrowers += 1;
+        return .{ .runtime = self, .role = role, .capacity = capacity, .executor_io = pool.workers.?.io() };
+    }
 
     pub fn acquireWorkers(self: *BackendRuntime, options: WorkerOptions) !WorkerLease {
         if (comptime builtin.os.tag == .freestanding) return error.BackendRuntimeUnavailable;

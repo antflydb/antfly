@@ -2166,3 +2166,41 @@ provide shared foreground/background CPU admission, bound every background
 registration by the node execution policy, adopt all dependency waits or
 qualify the complete cleanup/durability/physical DB/HTTP/PG/resource/performance
 contracts. Automatic defaults remain unqualified.
+
+
+### Node-shared SQL execution, control and cleanup executors
+
+The cumulative physical HTTP/SQL fixture exposed a deterministic capacity
+failure when two API instances borrowed the same 32-worker runtime. Their
+separate foreground/control/cleanup reservations exhausted that runtime and
+the text-schema EXPLAIN returned 503/53300. The unchanged compiled binary
+reproduced the failure; the fixture's request and exact row checks are retained.
+
+Backend runtime now owns one shared executor for each SQL execution, control
+and cleanup role. Role capacities follow the existing runtime partition: at
+32 workers, 11 execution, 5 control and 8 cleanup workers are charged once,
+regardless of API instance count. Exclusive completion, cleanup reaper and
+resource-manager workers keep independent reservations. Native and imported
+API consumers request a role and receive its actual node executor capacity.
+API-kernel ABI 28 carries the role argument and rejects ABI 27 before calling
+its old callback signature. This changes executor ownership, not SQL/session
+settings or the node runnable policy.
+
+Each role consumer holds a runtime lease and joins its own submissions before
+release. A peer keeps the executor alive without duplicating its physical
+reservation. Final release marks the role retiring, joins its executor outside
+the role mutex, completes metadata bookkeeping while a runtime gate remains
+held, then releases that gate. New acquisition during retirement fails before
+publication. Imported owner wrapper metadata is freed before its final runtime
+gate release, so runtime teardown cannot invalidate that metadata's allocator.
+
+Seven focused native checks pass, including existing independent-lane control
+and reaper saturation, imported receiver rollback, role sharing through the
+forced foreign receiver path, peer-safe release, distinct control/cleanup lanes,
+invalid role/version rejection, and physical callback/runtime shutdown joining.
+The audit tool's four regression checks pass. These focused fixtures instantiate
+actual backend runtimes and imported capabilities but no API server or DB. The
+unchanged physical HTTP/SQL fixture and independent archive compositions require
+the cumulative integration snapshot before the observed 503 is qualified fixed.
+Shared background CPU roots, complete wait/cleanup adoption, runtime resource/
+performance matrices and automatic default qualification remain incomplete.

@@ -29,13 +29,14 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 27;
+pub const abi_version: u32 = 28;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
 /// The producer owns the executor implementation and its worker accounting.
-/// Each successful acquisition is an independent lane, released only after
-/// every task and imported receiver has physically retired.
+/// Exclusive leases own independent lanes. Shared SQL roles retain a node
+/// executor; consumers join their own tasks before releasing a role lease.
+pub const SqlWorkerRole = enum(c_int) { exclusive, execution, control, cleanup };
 pub const SqlWorkerBorrow = extern struct {
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(@This()),
@@ -49,7 +50,7 @@ pub const SqlWorkerFactory = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     context: *anyopaque,
     capacity: usize,
-    acquire: *const fn (*anyopaque, usize, *SqlWorkerBorrow) callconv(.c) Status,
+    acquire: *const fn (*anyopaque, c_int, usize, *SqlWorkerBorrow) callconv(.c) Status,
 };
 
 pub const RuntimeIoBorrows = extern struct {

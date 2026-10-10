@@ -4504,6 +4504,13 @@ pub const ApiHttpServer = struct {
         }
         return @import("sql_worker_lease.zig").Lease.acquireNative(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, capacity);
     }
+    fn acquireSharedSqlWorkers(self: *ApiHttpServer, role: @import("kernel_abi.zig").SqlWorkerRole, capacity: usize) !@import("sql_worker_lease.zig").Lease {
+        if (self.cfg.imported_runtime_io) |views| {
+            const producer = views.sql_workers orelse return error.SqlWriteCapacityUnavailable;
+            return @import("sql_worker_lease.zig").Lease.acquireImportedShared(self.alloc, producer, role, capacity);
+        }
+        return @import("sql_worker_lease.zig").Lease.acquireNativeShared(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, role, capacity);
+    }
     pub fn sqlControlIo(self: *ApiHttpServer) !std.Io {
         const imported = self.cfg.imported_runtime_io;
         if (imported) |views| {
@@ -4517,7 +4524,7 @@ pub const ApiHttpServer = struct {
         defer self.sql_workers_mutex.unlock();
         if (self.sql_workers_closing) return error.SqlWriteCapacityUnavailable;
         if (self.sql_control_workers == null) {
-            self.sql_control_workers = self.acquireSqlWorkers(5) catch {
+            self.sql_control_workers = self.acquireSharedSqlWorkers(.control, 5) catch {
                 if (self.cfg.query_waiting.max_wait_ms == 0) {
                     if (imported) |views| return views.sql_control orelse error.SqlWriteCapacityUnavailable;
                     return self.cfg.backend_runtime.?.controlIo() orelse error.SqlWriteCapacityUnavailable;
@@ -4558,7 +4565,7 @@ pub const ApiHttpServer = struct {
                 if (imported) |views| return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
                 return self.cfg.backend_runtime.?.io() orelse error.SqlWriteCapacityUnavailable;
             }
-            self.sql_workers = self.acquireSqlWorkers(std.math.cast(usize, capacity) orelse return error.SqlWriteCapacityUnavailable) catch
+            self.sql_workers = self.acquireSharedSqlWorkers(.execution, std.math.cast(usize, capacity) orelse return error.SqlWriteCapacityUnavailable) catch
                 return error.SqlWriteCapacityUnavailable;
         }
         return self.sql_workers.?.io();
@@ -4589,7 +4596,7 @@ pub const ApiHttpServer = struct {
                 return error.SqlWriteCapacityUnavailable;
             const capacity = @min(retained_ceiling, worker_capacity / 4);
             if (capacity == 0) return error.SqlWriteCapacityUnavailable;
-            self.sql_cleanup_workers = self.acquireSqlWorkers(capacity) catch
+            self.sql_cleanup_workers = self.acquireSharedSqlWorkers(.cleanup, capacity) catch
                 return error.SqlWriteCapacityUnavailable;
         }
         return self.sql_cleanup_workers.?.io();

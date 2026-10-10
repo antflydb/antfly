@@ -729,3 +729,19 @@ consumer. Metrics capture effective policy and live counters under one lock.
 Automatic default sizing, public schema and whole API startup qualification
 still require their release gates. Whole Linux resource, protocol, durability and
 performance/default gates remain required.
+
+
+## Shared SQL executor roles
+
+Execution, protected control and cleanup executor reservations belong to the
+backend runtime. API instances borrow those role executors and report their
+actual capacities; aggregate worker accounting charges each role once. Each
+borrower joins its own submissions and stable imported receiver before release.
+The last borrower physically joins the executor outside the role mutex. Its
+separate runtime gate remains held until join and role bookkeeping finish. A
+retiring role rejects new acquisition rather than publishing a second executor.
+Independent completion, cleanup reaper and resource-manager worker leases remain
+separate and consume the remaining runtime worker budget. Per-API preparation,
+query, write and session ceilings remain per-API; the node runnable owner is the
+shared CPU/operation policy where configured. This executor ledger does not
+qualify automatic defaults or complete background CPU/wait-holder adoption.
