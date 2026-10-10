@@ -358,8 +358,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_index_ddl_run = addFilteredTestRunArtifact(b, sql_index_ddl_tests);
+    const sql_index_ddl_inventory = b.addRunArtifact(sql_index_ddl_tests);
+    sql_index_ddl_inventory.addArg("--list-tests");
+    const sql_index_ddl_audit = b.addSystemCommand(&.{"python3"});
+    sql_index_ddl_audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
+    for ([_][]const u8{
+        "SQL index DDL drops the exact qualified owner without a catalog snapshot",
+        "SQL catalog ALTER submits native schema CAS without client generations",
+        "httpx SQL catalog original null uniqueness declarations use real leader admission and restart",
+        "httpx SQL catalog originals commit through native authority and recover topology",
+        "httpx SQL catalog diagnostics preserve authority and uncertain commits are not replayed",
+    }) |required| sql_index_ddl_audit.addArgs(&.{ "--filter", required });
+    sql_index_ddl_audit.addArg("--inventory");
+    sql_index_ddl_audit.addFileArg2(sql_index_ddl_inventory.captureStdErr(.{}), .{ .make_absolute = true });
+    sql_index_ddl_run.step.dependOn(&sql_index_ddl_audit.step);
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
-        .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
+        .dependOn(&sql_index_ddl_run.step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });

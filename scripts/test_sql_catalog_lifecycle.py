@@ -24,9 +24,165 @@ import unittest
 
 import psycopg
 from generate_sql_postgres_reference import FIXTURES, postgres
+from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_generated_unique_names_clip_balanced_utf8_and_composite_prefixes(self):
+        cases = (
+            ("a" * 63, ("b" * 63,), False, False, "a" * 29 + "_" + "b" * 29 + "_key"),
+            ("a" * 63, ("b" * 63,), False, True, "a" * 29 + "_" + "b" * 28 + "_key1"),
+            ("é" * 31, ("中" * 21,), False, False, "é" * 14 + "_" + "中" * 9 + "_key"),
+            (
+                "items",
+                ("a" * 40, "b" * 40),
+                False,
+                False,
+                "items_" + "a" * 40 + "_" + "b" * 12 + "_key",
+            ),
+            ("a" * 63, ("id",), True, False, "a" * 58 + "_pkey"),
+        )
+        with postgres() as db:
+            db.execute("CREATE TABLE public.reserved (id BIGINT)")
+            for table, columns, primary, collision, expected in cases:
+                with self.subTest(table=table, primary=primary, collision=collision):
+                    occupied = "a" * 29 + "_" + "b" * 29 + "_key"
+                    if collision:
+                        db.execute(
+                            pgsql.SQL("CREATE INDEX {} ON public.reserved (id)").format(
+                                pgsql.Identifier(occupied)
+                            )
+                        )
+                    definitions = pgsql.SQL(", ").join(
+                        pgsql.SQL("{} TEXT").format(pgsql.Identifier(column))
+                        for column in columns
+                    )
+                    keys = pgsql.SQL(", ").join(map(pgsql.Identifier, columns))
+                    db.execute(
+                        pgsql.SQL("CREATE TABLE public.{} ({}, {} ({}))").format(
+                            pgsql.Identifier(table),
+                            definitions,
+                            pgsql.SQL("PRIMARY KEY" if primary else "UNIQUE"),
+                            keys,
+                        )
+                    )
+                    self.assertEqual(
+                        [(expected,)],
+                        db.execute(
+                            "SELECT c.conname FROM pg_constraint c "
+                            "JOIN pg_class t ON t.oid=c.conrelid "
+                            "JOIN pg_namespace n ON n.oid=t.relnamespace "
+                            "WHERE n.nspname='public' AND t.relname=%s "
+                            "AND c.contype=%s",
+                            (table, "p" if primary else "u"),
+                        ).fetchall(),
+                    )
+                    db.execute(
+                        pgsql.SQL("DROP TABLE public.{}").format(
+                            pgsql.Identifier(table)
+                        )
+                    )
+                    if collision:
+                        db.execute(
+                            pgsql.SQL("DROP INDEX public.{}").format(
+                                pgsql.Identifier(occupied)
+                            )
+                        )
+
+    def test_generated_unique_constraint_names_are_table_scoped_and_collision_safe(
+        self,
+    ):
+        with postgres() as db:
+            for table in ("first", "second"):
+                db.execute(
+                    f"CREATE TABLE public.{table} "
+                    "(id BIGINT PRIMARY KEY, email TEXT UNIQUE)"
+                )
+            self.assertEqual(
+                [
+                    ("first", "first_email_key", "u"),
+                    ("first", "first_pkey", "p"),
+                    ("second", "second_email_key", "u"),
+                    ("second", "second_pkey", "p"),
+                ],
+                db.execute(
+                    "SELECT t.relname, c.conname, c.contype "
+                    "FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid "
+                    "JOIN pg_namespace n ON n.oid=t.relnamespace "
+                    "WHERE n.nspname='public' AND c.contype IN ('p', 'u') "
+                    "ORDER BY t.relname, c.conname"
+                ).fetchall(),
+            )
+            db.execute("CREATE INDEX third_pkey ON public.first (id)")
+            db.execute("CREATE TABLE public.third (id BIGINT PRIMARY KEY)")
+            self.assertEqual(
+                [("third_pkey1",)],
+                db.execute(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid='public.third'::regclass AND contype='p'"
+                ).fetchall(),
+            )
+            # Explicit user names must not be silently renamed like generated
+            # ones. Failed admission must leave no partially created table.
+            with self.assertRaises(psycopg.Error) as explicit_collision:
+                db.execute(
+                    "CREATE TABLE public.fourth "
+                    "(id BIGINT CONSTRAINT third_pkey1 PRIMARY KEY)"
+                )
+            self.assertEqual("42P07", explicit_collision.exception.sqlstate)
+            self.assertIsNone(
+                db.execute("SELECT to_regclass('public.fourth')").fetchone()[0]
+            )
+            db.execute(
+                "CREATE TABLE public.fifth "
+                "(id BIGINT CONSTRAINT sixth_pkey CHECK (id > 0))"
+            )
+            self.assertIsNone(
+                db.execute("SELECT to_regclass('public.sixth_pkey')").fetchone()[0]
+            )
+            db.execute("CREATE TABLE public.sixth (id BIGINT PRIMARY KEY)")
+            self.assertEqual(
+                [("sixth_pkey1",)],
+                db.execute(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid='public.sixth'::regclass AND contype='p'"
+                ).fetchall(),
+            )
+
+    def test_alter_table_pins_first_search_path_relation_and_qualified_names_bypass_it(
+        self,
+    ):
+        with postgres() as db:
+            db.execute("CREATE SCHEMA tenant")
+            db.execute("CREATE TABLE tenant.items (id BIGINT)")
+            db.execute("CREATE TABLE public.index_owner (id BIGINT)")
+            db.execute("INSERT INTO tenant.items VALUES (1)")
+            db.execute("SET search_path TO public, tenant")
+            db.execute("ALTER TABLE items ADD COLUMN label TEXT")
+            self.assertEqual(
+                [("id",), ("label",)],
+                db.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='tenant' AND table_name='items' "
+                    "ORDER BY ordinal_position"
+                ).fetchall(),
+            )
+            db.execute("CREATE INDEX items ON public.index_owner (id)")
+            with self.assertRaises(psycopg.Error) as shadow:
+                db.execute("ALTER TABLE items ADD COLUMN blocked TEXT")
+            self.assertEqual("42809", shadow.exception.sqlstate)
+            self.assertEqual(
+                [(1, None)], db.execute("SELECT * FROM tenant.items").fetchall()
+            )
+            db.execute("SELECT set_config('search_path', '', false)")
+            with self.assertRaises(psycopg.Error) as absent:
+                db.execute("ALTER TABLE items ADD COLUMN missing TEXT")
+            self.assertEqual("42P01", absent.exception.sqlstate)
+            db.execute("ALTER TABLE tenant.items ADD COLUMN qualified TEXT")
+            self.assertEqual(
+                [(1, None, None)], db.execute("SELECT * FROM tenant.items").fetchall()
+            )
+
     def test_original_null_policy_ddl_executes_unchanged(self):
         original = {
             entry["id"]: entry
@@ -40,7 +196,10 @@ class IndexLifecycleTest(unittest.TestCase):
                     case = original[case_id]
                     self.assertEqual([], case["params"])
                     db.execute("DROP TABLE IF EXISTS public.usage_records CASCADE")
-                    db.execute("CREATE TABLE public.usage_records(email TEXT)")
+                    db.execute(
+                        "CREATE TABLE public.usage_records "
+                        "(id BIGINT PRIMARY KEY, email TEXT)"
+                    )
                     result = db.execute(case["sql"])
                     constraint = case_id == "sql-0731"
                     self.assertEqual(
@@ -51,7 +210,8 @@ class IndexLifecycleTest(unittest.TestCase):
                         [(True, case_id == "sql-0692")],
                         db.execute(
                             "SELECT i.indisunique, i.indnullsnotdistinct FROM pg_index i "
-                            "WHERE i.indrelid='public.usage_records'::regclass"
+                            "WHERE i.indrelid='public.usage_records'::regclass "
+                            "AND NOT i.indisprimary"
                         ).fetchall(),
                     )
                     if constraint:
@@ -59,9 +219,74 @@ class IndexLifecycleTest(unittest.TestCase):
                             [(False, False)],
                             db.execute(
                                 "SELECT condeferrable, condeferred FROM pg_constraint "
-                                "WHERE conrelid='public.usage_records'::regclass"
+                                "WHERE conrelid='public.usage_records'::regclass "
+                                "AND contype='u'"
                             ).fetchall(),
                         )
+                    db.execute("INSERT INTO public.usage_records VALUES (1, NULL)")
+                    if case_id == "sql-0692":
+                        with self.assertRaises(psycopg.Error) as duplicate_null:
+                            db.execute(
+                                "INSERT INTO public.usage_records VALUES (2, NULL)"
+                            )
+                        self.assertEqual("23505", duplicate_null.exception.sqlstate)
+                        expected = [(1, None)]
+                    else:
+                        db.execute("INSERT INTO public.usage_records VALUES (2, NULL)")
+                        expected = [(1, None), (2, None)]
+                    self.assertEqual(
+                        expected,
+                        db.execute(
+                            "SELECT id, email FROM public.usage_records ORDER BY id"
+                        ).fetchall(),
+                    )
+                    db.execute("INSERT INTO public.usage_records VALUES (3, 'known')")
+                    expected.append((3, "known"))
+                    with self.assertRaises(psycopg.Error) as duplicate_value:
+                        db.execute(
+                            "INSERT INTO public.usage_records VALUES (4, 'known')"
+                        )
+                    self.assertEqual("23505", duplicate_value.exception.sqlstate)
+                    self.assertEqual(
+                        expected,
+                        db.execute(
+                            "SELECT id, email FROM public.usage_records ORDER BY id"
+                        ).fetchall(),
+                    )
+
+    def test_alter_table_rejects_index_relation_kinds_without_changing_storage(self):
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE public.items (id BIGINT PRIMARY KEY, email TEXT UNIQUE)"
+            )
+            db.execute("CREATE INDEX email_lookup ON public.items (email)")
+            db.execute("INSERT INTO public.items VALUES (1, NULL), (2, 'known')")
+            indexes = db.execute(
+                "SELECT indexrelid, indisunique, indisprimary "
+                "FROM pg_index WHERE indrelid='public.items'::regclass "
+                "ORDER BY indexrelid"
+            ).fetchall()
+            for relation in ("email_lookup", "items_email_key", "items_pkey"):
+                with self.subTest(relation=relation):
+                    with self.assertRaises(psycopg.Error) as wrong_kind:
+                        db.execute(
+                            f"ALTER TABLE public.{relation} ADD COLUMN spare TEXT"
+                        )
+                    self.assertEqual("42809", wrong_kind.exception.sqlstate)
+                    self.assertEqual(
+                        [(1, None), (2, "known")],
+                        db.execute(
+                            "SELECT id, email FROM public.items ORDER BY id"
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
+                        indexes,
+                        db.execute(
+                            "SELECT indexrelid, indisunique, indisprimary "
+                            "FROM pg_index WHERE indrelid='public.items'::regclass "
+                            "ORDER BY indexrelid"
+                        ).fetchall(),
+                    )
 
     def test_unique_null_semantics_share_constraint_and_index_enforcement(self):
         cases = (
