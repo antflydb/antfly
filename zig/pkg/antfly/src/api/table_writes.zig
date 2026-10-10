@@ -23674,7 +23674,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocal(
+            if ((try owner.txnResolveGroupLocalWithCancellation(
                 alloc,
                 group_id,
                 table_name,
@@ -23683,6 +23683,7 @@ pub const ProvisionedTableWriteSource = struct {
                 commit_version,
                 topology_epoch,
                 sync_level,
+                cancellation,
             )) == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);

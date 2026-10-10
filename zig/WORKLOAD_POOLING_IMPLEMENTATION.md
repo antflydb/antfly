@@ -1621,3 +1621,12 @@ and scheduler shutdown, checking barrier reuse and retained operation/byte charg
 through physical joining. Production capture callers and durable local resolve
 still need execution-control transport and their complete service-wait dependency
 graph; these APIs alone do not qualify that graph or automatic defaults.
+
+Local transaction resolution now forwards the original completion cancellation
+token through the provisioned source's local owner handoff. The compiled table
+write boundary checks the token before dispatch and refuses legacy resolution
+fallback when any token component is supplied. Unscoped callers retain legacy
+compatibility. Contract coverage uses both direct and private ABI dispatch,
+including expiry during the callback, rejection before a subsequent call and
+atomic cancellation. This closes an authority loss, but does not release CPU
+across the internal storage, Raft, catalog or group-admission waits.

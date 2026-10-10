@@ -1204,8 +1204,14 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
-        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse
+        try cancellation.check();
+        const fn_ptr = self.vtable.txn_resolve_group_local_with_cancellation orelse {
+            // A completion deadline/lifetime may be carried in this token.
+            // An incapable callback cannot discard it at a physical handoff.
+            if (cancellation.ptr != null or cancellation.check_fn != null or cancellation.is_cancelled_fn != null)
+                return error.UnsupportedOperation;
             return try self.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+        };
         return try BoundaryAbi.call("txn_resolve_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation });
     }
 
@@ -1823,6 +1829,60 @@ fn consumerTests() type {
                 canceled.store(false, .release);
             }
             try std.testing.expectEqual(@as(usize, 40), fake.aware_calls);
+        }
+
+        test "compiled table write boundary preserves local resolve completion cancellation" {
+            const Fake = struct {
+                expected: db_mod.types.CancellationToken = .none,
+                legacy_calls: usize = 0,
+                aware_calls: usize = 0,
+                stopped: bool = false,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return null;
+                }
+                fn legacy(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.legacy_calls += 1;
+                    return {};
+                }
+                fn aware(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, token: db_mod.types.CancellationToken) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.aware_calls += 1;
+                    try std.testing.expectEqual(self.expected.ptr, token.ptr);
+                    try std.testing.expectEqual(self.expected.check_fn, token.check_fn);
+                    try std.testing.expectEqual(self.expected.is_cancelled_fn, token.is_cancelled_fn);
+                    self.stopped = true;
+                    try token.check();
+                    return {};
+                }
+                fn foreignDispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+                fn check(raw: *const anyopaque) !void {
+                    const self: *const @This() = @ptrCast(@alignCast(raw));
+                    if (self.stopped) return error.DeadlineExceeded;
+                }
+            };
+            inline for (.{ TableWriteSource.BoundaryAbi.local_dispatch, Fake.foreignDispatch }) |dispatch| {
+                var fake: Fake = .{};
+                const id: db_mod.types.TxnId = @splat(1);
+                var source: TableWriteSource = .{ .boundary_dispatch = dispatch, .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local = Fake.legacy } };
+                fake.expected = .{ .ptr = &fake, .check_fn = Fake.check };
+                try std.testing.expectError(error.UnsupportedOperation, source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, fake.expected));
+                try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+                _ = try source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, .none);
+                try std.testing.expectEqual(@as(usize, 1), fake.legacy_calls);
+                source.vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local = Fake.legacy, .txn_resolve_group_local_with_cancellation = Fake.aware };
+                try std.testing.expectError(error.DeadlineExceeded, source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, fake.expected));
+                try std.testing.expectEqual(@as(usize, 1), fake.aware_calls);
+                // Expired original completion authority cannot invoke a second RPC.
+                try std.testing.expectError(error.DeadlineExceeded, source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, fake.expected));
+                try std.testing.expectEqual(@as(usize, 1), fake.aware_calls);
+                var canceled = std.atomic.Value(bool).init(true);
+                try std.testing.expectError(error.Canceled, source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, db_mod.types.CancellationToken.fromAtomic(&canceled)));
+                try std.testing.expectEqual(@as(usize, 1), fake.aware_calls);
+                try std.testing.expectEqual(@as(usize, 1), fake.legacy_calls);
+            }
         }
 
         test "compiled table write boundary forwards original commit controls and rejects incapable fallback" {
