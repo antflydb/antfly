@@ -41,6 +41,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.backend_runtime = handle.db.backend_runtime;
     options.identity_namespace = .{ .table_id = id, .shard_id = id, .range_id = id };
     options.prefer_existing_identity_namespace = false;
+    options.online_source_authority = .native;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
@@ -142,10 +143,44 @@ pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_ex
     try persist(handle);
     const table = try openTable(handle, name, id);
     errdefer destroy(handle, table);
-    try table.db.setSchemaJson(handle.alloc, schema);
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fks = try parsed_schema.relationalForeignKeyDefinitions(a);
+    var full_schema: ?[]const u8 = null;
+    if (fks.len != 0) {
+        var bare = try std.json.parseFromSliceLeaky(std.json.Value, a, schema, .{});
+        const version = std.math.add(u32, parsed_schema.version, 1) catch return error.SqlProgramLimitExceeded;
+        try bare.object.put(a, "version", .{ .integer = version });
+        full_schema = try std.json.Stringify.valueAlloc(a, bare, .{});
+        try bare.object.put(a, "version", .{ .integer = parsed_schema.version });
+        try bare.object.put(a, "foreign_keys", .{ .array = std.array_list.Managed(std.json.Value).init(a) });
+        try table.db.setSchemaJson(handle.alloc, try std.json.Stringify.valueAlloc(a, bare, .{}));
+    } else try table.db.setSchemaJson(handle.alloc, schema);
     try h.antfly.lite.connection.provisionDefaultFullTextIndex(&table.db);
     try handle.embedded_tables.putNoClobber(handle.alloc, table.name, table);
     errdefer _ = handle.embedded_tables.remove(table.name);
+    if (full_schema) |target| {
+        var adapter = @import("sql.zig").Adapter(h.antfly){ .handle = handle, .db = &table.db, .table_name = name };
+        try @import("sql_fk.zig").publishInitial(&adapter, a, target, parsed_schema.version);
+    } else try persist(handle);
+}
+
+/// An admitted initial publication owns this reserved namespace even before
+/// its logical table becomes visible in the durable catalog.
+pub fn recoverCreate(handle: *h.Handle, name: []const u8, id: u64) !void {
+    try load(handle);
+    if (handle.embedded_tables.get(name)) |existing| {
+        if (existing.id != id) return error.IdentityNamespaceMismatch;
+        return;
+    }
+    if (std.mem.eql(u8, name, "default") or id >= handle.embedded_next_table_id) return error.InvalidGenerationPublication;
+    const table = try openTable(handle, name, id);
+    errdefer destroy(handle, table);
+    try handle.embedded_tables.putNoClobber(handle.alloc, table.name, table);
+}
+
+pub fn publishCreated(handle: *h.Handle) !void {
     try persist(handle);
 }
 
@@ -180,6 +215,30 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
     }
     // A stream owns snapshots and borrows this table's runtime until close.
     if (handle.sql_cursors.count() != 0) return error.SqlStatementReadUnavailable;
+    // Retire outgoing FK generations at every parent before the namespace
+    // becomes unreachable. A durable publication job also owns the final DROP.
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (try table.db.getSchemaJson(a)) |bytes| {
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        const parsed = try h.tables_api.parseValidatedTableSchema(a, bytes);
+        const fks = try parsed.relationalForeignKeyDefinitions(a);
+        if (fks.len != 0) {
+            try schema.object.put(a, "foreign_keys", .{ .array = std.array_list.Managed(std.json.Value).init(a) });
+            const version = std.math.add(u32, parsed.version, 1) catch return error.SqlProgramLimitExceeded;
+            try schema.object.put(a, "version", .{ .integer = version });
+            const target = try std.json.Stringify.valueAlloc(a, schema, .{});
+            var adapter = @import("sql.zig").Adapter(h.antfly){ .handle = handle, .db = &table.db, .table_name = name };
+            if (try @import("sql_fk.zig").publish(&adapter, a, target, parsed.version, true)) return;
+        }
+    }
+    try finishDrop(handle, name);
+}
+
+/// Recovery calls this only after the exact outgoing generation retirement.
+pub fn finishDrop(handle: *h.Handle, name: []const u8) !void {
+    const table = handle.embedded_tables.get(name) orelse return;
     _ = handle.embedded_tables.remove(name);
     errdefer handle.embedded_tables.putAssumeCapacity(table.name, table);
     try persist(handle);
@@ -256,6 +315,7 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
     const root = guard.handle;
     requireDatabase(root) catch |err| return h.capi.mapError(err);
     @import("sql_commit.zig").recover(root) catch |err| return h.capi.mapError(err);
+    @import("sql_ddl.zig").recover(root) catch |err| return h.capi.mapError(err);
     var i: usize = 0;
     while (i < root.table_handles.items.len) {
         if (h.handle_registry.enter(root.table_handles.items[i])) |entry| {

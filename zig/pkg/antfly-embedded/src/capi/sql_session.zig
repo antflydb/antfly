@@ -92,7 +92,7 @@ pub const Session = struct {
         const requests = try self.commitRequests(a);
         const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
         const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
-        var prepared = try d.api_relational_integrity_commit.prepareSessionStatement(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, .{});
+        var prepared = try d.api_relational_integrity_commit.prepareSessionStatementWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, adapter.repairAdmission(), .{});
         defer prepared.deinit();
         const owned = self.arena.allocator();
         for (prepared.tables) |request| {
@@ -144,9 +144,9 @@ pub const Session = struct {
         return mergeEntries(alloc, self.entries.items);
     }
 
-    fn mergeEntries(alloc: std.mem.Allocator, entries: []const Entry) ![]Entry {
+    fn mergeEntries(alloc: std.mem.Allocator, input: []const Entry) ![]Entry {
         var result: std.ArrayList(Entry) = .empty;
-        for (entries) |entry| {
+        for (input) |entry| {
             var found = false;
             for (result.items) |*prior| {
                 if (std.mem.eql(u8, prior.table.physical_name, entry.table.physical_name) and std.mem.eql(u8, prior.mutation.key, entry.mutation.key)) {
@@ -214,7 +214,7 @@ pub const Session = struct {
         }
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, requests[0].table_name), .table_name = requests[0].table_name };
         const metadata = try adapter.localCatalog(a, requests[0].schema_version.?);
-        var prepared = try d.api_relational_integrity_commit.prepareWithCoverage(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests);
+        var prepared = try d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{});
         defer prepared.deinit();
         const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
             self.failed = true;

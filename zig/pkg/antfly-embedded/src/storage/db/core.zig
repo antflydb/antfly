@@ -1319,7 +1319,13 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, null);
+    }
+
+    /// Pin the translator's source epoch before preparing index/constraint
+    /// transitions. Atomic commit rechecks this same immutable schema view.
+    pub fn prepareSchemaMetadataAtVersion(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_writes: []const docstore_mod.KVPair, expected_version: u32) !PreparedSchemaMetadata {
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version);
     }
 
     /// Only the private, metadata-authenticated child generation installer may
@@ -1330,7 +1336,7 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true, null);
     }
 
     fn prepareSchemaMetadataMode(
@@ -1338,11 +1344,16 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
         published_child: bool,
+        expected_version: ?u32,
     ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
         var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
         errdefer prepared.deinit();
         prepared.base_schema_view = self.schema_registry.acquire();
+        if (expected_version) |expected| {
+            const base = prepared.base_schema_view orelse return error.PreparedGenerationChanged;
+            if (base.version() != expected) return error.PreparedGenerationChanged;
+        }
         prepared.base_relational_indexes = self.relational_indexes.acquire();
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {

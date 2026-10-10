@@ -19,6 +19,18 @@
 const std = @import("std");
 const schema = @import("mod.zig");
 const native = @import("../storage/schema.zig");
+const relational = @import("../storage/relational_index.zig");
+
+/// FK claims bind the first eligible UNIQUE declaration in schema order.
+/// Publication, mutation planning and retirement must select the same owner;
+/// an equivalent later UNIQUE is a separate generation, not a dependency.
+pub fn resolveUnique(uniques: []const relational.UniqueConstraint, columns: []const []const u8) !relational.UniqueConstraint {
+    for (uniques) |unique| {
+        if (unique.keys.len != 0 or unique.where.len != 0 or unique.deferrable) continue;
+        if (sameColumns(columns, unique.columns)) return unique;
+    }
+    return error.ForeignKeyTargetNotUnique;
+}
 
 /// Same immutable definition identity used by storage generation allocation.
 /// Declaration edits cannot discard existing claims by first erasing the
@@ -59,11 +71,7 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
     const uniques = try parent.relationalUniqueDefinitions(owned);
     for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
         if (!std.mem.eql(u8, fk.parent_table, parent_name)) continue;
-        const unique_found = for (uniques) |unique| {
-            if (unique.keys.len != 0 or unique.where.len != 0 or unique.deferrable) continue;
-            if (sameColumns(fk.parent_columns, unique.columns)) break true;
-        } else false;
-        if (!unique_found) return error.ForeignKeyTargetNotUnique;
+        _ = try resolveUnique(uniques, fk.parent_columns);
         if (fk.match == .partial) try @import("relational_witness_indexes.zig").requireCoverage(parent, fk.parent_columns);
         if (fk.child_columns.len == 0 or fk.child_columns.len != fk.parent_columns.len)
             return error.ForeignKeyTypeMismatch;
@@ -92,6 +100,19 @@ fn columnType(layout: native.TableSchema, name: []const u8) !native.RelationalCo
 
 test "relational integrity FK target validates ordered uniqueness types and self references" {
     try testTargetContract();
+}
+
+test "distributed txn FK target selects one eligible UNIQUE in declaration order" {
+    const uniques = [_]relational.UniqueConstraint{
+        .{ .name = "deferred", .columns = &.{"id"}, .deferrable = true },
+        .{ .name = "different", .columns = &.{ "tenant", "id" } },
+        .{ .name = "selected", .columns = &.{"id"} },
+        .{ .name = "redundant", .columns = &.{"id"} },
+    };
+    try std.testing.expectEqualStrings("selected", (try resolveUnique(&uniques, &.{"id"})).name);
+    try std.testing.expectEqualStrings("different", (try resolveUnique(&uniques, &.{ "tenant", "id" })).name);
+    try std.testing.expectError(error.ForeignKeyTargetNotUnique, resolveUnique(uniques[0..2], &.{"id"}));
+    try std.testing.expectError(error.ForeignKeyTargetNotUnique, resolveUnique(&uniques, &.{ "id", "tenant" }));
 }
 
 test "distributed txn MATCH PARTIAL DDL pins selectable parent support for every non-null mask" {

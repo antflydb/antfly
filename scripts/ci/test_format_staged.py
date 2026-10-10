@@ -16,6 +16,7 @@
 
 """Verify the hook never stages unrelated or overlapping working-tree edits."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -164,14 +165,74 @@ class StagedFormattingTests(unittest.TestCase):
         format_staged.format_staged(self.root, self.format)
         self.assertEqual(self.git("show", ":example.py"), b"value = 1\n")
 
-    def test_installed_hook_formats_commit_and_leaves_unstaged_file_alone(self):
-        if not shutil.which("gofmt"):
-            self.skipTest("gofmt is required for the installed hook smoke test")
+    def install_hook(self):
         repository = Path(__file__).resolve().parents[2]
-        for path in (".githooks/pre-commit", "scripts/format_staged.py"):
+        files = (
+            ".githooks/pre-commit",
+            "scripts/format_staged.py",
+            "scripts/license_headers.py",
+            "scripts/asset_licenses.py",
+            "scripts/qualification_provenance.py",
+            "scripts/source_license_roots.json",
+            "scripts/embedded_asset_licenses.json",
+            "scripts/frozen_qualification_helpers.json",
+            "scripts/apache_engine_files.txt",
+            "scripts/preserved_license_notices.json",
+            "scripts/license-header-apache.txt",
+            "scripts/license-header-elv2.txt",
+        )
+        for path in files:
+            self.write(path, (repository / path).read_bytes())
+        for path in json.loads(
+            (repository / "scripts/frozen_qualification_helpers.json").read_text()
+        ):
             self.write(path, (repository / path).read_bytes())
         (self.root / ".githooks/pre-commit").chmod(0o755)
         self.git("config", "core.hooksPath", ".githooks")
+
+    def test_hook_rejects_unlicensed_staged_blob_even_if_working_file_is_fixed(self):
+        self.install_hook()
+        name = "zig/pkg/antfly-embedded/src/a space\n[bracket].zig"
+        missing = b"const value = 1;\n"
+        self.write(name, missing)
+        self.git("add", "--", name)
+        # The unstaged fix must not mask the invalid commit contents.
+        import license_headers
+
+        valid = license_headers.apply_header(
+            missing.decode(), Path(name), license_headers.read_header("apache")
+        ).encode()
+        self.write(name, valid)
+        result = subprocess.run(
+            ["git", "commit", "-qm", "invalid"],
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"missing or stale license header in staged file", result.stderr)
+        self.assertEqual(self.git("show", f":{name}"), missing)
+        self.assertEqual((self.root / name).read_bytes(), valid)
+
+    def test_hook_checks_staged_header_without_rejecting_unstaged_changes(self):
+        self.install_hook()
+        import license_headers
+
+        name = "zig/pkg/antfly-embedded/src/example.zig"
+        valid = license_headers.apply_header(
+            "const value = 1;\n", Path(name), license_headers.read_header("apache")
+        ).encode()
+        self.write(name, valid)
+        self.git("add", "--", name)
+        self.write(name, b"const value = 2;\n")
+        self.git("commit", "-qm", "licensed")
+        self.assertEqual(self.git("show", f"HEAD:{name}"), valid)
+        self.assertEqual((self.root / name).read_bytes(), b"const value = 2;\n")
+
+    def test_installed_hook_formats_commit_and_leaves_unstaged_file_alone(self):
+        if not shutil.which("gofmt"):
+            self.skipTest("gofmt is required for the installed hook smoke test")
+        self.install_hook()
         self.write("example.go", b"package main\nfunc main(){}\n")
         self.write("unstaged.go", b"package main\nfunc other(){}\n")
         self.git("add", "example.go")

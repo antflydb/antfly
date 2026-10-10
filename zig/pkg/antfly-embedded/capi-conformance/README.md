@@ -116,3 +116,12 @@ text, JSON, NULL, and SQLSTATE. Driver tests additionally exercise transaction
 isolation, savepoints, foreign keys, catalog reopen, and streaming past 128
 rows. Run Rust with `--features libantfly,sqlx --test sqlx`; the other packages
 discover SQL tests with their ordinary native-library test commands.
+
+The database SQL driver cases are in `sql/cases.json`. Before running them,
+seed `sql/search-fixture.json`: create `history_items` with its `history`
+document schema and the named vector table with its index definitions, apply
+the batch, and drain native work. Go database/sql, Rust
+SQLx, Python DB-API and TypeScript Connection run these same DDL, full-text,
+dense, sparse and hybrid join cases, including search sources in UPDATE and
+DELETE, constraint validation retries, failed UNIQUE repair, redundant UNIQUE
+retirement, FK constraint publication, and child-table retirement/recreation.

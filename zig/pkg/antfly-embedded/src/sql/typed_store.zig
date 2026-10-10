@@ -39,6 +39,16 @@ const Dictionary = struct {
     lookup: std.StringHashMapUnmanaged(u32) = .empty,
     flat: ?std.ArrayList([]const u8) = null,
     const empty: Dictionary = .{};
+    fn growthBytes(self: *const Dictionary, additional: usize) usize {
+        if (self.flat != null or additional <= self.lookup.available) return 0;
+        // A hash-table resize allocates the replacement before releasing the
+        // old table. Account for that capacity jump rather than one cell's
+        // payload, including metadata, keys, values and alignment/header space.
+        const entries = self.lookup.count() +| additional;
+        const required = entries *| 100 / std.hash_map.default_max_load_percentage +| 1;
+        const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
+        return capacity *| (@sizeOf(u8) + @sizeOf([]const u8) + @sizeOf(u32)) +| 64;
+    }
     fn deinit(self: *Dictionary, a: A) void {
         self.values.deinit(a);
         self.indices.deinit(a);
@@ -477,10 +487,24 @@ pub const Store = struct {
                 const column = self.columns[index];
                 if (column.values == .strings and value.value == .string) repeated = column.values.strings.lookup.contains(value.value.string);
                 if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.lookup.contains(value.value.number_string);
+                if (!repeated) {
+                    if (column.values == .strings and value.value == .string) bytes +|= column.values.strings.growthBytes(1);
+                    if (column.values == .decimals and value.value == .number_string) bytes +|= column.values.decimals.growthBytes(1);
+                }
             }
             bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
             if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         }
+        return bytes;
+    }
+    /// Reserve dictionary replacement capacity before admitting a batch. Treat
+    /// its incoming keys as distinct until their cardinality is established.
+    pub fn dictionaryGrowthBytes(self: *const Store, rows: usize) usize {
+        var bytes: usize = 0;
+        for (self.columns) |column| switch (column.values) {
+            .strings, .decimals => |dictionary| bytes +|= dictionary.growthBytes(rows),
+            else => {},
+        };
         return bytes;
     }
     /// Column-major payload admission. No per-row Datum slices or arenas;

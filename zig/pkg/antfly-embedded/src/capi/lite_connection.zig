@@ -196,8 +196,9 @@ pub const Connection = struct {
 
     fn maintenanceLoop(self: *Connection) void {
         const io = h.handleLockIo();
+        var next_wait_ms: i64 = 1000;
         while (!self.stopping.load(.acquire)) {
-            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }) catch {};
+            self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
             self.wake.reset();
             if (self.stopping.load(.acquire)) break;
             self.mutex.lockUncancelable(io);
@@ -226,15 +227,11 @@ pub const Connection = struct {
             }
             if (self.maintenance_pending) {
                 self.maintenance_pending = false;
-                root.db.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch {
-                    self.maintenance_pending = true;
-                };
+                self.maintenance_pending = (root.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 var tables = root.embedded_tables.valueIterator();
                 while (tables.next()) |table| {
                     if (self.stopping.load(.acquire)) break;
-                    table.*.db.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch {
-                        self.maintenance_pending = true;
-                    };
+                    self.maintenance_pending = (table.*.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
                 }
             }
             if (!self.stopping.load(.acquire)) {
@@ -249,6 +246,9 @@ pub const Connection = struct {
                 root.owned_lite_backend.?.native_docstore.?.maintainOnce(false) catch {};
             }
             self.collectRetired();
+            // Keep durable page work moving without retaining the path lease
+            // or spinning on a temporarily blocked maintenance page.
+            next_wait_ms = if (self.maintenance_pending) 100 else 1000;
         }
     }
 

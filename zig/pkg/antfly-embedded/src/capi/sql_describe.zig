@@ -27,6 +27,7 @@ fn describe(handle: *h.Handle, request_json: []const u8) !h.capi.Buffer {
     defer compiled.deinit();
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
+    try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = &handle.db, .table_name = "default", .read_only = !h.liteOpenModeCanWrite(handle.open_mode) };
     var description = try d.sql_describe.describe(handle.alloc, adapter.backend(), &compiled, request.value.parameter_types);
     defer description.deinit();

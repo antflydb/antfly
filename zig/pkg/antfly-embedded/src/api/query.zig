@@ -43,6 +43,7 @@ pub const validateStoragePublicQueryRequest = query_contract.validateStoragePubl
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
+pub const highlightsJsonValue = query_contract.highlightsJsonValue;
 pub const publicFilterQueryErrorStatus = query_contract.publicFilterQueryErrorStatus;
 pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFilterQueryErrorBodyAlloc;
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
