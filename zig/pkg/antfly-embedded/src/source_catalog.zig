@@ -66,6 +66,7 @@ pub const capi_sql_fk = @import("capi/sql_fk.zig");
 pub const capi_types = @import("capi/types.zig");
 pub const chunking_mod = @import("chunking/mod.zig");
 pub const chunking_types = @import("chunking/types.zig");
+pub const common_maintenance_scheduler = @import("common/maintenance_scheduler.zig");
 pub const common_byte_copy = @import("common/byte_copy.zig");
 pub const common_bounded_admission = @import("common/bounded_admission.zig");
 pub const common_read_admission = @import("common/read_admission.zig");

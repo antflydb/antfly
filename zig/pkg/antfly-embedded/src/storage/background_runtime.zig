@@ -1096,7 +1096,7 @@ pub const BackendRuntime = struct {
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
         const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
-        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)));
+        const scheduler = try MaintenanceScheduler.createWithRunnableOwner(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)), self.runnableOwner());
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }

@@ -943,3 +943,38 @@ is inspected. Whole standalone startup and shutdown remain integration gates.
 Existing recurring callbacks still need stage-level CPU admission, bounded
 physical waits and mandatory holder reentry. Creating their shared owner at
 birth is a prerequisite; it does not grant them CPU or qualify default sizing.
+
+### Explicit runnable recurring passes
+
+MaintenanceScheduler retains the runtime's shared node execution port and offers
+`registerRunnableClass` for callbacks that have adopted runnable ownership.
+Each admitted pass starts in the node's background CPU class with one slot,
+charged inputs and adapter metadata, and one finite deadline. Initial CPU
+pressure does not execute the callback or occupy a native runnable queue; the
+bounded physical registration retries later. The callback receives the same
+opaque borrow for checkpoints, actual wait parking and checked reentry. A final
+checkpoint prevents a swallowed reentry failure from becoming a successful
+scheduling result. Admission, rejection and pass failure counters are exposed
+in scheduler snapshots.
+
+Closing registration admission cancels runnable pass authority while preserving
+its operation, bytes and node lease until the physical callback joins. Scheduler
+destruction releases its consumer lease after all registrations, callbacks and
+the coordinator retire. A callback must join or authoritatively transfer every
+published resource and child before returning. This wrapper conveys no write
+authority or automatic service-holder cleanup. Callbacks retaining service
+leases need preauthorized mandatory reentry and cleanup before CPU transfer.
+Legacy callbacks keep their existing registration API until that graph is
+adopted; production producer, derived, propagation and maintenance migration is
+still required.
+
+Focused native checks exercise real API-owned opaque capsules with one ordinary
+CPU slot: background admission rejection, independent health progress, retained
+bytes during waits, queued reentry behind a foreground peer, original deadline,
+owner closure, authority rejection, swallowed failures and physical callback
+shutdown. These directly linked adapters do not qualify independently compiled
+storage archives or automatic defaults. The existing physical SQL cleanup
+saturation fixtures now assert the node's eight cleanup workers, five controls,
+eleven execution workers and separate reaper rather than the old per-API pool;
+their updated 24/25-worker accounting and full saturation/release paths remain
+pending cumulative integration.

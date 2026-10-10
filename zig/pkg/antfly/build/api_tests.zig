@@ -406,6 +406,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-cleanup-budget-test", "Verify cleanup activation budgets and runnable scheduler contracts")
         .dependOn(&b.addRunArtifact(cleanup_budget_tests).step);
 
+    const maintenance_runnable_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    maintenance_runnable_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    maintenance_runnable_root.addImport("antfly_local_sources", inference_owner_sources);
+    const maintenance_runnable_tests = b.addTest(.{
+        .name = "maintenance-runnable-tests",
+        .root_module = maintenance_runnable_root,
+        .filters = &.{"background execution recurring"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-background-execution-test", "Verify recurring background passes share node CPU and retain original authority through waits and joins")
+        .dependOn(&b.addRunArtifact(maintenance_runnable_tests).step);
+
     const cleanup_task_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_cleanup_task_test_root.zig"),
         .target = target,

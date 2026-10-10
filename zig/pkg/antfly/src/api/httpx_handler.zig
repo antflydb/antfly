@@ -18137,10 +18137,12 @@ test "SQL protected executor cleanup workers retain control progress under full 
     const cleanup_io = try api.sqlCleanupIo();
     const control = try api.sqlControlIo();
     try std.testing.expect(cleanup_io.userdata != foreground.userdata and cleanup_io.userdata != control.userdata);
-    try std.testing.expectEqual(@as(usize, 4), api.sql_cleanup_workers.?.capacity);
-    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    // The 32-worker node reserves eight shared cleanup workers, independent
+    // of this API's four-request foreground admission limit.
+    try std.testing.expectEqual(@as(usize, 8), api.sql_cleanup_workers.?.capacity);
+    try std.testing.expectEqual(@as(usize, 24), runtime.ptr().laneStats().reserved_workers);
     _ = try api.sqlCleanupIo();
-    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 24), runtime.ptr().laneStats().reserved_workers);
     const Blocked = struct {
         fn run(gate: *std.Io.Event, io: std.Io) std.Io.Cancelable!void {
             try gate.wait(io);
@@ -18166,7 +18168,7 @@ test "SQL protected executor cleanup workers retain control progress under full 
     var health = try control.concurrent(Blocked.health, .{&calls});
     health.await(control);
     try std.testing.expectEqual(@as(usize, 1), calls.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 24), runtime.ptr().laneStats().reserved_workers);
     cleanup_gate.set(cleanup_io);
     foreground_gate.set(foreground);
     try cleanup_jobs.await(cleanup_io);
@@ -18309,8 +18311,8 @@ test "SQL protected executor cleanup owner reserves independent reaper and recla
     defer if (!closed) api.deinit();
     const cleanup_io = try api.sqlCleanupIo();
     try std.testing.expect(api.sqlCleanupStats() == null);
-    try std.testing.expectEqual(@as(usize, 9), runtime.ptr().laneStats().reserved_workers);
-    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 23 });
+    try std.testing.expectEqual(@as(usize, 13), runtime.ptr().laneStats().reserved_workers);
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 19 });
     defer occupied.release();
     try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupOwner());
     try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
@@ -18325,20 +18327,20 @@ test "SQL protected executor cleanup owner reserves independent reaper and recla
     api.alloc = alloc;
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
-    try std.testing.expectEqual(@as(usize, 9), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 13), runtime.ptr().laneStats().reserved_workers);
     const active = try api.sqlCleanupOwner();
     const stats = api.sqlCleanupStats().?;
-    try std.testing.expectEqual(@as(usize, 4), stats.capacity);
+    try std.testing.expectEqual(@as(usize, 8), stats.capacity);
     try std.testing.expectEqual(@as(usize, 0), stats.retained);
     try std.testing.expect(!stats.closing);
     const control_io = try api.sqlControlIo();
     try std.testing.expect(active.io.userdata != cleanup_io.userdata and active.io.userdata != control_io.userdata);
-    try std.testing.expectEqual(@as(usize, 4), active.registry.limit);
-    try std.testing.expectEqual(@as(usize, 10), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 8), active.registry.limit);
+    try std.testing.expectEqual(@as(usize, 14), runtime.ptr().laneStats().reserved_workers);
     try std.testing.expectEqual(active, try api.sqlCleanupOwner());
-    try std.testing.expectEqual(@as(usize, 10), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 14), runtime.ptr().laneStats().reserved_workers);
     _ = try api.sqlExecutionIo();
-    try std.testing.expectEqual(@as(usize, 21), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
     var handler: AntflyApiHandler = .{ .api_server = &api };
     var request = try httpx.Request.init(alloc, .GET, "http://localhost/admin/v1/workload/query");
     defer request.deinit();
@@ -18354,7 +18356,7 @@ test "SQL protected executor cleanup owner reserves independent reaper and recla
     try std.testing.expect(!runnable_stats.get("enabled").?.bool);
     try std.testing.expectEqual(@as(i64, 0), runnable_stats.get("capacity_slots").?.integer);
     const cleanup_stats = body.value.object.get("cleanup").?.object;
-    try std.testing.expectEqual(@as(i64, 4), cleanup_stats.get("capacity").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), cleanup_stats.get("capacity").?.integer);
     try std.testing.expectEqual(@as(i64, 0), cleanup_stats.get("retained").?.integer);
     api.deinit();
     closed = true;
@@ -18480,7 +18482,7 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
     const cleanup_io = try api.sqlCleanupIo();
     const active = try api.sqlCleanupOwner();
     const control_io = try api.sqlControlIo();
-    try std.testing.expectEqual(@as(usize, 10), backend.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 14), backend.ptr().laneStats().reserved_workers);
     var owner: owners.State = .{ .owner_alloc = alloc, .owner = try scheduler.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Fixture.now };
     defer owner.owner.deinit();
     var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
@@ -18533,7 +18535,7 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
     try std.testing.expectEqual(@as(usize, 0), released.load(.acquire));
     try std.testing.expect(memory.stats().used_bytes > 0);
     try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
-    try std.testing.expectEqual(@as(usize, 10), backend.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 14), backend.ptr().laneStats().reserved_workers);
     fixture.go.set(cleanup_io);
     physically_released = true;
     shutdown_future.await(shutdown_io);

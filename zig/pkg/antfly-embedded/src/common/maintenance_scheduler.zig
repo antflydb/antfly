@@ -21,6 +21,9 @@
 //! context is destroyed, and all handles before the scheduler is destroyed.
 const std = @import("std");
 const Io = std.Io;
+const runnable = @import("antfly_runtime_abi").runnable_abi;
+const errors = @import("antfly_runtime_abi").error_abi;
+const native = @import("antfly_runtime_abi").native_abi;
 
 pub const Scheduler = struct {
     pub const Class = enum { maintenance, producer, derived, propagation };
@@ -32,6 +35,20 @@ pub const Scheduler = struct {
     pub fn cpuLimitedCapacity(cpu_parallelism: usize, lane_capacity: usize) usize {
         return @min(lane_capacity, @max(class_count, cpu_parallelism));
     }
+    /// Each admitted pass has one original finite deadline, including reentry.
+    /// Retained bytes cover callback-owned inputs; adapter metadata is added.
+    pub const RunnablePass = struct {
+        budget_ns: u64,
+        retained_bytes: u64 = 0,
+        fn validate(self: @This()) !void {
+            if (self.budget_ns == 0 or self.budget_ns > 60 * std.time.ns_per_s or self.retained_bytes > std.math.maxInt(u64) - @sizeOf(Task)) return error.InvalidArgument;
+        }
+    };
+    runnable_owner: ?runnable.Lease = null,
+    runnable_closing: std.atomic.Value(bool) = .init(false),
+    runnable_admissions: std.atomic.Value(u64) = .init(0),
+    runnable_rejections: std.atomic.Value(u64) = .init(0),
+    runnable_failures: std.atomic.Value(u64) = .init(0),
     alloc: std.mem.Allocator,
     io: Io,
     max_active: usize,
@@ -57,6 +74,9 @@ pub const Scheduler = struct {
         max_active_per_class: usize,
         dispatches: u64,
         dispatch_retries: u64,
+        runnable_admissions: u64,
+        runnable_rejections: u64,
+        runnable_failures: u64,
     };
 
     pub fn snapshot(self: *Scheduler) Stats {
@@ -71,13 +91,19 @@ pub const Scheduler = struct {
             .max_active_per_class = @max(1, self.max_active / class_count),
             .dispatches = self.dispatches,
             .dispatch_retries = self.dispatch_retries,
+            .runnable_admissions = self.runnable_admissions.load(.acquire),
+            .runnable_rejections = self.runnable_rejections.load(.acquire),
+            .runnable_failures = self.runnable_failures.load(.acquire),
         };
     }
 
     const Task = struct {
         scheduler: *Scheduler,
         context: *anyopaque,
-        step: *const fn (*anyopaque) ?u64,
+        step: ?*const fn (*anyopaque) ?u64 = null,
+        runnable_step: ?*const fn (*anyopaque, runnable.Borrowed) anyerror!?u64 = null,
+        runnable_pass: ?RunnablePass = null,
+        canceled: std.atomic.Value(bool) = .init(false),
         class: Class,
         future: ?Io.Future(void) = null,
         done: std.atomic.Value(bool) = .init(false),
@@ -108,6 +134,7 @@ pub const Scheduler = struct {
             // Detaching transfers exclusive future ownership to the joiner.
             const running = task.future != null;
             scheduler.mutex.unlock(scheduler.io);
+            if (cancel_active) task.canceled.store(true, .release);
             if (task.future) |*future| {
                 if (cancel_active) future.cancel(scheduler.io) else future.await(scheduler.io);
             }
@@ -125,10 +152,18 @@ pub const Scheduler = struct {
     };
 
     pub fn create(alloc: std.mem.Allocator, io: Io, max_active: usize) !*Scheduler {
+        return createWithRunnableOwner(alloc, io, max_active, null);
+    }
+
+    /// Retain the shared node before any pass can be dispatched. The lease
+    /// outlives registration detachment, callback joins and coordinator exit.
+    pub fn createWithRunnableOwner(alloc: std.mem.Allocator, io: Io, max_active: usize, owner: ?runnable.Owner) !*Scheduler {
         if (max_active == 0) return error.InvalidMaintenanceCapacity;
+        var lease = if (owner) |port| try runnable.Lease.init(port) else null;
+        errdefer if (lease) |*value| value.deinit();
         const self = try alloc.create(Scheduler);
         errdefer alloc.destroy(self);
-        self.* = .{ .alloc = alloc, .io = io, .max_active = max_active };
+        self.* = .{ .alloc = alloc, .io = io, .max_active = max_active, .runnable_owner = lease };
         self.coordinator = try io.concurrent(coordinate, .{self});
         return self;
     }
@@ -139,6 +174,7 @@ pub const Scheduler = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.stopping = true;
+        self.runnable_closing.store(true, .release);
         self.changed.set(self.io);
     }
 
@@ -152,6 +188,7 @@ pub const Scheduler = struct {
         self.mutex.unlock(self.io);
         if (self.coordinator) |*future| future.await(self.io);
         self.tasks.deinit(self.alloc);
+        if (self.runnable_owner) |*lease| lease.deinit();
         self.alloc.destroy(self);
     }
 
@@ -168,6 +205,31 @@ pub const Scheduler = struct {
         const task = try self.alloc.create(Task);
         errdefer self.alloc.destroy(task);
         task.* = .{ .scheduler = self, .context = context, .step = Adapter.call, .class = class };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.stopping) return error.BackendRuntimeShuttingDown;
+        try self.tasks.append(self.alloc, task);
+        self.changed.set(self.io);
+        return .{ .task = task };
+    }
+
+    /// Explicit adoption only: each callback must checkpoint CPU work, park
+    /// at actual waits, and physically join or transfer every published owner
+    /// before returning. Retained service holders require preauthorized
+    /// mandatory reentry/cleanup; this wrapper does not supply write authority.
+    /// Initial CPU pressure retries a registration without running its callback
+    /// or occupying a native runnable queue. Resumption uses the same capsule.
+    pub fn registerRunnableClass(self: *Scheduler, class: Class, pass: RunnablePass, context: anytype, comptime step: fn (@TypeOf(context), runnable.Borrowed) anyerror!?u64) !Handle {
+        try pass.validate();
+        if (self.runnable_owner == null) return error.ExecutionWaitUnsupported;
+        const Adapter = struct {
+            fn call(raw: *anyopaque, borrow: runnable.Borrowed) anyerror!?u64 {
+                return step(@ptrCast(@alignCast(raw)), borrow);
+            }
+        };
+        const task = try self.alloc.create(Task);
+        errdefer self.alloc.destroy(task);
+        task.* = .{ .scheduler = self, .context = context, .runnable_step = Adapter.call, .runnable_pass = pass, .class = class };
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.stopping) return error.BackendRuntimeShuttingDown;
@@ -193,9 +255,77 @@ pub const Scheduler = struct {
 
     fn run(task: *Task) void {
         const scheduler = task.scheduler;
-        task.delay_ms = task.step(task.context);
+        task.delay_ms = if (task.runnable_step != null) runRunnable(task) else task.step.?(task.context);
         task.done.store(true, .release);
         scheduler.changed.set(scheduler.io);
+    }
+
+    fn checkedRunnable(status: errors.Status) !void {
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    fn runnableCanceled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const task: *const Task = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(task.canceled.load(.acquire) or task.scheduler.runnable_closing.load(.acquire));
+    }
+
+    fn runRunnable(task: *Task) ?u64 {
+        const self = task.scheduler;
+        const owner = self.runnable_owner.?.owner;
+        const pass = task.runnable_pass.?;
+        const io_borrow = native.IoBorrow.init(&self.io);
+        const now_ns: u64 = @intCast(@max(0, Io.Clock.awake.now(self.io).nanoseconds));
+        var handle: ?*anyopaque = null;
+        const bytes = std.math.add(u64, pass.retained_bytes, @sizeOf(Task)) catch {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return null;
+        };
+        const status = owner.start(owner.context, &.{
+            .io = &io_borrow,
+            .class = @backingInt(runnable.Class.background),
+            .slots = 1,
+            .has_deadline = 1,
+            .deadline_ns = now_ns +| pass.budget_ns,
+            .allow_wait = 0,
+            .cancellation = .{ .context = task, .is_cancelled = runnableCanceled },
+            .retained_bytes = bytes,
+            .out_handle = &handle,
+        });
+        if (!status.isOk()) {
+            _ = self.runnable_rejections.fetchAdd(1, .release);
+            const cause = errors.errorFromStatus(status);
+            return switch (cause) {
+                error.SchedulerClosed, error.Canceled => null,
+                else => 10,
+            };
+        }
+        const owned = handle orelse {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return null;
+        };
+        // Callback completion is not retirement: its return contract requires
+        // every child/resource join before this owning finish can execute.
+        defer owner.finish(owned);
+        _ = self.runnable_admissions.fetchAdd(1, .release);
+        const borrow = runnable.Borrowed.fromOwner(owner, owned, 1, .background) catch {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return null;
+        };
+        checkedRunnable(borrow.checkpoint(borrow.context)) catch {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return if (runnableCanceled(task) != 0) null else 10;
+        };
+        const delay = task.runnable_step.?(task.context, borrow) catch {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return if (runnableCanceled(task) != 0) null else 10;
+        };
+        // A parked, expired or canceled capsule cannot publish a successful
+        // scheduling result, even when its callback swallowed a wait error.
+        checkedRunnable(borrow.checkpoint(borrow.context)) catch {
+            _ = self.runnable_failures.fetchAdd(1, .release);
+            return if (runnableCanceled(task) != 0) null else 10;
+        };
+        return delay;
     }
 
     fn coordinate(self: *Scheduler) void {
