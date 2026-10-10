@@ -13682,7 +13682,7 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "in_list";
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
         /**
@@ -13699,11 +13699,15 @@ export interface components {
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
-         *     Comparisons require operands of the same type and return boolean or
+         *     Comparisons require operands of compatible types (integer and number may mix) and return boolean or
          *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
          *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
          *     evaluate left to right with SQL three-valued short-circuit semantics;
-         *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         *     NOT preserves UNKNOWN. in_list evaluates its first argument once and
+         *     compares it to each remaining argument of a compatible type, keeping integer comparisons exact. A match
+         *     returns TRUE; otherwise a null operand or list item returns UNKNOWN,
+         *     and a list without nulls returns FALSE. It stops at the first match.
+         *     CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
@@ -13711,7 +13715,7 @@ export interface components {
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;
-            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
             args?: components["schemas"]["RelationalScalarExpression"][];
         };

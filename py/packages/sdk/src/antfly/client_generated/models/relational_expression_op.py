@@ -11,6 +11,7 @@ class RelationalExpressionOp(StrEnum):
     EQ = "eq"
     GT = "gt"
     GTE = "gte"
+    IN_LIST = "in_list"
     IS_DISTINCT = "is_distinct"
     IS_NOT_DISTINCT = "is_not_distinct"
     IS_NOT_NULL = "is_not_null"

@@ -20,6 +20,23 @@ const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 const Json = std.json.Value;
 
+test "SQL schema membership lowers typed NULL literals" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for ([_][]const u8{ "x IN (1, NULL)", "NULL IN (NULL)", "x IN (NULL)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(alloc, sql, .{});
+        defer compiled.deinit();
+        const lowered = try lowerColumns(arena.allocator(), &.{.{ .name = "x", .type = .integer }}, compiled.expression, .boolean);
+        const wire = try std.json.parseFromValueLeaky(@import("antfly_schema_openapi").RelationalScalarExpression, arena.allocator(), lowered.expression, .{});
+        const roundtrip = try json(arena.allocator(), wire);
+        const table: @import("../storage/schema.zig").TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "x", .path = "x", .column_type = .integer, .allows_null = true }} };
+        var plan = try @import("../schema/relational_expression.zig").Plan.init(alloc, table, roundtrip, .boolean);
+        defer plan.deinit();
+        try std.testing.expectEqual(@import("../schema/relational_expression.zig").Value.null, try plan.evaluate(alloc, &.{.{ .integer = 2 }}));
+    }
+}
+
 fn json(alloc: std.mem.Allocator, input: anytype) !Json {
     return std.json.parseFromSliceLeaky(Json, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
 }
@@ -53,7 +70,9 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     if (program.parameter_types.len != 0) return error.InvalidSqlParameters;
     const values = try alloc.alloc(Json, program.instructions.len);
     for (program.instructions, values) |instruction, *out| {
-        const kind = instruction.type.kind orelse return error.SqlTypeMismatch;
+        // An all-NULL membership list has no inferred comparison type.
+        // Resolve its untyped NULL literals as text, as ordinary SQL does.
+        const kind = instruction.type.kind orelse if (instruction.operation == .literal and instruction.operation.literal == .null) ast.ColumnType.string else return error.SqlTypeMismatch;
         out.* = switch (instruction.operation) {
             .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
             .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
@@ -97,7 +116,14 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 break :blk try json(alloc, .{ .op = op, .args = args });
             },
             .cast => |part| if (program.instructions[part.operand].type.kind == part.type) values[part.operand] else return error.UnsupportedSqlShape,
-            .case_when, .in_list => return error.UnsupportedSqlShape,
+            .in_list => |part| blk: {
+                const args = try alloc.alloc(Json, part.values.len + 1);
+                args[0] = values[part.operand];
+                for (part.values, args[1..]) |index, *arg| arg.* = values[index];
+                const membership = try json(alloc, .{ .op = "in_list", .args = args });
+                break :blk if (part.negated) try json(alloc, .{ .op = "not", .args = &[_]Json{membership} }) else membership;
+            },
+            .case_when => return error.UnsupportedSqlShape,
         };
     }
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch };
@@ -177,4 +203,28 @@ fn collectPredicates(alloc: std.mem.Allocator, expression: Json, negated: bool, 
         }
     }
     try appendPredicate(alloc, predicates, try json(alloc, .{ .column = column.string, .op = @tagName(op), .value = value }));
+}
+
+test "SQL schema numeric membership matches scalar comparison without integer rounding" {
+    const alloc = std.testing.allocator;
+    const table: @import("../storage/schema.zig").TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "x", .path = "x", .column_type = .integer }} };
+    const cases = [_]struct { sql: []const u8, value: i64, expected: bool }{
+        .{ .sql = "x IN (1, 2.0)", .value = 2, .expected = true },
+        .{ .sql = "x IN (1, 2.5)", .value = 2, .expected = false },
+        .{ .sql = "x NOT IN (9007199254740992.0)", .value = 9007199254740993, .expected = true },
+        .{ .sql = "x IN (9223372036854775808.0)", .value = 9223372036854775807, .expected = false },
+        .{ .sql = "x IN (-1.5, -2)", .value = -1, .expected = false },
+        .{ .sql = "2.0 IN (x, 3)", .value = 2, .expected = true },
+        .{ .sql = "x = 2.0", .value = 2, .expected = true },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var compiled = try @import("compiler.zig").compileScalar(alloc, case.sql, .{});
+        defer compiled.deinit();
+        const lowered = try lowerColumns(arena.allocator(), &.{.{ .name = "x", .type = .integer }}, compiled.expression, .boolean);
+        var plan = try @import("../schema/relational_expression.zig").Plan.init(alloc, table, lowered.expression, .boolean);
+        defer plan.deinit();
+        try std.testing.expectEqual(case.expected, (try plan.evaluate(alloc, &.{.{ .integer = case.value }})).boolean);
+    }
 }

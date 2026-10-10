@@ -27223,6 +27223,7 @@ components:
         - and
         - or
         - not
+        - in_list
     RelationalExpressionType:
       type: string
       enum:
@@ -27264,7 +27265,7 @@ components:
 
         normal relational datetime representation.
 
-        Comparisons require operands of the same type and return boolean or
+        Comparisons require operands of compatible types (integer and number may mix) and return boolean or
 
         SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
 
@@ -27272,7 +27273,15 @@ components:
 
         evaluate left to right with SQL three-valued short-circuit semantics;
 
-        NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+        NOT preserves UNKNOWN. in_list evaluates its first argument once and
+
+        compares it to each remaining argument of a compatible type, keeping integer comparisons exact. A match
+
+        returns TRUE; otherwise a null operand or list item returns UNKNOWN,
+
+        and a list without nulls returns FALSE. It stops at the first match.
+
+        CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
       properties:
         op:
           $ref: '#/components/schemas/RelationalExpressionOp'
@@ -27280,16 +27289,17 @@ components:
           $ref: '#/components/schemas/RelationalExpressionType'
         value:
           description: Typed literal value, including null.
+          nullable: true
         column:
           type: string
           minLength: 1
         collation:
           type: string
-          description: Optional binary or ASCII case-insensitive collation for binary string comparison
-            operations only; aliases match ordered indexes.
+          description: Optional binary or ASCII case-insensitive collation for string comparisons and
+            in_list; aliases match ordered indexes.
         args:
           type: array
-          maxItems: 32
+          maxItems: 128
           items:
             $ref: '#/components/schemas/RelationalScalarExpression'
     RelationalIndexKeyDirection:

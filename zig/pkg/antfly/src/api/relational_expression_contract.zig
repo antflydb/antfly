@@ -141,8 +141,8 @@ pub fn validType(value: std.json.Value) bool {
 /// This changes transport spelling only; native typed fingerprints are equal.
 pub fn canonicalizeOwnedExpression(alloc: std.mem.Allocator, expression: *wire.RelationalScalarExpression) !void {
     if (expression.op == .literal) {
-        if (expression.type) |kind| if (expression.value) |value| {
-            expression.value = try canonicalLiteral(alloc, kind, value);
+        if (expression.type) |kind| if (expression.value == .value) {
+            expression.value = .{ .value = try canonicalLiteral(alloc, kind, expression.value.value) };
         };
     }
     if (expression.args) |args| for (@constCast(args)) |*child| try canonicalizeOwnedExpression(alloc, child);
@@ -266,11 +266,11 @@ test "relational declarations canonical public expression copy preserves borrowe
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: wire.RelationalScalarExpression = .{ .op = .add, .args = &.{
-        .{ .op = .literal, .type = .integer, .value = .{ .number_string = "9007199254740993" } },
-        .{ .op = .literal, .type = .integer, .value = .{ .number_string = "1" } },
+        .{ .op = .literal, .type = .integer, .value = .{ .value = .{ .number_string = "9007199254740993" } } },
+        .{ .op = .literal, .type = .integer, .value = .{ .value = .{ .number_string = "1" } } },
     } };
     const copy = try cloneCanonicalExpression(arena.allocator(), source);
-    try std.testing.expectEqualStrings("9007199254740993", source.args.?[0].value.?.number_string);
-    try std.testing.expectEqualStrings("9007199254740993", copy.args.?[0].value.?.string);
-    try std.testing.expectEqualStrings("1", copy.args.?[1].value.?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", source.args.?[0].value.value.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", copy.args.?[0].value.value.string);
+    try std.testing.expectEqualStrings("1", copy.args.?[1].value.value.number_string);
 }

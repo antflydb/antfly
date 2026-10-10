@@ -51,11 +51,11 @@ pub const EvalLimits = struct {
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     depth: usize = 64,
-    output_bytes: usize = 1024 * 1024,
+    output_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, strpos, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", @"$like_escape", @"$ilike_escape" };
 
 pub const Instruction = struct {
     type: Type,
@@ -222,10 +222,10 @@ fn arity(function: Function, count: usize) !void {
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
         .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp, .current_setting => count == 1,
-        .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
+        .nullif, .power, .mod, .starts_with, .strpos, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified" => count == 5,
         .substring => count == 2 or count == 3,
-        .replace => count == 3,
+        .replace, .@"$like_escape", .@"$ilike_escape" => count == 3,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
         .coalesce, .greatest, .least => count > 0,
         .concat => true,
@@ -344,8 +344,8 @@ const Binder = struct {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
                 }
                 break :blk .{ .kind = switch (function) {
-                    .length, .octet_length => .integer,
-                    .starts_with, .@"$pattern_quantified" => .boolean,
+                    .length, .octet_length, .strpos => .integer,
+                    .starts_with, .@"$pattern_quantified", .@"$like_escape", .@"$ilike_escape" => .boolean,
                     .sqrt, .power, .date_part => .number,
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .mod, .@"$single" => merged.kind,
@@ -456,7 +456,7 @@ const Binder = struct {
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
-                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with => .string,
+                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .@"$like_escape", .@"$ilike_escape" => .string,
                         .substring => if (i == 0) .string else .integer,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
@@ -704,7 +704,7 @@ const Evaluator = struct {
                 break :blk switch (binary.op) {
                     .add, .subtract, .multiply, .divide, .modulo => try arithmetic(binary.op, left, right),
                     .concat => try self.concat(&.{ left, right }, false),
-                    .like, .ilike => .{ .bool = try self.like(left, right, binary.op == .ilike) },
+                    .like, .ilike => .{ .bool = try self.like(left, right, binary.op == .ilike, "\\") },
                     .eq, .neq, .lt, .lte, .gt, .gte => comparison(binary.op, try compare(left, right)),
                     else => unreachable,
                 };
@@ -857,7 +857,7 @@ const Evaluator = struct {
                         saw_null = true;
                         continue;
                     }
-                    const matches = (try self.like(operand, pattern.value, insensitive.bool)) != negated.bool;
+                    const matches = (try self.like(operand, pattern.value, insensitive.bool, "\\")) != negated.bool;
                     if (matches != all.bool) return .{ .bool = matches };
                 }
                 return if (saw_null) .null else .{ .bool = all.bool };
@@ -872,7 +872,7 @@ const Evaluator = struct {
                     saw_null = true;
                     continue;
                 }
-                const matches = (try self.like(operand, pattern, insensitive.bool)) != negated.bool;
+                const matches = (try self.like(operand, pattern, insensitive.bool, "\\")) != negated.bool;
                 if (matches != all.bool) return .{ .bool = matches };
             }
             return if (saw_null) .null else .{ .bool = all.bool };
@@ -957,6 +957,8 @@ const Evaluator = struct {
             .ai_decide, .ai_choice, .ai_score, .ai_probability => error.DecisionNotEvaluated,
             .length => .{ .integer = @intCast(std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch) },
             .octet_length => .{ .integer = @intCast(text_value.len) },
+            .strpos => .{ .integer = try self.strpos(text_value, values[1].string) },
+            .@"$like_escape", .@"$ilike_escape" => .{ .bool = try self.like(first, values[1], function == .@"$ilike_escape", values[2].string) },
             .lower, .upper => blk: {
                 try self.charge(text_value.len);
                 const output = try self.alloc.dupe(u8, text_value);
@@ -1032,48 +1034,88 @@ const Evaluator = struct {
         };
     }
 
-    fn like(self: *Evaluator, text_value: Json, pattern: Json, insensitive: bool) !bool {
+    fn chargePattern(self: *Evaluator, steps: usize) !void {
+        if (steps > self.limits.pattern_steps - self.pattern_steps) return error.SqlProgramLimitExceeded;
+        self.pattern_steps += steps;
+    }
+
+    fn strpos(self: *Evaluator, text: []const u8, needle: []const u8) !i64 {
+        try self.chargePattern(text.len);
+        try self.chargePattern(needle.len);
+        const view = std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch;
+        _ = std.unicode.Utf8View.init(needle) catch return error.SqlTypeMismatch;
+        if (needle.len == 0) return 1;
+        var iterator = view.iterator();
+        var position: i64 = 1;
+        while (iterator.i < text.len) : (position += 1) {
+            const offset = iterator.i;
+            _ = iterator.nextCodepointSlice();
+            if (needle.len > text.len - offset) return 0;
+            var matched = true;
+            for (needle, text[offset..][0..needle.len]) |expected, actual| {
+                try self.chargePattern(1);
+                if (expected != actual) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return position;
+        }
+        return 0;
+    }
+
+    fn like(self: *Evaluator, text_value: Json, pattern: Json, insensitive: bool, escape: []const u8) !bool {
         if (text_value != .string or pattern != .string) return error.SqlTypeMismatch;
         const text = text_value.string;
         const glob = pattern.string;
+        try self.chargePattern(text.len);
+        try self.chargePattern(glob.len);
+        try self.chargePattern(escape.len);
+        _ = std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch;
+        const pattern_view = std.unicode.Utf8View.init(glob) catch return error.SqlTypeMismatch;
+        const escape_view = std.unicode.Utf8View.init(escape) catch return error.InvalidSqlParameters;
+        var escape_iterator = escape_view.iterator();
+        _ = escape_iterator.nextCodepointSlice();
+        if (escape_iterator.nextCodepointSlice() != null) return error.InvalidSqlParameters;
+        // Reject a dangling escape even if an earlier mismatch would skip it.
+        var pattern_iterator = pattern_view.iterator();
+        while (pattern_iterator.nextCodepointSlice()) |character| {
+            if (escape.len > 0 and std.mem.eql(u8, character, escape) and pattern_iterator.nextCodepointSlice() == null) return error.InvalidSqlParameters;
+        }
         var i: usize = 0;
         var j: usize = 0;
         var star: ?usize = null;
         var restart: usize = 0;
         while (i < text.len) {
-            if (self.pattern_steps >= self.limits.pattern_steps) return error.SqlProgramLimitExceeded;
-            self.pattern_steps += 1;
-            if (j < glob.len and glob[j] == '%') {
+            try self.chargePattern(1);
+            const pattern_start = j;
+            const escaped = escape.len > 0 and std.mem.startsWith(u8, glob[j..], escape);
+            if (escaped) j += escape.len;
+            if (!escaped and j < glob.len and glob[j] == '%') {
                 if (j + 1 == glob.len) return true;
                 star = j + 1;
                 j += 1;
                 restart = i;
                 continue;
             }
-            if (j < glob.len and glob[j] == '_') {
+            if (!escaped and j < glob.len and glob[j] == '_') {
                 i += std.unicode.utf8ByteSequenceLength(text[i]) catch return error.SqlTypeMismatch;
                 j += 1;
                 continue;
-            }
-            var escaped = false;
-            if (j < glob.len and glob[j] == '\\') {
-                j += 1;
-                escaped = true;
-                if (j == glob.len) return error.InvalidSqlParameters;
             }
             if (j < glob.len and (if (insensitive) std.ascii.toLower(text[i]) == std.ascii.toLower(glob[j]) else text[i] == glob[j])) {
                 i += 1;
                 j += 1;
                 continue;
             }
-            if (escaped) j -= 1;
+            j = pattern_start;
             if (star) |next| {
                 restart += std.unicode.utf8ByteSequenceLength(text[restart]) catch return error.SqlTypeMismatch;
                 i = restart;
                 j = next;
             } else return false;
         }
-        while (j < glob.len and glob[j] == '%') : (j += 1) {}
+        while (j < glob.len and glob[j] == '%' and !(escape.len > 0 and std.mem.startsWith(u8, glob[j..], escape))) : (j += 1) {}
         return j == glob.len;
     }
 };
@@ -1115,12 +1157,7 @@ pub fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
 }
 fn compareIntFloat(integer: i64, number: f64) !std.math.Order {
     if (!std.math.isFinite(number)) return error.SqlNumericOutOfRange;
-    if (number >= 9223372036854775808.0) return .lt;
-    if (number < -9223372036854775808.0) return .gt;
-    const truncated: i64 = @intFromFloat(number);
-    const order = std.math.order(integer, truncated);
-    if (order != .eq) return order;
-    return std.math.order(@as(f64, @floatFromInt(truncated)), number);
+    return @import("../common/numeric_order.zig").intFloat(integer, number);
 }
 pub fn compare(left: Json, right: Json) !std.math.Order {
     if (left == .array or left == .object or left == .number_string or right == .array or right == .object or right == .number_string) {
@@ -1173,6 +1210,24 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         .{ .sql = "9007199254740993 > 9007199254740992.0", .expected = "true" },
         .{ .sql = "NULL IS NOT DISTINCT FROM NULL", .expected = "true" },
         .{ .sql = "CAST('12' AS bigint) + 1", .expected = "13" },
+        .{ .sql = "strpos('high', 'ig')", .expected = "2" },
+        .{ .sql = "strpos('é🍎z', 'z')", .expected = "3" },
+        .{ .sql = "strpos('abc', '')", .expected = "1" },
+        .{ .sql = "strpos('', '')", .expected = "1" },
+        .{ .sql = "strpos('abc', 'missing')", .expected = "0" },
+        .{ .sql = "strpos(NULL, 'x')", .expected = "null" },
+        .{ .sql = "strpos('abc', NULL)", .expected = "null" },
+        .{ .sql = "'a_b' LIKE 'a!_b' ESCAPE '!'", .expected = "true" },
+        .{ .sql = "'A_B' ILIKE 'a!_b' ESCAPE '!'", .expected = "true" },
+        .{ .sql = "'a_b' NOT LIKE 'a!_b' ESCAPE '!'", .expected = "false" },
+        .{ .sql = "'a%b' NOT ILIKE 'A!%B' ESCAPE '!'", .expected = "false" },
+        .{ .sql = "'a!b' LIKE 'a!!b' ESCAPE '!'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'aé_b' ESCAPE 'é'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'a__' ESCAPE '_'", .expected = "false" },
+        .{ .sql = "'a%b' LIKE 'a%%b' ESCAPE '%'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE '%é_%' ESCAPE 'é'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'a_b' ESCAPE ''", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'a!_b' ESCAPE NULL", .expected = "null" },
         .{ .sql = "length('é🍎')", .expected = "2" },
         .{ .sql = "substring('aé🍎z', 2, 2)", .expected = "\"é🍎\"" },
         .{ .sql = "trim('éêé', 'é')", .expected = "\"ê\"" },
@@ -1349,4 +1404,16 @@ test "SQL LIKE admits large ordinary text with an independent bounded work budge
         try std.testing.expectEqual(expected, actual.value.bool);
     }
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = "%absent%" } }, .{ .pattern_steps = 32 }));
+}
+
+test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
+    const alloc = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(alloc, "strpos($1,$2)", .{});
+    defer compiled.deinit();
+    var program = try bind(alloc, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const invalid = [_]u8{0xff};
+    try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
 }

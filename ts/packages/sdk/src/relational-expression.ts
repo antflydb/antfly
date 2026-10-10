@@ -25,6 +25,7 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   and: [2, 32],
   or: [2, 32],
   not: [1, 1],
+  in_list: [2, 128],
 };
 const operations = new Set(Object.keys(arities));
 const comparisons = new Set([
@@ -36,6 +37,7 @@ const comparisons = new Set([
   "lte",
   "is_distinct",
   "is_not_distinct",
+  "in_list",
 ]);
 const types: Record<RelationalExpressionType, true> = {
   string: true,

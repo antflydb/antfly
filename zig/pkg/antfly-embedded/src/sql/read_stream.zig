@@ -669,7 +669,7 @@ pub const Stream = struct {
             }
             const owner = try self.budget.allocator().create(Spool);
             owner.* = .{
-                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) },
+                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes },
                 .shared = backend.spill_manager,
                 .a = self.budget.allocator(),
                 .width = binding.columns.len,
@@ -752,7 +752,7 @@ pub const Stream = struct {
                         self.context.spill = manager;
                     } else if (backend.execution_io) |io| {
                         const manager = try self.budget.allocator().create(@import("spill.zig").Manager);
-                        manager.* = .{ .alloc = self.budget.allocator(), .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+                        manager.* = .{ .alloc = self.budget.allocator(), .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
                         self.stream_manager = manager;
                         self.context.spill = manager;
                     }

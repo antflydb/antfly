@@ -30,11 +30,15 @@ class RelationalColumnExpression:
             row and expression set. An integer literal may use a decimal string
             for exact int64 transport; blob uses base64 and datetime uses the
             normal relational datetime representation.
-            Comparisons require operands of the same type and return boolean or
+            Comparisons require operands of compatible types (integer and number may mix) and return boolean or
             SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
             boolean. Unary is_null and is_not_null test presence/null. AND and OR
             evaluate left to right with SQL three-valued short-circuit semantics;
-            NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+            NOT preserves UNKNOWN. in_list evaluates its first argument once and
+            compares it to each remaining argument of a compatible type, keeping integer comparisons exact. A match
+            returns TRUE; otherwise a null operand or list item returns UNKNOWN,
+            and a list without nulls returns FALSE. It stops at the first match.
+            CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
     """
 
     column: str

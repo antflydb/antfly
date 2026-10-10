@@ -25,11 +25,13 @@ const Json = std.json.Value;
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 
+pub const resource_limits = @import("resource_limits.zig");
+
 pub const Limits = struct {
     result_rows: usize = 128,
     mutation_rows: usize = 4096,
     scan_rows: usize = 10_000_000,
-    retained_bytes: usize = 64 * 1024 * 1024,
+    retained_bytes: usize = resource_limits.default_memory_bytes,
     page_rows: u32 = 256,
     /// Native execution batches are independent of response/decision pages.
     execution_batch_rows: u32 = 4096,
@@ -158,7 +160,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
-        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);

@@ -99,6 +99,9 @@ pub const EncodedTuple = struct {
 };
 
 pub const TuplePlan = struct {
+    /// Stored index tuples retain the physical key limit. Residual predicates
+    /// use the same ordering codec with a row-sized, allocation-bounded limit.
+    encoded_bytes_limit: usize = @import("relational_index_limits.zig").max_stored_key_bytes,
     alloc: Allocator,
     layout: *const rows.PhysicalLayout,
     columns: []const schema.RelationalColumn,
@@ -253,7 +256,7 @@ pub const TuplePlan = struct {
             key.ordinal = @intCast(ordinal);
             initialized += 1;
         }
-        return .{ .alloc = alloc, .layout = layout, .columns = source.relational_columns, .keys = keys, .fingerprint = self.fingerprint };
+        return .{ .alloc = alloc, .layout = layout, .columns = source.relational_columns, .keys = keys, .fingerprint = self.fingerprint, .encoded_bytes_limit = self.encoded_bytes_limit };
     }
 
     pub fn encodeAlloc(self: TuplePlan, alloc: Allocator, row: rows.OrdinalRowView) !EncodedTuple {
@@ -274,7 +277,7 @@ pub const TuplePlan = struct {
         var has_null = false;
         for (values, self.keys[0..values.len]) |value, key| {
             if (value == .null) has_null = true;
-            try appendValue(alloc, out, start, key, value);
+            try appendValue(alloc, out, start, self.encoded_bytes_limit, key, value);
         }
         return has_null;
     }
@@ -362,17 +365,17 @@ pub const TuplePlan = struct {
                 if (encoded_bound > expression_budget) return error.RelationalExpressionBudgetExceeded;
                 expression_budget -= encoded_bound;
                 has_null = has_null or value == .null;
-                try appendValue(alloc, out, start, key, value);
+                try appendValue(alloc, out, start, self.encoded_bytes_limit, key, value);
                 continue;
             }
             const cell = try row.findCell(key.ordinal);
             if (cell == null or cell.?.is_null) {
                 has_null = true;
-                try appendValue(alloc, out, start, key, .null);
+                try appendValue(alloc, out, start, self.encoded_bytes_limit, key, .null);
                 continue;
             }
             const value = cell.?.value;
-            try appendValue(alloc, out, start, key, switch (key.column_type) {
+            try appendValue(alloc, out, start, self.encoded_bytes_limit, key, switch (key.column_type) {
                 .string => .{ .string = value.bytes_val },
                 .blob => .{ .blob = value.bytes_val },
                 .boolean => .{ .boolean = value.bool_val },
@@ -461,10 +464,12 @@ pub const BatchKeys = struct {
                 .boolean => 2,
                 else => 9,
             };
-            if (bytes > budget) return error.RelationalExpressionBudgetExceeded;
-            budget -= bytes;
+            if (key.expression != null) {
+                if (bytes > budget) return error.RelationalExpressionBudgetExceeded;
+                budget -= bytes;
+            }
             has_null = has_null or value == .null;
-            try appendValue(alloc, out, start, key, value);
+            try appendValue(alloc, out, start, self.plan.encoded_bytes_limit, key, value);
         }
         return has_null;
     }
@@ -493,18 +498,18 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
     };
 }
 
-fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value) !void {
+fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, max_bytes: usize, key: BoundKey, value: Value) !void {
     const encoded_size: usize = switch (value) {
         .null => 1,
         .boolean => 2,
         .string, .blob => |bytes| blk: {
-            try @import("relational_index_limits.zig").admit(bytes.len);
+            if (bytes.len > max_bytes) return error.RelationalIndexKeyTooLarge;
             break :blk 3 + bytes.len + std.mem.count(u8, bytes, "\x00");
         },
         .datetime => 17,
         else => 9,
     };
-    try @import("relational_index_limits.zig").admit(out.items.len - tuple_start +| encoded_size);
+    if (out.items.len - tuple_start +| encoded_size > max_bytes) return error.RelationalIndexKeyTooLarge;
     if (value == .null) {
         try out.append(alloc, if (key.nulls_first) @as(u8, 0) else 0xff);
         return;

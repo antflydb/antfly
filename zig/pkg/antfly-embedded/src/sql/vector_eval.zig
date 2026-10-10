@@ -820,7 +820,7 @@ test "SQL vector root text validation matches scalar and ignores discarded inter
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const wide = try alloc.alloc(u8, 1024 * 1024 + 1);
+    const wide = try alloc.alloc(u8, (scalar.EvalLimits{}).output_bytes + 1);
     @memset(wide, 'x');
     for ([_][]const u8{ "s", "s = s" }) |sql| {
         var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});

@@ -21,7 +21,7 @@ pub const ast = @import("ast.zig");
 pub const Diagnostic = @import("diagnostics.zig").Diagnostic;
 
 pub const Limits = struct {
-    max_bytes: usize = 1 << 20,
+    max_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     max_tokens: usize = 16_384,
     max_nodes: usize = 8_192,
     max_depth: usize = 64,
@@ -578,7 +578,7 @@ const Parser = struct {
                         } });
                         continue;
                     }
-                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = left, .right = try self.scalar(depth + 1, 4) } }) } });
+                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.patternExpression(left, try self.scalar(depth + 1, 4), insensitive, depth) } });
                     continue;
                 }
             }
@@ -649,9 +649,22 @@ const Parser = struct {
                     continue;
                 }
             }
-            left = try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = try self.scalar(depth + 1, precedence + 1) } });
+            const right = try self.scalar(depth + 1, precedence + 1);
+            left = if (op == .like or op == .ilike)
+                try self.patternExpression(left, right, op == .ilike, depth)
+            else
+                try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = right } });
         }
         return left;
+    }
+
+    fn patternExpression(self: *Parser, left: *const ast.Scalar, right: *const ast.Scalar, insensitive: bool, depth: usize) Error!*const ast.Scalar {
+        if (!self.keyword(.escape)) return self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = left, .right = right } });
+        const escape = try self.scalar(depth + 1, 4);
+        return self.scalarNode(.{ .call = .{
+            .name = if (insensitive) "$ilike_escape" else "$like_escape",
+            .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right, escape }),
+        } });
     }
 
     fn checkScalarDepth(self: *Parser, expression: *const ast.Scalar, depth: usize) Error!void {

@@ -27,7 +27,7 @@ pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
 pub const max_allocated_bytes = 4 * max_output_bytes;
 
-const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not };
+const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, in_list };
 const Node = struct {
     op: Op,
     kind: Kind,
@@ -156,6 +156,21 @@ pub const Plan = struct {
             }
             return if (unknown) .null else .{ .boolean = node.op == .@"and" };
         }
+        if (node.op == .in_list) {
+            const operand = try self.evaluateNode(alloc, source, node.children[0], budget);
+            if (operand == .null) return .null;
+            var unknown = false;
+            for (node.children[1..]) |child| {
+                const value = try self.evaluateNode(alloc, source, child, budget);
+                if (value == .null) {
+                    unknown = true;
+                    continue;
+                }
+                try chargeComparison(operand, value, budget);
+                if (valueOrder(operand, value, node.fold_ascii) == .eq) return .{ .boolean = true };
+            }
+            return if (unknown) .null else .{ .boolean = false };
+        }
         if (node.op == .is_null or node.op == .is_not_null) {
             const value = try self.evaluateNode(alloc, source, node.children[0], budget);
             return .{ .boolean = (value == .null) == (node.op == .is_null) };
@@ -171,13 +186,7 @@ pub const Plan = struct {
             // Borrowed values need no allocation, but repeatedly comparing a
             // wide value still consumes CPU. Charge the maximum operand bytes
             // inspected against the same per-row budget as allocated outputs.
-            const compared_bytes: usize = switch (left) {
-                .string => |bytes| @min(bytes.len, right.string.len),
-                .blob => |bytes| @min(bytes.len, right.blob.len),
-                else => 0,
-            };
-            if (compared_bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
-            budget.* -= compared_bytes * 2;
+            try chargeComparison(left, right, budget);
             const order = valueOrder(left, right, node.fold_ascii);
             return .{ .boolean = switch (node.op) {
                 .eq, .is_not_distinct => order == .eq,
@@ -261,7 +270,24 @@ fn isComparison(op: Op) bool {
     };
 }
 
+fn chargeComparison(left: Value, right: Value, budget: *usize) !void {
+    const bytes: usize = switch (left) {
+        .string => |value| @min(value.len, right.string.len),
+        .blob => |value| @min(value.len, right.blob.len),
+        else => 0,
+    };
+    if (bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
+    budget.* -= bytes * 2;
+}
+
+fn isNumeric(kind: Kind) bool {
+    return kind == .integer or kind == .number;
+}
+
 fn valueOrder(a: Value, b: Value, fold_ascii: bool) std.math.Order {
+    const numeric = @import("../common/numeric_order.zig");
+    if (a == .integer and b == .number) return numeric.intFloat(a.integer, b.number);
+    if (a == .number and b == .integer) return numeric.intFloat(b.integer, a.number).invert();
     return switch (a) {
         .null => unreachable,
         .string => |left| blk: {
@@ -322,7 +348,7 @@ const Compiler = struct {
             const allowed = switch (op) {
                 .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value"),
                 .column => std.mem.eql(u8, name, "column"),
-                else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
+                else => std.mem.eql(u8, name, "args") or ((isComparison(op) or op == .in_list) and std.mem.eql(u8, name, "collation")),
             };
             if (!allowed) return error.InvalidRelationalExpression;
         }
@@ -404,6 +430,7 @@ const Compiler = struct {
                 const valid = switch (op) {
                     .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null => length == 1,
                     .concat, .coalesce, .@"and", .@"or" => length >= 2 and length <= 32,
+                    .in_list => length >= 2 and length <= max_nodes,
                     else => length == 2,
                 };
                 if (!valid) return error.InvalidRelationalExpression;
@@ -412,8 +439,11 @@ const Compiler = struct {
                 for (args.array.items, children) |arg, *child| child.* = try self.compile(arg, depth + 1);
                 node.children = children;
                 node.kind = self.nodes.items[children[0]].kind;
-                for (children[1..]) |child| if (self.nodes.items[child].kind != node.kind) return error.InvalidRelationalExpressionType;
-                if (isComparison(op)) {
+                for (children[1..]) |child| {
+                    const child_kind = self.nodes.items[child].kind;
+                    if (child_kind != node.kind and !((isComparison(op) or op == .in_list) and isNumeric(node.kind) and isNumeric(child_kind))) return error.InvalidRelationalExpressionType;
+                }
+                if (isComparison(op) or op == .in_list) {
                     if (input.object.get("collation")) |collation| {
                         if (collation != .string or node.kind != .string) return error.UnsupportedRelationalIndexCollation;
                         if (std.ascii.eqlIgnoreCase(collation.string, "ci") or std.ascii.eqlIgnoreCase(collation.string, "case_insensitive") or std.ascii.eqlIgnoreCase(collation.string, "antfly.case_insensitive")) {
@@ -429,7 +459,7 @@ const Compiler = struct {
                     .coalesce => {},
                     .@"and", .@"or", .not => if (node.kind != .boolean) return error.InvalidRelationalExpressionType,
                     .is_null, .is_not_null => node.kind = .boolean,
-                    .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => {},
+                    .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct, .in_list => {},
                     else => unreachable,
                 }
             },
@@ -1091,4 +1121,37 @@ test "relational declarations cold generated verification reads dependency cells
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
     row.missing = true;
     try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.execution.expressions.?.verifyRow(alloc, &row));
+}
+
+test "relational declarations IN preserves NULL exactness and lazy membership" {
+    const alloc = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "x", .path = "x", .column_type = .integer, .allows_null = true }} };
+    const cases = [_]struct { args: []const u8, value: Value, expected: Value }{
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\",\"value\":9007199254740993}", .value = .{ .integer = 9007199254740992 }, .expected = .{ .boolean = false } },
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\",\"value\":9007199254740993}", .value = .{ .integer = 9007199254740993 }, .expected = .{ .boolean = true } },
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}", .value = .null, .expected = .null },
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\"}", .value = .{ .integer = 1 }, .expected = .null },
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\"},{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}", .value = .{ .integer = 1 }, .expected = .{ .boolean = true } },
+        .{ .args = ",{\"op\":\"literal\",\"type\":\"integer\",\"value\":1},{\"op\":\"divide\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]}", .value = .{ .integer = 1 }, .expected = .{ .boolean = true } },
+        .{ .args = ",{\"op\":\"divide\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"value\":0}]}", .value = .null, .expected = .null },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(alloc, "{{\"op\":\"in_list\",\"args\":[{{\"op\":\"column\",\"column\":\"x\"}}{s}]}}", .{case.args});
+        defer alloc.free(text);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+        defer parsed.deinit();
+        var plan = try Plan.init(alloc, table, parsed.value, .boolean);
+        defer plan.deinit();
+        try std.testing.expectEqualDeep(case.expected, try plan.evaluate(alloc, &.{case.value}));
+        try std.testing.expectEqualSlices(u32, &.{0}, plan.dependencies);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"op":"in_list","collation":"ci","args":[{"op":"literal","type":"string","value":"APPLE"},{"op":"literal","type":"string","value":"apple"}]}
+    , .{});
+    defer parsed.deinit();
+    var plan = try Plan.init(alloc, table, parsed.value, .boolean);
+    defer plan.deinit();
+    try std.testing.expect((try plan.evaluate(alloc, &.{})).boolean);
+    var budget: usize = 9;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithBudget(alloc, &.{}, &budget));
 }

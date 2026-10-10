@@ -23,6 +23,24 @@ const std = h.std;
 const d = h.antfly.capi_dependencies;
 const catalog = d.sql_catalog;
 const types = h.db_mod.types;
+// Resolve connection context without retaining statement/parameter values. The
+// independent bounded scanner can reach a trailing session_id even when the
+// full request would exhaust its preparation allocator.
+pub fn requestSession(handle: *h.Handle, request_json: []const u8) !?*Session {
+    var storage: [64 * 1024]u8 = undefined;
+    var allocator = std.heap.FixedBufferAllocator.init(&storage);
+    const Envelope = struct { session_id: ?u64 = null };
+    const parsed = std.json.parseFromSlice(Envelope, allocator.allocator(), request_json, .{
+        .ignore_unknown_fields = true,
+        .max_value_len = 128,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.SqlProgramLimitExceeded;
+        return error.InvalidSqlParameters;
+    };
+    defer parsed.deinit();
+    return if (parsed.value.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
+}
+
 const Entry = struct { table: catalog.Table, mutation: catalog.Mutation };
 const Savepoint = struct { name: []const u8, length: usize };
 pub const Session = struct {
@@ -38,7 +56,7 @@ pub const Session = struct {
 
     pub fn reset(self: *Session) void {
         self.arena.deinit();
-        self.budget = .{ .backing = self.handle.alloc, .limit = 64 * 1024 * 1024 };
+        self.budget = .{ .backing = self.handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes };
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         self.entries = .empty;
         self.savepoints = .empty;
@@ -58,7 +76,7 @@ pub const Session = struct {
         for (mutations) |mutation| {
             const bytes = if (mutation.row) |row| try std.json.Stringify.valueAlloc(a, row, .{}) else "";
             self.bytes +|= bytes.len +| mutation.key.len +| 256;
-            if (self.bytes > 64 * 1024 * 1024 or self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
+            if (self.bytes > sql.runtime.resource_limits.default_memory_bytes or self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
             var copy = mutation;
             copy.key = try a.dupe(u8, mutation.key);
             copy.row = if (mutation.row != null) try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false }) else null;
@@ -296,7 +314,7 @@ pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.Err
     if (handle.parent_id != null) return .invalid_argument;
     if (handle.sql_sessions.count() >= 64) return .busy;
     const session = handle.alloc.create(Session) catch return .internal;
-    session.* = .{ .handle = handle, .budget = .{ .backing = handle.alloc, .limit = 64 * 1024 * 1024 }, .arena = undefined };
+    session.* = .{ .handle = handle, .budget = .{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes }, .arena = undefined };
     session.arena = std.heap.ArenaAllocator.init(session.budget.allocator());
     const id = handle.next_sql_session_id;
     handle.next_sql_session_id = std.math.add(u64, id, 1) catch {

@@ -520,5 +520,92 @@
   },
   {
     "statement": "DROP TABLE boolean_partial"
+  },
+  {
+    "statement": "CREATE TABLE membership_case(x BIGINT, CONSTRAINT allowed CHECK(x IN (1,2)))"
+  },
+  {
+    "statement": "INSERT INTO membership_case(_id,x) VALUES ('one',1),('two',2),('null',NULL)"
+  },
+  {
+    "statement": "INSERT INTO membership_case(_id,x) VALUES ('bad',3)",
+    "sqlstate": "23514"
+  },
+  {
+    "statement": "SELECT x FROM membership_case ORDER BY x NULLS LAST",
+    "rows": [
+      [
+        "1"
+      ],
+      [
+        "2"
+      ],
+      [
+        null
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT strpos($1,$2) AS found,strpos('absent',$2) AS missing,strpos(NULL,$2) AS unknown,strpos($1,'') AS empty",
+    "parameters": [
+      "\u00e9\ud83c\udf4eneedle",
+      "needle"
+    ],
+    "rows": [
+      [
+        "3",
+        "0",
+        null,
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT 'a_b' LIKE $1 ESCAPE $2 AS found,'axb' NOT ILIKE $1 ESCAPE $2 AS excluded,'a_b' LIKE $1 ESCAPE NULL AS unknown",
+    "parameters": [
+      "%\u00e9_%",
+      "\u00e9"
+    ],
+    "rows": [
+      [
+        true,
+        true,
+        null
+      ]
+    ]
+  },
+  {
+    "statement": "DROP TABLE membership_case"
+  },
+  {
+    "statement": "CREATE TABLE sql_eviction (id TEXT, updated BIGINT)"
+  },
+  {
+    "statement": "INSERT INTO sql_eviction (_id,id,updated) VALUES ('a','a',1),('b','b',2),('c','c',2),('d','d',3)"
+  },
+  {
+    "statement": "SELECT id FROM (SELECT id,ROW_NUMBER() OVER (ORDER BY updated DESC,id) AS rank FROM sql_eviction) ranked WHERE rank>2 ORDER BY rank",
+    "rows": [
+      [
+        "c"
+      ],
+      [
+        "a"
+      ]
+    ]
+  },
+  {
+    "statement": "DELETE FROM sql_eviction WHERE id IN (SELECT id FROM sql_eviction ORDER BY updated DESC,id OFFSET 2)"
+  },
+  {
+    "statement": "SELECT id FROM sql_eviction ORDER BY id",
+    "rows": [
+      [
+        "b"
+      ],
+      [
+        "d"
+      ]
+    ]
   }
 ]

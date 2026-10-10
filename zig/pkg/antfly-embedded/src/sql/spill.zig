@@ -1625,8 +1625,24 @@ pub const Sort = struct {
         var bytes: usize = @sizeOf(Row);
         for (row.values) |v| bytes +|= try operators.datumBytes(v);
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
-        if (bytes > self.memory_bytes / 3) return error.SqlProgramLimitExceeded;
         self.max_row_bytes = @max(self.max_row_bytes, bytes);
+        if (bytes > self.memory_bytes / 3) {
+            // A legal row may exceed the preferred in-memory run size. Encode
+            // it directly as a singleton run without copying it into the heap;
+            // record encoding and merge heads use the statement allocator.
+            try self.flush();
+            try self.collectRun();
+            const run = blk: {
+                var file = try Sequential.init(self.manager, self.blockBytes());
+                errdefer file.close();
+                _ = try file.append(row, none);
+                try file.seal();
+                break :blk file;
+            };
+            try self.admitRun(run);
+            self.total += 1;
+            return;
+        }
         if (self.rows.items.len != 0 and (self.values.columns.len != row.values.len or self.keys.columns.len != row.keys.len)) try self.flush();
         var retained = @sizeOf(Entry) +| try self.values.appendBytes(row.values) +| try self.keys.appendBytes(row.keys);
         if (self.rows.items.len != 0 and (retained > self.memory_bytes / (if (self.parallel_runs and self.memory_bytes >= 128 * 1024) @as(usize, 8) else 4) -| self.estimated)) {
@@ -2902,4 +2918,32 @@ test "SQL fused sort cohorts reserve shared file capacity for merges" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL spill sorts singleton rows larger than the preferred run buffer" {
+    const a = std.testing.allocator;
+    var quota: @import("memory_budget.zig") = .{ .backing = a, .limit = 512 * 1024 };
+    var dummy: u8 = 0;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var manager: Manager = .{ .alloc = quota.allocator(), .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .max_record_bytes = quota.limit };
+    defer manager.deinit();
+    var sort = Sort.init(quota.allocator(), &manager, &.{.{}}, 4096);
+    defer sort.deinit();
+    const text = try a.alloc(u8, 32 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    for (0..3) |i| try sort.add(.{ .values = &.{Datum.json(.{ .string = text })}, .keys = &.{Datum.json(.{ .integer = @intCast(3 - i) })}, .ordinal = i });
+    for (0..3) |i| {
+        var arena = std.heap.ArenaAllocator.init(quota.allocator());
+        defer arena.deinit();
+        const row = (try sort.next(arena.allocator())).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i + 1)), row.keys[0].value.integer);
+        try std.testing.expectEqualStrings(text, row.values[0].value.string);
+    }
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    try std.testing.expect((try sort.next(arena.allocator())) == null);
+    try std.testing.expect(quota.peak <= quota.limit);
 }

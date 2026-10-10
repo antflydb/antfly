@@ -351,14 +351,20 @@ pub const Reader = struct {
                     for (candidates[0..candidate_count]) |*candidate| {
                         planner_candidates += 1;
                         if ((try jobs.statusWithOwnership(&read, candidate.index, owner)).state != .ready) continue;
+                        var scratch = std.heap.ArenaAllocator.init(alloc);
+                        defer scratch.deinit();
+                        // An oversized search value is legal SQL data, even
+                        // when it cannot be represented as a stored index key.
+                        // Keep the residual predicate and use the primary scan.
+                        const bounds = candidate.bounds(scratch.allocator(), request.conditions, conditions) catch |err| switch (err) {
+                            error.RelationalIndexKeyTooLarge => continue,
+                            else => return err,
+                        };
                         if (candidate_count == 1) {
                             selected_index = candidate.index;
                             best_candidate = candidate;
                             break;
                         }
-                        var scratch = std.heap.ArenaAllocator.init(alloc);
-                        defer scratch.deinit();
-                        const bounds = try candidate.bounds(scratch.allocator(), request.conditions, conditions);
                         var count: usize = 0;
                         var complete = std.mem.order(u8, bounds.lower, bounds.upper) != .lt;
                         if (std.mem.order(u8, bounds.lower, bounds.upper) == .lt) {

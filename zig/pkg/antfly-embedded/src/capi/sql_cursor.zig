@@ -61,26 +61,47 @@ pub fn diagnostic(err: anyerror, out: *h.capi.Buffer) h.capi.ErrorCode {
 }
 fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u64 {
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
-    if (request_json.len > 2 * 1024 * 1024 or table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
+    if (request_json.len > sql.runtime.resource_limits.request_bytes or table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
+    const session = try @import("sql_session.zig").requestSession(handle, request_json);
+    return openWithSession(handle, table_name, request_json, session) catch |err| {
+        // Unsupported cursor shapes may fall back to materialized execution.
+        if (err != error.UnsupportedSqlExecution) if (session) |value| {
+            if (value.active) value.failed = true;
+        };
+        return err;
+    };
+}
+fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []const u8, session: ?*@import("sql_session.zig").Session) !u64 {
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     const cursor = try handle.alloc.create(Cursor);
     errdefer handle.alloc.destroy(cursor);
     cursor.alloc = handle.alloc;
-    cursor.budget = .{ .backing = handle.alloc, .limit = 64 * 1024 * 1024 };
+    cursor.budget = .{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes };
     cursor.arena = std.heap.ArenaAllocator.init(cursor.budget.allocator());
     errdefer cursor.arena.deinit();
+    const request = prepare(cursor, handle, table_name, request_json, session) catch |err| {
+        if (err == error.OutOfMemory and cursor.budget.exhausted) return error.SqlProgramLimitExceeded;
+        return err;
+    };
+    errdefer cursor.compiled.deinit();
+    cursor.lease = try handle.db.local_execution.row_policy_gate.enterRaw();
+    errdefer cursor.lease.release();
+    cursor.stream = (try dependencies.sql_read_stream.Stream.open(handle.alloc, cursor.adapter.backend(), &cursor.compiled, request.parameters, .{})) orelse return error.UnsupportedSqlExecution;
+    errdefer cursor.stream.close();
+    const id = handle.next_sql_cursor_id;
+    handle.next_sql_cursor_id = std.math.add(u64, id, 1) catch return error.SqlProgramLimitExceeded;
+    try handle.sql_cursors.putNoClobber(handle.alloc, id, cursor);
+    return id;
+}
+// Only this phase allocates from the cursor's preparation budget. Keep its
+// quota rejection separate from backing-allocator failures in stream creation.
+fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_json: []const u8, session: ?*@import("sql_session.zig").Session) !Request {
     const a = cursor.arena.allocator();
     const request = try std.json.parseFromSliceLeaky(Request, a, request_json, .{});
     cursor.session_id = request.session_id;
-    const session = if (request.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
-    cursor.compiled = sql.compiler.compile(cursor.budget.allocator(), request.statement, .{}) catch |err| {
-        if (session) |value| if (value.active) {
-            value.failed = true;
-        };
-        return err;
-    };
+    cursor.compiled = try sql.compiler.compile(cursor.budget.allocator(), request.statement, .{});
     errdefer cursor.compiled.deinit();
     switch (cursor.compiled.statement) {
         .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => return error.UnsupportedSqlExecution,
@@ -88,19 +109,7 @@ fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u6
     }
     if (session) |value| if (value.failed) return error.SqlTransactionAborted;
     cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
-    cursor.lease = try handle.db.local_execution.row_policy_gate.enterRaw();
-    errdefer cursor.lease.release();
-    cursor.stream = (dependencies.sql_read_stream.Stream.open(handle.alloc, cursor.adapter.backend(), &cursor.compiled, request.parameters, .{}) catch |err| {
-        if (err != error.UnsupportedSqlExecution) if (session) |value| if (value.active) {
-            value.failed = true;
-        };
-        return err;
-    }) orelse return error.UnsupportedSqlExecution;
-    errdefer cursor.stream.close();
-    const id = handle.next_sql_cursor_id;
-    handle.next_sql_cursor_id = std.math.add(u64, id, 1) catch return error.SqlProgramLimitExceeded;
-    try handle.sql_cursors.putNoClobber(handle.alloc, id, cursor);
-    return id;
+    return request;
 }
 pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) h.capi.ErrorCode {
     out.* = .{};
