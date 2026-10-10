@@ -96,7 +96,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const RequestPreparationContext = execution_resources.RequestPreparationContext;
         const ShadowState = execution_resources.ShadowState;
         const appendDocumentChildRangeOutboxWrites = D.appendDocumentChildRangeOutboxWrites;
-        const decodeDurableReplicationOutbox = D.decodeDurableReplicationOutbox;
         const durableReplicationOutboxKeyAlloc = D.durableReplicationOutboxKeyAlloc;
         const durableReplicationOutboxKindFromKey = D.durableReplicationOutboxKindFromKey;
         const encodeDurableReplicationOutboxAlloc = D.encodeDurableReplicationOutboxAlloc;
@@ -3300,9 +3299,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             apply_held = false;
             if (!any_pending) return;
 
-            const batch_outbox = if (batch_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const replay_outbox = if (replay_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
+            const batch_outbox = if (batch_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const replay_outbox = if (replay_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const schema_outbox = if (schema_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
 
             if (batch_outbox != null) {
                 const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -3342,7 +3341,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (pending) |entry| {
                 try admission.checkLifetime(retained);
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
-                const outbox = try decodeDurableReplicationOutbox(entry.value);
+                const outbox = try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(entry.value, read_control);
                 const mirror = switch (kind) {
                     .batch, .restore_batch => self.local_execution.replication_async_batch_mirror,
                     .replay, .primary_effect => self.local_execution.replication_async_effect_mirror,

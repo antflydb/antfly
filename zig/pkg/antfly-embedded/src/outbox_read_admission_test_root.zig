@@ -4,4 +4,5 @@ pub const antfly_sources = struct {};
 pub const consumer_tests_only = true;
 test {
     _ = @import("storage/db/durable_outbox_store.zig");
+    _ = @import("storage/db/durable_outbox.zig");
 }
