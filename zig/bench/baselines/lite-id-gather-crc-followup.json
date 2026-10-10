@@ -49,7 +49,8 @@
     "Record append provenance in live spans, retaining the dense fallback for fragmented mappings; traverse live ranges during external sorting.",
     "Prepare ordinal section descriptors once and gather up to 128 references in source order using a fixed 512-byte read buffer. Preserve requested order, duplicates, missing ordinals and all-zero section omission.",
     "Skip fully deleted typed-value inputs and keep complement traversal across chunks; seek within validated ordered doc IDs before constructing surviving values. Indexed streams expose authenticated per-chunk bounds and relative-ID bases; fully excluded chunks skip decoding and intact chunks copy compressed bytes with a shifted external base. Legacy streams retain bounded decoding.",
-    "Binary-search array-container seeks and contiguous deletion-run boundaries using monotonic value-minus-index deltas."
+    "Binary-search array-container seeks and contiguous deletion-run boundaries using monotonic value-minus-index deltas.",
+    "Prepare sparse consecutive source-span proofs with selected counts once per sorted plan. Store only runs of at least three coordinates (20 bytes per file descriptor); fragmented gaps keep original coordinates. Native file plans spool only qualifying runs and read at most 64 descriptors per batch; fields synthesize span coordinates without replaying original records."
   ],
   "bounds": {
     "batch_documents": 128,
@@ -63,7 +64,9 @@
     "ordinal_read_buffer_bytes": 512,
     "ordinal_stack_input_descriptors": 16,
     "typed_chunk_directory_bytes": 32,
-    "typed_copy_buffer_bytes": 65536
+    "typed_copy_buffer_bytes": 65536,
+    "source_span_descriptor_bytes": 20,
+    "source_span_read_batch": 64
   },
   "coverage": [
     "Dense, sparse-deleted and reversed IDs against individual reads; mixed input numbering and duplicate references.",
@@ -75,7 +78,8 @@
     "Long dense and reversed identities across the gather cap; mixed readers retain native gathering and packed writes.",
     "Sparse/dense/missing Roaring containers, uint32 end boundary, forward seeks and randomized complement traversal; end-to-end merge with one surviving document.",
     "Ordinal gathers with shuffled, duplicate, sparse, mixed heap/native and absent references; sorted output and all-zero omission.",
-    "Fixed and variable-width typed-value exclusion cursors across chunks against unfiltered output; provenance range mappings across fragmentation and output boundaries."
+    "Fixed and variable-width typed-value exclusion cursors across chunks against unfiltered output; provenance range mappings across fragmentation and output boundaries.",
+    "Negative base-remapping fallback preserves values; whole-chunk permutations; uncached heap/range indexed lookups; sparse span replay with gaps/duplicates, fragmented plans, shared typed-field proofs, native allocation-failure sweeps and retry."
   ],
   "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count. Indexed typed navigation uses 32 bytes per chunk instead of 8; copying avoids codec work but still reads and writes compressed bytes. Existing binaries do not understand the new flagged typed format.",
   "long_id_windows": {
@@ -143,5 +147,32 @@
     "copied_compressed_bytes": 76,
     "sorted_decoded_chunks": 1,
     "measurement": "Native Debug append and sorted production helpers; compressed bytes verified equal to their source after document-ID remapping."
+  },
+  "uncached_indexed_points": {
+    "documents": 4096,
+    "chunks": 64,
+    "heap_decode_allocations_before": 64,
+    "range_decode_allocations_before": 6,
+    "heap_decode_allocations_after": 1,
+    "range_decode_allocations_after": 1,
+    "measurement": "Native Debug one getU64(4095), without PointCache; directory initialization excluded. Range source is an in-memory provider, so these are decode allocations, not physical disk reads."
+  },
+  "intact_chunk_permutation": {
+    "logical_value_bytes": 4194304,
+    "intact_chunks": 66,
+    "decoded_chunks_before": 66,
+    "decoded_chunks_after": 0,
+    "measurement": "Native Debug sorted typed helper; source chunks reversed as groups, preserving order within each chunk."
+  },
+  "prepared_source_spans": {
+    "documents": 32,
+    "typed_fields": 2,
+    "sidecar_bytes": 20,
+    "original_coordinate_reads_after_preparation": 0,
+    "typed_decodes": 0,
+    "minimum_run_coordinates": 3,
+    "descriptor_read_batch": 64,
+    "fragmented_stream_span_descriptors": 0,
+    "measurement": "Forced file-backed production plan; replace its coordinate owner with an empty run after preparation. Both fields still merge successfully. Fragmented and duplicate/gapped fixtures cover the original-coordinate fallback. No end-to-end throughput claim."
   }
 }

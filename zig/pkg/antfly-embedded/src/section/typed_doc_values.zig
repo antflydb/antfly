@@ -540,6 +540,17 @@ pub const StreamingWriter = struct {
         std.mem.writeInt(u64, entry[24..32], info.decoded, .little);
         try self.offsets.appendSlice(self.alloc, &entry);
     }
+    /// A valid decoded interval need not have a representable shifted base.
+    /// Test copy eligibility before writing; callers can then decode instead.
+    pub fn canCopyChunk(self: *const StreamingWriter, reader: *const TypedDocValuesReader, index: u32, delta: i64) bool {
+        const info = reader.chunkInfo(index) orelse return false;
+        if (reader.value_type != self.value_type) return false;
+        for ([_]u32{ info.first, info.last, info.base }) |value| {
+            const shifted = std.math.add(i64, value, delta) catch return false;
+            _ = std.math.cast(u32, shifted) orelse return false;
+        }
+        return true;
+    }
     /// Only indexed chunks with the same physical value type may be copied.
     pub fn copyChunk(self: *StreamingWriter, reader: *const TypedDocValuesReader, index: u32, delta: i64) !void {
         var info = reader.chunkInfo(index) orelse return error.InvalidData;
@@ -1028,16 +1039,20 @@ pub const TypedDocValuesReader = struct {
         const entry = self.chunk_offsets[@as(usize, index) * chunk_directory_stride ..][0..chunk_directory_stride];
         return .{ .end = std.mem.readInt(u64, entry[0..8], .little), .first = std.mem.readInt(u32, entry[8..12], .little), .last = std.mem.readInt(u32, entry[12..16], .little), .base = std.mem.readInt(u32, entry[16..20], .little), .count = std.mem.readInt(u32, entry[20..24], .little), .decoded = std.mem.readInt(u64, entry[24..32], .little) };
     }
-    pub fn chunkForDoc(self: *const TypedDocValuesReader, doc: u32) ?u32 {
+    /// First chunk whose upper bound reaches doc, including a following gap.
+    pub fn chunkAtOrAfterDoc(self: *const TypedDocValuesReader, doc: u32) ?u32 {
         if (!self.indexed) return null;
         var low: u32 = 0;
         var high = self.num_chunks;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            const info = self.chunkInfo(mid).?;
-            if (doc < info.first) high = mid else if (doc > info.last) low = mid + 1 else return mid;
+            if (self.chunkInfo(mid).?.last < doc) low = mid + 1 else high = mid;
         }
-        return null;
+        return if (low == self.num_chunks) null else low;
+    }
+    pub fn chunkForDoc(self: *const TypedDocValuesReader, doc: u32) ?u32 {
+        const index = self.chunkAtOrAfterDoc(doc) orelse return null;
+        return if (doc < self.chunkInfo(index).?.first) null else index;
     }
     fn validateDirectory(self: *const TypedDocValuesReader) !void {
         if (!self.indexed) return;
@@ -1208,6 +1223,22 @@ pub const TypedDocValuesReader = struct {
     /// Returns (chunk_idx, position_within_chunk).
     pub fn findDoc(self: *const TypedDocValuesReader, doc_id: u32) !?FoundDoc {
         if (self.point_cache) |cache| return cache.find(self, doc_id);
+        if (self.indexed) {
+            const index = self.chunkForDoc(doc_id) orelse return null;
+            var chunk = try self.decodeChunk(index);
+            var keep = false;
+            defer if (!keep) chunk.deinit();
+            var low: u32 = 0;
+            var high = chunk.num_docs;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                const id = std.mem.readInt(u32, chunk.data[4 + @as(usize, mid) * 4 ..][0..4], .little);
+                if (id < doc_id) low = mid + 1 else high = mid;
+            }
+            if (low == chunk.num_docs or std.mem.readInt(u32, chunk.data[4 + @as(usize, low) * 4 ..][0..4], .little) != doc_id) return null;
+            keep = true;
+            return .{ .chunk_idx = index, .pos = low, .chunk_data = chunk.data };
+        }
         if (self.range != null) {
             // Writers require strictly increasing IDs across the field. Use
             // that wire invariant for point access without a full-column copy.
@@ -2546,4 +2577,30 @@ test "legacy and indexed streams concatenate into bounded indexed columns" {
     defer reader.deinit();
     try std.testing.expect(reader.indexed);
     for (0..8) |doc| try std.testing.expectEqual(@as(?u64, doc), try reader.getU64(@intCast(doc)));
+}
+
+test "uncached indexed points should decode only matching chunk" {
+    const a = std.testing.allocator;
+    var writer = TypedDocValuesWriter.init(a, .u64_val, 64);
+    defer writer.deinit();
+    for (0..4096) |doc| try writer.add(@intCast(doc), .{ .u64_val = doc });
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var heap_budget = Budget{ .backing = a, .limit = 8 * 1024 * 1024 };
+    var heap = try TypedDocValuesReader.init(heap_budget.allocator(), bytes);
+    defer heap.deinit();
+    const heap_before = heap_budget.alloc_calls;
+    try std.testing.expectEqual(@as(?u64, 4095), try heap.getU64(4095));
+    const heap_allocs = heap_budget.alloc_calls - heap_before;
+    var native_budget = Budget{ .backing = a, .limit = 8 * 1024 * 1024 };
+    const view = try @import("../segment_source.zig").View.init(.{ .contiguous = bytes }, 0, bytes.len);
+    var range = try RangeTypedDocValuesReader.init(native_budget.allocator(), view, 8192, 8192);
+    defer range.deinit();
+    const range_before = native_budget.alloc_calls;
+    try std.testing.expectEqual(@as(?u64, 4095), try range.reader.getU64(4095));
+    const range_allocs = native_budget.alloc_calls - range_before;
+    std.debug.print("FRESH_POINT chunks=64 heap_decode_allocations={d} range_decode_allocations={d} target=1\n", .{ heap_allocs, range_allocs });
+    try std.testing.expectEqual(@as(usize, 1), heap_allocs);
+    try std.testing.expectEqual(@as(usize, 1), range_allocs);
 }

@@ -48,16 +48,32 @@ and normalized first/last IDs against its descriptor.
 Append compaction compares deletion ranks at each chunk boundary. A fully deleted
 interval needs no payload decode. An intact same-type interval has a constant ID
 shift, so compaction copies compressed bytes through a fixed 64 KiB buffer and
-shifts the descriptor's bounds and base. Partial deletions or type promotion use
-the existing bounded decode path.
+shifts the descriptor's bounds and base. Partial deletions, type promotion, or an unrepresentable shifted external base
+use the existing bounded decode path. Copy eligibility is checked before writing;
+a valid interval can still decode and remap when its base would become negative.
 
-Sorted compaction checks that the output coordinates cover a complete source
-interval in source order before copying. Coordinate checks use at most 64 records
-at a time. A partial output prefix flushes before a copied chunk; decoded batches
-stop at the next chunk boundary so they do not consume every potential copy start.
-Selected-input counts and source monotonicity are computed once per merge plan,
-then shared across fields. Inputs with no selected documents do not participate
-in physical-type inference.
+Sorted compaction prepares source-coordinate proofs once per merge plan. Each
+maximal consecutive run of at least three coordinates has a 20-byte descriptor
+(output start, input, first source ID, and count). A descriptor replaces at least
+24 bytes of file coordinates. File plans create a private descriptor run only
+when a qualifying span exists; readers consume at most 64 descriptors per batch.
+Memory plans retain coalesced descriptors under their allocator budget. Fully
+fragmented streams retain no span descriptors and use their original coordinates.
+
+Fields synthesize output references from proved spans, avoiding repeated
+coordinate verification. Singleton/pair gaps retain batches of up to 64 original
+coordinates; one- or two-row chunks need only a bounded direct proof. A complete
+source interval can copy even when chunks appear in a different order. A partial
+output prefix flushes before a copied chunk, and decoded batches stop at the next
+eligible copy start. Selected-input counts and monotonicity are collected during
+the same preparation pass. Inputs with no selected documents do not participate
+in physical-type inference. Plans and fields without live typed sections skip
+preparation entirely.
+
+Uncached indexed point reads use the directory to select a single chunk before
+decoding, for both heap and range sources. Requests outside all chunk bounds need
+no decode; missing IDs within a sparse chunk still validate that chunk. Existing
+point-cache behavior and legacy decoder paths remain available.
 
 Navigation grows from 8 to 32 bytes per chunk. New writes retain the 64 KiB raw
 chunk target, allowing an oversized individual value as the established exception.
