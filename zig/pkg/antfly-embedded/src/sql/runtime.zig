@@ -1757,6 +1757,46 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
     };
 }
 
+test "SQL typed windows preserve NUMERIC and REAL semantics in memory and spill" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, expected: []const ?[]const u8, element: @import("array_value.zig").ElementType };
+    const cases = [_]Case{
+        .{ .sql = "SELECT SUM(x) OVER () FROM (VALUES (1.20::numeric),(2.30::numeric)) t(x)", .expected = &.{ "3.50", "3.50" }, .element = .numeric },
+        .{ .sql = "SELECT AVG(x) OVER () FROM (VALUES (1.20::numeric),(2.30::numeric)) t(x)", .expected = &.{ "1.7500000000000000", "1.7500000000000000" }, .element = .numeric },
+        .{ .sql = "SELECT SUM(x) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM (VALUES (1,1.20::numeric),(2,2.30::numeric),(3,NULL::numeric),(4,4.567::numeric)) t(k,x) ORDER BY k", .expected = &.{ null, "1.20", "2.30", null }, .element = .numeric },
+        .{ .sql = "SELECT AVG(x) FILTER (WHERE k <> 2) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM (VALUES (1,1.20::numeric),(2,2.30::numeric),(3,3.40::numeric)) t(k,x) ORDER BY k", .expected = &.{ "1.20000000000000000000", "2.3000000000000000", "3.4000000000000000" }, .element = .numeric },
+        .{ .sql = "SELECT SUM(x) OVER () FROM (VALUES ('9007199254740993.1200'::numeric),('0.0001'::numeric)) t(x)", .expected = &.{ "9007199254740993.1201", "9007199254740993.1201" }, .element = .numeric },
+        .{ .sql = "SELECT SUM(x) OVER (ORDER BY k ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM (VALUES (1,'Infinity'::numeric),(2,'-Infinity'::numeric),(3,1.20::numeric)) t(k,x) ORDER BY k", .expected = &.{ "NaN", "-Infinity", "1.20" }, .element = .numeric },
+        .{ .sql = "SELECT COUNT(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1.20::numeric),(2.00::numeric),(3.50::numeric)) t(x) ORDER BY x", .expected = &.{ "1", "2", "1" }, .element = .int64 },
+        .{ .sql = "SELECT COUNT(*) OVER (ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1.20::numeric),(2.00::numeric),(3.50::numeric)) t(x) ORDER BY x DESC", .expected = &.{ "1", "1", "2" }, .element = .int64 },
+        .{ .sql = "SELECT COUNT(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES ('9007199254740993.12'::numeric),('9007199254740994.12'::numeric),('9007199254740995.13'::numeric)) t(x) ORDER BY x", .expected = &.{ "1", "2", "1" }, .element = .int64 },
+        .{ .sql = "SELECT SUM(x) OVER () FROM (VALUES (16777216::real),(1::real),(-16777216::real)) t(x)", .expected = &.{ "0", "0", "0" }, .element = .float32 },
+        .{ .sql = "SELECT SUM(x) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM (VALUES (1,16777216::real),(2,1::real),(3,1::real),(4,-16777216::real)) t(k,x) ORDER BY k", .expected = &.{ "16777216", "16777216", "16777216", "0" }, .element = .float32 },
+        .{ .sql = "SELECT SUM(x) FILTER (WHERE k <> 2) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM (VALUES (1,2::real),(2,NULL::real),(3,4::real),(4,8::real)) t(k,x) ORDER BY k", .expected = &.{ null, "6", "8", "4" }, .element = .float32 },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |spilled| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var backend = fixture.iface();
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+        defer manager.deinit();
+        if (spilled) backend.spill_manager = &manager;
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = if (spilled) 1 else 256, .retained_bytes = 256 * 1024 });
+        defer result.deinit();
+        if (spilled) try std.testing.expect(manager.written_bytes > 0);
+        try std.testing.expectEqual(case.element, result.output.columns[0].element_type.?);
+        try std.testing.expectEqual(case.expected.len, result.output.rows.len);
+        for (result.output.rows, case.expected) |row, expected| {
+            if (expected) |text| {
+                if (case.element == .float32) {
+                    try std.testing.expectEqual(try std.fmt.parseFloat(f64, text), row[0].float);
+                } else try std.testing.expectEqualStrings(text, row[0].string);
+            } else try std.testing.expect(row[0] == .null);
+        }
+    };
+}
+
 test "SQL real SUM retains float4 transitions and result identity in scalar and grouped plans" {
     const a = std.testing.allocator;
     for ([_][]const u8{

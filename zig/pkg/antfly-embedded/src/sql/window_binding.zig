@@ -301,7 +301,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         };
         const result_element = switch (kind) {
             .row_number, .rank, .dense_rank, .ntile, .count => @import("array_value.zig").ElementType.int64,
-            .avg, .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
+            .avg => if (input_element == .numeric) @import("array_value.zig").ElementType.numeric else .float64,
+            .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
             .bool_and, .bool_or => @import("array_value.zig").ElementType.boolean,
             .sum => if (result_type == .integer) @import("array_value.zig").ElementType.int64 else input_element,
             else => input_element,

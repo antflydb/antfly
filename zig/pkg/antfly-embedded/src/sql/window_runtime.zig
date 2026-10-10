@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Windows share one sort per partition/order specification. Arbitrary moving
-//! aggregate frames use a segment tree, never a quadratic per-row rescan.
+//! exact aggregate frames use a segment tree. Non-associative REAL sums
+//! retain ordered transitions, reusing state for growing and repeated frames.
 //! All input, sort, frame and output state uses the statement memory budget.
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -26,6 +27,8 @@ const Datum = scalar.Datum;
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
+const numeric = @import("numeric_value.zig");
+const numeric_aggregate = @import("numeric_aggregate.zig");
 const disk = @import("disk_rows.zig");
 const Cells = union(enum) {
     memory: []const []Datum,
@@ -138,6 +141,30 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: anytype, indi
     const direction = spec.directions[0];
     const current = try getCell(cells, try at(indices, position), column);
     if (current.sql_null) return if (end) peer_end else peer_start;
+    if (current.numeric) |number| {
+        var scratch = std.heap.ArenaAllocator.init(context.alloc);
+        defer scratch.deinit();
+        var ctx: numeric.Context = .{ .alloc = scratch.allocator(), .max_output_bytes = context.limits.retained_bytes };
+        var digits: [5]u16 = undefined;
+        const offset = numeric.integerView(std.math.cast(i64, distance) orelse return error.SqlNumericOutOfRange, &digits);
+        const subtract = (bound == .preceding) != direction.descending;
+        const target = if (subtract) try numeric.subtract(&ctx, number.*, offset) else try numeric.add(&ctx, number.*, offset);
+        var low: usize = 0;
+        var high = indices.len;
+        while (low < high) {
+            try context.checkpoint();
+            const middle = low + (high - low) / 2;
+            const value = try getCell(cells, try at(indices, middle), column);
+            const order: std.math.Order = if (value.sql_null)
+                (if (direction.nulls_first orelse direction.descending) .lt else .gt)
+            else blk: {
+                const result = try numeric.order(&ctx, (value.numeric orelse return error.SqlTypeMismatch).*, target.value);
+                break :blk if (direction.descending) result.invert() else result;
+            };
+            if (order == .lt or (end and order == .eq)) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
     if (current.value != .integer and current.value != .float) return error.SqlTypeMismatch;
     const subtract = (bound == .preceding) != direction.descending;
     const integer_target: i128 = if (current.value == .integer) @as(i128, current.value.integer) + (if (subtract) -@as(i128, @intCast(distance)) else @as(i128, @intCast(distance))) else 0;
@@ -507,6 +534,211 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
     std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
+/// Exact decimal partials stay widened until the requested frame is complete.
+/// Disk windows store variable-sized checkpoints beside a fixed-size index.
+const NumericTree = struct {
+    nodes: []numeric_aggregate.State,
+    base: usize,
+    index: ?*disk.RawCache = null,
+    payload: ?@import("spill.zig").File = null,
+    alloc: Allocator,
+
+    fn create(context: anytype, cells: anytype, indices: anytype, spec: binding.Spec) !NumericTree {
+        const base = try std.math.ceilPowerOfTwo(usize, @max(1, indices.len));
+        const count = try std.math.mul(usize, base, 2);
+        var tree: NumericTree = .{ .nodes = &.{}, .base = base, .alloc = context.alloc };
+        errdefer tree.deinit();
+        if (comptime disk.isDisk(@TypeOf(cells))) {
+            tree.index = blk: {
+                var file = try context.spill.?.create();
+                errdefer file.close();
+                var remaining = try std.math.mul(usize, count, 16);
+                const zeros: [4096]u8 = @splat(0);
+                while (remaining != 0) {
+                    const size = @min(remaining, zeros.len);
+                    try file.writeRaw(file.size, zeros[0..size]);
+                    remaining -= size;
+                }
+                break :blk try disk.RawCache.init(context.alloc, file);
+            };
+            tree.payload = try context.spill.?.create();
+        } else {
+            tree.nodes = try context.alloc.alloc(numeric_aggregate.State, count);
+            @memset(tree.nodes, .{});
+        }
+        for (0..indices.len) |position| {
+            try context.checkpoint();
+            const row = try at(indices, position);
+            if (spec.filter) |slot| {
+                const accepted = try getCell(cells, row, slot);
+                if (accepted.sql_null) continue;
+                if (accepted.value != .bool) return error.SqlTypeMismatch;
+                if (!accepted.value.bool) continue;
+            }
+            const value = try getCell(cells, row, spec.arguments[0]);
+            if (value.sql_null) continue;
+            var ctx: numeric.Context = .{ .alloc = context.alloc, .max_output_bytes = context.limits.retained_bytes };
+            var state: numeric_aggregate.State = .{};
+            defer state.deinit(context.alloc);
+            try state.add(&ctx, (value.numeric orelse return error.SqlTypeMismatch).*);
+            try tree.put(base + position, &ctx, state);
+        }
+        var index = base;
+        while (index > 1) {
+            index -= 1;
+            try context.checkpoint();
+            var ctx: numeric.Context = .{ .alloc = context.alloc, .max_output_bytes = context.limits.retained_bytes };
+            var left = try tree.get(2 * index, &ctx);
+            defer left.deinit(context.alloc);
+            var right = try tree.get(2 * index + 1, &ctx);
+            defer right.deinit(context.alloc);
+            try left.merge(&ctx, right);
+            try tree.put(index, &ctx, left);
+        }
+        return tree;
+    }
+    fn deinit(self: *NumericTree) void {
+        for (self.nodes) |*node| node.deinit(self.alloc);
+        self.alloc.free(self.nodes);
+        if (self.index) |file| file.close();
+        if (self.payload) |*file| file.close();
+    }
+    fn put(self: *NumericTree, index: usize, ctx: *numeric.Context, state: numeric_aggregate.State) !void {
+        if (self.index) |file| {
+            if (state.count == 0) return;
+            const encoded = try state.encodeAlloc(ctx);
+            defer ctx.alloc.free(encoded);
+            const offset = self.payload.?.size;
+            try self.payload.?.writeRaw(offset, encoded);
+            var bytes: [16]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], offset, .little);
+            std.mem.writeInt(u64, bytes[8..16], encoded.len, .little);
+            try file.writeRaw(index * 16, &bytes);
+        } else self.nodes[index] = try state.clone(ctx);
+    }
+    fn get(self: *NumericTree, index: usize, ctx: *numeric.Context) !numeric_aggregate.State {
+        if (self.index) |file| {
+            var bytes: [16]u8 = undefined;
+            try file.readRaw(index * 16, &bytes);
+            const offset = std.mem.readInt(u64, bytes[0..8], .little);
+            const length = std.mem.readInt(u64, bytes[8..16], .little);
+            if (length == 0) return .{};
+            if (length > ctx.max_input_bytes) return error.SqlProgramLimitExceeded;
+            const encoded = try ctx.alloc.alloc(u8, @intCast(length));
+            defer ctx.alloc.free(encoded);
+            try self.payload.?.readRaw(offset, encoded);
+            return numeric_aggregate.decode(ctx, encoded);
+        }
+        return self.nodes[index].clone(ctx);
+    }
+    fn query(self: *NumericTree, context: anytype, a: Allocator, bounds: FrameSet, average: bool) !Datum {
+        var ctx: numeric.Context = .{ .alloc = context.alloc, .max_output_bytes = context.limits.retained_bytes };
+        var state: numeric_aggregate.State = .{};
+        defer state.deinit(context.alloc);
+        for (bounds.parts[0..bounds.len]) |part| {
+            var left = self.base + part.start;
+            var right = self.base + part.end;
+            while (left < right) {
+                try context.checkpoint();
+                if (left % 2 != 0) {
+                    var node = try self.get(left, &ctx);
+                    defer node.deinit(context.alloc);
+                    try state.merge(&ctx, node);
+                    left += 1;
+                }
+                if (right % 2 != 0) {
+                    right -= 1;
+                    var node = try self.get(right, &ctx);
+                    defer node.deinit(context.alloc);
+                    try state.merge(&ctx, node);
+                }
+                left /= 2;
+                right /= 2;
+            }
+        }
+        if (state.count == 0) return .{};
+        ctx.alloc = a;
+        var result = try state.total(&ctx, average);
+        errdefer result.deinit();
+        const value = try a.create(numeric.Value);
+        value.* = result.value;
+        return Datum.typedNumeric(value);
+    }
+};
+
+test "SQL NUMERIC window tree unwinds allocation failures in memory and spill" {
+    const Harness = struct {
+        const Context = struct {
+            alloc: Allocator,
+            limits: @import("runtime.zig").Limits = .{},
+            spill: ?*@import("spill.zig").Manager,
+            fn checkpoint(_: @This()) !void {}
+        };
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(a: Allocator, spilled: bool) !void {
+            var marker: u8 = 0;
+            var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = checkpoint, .async_writes = false };
+            defer manager.deinit();
+            const context: Context = .{ .alloc = a, .spill = &manager };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var ctx: numeric.Context = .{ .alloc = arena.allocator() };
+            const left = try numeric.parse(&ctx, "9007199254740993.1200");
+            const right = try numeric.parse(&ctx, "0.0001");
+            var data = [_][1]Datum{ .{Datum.typedNumeric(&left.value)}, .{Datum.typedNumeric(&right.value)} };
+            var cells = [_][]Datum{ &data[0], &data[1] };
+            const spec: binding.Spec = .{ .kind = .sum, .arguments = &.{0}, .filter = null, .sort = 0, .frame = null, .type = .number, .element_type = .numeric, .star = false };
+            const bounds = FrameSet.init(.{ .start = 0, .end = 2 }, .no_others, 0, 0, 2);
+            if (spilled) {
+                var rows = try disk.Rows.init(a, &manager, 1);
+                defer rows.deinit();
+                for (cells, 0..) |row, i| try rows.append(.{ .values = row, .keys = &.{}, .ordinal = i });
+                var tree = try NumericTree.create(context, &rows, &.{ 0, 1 }, spec);
+                defer tree.deinit();
+                const result = try tree.query(context, arena.allocator(), bounds, false);
+                try std.testing.expectEqualStrings("9007199254740993.1201", try numeric.format(&ctx, result.numeric.?.*));
+            } else {
+                var tree = try NumericTree.create(context, &cells, &.{ 0, 1 }, spec);
+                defer tree.deinit();
+                const result = try tree.query(context, arena.allocator(), bounds, false);
+                try std.testing.expectEqualStrings("9007199254740993.1201", try numeric.format(&ctx, result.numeric.?.*));
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |spilled| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{spilled});
+}
+
+/// REAL transitions are not associative. Preserve sorted row order and only
+/// reuse a transition state when the frame grows from the same starting row.
+const RealSum = struct {
+    state: operators.Aggregate,
+    bounds: ?Frame = null,
+    fn query(self: *RealSum, context: anytype, cells: anytype, indices: anytype, spec: binding.Spec, selected: FrameSet) !Datum {
+        const reusable = selected.len == 1 and self.bounds != null and
+            selected.parts[0].start == self.bounds.?.start and selected.parts[0].end >= self.bounds.?.end;
+        if (!reusable) {
+            self.state.deinit();
+            self.state = try operators.Aggregate.initTyped(context.alloc, .sum, .number, .float32);
+        }
+        for (selected.parts[0..selected.len], 0..) |part, index| {
+            const first = if (reusable and index == 0) self.bounds.?.end else part.start;
+            for (first..part.end) |position| {
+                if (position % 256 == 0) try context.checkpoint();
+                const row = try at(indices, position);
+                if (spec.filter) |slot| {
+                    const accepted = try getCell(cells, row, slot);
+                    if (accepted.sql_null) continue;
+                    if (accepted.value != .bool) return error.SqlTypeMismatch;
+                    if (!accepted.value.bool) continue;
+                }
+                try self.state.update(try getCell(cells, row, spec.arguments[0]));
+            }
+        }
+        self.bounds = if (selected.len == 1) selected.parts[0] else null;
+        return self.state.finish();
+    }
+};
+
 // Removable exact state gives running and sliding count/integer/boolean
 // frames linear work and constant memory. Floating-point, min/max and frame
 // exclusions retain the tree, preserving their existing numeric semantics.
@@ -578,7 +810,13 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
     // between specifications/partitions instead of accumulating with input.
     const sliding = aggregate and Sliding.eligible(spec);
     var running: Sliding = .{};
-    var tree: ?Tree = if (aggregate and !sliding) try Tree.create(context, context.alloc, cells, indices, spec) else null;
+    const exact_numeric = (spec.kind == .sum or spec.kind == .avg) and spec.element_type == .numeric;
+    const real_sum = spec.kind == .sum and spec.element_type == .float32;
+    var numeric_tree: ?NumericTree = if (exact_numeric) try NumericTree.create(context, cells, indices, spec) else null;
+    defer if (numeric_tree) |*value| value.deinit();
+    var real: RealSum = .{ .state = try operators.Aggregate.initTyped(context.alloc, .sum, .number, .float32) };
+    defer real.state.deinit();
+    var tree: ?Tree = if (aggregate and !sliding and !exact_numeric and !real_sum) try Tree.create(context, context.alloc, cells, indices, spec) else null;
     defer if (tree) |*value| value.deinit(context.alloc);
     var dense: i64 = 0;
     for (0..indices.len) |position| {
@@ -589,6 +827,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
         if ((try at(peers_start, position)) == position) dense += 1;
         const bounds = try frame(context, spec, sort, cells, indices, position, (try at(peers_start, position)), (try at(peers_end, position)), groups, @intCast(dense - 1));
         const selected = FrameSet.init(bounds, if (spec.frame) |definition| definition.exclusion else .no_others, position, (try at(peers_start, position)), (try at(peers_end, position)));
+        const a = if (comptime disk.isDisk(@TypeOf(cells))) result_arena.allocator() else context.arena;
         const result: Datum = switch (spec.kind) {
             .row_number => Datum.json(.{ .integer = @intCast(position + 1) }),
             .rank => Datum.json(.{ .integer = @intCast((try at(peers_start, position)) + 1) }),
@@ -622,9 +861,8 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
                 };
                 break :blk try getCell(cells, try at(indices, index), spec.arguments[0]);
             },
-            else => if (sliding) try running.query(context, cells, indices, spec, bounds) else try tree.?.querySet(selected),
+            else => if (exact_numeric) try numeric_tree.?.query(context, a, selected, spec.kind == .avg) else if (real_sum) try real.query(context, cells, indices, spec, selected) else if (sliding) try running.query(context, cells, indices, spec, bounds) else try tree.?.querySet(selected),
         };
-        const a = if (comptime disk.isDisk(@TypeOf(cells))) result_arena.allocator() else context.arena;
         const typed = if (!result.sql_null and spec.type == .array)
             try scalar.castArrayDatum(a, result, spec.element_type orelse return error.InvalidSqlProgram, .{ .output_bytes = context.limits.retained_bytes })
         else
