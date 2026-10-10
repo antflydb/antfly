@@ -617,6 +617,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     inference_phase_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, inference_wire_tests, &inference_wire_filters).step);
     const pooling_filters = [_][]const u8{
+        "HA runnable ingress",
         "bounded admission",
         "runnable scheduler",
         "runnable execution",
@@ -2418,6 +2419,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-mutation-service-admission-test", "Verify original mutation admission rejects before effects and releases real DB fences")
         .dependOn(&b.addRunArtifact(mutation_service_admission_tests).step);
+
+    const ha_operation_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/ha_operation_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, ha_operation_admission_root, true, true);
+    ha_operation_admission_root.addImport("antfly_source_root", ha_operation_admission_root);
+    const ha_operation_admission_tests = b.addTest(.{
+        .name = "ha-operation-admission-tests",
+        .root_module = ha_operation_admission_root,
+        .filters = &.{"HA original admission"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-ha-operation-admission-test", "Verify original HA capture admission, C1 holder/control progress and rejection retirement")
+        .dependOn(&b.addRunArtifact(ha_operation_admission_tests).step);
 
     const controlled_service_lock_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/controlled_service_lock_test_root.zig"),

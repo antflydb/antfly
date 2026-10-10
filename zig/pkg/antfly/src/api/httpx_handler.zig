@@ -1687,6 +1687,7 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return textResponse(ctx, 405, "method not allowed"),
         };
+        var cancellation = requestCancellation(ctx);
         const body = (try ctx.body()) orelse "";
         var response = (try self.api_server.executeHotStandbyRoute(.{
             .method = method,
@@ -1694,6 +1695,8 @@ pub const AntflyApiHandler = struct {
             .authorization = ctx.header("authorization"),
             .content_type = ctx.header("content-type"),
             .body = body,
+            .deadline_ns = cancellation.execution_deadline_ns,
+            .cancellation = &cancellation,
         })) orelse return textResponse(ctx, 404, "not found");
         defer response.deinit();
         _ = ctx.status(response.status);

@@ -8809,6 +8809,16 @@ pub const DataServer = struct {
         generation: []const u8,
         binding: antfly.hot_standby.seed_artifact.LifecycleBinding,
     ) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        return captureHotStandbySeedInternal(ptr, alloc, slot_name, generation, binding, null);
+    }
+
+    fn captureHotStandbySeedControlledCallback(ptr: *anyopaque, alloc: std.mem.Allocator, slot_name: []const u8, generation: []const u8, binding: antfly.hot_standby.seed_artifact.LifecycleBinding, control: @import("../storage/hot_standby/operation_admission.zig").Control) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        return captureHotStandbySeedInternal(ptr, alloc, slot_name, generation, binding, control);
+    }
+
+    fn captureHotStandbySeedInternal(ptr: *anyopaque, alloc: std.mem.Allocator, slot_name: []const u8, generation: []const u8, binding: antfly.hot_standby.seed_artifact.LifecycleBinding, control: ?@import("../storage/hot_standby/operation_admission.zig").Control) !antfly.hot_standby.http_admin.Server.SeedCaptureResult {
+        var admission: @import("../storage/hot_standby/operation_admission.zig").Session = .{};
+        if (control) |original| try admission.bind(original);
         const self: *DataServer = @ptrCast(@alignCast(ptr));
 
         if (self.hot_standby_seed_capture_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
@@ -8836,10 +8846,10 @@ pub const DataServer = struct {
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.
-        var lease = self.hot_standby_mutation_barrier.acquireExclusive();
+        var lease = if (control != null) try admission.acquireExclusive(&self.hot_standby_mutation_barrier) else self.hot_standby_mutation_barrier.acquireExclusive();
         var lease_held = true;
         defer if (lease_held) lease.release();
-        lockAtomic(&self.hot_standby_state_mutex);
+        if (control != null) try admission.lockRetained(&self.hot_standby_state_mutex) else lockAtomic(&self.hot_standby_state_mutex);
         var state_mutex_held = true;
         defer if (state_mutex_held) self.hot_standby_state_mutex.unlock();
 
@@ -8938,6 +8948,7 @@ pub const DataServer = struct {
                     .seed_capture = if (ctx.primary != null and self.hot_standby_cfg.seed_capture_root != null) .{
                         .ptr = self,
                         .run_fn = DataServer.captureHotStandbySeedCallback,
+                        .run_controlled_fn = DataServer.captureHotStandbySeedControlledCallback,
                     } else null,
                     .lifecycle_receipts = if (self.hot_standby_cfg.seed_capture_root != null or self.hot_standby_cfg.seed_activation_root != null) .{
                         .capture_root = self.hot_standby_cfg.seed_capture_root,

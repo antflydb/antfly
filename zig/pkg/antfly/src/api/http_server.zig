@@ -8524,6 +8524,8 @@ pub const ApiHttpServer = struct {
         authorization: ?[]const u8,
         content_type: ?[]const u8,
         body: []const u8,
+        deadline_ns: ?u64 = null,
+        cancellation: ?*const http_common.RequestCancellation = null,
     };
 
     pub fn executeHotStandbyRoute(self: *ApiHttpServer, request: HotStandbyRouteRequest) !?hot_standby_http_operation.OwnedResponse {
@@ -8552,7 +8554,7 @@ pub const ApiHttpServer = struct {
                 return try hotStandbyOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const hot_standby_exec = self.cfg.hot_standby_admin_executor orelse return null;
-            return try hot_standby_exec.execute(operation_request);
+            return try self.executeAdmittedHotStandby(hot_standby_exec, operation_request, request);
         }
         if (isHotStandbyInternalPath(path)) {
             const expected = self.cfg.admin_bearer_token orelse
@@ -8566,9 +8568,48 @@ pub const ApiHttpServer = struct {
                 return try hotStandbyOperationTextResponse(self.alloc, 401, "unauthorized");
             }
             const hot_standby_exec = self.cfg.hot_standby_internal_executor orelse return null;
-            return try hot_standby_exec.execute(operation_request);
+            return try self.executeAdmittedHotStandby(hot_standby_exec, operation_request, request);
         }
         return null;
+    }
+
+    fn executeAdmittedHotStandby(self: *ApiHttpServer, executor_value: hot_standby_http_operation.Executor, request: hot_standby_http_operation.Request, ingress: HotStandbyRouteRequest) !hot_standby_http_operation.OwnedResponse {
+        const scheduler = self.runnableScheduler() orelse return executor_value.execute(request);
+        const io = self.sharedApiIo() orelse self.embedding_provider_runtime.io;
+        const admin = @import("../admin/mod.zig").routes;
+        const path = splitTarget(request.target).path;
+        const protected_status = request.method == .get and
+            (std.mem.eql(u8, path, admin.hot_standby_primary_status) or std.mem.eql(u8, path, admin.hot_standby_standby_status));
+        const configured_deadline = platform_time.monotonicNs() +| (if (protected_status) @as(u64, 250) else self.cfg.backup_operation_timeout_ms) *| std.time.ns_per_ms;
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        execution.start(scheduler, .{
+            .io = io,
+            .native_now_ns = platform_time.monotonicNs,
+            .deadline_ns = @min(ingress.deadline_ns orelse configured_deadline, configured_deadline),
+            .cancellation = if (ingress.cancellation) |value| .{ .ptr = value, .requested = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    return @as(*const http_common.RequestCancellation, @ptrCast(@alignCast(raw))).isCancelled();
+                }
+            }.requested } else null,
+            .retained_bytes = @as(u64, request.body.len) +| request.target.len +| (if (request.authorization) |value| value.len else 0) +| 1024,
+        }, if (protected_status) .control else .background) catch |err| {
+            return hotStandbyOperationTextResponse(self.alloc, switch (err) {
+                error.Canceled => 499,
+                error.Timeout, error.DeadlineExceeded => 504,
+                else => 503,
+            }, @errorName(err));
+        };
+        var bridge: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = self.alloc };
+        const team = try bridge.team();
+        var admitted = request;
+        admitted.admission = .{ .execution = team.borrow, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
+        return executor_value.execute(admitted) catch |err| switch (err) {
+            error.Canceled => hotStandbyOperationTextResponse(self.alloc, 499, @errorName(err)),
+            error.Timeout, error.DeadlineExceeded => hotStandbyOperationTextResponse(self.alloc, 504, @errorName(err)),
+            error.SchedulerClosed, error.SchedulerFull, error.ResourceTemporarilyUnavailable, error.ExecutionWaitUnsupported => hotStandbyOperationTextResponse(self.alloc, 503, @errorName(err)),
+            else => return err,
+        };
     }
 
     pub fn executeArd(
@@ -36582,6 +36623,65 @@ fn executeHotStandbyRouteForTest(
         .content_type = if (body.len > 0) "application/json" else null,
         .body = body,
     })) orelse error.TestUnexpectedResult;
+}
+
+test "HA runnable ingress admits authenticated original lifetime and retires physical callbacks" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        alloc: std.mem.Allocator,
+        server: ?*ApiHttpServer = null,
+        calls: usize = 0,
+        expected: @import("antfly_runtime_abi").runnable_abi.Class = .control,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn execute(raw: *anyopaque, request: hot_standby_http_operation.Request) !hot_standby_http_operation.OwnedResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const original = request.admission orelse return error.MissingAdmission;
+            try original.execution.checkLifetime();
+            try std.testing.expectEqual(self.expected, try original.execution.currentClass());
+            const stats = self.server.?.runnableScheduler().?.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
+            try std.testing.expect(stats.retained_bytes >= 1024);
+            var admission: @import("../storage/hot_standby/operation_admission.zig").Session = .{};
+            try admission.bind(original);
+            self.calls += 1;
+            return error.InvalidArgument;
+        }
+    };
+    var fake: Fake = .{ .alloc = alloc };
+    var server = ApiHttpServer.init(alloc, .{
+        .admin_bearer_token = "ha-secret",
+        .hot_standby_admin_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } },
+        .runnable_policy = .{ .slots = 2, .control_slots = 1 },
+    }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    fake.server = &server;
+    const admin = @import("../admin/mod.zig").routes;
+    var unauthorized = try executeHotStandbyRouteForTest(&server, .get, admin.hot_standby_primary_status, null, "");
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
+    try std.testing.expectError(error.InvalidArgument, executeHotStandbyRouteForTest(&server, .get, admin.hot_standby_primary_status, "Bearer ha-secret", ""));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
+    fake.expected = .background;
+    try std.testing.expectError(error.InvalidArgument, executeHotStandbyRouteForTest(&server, .post, admin.hot_standby_primary_status, "Bearer ha-secret", "{}"));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(u64, 0), server.runnableScheduler().?.stats().retained_bytes);
+    var expired = (try server.executeHotStandbyRoute(.{ .method = .get, .target = admin.hot_standby_primary_status, .authorization = "Bearer ha-secret", .content_type = null, .body = "", .deadline_ns = platform_time.monotonicNs() -| 1 })) orelse return error.TestUnexpectedResult;
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 504), expired.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    var cancellation: http_common.RequestCancellation = .{};
+    cancellation.cancel();
+    var canceled = (try server.executeHotStandbyRoute(.{ .method = .get, .target = admin.hot_standby_primary_status, .authorization = "Bearer ha-secret", .content_type = null, .body = "", .cancellation = &cancellation })) orelse return error.TestUnexpectedResult;
+    defer canceled.deinit();
+    try std.testing.expectEqual(@as(u16, 499), canceled.status);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
 }
 
 test "typed HA route operation dispatches admin and internal executors" {
