@@ -920,9 +920,16 @@ pub const Directory = struct {
         try visitAdded(node.right, other, visitor);
     }
     pub fn project(self: *const Directory, allocator: std.mem.Allocator) ![]Run {
+        return self.projectWithAdmission(allocator, null);
+    }
+
+    pub fn projectWithAdmission(self: *const Directory, allocator: std.mem.Allocator, control: ?@import("../../common/read_admission.zig").Port) ![]Run {
+        if (control) |owner| try owner.checkpoint();
         const runs = try allocator.alloc(Run, self.count());
+        errdefer allocator.free(runs);
         var cursor: Tree.Cursor = .{};
         for (runs, 0..) |*run, i| {
+            if (control) |owner| try owner.checkpoint();
             run.* = cursor.at(self.tree.root.?, i).run.*;
             run.owns_metadata = false;
             run.owns_path = false;
@@ -930,6 +937,7 @@ pub const Directory = struct {
             run.version_ref_pinned = false;
             run.shared_read_version = true;
         }
+        if (control) |owner| try owner.checkpoint();
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {

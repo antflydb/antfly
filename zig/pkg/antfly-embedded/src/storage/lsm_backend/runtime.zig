@@ -3523,17 +3523,37 @@ pub const ReadVersion = struct {
     /// owns metadata and file pins; the projection contains only borrowed data
     /// and per-version cache hints. All O(number-of-runs) work is off-lock.
     pub fn createFromDirectory(allocator: Allocator, directory: *@import("run_directory.zig").Directory) !*ReadVersion {
+        return createFromDirectoryWithAdmission(allocator, directory, null);
+    }
+
+    pub fn createFromDirectoryWithAdmission(allocator: Allocator, directory: *@import("run_directory.zig").Directory, control: ?read_admission.Port) !*ReadVersion {
+        if (control) |owner| try owner.checkpoint();
         const version = try allocator.create(ReadVersion);
         errdefer allocator.destroy(version);
-        const runs = try directory.project(allocator);
+        const runs = try directory.projectWithAdmission(allocator, control);
         errdefer allocator.free(runs);
-        const groups = try buildL0RunGroups(allocator, runs);
+        const groups = try buildL0RunGroupsControlled(allocator, runs, control);
         errdefer deinitRunGroups(allocator, groups);
-        const levels = try buildLowerLevels(allocator, runs);
+        const levels = try buildLowerLevelsControlled(allocator, runs, control);
+        errdefer allocator.free(levels);
         var projection_bytes: u64 = runs.len * @sizeOf(Run) + groups.len * @sizeOf(RunGroup) + levels.len * @sizeOf(RunLevel);
-        for (groups) |group| projection_bytes += group.run_indices.len * @sizeOf(usize);
+        for (groups) |group| {
+            if (control) |owner| try owner.checkpoint();
+            projection_bytes += group.run_indices.len * @sizeOf(usize);
+        }
+        if (control) |owner| try owner.checkpoint();
         version.* = .{ .allocator = allocator, .runs = runs, .l0_groups = groups, .levels = levels, .directory = directory, .projection_bytes = projection_bytes };
         return version;
+    }
+
+    /// Discard unpublished projection arrays. The pinned epoch still owns
+    /// the directory; this temporary header must never destroy that root.
+    pub fn discardProjection(self: *ReadVersion) void {
+        const allocator = self.allocator;
+        allocator.free(self.runs);
+        deinitRunGroups(allocator, self.l0_groups);
+        allocator.free(self.levels);
+        allocator.destroy(self);
     }
 
     pub fn buildMemoryBound(run_count: usize) u64 {
@@ -3634,6 +3654,18 @@ const RunReadView = struct {
             self.l0_groups = version.l0_groups;
             self.levels = version.levels;
         };
+    }
+
+    fn prepareWithAdmission(self: *RunReadView, backend: anytype, control: read_admission.Port) !void {
+        try control.checkpoint();
+        if (self.version) |version| {
+            if (comptime !@hasDecl(@TypeOf(backend.*), "prepareReadVersionWithAdmission")) return error.ExecutionWaitUnsupported;
+            try backend.prepareReadVersionWithAdmission(version, control);
+            self.runs = version.runs;
+            self.l0_groups = version.l0_groups;
+            self.levels = version.levels;
+        }
+        try control.checkpoint();
     }
 
     fn release(self: RunReadView, backend: anytype) void {
@@ -4213,11 +4245,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return copyPointValue(self.backend, self.allocator, &self.held_values, value);
         }
 
-        fn ensureStablePointViewLoaded(self: *@This()) !void {
+        fn ensureStablePointViewLoaded(self: *@This(), control: ?read_admission.Port) !void {
             if (!self.stable_point_view or self.stable_point_view_loaded) return;
-            const locked = lockBackend(BackendType, self.backend);
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, self.backend, owner) else lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
-            try self.read_view.?.prepare(self.backend);
+            if (control) |owner| try self.read_view.?.prepareWithAdmission(self.backend, owner) else try self.read_view.?.prepare(self.backend);
             const read_view = self.read_view.?;
             self.runs = read_view.runs;
             self.l0_groups = read_view.l0_groups;
@@ -4257,7 +4289,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     recordPointValueBorrow(self.backend);
                     return value;
                 };
-                try self.ensureStablePointViewLoaded();
+                try self.ensureStablePointViewLoaded(null);
                 self.backend.recordPointGet();
                 if (!lease) switch (try getFromStableCachedPointView(self.backend, self.metadata_allocator, self.runs, self.l0_groups, self.levels, &self.last_l0_group_index, self.namespace, key)) {
                     .hit => |value| return try self.ownValue(value),
@@ -4373,7 +4405,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
                     const plan = chooseMultiGetPlan(keys[offset..end], .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
-                    if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
+                    if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded(control);
                     const chunk_result = if (self.read_view.?.directory()) |directory|
                         try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator, control)
                     else switch (plan) {
@@ -6162,9 +6194,16 @@ fn getFromSnapshotRuns(
 }
 
 fn buildL0RunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
+    return buildL0RunGroupsControlled(allocator, runs, null);
+}
+
+fn buildL0RunGroupsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunGroup {
+    if (control) |owner| try owner.checkpoint();
     var l0_count: usize = 0;
-    while (l0_count < runs.len and runs[l0_count].level == 0) : (l0_count += 1) {}
-    return try buildRunGroups(allocator, runs[0..l0_count]);
+    while (l0_count < runs.len and runs[l0_count].level == 0) : (l0_count += 1) {
+        if (control) |owner| try owner.checkpoint();
+    }
+    return try buildRunGroupsControlled(allocator, runs[0..l0_count], control);
 }
 
 fn buildL0RunGroupsWithStats(backend: anytype, allocator: Allocator, runs: []const Run) ![]RunGroup {
@@ -6181,8 +6220,15 @@ fn buildL0RunGroupsWithStats(backend: anytype, allocator: Allocator, runs: []con
 }
 
 fn buildLowerLevels(allocator: Allocator, runs: []const Run) ![]RunLevel {
+    return buildLowerLevelsControlled(allocator, runs, null);
+}
+
+fn buildLowerLevelsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunLevel {
+    if (control) |owner| try owner.checkpoint();
     var start: usize = 0;
-    while (start < runs.len and runs[start].level == 0) : (start += 1) {}
+    while (start < runs.len and runs[start].level == 0) : (start += 1) {
+        if (control) |owner| try owner.checkpoint();
+    }
     if (start >= runs.len) return try allocator.alloc(RunLevel, 0);
 
     var levels = std.ArrayListUnmanaged(RunLevel).empty;
@@ -6190,19 +6236,28 @@ fn buildLowerLevels(allocator: Allocator, runs: []const Run) ![]RunLevel {
 
     var i = start;
     while (i < runs.len) {
+        if (control) |owner| try owner.checkpoint();
         const level = runs[i].level;
         const level_start = i;
-        while (i < runs.len and runs[i].level == level) : (i += 1) {}
+        while (i < runs.len and runs[i].level == level) : (i += 1) {
+            if (control) |owner| try owner.checkpoint();
+        }
         try levels.append(allocator, .{
             .level = level,
             .start_index = level_start,
             .len = i - level_start,
         });
     }
+    if (control) |owner| try owner.checkpoint();
     return try levels.toOwnedSlice(allocator);
 }
 
 fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
+    return buildRunGroupsControlled(allocator, runs, null);
+}
+
+fn buildRunGroupsControlled(allocator: Allocator, runs: []const Run, control: ?read_admission.Port) ![]RunGroup {
+    if (control) |owner| try owner.checkpoint();
     const IndexedRun = struct {
         run_index: usize,
         smallest_namespace_name: ?[]const u8,
@@ -6216,6 +6271,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
     var indexed = try allocator.alloc(IndexedRun, runs.len);
     defer allocator.free(indexed);
     for (runs, 0..) |run, i| {
+        if (control) |owner| try owner.checkpoint();
         indexed[i] = .{
             .run_index = i,
             .smallest_namespace_name = run.smallest_namespace_name,
@@ -6224,11 +6280,11 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
             .largest_key = run.largest_key,
         };
     }
-    std.mem.sort(IndexedRun, indexed, {}, struct {
+    try read_admission.sort(IndexedRun, indexed, {}, struct {
         fn lessThan(_: void, lhs: IndexedRun, rhs: IndexedRun) bool {
             return compareRunBound(lhs.smallest_namespace_name, lhs.smallest_key, rhs.smallest_namespace_name, rhs.smallest_key) == .lt;
         }
-    }.lessThan);
+    }.lessThan, control);
 
     var groups = std.ArrayListUnmanaged(RunGroup).empty;
     errdefer {
@@ -6246,6 +6302,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
     try current.append(allocator, indexed[0].run_index);
 
     for (indexed[1..]) |run| {
+        if (control) |owner| try owner.checkpoint();
         if (!rangesOverlap(
             run.smallest_namespace_name,
             run.smallest_key,
@@ -6256,8 +6313,9 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
             group_largest_namespace_name,
             group_largest_key,
         )) {
-            std.mem.sort(usize, current.items, {}, std.sort.asc(usize));
-            try groups.append(allocator, .{
+            try read_admission.sort(usize, current.items, {}, std.sort.asc(usize), control);
+            try groups.ensureUnusedCapacity(allocator, 1);
+            groups.appendAssumeCapacity(.{
                 .smallest_namespace_name = group_smallest_namespace_name,
                 .smallest_key = group_smallest_key,
                 .largest_namespace_name = group_largest_namespace_name,
@@ -6282,8 +6340,9 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
         try current.append(allocator, run.run_index);
     }
 
-    std.mem.sort(usize, current.items, {}, std.sort.asc(usize));
-    try groups.append(allocator, .{
+    try read_admission.sort(usize, current.items, {}, std.sort.asc(usize), control);
+    try groups.ensureUnusedCapacity(allocator, 1);
+    groups.appendAssumeCapacity(.{
         .smallest_namespace_name = group_smallest_namespace_name,
         .smallest_key = group_smallest_key,
         .largest_namespace_name = group_largest_namespace_name,
@@ -6291,6 +6350,7 @@ fn buildRunGroups(allocator: Allocator, runs: []const Run) ![]RunGroup {
         .run_indices = try current.toOwnedSlice(allocator),
     });
 
+    if (control) |owner| try owner.checkpoint();
     return try groups.toOwnedSlice(allocator);
 }
 

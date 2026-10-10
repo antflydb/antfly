@@ -5490,3 +5490,140 @@ test "transaction intent collection original admission scopes bound payload and 
         try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
     }
 }
+
+test "transaction intent collection original admission lazy layout builder wait preserves pinned epoch" {
+    const alloc = std.testing.allocator;
+    const runtime = @import("lsm_backend/runtime.zig");
+    const storage = @import("lsm_backend/storage_io.zig");
+    for ([_]bool{ false, true }) |with_io| for ([_]bool{ false, true }) |expire| {
+        const path = try tempTestPath(alloc, "txn-layout-builder");
+        defer alloc.free(path);
+        defer cleanupTestDir(path);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .read_runtime = if (with_io) storage.ReadRuntime.init(std.testing.io) else null });
+        defer backend.close();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "before", "old");
+            try write.commit();
+        }
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.unlockWithReclamation();
+        const version = try backend.createReadVersionFromDirectory();
+        _ = version.references.fetchAdd(1, .monotonic);
+        defer version.release(&backend);
+        const captured_count = version.directory.?.count();
+        const locked = if (with_io) version.build_mu.tryLock() else version.build_fallback_mu.tryLock();
+        try std.testing.expect(locked);
+        const State = struct {
+            backend: *lsm_backend.Backend,
+            version: *runtime.ReadVersion,
+            with_io: bool,
+            expire: bool,
+            expired: bool = false,
+            waits: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.expired) return error.DeadlineExceeded;
+            }
+            fn unlock(self: *@This()) void {
+                if (self.with_io) self.version.build_mu.unlock(std.testing.io) else self.version.build_fallback_mu.unlock();
+            }
+            fn wait(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.waits += 1;
+                // The actual builder lock wait has released the backend lock.
+                try std.testing.expect(self.backend.mu.tryLock());
+                self.backend.mu.unlock();
+                if (self.expire) {
+                    self.expired = true;
+                } else {
+                    var write = try self.backend.beginWrite();
+                    errdefer write.abort();
+                    try write.put(.{}, "after", "new");
+                    try write.commit();
+                    try self.backend.flushBufferedWritesWithOptions(.{ .compact = false });
+                    self.unlock();
+                }
+            }
+        };
+        var state: State = .{ .backend = &backend, .version = version, .with_io = with_io, .expire = expire };
+        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+        if (expire) {
+            try std.testing.expectError(error.DeadlineExceeded, backend.prepareReadVersionWithAdmission(version, read_control.Port.init(&source)));
+            try std.testing.expect(!version.prepared);
+            state.unlock();
+        } else {
+            try backend.prepareReadVersionWithAdmission(version, read_control.Port.init(&source));
+            try std.testing.expect(version.prepared);
+            try std.testing.expectEqual(captured_count, version.runs.len);
+            try std.testing.expect(backend.runs.count() > captured_count);
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        // Even rejected preparation returns the caller's backend lock.
+        try std.testing.expect(!backend.mu.tryLock());
+    };
+}
+
+test "transaction intent collection original admission lazy projection rejects every checkpoint and allocation" {
+    const alloc = std.testing.allocator;
+    const runtime = @import("lsm_backend/runtime.zig");
+    const path = try tempTestPath(alloc, "txn-layout-projection");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .compact_threshold_runs = 1024, .l0_soft_limit_runs = 1024, .l0_hard_limit_runs = 2048 });
+    defer backend.close();
+    for (0..8) |i| {
+        var key: [16]u8 = undefined;
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, try std.fmt.bufPrint(&key, "k{d:0>4}", .{i}), "value");
+        try write.commit();
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+    }
+    try std.testing.expect(backend.runs.count() >= 8);
+    try std.testing.expect(backend.mu.tryLock());
+    const version = try backend.createReadVersionFromDirectory();
+    _ = version.references.fetchAdd(1, .monotonic);
+    backend.mu.unlock();
+    defer {
+        const locked = runtime.lockBackend(lsm_backend.Backend, &backend);
+        version.release(&backend);
+        runtime.unlockBackend(lsm_backend.Backend, &backend, locked);
+    }
+    const directory = version.directory.?;
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    var state: State = .{};
+    var source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const projection = try runtime.ReadVersion.createFromDirectoryWithAdmission(alloc, directory, read_control.Port.init(&source));
+    const checks = state.checks;
+    try std.testing.expect(checks > directory.count());
+    try std.testing.expectEqual(directory.count(), projection.runs.len);
+    projection.discardProjection();
+    for (1..checks + 1) |stop_at| {
+        var stopped: State = .{ .stop_at = stop_at };
+        source.ptr = &stopped;
+        try std.testing.expectError(error.DeadlineExceeded, runtime.ReadVersion.createFromDirectoryWithAdmission(alloc, directory, read_control.Port.init(&source)));
+        try std.testing.expectEqual(stop_at, stopped.checks);
+        try std.testing.expectEqual(@as(usize, 8), directory.count());
+    }
+    const Allocation = struct {
+        fn run(failing: Allocator, root: *@import("lsm_backend/run_directory.zig").Directory, control: read_control.Port) !void {
+            const result = try runtime.ReadVersion.createFromDirectoryWithAdmission(failing, root, control);
+            defer result.discardProjection();
+        }
+    };
+    state.checks = 0;
+    source.ptr = &state;
+    try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ directory, read_control.Port.init(&source) });
+}

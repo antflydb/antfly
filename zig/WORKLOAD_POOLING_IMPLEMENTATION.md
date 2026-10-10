@@ -1757,3 +1757,29 @@ rejection. Five collector checks and 88 service checks pass, plus 13 source audi
 Lazy layout preparation/reacquisition, bulk current-scan cloning/rotation, artifact
 reconstruction, the full capture/Raft graph, corrected HTTP fixtures, resource and
 performance gates and automatic defaults remain unqualified.
+
+Controlled lazy read-version preparation now carries the original admission into
+the single-flight builder lock, backend reentry and projection construction.
+The projected directory, run descriptors, overlap groups, sort steps and level
+walks check that admission. Probe fallback preparation forwards its original
+controls and admits its initial backend lock. The pinned epoch remains the
+projection source even when a concurrent writer publishes a newer epoch.
+
+Preparation returns the caller's backend mutex on every outcome. After lifetime
+rejection, mandatory cleanup reentry may still wait for that mutex; it retains
+physical ownership until cleanup finishes. Temporary projection arrays are
+freed before their resource reservation is released. Group construction admits
+array capacity before transferring owned index arrays, closing an allocation
+failure leak in the shared projection path. Projection discard preserves the
+captured epoch's directory root. CPU transfer is refused while this retained
+service dependency graph is incomplete.
+
+Physical checks exercise both Io and atomic builder locks, successful progress,
+original deadline rejection, backend lock return, reader retirement and epoch
+publication during the builder wait. Projection checks reject at every reachable
+checkpoint and inject every projection allocation failure while preserving the
+original directory. Seven collector checks and 88 service checks pass, plus 13
+source ownership checks. Mandatory cleanup wait bounds, broader builder/capture
+caller adoption, metadata-key comparison byte quanta, bulk clone/rotation and
+artifact transport, full native/HTTP integration, resource/performance gates and
+automatic defaults remain unqualified.

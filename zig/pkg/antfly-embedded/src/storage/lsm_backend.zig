@@ -6491,37 +6491,81 @@ pub const Backend = struct {
     /// Caller owns an epoch reference and holds the backend mutex. The exact
     /// pinned epoch is prepared once, even if publication advances meanwhile.
     pub fn prepareReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) !void {
+        return self.prepareReadVersionControlled(version, null);
+    }
+
+    pub fn prepareReadVersionWithAdmission(self: *Backend, version: *runtime_mod.ReadVersion, control: read_admission.Port) !void {
+        return self.prepareReadVersionControlled(version, control);
+    }
+
+    /// Returns with the backend mutex held on every outcome. Rejection uses
+    /// mandatory physical reentry before releasing epoch/accounting ownership.
+    fn reacquireReadPreparationBackend(self: *Backend, control: ?read_admission.Port) !void {
+        if (control) |owner| {
+            _ = runtime_mod.lockBackendWithAdmission(Backend, self, owner) catch |err| {
+                _ = runtime_mod.lockBackend(Backend, self);
+                return err;
+            };
+        } else _ = runtime_mod.lockBackend(Backend, self);
+    }
+
+    fn prepareReadVersionControlled(self: *Backend, version: *runtime_mod.ReadVersion, control: ?read_admission.Port) !void {
+        if (control) |owner| {
+            try owner.checkpoint();
+            if (try owner.executionWait() != null) return error.ExecutionWaitUnsupported;
+        }
         if (version.prepared) return;
         self.retainReaderKind(.other);
         runtime_mod.unlockBackend(Backend, self, true);
         const build_io: ?std.Io = if (comptime builtin.os.tag == .freestanding) null else if (self.options.read_runtime) |read_runtime| read_runtime.io else null;
         if (build_io) |io| {
-            version.build_mu.lockUncancelable(io);
+            if (control) |owner| {
+                @import("../common/bounded_mutex.zig").lock(&version.build_mu, io, owner) catch |err| {
+                    _ = runtime_mod.lockBackend(Backend, self);
+                    self.releaseReaderKind(.other);
+                    return err;
+                };
+            } else version.build_mu.lockUncancelable(io);
         } else {
-            platform.sync.lockYielding(&version.build_fallback_mu);
+            if (control) |owner| {
+                @import("../common/bounded_mutex.zig").lockAtomic(&version.build_fallback_mu, owner) catch |err| {
+                    _ = runtime_mod.lockBackend(Backend, self);
+                    self.releaseReaderKind(.other);
+                    return err;
+                };
+            } else platform.sync.lockYielding(&version.build_fallback_mu);
         }
-        _ = runtime_mod.lockBackend(Backend, self);
+        const initial_reentry = self.reacquireReadPreparationBackend(control);
         defer self.releaseReaderKind(.other);
         defer if (build_io) |io| version.build_mu.unlock(io) else version.build_fallback_mu.unlock();
+        try initial_reentry;
         if (version.prepared) return;
         const directory = version.directory.?;
         const build_started = self.readStatsNowNs();
         runtime_mod.unlockBackend(Backend, self, true);
         var reservation: ?resource_manager_mod.Reservation = null;
-        const built = blk: {
+        const built: anyerror!*runtime_mod.ReadVersion = blk: {
+            if (control) |owner| owner.checkpoint() catch |err| break :blk err;
             if (self.options.resource_manager) |manager| {
                 reservation = manager.reserve(.lsm_in_memory_state, runtime_mod.ReadVersion.buildMemoryBound(directory.count())) catch |err| break :blk @as(anyerror!*runtime_mod.ReadVersion, err);
             }
-            break :blk runtime_mod.ReadVersion.createFromDirectory(self.allocator, directory);
+            break :blk runtime_mod.ReadVersion.createFromDirectoryWithAdmission(self.allocator, directory, control);
         };
-        _ = runtime_mod.lockBackend(Backend, self);
         defer if (reservation) |*lease| lease.release();
+        var transferred = false;
+        defer if (!transferred) {
+            if (built) |projection| projection.discardProjection() else |_| {}
+        };
+        const final_reentry = self.reacquireReadPreparationBackend(control);
+        try final_reentry;
         const projection = try built;
+        if (control) |owner| try owner.checkpoint();
         // Transfer only the projection. The epoch already owns this root.
         version.runs = projection.runs;
         version.l0_groups = projection.l0_groups;
         version.levels = projection.levels;
         version.projection_bytes = projection.projection_bytes;
+        transferred = true;
         self.allocator.destroy(projection);
         version.prepared = true;
         self.read_version_builds +|= 1;
