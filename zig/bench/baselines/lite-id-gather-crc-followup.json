@@ -188,5 +188,34 @@
     "before_staging_copy_bytes": "compressed payload length",
     "after_staging_copy_bytes": 0,
     "measurement": "Native Debug range-provider copy fixture tracks readInto bytes after reader initialization; visitor slices append directly. Page-facade fixtures verify contiguous borrowing on cold pages, native-range borrowing on verified pages, and fail-closed cold corruption. Cold range providers retain bounded buffered authentication."
+  },
+  "shared_typed_navigation": {
+    "comparison_commit": "73127e1aa18a6b9d1768fbc863d2c41cea577bfd",
+    "documents": 50000,
+    "chunks": 49,
+    "scopes": 100,
+    "before_navigation_allocations": 100,
+    "after_navigation_allocations": 0,
+    "before_navigation_provider_reads": 400,
+    "after_navigation_provider_reads": 0,
+    "retained_directory_bytes": 1568,
+    "measurement": "Native Debug in-memory range provider. Segment admission and source binding excluded from scope measurements. Shared directory is charged to the admitted artifact; payload reads use the query-bound source. Not total query allocations or physical disk I/O."
+  },
+  "mixed_authentication": {
+    "pages": 64,
+    "page_bytes": 65536,
+    "cold_pages": 1,
+    "verified_pages": 63,
+    "before_staged_bytes": 4194304,
+    "after_staged_bytes": 65536,
+    "after_borrowed_bytes": 4128768,
+    "warm_staged_bytes": 0,
+    "measurement": "Native Debug borrowed-visitor pointer fixture. Counts copied bytes, not retained scratch or RSS; private scratch remains 64 KiB plus 1 KiB."
+  },
+  "foreground_cleanup_backoff": {
+    "requests_per_visibility_api": 20,
+    "before_truncate_attempts_per_api": 20,
+    "after_truncate_attempts_per_api": 0,
+    "measurement": "Native Debug runtime fixture, 1 ms caller deadlines within a shared retry deadline. Both all-index and selected-index visibility entrypoints preserve deadline errors and retained cleanup credit. Not a QPS measurement."
   }
 }

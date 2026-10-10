@@ -744,6 +744,7 @@ pub const SegmentReader = struct {
         offset: u64,
         length: u64,
         cached_navigation: ?[]u8 = null,
+        typed_navigation: ?*typed_dv.RangeTypedDocValuesReader = null,
         checksum: u32 = 0,
         validation: std.atomic.Value(u8) = .init(integrity_valid),
     };
@@ -766,7 +767,13 @@ pub const SegmentReader = struct {
         errdefer alloc.free(fields);
         var initialized: usize = 0;
         errdefer for (fields[0..initialized]) |field| {
-            for (field.sections) |section| if (section.cached_navigation) |bytes| alloc.free(bytes);
+            for (field.sections) |section| {
+                if (section.cached_navigation) |bytes| alloc.free(bytes);
+                if (section.typed_navigation) |navigation| {
+                    navigation.deinit();
+                    alloc.destroy(navigation);
+                }
+            }
         };
         for (native.range.fields, fields) |field, *out| {
             out.* = .{ .name = field.name, .sections = field.sections };
@@ -776,6 +783,16 @@ pub const SegmentReader = struct {
                     const view = try @import("segment_source.zig").View.init(native.range.source, section.offset, section.length);
                     const stats = try inverted.RangeInvertedIndexReader.init(alloc, view, 1024 * 1024);
                     out.inverted_stats = .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+                }
+                // Immutable, authenticated directory ownership follows the
+                // admitted artifact, charged to its publication allocator.
+                // Query scopes borrow it while binding their own source/cache.
+                if (section.section_type == .typed_doc_values and section.length != 0) {
+                    const view = (try native.range.sectionView(field.name, .typed_doc_values)).?;
+                    const navigation = try alloc.create(typed_dv.RangeTypedDocValuesReader);
+                    errdefer alloc.destroy(navigation);
+                    navigation.* = try typed_dv.RangeTypedDocValuesReader.init(alloc, view, std.math.maxInt(usize), std.math.maxInt(usize));
+                    section.typed_navigation = navigation;
                 }
                 switch (section.section_type) {
                     .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => continue,
@@ -834,9 +851,10 @@ pub const SegmentReader = struct {
         } else bytes += native.range.source.retainedBytes();
         for (self.fields) |field| {
             bytes += field.name.len + field.sections.len * @sizeOf(SectionInfo);
-            for (field.sections) |section| if (section.cached_navigation) |data| {
-                bytes += data.len;
-            };
+            for (field.sections) |section| {
+                if (section.cached_navigation) |data| bytes += data.len;
+                if (section.typed_navigation) |navigation| bytes += @sizeOf(typed_dv.RangeTypedDocValuesReader) + navigation.offsets.len;
+            }
         }
         return bytes;
     }
@@ -852,10 +870,14 @@ pub const SegmentReader = struct {
     pub fn typedDocValuesScoped(self: *const SegmentReader, allocator: Allocator, field: []const u8) !?typed_dv.TypedDocValuesReader {
         if (self.native) |native| {
             const view = (try native.range.sectionView(field, .typed_doc_values)) orelse return null;
-            const scoped = try typed_dv.RangeTypedDocValuesReader.init(allocator, view, std.math.maxInt(usize), std.math.maxInt(usize));
-            var reader = scoped.reader;
-            reader.owned_offsets = scoped.offsets;
-            return reader;
+            const section = native.range.findSection(field, .typed_doc_values).?;
+            if (section.typed_navigation) |navigation| {
+                var reader = navigation.reader;
+                reader.alloc = allocator;
+                reader.range = .{ .view = view, .max_chunk_bytes = std.math.maxInt(usize) };
+                return reader;
+            }
+            return error.InvalidSegment;
         }
         return try typed_dv.TypedDocValuesReader.init(allocator, (try self.getSection(field, .typed_doc_values)) orelse return null);
     }
@@ -1030,6 +1052,10 @@ pub const SegmentReader = struct {
             if (!native.borrowed_navigation) {
                 for (self.fields) |field| for (field.sections) |section| {
                     if (section.cached_navigation) |bytes| self.alloc.free(bytes);
+                    if (section.typed_navigation) |navigation| {
+                        navigation.deinit();
+                        self.alloc.destroy(navigation);
+                    }
                 };
                 self.alloc.free(self.fields);
                 self.alloc.free(self.stored_block_validations.?);
@@ -11601,4 +11627,80 @@ test "segment.cold multi-page borrowing amortizes native traversal" {
     reads = file.test_backing_read_calls.load(.monotonic);
     try point.source().visitRange(0, 8, &context, Consumer.consume);
     try std.testing.expectEqual(reads, file.test_backing_read_calls.load(.monotonic));
+}
+
+test "segment.scoped typed navigation borrows admitted directory without allocation or reads" {
+    const a = std.testing.allocator;
+    var sink = MemorySegmentSink.init(a);
+    defer sink.deinit();
+    var column_sink = sink.sink();
+    var values = typed_dv.StreamingWriter.init(a, &column_sink, .u64_val);
+    defer values.deinit();
+    for (0..50_000) |doc| try values.add(@intCast(doc), .{ .u64_val = doc });
+    try std.testing.expect(try values.finish());
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..50_000) |_| try writer.addUnstoredDoc();
+    try writer.addSection(try writer.addField("value"), .typed_doc_values, sink.out.items);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const Backend = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .bytes = bytes };
+    const input = SegmentSource{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .close = Backend.close } };
+    var reader = try SegmentReader.initSource(a, input);
+    defer reader.deinit();
+    var query_backend = Backend{ .bytes = bytes };
+    const query_input = SegmentSource{ .ranges = .{ .ptr = &query_backend, .length = bytes.len, .read_into = Backend.read, .close = Backend.close } };
+    var bound = try reader.bindSource(a, query_input);
+    defer bound.deinit();
+    const admitted = reader.native.?.range.findSection("value", .typed_doc_values).?.typed_navigation.?;
+    const baseline_reads = backend.reads;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for (0..100) |_| {
+        var scoped = (try bound.typedDocValuesScoped(failing.allocator(), "value")).?;
+        defer scoped.deinit();
+        try std.testing.expectEqual(admitted.offsets.ptr, scoped.chunk_offsets.ptr);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(baseline_reads, backend.reads);
+    try std.testing.expectEqual(@as(usize, 0), query_backend.reads);
+    var scoped = (try bound.typedDocValuesScoped(a, "value")).?;
+    defer scoped.deinit();
+    try std.testing.expectEqual(@as(u64, 49_999), (try scoped.getU64(49_999)).?);
+    try std.testing.expect(query_backend.reads > 0);
+    try std.testing.expectEqual(baseline_reads, backend.reads);
+    std.debug.print("LITE_SHARED_NAV scopes=100 metadata_allocations=0 metadata_reads=0 retained_directory_bytes={d}\n", .{admitted.offsets.len});
+}
+
+test "segment.shared typed navigation authenticates legacy sections before admission" {
+    const a = std.testing.allocator;
+    var column = typed_dv.TypedDocValuesWriter.init(a, .u64_val, 128);
+    defer column.deinit();
+    try column.add(0, .{ .u64_val = 42 });
+    const payload = try column.build();
+    defer a.free(payload);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addUnstoredDoc();
+    try writer.addSection(try writer.addField("value"), .typed_doc_values, payload);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const legacy = try legacyV4Fixture(a, bytes);
+    defer a.free(legacy);
+    var good = try SegmentReader.initSource(a, .{ .contiguous = legacy });
+    const offset = good.native.?.range.findSection("value", .typed_doc_values).?.offset;
+    good.deinit();
+    // Keep the directory structurally valid while corrupting compressed data.
+    // Legacy artifacts authenticate the complete section, not individual pages.
+    legacy[@intCast(offset + 14)] ^= 1;
+    try std.testing.expectError(error.CrcMismatch, SegmentReader.initSource(a, .{ .contiguous = legacy }));
 }

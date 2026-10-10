@@ -96,3 +96,24 @@ ranges directly. Cold range providers and providers without a visitor retain
 bounded buffered reads and CRC checks. Visitors are synchronous, spans are capped
 at 64 KiB, and callers discard private output if any provider or sink operation
 fails. No borrowed slice escapes a callback.
+
+## Native reader ownership
+
+Native segment admission reads and validates each typed directory once. The
+immutable directory lives with the admitted segment and is charged to its
+publication allocator; `nativeNavigationBytes` includes its descriptor object
+and bytes. A snapshot pins that ownership until all bound readers and query
+scopes are finished. Bound readers borrow the directory and retain their own
+capability-bound source. Opening a typed reader copies only its small descriptor,
+without allocating, reading, or validating navigation again. Payload caches and
+decoded buffers remain private to each query/merge scope. Failed admission frees
+all directories prepared so far; closing a bound reader never frees its owner's
+navigation. Historical directory layouts use the same ownership rule. Revision 4 artifacts
+retain their whole-section CRC check before directory admission; revision 5
+authenticates touched pages.
+
+Mixed authenticated range traversal selects buffering at each page boundary.
+Cold pages retain all fragments until their full CRC passes; already verified
+pages borrow provider fragments directly, even after a cold prefix. Concurrent
+validation of a buffered page cannot discard its prefix or expose an unchecked
+suffix. Private scratch remains one 64 KiB page plus a 1 KiB CRC window.

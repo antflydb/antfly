@@ -289,6 +289,7 @@ pub const PagedSource = struct {
             relative: u64,
             start: u64,
             position: u64,
+            buffering: bool = false,
             page: [page_size]u8 = undefined,
             crc_window: [1024]u8 = undefined,
             crc_start: usize = 0,
@@ -320,6 +321,15 @@ pub const PagedSource = struct {
                     const validation = &stream.owner.validations[index];
                     const state = validation.load(.acquire);
                     if (state == 2) return error.CrcMismatch;
+                    // Choose once at the page boundary. If another validator
+                    // finishes midway, retain our cold prefix until delivery.
+                    if (within == 0) stream.buffering = state != 1;
+                    if (!stream.buffering) {
+                        try stream.deliver(stream.position, bytes[copied..][0..take]);
+                        stream.position += take;
+                        copied += take;
+                        continue;
+                    }
                     // Always retain cold-page fragments until the full CRC is
                     // checked. Another validator completing midway cannot
                     // expose a suffix while dropping our buffered prefix.
@@ -570,4 +580,50 @@ test "segment cold streaming handles fragmented pages, tails, reentrancy and fai
     consumer.used = 0;
     try std.testing.expectError(error.CrcMismatch, paged.source().visitRange(0, payload_len, &consumer, Consumer.consume));
     try std.testing.expectEqual(2 * page_size, consumer.used);
+}
+
+test "segment.mixed authentication borrows verified suffix after a cold prefix" {
+    const a = std.testing.allocator;
+    const pages = 64;
+    const length = pages * page_size;
+    const bytes = try a.alloc(u8, length + pages * 4);
+    defer a.free(bytes);
+    @memset(bytes[0..length], 'x');
+    for (0..pages) |index| std.mem.writeInt(u32, bytes[length + index * 4 ..][0..4], Crc32.hash(bytes[index * page_size ..][0..page_size]), .big);
+    const Backend = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn visit(raw: *anyopaque, offset: u64, size: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try consume(context, 0, self.bytes[@intCast(offset)..][0..@intCast(size)]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Consumer = struct {
+        expected: []const u8,
+        copied: usize = 0,
+        borrowed: usize = 0,
+        fn consume(raw: *anyopaque, relative: u64, span: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualSlices(u8, self.expected[@intCast(relative)..][0..span.len], span);
+            if (@intFromPtr(span.ptr) == @intFromPtr(self.expected.ptr) + relative) self.borrowed += span.len else self.copied += span.len;
+        }
+    };
+    var backend = Backend{ .bytes = bytes };
+    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } };
+    const paged = try PagedSource.init(a, original, .{ .offset = length, .length = pages * 4, .checksum = Crc32.hash(bytes[length..]) });
+    defer paged.deinit();
+    var one: [1]u8 = undefined;
+    for (1..pages) |index| try paged.source().readInto(index * page_size, &one);
+    var mixed = Consumer{ .expected = bytes[0..length] };
+    try paged.source().visitRange(0, length, &mixed, Consumer.consume);
+    var warm = Consumer{ .expected = bytes[0..length] };
+    try paged.source().visitRange(0, length, &warm, Consumer.consume);
+    std.debug.print("FRESH_MIXED_PAGES cold_pages=1 verified_pages=63 mixed_staged_bytes={d} mixed_borrowed_bytes={d} warm_staged_bytes={d} warm_borrowed_bytes={d}\n", .{ mixed.copied, mixed.borrowed, warm.copied, warm.borrowed });
+    try std.testing.expectEqual(@as(usize, page_size), mixed.copied);
+    try std.testing.expectEqual(@as(usize, length - page_size), mixed.borrowed);
+    try std.testing.expectEqual(@as(usize, 0), warm.copied);
 }

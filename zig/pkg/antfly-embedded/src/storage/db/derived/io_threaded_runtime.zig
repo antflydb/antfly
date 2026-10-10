@@ -516,7 +516,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             if (delay > 0) {
                 io.sleep(Io.Duration.fromNanoseconds(@intCast(delay)), .awake) catch {};
             } else {
-                _ = persistIdleAppliedSequence(self, worker, worker.applied_sequence, io) catch |err| {
+                attemptPendingTruncate(self, io) catch |err| {
                     self.recordError(io, worker, "pause_truncate", err);
                     return err;
                 };
@@ -1291,51 +1291,59 @@ fn workerMain(worker: *Worker) void {
 
 fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !bool {
     const persisted = try runtime.persist_fn(runtime.ctx, worker.name, sequence, false);
-    var truncate_sequence: u64 = 0;
     runtime.mutex.lockUncancelable(io);
     if (persisted and sequence > worker.persisted_sequence) {
         worker.persisted_sequence = sequence;
     }
-    if (runtime.truncates_in_flight == 0 and platform_time.monotonicNs() >= runtime.truncate_retry_not_before_ns and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
-        const min_persisted = runtime.computeMinPersistedLocked();
-        if (min_persisted > runtime.last_claimed_truncate_sequence) {
-            runtime.last_claimed_truncate_sequence = min_persisted;
-            truncate_sequence = min_persisted;
-        }
-    }
-    if (truncate_sequence > 0) {
-        runtime.truncates_in_flight += 1;
-    } else {
-        runtime.cond.broadcast(io);
-    }
+    const truncate_sequence = claimPendingTruncateLocked(runtime);
+    if (truncate_sequence == 0) runtime.cond.broadcast(io);
     runtime.mutex.unlock(io);
-
-    if (truncate_sequence > 0) {
-        try completeWorkerTruncateAttempt(runtime, truncate_sequence, io);
-    }
+    if (truncate_sequence != 0) try completeWorkerTruncateAttempt(runtime, truncate_sequence, io);
     return persisted;
 }
 
+/// Caller holds the runtime mutex. Durable publication and cleanup admission
+/// use the same critical section without an additional lock per idle dispatch.
+fn claimPendingTruncateLocked(runtime: *DerivedRuntime) u64 {
+    if (runtime.truncates_in_flight != 0 or platform_time.monotonicNs() < runtime.truncate_retry_not_before_ns) return 0;
+    const minimum = runtime.computeMinPersistedLocked();
+    if (minimum <= runtime.last_claimed_truncate_sequence) return 0;
+    runtime.last_claimed_truncate_sequence = minimum;
+    runtime.truncates_in_flight += 1;
+    return minimum;
+}
+
+/// Cleanup does not need to re-persist an already durable worker watermark.
+/// All callers share one exclusive claim and one contention backoff.
+fn attemptPendingTruncate(runtime: *DerivedRuntime, io: Io) !void {
+    runtime.mutex.lockUncancelable(io);
+    const sequence = claimPendingTruncateLocked(runtime);
+    if (sequence == 0) runtime.cond.broadcast(io);
+    runtime.mutex.unlock(io);
+    if (sequence != 0) try completeWorkerTruncateAttempt(runtime, sequence, io);
+}
+
 fn truncateWithVisibilityWait(runtime: *DerivedRuntime, sequence: u64, wait: runtime_types.VisibilityWait, io: Io) !void {
-    var backoff = catch_up_policy.RecoverableRetryBackoff{};
     while (true) {
         try wait.check();
+        runtime.mutex.lockUncancelable(io);
+        const remaining = runtime.truncate_retry_not_before_ns -| platform_time.monotonicNs();
+        runtime.mutex.unlock(io);
+        if (remaining != 0) {
+            var sleep_ns = @min(remaining, 10 * std.time.ns_per_ms);
+            if (wait.deadline_ns) |deadline| {
+                const now = if (wait.clock) |clock| clock.nowRealtimeNs() else platform_time.monotonicNs();
+                sleep_ns = @min(sleep_ns, deadline -| now);
+            }
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            continue;
+        }
         runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
             if (!catch_up_policy.isRecoverableAdmissionError(err)) return err;
-            const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &backoff, err);
-            const retry_at = platform_time.monotonicNs() +| delay;
-            while (true) {
-                try wait.check();
-                const remaining = retry_at -| platform_time.monotonicNs();
-                if (remaining == 0) break;
-                var sleep_ns = @min(remaining, 10 * std.time.ns_per_ms);
-                if (wait.deadline_ns) |deadline| {
-                    const now = if (wait.clock) |clock| clock.nowRealtimeNs() else platform_time.monotonicNs();
-                    sleep_ns = @min(sleep_ns, deadline -| now);
-                }
-                // Poll cancellation while preserving the full retry backoff.
-                io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
-            }
+            runtime.mutex.lockUncancelable(io);
+            const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &runtime.truncate_retry_backoff, err);
+            runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() +| delay;
+            runtime.mutex.unlock(io);
             continue;
         };
         return;
@@ -2858,4 +2866,59 @@ test "issue1015 failed registration can still pause and retire retained cleanup"
     try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
     runtime.removeWorker("failed");
     try runtime.failIfUnhealthy();
+}
+
+test "issue1015 pause cleanup bypasses persistence for a durable worker" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        persist_calls: usize = 0,
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.persist_calls += 1;
+            return error.WouldBlock;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+    };
+    var probe = Probe{};
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const worker = try alloc.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "healthy"), .kind = .{ .name = "healthy", .kind = .full_text }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
+    try runtime.workers.append(alloc, worker);
+    try std.testing.expect(try runtime.pauseWorker("healthy"));
+    try std.testing.expectEqual(@as(usize, 0), probe.persist_calls);
+    try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
+    std.debug.print("FRESH_PAUSE_HEALTH durable_sequence={d} persist_calls={d} worker_error={s} paused={any}\n", .{ worker.persisted_sequence, probe.persist_calls, worker.last_error_name orelse "none", worker.paused });
+    // A transient race must not permanently disable an already-durable index.
+    try runtime.failIfUnhealthy();
+}
+
+test "issue1015 foreground visibility cleanup preserves runtime backoff" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.WouldBlock;
+        }
+    };
+    var probe = Probe{};
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const worker = try alloc.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
+    try runtime.workers.append(alloc, worker);
+    runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+    for (0..20) |_| {
+        try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForAllWithVisibilityWait(1, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_ms }));
+    }
+    for (0..20) |_| {
+        try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForIndexesWithVisibilityWait(1, &.{"cleanup"}, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_ms }));
+    }
+    std.debug.print("FRESH_FOREGROUND_BACKOFF requests=20 truncate_calls={d} claim={d} complete={d}\n", .{ probe.calls, runtime.last_claimed_truncate_sequence, runtime.last_truncated_sequence });
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
 }
