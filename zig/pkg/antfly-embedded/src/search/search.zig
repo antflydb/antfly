@@ -899,7 +899,7 @@ fn executeFilterQuery(
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter, request.authority);
     defer alloc.free(doc_ids);
 
     var all_scored = try alloc.alloc(scorer_mod.ScoredHit, doc_ids.len);
@@ -1355,7 +1355,7 @@ fn executeMatchAll(
 ) !SearchResult {
     // Use filter to get all doc IDs
     const filter = query_mod.Filter{ .match_all = {} };
-    const raw_doc_ids = try snap.executeFilter(alloc, filter);
+    const raw_doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter, request.authority);
     defer alloc.free(raw_doc_ids);
 
     // Unlike every other query type, match_all never goes through the
@@ -3145,7 +3145,7 @@ fn executeSort(
     // Get matching doc IDs via filter
     const owned_filter = try queryToFilter(alloc, request.query);
     defer owned_filter.deinit(alloc);
-    const doc_ids = try snap.executeFilter(alloc, owned_filter.filter);
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, owned_filter.filter, request.authority);
     defer alloc.free(doc_ids);
 
     // Read sort field values and pair with doc IDs
@@ -6403,5 +6403,43 @@ test "native text count authority covers exact and candidate count entry points"
     for (1..candidate_checks + 1) |fail_at| {
         state = .{ .fail_at = fail_at };
         try std.testing.expectError(error.SchedulerClosed, executeCountCandidatesWithAuthority(a, snapshot, query, authority));
+    }
+}
+
+test "native dictionary search entry retains lifetime authority through filters" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "help", .freq = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const request: SearchRequest = .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "hel" } },
+        .include_stored = false,
+        .authority = .{ .context = &state, .check_fn = State.check },
+    };
+    var actual = try execute(a, snapshot, request);
+    defer actual.deinit();
+    try std.testing.expectEqual(@as(usize, 2), actual.hits.len);
+    const checks = state.calls;
+    try std.testing.expect(checks > 5);
+    for (1..checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, execute(a, snapshot, request));
+        try std.testing.expectEqual(fail_at, state.calls);
     }
 }

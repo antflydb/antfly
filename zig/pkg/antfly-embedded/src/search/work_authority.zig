@@ -16,3 +16,16 @@ pub const Authority = struct {
         try self.check_fn(self.context);
     }
 };
+
+/// Request-local work counter; never install it on a shared reader.
+pub const Poller = struct {
+    authority: ?Authority = null,
+    steps: u8 = 0,
+
+    pub fn tick(self: *Poller) !void {
+        if (self.authority) |owner| {
+            if (self.steps == 0) try owner.check();
+            self.steps = (self.steps + 1) % 64;
+        }
+    }
+};

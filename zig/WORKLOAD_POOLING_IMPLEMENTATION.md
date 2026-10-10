@@ -1342,3 +1342,16 @@ lifetime failures at every observed checkpoint to check partial retirement.
 Specialized leaf filters, bulk bitmap operations, positional verification,
 provider/decoder work and lock-safe CPU yielding still need bounded-work coverage;
 checks surrounding these operations do not prove bounded execution within them.
+
+Prefix (including companion exact lookup), wildcard, fuzzy, regexp and term-range
+filters now pass original lifetime authority into postings scans and request-local
+dictionary iterators. Contiguous and range-backed iterators poll while decoding
+rejected terms and skipping blocks, including within a single `next()` call that
+exposes no accepted entry. Ordinary filter queries, match-all and sorted-query
+filter selection retain the authority through the public search dispatcher.
+Focused tests compare membership with the legacy paths, reject every observed
+checkpoint, and expire no-output iterator scans in both storage representations.
+Automaton construction/transitions, bulk bitmap work, specialized leaf filters,
+projection/sort/aggregation loops, physical I/O and lock-safe CPU yielding remain
+separate bounded-execution requirements. In particular, production text sources
+currently retain an analysis read lock for the query's lifetime.
