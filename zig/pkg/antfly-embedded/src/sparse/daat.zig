@@ -54,6 +54,7 @@ pub const Stream = struct {
     term: u32 = 0,
     query_order: usize = 0,
     seek_target: u64 = 0,
+    ordinal_range: ?struct { first: u32, last: u32 } = null,
     segment: ?u64 = null,
     version: u32 = 1,
     weight: f32,
@@ -222,11 +223,67 @@ pub const Stream = struct {
     }
 };
 
+pub const Range = struct { first: u32, end: u64 };
+/// Coalesce authenticated stream coverage before dividing work. Every interval
+/// is a superset; unknown legacy coverage keeps the entire pinned ordinal domain.
+/// Complete masks can reject empty tasks without reading any posting metadata.
+pub fn planRanges(a: A, streams: []const Stream, span: u64, include: ?*const @import("../encoding/roaring.zig").RoaringBitmap, exclude: ?*const @import("../encoding/roaring.zig").RoaringBitmap) ![]Range {
+    if (span > 0x1_0000_0000) return error.InvalidChunk;
+    var intervals: std.ArrayListUnmanaged(Range) = .empty;
+    defer intervals.deinit(a);
+    for (streams) |stream| {
+        const bounds = stream.ordinal_range orelse {
+            intervals.clearRetainingCapacity();
+            try intervals.append(a, .{ .first = 0, .end = span });
+            break;
+        };
+        if (bounds.first > bounds.last or bounds.last >= span) return error.InvalidChunk;
+        try intervals.append(a, .{ .first = bounds.first, .end = @as(u64, bounds.last) + 1 });
+    }
+    std.mem.sort(Range, intervals.items, {}, struct {
+        fn less(_: void, left: Range, right: Range) bool {
+            return left.first < right.first;
+        }
+    }.less);
+    var used: usize = 0;
+    for (intervals.items) |range| {
+        if (used != 0 and range.first <= intervals.items[used - 1].end) {
+            intervals.items[used - 1].end = @max(intervals.items[used - 1].end, range.end);
+        } else {
+            intervals.items[used] = range;
+            used += 1;
+        }
+    }
+    var total: u64 = 0;
+    for (intervals.items[0..used]) |range| total += range.end - range.first;
+    if (total < 8192) return a.alloc(Range, 0);
+    const grain = @max(4096, (total + 4095) / 4096);
+    var work: std.ArrayListUnmanaged(Range) = .empty;
+    defer work.deinit(a);
+    for (intervals.items[0..used]) |range| {
+        var first: u64 = range.first;
+        while (first < range.end) {
+            const end = @min(range.end, first + grain);
+            const admitted = (if (include) |bitmap| bitmap.rangeCardinality(@intCast(first), end) != 0 else true) and
+                (if (exclude) |bitmap| bitmap.rangeCardinality(@intCast(first), end) != end - first else true);
+            if (admitted) try work.append(a, .{ .first = @intCast(first), .end = end });
+            first = end;
+        }
+    }
+    return work.toOwnedSlice(a);
+}
+
 fn cannotBeat(upper: f32, first: u32, winner: Entry) bool {
     return std.math.isFinite(upper) and (upper < winner.score or (upper == winner.score and first > winner.doc_num));
 }
 
 pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stats) ![]Entry {
+    return collectRange(a, streams, k, context, stats, 0, 0x1_0000_0000);
+}
+
+/// Every range owns all contributions for its documents, preserving canonical
+/// signed f32 accumulation even when ranges execute in a different order.
+pub fn collectRange(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stats, lower: u32, range_end: u64) ![]Entry {
     var winners = std.PriorityQueue(Entry, void, Entry.worse).initContext({});
     defer winners.deinit(a);
     if (k == 0) return a.alloc(Entry, 0);
@@ -242,12 +299,17 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
         try context.check();
         if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
             if (stream.reader != null) {
-                try stream.seek(try context.nextCandidate(0));
+                try stream.seek(try context.nextCandidate(lower));
             } else {
                 try stream.advance();
-                if (stream.doc) |doc| try stream.seek(try context.nextCandidate(doc));
+                if (stream.doc) |doc| try stream.seek(try context.nextCandidate(@max(doc, lower)));
             }
-        } else try stream.advance();
+        } else {
+            if (stream.reader != null) try stream.seek(lower) else {
+                try stream.advance();
+                try stream.seek(lower);
+            }
+        }
         if (stream.doc != null) try queue.push(a, i);
     }
     var next_bounds: u64 = 0;
@@ -256,6 +318,11 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
     while (queue.peek()) |first| {
         try context.check();
         const doc = streams[first].doc.?;
+        if (doc >= range_end) break;
+        var competitive: ?Entry = if (winners.items.len == k) winners.peek() else null;
+        if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "competitiveCutoff")) if (context.competitiveCutoff()) |global| {
+            if (competitive == null or Entry.better({}, global, competitive.?)) competitive = global;
+        };
         if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
             const candidate = try context.nextCandidate(doc);
             if (candidate > doc) {
@@ -273,7 +340,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 continue;
             }
         }
-        if (winners.items.len == k and doc >= next_bounds) {
+        if (competitive != null and doc >= next_bounds) {
             var upper: f32 = 0;
             var end: u32 = std.math.maxInt(u32);
             for (streams) |stream| if (stream.doc != null) {
@@ -281,7 +348,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 end = @min(end, stream.last);
             };
             next_bounds = @as(u64, end) + 1;
-            if (cannotBeat(upper, doc, winners.peek().?)) {
+            if (cannotBeat(upper, doc, competitive.?)) {
                 queue.clearRetainingCapacity();
                 for (streams, 0..) |*stream, i| {
                     try context.check();
@@ -291,7 +358,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 continue;
             }
         }
-        if (winners.items.len == k) {
+        if (competitive != null) {
             // Terms with a later next document cannot contribute in this lead
             // range. Current bounds expire at the earliest block end. Strict
             // pruning and canonical f32 addition preserve signed scores/ties.
@@ -305,7 +372,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                     if (next <= doc) prefix_upper += stream.upper else prefix_end = @min(prefix_end, next);
                 };
             }
-            if (cannotBeat(prefix_upper, doc, winners.peek().?)) {
+            if (cannotBeat(prefix_upper, doc, competitive.?)) {
                 while (queue.peek()) |i| {
                     if (streams[i].doc.? != doc) break;
                     _ = queue.pop();
@@ -347,7 +414,9 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
             _ = winners.pop();
             try winners.push(a, entry);
         }
+        if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "publishCompetitiveCutoff")) if (winners.items.len == k and stats.scored % 128 == 0) context.publishCompetitiveCutoff(winners.peek().?);
     }
+    if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "publishCompetitiveCutoff")) if (winners.items.len == k) context.publishCompetitiveCutoff(winners.peek().?);
     const result = try a.dupe(Entry, winners.items);
     std.mem.sort(Entry, result, {}, Entry.better);
     return result;
@@ -667,4 +736,48 @@ test "sparse exact constant bounds prune equal score losers by ordinal" {
     try std.testing.expectEqual(@as(u32, 0), result[0].doc_num);
     try std.testing.expectEqual(@as(usize, 1), stats.scored);
     try std.testing.expect(stats.skipped_blocks > 0);
+}
+
+test "sparse range planning coalesces coverage skips holes and masks and preserves u32 end" {
+    const a = std.testing.allocator;
+    const high = std.math.maxInt(u32);
+    const streams = [_]Stream{
+        .{ .weight = 1, .ordinal_range = .{ .first = 0, .last = 8191 } },
+        .{ .weight = 1, .ordinal_range = .{ .first = 4096, .last = 8191 } },
+        .{ .weight = 1, .ordinal_range = .{ .first = high - 8191, .last = high } },
+    };
+    const work = try planRanges(a, &streams, 0x1_0000_0000, null, null);
+    defer a.free(work);
+    try std.testing.expectEqual(@as(usize, 4), work.len);
+    try std.testing.expectEqual(@as(u32, 0), work[0].first);
+    try std.testing.expectEqual(@as(u64, 8192), work[1].end);
+    try std.testing.expectEqual(high - 8191, work[2].first);
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), work[3].end);
+    var include = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer include.deinit();
+    try include.addRange(0, 8192);
+    try include.prepareRead();
+    var exclude = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer exclude.deinit();
+    try exclude.addRange(0, 4096);
+    try exclude.prepareRead();
+    const masked = try planRanges(a, &streams, 0x1_0000_0000, &include, &exclude);
+    defer a.free(masked);
+    try std.testing.expectEqualSlices(Range, &.{.{ .first = 4096, .end = 8192 }}, masked);
+    const rare = [_]Stream{.{ .weight = 1, .ordinal_range = .{ .first = high, .last = high } }};
+    const small = try planRanges(a, &rare, 0x1_0000_0000, null, null);
+    defer a.free(small);
+    try std.testing.expectEqual(@as(usize, 0), small.len);
+    const unknown = [_]Stream{.{ .weight = 1 }};
+    const legacy = try planRanges(a, &unknown, 12288, null, null);
+    defer a.free(legacy);
+    try std.testing.expectEqual(@as(usize, 3), legacy.len);
+    const Failure = struct {
+        fn run(alloc: A, input: []const Stream) !void {
+            const ranges = try planRanges(alloc, input, 0x1_0000_0000, null, null);
+            defer alloc.free(ranges);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Failure.run, .{@as([]const Stream, &streams)});
 }

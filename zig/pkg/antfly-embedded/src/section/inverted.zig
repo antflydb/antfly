@@ -3035,7 +3035,7 @@ pub const BlockMaxInfo = struct {
         const min_norm = self.minNormAt(offset);
         if (max_freq == 0) return 0;
         // Use min_norm as doc_len (shortest doc → highest TF component)
-        return scorer.score(max_freq, min_norm);
+        return bm25FrequencyBound(scorer, max_freq, min_norm);
     }
 
     fn maxImpactAtOrdinalWithBoundTable(
@@ -3070,7 +3070,7 @@ pub const BlockMaxInfo = struct {
         for (0..self.chunkCount()) |ordinal| {
             const limits = self.frequencyNormAtOrdinal(ordinal).?;
             if (limits.frequency == 0) continue;
-            maximum = @max(maximum, bm25ScoreWithIdf(limits.frequency, limits.norm, avg_dl, idf, config));
+            maximum = @max(maximum, if (limits.frequency == std.math.maxInt(u32)) BM25TermScorer.init(avg_dl, idf, config).maxScore() else bm25ScoreWithIdf(limits.frequency, limits.norm, avg_dl, idf, config));
         }
         return maximum;
     }
@@ -3078,15 +3078,7 @@ pub const BlockMaxInfo = struct {
     /// Conservative maximum impact over every stored chunk in this postings
     /// list. This supports segment ordering/pruning without decoding postings.
     pub fn maxImpactAll(self: BlockMaxInfo, doc_count: u32, doc_freq: u32, avg_dl: f32, config: BM25Config) f32 {
-        var maximum: f32 = 0;
-        for (0..self.chunkCount()) |ordinal| {
-            const offset = if (self.packed_impact_frequency) ordinal else ordinal * self.recordSize();
-            const max_freq = self.maxFreqAt(offset);
-            const min_norm = self.minNormAt(offset);
-            if (max_freq == 0) continue;
-            maximum = @max(maximum, bm25Score(max_freq, min_norm, doc_count, doc_freq, avg_dl, config));
-        }
-        return maximum;
+        return self.maxImpactAllWithIdf(avg_dl, bm25Idf(doc_count, doc_freq), config);
     }
 };
 
@@ -5286,6 +5278,12 @@ pub const BM25TermScorer = struct {
     }
 };
 
+/// The largest encoded frequency is an escape, rather than 65,535 exact
+/// occurrences. Use the asymptote for all authenticated bound representations.
+fn bm25FrequencyBound(scorer: BM25TermScorer, frequency: u16, norm: u32) f32 {
+    return if (frequency == std.math.maxInt(u16)) scorer.maxScore() else scorer.score(frequency, norm);
+}
+
 pub const bm25_bound_table_frequency_count: usize = 32;
 pub const bm25_bound_table_norm_count: usize = 256;
 
@@ -5301,10 +5299,7 @@ pub const BM25BoundTable = struct {
         for (0..bm25_bound_table_frequency_count) |freq_id| {
             const freq = impactMaxFreqFromPackedId(@intCast(freq_id));
             for (0..bm25_bound_table_norm_count) |norm_id| {
-                const value = scorer.score(
-                    freq,
-                    fieldNormFromId(@intCast(norm_id)),
-                );
+                const value = bm25FrequencyBound(scorer, freq, fieldNormFromId(@intCast(norm_id)));
                 // Pre-bias the IDF-independent component upward so the query
                 // hot path remains one indexed load and one multiply.
                 table.values[freq_id * bm25_bound_table_norm_count + norm_id] =
@@ -7878,6 +7873,12 @@ test "v29 impact frequency escape remains a conservative upper bound" {
         try std.testing.expect(metadata.frequencyNormAtOrdinal(1) == null);
         const upper = metadata.maxImpactAllWithIdf(100, 2, .{});
         try std.testing.expect(upper >= bm25ScoreWithIdf(100000, limits.norm, 100, 2, .{}));
+        for ([_]BM25Config{ .{}, .{ .k1 = 100, .b = 0 } }) |config| {
+            const actual = bm25ScoreWithIdf(100000, limits.norm, 100, 2, config);
+            try std.testing.expect(metadata.maxImpactAtOrdinalWithIdf(0, 100, 2, config) >= actual);
+            const table = BM25BoundTable.init(100, config);
+            try std.testing.expect(table.score(31, 7, 2) >= actual);
+        }
     }
 }
 
@@ -9456,7 +9457,7 @@ pub const ScopedInvertedIndexReader = struct {
         const context = try allocator.create(Context);
         context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
         errdefer context.destroy();
-        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow, .prefetch = if (backing.source == .ranges and backing.source.ranges.prefetch != null) Context.prefetch else null } };
+        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow, .check_read_context = Context.check, .read_io = if (backing.source == .ranges) backing.source.ranges.read_io else null, .prefetch = if (backing.source == .ranges and backing.source.ranges.prefetch != null) Context.prefetch else null } };
         if (options.concurrent) {
             context.shared_cache = try @import("../segment_source.zig").ConcurrentBlockCache.init(options.cache_allocator orelse allocator, source, options.cache_bytes);
             try context.shared_cache.?.preallocate();
@@ -9798,6 +9799,11 @@ pub const ScopedInvertedIndexReader = struct {
         fn release(ptr: *anyopaque) void {
             const self: *Context = @ptrCast(@alignCast(ptr));
             if (self.references.fetchSub(1, .acq_rel) == 1) self.destroy();
+        }
+
+        fn check(ptr: *anyopaque) !void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            if (self.view.source == .ranges) if (self.view.source.ranges.check_read_context) |check_context| try check_context(self.view.source.ranges.ptr);
         }
 
         fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {

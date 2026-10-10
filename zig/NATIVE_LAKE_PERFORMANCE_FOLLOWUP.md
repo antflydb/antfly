@@ -1202,3 +1202,98 @@ Zig 0.17.0.
 Representative 50-million-row cold/warm throughput and peak process RSS remain
 unmeasured. No archive speedup is inferred from these work-count regressions or
 the fixture's total runtime.
+
+## Saturated bounds, concurrent fills, reusable summaries and broader scheduling
+
+Saturated impact frequencies are now treated consistently as an open-ended
+frequency bound. Scalar block ceilings, whole-term ceilings and precomputed
+packed-frequency tables use the BM25 asymptote for the escape value. A mixed-field
+`k=1` regression retains a later 100,000-frequency winner over an earlier
+80,000-frequency document under both default and custom supported BM25 settings.
+The previous block ceiling could discard that winner despite the correct segment
+and phrase bounds.
+
+Concurrent native caches now have four bounded fill flights alongside four hot
+slabs. Independent cold blocks read concurrently; requests for the same block
+wait for the active fill and recheck the hot cache. Backend I/O runs outside the
+allocator and hot-cache locks. Query-bound waiters use cancellation-aware I/O
+conditions, with a yielding fallback for sources without an I/O runtime. A failed
+or canceled fill releases its flight without publishing partial bytes. Active
+flights prevent pressure reclamation of their slabs. Cache budgets include all
+eight slabs; prepared field readers reserve 512 KiB to retain the 64 KiB grain.
+Reader adapters forward the I/O runtime and current read-context check through
+cache layers. Threaded regressions check overlapping physical reads, one read for
+a duplicate block, failed-fill retry, cancellation of a duplicate waiter and
+bounded retained storage.
+
+Immutable snapshots now retain scalar term summaries across query facades for
+the exact same corpus. A summary records segment-local document frequency and an
+IDF-independent TF ceiling, keyed by segment, exact field/term bytes, average
+field length and BM25 configuration. The cache admits at most 4,096 entries and
+256 KiB of owned key bytes, with bounded eviction. It stores no readers, query
+capabilities, borrowed navigation or decoders. Hits check the current facade's
+read authority, and a changed corpus starts a separate cache. Query IDF and boost
+are applied when composing term and phrase ceilings.
+
+Fragmented metadata planning now builds only summary-based clause trees. It does
+not populate or churn the four-entry full-reader cache. Full prepared readers are
+created only after a range survives its scalar segment ceiling. The 20-segment
+positional fixture therefore prepares one full reader for its competitive
+segment, rather than preparing all 20 before pruning 19. Subsequent queries reuse
+all 60 cached term summaries, including different outer boosts. Metadata planning
+continues to use bounded shared-scheduler lanes and conservative cap fallback.
+
+Remote simple Boolean queries and default-boost standalone terms/matches now use
+the shared bounded text scheduler ahead of their serial fast paths. The existing
+simple clause lowering preserves score arithmetic; unsupported shapes and small
+or unbound snapshots retain their established execution. Differential tests
+compare real public dispatch against a serial facade over the same immutable
+bytes, alongside the existing cursor, filter and signed-score coverage.
+
+Native sparse DAAT scoring now supports disjoint document ranges on the shared
+scheduler. Authenticated routing intervals are coalesced before partitioning, so
+holes and rare postings do not schedule an archive-sized ordinal domain. Only
+streams whose proved interval intersects a range are opened there. Legacy streams
+without interval proofs retain a conservative domain. Small covered domains and
+selective ordinal masks keep serial scoring.
+
+Each sparse lane owns an independent fork of the exact pinned read transaction,
+visibility/incarnation caches, decoder buffers and adaptive ordinal windows.
+Initial immutable masks are borrowed from the coordinator rather than translated
+again per lane. Adaptive provider callbacks are serialized, while physical page
+reads and scoring proceed independently. A document and all of its contributions
+belong to one range, retaining canonical signed f32 addition order. Lanes publish
+monotone competitive cutoffs and merge bounded heaps. Up to four 16 MiB lanes
+share a 64 MiB operator allowance, separate from request routing/results and the
+existing serial fallback. Required work runs inline under scheduler saturation.
+Explicit lane/page caps discard the entire parallel attempt and rerun the exact
+serial/spill path without a discarded cutoff; ordinary errors propagate after
+all tasks join. Regressions cover signed/zero weights, deletes, residual filters,
+forced one-byte lane caps and provider errors.
+
+These changes preserve query syntax, artifact formats, snapshot/cursor identity
+and result-size limits. Representative archive-scale cold/warm throughput and
+peak process RSS still require measurement; unit work counts and E2E runtime do
+not establish an archive speedup.
+
+Qualification for these refinements with Zig 0.17.0:
+
+- Debug: 399 bounded-reader, 70 sparse, 31 focused text/scorer and seven API
+  checks passed (507 total), with no failures or leaks. The two optimized-only
+  benchmark runs were skipped.
+- ReleaseFast: 400 bounded-reader, 70 sparse, 32 focused text/scorer and seven
+  API checks passed (509 total), with no failures or leaks.
+- Sparse range planning verifies coalesced coverage, skipped ordinal holes,
+  complete include/exclude masks, the exclusive `2^32` endpoint, conservative
+  legacy coverage and allocation-failure cleanup. Parallel differential checks
+  retain exact score bits and IDs under signed/zero weights and forced caps.
+- The production Debug server build, generated storage-catalog equality, Zig
+  formatting and `git diff --check` passed.
+- `origin/main` at `551b8b3895` is included; the latest fetch required no merge
+  changes or conflict resolution.
+- All four real-data E2Es passed against the rebuilt server in 178.68 seconds:
+  independently written Iceberg snapshots/schema IDs/partitions/deletes/restart;
+  70,003-row Parquet and Iceberg indexed conjunctions, includes/exclusions,
+  signed/zero sparse ranking, positional filters, sorted cursor pages and
+  persistence; quantized sparse score/ranking preservation. The entire
+  `e2e-full` suite was not run; the Iceberg fixtures remain registered there.

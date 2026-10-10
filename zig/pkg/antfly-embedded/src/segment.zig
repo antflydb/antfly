@@ -9852,3 +9852,65 @@ test "stored identity streaming bounds scratch for large IDs and skips deleted r
     try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
     try std.testing.expectError(error.InvalidSegment, appendStoredIdentityRange(&sink, .{ .reader = &reader }, 1, 1, &scratch));
 }
+
+test "native concurrent cache overlaps cold fills deduplicates blocks and releases failed flights" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const Cache = @import("segment_source.zig").ConcurrentBlockCache;
+    const State = struct {
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        gate: std.Io.Event = .unset,
+        fail: std.atomic.Value(bool) = .init(false),
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            _ = state.calls.fetchAdd(1, .monotonic);
+            const active = state.active.fetchAdd(1, .monotonic) + 1;
+            defer _ = state.active.fetchSub(1, .monotonic);
+            _ = state.peak.fetchMax(active, .monotonic);
+            if (offset == 262144) try state.gate.wait(state.io);
+            try std.Io.sleep(state.io, .fromMilliseconds(30), .awake);
+            if (state.fail.load(.monotonic)) return error.TestReadFailure;
+            for (out, 0..) |*byte, i| byte.* = @truncate(offset + i);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Read = struct {
+        fn run(cache: *Cache, offset: u64) anyerror!void {
+            var out: [16]u8 = undefined;
+            try cache.readInto(offset, &out);
+            for (out, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(offset + i)), byte);
+        }
+    };
+    var state: State = .{ .io = threaded.io() };
+    var cache = try Cache.init(a, .{ .ranges = .{ .ptr = &state, .length = 1024 * 1024, .read_into = State.read, .close = State.close, .read_io = threaded.io() } }, 512 * 1024);
+    defer cache.deinit();
+    try cache.preallocate();
+    var tasks: [4]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.cancel(threaded.io()) catch {};
+    for ([_]u64{ 0, 65536, 131072, 65536 }, &tasks) |offset, *task| {
+        task.* = try threaded.io().concurrent(Read.run, .{ &cache, offset });
+        started += 1;
+    }
+    for (&tasks) |*task| try task.await(threaded.io());
+    started = 0;
+    try std.testing.expectEqual(@as(usize, 3), state.calls.load(.monotonic));
+    try std.testing.expect(state.peak.load(.monotonic) >= 2);
+    try std.testing.expect(cache.retainedBytes() <= 512 * 1024);
+    state.fail.store(true, .monotonic);
+    try std.testing.expectError(error.TestReadFailure, Read.run(&cache, 196608));
+    state.fail.store(false, .monotonic);
+    try Read.run(&cache, 196608);
+    var filling = try threaded.io().concurrent(Read.run, .{ &cache, @as(u64, 262144) });
+    defer filling.cancel(threaded.io()) catch {};
+    while (state.active.load(.monotonic) == 0) try std.Io.sleep(threaded.io(), .fromMilliseconds(1), .awake);
+    var waiting = try threaded.io().concurrent(Read.run, .{ &cache, @as(u64, 262144) });
+    try std.testing.expectError(error.Canceled, waiting.cancel(threaded.io()));
+    state.gate.set(threaded.io());
+    try filling.await(threaded.io());
+    for (cache.flights) |flight| try std.testing.expect(!flight.active);
+}

@@ -239,6 +239,7 @@ const AdaptiveOrdinalConstraints = struct {
     include: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
     exclude: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
     resolved: bool = false,
+    borrowed: bool = false,
     budget: ?*@import("ordinal_lookup.zig").MaskBudget = null,
     deferred: bool = false,
     window: ?std.heap.ArenaAllocator = null,
@@ -266,9 +267,12 @@ const AdaptiveOrdinalConstraints = struct {
         if (self.probes > 16) try self.ensureRange(doc);
     }
     fn clear(self: *@This()) void {
-        if (self.include) |*bitmap| bitmap.deinit();
-        if (self.exclude) |*bitmap| bitmap.deinit();
-        if (self.budget) |budget| budget.destroy();
+        if (!self.borrowed) {
+            if (self.include) |*bitmap| bitmap.deinit();
+            if (self.exclude) |*bitmap| bitmap.deinit();
+            if (self.budget) |budget| budget.destroy();
+        }
+        self.borrowed = false;
         if (self.range) |*selection| selection.deinit();
         self.range = null;
     }
@@ -344,9 +348,29 @@ const AdaptiveOrdinalConstraints = struct {
     }
 };
 
+const SparseCompetitiveCutoff = struct {
+    value: std.atomic.Value(u64) = .init((@as(u64, @as(u32, @bitCast(-std.math.inf(f32)))) << 32) | std.math.maxInt(u32)),
+    fn get(self: *@This()) ?daat.Entry {
+        const bits = self.value.load(.acquire);
+        const entry: daat.Entry = .{ .doc_num = @truncate(bits), .score = @bitCast(@as(u32, @truncate(bits >> 32))) };
+        return if (std.math.isFinite(entry.score)) entry else null;
+    }
+    fn publish(self: *@This(), entry: daat.Entry) void {
+        var prior = self.value.load(.monotonic);
+        while (true) {
+            const old: daat.Entry = .{ .doc_num = @truncate(prior), .score = @bitCast(@as(u32, @truncate(prior >> 32))) };
+            if (!daat.Entry.better({}, entry, old)) return;
+            const next = (@as(u64, @as(u32, @bitCast(entry.score))) << 32) | entry.doc_num;
+            prior = self.value.cmpxchgWeak(prior, next, .release, .monotonic) orelse return;
+        }
+    }
+};
+
 pub const SearchConstraints = struct {
     score_spill: ?@import("../spill_sort.zig").Options = null,
     max_score_docs: usize = 65536,
+    parallel_workspace_bytes: usize = 16 * 1024 * 1024,
+    parallel_tasks: ?*u64 = null,
     key_predicate: ?KeyPredicate = null,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
@@ -1812,7 +1836,7 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
                             continue;
                         };
                         if (streams.items.len == max_streams) return null;
-                        try streams.append(a, .{ .weight = weight, .query_order = query_order, .segment = id, .version = SEGMENT_FORMAT_VERSION, .term = term, .reader = page_reader.interface(), .allocator = a });
+                        try streams.append(a, .{ .weight = weight, .query_order = query_order, .segment = id, .version = SEGMENT_FORMAT_VERSION, .term = term, .reader = page_reader.interface(), .allocator = a, .ordinal_range = .{ .first = lower, .last = upper } });
                     } else {
                         if (route.value.len != 0) return error.InvalidSparseSegment;
                         var root_key: [16]u8 = undefined;
@@ -4929,6 +4953,14 @@ pub const SparseIndex = struct {
             index: *SparseIndex,
             decisions: *Decisions,
 
+            shared_cutoff: ?*SparseCompetitiveCutoff = null,
+            pub fn competitiveCutoff(ctx: *@This()) ?daat.Entry {
+                return if (ctx.shared_cutoff) |cutoff| cutoff.get() else null;
+            }
+            pub fn publishCompetitiveCutoff(ctx: *@This(), entry: daat.Entry) void {
+                if (ctx.shared_cutoff) |cutoff| cutoff.publish(entry);
+            }
+
             pub fn check(ctx: *@This()) !void {
                 try checkSearchCancellation(ctx.cancellation);
             }
@@ -5042,6 +5074,167 @@ pub const SparseIndex = struct {
             }
         };
 
+        const Parallel = struct {
+            const scheduler = @import("../sql/parallel_scheduler.zig");
+            io: std.Io,
+            parent: *backend_erased.ReadTxn,
+            base: AccumulateContext,
+            input: []const daat.Stream,
+            span: u64,
+            work: []const daat.Range = &.{},
+            k: u32,
+            workspace: usize,
+            a: Allocator,
+            winners: std.PriorityQueue(daat.Entry, void, daat.Entry.worse) = .initContext({}),
+            mutex: std.Io.Mutex = .init,
+            next: std.atomic.Value(usize) = .init(0),
+            capped: std.atomic.Value(bool) = .init(false),
+            cutoff: SparseCompetitiveCutoff = .{},
+            scored: usize = 0,
+            fn predicate(lane_self: *@This()) ?KeyPredicate {
+                const original = lane_self.base.key_predicate orelse return null;
+                return .{ .ptr = lane_self, .allows = allows, .select_constraints = if (original.select_constraints != null) select else null, .select_ordinals = if (original.select_ordinals != null) selectOrdinals else null, .select_range = if (original.select_range != null) selectRange else null, .constraint_revision = if (original.constraint_revision != null) revision else null };
+            }
+            fn allows(raw: *anyopaque, key: []const u8) !bool {
+                const lane_self: *@This() = @ptrCast(@alignCast(raw));
+                try lane_self.mutex.lock(lane_self.io);
+                defer lane_self.mutex.unlock(lane_self.io);
+                const original = lane_self.base.key_predicate.?;
+                return original.allows(original.ptr, key);
+            }
+            fn select(raw: *anyopaque, a: Allocator, lane_lookup: OrdinalLookup) !?@import("ordinal_lookup.zig").Selection {
+                const lane_self: *@This() = @ptrCast(@alignCast(raw));
+                try lane_self.mutex.lock(lane_self.io);
+                defer lane_self.mutex.unlock(lane_self.io);
+                const original = lane_self.base.key_predicate.?;
+                return original.select_constraints.?(original.ptr, a, lane_lookup);
+            }
+            fn selectOrdinals(raw: *anyopaque, a: Allocator, lane_lookup: OrdinalLookup) !?@import("../encoding/roaring.zig").RoaringBitmap {
+                const lane_self: *@This() = @ptrCast(@alignCast(raw));
+                try lane_self.mutex.lock(lane_self.io);
+                defer lane_self.mutex.unlock(lane_self.io);
+                const original = lane_self.base.key_predicate.?;
+                return original.select_ordinals.?(original.ptr, a, lane_lookup);
+            }
+            fn selectRange(raw: *anyopaque, a: Allocator, lane_lookup: OrdinalLookup, first: u32, last: u32) !?@import("ordinal_lookup.zig").Selection {
+                const lane_self: *@This() = @ptrCast(@alignCast(raw));
+                try lane_self.mutex.lock(lane_self.io);
+                defer lane_self.mutex.unlock(lane_self.io);
+                const original = lane_self.base.key_predicate.?;
+                return original.select_range.?(original.ptr, a, lane_lookup, first, last);
+            }
+            fn revision(raw: *anyopaque) u64 {
+                const lane_self: *@This() = @ptrCast(@alignCast(raw));
+                lane_self.mutex.lockUncancelable(lane_self.io);
+                defer lane_self.mutex.unlock(lane_self.io);
+                const original = lane_self.base.key_predicate.?;
+                return original.constraint_revision.?(original.ptr);
+            }
+            fn run(lane_self: *@This()) anyerror!void {
+                var budget: @import("ordinal_lookup.zig").MaskBudget = .{ .backing = std.heap.page_allocator, .limit = lane_self.workspace };
+                lane_self.runBounded(budget.allocator()) catch |err| {
+                    if ((err == error.OutOfMemory and budget.exhausted) or err == error.ResourceBudgetExceeded) {
+                        lane_self.capped.store(true, .release);
+                        return;
+                    }
+                    return err;
+                };
+            }
+            fn runBounded(lane_self: *@This(), a: Allocator) !void {
+                try lane_self.mutex.lock(lane_self.io);
+                var lane_txn = lane_self.parent.vtable.fork_read.?(a, lane_self.parent.ptr) catch |err| {
+                    lane_self.mutex.unlock(lane_self.io);
+                    return err;
+                };
+                lane_self.mutex.unlock(lane_self.io);
+                defer lane_txn.abort();
+                var reader: PageReader = .{ .txn = &lane_txn, .budget = lane_self.workspace / 2 };
+                defer reader.deinit();
+                var lane_visibility = try VisibilityReader.init(&lane_txn);
+                defer lane_visibility.deinit();
+                var lane_incarnations: IncarnationCache = .{};
+                defer lane_incarnations.deinit(a);
+                var lane_decisions: Decisions = .{ .complete = true };
+                defer if (lane_decisions.identities) |*cursor| cursor.close();
+                var lane_lookup: Lookup = .{ .index = lane_self.base.index, .txn = &lane_txn, .cancellation = lane_self.base.cancellation };
+                var ordinals: AdaptiveOrdinalConstraints = .{
+                    .a = a,
+                    .predicate = lane_self.predicate(),
+                    .lookup = .{ .ptr = &lane_lookup, .one = Lookup.lookup, .block = Lookup.block, .bounded_block = Lookup.boundedBlock, .native_range = Lookup.nativeRange },
+                    .include = lane_self.base.ordinals.include,
+                    .exclude = lane_self.base.ordinals.exclude,
+                    .resolved = lane_self.base.ordinals.resolved,
+                    .deferred = lane_self.base.ordinals.deferred,
+                    .revision = lane_self.base.ordinals.revision,
+                    .borrowed = true,
+                };
+                defer ordinals.deinit();
+                var lane_context = lane_self.base;
+                lane_context.alloc = a;
+                lane_context.txn = &lane_txn;
+                lane_context.incarnations = &lane_incarnations;
+                lane_context.visibility = &lane_visibility;
+                lane_context.ordinals = &ordinals;
+                lane_context.decisions = &lane_decisions;
+                lane_context.key_predicate = lane_self.predicate();
+                lane_context.profile = null;
+                lane_context.shared_cutoff = &lane_self.cutoff;
+                const streams = try a.alloc(daat.Stream, lane_self.input.len);
+                defer a.free(streams);
+                while (!lane_self.capped.load(.acquire)) {
+                    const work_index = lane_self.next.fetchAdd(1, .monotonic);
+                    if (work_index >= lane_self.work.len) return;
+                    const range = lane_self.work[work_index];
+                    var active: usize = 0;
+                    for (lane_self.input) |input| {
+                        if (input.ordinal_range) |bounds| if (bounds.first >= range.end or bounds.last < range.first) continue;
+                        const stream = &streams[active];
+                        stream.* = input;
+                        stream.allocator = a;
+                        if (stream.reader != null) stream.reader = reader.interface();
+                        active += 1;
+                    }
+                    var lane_stats: daat.Stats = .{};
+                    const result = daat.collectRange(a, streams[0..active], lane_self.k, &lane_context, &lane_stats, range.first, range.end) catch |err| {
+                        for (streams[0..active]) |*stream| stream.deinit();
+                        return err;
+                    };
+                    defer a.free(result);
+                    for (streams[0..active]) |*stream| stream.deinit();
+                    try lane_self.mutex.lock(lane_self.io);
+                    defer lane_self.mutex.unlock(lane_self.io);
+                    lane_self.scored += lane_stats.scored;
+                    for (result) |entry| {
+                        if (lane_self.winners.items.len < lane_self.k) try lane_self.winners.push(lane_self.a, entry) else if (daat.Entry.better({}, entry, lane_self.winners.peek().?)) {
+                            _ = lane_self.winners.pop();
+                            try lane_self.winners.push(lane_self.a, entry);
+                        }
+                    }
+                }
+            }
+            fn execute(lane_self: *@This(), tasks_count: ?*u64) !?[]ScoreEntry {
+                defer lane_self.winners.deinit(lane_self.a);
+                const work = try daat.planRanges(lane_self.a, lane_self.input, lane_self.span, if (lane_self.base.ordinals.include) |*bitmap| bitmap else null, if (lane_self.base.ordinals.exclude) |*bitmap| bitmap else null);
+                defer lane_self.a.free(work);
+                lane_self.work = work;
+                const lanes = @min(4, scheduler.global().fanout(work.len, 64 * 1024 * 1024, lane_self.workspace));
+                if (lanes < 2) return null;
+                try lane_self.winners.ensureTotalCapacity(lane_self.a, lane_self.k);
+                var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
+                defer for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) task.cancel(lane_self.io) catch {};
+                var submitted: u64 = 0;
+                for (tasks[0 .. lanes - 1]) |*slot| {
+                    slot.* = scheduler.global().submit(lane_self.io, lane_self.workspace, run, .{lane_self});
+                    if (slot.* == null) try lane_self.run() else submitted += 1;
+                }
+                try lane_self.run();
+                for (&tasks) |*slot| if (slot.*) |*task| try task.await(lane_self.io);
+                if (tasks_count) |count| count.* += submitted;
+                if (lane_self.capped.load(.acquire)) return null;
+                return try lane_self.a.dupe(ScoreEntry, lane_self.winners.items);
+            }
+        };
+
         var page_reader: PageReader = .{ .txn = &txn, .io = if (constraints.score_spill) |options| options.io else null };
         defer page_reader.deinit();
         var fast_entries: ?[]ScoreEntry = null;
@@ -5072,7 +5265,17 @@ pub const SparseIndex = struct {
                     .decisions = &decisions,
                 };
                 var scoring_stats: daat.Stats = .{};
-                fast_entries = daat.collect(alloc, input, k, &context, &scoring_stats) catch |err| switch (err) {
+                const span_data = txn.get(metaKey(meta_next_doc_num)) catch |err| switch (err) {
+                    error.NotFound => &.{},
+                    else => return err,
+                };
+                const span: u64 = if (span_data.len == 8) std.mem.readInt(u64, span_data[0..8], .little) else 0;
+                if (page_reader.io != null and txn.vtable.fork_read != null and span >= 8192 and span <= 0x1_0000_0000 and k != 0 and (ordinal_state.include == null or ordinal_state.include.?.cardinality() >= 8192)) {
+                    var parallel: Parallel = .{ .io = page_reader.io.?, .parent = &txn, .base = context, .input = input, .span = span, .k = k, .workspace = constraints.parallel_workspace_bytes, .a = alloc };
+                    fast_entries = try parallel.execute(constraints.parallel_tasks);
+                    if (fast_entries != null) scoring_stats.scored = parallel.scored;
+                }
+                if (fast_entries == null) fast_entries = daat.collect(alloc, input, k, &context, &scoring_stats) catch |err| switch (err) {
                     // Page sizes are learned lazily. A query exceeding the live
                     // block budget retries through the existing bounded spill
                     // collector after every admitted stream is released.
@@ -8438,4 +8641,59 @@ test "sparse planning caps do not hide backing allocation failures after optiona
     try std.testing.expect(!budget.exhausted);
     try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 32));
     try std.testing.expect(budget.exhausted);
+}
+
+test "sparse shared parallel ranges preserve signed canonical scores filters and cap fallback" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "parallel-ordinals");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 64 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 12288);
+    for (writes, 0..) |*write, i| {
+        const values = try ca.alloc(f32, 3);
+        values[0] = @floatFromInt(i % 97 + 1);
+        values[1] = @floatFromInt(i % 31 + 1);
+        values[2] = @floatFromInt(i % 7 + 1);
+        write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{ 1, 2, 3 }, .values = values } };
+    }
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try idx.batch(&.{}, &.{writes[12287].doc_id});
+    const Predicate = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const state: *@This() = @ptrCast(@alignCast(raw));
+            state.calls += 1;
+            if (state.fail) return error.TestPredicateFailed;
+            return (try std.fmt.parseInt(usize, key[4..], 10)) % 3 != 0;
+        }
+    };
+    for ([_][3]f32{ .{ 1, -2, 0 }, .{ -1, 0.25, 2 }, .{ 0, 0, 0 } }) |weights| {
+        const query: SparseVector = .{ .indices = &.{ 1, 2, 3 }, .values = &weights };
+        var predicate: Predicate = .{};
+        const key_predicate: KeyPredicate = .{ .ptr = &predicate, .allows = Predicate.allows };
+        const expected = try idx.searchConstrained(a, &query, 17, .{ .key_predicate = key_predicate });
+        defer SparseIndex.freeResults(a, expected);
+        for ([_]usize{ 16 * 1024 * 1024, 1 }) |limit| {
+            var tasks: u64 = 0;
+            const actual = try idx.searchConstrained(a, &query, 17, .{ .key_predicate = key_predicate, .score_spill = .{ .io = threaded.io(), .directory = "/tmp", .chunk_records = 32, .chunk_bytes = 1024 }, .parallel_tasks = &tasks, .parallel_workspace_bytes = limit });
+            defer SparseIndex.freeResults(a, actual);
+            try std.testing.expect(tasks > 0);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |reference, hit| {
+                try std.testing.expectEqualStrings(reference.doc_id, hit.doc_id);
+                try std.testing.expectEqual(reference.score, hit.score);
+            }
+        }
+    }
+    var predicate: Predicate = .{ .fail = true };
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    try std.testing.expectError(error.TestPredicateFailed, idx.searchConstrained(a, &query, 17, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows }, .score_spill = .{ .io = threaded.io(), .directory = "/tmp" } }));
 }
