@@ -229,6 +229,36 @@ test "system catalog relation namespace transaction occupancy adoption rejects l
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = start }));
     try std.testing.expectEqual(prior_revision, try store.standaloneRevision());
     try std.testing.expect(std.meta.eql(observed, try store.relationReconciliationWork(group)));
+    const meta = try store.systemCatalogMeta(a, group);
+    const named: SystemCatalogCommand = .{
+        .version = 2,
+        .expected_revision = meta.revision,
+        .mutation = .{ .action = .create, .kind = .table, .name = "t", .table_id = 7, .storage_name = "table:7" },
+        .topology = .{ .create = .{ .expected_transition_generation = 0, .table = .{ .table_id = 7, .name = "table:7", .schema_json = "{}" }, .ranges = &.{} } },
+        .constraint_name_admission = .{ .namespace_id = system_catalog.default_namespace_id, .names = &.{.{ .name = "t_pkey", .kind = .primary }} },
+    };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.prepareSystemCatalogResult(a, group, named));
+    const named_bytes = try std.json.Stringify.valueAlloc(a, named, .{});
+    defer a.free(named_bytes);
+    try store.applyStandaloneCommand(group, .{ .apply_system_catalog = named_bytes });
+    try std.testing.expect(std.meta.eql(meta, try store.systemCatalogMeta(a, group)));
+    try std.testing.expect(std.meta.eql(observed, try store.relationReconciliationWork(group)));
+}
+
+test "system catalog relation namespace transaction legacy request and command wire omit future naming fields" {
+    const a = std.testing.allocator;
+    const request: system_catalog.Request = .{ .mutation = .{ .action = .create, .kind = .database, .name = "legacy" } };
+    const actual_request = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(actual_request);
+    const old_request = try std.json.Stringify.valueAlloc(a, .{ .mutation = request.mutation, .create_table_json = request.create_table_json, .physical_name = request.physical_name }, .{});
+    defer a.free(old_request);
+    try std.testing.expectEqualStrings(old_request, actual_request);
+    const command: SystemCatalogCommand = .{ .expected_revision = 0, .mutation = request.mutation };
+    const actual_command = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(actual_command);
+    const old_command = try std.json.Stringify.valueAlloc(a, .{ .version = command.version, .expected_revision = command.expected_revision, .mutation = command.mutation, .topology = command.topology, .placement_update = command.placement_update }, .{});
+    defer a.free(old_command);
+    try std.testing.expectEqualStrings(old_command, actual_command);
 }
 
 test "system catalog relation namespace transaction occupancy follows native writes checkpoint and restart" {
@@ -274,6 +304,47 @@ test "system catalog relation namespace transaction occupancy follows native wri
         defer reopened.deinit();
         try T.verify(&reopened);
     }
+}
+
+test "system catalog relation namespace transaction prepared names pin native coverage and observe later conflicts" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-names", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    const schema = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"id\"}}]}";
+    const initial_meta = try store.systemCatalogMeta(a, group);
+    try std.testing.expectError(error.CatalogOccupancyNotReady, store.prepareGeneratedConstraintNames(a, group, initial_meta.revision, system_catalog.default_namespace_id, "t", schema, &.{"anonymous"}, .{}));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "t_id_check", .schema_json = "{\"version\":1}" } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "holder", .schema_json = "{\"version\":1}" } });
+    try adoptRelationWriterForTest(&store, a, group);
+    _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+    const meta = try store.systemCatalogMeta(a, group);
+    var selected = try store.prepareGeneratedConstraintNames(a, group, meta.revision, system_catalog.default_namespace_id, "t", schema, &.{"anonymous"}, .{});
+    defer selected.deinit();
+    try std.testing.expectEqualStrings("t_id_check", selected.admission.names[0].name);
+    try selected.admission.validateSchema(a, selected.schema_json);
+    const explicit_collision = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"email\"}}],\"unique_constraints\":[{\"name\":\"t_id_check\",\"columns\":[\"id\"]}]}";
+    try std.testing.expectError(error.SqlIndexAlreadyExists, store.prepareGeneratedConstraintNames(a, group, meta.revision, system_catalog.default_namespace_id, "t", explicit_collision, &.{"anonymous"}, .{}));
+    try std.testing.expectError(error.CatalogGenerationChanged, store.prepareGeneratedConstraintNames(a, group, meta.revision + 1, system_catalog.default_namespace_id, "t", schema, &.{"anonymous"}, .{}));
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "holder", .schema_json = "{\"version\":2,\"checks\":[{\"name\":\"t_id_check\"},{\"name\":\"only_member\"}]}" } });
+    // Schema-only changes need not advance the ordinary catalog revision.
+    // A selected-name predicate must use the current native root at commit.
+    try std.testing.expectEqual(meta.revision, (try store.systemCatalogMeta(a, group)).revision);
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+    try std.testing.expect(try live.nameOccupied(system_catalog.default_namespace_id, selected.admission.names[0].name, false));
+    var retried = try store.prepareGeneratedConstraintNames(a, group, meta.revision, system_catalog.default_namespace_id, "t", schema, &.{"anonymous"}, .{});
+    defer retried.deinit();
+    try std.testing.expectEqualStrings("t_id_check1", retried.admission.names[0].name);
+    const allowed_explicit = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"email\"}}],\"unique_constraints\":[{\"name\":\"only_member\",\"columns\":[\"id\"]}]}";
+    var explicit = try store.prepareGeneratedConstraintNames(a, group, meta.revision, system_catalog.default_namespace_id, "t", allowed_explicit, &.{"anonymous"}, .{});
+    defer explicit.deinit();
 }
 
 test "system catalog relation namespace transaction bulk resolution requires a live root and follows schema ownership" {
@@ -14121,6 +14192,7 @@ pub const RaftApplyStore = struct {
         if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
             const view: system_catalog_storage.View = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta };
             const namespace = try view.namespaceFor(request.database, request.namespace);
+            result.namespace_id = namespace.id;
             const explicit = if (request.tablespace) |name| ((try view.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (try view.effectiveTablespace(namespace, explicit)) |space| result.placement_policy = space.placement_policy;
         }
@@ -14131,6 +14203,53 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return system_catalog_storage.readMeta(alloc, &txn, group_id);
+    }
+
+    pub fn prepareGeneratedConstraintNames(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, expected_revision: u64, namespace_id: u64, logical_name: []const u8, schema_json: []const u8, generated: []const []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !relation_names.constraint_naming.Plan {
+        try context.ensureActive();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
+        if (meta.revision != expected_revision) return error.CatalogGenerationChanged;
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) orelse return error.CatalogOccupancyNotReady;
+        if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+        const Namespace = struct {
+            live: *relation_reconciliation.LiveStore(docstore.DocStore.Txn),
+            id: u64,
+            context: @import("antfly_local_sources").api_operation.RequestContext,
+            pub fn checkpoint(self_ns: *@This()) !void {
+                try self_ns.context.ensureActive();
+            }
+            pub fn occupied(self_ns: *@This(), label: []const u8, kind: relation_names.constraint_naming.Kind) !bool {
+                try self_ns.checkpoint();
+                return self_ns.live.nameOccupied(self_ns.id, label, kind.includesRelationNames());
+            }
+            pub fn relationOccupied(self_ns: *@This(), label: []const u8) !bool {
+                try self_ns.checkpoint();
+                const entry = (try self_ns.live.getEntry(.{ .namespace_id = self_ns.id, .name = label })) orelse return false;
+                if (entry.empty()) return error.InvalidCatalogRecord;
+                return true;
+            }
+        };
+        var namespace: Namespace = .{ .live = &live, .id = namespace_id, .context = context };
+        return relation_names.constraint_naming.Plan.prepare(alloc, logical_name, namespace_id, schema_json, generated, &namespace, 8192);
+    }
+
+    fn validateGeneratedConstraintNamesTxn(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: SystemCatalogCommand, meta: system_catalog_storage.Meta) !void {
+        const admission = command.constraint_name_admission orelse {
+            if (command.version != 1) return error.InvalidCatalogMutation;
+            return;
+        };
+        if (command.version != 2 or command.mutation.kind != .table or command.mutation.action != .create) return error.InvalidCatalogMutation;
+        const topology = command.topology orelse return error.InvalidCatalogMutation;
+        if (topology != .create) return error.InvalidCatalogMutation;
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.constraint_occupancy_version);
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta };
+        const namespace = try view.namespaceFor(command.mutation.database, command.mutation.namespace);
+        if (admission.namespace_id != namespace.id) return error.InvalidCatalogRecord;
+        try admission.validateSchema(a, topology.create.table.schema_json);
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogOccupancyNotReady;
+        for (admission.names) |name| if (try live.nameOccupied(namespace.id, name.name, name.kind.includesRelationNames())) return error.CatalogGenerationChanged;
     }
 
     pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: SystemCatalogCommand) !void {
@@ -14156,6 +14275,7 @@ pub const RaftApplyStore = struct {
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
         if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
+        try self.validateGeneratedConstraintNamesTxn(a, &txn, group_id, command, meta);
         const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
         try validateCatalogTopology(command);
         var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
@@ -14358,12 +14478,16 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(SystemCatalogCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const command = parsed.value;
-        if (command.version != 1) return error.InvalidCatalogMutation;
+        if (command.version != 1 and command.version != 2) return error.InvalidCatalogMutation;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const meta = try system_catalog_storage.readMeta(a, txn, group_id);
         if (meta.revision != command.expected_revision) return;
+        self.validateGeneratedConstraintNamesTxn(a, txn, group_id, command, meta) catch |err| switch (err) {
+            error.CatalogGenerationChanged, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired => return,
+            else => return err, // Storage/corruption failures must abort.
+        };
         if (command.mutation.kind == .table and command.mutation.action == .create) {
             const namespace = if (std.mem.eql(u8, command.mutation.namespace, system_catalog.default_namespace_name) and
                 std.mem.eql(u8, command.mutation.database, system_catalog.default_database_name))

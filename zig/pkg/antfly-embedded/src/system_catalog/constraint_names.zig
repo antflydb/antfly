@@ -159,10 +159,311 @@ pub fn choose(alloc: std.mem.Allocator, candidate: *const Candidate, namespace: 
     return error.ProgramLimitExceeded;
 }
 
+pub const Selected = struct { name: []const u8, kind: Kind };
+
+/// Selected-name predicates are rechecked against the current covered root in
+/// the caller's atomic transaction, not against an unrelated catalog revision.
+pub const Admission = struct {
+    namespace_id: u64,
+    names: []const Selected,
+
+    pub fn dupe(self: Admission, a: std.mem.Allocator) !Admission {
+        const result = try a.alloc(Selected, self.names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |entry| a.free(entry.name);
+            a.free(result);
+        }
+        for (self.names, result) |entry, *copy| {
+            copy.* = .{ .name = try a.dupe(u8, entry.name), .kind = entry.kind };
+            initialized += 1;
+        }
+        return .{ .namespace_id = self.namespace_id, .names = result };
+    }
+
+    /// Match each predicate once to its actual final schema declaration.
+    /// Hash lookup keeps validation linear, rather than rescanning the schema
+    /// once for every selected name. Explicit declarations need no predicate.
+    pub fn validateSchema(self: Admission, a: std.mem.Allocator, schema_json: []const u8) !void {
+        if (self.namespace_id == 0 or self.names.len == 0 or self.names.len > 8192 or schema_json.len > 16 * 1024 * 1024) return error.InvalidCatalogRecord;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var selected: std.StringHashMapUnmanaged(struct { kind: Kind, seen: bool = false }) = .empty;
+        for (self.names) |entry| {
+            try validate(entry.name);
+            if (entry.name.len > max_name_bytes) return error.InvalidCatalogRecord;
+            const slot = try selected.getOrPut(scratch, entry.name);
+            if (slot.found_existing) return error.InvalidCatalogRecord;
+            slot.value_ptr.* = .{ .kind = entry.kind };
+        }
+        const schema = try std.json.parseFromSliceLeaky(std.json.Value, scratch, schema_json, .{ .parse_numbers = false });
+        if (schema != .object) return error.InvalidCatalogRecord;
+        for ([_][]const u8{ "checks", "unique_constraints", "foreign_keys" }, [_]Kind{ .check, .unique, .foreign_key }) |key, base_kind| {
+            const rules = schema.object.get(key) orelse continue;
+            if (rules != .array or rules.array.items.len > 8192) return error.InvalidCatalogRecord;
+            for (rules.array.items) |rule| {
+                if (rule != .object) return error.InvalidCatalogRecord;
+                const label = rule.object.get("name") orelse return error.InvalidCatalogRecord;
+                if (label != .string) return error.InvalidCatalogRecord;
+                if (selected.getPtr(label.string)) |expected| {
+                    if (expected.seen) return error.InvalidCatalogRecord;
+                    if (base_kind == .unique) if (rule.object.get("origin")) |origin| {
+                        if (origin != .null and (origin != .string or !std.mem.eql(u8, origin.string, "constraint"))) return error.InvalidCatalogRecord;
+                    };
+                    var kind = base_kind;
+                    if (base_kind == .unique) if (rule.object.get("primary")) |primary| {
+                        if (primary != .bool) return error.InvalidCatalogRecord;
+                        if (primary.bool) kind = .primary;
+                    };
+                    if (kind != expected.kind) return error.InvalidCatalogRecord;
+                    expected.seen = true;
+                }
+            }
+        }
+        var values = selected.valueIterator();
+        while (values.next()) |value| if (!value.seen) return error.InvalidCatalogRecord;
+    }
+};
+
+pub const Plan = struct {
+    arena: std.heap.ArenaAllocator,
+    schema_json: []const u8,
+    admission: Admission,
+
+    pub fn deinit(self: *Plan) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Input is compiler-normalized CREATE schema and trusted generated-name
+    /// provenance, never a user-editable flag embedded in schema JSON. The
+    /// reader pins one covered namespace cut and implements checkpoint() plus
+    /// occupied(name,kind) and relationOccupied(name). Explicit index names
+    /// check only relations, not another table's nonexclusive constraint name.
+    /// Cancellation applies even to local-only collisions.
+    pub fn prepare(alloc: std.mem.Allocator, table: []const u8, namespace_id: u64, schema_json: []const u8, generated: []const []const u8, reader: anytype, max_attempts: u32) !Plan {
+        if (namespace_id == 0 or generated.len == 0) return error.InvalidCatalogRecord;
+        if (generated.len > 8192 or schema_json.len > 16 * 1024 * 1024) return error.ProgramLimitExceeded;
+        _ = try Candidate.initKind(table, &.{}, .primary);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const Stage = struct {
+            a: std.mem.Allocator,
+            table: []const u8,
+            reader: @TypeOf(reader),
+            hints: std.StringHashMapUnmanaged(usize) = .empty,
+            constraints: std.StringHashMapUnmanaged(void) = .empty,
+            relations: std.StringHashMapUnmanaged(void) = .empty,
+            selected: []Selected,
+            seen: []bool,
+            max_attempts: u32,
+            probes_left: u32,
+            nodes_left: usize = 8192,
+
+            pub fn occupied(self: *@This(), name: []const u8, kind: Kind) !bool {
+                try self.reader.checkpoint();
+                if (self.probes_left == 0) return error.ProgramLimitExceeded;
+                self.probes_left -= 1;
+                return self.constraints.contains(name) or (kind.includesRelationNames() and self.relations.contains(name)) or
+                    try self.reader.occupied(name, kind);
+            }
+
+            fn rules(schema: *std.json.Value, key: []const u8) ![]std.json.Value {
+                if (schema.* != .object) return error.InvalidCatalogRecord;
+                const list = schema.object.getPtr(key) orelse return &.{};
+                if (list.* != .array) return error.InvalidCatalogRecord;
+                if (list.array.items.len > 8192) return error.ProgramLimitExceeded;
+                return list.array.items;
+            }
+
+            fn primary(rule: std.json.Value) !bool {
+                if (rule != .object) return error.InvalidCatalogRecord;
+                const flag = rule.object.get("primary") orelse return false;
+                if (flag != .bool) return error.InvalidCatalogRecord;
+                return flag.bool;
+            }
+
+            fn column(self: *@This(), expression: std.json.Value, depth: usize, single: *?[]const u8, multiple: *bool) !void {
+                try self.reader.checkpoint();
+                if (depth > 64 or self.nodes_left == 0) return error.ProgramLimitExceeded;
+                if (expression != .object) return error.InvalidCatalogRecord;
+                self.nodes_left -= 1;
+                const op = expression.object.get("op") orelse return error.InvalidCatalogRecord;
+                if (op != .string) return error.InvalidCatalogRecord;
+                if (std.mem.eql(u8, op.string, "literal")) return; // JSON literals are not expression nodes.
+                if (std.mem.eql(u8, op.string, "column")) {
+                    const label = expression.object.get("column") orelse return error.InvalidCatalogRecord;
+                    if (label != .string) return error.InvalidCatalogRecord;
+                    try validate(label.string);
+                    if (single.*) |previous| {
+                        if (!std.mem.eql(u8, previous, label.string)) multiple.* = true;
+                    } else single.* = label.string;
+                }
+                if (expression.object.get("args")) |args| {
+                    if (args != .array) return error.InvalidCatalogRecord;
+                    for (args.array.items) |arg| try self.column(arg, depth + 1, single, multiple);
+                }
+            }
+
+            fn apply(self: *@This(), rule: *std.json.Value, kind: Kind) !void {
+                try self.reader.checkpoint();
+                if (rule.* != .object) return error.InvalidCatalogRecord;
+                const label = rule.object.getPtr("name") orelse return error.InvalidCatalogRecord;
+                if (label.* != .string) return error.InvalidCatalogRecord;
+                try validate(label.string);
+                if (self.hints.get(label.string)) |index| {
+                    if (self.seen[index]) return error.InvalidCatalogRecord;
+                    if (kind.includesRelationNames()) if (rule.object.get("origin")) |origin| {
+                        if (origin != .null and (origin != .string or !std.mem.eql(u8, origin.string, "constraint"))) return error.InvalidCatalogRecord;
+                    };
+                    var columns: []const []const u8 = &.{};
+                    var check_column: [1][]const u8 = undefined;
+                    if (kind == .check) {
+                        const expression = rule.object.get("expression") orelse return error.InvalidCatalogRecord;
+                        var single: ?[]const u8 = null;
+                        var multiple = false;
+                        try self.column(expression, 0, &single, &multiple);
+                        if (!multiple) if (single) |value| {
+                            check_column[0] = value;
+                            columns = &check_column;
+                        };
+                    } else if (kind != .primary) {
+                        const keys = rule.object.get(if (kind == .foreign_key) "child_columns" else "columns") orelse return error.InvalidCatalogRecord;
+                        if (keys != .array or keys.array.items.len == 0 or keys.array.items.len > 256) return error.InvalidCatalogRecord;
+                        const values = try self.a.alloc([]const u8, keys.array.items.len);
+                        for (keys.array.items, values) |key, *value| {
+                            if (key != .string) return error.InvalidCatalogRecord;
+                            value.* = key.string;
+                        }
+                        columns = values;
+                    }
+                    const candidate = try Candidate.initKind(self.table, columns, kind);
+                    const chosen = try choose(self.a, &candidate, self, self.max_attempts);
+                    label.* = .{ .string = chosen };
+                    self.selected[index] = .{ .name = chosen, .kind = kind };
+                    self.seen[index] = true;
+                } else if (kind.includesRelationNames() and try self.reader.relationOccupied(label.string)) return error.SqlIndexAlreadyExists;
+                if (kind.includesRelationNames() and self.relations.contains(label.string)) return error.SqlIndexAlreadyExists;
+                if (self.constraints.contains(label.string)) return error.SqlConstraintAlreadyExists;
+                try self.constraints.put(self.a, label.string, {});
+                if (kind.includesRelationNames()) try self.relations.put(self.a, label.string, {});
+            }
+        };
+        var stage: Stage = .{
+            .a = a,
+            .table = table,
+            .reader = reader,
+            .selected = try a.alloc(Selected, generated.len),
+            .seen = try a.alloc(bool, generated.len),
+            .max_attempts = max_attempts,
+            .probes_left = max_attempts,
+        };
+        @memset(stage.seen, false);
+        for (generated, 0..) |source, index| {
+            try validate(source);
+            const entry = try stage.hints.getOrPut(a, source);
+            if (entry.found_existing) return error.InvalidCatalogRecord;
+            entry.value_ptr.* = index;
+        }
+        try stage.relations.put(a, table, {});
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .parse_numbers = false });
+        for (try Stage.rules(&schema, "checks")) |*rule| try stage.apply(rule, .check);
+        const uniques = try Stage.rules(&schema, "unique_constraints");
+        for ([_]bool{ true, false }) |is_primary| for (uniques) |*rule| {
+            if (try Stage.primary(rule.*) == is_primary) try stage.apply(rule, if (is_primary) .primary else .unique);
+        };
+        for (try Stage.rules(&schema, "foreign_keys")) |*rule| try stage.apply(rule, .foreign_key);
+        for (stage.seen) |seen| if (!seen) return error.InvalidCatalogRecord;
+        return .{ .arena = arena, .schema_json = try std.json.Stringify.valueAlloc(a, schema, .{}), .admission = .{ .namespace_id = namespace_id, .names = stage.selected } };
+    }
+};
+
 fn repeated(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
     var result: [bytes.len * count]u8 = undefined;
     for (0..count) |i| @memcpy(result[i * bytes.len ..][0..bytes.len], bytes);
     return result;
+}
+
+const EmptyNamespace = struct {
+    cancelled: bool = false,
+    pub fn checkpoint(self: *@This()) !void {
+        if (self.cancelled) return error.DeadlineExceeded;
+    }
+    pub fn occupied(_: *@This(), _: []const u8, _: Kind) !bool {
+        return false;
+    }
+    pub fn relationOccupied(_: *@This(), _: []const u8) !bool {
+        return false;
+    }
+};
+
+const plan_schema =
+    \\{"checks":[{"name":"t_email_key","expression":{"op":"literal","value":true}}],"unique_constraints":[{"name":"anonymous_unique","columns":["email"]},{"name":"anonymous_primary","columns":["id"],"primary":true}],"foreign_keys":[{"name":"anonymous_fk","child_columns":["id"]}]}
+;
+
+fn preparedPlanAllocationCase(a: std.mem.Allocator) !void {
+    var namespace: EmptyNamespace = .{};
+    var plan = try Plan.prepare(a, "t", 5, plan_schema, &.{ "anonymous_unique", "anonymous_primary", "anonymous_fk" }, &namespace, 16);
+    defer plan.deinit();
+    try std.testing.expectEqualStrings("t_email_key1", plan.admission.names[0].name);
+    try std.testing.expectEqualStrings("t_pkey", plan.admission.names[1].name);
+    try std.testing.expectEqualStrings("t_id_fkey", plan.admission.names[2].name);
+    try plan.admission.validateSchema(a, plan.schema_json);
+    const copy = try plan.admission.dupe(a);
+    defer {
+        for (copy.names) |entry| a.free(entry.name);
+        a.free(copy.names);
+    }
+    try copy.validateSchema(a, plan.schema_json);
+}
+
+test "prepared constraint naming uses staged CHECK index FK visibility and owns its predicates" {
+    try preparedPlanAllocationCase(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparedPlanAllocationCase, .{});
+}
+
+test "prepared naming rejects future explicit collisions and bounds aggregate probes" {
+    var namespace: EmptyNamespace = .{};
+    const unique = "{\"unique_constraints\":[{\"name\":\"anonymous\",\"columns\":[\"id\"],\"primary\":true},{\"name\":\"t_pkey\",\"columns\":[\"email\"]}]}";
+    try std.testing.expectError(error.SqlIndexAlreadyExists, Plan.prepare(std.testing.allocator, "t", 5, unique, &.{"anonymous"}, &namespace, 16));
+    const check_after = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"id\"}},{\"name\":\"t_id_check\",\"expression\":{\"op\":\"literal\",\"value\":true}}]}";
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, Plan.prepare(std.testing.allocator, "t", 5, check_after, &.{"anonymous"}, &namespace, 16));
+    const checks = "{\"checks\":[{\"name\":\"first\",\"expression\":{\"op\":\"literal\",\"value\":true}},{\"name\":\"second\",\"expression\":{\"op\":\"literal\",\"value\":false}}]}";
+    try std.testing.expectError(error.ProgramLimitExceeded, Plan.prepare(std.testing.allocator, "t", 5, checks, &.{ "first", "second" }, &namespace, 2));
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.prepare(std.testing.allocator, "t", 5, checks, &.{"missing"}, &namespace, 16));
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.prepare(std.testing.allocator, "t", 5, checks, &.{ "first", "first" }, &namespace, 16));
+    namespace.cancelled = true;
+    try std.testing.expectError(error.DeadlineExceeded, Plan.prepare(std.testing.allocator, "t", 5, checks, &.{"first"}, &namespace, 16));
+}
+
+test "selected constraint predicates authenticate final schema kinds and uniqueness" {
+    const names = [_]Selected{.{ .name = "chosen", .kind = .check }};
+    const admission: Admission = .{ .namespace_id = 5, .names = &names };
+    try admission.validateSchema(std.testing.allocator, "{\"checks\":[{\"name\":\"chosen\"}]}");
+    try std.testing.expectError(error.InvalidCatalogRecord, admission.validateSchema(std.testing.allocator, "{\"unique_constraints\":[{\"name\":\"chosen\"}]}"));
+    try std.testing.expectError(error.InvalidCatalogRecord, admission.validateSchema(std.testing.allocator, "{\"checks\":[{\"name\":\"chosen\"},{\"name\":\"chosen\"}]}"));
+    try std.testing.expectError(error.InvalidCatalogRecord, admission.validateSchema(std.testing.allocator, "{\"checks\":[{\"name\":\"other\"}]}"));
+    const unique: Admission = .{ .namespace_id = 5, .names = &.{.{ .name = "chosen", .kind = .unique }} };
+    try std.testing.expectError(error.InvalidCatalogRecord, unique.validateSchema(std.testing.allocator, "{\"unique_constraints\":[{\"name\":\"chosen\",\"origin\":\"index\"}]}"));
+}
+
+test "prepared CHECK names collect distinct expression columns without walking JSON literal data" {
+    const cases = [_]struct { expression: []const u8, expected: []const u8 }{
+        .{ .expression = "{\"op\":\"add\",\"args\":[{\"op\":\"column\",\"column\":\"id\"},{\"op\":\"column\",\"column\":\"id\"}]}", .expected = "t_id_check" },
+        .{ .expression = "{\"op\":\"gt\",\"args\":[{\"op\":\"column\",\"column\":\"id\"},{\"op\":\"column\",\"column\":\"tenant\"}]}", .expected = "t_check" },
+        .{ .expression = "{\"op\":\"is_not_null\",\"args\":[{\"op\":\"literal\",\"value\":{\"op\":\"column\",\"column\":\"not_a_reference\"}}]}", .expected = "t_check" },
+    };
+    for (cases) |case| {
+        const schema = try std.fmt.allocPrint(std.testing.allocator, "{{\"checks\":[{{\"name\":\"anonymous\",\"expression\":{s}}}]}}", .{case.expression});
+        defer std.testing.allocator.free(schema);
+        var namespace: EmptyNamespace = .{};
+        var plan = try Plan.prepare(std.testing.allocator, "t", 5, schema, &.{"anonymous"}, &namespace, 16);
+        defer plan.deinit();
+        try std.testing.expectEqualStrings(case.expected, plan.admission.names[0].name);
+        try plan.admission.validateSchema(std.testing.allocator, plan.schema_json);
+    }
 }
 
 test "generated unique constraint names preserve PostgreSQL prefixes suffixes and UTF8 clipping" {

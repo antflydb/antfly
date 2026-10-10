@@ -482,6 +482,28 @@ pub fn LiveStore(comptime Txn: type) type {
         pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
             return if (try self.getEntry(key)) |entry| entry.active else null;
         }
+        /// One exact name-prefix seek and, only for constraint-only lookup,
+        /// at most one next past the exclusive relation. Shared memberships
+        /// are not enumerated. A legacy root cannot establish name absence.
+        pub fn nameOccupied(self: *@This(), namespace_id: u64, label: []const u8, include_relations: bool) !bool {
+            if (self.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const prefix = try candidateGenerationKey(&buf, self.root.generation, .{ .namespace_id = namespace_id, .name = label });
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            var found = try cursor.seekAtOrAfter(prefix);
+            for (0..2) |_| {
+                const row = found orelse return false;
+                if (!std.mem.startsWith(u8, row.key, prefix)) return false;
+                const key = try logicalLiveCandidateKey(row.key, self.root);
+                const entry = try names.Entry.decode(row.value);
+                try key.validateEntry(entry);
+                if (entry.empty()) return error.InvalidCatalogRecord;
+                if (include_relations or key.membership_table_id != 0) return true;
+                found = try cursor.next();
+            }
+            return error.InvalidCatalogRecord;
+        }
         pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
             if (key.membership_table_id != 0 and self.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             var buf: [max_cursor_bytes]u8 = undefined;
@@ -1713,6 +1735,67 @@ fn exerciseOccupancyLifecycle(a: A) !void {
     try replay.feed(try sourceKey(&buf, 41));
     try replay.feed(try liveKey(&buf, 41));
     try replay.finish();
+}
+
+test "relation occupancy name probes bound seeks independently of shared memberships" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var ready = try State.initWithCoverage(41, try nextJobId(null), test_epoch, .constraint_names);
+    const generation = Generation.of(&ready);
+    const Put = struct {
+        fn owner(base: *TestTxn, gen: Generation, key: names.Key, value: names.Owner, root: *LiveRoot) !void {
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const entry: names.Entry = if (value.phase == .reserved) .{ .pending = value } else .{ .active = value };
+            try key.validateEntry(entry);
+            try base.put(try candidateGenerationKey(&buf, gen, key), &(try entry.encode()));
+            root.claims += 1;
+            addClaimHash(&root.claim_hash, try ownerHash(key, value));
+        }
+    };
+    var root: LiveRoot = .{ .generation = generation, .coverage = .constraint_names, .epoch = test_epoch, .claims = 0, .claim_hash = @splat(0) };
+    try Put.owner(&txn, generation, .{ .namespace_id = 5, .name = "shared" }, test_owner, &root);
+    try Put.owner(&txn, generation, .{ .namespace_id = 5, .name = "relation_only" }, test_owner, &root);
+    for (100..1100) |id| {
+        var owner = test_owner;
+        owner.kind = .constraint_name;
+        owner.table_id = @intCast(id);
+        try Put.owner(&txn, generation, .{ .namespace_id = 5, .name = "shared", .membership_table_id = owner.table_id }, owner, &root);
+    }
+    var pending = test_owner;
+    pending.kind = .constraint_name;
+    pending.phase = .reserved;
+    pending.publication_id = @splat(9);
+    try Put.owner(&txn, generation, .{ .namespace_id = 5, .name = "pending", .membership_table_id = pending.table_id }, pending, &root);
+    var buf: [max_cursor_bytes]u8 = undefined;
+    ready.phase = .ready;
+    ready.expected.claims = root.claims;
+    ready.expected.claim_hash = root.claim_hash;
+    try txn.put(try jobKey(&buf, 41), &(try ready.encode()));
+    try txn.put(try rootKey(&buf, 41), &(try generation.encode()));
+    try txn.put(try liveKey(&buf, 41), &(try root.encode()));
+    for (0..test_epoch.revision) |_| try advanceSource(&txn, 41);
+    try verifyLiveRootForTest(&txn, test_epoch);
+    var live = (try LiveStore(TestTxn).open(&txn, 41)).?;
+    const cases = [_]struct { namespace: u64 = 5, label: []const u8, relations: bool, expected: bool }{
+        .{ .label = "shared", .relations = true, .expected = true },
+        .{ .label = "shared", .relations = false, .expected = true },
+        .{ .label = "relation_only", .relations = true, .expected = true },
+        .{ .label = "relation_only", .relations = false, .expected = false },
+        .{ .label = "pending", .relations = false, .expected = true },
+        .{ .label = "missing", .relations = false, .expected = false },
+        .{ .namespace = 6, .label = "shared", .relations = true, .expected = false },
+    };
+    for (cases) |case| {
+        txn.cursor_seeks = 0;
+        txn.cursor_nexts = 0;
+        try std.testing.expectEqual(case.expected, try live.nameOccupied(case.namespace, case.label, case.relations));
+        try std.testing.expectEqual(@as(usize, 1), txn.cursor_seeks);
+        try std.testing.expect(txn.cursor_nexts <= 1);
+    }
+    live.root.coverage = .relations;
+    txn.cursor_seeks = 0;
+    try std.testing.expectError(error.CatalogOccupancyNotReady, live.nameOccupied(5, "missing", false));
+    try std.testing.expectEqual(@as(usize, 0), txn.cursor_seeks);
 }
 
 test "relation occupancy garbage and authenticated replay retain retired coverage" {

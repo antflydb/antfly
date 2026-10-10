@@ -76,6 +76,7 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
+    if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
     var object_create = false;
     if (request.create_table_json) |json| {
         var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
@@ -85,7 +86,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try tables_api.validateObjectCreateDefinition(alloc, create_req);
         object_create = storage_settings.engine == .object;
     }
-    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const ordinary_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const required_version = if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -100,6 +102,13 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         const json = request.create_table_json orelse return error.InvalidCatalogMutation;
         var req = try tables_api.parseStoredCreateTableRequest(a, json);
+        if (request.generated_constraint_names.len != 0) {
+            var names = try store.prepareGeneratedConstraintNames(a, svc.metadata_group_id, admission.meta.revision, admission.namespace_id, request.mutation.name, req.schema_json orelse return error.InvalidCatalogMutation, request.generated_constraint_names, context);
+            defer names.deinit();
+            req.schema_json = try a.dupe(u8, names.schema_json);
+            command.constraint_name_admission = try names.admission.dupe(a);
+            command.version = 2;
+        }
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
         if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
         req.indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(a, storage_name, req.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(req.schema_json));

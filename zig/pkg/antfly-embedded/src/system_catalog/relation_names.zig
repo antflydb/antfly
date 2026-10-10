@@ -18,6 +18,7 @@
 //! does it commit independently of the caller's metadata write transaction.
 const std = @import("std");
 const A = std.mem.Allocator;
+pub const constraint_naming = @import("constraint_names.zig");
 pub const max_claims = 8192;
 pub const max_name_bytes = 256;
 const key_prefix = "\x00\x00__metadata_derived__:sql_relation_names:v1:";

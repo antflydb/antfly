@@ -509,3 +509,30 @@ SQL gate passes 701 local and 226 native tests; a fresh broad gate for the final
 distinct-key growth change is running. The separate mounted catalog campaign
 and coordinator CPU-backed gates remain pending. Original dispositions and
 production occupancy activation remain unchanged.
+
+### Prepared generated-name admission checkpoint
+
+The CREATE naming pipeline now owns its schema and selected-name predicates,
+pins a covered catalog read, and stages CHECK, primary/unique and FK names in
+PostgreSQL visibility order. Candidate probes share an aggregate budget and
+honor cancellation. Namespace occupancy uses bounded seeks rather than
+enumerating all owners of a shared constraint name. Explicit index names
+check exclusive relations without rejecting other-table CHECK memberships.
+
+Version-two catalog commands carry exact selected-name predicates, checked
+again inside the atomic mutation. Ordinary requests and version-one commands
+retain their previous JSON representation. Definite naming diagnostics cross
+metadata forwarding only after a definite not-proposed outcome; uncertain
+receipts retain the existing unknown-outcome semantics.
+
+This is not production activation: advertised capability remains 33 and the
+new admission requires 34. Hidden FK CREATE and ALTER integration, distributed
+fault qualification and capability activation remain unfinished. No original
+parity disposition is changed by these component tests.
+
+Before the latest main merge, the shared reconciliation gate passed 70 tests
+in both Debug and ReleaseFast, the naming gate passed eight in both modes,
+and the native catalog gate passed 45 tests. The broader SQL gate passed
+703 local and 226 native tests before this admission integration. After
+merging main at b7e4f43a30, the focused naming gate passes again; the fresh
+native catalog gate is still running at this checkpoint.

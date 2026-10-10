@@ -241,9 +241,17 @@ pub const SystemCatalogCommand = struct {
     mutation: system_catalog.Mutation,
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
+    constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
+
+    pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        // Keep legacy frames byte-for-byte shaped as before while capability
+        // 34 is not activated. Old decoders must not see even a null new field.
+        if (self.constraint_name_admission == null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update });
+        try writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission });
+    }
 };
 
-pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{}, namespace_id: u64 = 0 };
 
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {

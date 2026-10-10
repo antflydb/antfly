@@ -563,6 +563,11 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
                 };
             }
             request.create_table_json = try tables.encodeStoredCreateTableRequestAlloc(a, parsed);
+            // Rollout waits for native/standby/FK qualification before this
+            // binary advertises occupancy support. Never interpret legacy
+            // roots as proof that generated names are free.
+            if (@import("../metadata/topology_protocol.zig").current_version >= @import("../metadata/topology_protocol.zig").constraint_occupancy_version)
+                request.generated_constraint_names = create.generated_constraint_names;
         },
         .drop_table => {},
         .catalog_ddl => |ddl| {

@@ -866,6 +866,13 @@ pub const Request = struct {
     create_table_json: ?[]const u8 = null,
     /// Trusted ingress allocates identity before sealing durable destinations.
     physical_name: ?[]const u8 = null,
+    /// Trusted SQL compiler provenance; not a public schema JSON attribute.
+    generated_constraint_names: []const []const u8 = &.{},
+
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.generated_constraint_names.len == 0) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
+        try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .generated_constraint_names = self.generated_constraint_names });
+    }
 };
 
 /// Relation names share a namespace with tables, indexes and constraint indexes.
@@ -1073,6 +1080,9 @@ pub const TableStatusTarget = union(enum) {
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
+        error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists => 409,
+        error.ProgramLimitExceeded => 400,
+        error.CatalogOccupancyNotReady => 503,
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
@@ -1089,6 +1099,24 @@ pub fn httpStatus(err: anyerror) u16 {
         error.MetadataMutationOutcomeUnknown, error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+/// Only call after the transport has established a definite not-proposed
+/// mutation outcome. Unknown/committed responses must never become retryable
+/// admission failures merely because their bodies resemble these names.
+pub fn definiteNamingError(status: u16, body: []const u8) ?anyerror {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        if (status == httpStatus(err) and std.mem.eql(u8, body, @errorName(err))) return err;
+    }
+    return null;
+}
+
+test "system catalog definite naming diagnostics require exact status and error identity" {
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        try std.testing.expectEqual(err, definiteNamingError(httpStatus(err), @errorName(err)).?);
+        try std.testing.expect(definiteNamingError(200, @errorName(err)) == null);
+    }
+    try std.testing.expect(definiteNamingError(409, "SqlIndexAlreadyExists suffix") == null);
 }
 
 test "invalid initial FK retirement page is a client error" {
