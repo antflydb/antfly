@@ -1836,6 +1836,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
+        "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
@@ -2039,7 +2040,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = &.{ "search.search.", "search.query.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .filters = &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
@@ -2617,6 +2618,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const filtered_topk_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, filtered_topk_mod, true, true);
+    const filtered_topk_tests = b.addTest(.{
+        .root_module = filtered_topk_mod,
+        .filters = &.{ "producer top k", "deferred membership refines", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning" },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties")
+        .dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
     const lake_refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
         .target = target,

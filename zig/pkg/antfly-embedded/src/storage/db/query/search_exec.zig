@@ -15590,7 +15590,7 @@ pub fn searchSparse(
             .exclude_doc_ids = native_constraints.exclude_doc_ids,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .exclude_doc_nums = native_constraints.exclude_doc_nums,
-            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .select_ordinals = predicate.select_ordinals } else null,
+            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .select_ordinals = predicate.select_ordinals, .select_constraints = predicate.select_constraints } else null,
             .cancellation = req.cancellation,
         });
         defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
