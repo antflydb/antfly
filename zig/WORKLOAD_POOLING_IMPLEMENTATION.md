@@ -2644,3 +2644,32 @@ then a healthy retry retires the remaining obligations without a leaked reader.
 These cases are pending cumulative `antfly-server-db-test` compilation/execution;
 format checking or the existing six helper-level lease checks do not qualify
 their DB behavior. Full integration and pooling defaults remain unqualified.
+
+
+### Startup and durable-outbox recovery separate capture phases
+
+Prepared batches run startup recovery before acquiring their primary mutation
+reader. A directly enclosing resolver reader is released for that startup phase
+and reacquired with the original controls before preparation continues. Restore-
+scoped resolution likewise flushes earlier durable obligations before acquiring
+its own mutation reader. No new operation or deadline is created.
+
+The local durable recovery helper acquires mutation protection before matching
+or appending a record under transition/log ordering. It releases transition and
+its local reader before remote completion and final write-authority checking.
+Context projection preserves the common barrier even when an individual mirror
+omits its own binding, and rejects a root from another barrier before publication.
+Generic durable-outbox deletion independently reacquires mutation/apply protection
+and checks captured replication policy after apply. The pending-append flag being
+repaired cannot reject its own cleanup.
+
+Focused recovery checks exercise protected appends, physically joined capture
+workers during successful/fenced/uncertain completion, original rejection at a
+held capture with reader rollback, common mirror bindings, and wrong-root
+rejection. The actual HA recovery fixture also covers a following batch draining
+the startup barrier, without duplicating an already appended mutation. That DB
+fixture, resolver reacquisition, and full consumer instantiations remain pending
+cumulative integration. An externally owned explicit root or any unconverted
+coarse holder still requires phase migration; retained service-holder controls
+continue to suppress CPU lending. Whole scheduler/memory/lifetime/performance
+qualification and default enablement remain incomplete.

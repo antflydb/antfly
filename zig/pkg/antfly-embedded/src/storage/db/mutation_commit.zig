@@ -270,9 +270,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 mutation_admission.retainedLeaseControls(opts.admission_controls)
             else
                 opts.admission_controls;
+            // Startup recovery is a separate durable obligation. Do not wrap
+            // its remote acknowledgement in this batch's primary mutation reader.
+            if (!opts.bypass_replication_write_gate) {
+                const enclosing = opts.enclosing_mutation_retirement;
+                const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
+                if (enclosing) |slot| releaseReplicationMutationShared(slot);
+                try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
+                if (reacquire_enclosing) enclosing.?.* = try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            }
             var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
@@ -3092,8 +3100,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            defer releaseReplicationMutationShared(&mutation);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            // Recovery is repairing the pending-append flag. Check captured
+            // write authority without making that flag reject its own cleanup.
+            try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
             try durable_outbox_store.clearPublished(self.core.store, key);
         }
 
@@ -3710,10 +3723,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
             const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
             const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
+            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxesWithAdmission(retained);
             var replication_mutation = if (!bypass_replication_write_gate) try admission.acquireReplicationMutationShared(self, controls) else null;
             defer if (replication_mutation) |*lease| lease.release();
             if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
             if (status != .committed) {
                 try admission.lockApply(self, retained);
                 defer self.core.unlockApply();
@@ -4828,9 +4841,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             kind: DurableReplicationOutboxKind,
             control: ?@import("../../common/read_admission.zig").Port,
         ) !void {
+            var mutation_barrier: ?*MutationBarrier = null;
+            inline for (.{ ctx.replication_async_batch_mirror, ctx.replication_async_effect_mirror, ctx.replication_async_metadata_mirror }) |configured| {
+                if (configured) |binding| {
+                    if (binding.mutation_barrier) |barrier| {
+                        if (mutation_barrier) |existing| std.debug.assert(existing == barrier);
+                        mutation_barrier = barrier;
+                    }
+                }
+            }
             try replication_commit.recoverDurableOutbox(.{
+                .mutation_barrier = mutation_barrier,
                 .io = ctx.io,
                 .admission = control,
+                .mutation_root = ctx.mutation_root,
                 .transition_mutex = replicationTransitionMutexFromContext(ctx),
                 .log_mutex = ctx.log_mutex,
                 .namespace = ctx.identity_namespace,

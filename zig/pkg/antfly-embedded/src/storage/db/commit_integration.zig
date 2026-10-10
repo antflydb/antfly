@@ -27,6 +27,7 @@ const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const types = @import("types.zig");
 const read_admission = @import("../../common/read_admission.zig");
 const schema_mod = @import("../schema.zig");
+const MutationBarrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
 
 pub const ReplicationDeferredCommitGate = struct {
     mirror: ReplicationAsyncEffectMirror,
@@ -154,6 +155,8 @@ fn lockAtomicWithAdmission(mutex: *std.atomic.Mutex, io: ?std.Io, control: ?read
 /// Borrowed for one recovery operation. This owner cannot access DB internals
 /// or delete pending records; the storage owner clears them after success.
 pub const RecoveryContext = struct {
+    mutation_barrier: ?*MutationBarrier = null,
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
     io: ?std.Io = null,
     admission: ?read_admission.Port = null,
     transition_mutex: ?*std.atomic.Mutex,
@@ -170,6 +173,33 @@ pub fn recoverDurableOutbox(
     outbox: durable_outbox.DurableReplicationOutbox,
     kind: durable_outbox.Kind,
 ) !void {
+    const Lifetime = struct {
+        original: ?read_admission.Port,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.original) |port| try port.checkpoint();
+        }
+        pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return null;
+        }
+    };
+    var lifetime: Lifetime = .{ .original = context.admission };
+    var mutation: ?MutationBarrier.SharedLease = if (context.mutation_barrier orelse mirror.mutation_barrier) |barrier| blk: {
+        if (mirror.mutation_barrier) |configured| {
+            if (configured != barrier) return error.InvalidArgument;
+        }
+        if (context.mutation_root) |root| {
+            if (root.barrier != barrier) return error.InvalidArgument;
+            break :blk try root.borrowControlled(&lifetime);
+        }
+        break :blk if (context.admission != null)
+            try barrier.acquireSharedControlled(context.io orelse return error.MissingBackendRuntimeIo, &lifetime)
+        else
+            barrier.acquireShared();
+    } else blk: {
+        if (context.mutation_root != null) return error.InvalidArgument;
+        break :blk null;
+    };
+    defer if (mutation) |*lease| lease.release();
     var deferred = try ReplicationDeferredCommitGates.beginWithAdmission(context.transition_mutex, context.io, context.admission);
     defer deferred.releaseTransition();
 
@@ -191,6 +221,9 @@ pub fn recoverDurableOutbox(
     // clearing it early; finish under the existing mandatory completion owner.
     mirror.notePublished(lsn);
     deferred.append(.{ .mirror = mirror, .lsn = lsn });
+    deferred.releaseTransition();
+    if (mutation) |*lease| lease.release();
+    mutation = null;
     try deferred.waitForDurabilityAndAuthority(context.write_gate);
 }
 
@@ -407,12 +440,14 @@ const TestPublisher = struct {
     fail_completion: bool = false,
     preflight_locked: bool = false,
     recovered: bool = false,
+    barrier: ?*MutationBarrier = null,
+    captured: bool = false,
 
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
     fn mirror(self: *@This()) ReplicationAsyncEffectMirror {
-        return .{ .publisher = .{ .ptr = self, .vtable = &vtable }, .transition_mutex = &self.transition, .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true } };
+        return .{ .publisher = .{ .ptr = self, .vtable = &vtable }, .mutation_barrier = self.barrier, .transition_mutex = &self.transition, .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true } };
     }
     fn next(_: *anyopaque) u64 {
         return 7;
@@ -431,6 +466,13 @@ const TestPublisher = struct {
         try std.testing.expectEqual(@as(u64, 5), pending.from_lsn);
         try std.testing.expectEqualStrings("payload", pending.payload);
         try std.testing.expectEqual(@as(u64, 2), ns.shard_id);
+        if (self.barrier) |barrier| {
+            if (barrier.tryAcquireExclusive()) |lease| {
+                var unexpected = lease;
+                unexpected.release();
+                return error.RecoveryAppendOutsideMutationProtection;
+            }
+        }
         self.recovered = true;
         return 7;
     }
@@ -447,8 +489,20 @@ const TestPublisher = struct {
         self.transition.unlock();
         try std.testing.expect(self.log.tryLock());
         self.log.unlock();
+        if (self.barrier != null) {
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            try std.testing.expect(self.captured);
+        }
         self.completed = true;
         if (self.fail_completion) return error.CommitCompletionPending;
+    }
+    fn capture(self: *@This()) void {
+        if (self.barrier.?.tryAcquireExclusive()) |lease| {
+            var owned = lease;
+            owned.release();
+            self.captured = true;
+        }
     }
     fn check(ptr: *const anyopaque) !void {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
@@ -562,4 +616,77 @@ test "durable outbox storage recovery admission preserves mandatory completion a
         try std.testing.expect(publisher.log.tryLock());
         publisher.log.unlock();
     }
+}
+
+test "durable outbox storage recovery protects local append and releases capture for remote completion" {
+    for (0..3) |case| {
+        var barrier: MutationBarrier = .{};
+        var publisher: TestPublisher = .{ .barrier = &barrier, .fenced = case == 1, .fail_completion = case == 2 };
+        const result = recoverDurableOutbox(.{ .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() }, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay);
+        if (case == 1) try std.testing.expectError(error.PrimaryFenced, result) else if (case == 2) try std.testing.expectError(error.CommitCompletionPending, result) else try result;
+        try std.testing.expect(publisher.recovered and publisher.completed and publisher.captured);
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        var capture = barrier.tryAcquireExclusive() orelse return error.RecoveryLeakedMutationReader;
+        capture.release();
+    }
+}
+
+test "durable outbox storage recovery preserves original expiry at held capture before append" {
+    const Lifetime = struct {
+        barrier: *MutationBarrier,
+        checks: usize = 0,
+        failure: anyerror,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.barrier.pendingSharedAcquisitions() != 0) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |failure| {
+        var barrier: MutationBarrier = .{};
+        var capture = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+        var held = true;
+        defer if (held) capture.release();
+        var publisher: TestPublisher = .{ .barrier = &barrier };
+        var lifetime: Lifetime = .{ .barrier = &barrier, .failure = failure };
+        const payload: read_admission.Payload = .{ .ptr = &lifetime, .vtable = &.{ .checkpoint = Lifetime.check } };
+        const context: RecoveryContext = .{ .io = std.testing.io, .admission = read_admission.Port.init(&payload), .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+        try std.testing.expectError(failure, recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
+        try std.testing.expect(!publisher.recovered and !publisher.completed);
+        try std.testing.expect(lifetime.checks >= 2);
+        try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        capture.release();
+        held = false;
+    }
+}
+
+test "durable outbox storage recovery uses the common barrier across mirror bindings" {
+    var barrier: MutationBarrier = .{};
+    var publisher: TestPublisher = .{ .barrier = &barrier };
+    var mirror = publisher.mirror();
+    mirror.mutation_barrier = null;
+    try recoverDurableOutbox(.{ .mutation_barrier = &barrier, .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() }, mirror, .{ .from_lsn = 5, .payload = "payload" }, .replay);
+    try std.testing.expect(publisher.recovered and publisher.completed and publisher.captured);
+    try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+}
+
+test "durable outbox storage recovery rejects another mutation root before publication" {
+    const Controls = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return null;
+        }
+    };
+    var controls: Controls = .{};
+    var barrier: MutationBarrier = .{};
+    var other: MutationBarrier = .{};
+    var root = try other.acquireSharedRootControlled(std.testing.io, &controls);
+    defer root.release();
+    var publisher: TestPublisher = .{ .barrier = &barrier };
+    try std.testing.expectError(error.InvalidArgument, recoverDurableOutbox(.{ .mutation_root = &root, .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() }, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
+    try std.testing.expect(!publisher.recovered and !publisher.completed);
+    try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+    try std.testing.expectEqual(@as(usize, 1), other.reader_count);
 }

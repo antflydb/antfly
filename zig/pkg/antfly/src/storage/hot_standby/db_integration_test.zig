@@ -1408,86 +1408,109 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
 
 test "storage.hot_standby durable outbox recovery does not duplicate an appended batch" {
     const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |via_batch_startup| {
+        var db_path_tmp = try TestDirectory.init("db");
+        defer db_path_tmp.cleanup();
+        const db_path = db_path_tmp.path().ptr;
+        defer cleanupTempDir(db_path);
+        var replication_log_path_tmp = try TestDirectory.init("db");
+        defer replication_log_path_tmp.cleanup();
+        const replication_log_path = replication_log_path_tmp.path().ptr;
+        defer cleanupTempDir(replication_log_path);
+        var replication_slots_path_tmp = try TestDirectory.init("db");
+        defer replication_slots_path_tmp.cleanup();
+        const replication_slots_path = replication_slots_path_tmp.path().ptr;
+        defer cleanupTempDir(replication_slots_path);
 
-    var db_path_tmp = try TestDirectory.init("db");
-    defer db_path_tmp.cleanup();
-    const db_path = db_path_tmp.path().ptr;
-    defer cleanupTempDir(db_path);
-    var replication_log_path_tmp = try TestDirectory.init("db");
-    defer replication_log_path_tmp.cleanup();
-    const replication_log_path = replication_log_path_tmp.path().ptr;
-    defer cleanupTempDir(replication_log_path);
-    var replication_slots_path_tmp = try TestDirectory.init("db");
-    defer replication_slots_path_tmp.cleanup();
-    const replication_slots_path = replication_slots_path_tmp.path().ptr;
-    defer cleanupTempDir(replication_slots_path);
+        var primary = try hot_standby_primary_mod.Primary.open(alloc, replication_log_path, replication_slots_path, .{
+            .cluster_id = 256,
+            .shard_id = 4,
+            .table_id = 10,
+            .timeline_id = 1,
+            .epoch = 1,
+        }, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
 
-    var primary = try hot_standby_primary_mod.Primary.open(alloc, replication_log_path, replication_slots_path, .{
-        .cluster_id = 256,
-        .shard_id = 4,
-        .table_id = 10,
-        .timeline_id = 1,
-        .epoch = 1,
-    }, .{});
-    defer primary.close();
-    try primary.createSlot("standby-a", 0);
+        var mutation_barrier: MutationBarrier = .{};
+        const SyncWait = struct {
+            barrier: *MutationBarrier,
+            captured: bool = false,
+            calls: usize = 0,
 
-    const SyncWait = struct {
-        calls: usize = 0,
+            fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
+                const primary_arg: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.captured = false;
+                const worker = try std.Thread.spawn(.{}, capture, .{self});
+                worker.join();
+                try std.testing.expect(self.captured);
+                self.calls += 1;
+                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+            }
+            fn capture(self: *@This()) void {
+                if (self.barrier.tryAcquireExclusive()) |lease| {
+                    var owned = lease;
+                    owned.release();
+                    self.captured = true;
+                }
+            }
+        };
+        var wait_state = SyncWait{ .barrier = &mutation_barrier };
+        var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
+        const standby_names = [_][]const u8{"standby-a"};
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
+            .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
+                .last_lsn = &last_lsn,
+                .mutation_barrier = &mutation_barrier,
+                .sync_policy = .{
+                    .mode = .remote_write,
+                    .standby_names = &standby_names,
+                    .failure_policy = .block,
+                },
+                .sync_wait_ctx = &wait_state,
+                .sync_wait_fn = SyncWait.wait,
+            }),
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer db.close();
 
-        fn wait(ctx: *anyopaque, primary_arg_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
-            const primary_arg: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(primary_arg_ctx));
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.calls += 1;
-            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
-        }
-    };
-    var wait_state = SyncWait{};
-    var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    const standby_names = [_][]const u8{"standby-a"};
-    var db = try DB.open(alloc, std.mem.span(db_path), .{
-        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
-        .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
-            .last_lsn = &last_lsn,
-            .sync_policy = .{
-                .mode = .remote_write,
-                .standby_names = &standby_names,
-                .failure_policy = .block,
-            },
-            .sync_wait_ctx = &wait_state,
-            .sync_wait_fn = SyncWait.wait,
-        }),
-        .start_index_workers = false,
-    });
-    defer db.close();
+        const request = types.BatchRequest{
+            .writes = &.{.{ .key = "doc:recovered", .value = "{\"title\":\"recovered\"}" }},
+            .sync_level = .write,
+        };
+        const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, request);
+        defer alloc.free(payload);
+        const from_lsn = primary.nextLsn();
+        const outbox = try encodeDurableReplicationOutboxAlloc(alloc, from_lsn, payload);
+        defer alloc.free(outbox);
+        try db.core.store.putBatch(&.{.{ .key = replication_batch_outbox_key, .value = outbox }}, &.{});
+        // Direct fixture insertion bypasses the normal writer publication fence.
+        db.local_execution.durable_replication_outbox_maybe.store(true, .release);
 
-    const request = types.BatchRequest{
-        .writes = &.{.{ .key = "doc:recovered", .value = "{\"title\":\"recovered\"}" }},
-        .sync_level = .write,
-    };
-    const payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(alloc, request);
-    defer alloc.free(payload);
-    const from_lsn = primary.nextLsn();
-    const outbox = try encodeDurableReplicationOutboxAlloc(alloc, from_lsn, payload);
-    defer alloc.free(outbox);
-    try db.core.store.putBatch(&.{.{ .key = replication_batch_outbox_key, .value = outbox }}, &.{});
-    // Direct fixture insertion bypasses the normal writer publication fence.
-    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        // Model a crash after the HA append succeeds but before the local outbox
+        // delete commits. Recovery must acknowledge this exact record, not append
+        // the non-idempotent request a second time.
+        const appended_lsn = try @import("effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
+            .shard_id = 4,
+            .table_id = 10,
+        });
+        try std.testing.expectEqual(@as(u64, 1), appended_lsn);
+        if (via_batch_startup) {
+            db.local_execution.durable_replication_startup_barrier_pending.store(true, .release);
+            db.async_context.primary_replication_append_pending.store(true, .release);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:next", .value = "{}" }}, .sync_level = .write });
+        } else try engine.test_support.flushDurableReplicationOutboxes(&db);
 
-    // Model a crash after the HA append succeeds but before the local outbox
-    // delete commits. Recovery must acknowledge this exact record, not append
-    // the non-idempotent request a second time.
-    const appended_lsn = try @import("effects.zig").appendEncodedBatchMutationRequest(&primary, payload, .{
-        .shard_id = 4,
-        .table_id = 10,
-    });
-    try std.testing.expectEqual(@as(u64, 1), appended_lsn);
-    try engine.test_support.flushDurableReplicationOutboxes(&db);
-
-    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
-    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 1), wait_state.calls);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, replication_batch_outbox_key));
+        const expected_lsn: u64 = if (via_batch_startup) 2 else 1;
+        try std.testing.expectEqual(expected_lsn, primary.lastLsn());
+        try std.testing.expectEqual(expected_lsn, last_lsn.load(.acquire));
+        try std.testing.expectEqual(@as(usize, @intCast(expected_lsn)), wait_state.calls);
+        try std.testing.expectEqual(@as(usize, 0), mutation_barrier.reader_count);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, replication_batch_outbox_key));
+    }
 }
 
 test "storage.hot_standby db session sync wait satisfies remote apply through standby DB apply" {
