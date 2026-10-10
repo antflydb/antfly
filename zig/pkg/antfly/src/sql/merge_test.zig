@@ -52,7 +52,7 @@ test "SQL original MERGE corpus admitted plans retain exact source SQL" {
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.TestUnexpectedCall;
         }
         fn checkpoint(_: *anyopaque) !void {}
@@ -144,7 +144,7 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 1), table.id);
             try std.testing.expectEqual(@as(usize, 2), mutations.len);
@@ -297,7 +297,7 @@ test "SQL MERGE candidate binding pins target and projects only referenced sourc
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.TestUnexpectedCall;
         }
         fn open(_: *anyopaque, _: std.mem.Allocator, _: []const catalog.StatementScan) !catalog.StatementRead {
@@ -458,7 +458,7 @@ test "SQL MERGE source-preserving candidates exclude target-only rows" {
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.atomic) return error.TestUnexpectedCall;
             try std.testing.expectEqual(@as(u64, 1), table.id);
@@ -703,7 +703,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.TestUnexpectedCall;
         }
         fn checkpoint(_: *anyopaque) !void {}

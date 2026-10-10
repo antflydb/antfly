@@ -15,13 +15,15 @@
 
 //! Transport-independent, allocation-free diagnostics. Only static text crosses
 //! this boundary: errors must not disclose row values, SQL text, credentials,
-//! physical catalog names, or internal Zig implementation identifiers.
+//! physical catalog names, or internal Zig implementation identifiers. Public
+//! column identifiers are copied into a request-owned bounded context.
 const std = @import("std");
 
 pub const Diagnostic = struct {
     code: []const u8,
     message: []const u8,
     hint: ?[]const u8 = null,
+    column_name: ?[]const u8 = null,
     retryable: ?bool = null,
 
     pub fn httpStatus(self: Diagnostic) u16 {
@@ -34,6 +36,34 @@ pub const Diagnostic = struct {
         return 400;
     }
 };
+
+/// Own diagnostic identifiers independently of temporary binding/result arenas.
+/// A context belongs to one request; it must never be shared between sessions.
+pub const Context = struct {
+    column: [1024]u8 = undefined,
+    column_len: ?usize = null,
+
+    pub fn notNull(self: *Context, name: []const u8) anyerror {
+        if (name.len <= self.column.len) {
+            @memcpy(self.column[0..name.len], name);
+            self.column_len = name.len;
+        }
+        return error.SqlNotNullViolation;
+    }
+
+    pub fn diagnostic(self: *const Context, err: anyerror) Diagnostic {
+        var result = describe(err);
+        if (err == error.SqlNotNullViolation) if (self.column_len) |length| {
+            result.column_name = self.column[0..length];
+        };
+        return result;
+    }
+};
+
+pub fn notNull(context: ?*Context, name: []const u8) anyerror {
+    if (context) |value| return value.notNull(name);
+    return error.SqlNotNullViolation;
+}
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
@@ -162,6 +192,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidRegularExpression => .{ .code = "2201B", .message = "The regular expression is invalid.", .hint = "Use PostgreSQL-compatible regular expression syntax." },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },
         error.InvalidCatalogName => .{ .code = "22023", .message = "The database, namespace, or table name is invalid.", .hint = "Use a valid catalog name without empty components." },
+        error.SqlWorkingMemoryLimitExceeded => .{ .code = "54000", .message = "The statement exceeds its working-memory limit (default: 256 MiB, 268435456 bytes).", .hint = "Reduce the number and size of simultaneously retained rows or increase the runtime retained-byte limit.", .retryable = false },
+        error.SqlRequestTooLarge => .{ .code = "54000", .message = "The SQL JSON request exceeds the 64 MiB (67108864 byte) limit.", .hint = "Reduce the statement and parameter payload size.", .retryable = false },
         error.SqlProgramLimitExceeded, error.SqlLimitExceeded, error.SqlResultTooLarge, error.RelationalRowResultTooLarge, error.RelationalExpressionBudgetExceeded, error.TransactionTooLarge, error.RelationalIndexKeyTooLarge, error.SettingLimitExceeded => .{ .code = "54000", .message = "The statement exceeds the supported work, result, or mutation limit.", .hint = "Narrow the predicate or reduce the number and size of rows." },
         error.SqlNegativeLimit => .{ .code = "2201W", .message = "LIMIT must not be negative." },
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },

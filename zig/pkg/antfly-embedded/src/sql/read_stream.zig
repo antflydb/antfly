@@ -88,7 +88,7 @@ const Fixture = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedStatelessScan;
     }
-    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.UnexpectedMutation;
     }
     fn checkpoint(raw: *anyopaque) !void {
@@ -513,7 +513,7 @@ const ParallelScan = struct {
         fn noScan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.InvalidChildScanBackend;
         }
-        fn noMutation(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn noMutation(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.InvalidChildScanBackend;
         }
         fn runChild(self: *Worker, execution: *@import("../common/runnable_scheduler.zig").Execution) anyerror!void {
@@ -621,15 +621,17 @@ const ParallelScan = struct {
                 return null;
             }
         };
+        const scheduler = @import("parallel_scheduler.zig").global();
+        const workspace_budget = scheduler.workspaceBudget(source.context.limits.retained_bytes / 2);
         const fanout = if (scope != null)
-            @min(@as(usize, 8), @min(children.len, source.context.limits.retained_bytes / (8 * 1024 * 1024)))
+            @min(@as(usize, 8), @min(children.len, workspace_budget / (4 * 1024 * 1024)))
         else
-            @import("parallel_scheduler.zig").global().fanout(children.len, source.context.limits.retained_bytes / 2, 4 * 1024 * 1024);
+            scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024);
         if (fanout < 2) {
             for (children) |child| child.close(child.ptr);
             return null;
         }
-        const workspace = source.context.limits.retained_bytes / (2 * fanout);
+        const workspace = workspace_budget / fanout;
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
@@ -935,7 +937,7 @@ pub const Stream = struct {
             // defaults. Its owned manager needs this stable heap address before
             // the run can borrow it; rows become valid only after init succeeds.
             owner.* = .{
-                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) },
+                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes },
                 .shared = backend.spill_manager,
                 .a = self.budget.allocator(),
                 .width = binding.columns.len,
@@ -1016,7 +1018,7 @@ pub const Stream = struct {
                         self.context.spill = manager;
                     } else if (backend.execution_io) |io| {
                         const manager = try self.budget.allocator().create(@import("spill.zig").Manager);
-                        manager.* = .{ .alloc = self.budget.allocator(), .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+                        manager.* = .{ .alloc = self.budget.allocator(), .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
                         self.stream_manager = manager;
                         self.context.spill = manager;
                     }
@@ -2175,7 +2177,7 @@ test "SQL native page quotas survive ordered task fragmentation and delivery siz
         backend.execution_io = if (parallel) std.testing.io else null;
         var compiled = try compiler.compile(a, "SELECT n FROM docs LIMIT 8192", .{});
         defer compiled.deinit();
-        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_pages = 3 })).?;
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_pages = 3, .retained_bytes = 64 * 1024 * 1024 })).?;
         defer stream.close();
         var count: usize = 0;
         while (true) {

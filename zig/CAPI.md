@@ -369,6 +369,16 @@ that own a retiring UNIQUE generation prevent admission; another equivalent
 UNIQUE can be dropped if it is not the selected foreign-key target. A pending
 receipt means the operation was durably admitted; inspect the schema and native
 status rather than replaying it.
+
+CHECK expressions also accept typed `IN` and `NOT IN` membership lists,
+including NULL items and other supported scalar expressions. Membership uses
+SQL three-valued logic and stops at the first match. SQL queries support
+`strpos(text, substring)`, returning the first one-based Unicode character
+position, zero for no match, and NULL when either argument is NULL.
+`LIKE` and `ILIKE`, including their negations, accept `ESCAPE` with a single
+Unicode character or an empty string to disable escaping. The default escape
+is backslash. Escape expressions can be parameters; NULL produces UNKNOWN.
+
 Partial-index predicates accept boolean columns, `NOT`, `IS [NOT] TRUE/FALSE`,
 and conjunctions of typed column/literal comparisons and NULL tests. Boolean
 shorthand shares the native equality predicates used by explicit comparisons.
@@ -468,3 +478,15 @@ The bindings provide Go `database/sql` (`antfly`, `file:/path/app.aflite`),
 Python `antfly_embedded.dbapi`, Rust's optional `sqlx` feature, and TypeScript
 `Connection` / `@antfly/embedded/kysely`. Their shared SQL conformance inputs
 are in `pkg/antfly-embedded/capi-conformance/sql/cases.json`.
+
+SQL JSON requests admit at most 64 MiB (67,108,864 bytes), including source
+text and parameter data. Larger requests return a structured SQLSTATE `54000`
+diagnostic naming that limit, including when a SQL session is active.
+Preparation and execution each default to 256 MiB (268,435,456 bytes) of
+working memory; decoding, staged rows and storage representations can coexist.
+Requests below the wire limit can still exhaust working memory. Token, node
+and nesting limits independently bound syntax. Embedded SQL sessions admit
+4,096 staged mutations and 256 MiB of staging memory; native transaction
+intent admission additionally counts retained payload and metadata, with its
+configured transaction-byte limit (128 MiB by default). Nested OFFSET queries and derived-table
+window functions grow retained storage with observed rows and may spill to disk.

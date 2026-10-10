@@ -1337,7 +1337,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
             const self: *@This() = @ptrCast(@alignCast(raw));
             return try openPinned(alloc, table, request, .{}, &self.lake.source);
         }
-        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}
@@ -1914,7 +1914,7 @@ test "lake SQL coordinator receivers cover streaming materialized count and repe
         fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedStatelessScan;
         }
-        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn openScan(raw: *anyopaque, alloc: Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {

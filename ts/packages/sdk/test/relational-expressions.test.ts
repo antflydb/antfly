@@ -44,7 +44,7 @@ describe("relational expression structural admission", () => {
     for (const value of [
       { op: "array", args: [] },
       { op: "array", sql_type: "unknown", args: [] },
-      { op: "array", sql_type: "int32", args: Array(33).fill(integer) },
+      { op: "array", sql_type: "int32", args: Array(128).fill(integer) },
       { op: "array", sql_type: "int32", args: [], value: null },
     ])
       expect(() => validate(value)).toThrow(TypeError);
@@ -143,7 +143,7 @@ describe("relational expression structural admission", () => {
     { op: "case_when", args: [boolean, integer, boolean, integer] },
     { op: "modulo", args: [integer] },
     { op: "in_list", args: [integer] },
-    { op: "not_in_list", args: Array(33).fill(integer) },
+    { op: "not_in_list", args: Array(128).fill(integer) },
     { ...integer, sql_type: "uuid" },
     { op: "literal", type: "number", sql_type: "numeric", value: 1 },
     { op: "literal", type: "numeric", sql_type: "float64", value: "1" },
@@ -220,6 +220,19 @@ describe("relational expression structural admission", () => {
 });
 
 describe("generated relational expression and predicate contracts", () => {
+  it("accepts bounded membership lists and rejects malformed membership", () => {
+    const operand = { op: "column", column: "title" };
+    const literal = { op: "literal", type: "string", value: "needle" };
+    const validate = (expression: unknown) =>
+      validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
+    expect(() =>
+      validate({ op: "in_list", collation: "ci", args: [operand, ...Array(100).fill(literal)] })
+    ).not.toThrow();
+    expect(() => validate({ op: "in_list", args: [operand] })).toThrow();
+    expect(() =>
+      validate({ op: "in_list", args: [operand, ...Array(127).fill(literal)] })
+    ).toThrow();
+  });
   it("retains signed NUMERIC modifiers in generated recursive contracts", () => {
     const generated: RelationalColumnExpression = {
       column: "n",

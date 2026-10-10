@@ -96,7 +96,7 @@ const SetTestBackend = struct {
     fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedBackendCall;
     }
-    fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.UnexpectedBackendCall;
     }
     fn checkpoint(ptr: *anyopaque) !void {
@@ -561,7 +561,7 @@ test "SQL set promotion bounds high cardinality memory without replaying prior o
                 defer compiled.deinit();
                 const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
                 var result = @import("runtime.zig").execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 65536 }) catch |err| {
-                    if (!with_spill and err == error.SqlProgramLimitExceeded) {
+                    if (!with_spill and (err == error.SqlProgramLimitExceeded or err == error.SqlWorkingMemoryLimitExceeded)) {
                         std.debug.print("SQL set no-spill baseline exceeded 2 MiB: {s}\n", .{case.sql});
                         continue;
                     }
@@ -700,7 +700,7 @@ test "SQL set admission rejects incompatible shapes and enforces the shared memo
     }
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 'long retained payload' AS x UNION SELECT 'another retained payload'", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1024 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1024 }));
     backend = .{ .cancel_after = 12 };
     try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
 }
@@ -1977,7 +1977,7 @@ fn Engine(comptime Context: type) type {
             fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
                 return error.InvalidSqlBackendResponse;
             }
-            fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
                 return error.UnsupportedSqlExecution;
             }
             fn checkpoint(ptr: *anyopaque) !void {

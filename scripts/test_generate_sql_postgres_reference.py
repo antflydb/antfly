@@ -271,7 +271,9 @@ class PostgresReferenceTest(unittest.TestCase):
             # DROP resolves the index itself, so the earlier namespace wins.
             self.db.execute("DROP INDEX namespace_key")
             self.assertIsNone(
-                self.db.execute("SELECT to_regclass('public.namespace_key')").fetchone()[0]
+                self.db.execute(
+                    "SELECT to_regclass('public.namespace_key')"
+                ).fetchone()[0]
             )
             self.assertIsNotNone(
                 self.db.execute(

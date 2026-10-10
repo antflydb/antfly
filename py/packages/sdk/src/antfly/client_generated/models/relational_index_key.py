@@ -40,7 +40,7 @@ class RelationalIndexKey:
                 row and expression set. An integer literal may use a decimal string
                 for exact int64 transport; blob uses base64 and datetime uses the
                 normal relational datetime representation.
-                Comparisons require operands of the same type and return boolean or
+                Comparisons require operands of compatible types (integer and number may mix) and return boolean or
                 SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
                 boolean. Unary is_null and is_not_null test presence/null. AND and OR
                 evaluate left to right with SQL three-valued short-circuit semantics;
@@ -97,7 +97,7 @@ class RelationalIndexKey:
                 operation requires schema capability version 18.
                 modulo takes two same-domain integer or NUMERIC operands and returns the signed
                 remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
-                in_list and not_in_list take one probe followed by 1 to 31 same-domain
+                in_list and not_in_list take one probe followed by 1 to 127 same-domain
                 candidates. The probe is evaluated once; NULL probes return UNKNOWN.
                 A matching candidate wins over NULL candidates; otherwise a NULL
                 candidate makes the result UNKNOWN. These operations require schema

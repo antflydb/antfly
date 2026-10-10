@@ -56,6 +56,10 @@ pub const Plan = struct {
             return error.InvalidRelationalPredicate;
         var tuple = try tuples.TuplePlan.init(alloc, table, layout, &.{.{ .column = condition.column, .collation = condition.collation }});
         errdefer tuple.deinit();
+        // A comparison does not publish an index key. Admit the largest legal
+        // row value, including worst-case NUL escaping, under the caller's
+        // measured allocator budget.
+        tuple.encoded_bytes_limit = @import("relational_row_transform.zig").max_row_bytes * 2 + 3;
         var operand = std.ArrayList(u8).empty;
         defer operand.deinit(alloc);
         const operand_null = try tuple.appendValues(alloc, &operand, &.{condition.value});
@@ -180,4 +184,28 @@ test "relational predicate exact integers null truth and historical absence" {
     defer historical.deinit();
     try std.testing.expect(historical.tuple == null);
     try std.testing.expectError(error.RelationalRowSchemaMismatch, historical.evaluate(alloc, &scratch, row));
+}
+
+test "relational residual comparisons admit large row values without expanding stored index keys" {
+    const alloc = std.testing.allocator;
+    const columns = [_]schema.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+    const table = schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(alloc, table);
+    defer layout.deinit();
+    const body = try alloc.alloc(u8, 2 * 1024 * 1024);
+    defer alloc.free(body);
+    @memset(body, 0);
+    var plan = try Plan.init(alloc, table, &layout, .{ .column = "body", .op = .eq, .value = .{ .string = body } });
+    defer plan.deinit();
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(alloc);
+    try std.testing.expectEqual(Truth.yes, try plan.evaluateValue(alloc, &scratch, .{ .string = body }));
+    var historical = try plan.projectSource(alloc, table, &layout);
+    defer historical.deinit();
+    try std.testing.expectEqual(plan.tuple.encoded_bytes_limit, historical.tuple.?.encoded_bytes_limit);
+    var index = try tuples.TuplePlan.init(alloc, table, &layout, &.{.{ .column = "body" }});
+    defer index.deinit();
+    scratch.clearRetainingCapacity();
+    try std.testing.expectError(error.RelationalIndexKeyTooLarge, index.appendValues(alloc, &scratch, &.{.{ .string = body }}));
+    try std.testing.expectEqual(@as(usize, 0), scratch.items.len);
 }

@@ -100,7 +100,7 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         try std.testing.expect(action == .read_write or action == .read);
         if (self.arrays) return .{ .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
-            .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
+            .{ .name = "n", .path = "n", .type = .integer, .nullable = false, .defaulted = true },
             .{ .name = "g", .path = "g", .type = .integer, .generated = true },
             .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
             .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
@@ -112,7 +112,7 @@ const Fixture = struct {
             .{ .name = "positive_n", .kind = .check },
             .{ .name = "parent_fk", .kind = .foreign_key },
         }, .columns = &.{
-            .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
+            .{ .name = "n", .path = "n", .type = .integer, .nullable = false, .defaulted = true },
             .{ .name = "g", .path = "g", .type = .integer, .generated = true },
         } };
     }
@@ -208,7 +208,7 @@ const Fixture = struct {
         }
         return output;
     }
-    fn mutateUnprepared(ptr: *anyopaque, alloc: Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutateUnprepared(ptr: *anyopaque, alloc: Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         // Native non-RETURNING writes normalize at the storage boundary.
         // Predicate-only fences are not row images and must remain untouched.
         const normalized = try alloc.dupe(catalog.Mutation, input);
@@ -217,9 +217,9 @@ const Fixture = struct {
             const one = try prepare(ptr, alloc, table, &.{mutation.*});
             mutation.* = one[0];
         }
-        return mutate(ptr, alloc, table, normalized);
+        return mutate(ptr, alloc, alloc, table, normalized);
     }
-    fn mutate(ptr: *anyopaque, _: Allocator, _: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         if (self.conflicted) return error.SqlWriteConflict;
         for (input) |mutation| {

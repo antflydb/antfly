@@ -226,7 +226,7 @@ test "relational replicated admission is identical across local memory envelopes
         defer db.close();
         const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
         try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
-        db.core.table_catalog.transaction_admission_bytes = 12 * 1024;
+        db.core.table_catalog.transaction_admission_bytes = 6 * 1024;
         const catalog = db.core.table_catalog.encode();
         try db.core.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &catalog }}, &.{});
         const txn = try db.beginTransaction(100);

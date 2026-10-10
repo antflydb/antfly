@@ -11,8 +11,8 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   modulo: [2, 2],
   cast: [1, 1],
   case_when: [3, 31],
-  in_list: [2, 32],
-  not_in_list: [2, 32],
+  in_list: [2, 128],
+  not_in_list: [2, 128],
   negate: [1, 1],
   concat: [2, 32],
   coalesce: [2, 32],
@@ -45,6 +45,8 @@ const comparisons = new Set([
   "lte",
   "is_distinct",
   "is_not_distinct",
+  "in_list",
+  "not_in_list",
 ]);
 const types: Record<RelationalExpressionType, true> = {
   string: true,

@@ -274,9 +274,9 @@ test "SQL prepared parameter frames match PostgreSQL descriptors values and diag
     }
 }
 pub const Limits = struct {
-    bytes: usize = 8 * 1024 * 1024,
-    wire_bytes: usize = 8 * 1024 * 1024,
-    work: usize = 1_048_576,
+    bytes: usize = @import("resource_limits.zig").default_memory_bytes,
+    wire_bytes: usize = @import("resource_limits.zig").request_bytes,
+    work: usize = @import("resource_limits.zig").default_memory_bytes,
     elements: usize = 65_536,
 };
 

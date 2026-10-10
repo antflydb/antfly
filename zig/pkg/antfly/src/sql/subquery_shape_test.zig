@@ -32,7 +32,7 @@ const Backend = struct {
         self.calls += 1;
         return error.UnexpectedBackendCall;
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         return error.UnexpectedBackendCall;

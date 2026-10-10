@@ -23,25 +23,70 @@ from pathlib import Path
 
 from generate_sql_postgres_reference import postgres
 
-FIXTURE = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_constraints_reference.json"
-SPECIAL = {"nan", "+nan", "-nan", "infinity", "+infinity", "-infinity", "inf", "+inf", "-inf"}
+FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_constraints_reference.json"
+)
+SPECIAL = {
+    "nan",
+    "+nan",
+    "-nan",
+    "infinity",
+    "+infinity",
+    "-infinity",
+    "inf",
+    "+inf",
+    "-inf",
+}
 
 
 def literal(value):
     # Finite JSON strings are not numeric const/enum members.
-    if isinstance(value, Decimal) or isinstance(value, str) and value.lower() in SPECIAL:
+    if (
+        isinstance(value, Decimal)
+        or isinstance(value, str)
+        and value.lower() in SPECIAL
+    ):
         return str(value)
     return None
 
 
 def cases():
-    for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"):
+    for key in (
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    ):
         bound = "0.0001" if key == "multipleOf" else "9007199254740993.2500"
-        schema = '{"' + key + '":' + bound + '}'
-        for value in ("9007199254740993.2499", "9007199254740993.25", "9007199254740993.2501", "9007199254740993.25001", "NaN", "Infinity", "-Infinity"):
+        schema = '{"' + key + '":' + bound + "}"
+        for value in (
+            "9007199254740993.2499",
+            "9007199254740993.25",
+            "9007199254740993.2501",
+            "9007199254740993.25001",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ):
             yield schema, value
-    for schema in ('{"minimum":1e-1000,"maximum":1e1000,"multipleOf":1e-1000}', '{"const":9007199254740993.2500}', '{"const":"NaN"}', '{"const":"9007199254740993.25"}', '{"enum":[9007199254740993.2500,9007199254740993.25,"NaN","Infinity","9007199254740993.26",null,true]}'):
-        for value in ("9007199254740993.25", "9007199254740993.26", "1e-999", "1e-1001", "NaN", "Infinity", "-Infinity"):
+    for schema in (
+        '{"minimum":1e-1000,"maximum":1e1000,"multipleOf":1e-1000}',
+        '{"const":9007199254740993.2500}',
+        '{"const":"NaN"}',
+        '{"const":"9007199254740993.25"}',
+        '{"enum":[9007199254740993.2500,9007199254740993.25,"NaN","Infinity","9007199254740993.26",null,true]}',
+    ):
+        for value in (
+            "9007199254740993.25",
+            "9007199254740993.26",
+            "1e-999",
+            "1e-1001",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ):
             yield schema, value
 
 
@@ -50,7 +95,12 @@ def main():
     parser.add_argument("--generate", action="store_true")
     args = parser.parse_args()
     output = {"reference": "PostgreSQL 18 NUMERIC constraint predicates", "entries": []}
-    operators = {"minimum": ">=", "maximum": "<=", "exclusiveMinimum": ">", "exclusiveMaximum": "<"}
+    operators = {
+        "minimum": ">=",
+        "maximum": "<=",
+        "exclusiveMinimum": ">",
+        "exclusiveMaximum": "<",
+    }
     with postgres() as db:
         for schema, value in cases():
             document = json.loads(schema, parse_float=Decimal, parse_int=Decimal)
@@ -64,20 +114,36 @@ def main():
                     params.append(str(bound))
                 elif key in ("const", "enum"):
                     values = [bound] if key == "const" else bound
-                    values = [parsed for item in values if (parsed := literal(item)) is not None]
-                    predicates.append("(" + " OR ".join("n=%s::numeric" for _ in values) + ")" if values else "false")
+                    values = [
+                        parsed
+                        for item in values
+                        if (parsed := literal(item)) is not None
+                    ]
+                    predicates.append(
+                        "(" + " OR ".join("n=%s::numeric" for _ in values) + ")"
+                        if values
+                        else "false"
+                    )
                     params.extend(values)
                 else:
                     raise ValueError(f"Unrecognized oracle keyword: {key}")
-            sql = "SELECT " + " AND ".join(predicates) + " FROM (SELECT %s::numeric AS n) AS inputs"
+            sql = (
+                "SELECT "
+                + " AND ".join(predicates)
+                + " FROM (SELECT %s::numeric AS n) AS inputs"
+            )
             expected = db.execute(sql, (*params, value)).fetchone()[0]
-            output["entries"].append({"schema": schema, "value": value, "expected": expected})
+            output["entries"].append(
+                {"schema": schema, "value": value, "expected": expected}
+            )
     if args.generate:
         print(json.dumps(output, indent=2))
     else:
         if output != json.loads(FIXTURE.read_text()):
             raise ValueError("PostgreSQL NUMERIC constraint oracle drift")
-        print(f"Verified {len(output['entries'])} PostgreSQL NUMERIC constraint predicates")
+        print(
+            f"Verified {len(output['entries'])} PostgreSQL NUMERIC constraint predicates"
+        )
 
 
 if __name__ == "__main__":

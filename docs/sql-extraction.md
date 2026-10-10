@@ -268,7 +268,15 @@ column decoders overlap provider reads and page decoding; allocation admission
 is serialized, and every worker joins before releasing cursor state. The 32 MiB
 input/decoded budgets apply to the active page set, rather than the entire row group. Large
 individual pages and dictionaries can still fail admission. SQL defaults admit
-10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement.
+10,000,000 scanned rows, 65,536 scan pages and 256 MiB retained bytes per statement.
+The embedded SQL JSON request limit is 64 MiB (67,108,864 bytes), including
+statement text and parameters. Preparation and execution each have a 256 MiB
+working-memory budget: decoded inputs, mutation staging and storage encodings
+can coexist, so this is distinct from the wire limit. Embedded SQL sessions
+admit 4,096 staged mutations and 256 MiB of staging memory. Native transaction
+intents additionally use the configured admission limit (128 MiB by default). Oversized
+requests return SQLSTATE `54000` with the numeric wire limit; execution remains
+bounded by memory, result, syntax and work quotas rather than a 2 MiB value cap.
 Nested pipelines reduce internal page sizes under smaller budgets.
 
 Blocking sorts, grouped aggregates (including DISTINCT inputs), hash-join build

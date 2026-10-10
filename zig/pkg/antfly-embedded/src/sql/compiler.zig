@@ -21,7 +21,7 @@ pub const ast = @import("ast.zig");
 pub const Diagnostic = @import("diagnostics.zig").Diagnostic;
 
 pub const Limits = struct {
-    max_bytes: usize = 1 << 20,
+    max_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     max_tokens: usize = 16_384,
     max_nodes: usize = 8_192,
     max_depth: usize = 64,

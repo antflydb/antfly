@@ -399,7 +399,7 @@ pub const Candidates = struct {
             for (assignments, values) |assignment, datum| {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
-                if (datum.sql_null and !field.nullable) return error.SqlNotNullViolation;
+                if (datum.sql_null and !field.nullable) return @import("errors.zig").notNull(backend.error_context, field.name);
                 const typed = try @import("runtime.zig").encodeStorageDatum(alloc, datum, field, max_bytes);
                 if (std.mem.eql(u8, field.name, "_id")) {
                     if (!inserting or datum.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
@@ -676,7 +676,7 @@ test "MERGE arm domains retain array identity and shared assignment inference" {
         fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.TestUnexpectedCall;
         }
-        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.TestUnexpectedCall;
         }
         fn checkpoint(_: *anyopaque) !void {}
