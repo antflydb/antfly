@@ -3500,6 +3500,7 @@ pub const DB = struct {
     /// silently discard a durability obligation.
     pub const flushDurableReplicationOutboxes = local_mutation.flushDurableReplicationOutboxes;
     pub const flushDurableReplicationOutboxesWithAdmission = local_mutation.flushDurableReplicationOutboxesWithAdmission;
+    pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = local_mutation.flushDurableReplicationOutboxesWithAdmissionAndRoot;
 
     pub const ensureDurableReplicationStartupBarrier = local_mutation.ensureDurableReplicationStartupBarrier;
 
@@ -3511,6 +3512,7 @@ pub const DB = struct {
     /// overlap idempotent.
     pub const flushDurableReplicationOutboxesLocked = local_mutation.flushDurableReplicationOutboxesLocked;
     pub const flushDurableReplicationOutboxesLockedWithAdmission = local_mutation.flushDurableReplicationOutboxesLockedWithAdmission;
+    pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = local_mutation.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
 
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance

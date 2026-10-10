@@ -2673,3 +2673,26 @@ cumulative integration. An externally owned explicit root or any unconverted
 coarse holder still requires phase migration; retained service-holder controls
 continue to suppress CPU lending. Whole scheduler/memory/lifetime/performance
 qualification and default enablement remain incomplete.
+
+
+### Invocation-owned startup recovery scope
+
+Startup admission accepts a stable borrowed mutation root from batch options.
+Both flush phases preserve it through each recovery context and final debt
+cleanup, rather than reacquiring an unrelated reader behind writer intent.
+Receiver-based entry points retain their previous behavior, including dedicated
+local recovery contexts; no root pointer is written to the shared resident DB.
+
+A focused startup fixture holds the writer gate while an explicit physical root
+remains live. Both flush phases borrow that exact root, create no pending reader
+or CPU wait, and retire every borrow before the enclosing root is released.
+The existing startup lifetime/rejection fixtures and outbox recovery checks
+remain in their respective gates. Actual DB option/context propagation and
+cleanup still require cumulative integration. This preserves nested ownership;
+it does not retire a caller-owned root for remote waits, adopt CPU lending, or
+qualify defaults.
+
+The canonical worktree now owns its untracked immutable Zig package cache.
+The previous symlink to a removed historical task cache was repaired using a
+verified local copy; the running historical validator points to the canonical
+cache without tracked source or HEAD changes.

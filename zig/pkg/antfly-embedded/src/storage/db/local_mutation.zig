@@ -251,8 +251,10 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
         pub const flushDurableReplicationOutboxesWithAdmission = commit.flushDurableReplicationOutboxesWithAdmission;
+        pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = commit.flushDurableReplicationOutboxesWithAdmissionAndRoot;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushDurableReplicationOutboxesLockedWithAdmission = commit.flushDurableReplicationOutboxesLockedWithAdmission;
+        pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = commit.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
@@ -824,8 +826,10 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
             pub const flushDurableReplicationOutboxesWithAdmission = Implementation.flushDurableReplicationOutboxesWithAdmission;
+            pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesWithAdmissionAndRoot;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushDurableReplicationOutboxesLockedWithAdmission = Implementation.flushDurableReplicationOutboxesLockedWithAdmission;
+            pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
             pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
             pub const lockApplyForPortableRuntime = Implementation.lockApplyForPortableRuntime;

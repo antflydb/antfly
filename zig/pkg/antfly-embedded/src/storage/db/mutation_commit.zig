@@ -276,7 +276,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const enclosing = opts.enclosing_mutation_retirement;
                 const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
                 if (enclosing) |slot| releaseReplicationMutationShared(slot);
-                try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
+                try @import("replication_startup_admission.zig").ensureWithRoot(self, mutation_admission.retainedLeaseControls(initial_controls), opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
                 if (reacquire_enclosing) enclosing.?.* = try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             }
             var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
@@ -3100,7 +3100,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
-            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            return clearDurableReplicationOutboxWithRoot(self, key, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        fn clearDurableReplicationOutboxWithRoot(self: anytype, key: []const u8, root: ?*MutationBarrier.RootSharedLease) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer releaseReplicationMutationShared(&mutation);
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -3294,6 +3298,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxesWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            return flushDurableReplicationOutboxesWithAdmissionAndRoot(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn flushDurableReplicationOutboxesWithAdmissionAndRoot(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
             const admission = @import("replication_startup_admission.zig");
             const retained = @import("mutation_admission.zig").retainedLeaseControls(controls);
             try @import("mutation_admission.zig").checkLifetime(retained);
@@ -3302,7 +3310,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const io = self.backend_runtime.io() orelse std.Options.debug_io;
             try admission.lockFlush(&self.local_execution.durable_replication_flush_mutex, io, retained);
             defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            try self.flushDurableReplicationOutboxesLockedWithAdmission(retained);
+            try flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self, retained, root);
         }
 
         pub fn flushDurableReplicationOutboxesLocked(self: anytype) !void {
@@ -3310,6 +3318,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxesLockedWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            return flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
             const admission = @import("mutation_admission.zig");
             const retained = admission.retainedLeaseControls(controls);
             try admission.checkLifetime(retained);
@@ -3360,21 +3372,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             if (batch_outbox) |outbox| {
                 try admission.checkLifetime(retained);
-                var ctx = self.batchContext();
+                var ctx = batchContextWithMutationRoot(self, root);
                 try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch, read_control);
-                try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
+                try clearDurableReplicationOutboxWithRoot(self, replication_batch_outbox_key, root);
             }
             if (replay_outbox) |outbox| {
                 try admission.checkLifetime(retained);
-                var ctx = self.batchContext();
+                var ctx = batchContextWithMutationRoot(self, root);
                 try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay, read_control);
-                try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
+                try clearDurableReplicationOutboxWithRoot(self, replication_replay_outbox_key, root);
             }
             if (schema_outbox) |outbox| {
                 try admission.checkLifetime(retained);
-                var ctx = self.batchContext();
+                var ctx = batchContextWithMutationRoot(self, root);
                 try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema, read_control);
-                try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
+                try clearDurableReplicationOutboxWithRoot(self, replication_schema_outbox_key, root);
             }
 
             for (pending) |entry| {
@@ -3387,11 +3399,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .schema, .row_policy => self.local_execution.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
-                var ctx = self.batchContext();
+                var ctx = batchContextWithMutationRoot(self, root);
                 try recoverDurableReplicationOutboxContextWithAdmission(&ctx, mirror, outbox, kind, read_control);
                 // The key names this exact mutation, so concurrent publishers cannot
                 // replace the record which this recovery pass is about to remove.
-                try self.clearDurableReplicationOutbox(entry.key);
+                try clearDurableReplicationOutboxWithRoot(self, entry.key, root);
             }
         }
 
