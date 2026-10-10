@@ -26,7 +26,7 @@ pub fn snapshot(scheduler: ?*scheduling.Scheduler) Snapshot {
     return .{
         .enabled = true,
         .capacity_slots = owner.config.slots,
-        .control_capacity_slots = owner.config.control_slots,
+        .control_capacity_slots = owner.config.control_slots + owner.config.cleanup_slots,
         .operation_capacity = owner.config.max_operations,
         .metadata_capacity_bytes = owner.config.max_bytes,
         .control_metadata_capacity_bytes = owner.config.control_bytes,

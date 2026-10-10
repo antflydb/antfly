@@ -2258,7 +2258,7 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     };
     var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
     defer lane.deinit();
-    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+    var scheduler = try native.Scheduler.init(.{ .slots = 4, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 });
     defer scheduler.close();
     var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
     defer manager.deinit(std.testing.allocator);
@@ -2298,8 +2298,16 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     manager.payload_retirement_mutex.unlock();
     var foreground: native.Execution = .{};
     defer foreground.finish();
-    try foreground.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query);
+    try foreground.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, 2);
     try foreground.checkpoint();
+    var health: native.Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 19 }, .control);
+    try health.checkpoint();
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().control_slots);
+    health.finish();
     foreground.finish();
     try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
     var joining = try lane.io().concurrent(Gate.joinWorker, .{ &gate, worker });
@@ -2622,4 +2630,56 @@ noinline fn qualifyWarmCleanupStartupFailure(failure: CleanupStartupFailure) !vo
 
 test "text statistics trusted controls warm cleanup startup failures retain physical credit and allow later publication" {
     for ([_]CleanupStartupFailure{ .parent, .header, .worker, .cleanup_capacity }) |failure| try qualifyWarmCleanupStartupFailure(failure);
+}
+
+noinline fn qualifyDedicatedCleanupCpu() !void {
+    try std.testing.expectError(error.InvalidRunnablePolicy, native.Scheduler.init(.{ .slots = 2, .cleanup_slots = 1 }));
+    const owner_module = @import("api/runnable_owner_execution.zig");
+    var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try native.NodeOwner.init(.{ .slots = 4, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = clock.monotonicNs };
+    defer state.owner.deinit();
+    const scheduler = &state.owner.scheduler;
+    var query: native.Execution = .{};
+    defer query.finish();
+    try query.startWithSlots(scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, 2);
+    var cleanup: native.Execution = .{};
+    defer cleanup.finish();
+    try cleanup.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .allow_wait = false, .retained_bytes = 23 });
+    try std.testing.expectError(error.InvalidRunnableDemand, cleanup.resizeTeam(2));
+    var health: native.Execution = .{};
+    defer health.finish();
+    try health.start(scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 19 }, .control);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+    var rejected: native.Execution = .{};
+    defer rejected.finish();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rejected.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .allow_wait = false, .retained_bytes = 23 }));
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().operations);
+    try cleanup.park(.resource_blocked);
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().cleanup_runnable_slots);
+    const port = state.port();
+    const io = runtime.native_abi.IoBorrow.init(&std.testing.io);
+    var handle: ?*anyopaque = null;
+    const admitted = port.start(port.context, &.{ .io = &io, .class = @backingInt(runtime.runnable_abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = 64, .out_handle = &handle });
+    if (!admitted.isOk()) return runtime.error_abi.errorFromStatus(admitted);
+    defer if (handle) |value| port.finish(value);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().cleanup_operations);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    port.finish(handle.?);
+    handle = null;
+    try cleanup.enter(.control);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectError(error.InvalidRunnableTransition, cleanup.enter(.query));
+    scheduler.close();
+    health.finish();
+    query.finish();
+    cleanup.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "text statistics trusted controls dedicated cleanup CPU cannot borrow health or ordinary capacity" {
+    try qualifyDedicatedCleanupCpu();
 }

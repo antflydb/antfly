@@ -701,3 +701,25 @@ Duplicate cache publication destroys the discarded physical entry and value befo
 Cache publication constructors own both input value and admitted reservation from entry, including the first checkpoint failure. Complete bytes are admitted before entry/path metadata allocation. Error guards unlock the shard and destroy descriptor/path/input before atomically transferring charged retirement debt; they never borrow the failed foreground scope or wait on its ledger locks. See `receipts/2026-10-08/publication-rollback-proposal`. Caller input allocation/native I/O and physical allocator deinit/free latency remain unqualified.
 
 Admitted transient handles now reserve one of 32 inline physical cleanup slots per shard before publication. Last return transfers the physical body with atomics, retaining byte charge and cache lifetime; it does not destroy it on the foreground task. A fresh scoped collector or nonwaiting pressure reclaimer owns destruction and debt transfer. The latter shares 64 inspections/eight retirements across transients and retained cache entries. See `receipts/2026-10-08/transient-cleanup-owner-proposal`; final focused native and pinned Nix/glibc Linux qualification both pass (91 cache, 14 storage, four metadata and three cleanup-task tests); the initial unavailable-engine failure remains preserved. Physical allocator destruction, prepublication input rollback and native input preadmission remain incomplete.
+
+
+## Dedicated cleanup CPU proposal
+
+The native scheduler accepts `cleanup_slots: 1` as an explicit reserve within
+`slots`. Health/control keeps `control_slots`; ordinary query, write, inference
+and background teams share `slots - control_slots - cleanup_slots`. A valid
+policy retains at least one ordinary slot. The dedicated cleanup queue admits
+only trusted protected cleanup roots, and parking, failed entry, team resizing
+and owning finish return capacity to that same partition. The existing global
+control operation and byte quotas still cover both kinds of control work.
+Public control CPU gauges include both reserves and their live grants.
+
+A configuration with `slots: 4`, `control_slots: 1`, `cleanup_slots: 1` allows a
+two-slot ordinary team, one physical cleanup and one health operation at once.
+The cleanup may hold its slot through an uninterruptible allocator callback;
+this does not loan its CPU or return live memory credit. Explicit zero retains
+the earlier shared-control CPU policy and does not qualify health progress
+through a stalled destructor. Production policy/default sizing, public schema
+and API startup qualification must adopt the dedicated reserve before claiming
+that contract by default. Whole Linux resource, protocol, durability and
+performance/default gates remain required.

@@ -29,7 +29,7 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
             .current_class = currentClass,
         },
         // Protected terminal SQL work must leave the health reserve available.
-        .maximum_slots = if (entry.class == .control) 1 else owner.config.slots - owner.config.control_slots,
+        .maximum_slots = if (entry.class == .control) 1 else owner.config.ordinarySlots(),
         .allocator = allocator,
     };
 }

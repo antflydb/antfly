@@ -24,6 +24,9 @@ pub const State = enum { fresh, queued, running, resource_blocked, output_blocke
 pub const Config = struct {
     slots: usize = 8,
     control_slots: usize = 1,
+    /// Dedicated cleanup CPU drawn from slots, separate from health controls.
+    /// Zero retains the legacy shared-control policy until callers opt in.
+    cleanup_slots: usize = 0,
     weights: [4]u16 = .{ 4, 2, 1, 1 },
     max_operations: usize = 128,
     max_bytes: u64 = 8 << 20,
@@ -33,8 +36,13 @@ pub const Config = struct {
     quantum_ms: u32 = 2,
     checkpoint_budget: u32 = 64,
 
+    pub fn ordinarySlots(self: Config) usize {
+        return self.slots - self.control_slots - self.cleanup_slots;
+    }
+
     pub fn validate(self: Config) !void {
         if (self.slots < 2 or self.slots > 65535 or self.control_slots == 0 or self.control_slots >= self.slots or
+            self.cleanup_slots > 1 or self.cleanup_slots >= self.slots - self.control_slots or
             self.max_operations < 2 or self.max_bytes == 0 or self.control_bytes == 0 or self.control_bytes >= self.max_bytes or self.max_wait_ms == 0 or self.max_wait_ms > 60000 or
             self.quantum_ms == 0 or self.quantum_ms > 100 or self.checkpoint_budget == 0 or self.checkpoint_budget > 1048576)
             return error.InvalidRunnablePolicy;
@@ -85,9 +93,9 @@ const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
 pub const Scheduler = struct {
     config: Config,
     mutex: std.atomic.Mutex = .unlocked,
-    queues: [5]Queue = @splat(.{}),
+    queues: [6]Queue = @splat(.{}),
     entries: ?*Entry = null,
-    used: [5]usize = @splat(0),
+    used: [6]usize = @splat(0),
     credits: [4]usize = @splat(0),
     cursor: usize = 0,
     round_open: bool = false,
@@ -106,6 +114,7 @@ pub const Scheduler = struct {
         queued: usize = 0,
         runnable_slots: usize = 0,
         control_slots: usize = 0,
+        cleanup_runnable_slots: usize = 0,
         resource_blocked: usize = 0,
         output_blocked: usize = 0,
         grants: [5]u64 = @splat(0),
@@ -123,10 +132,18 @@ pub const Scheduler = struct {
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    fn cpuIndex(self: *const Scheduler, e: *const Entry) usize {
+        return if (e.protected_cleanup_root and self.config.cleanup_slots != 0) 5 else @backingInt(e.class);
+    }
+    fn capacityFor(self: *const Scheduler, e: *const Entry, class: Class) usize {
+        if (e.protected_cleanup_root and self.config.cleanup_slots != 0) return self.config.cleanup_slots;
+        return if (class == .control) self.config.control_slots else self.config.ordinarySlots();
+    }
+
     fn enqueue(self: *Scheduler, e: *Entry, now: u64) void {
         e.queued_since_ns = now;
         e.waited = false;
-        const q = &self.queues[@backingInt(e.class)];
+        const q = &self.queues[self.cpuIndex(e)];
         e.previous = q.tail;
         e.next = null;
         if (q.tail) |tail| tail.next = e else q.head = e;
@@ -136,7 +153,7 @@ pub const Scheduler = struct {
         self.metrics.queued += 1;
     }
     fn unlink(self: *Scheduler, e: *Entry) void {
-        const q = &self.queues[@backingInt(e.class)];
+        const q = &self.queues[self.cpuIndex(e)];
         if (e.previous) |p| p.next = e.next else q.head = e.next;
         if (e.next) |n| n.previous = e.previous else q.tail = e.previous;
         e.next = null;
@@ -150,7 +167,7 @@ pub const Scheduler = struct {
         self.unlink(e);
         e.state = .running;
         const c = @backingInt(e.class);
-        self.used[c] += e.slots;
+        self.used[self.cpuIndex(e)] += e.slots;
         self.metrics.grants[c] +|= 1;
         e.ready.set(e.options.io);
     }
@@ -205,7 +222,11 @@ pub const Scheduler = struct {
             if (e.slots > self.config.control_slots - self.used[4]) break;
             self.grant(e);
         }
-        const capacity = self.config.slots - self.config.control_slots;
+        while (self.queues[5].head) |e| {
+            if (e.slots > self.config.cleanup_slots - self.used[5]) break;
+            self.grant(e);
+        }
+        const capacity = self.config.ordinarySlots();
         while (self.ordinaryUsed() < capacity) {
             const free = capacity - self.ordinaryUsed();
             const e = self.choose(free) orelse break;
@@ -254,7 +275,7 @@ pub const Scheduler = struct {
 
     fn submitLocked(self: *Scheduler, e: *Entry, now: u64) !void {
         if (e.state != .fresh or e.scheduler != null) return error.InvalidRunnableTransition;
-        const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
+        const capacity = self.capacityFor(e, e.class);
         if (self.closed) return error.SchedulerClosed;
         if (e.slots == 0 or e.slots > capacity) return error.InvalidRunnableDemand;
         const control = e.class == .control;
@@ -354,7 +375,7 @@ pub const Scheduler = struct {
         if (e.scheduler != self) return;
         switch (e.state) {
             .queued => self.unlink(e),
-            .running => self.used[@backingInt(e.class)] -= e.slots,
+            .running => self.used[self.cpuIndex(e)] -= e.slots,
             .resource_blocked => self.metrics.resource_blocked -= 1,
             .output_blocked => self.metrics.output_blocked -= 1,
             .stopped => {},
@@ -441,7 +462,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
-        self.used[@backingInt(e.class)] -= e.slots;
+        self.used[self.cpuIndex(e)] -= e.slots;
         self.metrics.yields +|= 1;
         e.bypasses = 0;
         self.sequence +|= 1;
@@ -464,13 +485,13 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or e.children != 0) return error.InvalidRunnableTransition;
-        const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
+        const capacity = self.capacityFor(e, e.class);
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
         // Only a separately reserved/activated retained phase may resize
         // after close. Other live work keeps its existing grant until finish.
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (slots <= e.slots) {
-            self.used[@backingInt(e.class)] -= e.slots - slots;
+            self.used[self.cpuIndex(e)] -= e.slots - slots;
             e.slots = slots;
             // Shrinking retains the current grant; no old queue deadline
             // applies to this synchronous return of CPU capacity.
@@ -478,7 +499,7 @@ pub const Scheduler = struct {
             self.dispatch();
             return;
         }
-        self.used[@backingInt(e.class)] -= e.slots;
+        self.used[self.cpuIndex(e)] -= e.slots;
         e.slots = slots;
         e.bypasses = 0;
         self.sequence +|= 1;
@@ -492,7 +513,7 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (reason != .resource_blocked and reason != .output_blocked)) return error.InvalidRunnableTransition;
-        self.used[@backingInt(e.class)] -= e.slots;
+        self.used[self.cpuIndex(e)] -= e.slots;
         if (self.closed and !e.retainedPhase()) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
@@ -537,7 +558,7 @@ pub const Scheduler = struct {
         if ((e.children != 0 or e.parent != null) and class != e.class) return error.InvalidRunnableTransition;
         // Retained completion/cleanup cannot promote its capacity partition.
         if (e.retainedPhase() and class != e.class) return error.InvalidRunnableTransition;
-        const capacity = if (class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
+        const capacity = self.capacityFor(e, class);
         if (e.slots > capacity) return error.InvalidRunnableDemand;
         e.class = class;
     }
@@ -668,7 +689,7 @@ pub const Scheduler = struct {
         std.debug.assert(e.scheduler == self and e.children == 0);
         switch (e.state) {
             .queued => self.unlink(e),
-            .running => self.used[@backingInt(e.class)] -= e.slots,
+            .running => self.used[self.cpuIndex(e)] -= e.slots,
             .resource_blocked => self.metrics.resource_blocked -= 1,
             .output_blocked => self.metrics.output_blocked -= 1,
             else => {},
@@ -727,8 +748,9 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         var result = self.metrics;
-        result.runnable_slots = self.ordinaryUsed() + self.used[4];
-        result.control_slots = self.used[4];
+        result.runnable_slots = self.ordinaryUsed() + self.used[4] + self.used[5];
+        result.control_slots = self.used[4] + self.used[5];
+        result.cleanup_runnable_slots = self.used[5];
         return result;
     }
 };
@@ -844,7 +866,9 @@ pub const Execution = struct {
         self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes, .protected_cleanup_root = protected_cleanup };
         errdefer self.finish();
         try owner.submit(&self.entry.?);
-        try owner.wait(&self.entry.?);
+        // A new cleanup root has no published consumer yet. Respect its
+        // fail-fast acquisition; only subsequent reentry retains ownership.
+        if (protected_cleanup) try owner.waitImpl(&self.entry.?, false) else try owner.wait(&self.entry.?);
         self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
     }
