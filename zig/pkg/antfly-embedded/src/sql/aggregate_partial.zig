@@ -227,6 +227,10 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         v.* = @bitCast(try decoder.integer(u64));
         if (!std.math.isFinite(v.*)) return error.InvalidSqlSpill;
     }
+    if (spec.kind == .sum and spec.input_element == .float32) {
+        const rounded: f32 = @floatCast(numbers[0]);
+        if (numbers[0] != @as(f64, rounded) or numbers[1] != 0 or numbers[2] != 0) return error.InvalidSqlSpill;
+    }
     const numeric_flag = try decoder.integer(u8);
     const exact = spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg);
     if (numeric_flag != @intFromBool(exact)) return error.InvalidSqlSpill;
@@ -294,6 +298,26 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         state.selected = owned;
     } else if ((spec.kind == .min or spec.kind == .max) and count != 0) return error.InvalidSqlSpill;
     return state;
+}
+
+test "SQL real SUM partials preserve rounded transitions across restore and merge" {
+    const a = std.testing.allocator;
+    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .number, .input_element = .float32 };
+    var left = try operators.Aggregate.initTyped(a, .sum, .number, .float32);
+    defer left.deinit();
+    var right = try operators.Aggregate.initTyped(a, .sum, .number, .float32);
+    defer right.deinit();
+    try left.update(Datum.json(.{ .float = 16777216 }));
+    try right.update(Datum.json(.{ .float = 1 }));
+    const encoded = try cell(a, right);
+    defer a.free(encoded.value.string);
+    var restored = try decode(a, encoded, spec);
+    defer restored.deinit();
+    try merge(&left, restored);
+    try left.update(Datum.json(.{ .float = -16777216 }));
+    try std.testing.expectEqual(@as(f64, 0), (try left.finish()).value.float);
+    try std.testing.expectEqual(@as(f64, 0), left.compensation);
+    try std.testing.expectError(error.SqlNumericOutOfRange, operators.Aggregate.addRealSum(std.math.floatMax(f32), std.math.floatMax(f32)));
 }
 
 fn numericCheckpointScenario(backing: A, corruptions: bool) !void {
@@ -411,6 +435,8 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
             // answer differently before any other contribution is merged.
             target.number_sum = source.number_sum;
             target.compensation = source.compensation;
+        } else if (target.input_element == .float32) {
+            target.number_sum = try operators.Aggregate.addRealSum(target.number_sum, source.number_sum);
         } else {
             // Include the incoming compensation when composing local sums.
             for ([_]f64{ source.number_sum, -source.compensation }) |value| {

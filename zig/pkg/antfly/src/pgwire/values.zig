@@ -111,8 +111,10 @@ fn encodeNarrowScalar(writer: *std.Io.Writer, element: @import("antfly_local_sou
                 else => return error.InvalidResult,
             };
             const narrowed: f32 = @floatCast(number);
-            if (!std.math.isFinite(narrowed) or (number != 0 and narrowed == 0)) return error.InvalidResult;
-            if (format == 0) try writer.print("{d}", .{narrowed}) else try writer.writeInt(u32, @bitCast(narrowed), .big);
+            if (std.math.isFinite(number) and (!std.math.isFinite(narrowed) or (number != 0 and narrowed == 0))) return error.InvalidResult;
+            if (format == 0) {
+                if (std.math.isNan(narrowed)) try writer.writeAll("NaN") else if (std.math.isInf(narrowed)) try writer.writeAll(if (narrowed < 0) "-Infinity" else "Infinity") else try writer.print("{d}", .{narrowed});
+            } else try writer.writeInt(u32, @bitCast(narrowed), .big);
         },
         else => unreachable,
     }
@@ -447,6 +449,26 @@ pub fn timestampNanos(value: std.json.Value) !u64 {
 pub fn timestampValue(alloc: std.mem.Allocator, nanos: u64) !std.json.Value {
     if (std.math.cast(i64, nanos)) |signed| return .{ .integer = signed };
     return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{nanos}) };
+}
+
+test "pgwire real special results preserve PostgreSQL text and binary representations" {
+    const a = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    const column: Column = .{ .name = "v", .type = .number, .element_type = .float32 };
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }, [_][]const u8{ "NaN", "Infinity", "-Infinity" }) |value, text| {
+        output.writer.end = 0;
+        try encodeColumnInto(a, &output.writer, column, 0, .{ .float = value }, 128);
+        try std.testing.expectEqualStrings(text, output.written());
+        output.writer.end = 0;
+        try encodeColumnInto(a, &output.writer, column, 1, .{ .float = value }, 128);
+        try std.testing.expectEqual(@as(usize, 4), output.written().len);
+        const restored: f32 = @bitCast(std.mem.readInt(u32, output.written()[0..4], .big));
+        if (std.math.isNan(value)) try std.testing.expect(std.math.isNan(restored)) else try std.testing.expectEqual(value, @as(f64, restored));
+        output.writer.end = 0;
+        try std.testing.expectError(error.ProgramLimitExceeded, encodeColumnInto(a, &output.writer, column, 1, .{ .float = value }, 3));
+        try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    }
 }
 
 test "SQL pgwire scalar builtin descriptors match binary widths and round trip values" {

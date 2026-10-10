@@ -390,6 +390,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
         if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
+        if (kind == .sum and input_element == .float32) column.element_type = .float32;
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;

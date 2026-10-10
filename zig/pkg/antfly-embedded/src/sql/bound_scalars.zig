@@ -159,12 +159,18 @@ pub const Prepared = struct {
 pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bool {
     const node = predicate orelse return false;
     return switch (node.*) {
-        .comparison => |comparison| jsonColumn(table, comparison.field) or (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
+        .comparison => |comparison| typedComparisonColumn(table, comparison.field) or (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
             (comparison.value == .string and std.mem.eql(u8, std.mem.trim(u8, comparison.value.string, " \t\r\n"), "null")),
         .is_null => |condition| jsonColumn(table, condition.field),
         .conjunction => |pair| needsResidual(table, pair.left) or needsResidual(table, pair.right),
         .disjunction, .negation, .scalar => true,
     };
+}
+
+fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
+    const definition = table orelse return false;
+    const column = definition.column(name) catch return false;
+    return column.type == .json or column.type == .array or column.element_type == .numeric;
 }
 
 fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
@@ -675,7 +681,12 @@ const Builder = struct {
             .comparison => |comparison| blk: {
                 const column = try (self.table orelse return error.UndefinedColumn).column(comparison.field);
                 const literal = try self.node(.{ .literal = comparison.value });
-                const right = if (comparison.value == .null) literal else try self.node(.{ .cast = .{ .operand = literal, .type = column.type } });
+                // Declared floating parameters keep PostgreSQL's mixed
+                // NUMERIC/float comparison domain. Unknown inputs instead
+                // inherit the column's exact NUMERIC identity.
+                const floating_parameter = comparison.value == .parameter and comparison.value.parameter > 0 and comparison.value.parameter <= self.parameters.len and
+                    (self.parameters[comparison.value.parameter - 1].element_type == .float32 or self.parameters[comparison.value.parameter - 1].element_type == .float64);
+                const right = if (comparison.value == .null) literal else try self.node(.{ .cast = .{ .operand = literal, .type = column.type, .element_type = if (column.type == .array or (column.element_type == .numeric and !floating_parameter)) column.element_type else null } });
                 break :blk try self.node(.{ .binary = .{
                     .op = switch (comparison.op) {
                         inline else => |tag| @field(ast.Scalar.Binary, @tagName(tag)),

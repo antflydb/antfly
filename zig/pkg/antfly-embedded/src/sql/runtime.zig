@@ -458,6 +458,13 @@ pub const Context = struct {
         switch (node.*) {
             .comparison => |comparison| {
                 const column = try table_def.column(comparison.field);
+                // Native condition values cannot carry typed arrays or exact
+                // NUMERIC limbs. Keep these comparisons in the typed residual
+                // instead of interpreting their JSON placeholder as SQL NULL.
+                if (column.type == .array or column.element_type == .numeric) {
+                    output.complete = false;
+                    return;
+                }
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
                 const bound_value = try self.value(comparison.value, column);
@@ -1668,6 +1675,102 @@ test "SQL NUMERIC executes exact scalar projections through public result metada
     for (result.output.columns) |column| {
         try std.testing.expectEqual(ast.ColumnType.number, column.type);
         try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    }
+}
+
+test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads and mutations" {
+    const Fixture = struct {
+        mutations: usize = 0,
+        scan_request: catalog.Scan = undefined,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            try std.testing.expectEqual(@as(usize, 0), request.conditions.len);
+            const rows = try a.alloc(catalog.Row, 2);
+            for (rows, [_][]const u8{ "9007199254740993.1200", "9007199254740993.1201" }, [_][]const u8{ "match", "other" }) |*row, text, key| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(a, "n", .{ .string = text });
+                row.* = .{ .id = key, .version = 7, .value = .{ .object = object } };
+            }
+            return .{ .rows = rows };
+        }
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), mutations.len);
+            try std.testing.expectEqualStrings("match", mutations[0].key);
+            self.mutations += mutations.len;
+            return .committed;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            return mutations;
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.scan_request = request;
+            return .{ .ptr = raw, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return scan(raw, a, undefined, self.scan_request);
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |explicit| for ([_][]const u8{
+        "SELECT n FROM docs WHERE n = $1",
+        "UPDATE docs SET n = n + 1 WHERE n = $1 RETURNING n",
+        "DELETE FROM docs WHERE n = $1 RETURNING n",
+    }, 0..) |sql, index| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .parameter_descriptor_hints = if (explicit) &.{.{ .kind = .number, .element_type = .numeric }} else &.{}, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .mutate_prepared = Fixture.mutate, .prepare_mutations = Fixture.prepare, .checkpoint = Fixture.checkpoint } };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{.{ .string = "9007199254740993.1200" }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(if (index == 1) "9007199254740994.1200" else "9007199254740993.1200", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), fixture.mutations);
+        if (index == 0) {
+            var floating_backend = backend;
+            floating_backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }};
+            var floating_result = try execute(a, floating_backend, &compiled, &.{.{ .float = 9007199254740994 }}, .{});
+            defer floating_result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), floating_result.output.rows.len);
+            var stream_backend = backend;
+            var stream_vtable = backend.vtable.*;
+            stream_vtable.open_scan = Fixture.open;
+            stream_backend.vtable = &stream_vtable;
+            const stream = (try @import("read_stream.zig").Stream.open(a, stream_backend, &compiled, &.{.{ .string = "9007199254740993.1200" }}, .{})).?;
+            defer stream.close();
+            var page = try stream.next(32);
+            defer page.deinit();
+            try std.testing.expect(page.exhausted);
+            try std.testing.expectEqual(@as(usize, 1), page.output.rows.len);
+            try std.testing.expectEqualStrings("9007199254740993.1200", page.output.rows[0][0].string);
+        }
+        var null_result = try execute(a, backend, &compiled, &.{.null}, .{});
+        defer null_result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), null_result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), fixture.mutations);
+    };
+}
+
+test "SQL real SUM retains float4 transitions and result identity in scalar and grouped plans" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT SUM(x) FROM (VALUES (16777216::real),(1::real),(-16777216::real)) t(x)",
+        "SELECT SUM(DISTINCT x) FROM (VALUES (16777216::real),(1::real),(-16777216::real)) t(x)",
+        "SELECT SUM(x) FROM (VALUES (1,16777216::real),(1,1::real),(1,-16777216::real)) t(g,x) GROUP BY g",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(f64, 0), result.output.rows[0][0].float);
+        try std.testing.expectEqual(@import("array_value.zig").ElementType.float32, result.output.columns[0].element_type.?);
     }
 }
 

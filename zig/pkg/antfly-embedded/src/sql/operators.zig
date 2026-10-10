@@ -456,6 +456,8 @@ pub const Aggregate = struct {
                     if (self.input_type == .integer) {
                         if (value.value != .integer) return error.SqlTypeMismatch;
                         self.integer_sum = std.math.add(i128, self.integer_sum, value.value.integer) catch return error.SqlNumericOutOfRange;
+                    } else if (self.input_element == .float32) {
+                        self.number_sum = try addRealSum(self.number_sum, number);
                     } else {
                         const adjusted = number - self.compensation;
                         const total = self.number_sum + adjusted;
@@ -494,6 +496,16 @@ pub const Aggregate = struct {
             },
         }
         self.count += 1;
+    }
+
+    /// PostgreSQL float4 SUM rounds each transition and partial combination.
+    /// Finite inputs must not overflow the float4 transition state.
+    pub fn addRealSum(left: f64, right: f64) !f64 {
+        const a: f32 = @floatCast(left);
+        const b: f32 = @floatCast(right);
+        const sum: f32 = a + b;
+        if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
+        return sum;
     }
 
     pub fn finish(self: *const Aggregate) !Datum {
