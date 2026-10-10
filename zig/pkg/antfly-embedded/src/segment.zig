@@ -2357,6 +2357,31 @@ pub const MergeSourceMap = struct {
             row.dense = dense;
         } else try row.spans.append(self.allocator, .{ .source = source, .count = 1, .output = global });
     }
+    /// Record a consecutive source/output range without visiting each document.
+    pub fn recordRange(self: *@This(), input: usize, source: u32, count: u32, output: u32) !void {
+        if (self.file != null or input >= self.rows.len) return error.InvalidSegment;
+        const row = &self.rows[input];
+        if (source > row.count or count > row.count - source) return error.InvalidSegment;
+        if (count == 0) return;
+        const global = try std.math.add(u32, self.output_base, output);
+        _ = try std.math.add(u32, global, count - 1);
+        if (row.dense != null or (row.spans.items.len > 0 and source < row.spans.items[row.spans.items.len - 1].source + row.spans.items[row.spans.items.len - 1].count)) {
+            for (0..count) |i| try self.record(input, source + @as(u32, @intCast(i)), output + @as(u32, @intCast(i)));
+            return;
+        }
+        if (row.spans.items.len > 0) {
+            const last = &row.spans.items[row.spans.items.len - 1];
+            if (source == last.source + last.count and global == last.output + last.count) {
+                last.count += count;
+                return;
+            }
+        }
+        if ((row.spans.items.len + 1) * @sizeOf(Span) > @as(usize, row.count) * 4) {
+            for (0..count) |i| try self.record(input, source + @as(u32, @intCast(i)), output + @as(u32, @intCast(i)));
+            return;
+        }
+        try row.spans.append(self.allocator, .{ .source = source, .count = count, .output = global });
+    }
     pub fn finishOutput(self: *@This(), count: u32) !void {
         if (self.file) |file| if (self.output_base != 0 or count != file.count) return error.InvalidSegment;
         const end = try std.math.add(u32, self.output_base, count);
@@ -2912,11 +2937,15 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
     try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
     if (options.source_map) |map| {
         var output_doc: u32 = 0;
-        for (inputs, 0..) |input, input_idx| for (0..input.reader.doc_count) |source_doc| {
-            if (input.isDeleted(@intCast(source_doc))) continue;
-            try map.record(input_idx, @intCast(source_doc), output_doc);
-            output_doc += 1;
-        };
+        for (inputs, 0..) |input, input_idx| {
+            var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+            while (live.next()) |source_doc| {
+                const count: u32 = @intCast(live.end - source_doc);
+                try map.recordRange(input_idx, source_doc, count, output_doc);
+                output_doc += count;
+                live.seekForward(live.end);
+            }
+        }
     }
 }
 
@@ -3075,7 +3104,7 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
 
     const ordinal_start = sink.len();
     sink.beginSection();
-    if (try writeMergedDocOrdinals(sink, inputs, null, doc_count)) {
+    if (try writeMergedDocOrdinals(alloc, sink, inputs, null, doc_count)) {
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try built_field.sections.append(alloc, .{ .section_type = .doc_ordinals, .offset = ordinal_start, .length = sink.len() - ordinal_start, .checksum = try sink.crc32Range(ordinal_start, sink.len() - ordinal_start) });
@@ -3183,7 +3212,7 @@ fn writeSortedMergedSegmentToSink(
 
     const ordinal_start = sink.len();
     sink.beginSection();
-    if (try writeMergedDocOrdinals(sink, inputs, plan.ordered(), doc_count)) {
+    if (try writeMergedDocOrdinals(alloc, sink, inputs, plan.ordered(), doc_count)) {
         var built_field = BuiltField{ .name = doc_ordinals_field };
         errdefer built_field.deinit(alloc);
         try built_field.sections.append(alloc, .{ .section_type = .doc_ordinals, .offset = ordinal_start, .length = sink.len() - ordinal_start, .checksum = try sink.crc32Range(ordinal_start, sink.len() - ordinal_start) });
@@ -4283,8 +4312,8 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
     var chunk_bytes: usize = 0;
     for (inputs, 0..) |input, input_idx| {
         try validateInputIndexSortMetadata(alloc, input, fields);
-        for (0..input.reader.doc_count) |doc| {
-            if (input.isDeleted(@intCast(doc))) continue;
+        var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+        while (live.next()) |doc| {
             if (chunk.items.len != 0 and (chunk.items.len >= scratch.external_sort_chunk_documents or chunk_bytes >= scratch.external_sort_chunk_bytes)) {
                 try sorter.push(chunk.items);
                 chunk.clearRetainingCapacity();
@@ -4757,6 +4786,7 @@ fn writeMergeTypedDocValuesSections(
     var value_type: ?typed_dv.ValueType = null;
 
     for (inputs) |input| {
+        if (!inputHasLiveDocs(input)) continue;
         var reader = (try input.reader.typedDocValuesScoped(alloc, field_name)) orelse continue;
         defer reader.deinit();
         value_type = mergeTypedDocValuesValueType(value_type, reader.value_type) orelse return false;
@@ -4767,6 +4797,7 @@ fn writeMergeTypedDocValuesSections(
 
     var merged_doc_base: u32 = 0;
     for (inputs, 0..) |input, input_idx| {
+        if (!inputHasLiveDocs(input)) continue;
         const reader = input.reader;
         var dv_reader = try reader.typedDocValuesScoped(alloc, field_name);
         defer if (dv_reader) |*dv| dv.deinit();
@@ -4774,9 +4805,8 @@ fn writeMergeTypedDocValuesSections(
         if (dv_reader) |*dv| {
             var cursor = typed_dv.TypedDocValuesReader.Cursor.init(dv);
             defer cursor.deinit();
-            while (try cursor.next()) |entry| {
+            while (try cursor.nextExcluding(if (input.deleted) |*deleted| deleted else null)) |entry| {
                 if (entry.doc_id >= reader.doc_count) return error.InvalidSegment;
-                if (input.isDeleted(entry.doc_id)) continue;
                 const deleted_before: u32 = if (rank_maps) |maps|
                     if (maps[input_idx].rank_index) |rank| @intCast(rank.rank(entry.doc_id)) else 0
                 else if (input.deleted) |deleted|
@@ -5094,40 +5124,120 @@ const OrdinalOutput = struct {
         self.used = 0;
     }
 };
-fn writeMergedDocOrdinals(sink: *SegmentSink, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !bool {
-    var present = false;
-    if (records) |ordered| {
-        var it = ordered.iterator();
-        while (try it.next()) |record| {
-            if (((try inputs[record.ref.input_idx].reader.docOrdinal(record.ref.doc_id)) orelse 0) != 0) {
-                present = true;
-                break;
-            }
-        }
-    } else outer: for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc| {
-            if (input.isDeleted(@intCast(doc))) continue;
-            if (((try input.reader.docOrdinal(@intCast(doc))) orelse 0) != 0) {
-                present = true;
-                break :outer;
-            }
-        }
+const OrdinalReader = struct {
+    view: ?@import("segment_source.zig").View = null,
+    count: u32 = 0,
+    fn init(reader: *const SegmentReader) !OrdinalReader {
+        const View = @import("segment_source.zig").View;
+        const view = if (reader.native) |native| blk: {
+            const section = (try native.range.sectionView(doc_ordinals_field, .doc_ordinals)) orelse return .{};
+            break :blk try View.init(native.metadata_cache.?.borrowedSource(), section.offset, section.length);
+        } else blk: {
+            const bytes = (try reader.getSection(doc_ordinals_field, .doc_ordinals)) orelse return .{};
+            break :blk try View.init(.{ .contiguous = bytes }, 0, bytes.len);
+        };
+        if (view.length < 5) return error.InvalidSegment;
+        var header: [5]u8 = undefined;
+        try view.readInto(0, &header);
+        if (header[0] != 1) return error.UnsupportedVersion;
+        const count = std.mem.readInt(u32, header[1..5], .big);
+        if (view.length != 5 + @as(u64, count) * 4) return error.InvalidSegment;
+        return .{ .view = view, .count = count };
     }
-    if (!present) return false;
+};
+
+fn gatherOrdinals(readers: []const OrdinalReader, refs: []const SortedMergeDoc, values: []u32) !bool {
+    var order: [128]usize = undefined;
+    for (refs, 0..) |_, i| order[i] = i;
+    const Less = struct {
+        fn less(records: []const SortedMergeDoc, l: usize, r: usize) bool {
+            const a = records[l].ref;
+            const b = records[r].ref;
+            return if (a.input_idx != b.input_idx) a.input_idx < b.input_idx else a.doc_id < b.doc_id;
+        }
+    };
+    if (!std.sort.isSorted(usize, order[0..refs.len], refs, Less.less))
+        std.mem.sort(usize, order[0..refs.len], refs, Less.less);
+    @memset(values, 0);
+    var bytes: [128 * 4]u8 = undefined;
+    var cursor: usize = 0;
+    var present = false;
+    while (cursor < refs.len) {
+        const first = refs[order[cursor]].ref;
+        if (first.input_idx >= readers.len) return error.InvalidSegment;
+        const reader = readers[first.input_idx];
+        if (reader.view == null or first.doc_id >= reader.count) {
+            cursor += 1;
+            continue;
+        }
+        var end = cursor + 1;
+        while (end < refs.len) : (end += 1) {
+            const next = refs[order[end]].ref;
+            if (next.input_idx != first.input_idx or next.doc_id >= reader.count or next.doc_id - first.doc_id >= 128 or next.doc_id - first.doc_id + 1 > (end - cursor + 1) * 4) break;
+        }
+        const count = refs[order[end - 1]].ref.doc_id - first.doc_id + 1;
+        try reader.view.?.readInto(5 + @as(u64, first.doc_id) * 4, bytes[0 .. @as(usize, count) * 4]);
+        for (order[cursor..end]) |idx| {
+            const offset = @as(usize, refs[idx].ref.doc_id - first.doc_id) * 4;
+            values[idx] = std.mem.readInt(u32, bytes[offset..][0..4], .big);
+            present = present or values[idx] != 0;
+        }
+        cursor = end;
+    }
+    return present;
+}
+
+fn ordinalPass(sink: ?*SegmentSink, readers: []const OrdinalReader, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !bool {
+    var refs: [128]SortedMergeDoc = undefined;
+    var values: [128]u32 = undefined;
+    var output = OrdinalOutput{};
+    var used: usize = 0;
+    var iterator = if (records) |ordered| ordered.iterator() else null;
+    var input_idx: usize = 0;
+    var live: ?LiveDocs = if (inputs.len != 0) LiveDocs.init(&inputs[0], 0, inputs[0].reader.doc_count) else null;
+    while (true) {
+        const ref: ?SortedMergeDoc = if (iterator) |*it| try it.next() else blk: {
+            while (input_idx < inputs.len) {
+                if (sink == null and readers[input_idx].view == null) {
+                    input_idx += 1;
+                } else if (live.?.next()) |doc| break :blk .{ .ref = .{ .input_idx = input_idx, .doc_id = doc } } else input_idx += 1;
+                if (input_idx < inputs.len) live = LiveDocs.init(&inputs[input_idx], 0, inputs[input_idx].reader.doc_count);
+            }
+            break :blk null;
+        };
+        if (ref) |record| {
+            refs[used] = record;
+            used += 1;
+        }
+        if (used == refs.len or (ref == null and used != 0)) {
+            const present = try gatherOrdinals(readers, refs[0..used], values[0..used]);
+            if (sink) |destination| {
+                for (values[0..used]) |value| try output.add(destination, value);
+            } else if (present) return true;
+            used = 0;
+        }
+        if (ref == null) break;
+    }
+    if (sink) |destination| {
+        if (output.count != doc_count) return error.InvalidSegment;
+        try output.flush(destination);
+    }
+    return false;
+}
+
+fn writeMergedDocOrdinals(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, records: ?SortedRecords, doc_count: u32) !bool {
+    var local_readers: [16]OrdinalReader = undefined;
+    const readers = if (inputs.len <= local_readers.len) local_readers[0..inputs.len] else try alloc.alloc(OrdinalReader, inputs.len);
+    defer if (inputs.len > local_readers.len) alloc.free(readers);
+    var any = false;
+    for (inputs, readers) |input, *reader| {
+        reader.* = if (inputHasLiveDocs(input)) try OrdinalReader.init(input.reader) else .{};
+        any = any or reader.view != null;
+    }
+    if (!any or !try ordinalPass(null, readers, inputs, records, doc_count)) return false;
     try sink.appendByte(1);
     try sinkAppendU32BE(sink, doc_count);
-    var output = OrdinalOutput{};
-    if (records) |ordered| {
-        var it = ordered.iterator();
-        while (try it.next()) |record| try output.add(sink, (try inputs[record.ref.input_idx].reader.docOrdinal(record.ref.doc_id)) orelse 0);
-    } else for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc| {
-            if (input.isDeleted(@intCast(doc))) continue;
-            try output.add(sink, (try input.reader.docOrdinal(@intCast(doc))) orelse 0);
-        }
-    }
-    if (output.count != doc_count) return error.InvalidSegment;
-    try output.flush(sink);
+    _ = try ordinalPass(sink, readers, inputs, records, doc_count);
     return true;
 }
 
@@ -10525,4 +10635,101 @@ test "stored identity windows bound sparse expansion across the gather cap" {
     // Sparse gap reads force window reduction. Small IDs still pack into
     // bounded output writes rather than falling back to 128 appends.
     try std.testing.expect(output.test_append_calls < 20);
+}
+
+test "ordinal gathers batch native reads and preserve shuffled duplicate mixed references" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var ordinals: [256]u32 = undefined;
+    for (&ordinals, 0..) |*ordinal, i| {
+        ordinal.* = if (i % 7 == 0) 0 else @intCast(i + 1);
+        try writer.addStoredDoc("id", "{}");
+    }
+    try writer.addDocOrdinals(&ordinals);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    var heap = try SegmentReader.init(a, bytes);
+    defer heap.deinit();
+    const readers = [_]OrdinalReader{ try OrdinalReader.init(&native), try OrdinalReader.init(&heap), .{} };
+    var refs: [128]SortedMergeDoc = undefined;
+    var values: [128]u32 = undefined;
+    for (&refs, 0..) |*ref, i| ref.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(i) } };
+    const cache = &native.native.?.metadata_cache.?;
+    const scalar_before = cache.cache.clock;
+    for (0..128) |i| _ = try native.docOrdinal(@intCast(i));
+    const scalar_probes = cache.cache.clock - scalar_before;
+    const before = cache.cache.clock;
+    try std.testing.expect(try gatherOrdinals(&readers, &refs, &values));
+    const probes = cache.cache.clock - before;
+    try std.testing.expect(probes <= 2);
+    try std.testing.expectEqualSlices(u32, ordinals[0..128], &values);
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    const inputs = [_]MergeInput{ .{ .reader = &native }, .{ .reader = &heap } };
+    try std.testing.expect(try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128));
+    for (ordinals[0..128], 0..) |expected, i| try std.testing.expectEqual(expected, (try decodeDocOrdinal(output.out.items, @intCast(i))) orelse 0);
+    output.out.clearRetainingCapacity();
+    for (&refs) |*ref| ref.* = .{ .ref = .{ .input_idx = 0, .doc_id = 0 } };
+    try std.testing.expect(!try writeMergedDocOrdinals(a, &sink, &inputs, .{ .memory = &refs, .len = refs.len }, 128));
+    try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
+    var seed: u64 = 89312;
+    for (0..40) |_| {
+        for (&refs) |*ref| {
+            seed = seed *% 6364136223846793005 +% 1;
+            ref.* = .{ .ref = .{ .input_idx = @intCast((seed >> 32) % 3), .doc_id = @intCast((seed >> 16) % 260) } };
+        }
+        _ = try gatherOrdinals(&readers, &refs, &values);
+        for (refs, values) |ref, value| try std.testing.expectEqual(if (ref.ref.input_idx == 2 or ref.ref.doc_id >= ordinals.len) @as(u32, 0) else ordinals[ref.ref.doc_id], value);
+    }
+    std.debug.print("ORDINAL_GATHER docs=128 value_cache_probes={d}->{d} randomized_refs=5120\n", .{ scalar_probes, probes });
+}
+
+test "merge provenance range records match individual records across fragmentation and output boundaries" {
+    const a = std.testing.allocator;
+    var ranges = try MergeSourceMap.init(a, &.{10000});
+    defer ranges.deinit();
+    var individual = try MergeSourceMap.init(a, &.{10000});
+    defer individual.deinit();
+    try ranges.recordRange(0, 0, 4096, 0);
+    for (0..4096) |i| try individual.record(0, @intCast(i), @intCast(i));
+    try ranges.finishOutput(4096);
+    try individual.finishOutput(4096);
+    for (4096..10000) |i| if (i % 2 == 0) {
+        try ranges.recordRange(0, @intCast(i), 1, @intCast((i - 4096) / 2));
+        try individual.record(0, @intCast(i), @intCast((i - 4096) / 2));
+    };
+    try ranges.finishOutput(2952);
+    try individual.finishOutput(2952);
+    for (0..10000) |i| try std.testing.expectEqual(individual.lookup(0, @intCast(i)), ranges.lookup(0, @intCast(i)));
+    try std.testing.expect(ranges.retainedBytes() <= individual.retainedBytes());
+    try std.testing.expectError(error.InvalidSegment, ranges.recordRange(0, 9999, 2, 0));
+}
+
+test "ordinal descriptor overflow releases allocations on every failure" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("id", "{}");
+    try writer.addDocOrdinals(&.{7});
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const Sweep = struct {
+        fn run(alloc: Allocator, input: *const SegmentReader) !void {
+            var inputs: [17]MergeInput = undefined;
+            for (&inputs) |*entry| entry.* = .{ .reader = input };
+            var output = MemorySegmentSink.init(alloc);
+            defer output.deinit();
+            var sink = output.sink();
+            try std.testing.expect(try writeMergedDocOrdinals(alloc, &sink, &inputs, null, 17));
+            for (0..17) |i| try std.testing.expectEqual(@as(?u32, 7), try decodeDocOrdinal(output.out.items, @intCast(i)));
+        }
+    };
+    try Sweep.run(a, &reader);
+    try std.testing.checkAllAllocationFailures(a, Sweep.run, .{&reader});
 }

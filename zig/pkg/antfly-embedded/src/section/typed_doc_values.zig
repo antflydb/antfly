@@ -870,6 +870,10 @@ pub const TypedDocValuesReader = struct {
         chunk: ?DecodedChunk = null,
         entries: ?DecodedChunk.Iterator = null,
         next_chunk: u32 = 0,
+        ordered_checked: bool = false,
+        exclusions: ?*const @import("../encoding/roaring.zig").RoaringBitmap = null,
+        live_ranges: ?@import("../encoding/roaring.zig").AbsentRangeIterator = null,
+        live_range: ?@import("../encoding/roaring.zig").AbsentRangeIterator.Range = null,
 
         pub fn init(reader: *const TypedDocValuesReader) Cursor {
             return .{ .reader = reader, .scratch = @import("../segment_source.zig").Scratch.init(reader.alloc, 1024 * 1024) };
@@ -878,19 +882,77 @@ pub const TypedDocValuesReader = struct {
             self.scratch.deinit();
             self.* = undefined;
         }
-        pub fn next(self: *Cursor) !?DecodedChunk.Entry {
-            while (true) {
-                if (self.entries) |*entries| if (try entries.next()) |entry| return entry;
+        fn ensureEntries(self: *Cursor) !bool {
+            while (self.entries == null or self.entries.?.pos >= self.chunk.?.num_docs) {
                 self.entries = null;
                 self.chunk = null;
-                if (self.next_chunk >= self.reader.num_chunks) return null;
+                if (self.next_chunk >= self.reader.num_chunks) return false;
                 self.scratch.reset();
                 var scoped = self.reader.*;
                 scoped.alloc = self.scratch.allocator();
                 self.chunk = try scoped.decodeChunk(self.next_chunk);
                 self.next_chunk += 1;
                 self.entries = self.chunk.?.iterator();
+                self.ordered_checked = false;
             }
+            return true;
+        }
+        pub fn next(self: *Cursor) !?DecodedChunk.Entry {
+            if (!try self.ensureEntries()) return null;
+            return self.entries.?.next();
+        }
+        /// Skip excluded runs before constructing values. Chunk compression
+        /// still requires one bounded decode; the format has no chunk ID bounds.
+        pub fn nextExcluding(self: *Cursor, deleted: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !?DecodedChunk.Entry {
+            const exclusions = deleted orelse {
+                self.exclusions = null;
+                self.live_ranges = null;
+                self.live_range = null;
+                return self.next();
+            };
+            if (self.exclusions != exclusions) {
+                self.exclusions = exclusions;
+                self.live_ranges = exclusions.absentRanges(0, 0x1_0000_0000);
+                self.live_range = null;
+            }
+            while (try self.ensureEntries()) {
+                const chunk = &self.chunk.?;
+                if (!self.ordered_checked) {
+                    var previous: ?u32 = null;
+                    for (0..chunk.num_docs) |i| {
+                        const doc = std.mem.readInt(u32, chunk.data[4 + i * 4 ..][0..4], .little);
+                        if (previous) |last| if (doc <= last) return error.InvalidData;
+                        previous = doc;
+                    }
+                    self.ordered_checked = true;
+                }
+                const entries = &self.entries.?;
+                const doc = std.mem.readInt(u32, chunk.data[4 + @as(usize, entries.pos) * 4 ..][0..4], .little);
+                if (self.live_range == null or self.live_range.?.end <= doc) {
+                    self.live_ranges.?.seekForward(doc);
+                    self.live_range = self.live_ranges.?.next();
+                }
+                const range = self.live_range orelse return null;
+                const lower = @max(doc, range.start);
+                if (lower > doc) {
+                    var low: u32 = entries.pos + 1;
+                    var high = chunk.num_docs;
+                    while (low < high) {
+                        const mid = low + (high - low) / 2;
+                        const id = std.mem.readInt(u32, chunk.data[4 + @as(usize, mid) * 4 ..][0..4], .little);
+                        if (id < lower) low = mid + 1 else high = mid;
+                    }
+                    if (chunk.value_type == .bytes_val) {
+                        while (entries.pos < low) : (entries.pos += 1) {
+                            const length = std.mem.readInt(u32, chunk.data[entries.bytes_cursor..][0..4], .little);
+                            entries.bytes_cursor += 4 + @as(usize, length);
+                        }
+                    } else entries.pos = low;
+                    continue;
+                }
+                return entries.next();
+            }
+            return null;
         }
     };
 
@@ -2224,4 +2286,36 @@ test "external lake signed datetime doc values round trip wide instants and lega
     var old_reader = try TypedDocValuesReader.init(a, legacy);
     defer old_reader.deinit();
     try std.testing.expectEqual(@as(i128, std.math.maxInt(u64)), (try old_reader.getDateTimeNs(0)).?);
+}
+
+test "typed cursor exclusions preserve sparse fixed and byte values across chunks" {
+    const a = std.testing.allocator;
+    var deleted = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.addRange(0, 93);
+    try deleted.addRange(120, 240);
+    for ([_]ValueType{ .u64_val, .bytes_val }) |kind| {
+        var writer = TypedDocValuesWriter.init(a, kind, 17);
+        defer writer.deinit();
+        for (0..300) |i| {
+            var buffer: [32]u8 = undefined;
+            const value: TypedValue = if (kind == .u64_val) .{ .u64_val = i } else .{ .bytes_val = try std.fmt.bufPrint(&buffer, "value-{d}", .{i}) };
+            try writer.add(@intCast(i * 2), value);
+        }
+        const bytes = try writer.build();
+        defer a.free(bytes);
+        var reader = try TypedDocValuesReader.init(a, bytes);
+        defer reader.deinit();
+        var golden = TypedDocValuesReader.Cursor.init(&reader);
+        defer golden.deinit();
+        var filtered = TypedDocValuesReader.Cursor.init(&reader);
+        defer filtered.deinit();
+        while (try golden.next()) |expected| {
+            if (deleted.contains(expected.doc_id)) continue;
+            const actual = (try filtered.nextExcluding(&deleted)).?;
+            try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+            if (kind == .u64_val) try std.testing.expectEqual(expected.value.u64_val, actual.value.u64_val) else try std.testing.expectEqualSlices(u8, expected.value.bytes_val, actual.value.bytes_val);
+        }
+        try std.testing.expect((try filtered.nextExcluding(&deleted)) == null);
+    }
 }

@@ -1429,11 +1429,22 @@ pub const AbsentRangeIterator = struct {
             const chunk_end = @min(self.upper, base + 65536);
             switch (self.bitmap.containers.items[self.chunk_idx]) {
                 .array => |values| {
-                    while (self.array_pos < values.items.len and base + values.items[self.array_pos] < self.target) self.array_pos += 1;
-                    // Consume consecutive deleted members in one run.
-                    while (self.array_pos < values.items.len and base + values.items[self.array_pos] == self.target) {
-                        self.array_pos += 1;
-                        self.target += 1;
+                    if (self.array_pos < values.items.len and base + values.items[self.array_pos] < self.target)
+                        self.array_pos += arraySearchPos(values.items[self.array_pos..], @intCast(self.target - base));
+                    if (self.array_pos < values.items.len and base + values.items[self.array_pos] == self.target) {
+                        // For sorted unique values, value - index is monotone.
+                        // Equal deltas identify the whole contiguous deleted run.
+                        const first = self.array_pos;
+                        const delta = @as(usize, values.items[first]) - first;
+                        var low = first + 1;
+                        // Isolated deletions retain constant-time navigation.
+                        var high_index = if (low < values.items.len and @as(u32, values.items[low]) == @as(u32, values.items[first]) + 1) values.items.len else low;
+                        while (low < high_index) {
+                            const mid = low + (high_index - low) / 2;
+                            if (@as(usize, values.items[mid]) - mid == delta) low = mid + 1 else high_index = mid;
+                        }
+                        self.target += low - first;
+                        self.array_pos = low;
                     }
                     if (self.target >= chunk_end) continue;
                     const end = if (self.array_pos == values.items.len) chunk_end else @min(chunk_end, base + values.items[self.array_pos]);
@@ -2445,4 +2456,19 @@ test "absent ranges match randomized membership after forward seeks" {
         }
     }
     while (cursor < 100000) : (cursor += 1) try std.testing.expect(bitmap.contains(@intCast(cursor)));
+}
+
+test "absent array ranges jump contiguous deletions and clipped seeks" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 4095);
+    var ranges = bitmap.absentRanges(0, 4096);
+    try std.testing.expectEqual(@as(u32, 4095), ranges.next().?.start);
+    try std.testing.expect(ranges.next() == null);
+    ranges = bitmap.absentRanges(0, 2000);
+    ranges.seekForward(1999);
+    try std.testing.expect(ranges.next() == null);
+    ranges = bitmap.absentRanges(0, 4096);
+    ranges.seekForward(4094);
+    try std.testing.expectEqual(@as(u32, 4095), ranges.next().?.start);
 }

@@ -45,7 +45,11 @@
     "Keep contiguous output writes; buffer fragmented small IDs into fixed 8 KiB writes. Returned values never borrow this gather scope.",
     "Seal stored-metadata append CRC tracking before body writes; intersect patches with the sealed range and reread only dirty checksum pages. Plain sinks retain the existing range-CRC contract.",
     "Use deletion rank for live-input checks with and without a prepared frozen index.",
-    "Traverse borrowed live ranges by cached Roaring container and bitmap word, with forward seeking after intact block copies. Reuse the traversal in stored-field passes and sort plans; derive streaming sort live counts from rank."
+    "Traverse borrowed live ranges by cached Roaring container and bitmap word, with forward seeking after intact block copies. Reuse the traversal in stored-field passes and sort plans; derive streaming sort live counts from rank.",
+    "Record append provenance in live spans, retaining the dense fallback for fragmented mappings; traverse live ranges during external sorting.",
+    "Prepare ordinal section descriptors once and gather up to 128 references in source order using a fixed 512-byte read buffer. Preserve requested order, duplicates, missing ordinals and all-zero section omission.",
+    "Skip fully deleted typed-value inputs and keep complement traversal across chunks; seek within validated ordered doc IDs before constructing surviving values. Compressed chunks still require decoding because this format has no chunk ID bounds.",
+    "Binary-search array-container seeks and contiguous deletion-run boundaries using monotonic value-minus-index deltas."
   ],
   "bounds": {
     "batch_documents": 128,
@@ -54,7 +58,10 @@
     "fragmented_output_buffer_bytes": 8192,
     "metadata_span_expansion_max": 4,
     "identity_span_expansion_max": 4,
-    "coordinate_read_records_max": 64
+    "coordinate_read_records_max": 64,
+    "ordinal_batch_documents": 128,
+    "ordinal_read_buffer_bytes": 512,
+    "ordinal_stack_input_descriptors": 16
   },
   "coverage": [
     "Dense, sparse-deleted and reversed IDs against individual reads; mixed input numbering and duplicate references.",
@@ -64,7 +71,9 @@
     "Empty inputs and fully/partially deleted liveness with frozen and bitmap-only navigation.",
     "File-backed sort plans fill each 128-document gather with reads of at most 64 records; in-memory plans copy their borrowed slices into the gather buffer.",
     "Long dense and reversed identities across the gather cap; mixed readers retain native gathering and packed writes.",
-    "Sparse/dense/missing Roaring containers, uint32 end boundary, forward seeks and randomized complement traversal; end-to-end merge with one surviving document."
+    "Sparse/dense/missing Roaring containers, uint32 end boundary, forward seeks and randomized complement traversal; end-to-end merge with one surviving document.",
+    "Ordinal gathers with shuffled, duplicate, sparse, mixed heap/native and absent references; sorted output and all-zero omission.",
+    "Fixed and variable-width typed-value exclusion cursors across chunks against unfiltered output; provenance range mappings across fragmentation and output boundaries."
   ],
   "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count.",
   "long_id_windows": {
@@ -88,5 +97,18 @@
     "stored_writer_membership_checks_before": 12288,
     "stored_writer_membership_checks_after": 0,
     "measurement": "Review-only isDeleted instrumentation; all three stored-field production passes."
+  },
+  "array_deleted_run_navigation": {
+    "deleted_entries": 4095,
+    "before_entry_advances": 4095,
+    "after_binary_comparisons": 11,
+    "measurement": "Review-only instrumentation of production AbsentRangeIterator; warm in-memory bitmap. These counts describe different operations, not a throughput ratio."
+  },
+  "ordinal_gather": {
+    "documents": 128,
+    "before_value_cache_probes": 256,
+    "after_value_cache_probes": 1,
+    "randomized_refs": 5120,
+    "measurement": "Native Debug production helpers: scalar SegmentReader.docOrdinal versus gatherOrdinals, with warm metadata cache. Descriptor preparation is excluded from both value-read counts."
   }
 }
