@@ -2696,3 +2696,28 @@ The canonical worktree now owns its untracked immutable Zig package cache.
 The previous symlink to a removed historical task cache was repaired using a
 verified local copy; the running historical validator points to the canonical
 cache without tracked source or HEAD changes.
+
+
+### Stable-address mutation root phases
+
+An explicitly owned mutation root can retire its physical reader while retaining
+its stable address and barrier identity. Retirement is idempotent, rejects active
+borrows, and does not consult cancellation or create execution ownership.
+Reentry acquires an independent reader with the supplied original controls and
+writer priority. Entry/post-grant rejection leaves the root retired; final release
+works in either phase without double unlocking. Controlled borrowing rejects a
+retired phase rather than using an invalid physical lease.
+
+The enclosing owner must physically join every borrower and serialize transitions
+against new borrow attempts. A zero borrow count does not prove those joins. The
+phase flag is owner-managed under that contract, not an admission protocol for
+concurrent phase transition and borrowing. CPU authority must be resumed before
+reentry acquires a new service reader.
+
+Eight focused root checks now include joined cross-worker borrower release,
+retirement/C1 parking/H1 capture with the original operation and bytes retained,
+fresh reentry alongside another operation's legacy reader, and original entry/
+post-grant rejection with physical reader rollback and healthy reuse. These are
+root primitive checks. Production callers still need explicit phase adoption,
+complete service-holder migration and actual DB/consumer validation before CPU
+lending or defaults can be enabled.

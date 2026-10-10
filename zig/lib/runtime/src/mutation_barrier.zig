@@ -70,25 +70,50 @@ pub const MutationBarrier = struct {
     pub const RootSharedLease = struct {
         barrier: *MutationBarrier,
         borrowers: std.atomic.Value(usize) = .init(0),
+        /// Phase transitions belong to the enclosing owner, after physical
+        /// borrower joins. They must not race new borrow attempts.
+        held: bool = true,
 
         /// The root must stay at a stable address until every borrower has
         /// physically joined and released. Borrowing never enters reader_gate.
         pub fn borrow(self: *@This()) SharedLease {
+            std.debug.assert(self.held);
             _ = self.borrowers.fetchAdd(1, .acq_rel);
             return .{ .barrier = self.barrier, .nested = true, .root = self };
         }
 
         pub fn borrowControlled(self: *@This(), controls: anytype) !SharedLease {
             try controls.checkpoint();
+            if (!self.held) return error.InvalidRunnableTransition;
             var lease = self.borrow();
             errdefer lease.release();
             try controls.checkpoint();
             return lease;
         }
 
+        /// Retire only the physical reader, preserving this stable address and
+        /// barrier identity for later local work. The owner must first join all
+        /// physical borrowers; a zero count alone does not prove those joins.
+        /// Mandatory retirement never checks cancellation or mints a deadline.
+        pub fn retirePhase(self: *@This()) !void {
+            if (self.borrowers.load(.acquire) != 0) return error.InvalidRunnableTransition;
+            if (!self.held) return;
+            self.barrier.unlockShared();
+            self.held = false;
+        }
+
+        /// Reentry uses the caller's original controls and writer priority.
+        /// Failure leaves the root retired and usable for final release.
+        /// Resume execution authority before attempting a new physical phase.
+        pub fn reenterPhaseControlled(self: *@This(), io: std.Io, controls: anytype) !void {
+            if (self.held or self.borrowers.load(.acquire) != 0) return error.InvalidRunnableTransition;
+            const fresh = try self.barrier.acquireSharedRootControlled(io, controls);
+            self.* = fresh;
+        }
+
         pub fn release(self: *@This()) void {
             std.debug.assert(self.borrowers.load(.acquire) == 0);
-            self.barrier.unlockShared();
+            if (self.held) self.barrier.unlockShared();
             self.* = undefined;
         }
     };

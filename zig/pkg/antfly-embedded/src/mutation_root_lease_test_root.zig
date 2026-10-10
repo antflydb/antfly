@@ -342,3 +342,119 @@ test "mutation root lease graph migration admission preserves original pass reje
         after.release();
     }
 }
+
+test "mutation root lease phase retirement preserves C1 owner through capture and fresh reentry" {
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var original: native.Execution = .{};
+    defer original.finish();
+    try original.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+    const Controls = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkLifetime();
+        }
+        pub fn executionBoundary(_: *@This()) ?Boundary {
+            return null;
+        }
+    };
+    var controls: Controls = .{ .execution = &original };
+    var barrier: Barrier = .{};
+    var root = try barrier.acquireSharedRootControlled(std.testing.io, &controls);
+    defer root.release();
+    var child = root.borrow();
+    try std.testing.expectError(error.InvalidRunnableTransition, root.retirePhase());
+    try std.testing.expect(root.held);
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    const joined = try std.Thread.spawn(.{}, Barrier.SharedLease.release, .{&child});
+    joined.join();
+    try root.retirePhase();
+    try root.retirePhase();
+    try std.testing.expect(!root.held);
+    try std.testing.expect(root.barrier == &barrier);
+    try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+    try std.testing.expectError(error.InvalidRunnableTransition, root.borrowControlled(&controls));
+    try original.park(.resource_blocked);
+    const Capture = struct {
+        scheduler: *native.Scheduler,
+        barrier: *Barrier,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.capture() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn capture(self: *@This()) !void {
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            var physical = self.barrier.tryAcquireExclusive() orelse return error.RetiredRootBlockedCapture;
+            physical.release();
+        }
+    };
+    var capture: Capture = .{ .scheduler = &scheduler, .barrier = &barrier };
+    const worker = try std.Thread.spawn(.{}, Capture.run, .{&capture});
+    worker.join();
+    if (capture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    try original.enter(.write);
+    // Another operation's legacy reader on this OS worker cannot turn a new
+    // physical phase into thread-local nesting of that unrelated operation.
+    var other = barrier.acquireShared();
+    var other_held = true;
+    defer if (other_held) other.release();
+    try root.reenterPhaseControlled(std.testing.io, &controls);
+    try std.testing.expect(root.held);
+    try std.testing.expectEqual(@as(usize, 2), barrier.reader_count);
+    var nested = try root.borrowControlled(&controls);
+    nested.release();
+    try root.retirePhase();
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    other.release();
+    other_held = false;
+    var after = barrier.tryAcquireExclusive() orelse return error.PhaseReentryLeakedReader;
+    after.release();
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+}
+
+test "mutation root lease phase reentry retains original rejection and rolls back post grant" {
+    const Controls = struct {
+        calls: usize = 0,
+        reject_at: usize = 0,
+        failure: anyerror = error.Canceled,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.reject_at != 0 and self.calls == self.reject_at) return self.failure;
+        }
+        pub fn executionBoundary(_: *@This()) ?Boundary {
+            return null;
+        }
+    };
+    var controls: Controls = .{};
+    var barrier: Barrier = .{};
+    var root = try barrier.acquireSharedRootControlled(std.testing.io, &controls);
+    defer root.release();
+    try std.testing.expectError(error.InvalidRunnableTransition, root.reenterPhaseControlled(std.testing.io, &controls));
+    try root.retirePhase();
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.Forbidden, error.SchedulerClosed }) |failure| {
+        for ([_]usize{ 1, 2 }) |reject_at| {
+            controls = .{ .reject_at = reject_at, .failure = failure };
+            try std.testing.expectError(failure, root.reenterPhaseControlled(std.testing.io, &controls));
+            try std.testing.expectEqual(reject_at, controls.calls);
+            try std.testing.expect(!root.held);
+            try std.testing.expect(root.barrier == &barrier);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+            var capture = barrier.tryAcquireExclusive() orelse return error.RejectedPhaseLeakedReader;
+            capture.release();
+        }
+    }
+    controls = .{};
+    try root.reenterPhaseControlled(std.testing.io, &controls);
+    try std.testing.expect(root.held);
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    try root.retirePhase();
+}
