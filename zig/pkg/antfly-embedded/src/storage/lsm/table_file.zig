@@ -2258,10 +2258,11 @@ pub const PrefixPointReader = struct {
         self.* = undefined;
     }
 
-    fn seek(self: *@This(), namespace_name: ?[]const u8, key: []const u8) !void {
+    fn seek(self: *@This(), namespace_name: ?[]const u8, key: []const u8, control: ?read_admission.Port) !void {
         var lo: usize = 0;
         var hi = self.view.restart_count;
         while (lo < hi) {
+            if (control) |budget| try budget.checkpoint();
             const mid = lo + (hi - lo) / 2;
             if (compareEntryTo(try prefixRestartEntry(self.view, mid), namespace_name, key) != .gt) lo = mid + 1 else hi = mid;
         }
@@ -2277,24 +2278,32 @@ pub const PrefixPointReader = struct {
     }
 
     pub fn find(self: *@This(), scratch: std.mem.Allocator, namespace_name: ?[]const u8, key: []const u8) !?BorrowedDecoded.PositionedEntry {
+        return self.findWithAdmission(scratch, namespace_name, key, null);
+    }
+
+    /// Admission is borrowed only for this lookup, including restart search
+    /// and bounded key reconstruction. A stopped reader can retry from a restart.
+    pub fn findWithAdmission(self: *@This(), scratch: std.mem.Allocator, namespace_name: ?[]const u8, key: []const u8, control: ?read_admission.Port) !?BorrowedDecoded.PositionedEntry {
         // A failed allocation may leave the byte cursor advanced. Retry from
         // the restart index, preserving only the reusable key capacity.
         errdefer self.current = null;
+        if (control) |budget| try budget.checkpoint();
         if (self.view.entry_count == 0) return null;
         if (self.current) |current| {
             switch (compareEntryTo(current.entry, namespace_name, key)) {
                 .eq => {
                     if (try tableEntryEncodedLen(current.entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    if (control) |budget| try budget.checkpoint();
                     return current;
                 },
-                .gt => try self.seek(namespace_name, key),
+                .gt => try self.seek(namespace_name, key, control),
                 .lt => if (self.upper_restart) |upper| {
-                    if (compareEntryTo(upper, namespace_name, key) != .gt) try self.seek(namespace_name, key);
+                    if (compareEntryTo(upper, namespace_name, key) != .gt) try self.seek(namespace_name, key, control);
                 },
             }
-        } else try self.seek(namespace_name, key);
+        } else try self.seek(namespace_name, key, control);
         while (self.next_entry_index < self.interval_end_index) {
-            const entry = try readPrefixBlockEntryInPlace(scratch, self.view.encoded_entries, &self.cursor, &self.key_bytes, self.max_result_bytes);
+            const entry = try readPrefixBlockEntryInPlaceWithAdmission(scratch, self.view.encoded_entries, &self.cursor, &self.key_bytes, self.max_result_bytes, control);
             self.next_entry_index += 1;
             if (self.cursor > self.interval_end_cursor or (self.next_entry_index == self.interval_end_index and self.cursor != self.interval_end_cursor)) return error.InvalidTableFile;
             const current: BorrowedDecoded.PositionedEntry = .{ .index = self.first_entry_index + self.next_entry_index - 1, .entry = entry };
@@ -2302,6 +2311,7 @@ pub const PrefixPointReader = struct {
             switch (compareEntryTo(entry, namespace_name, key)) {
                 .eq => {
                     if (try tableEntryEncodedLen(entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    if (control) |budget| try budget.checkpoint();
                     return current;
                 },
                 .gt => return null,
@@ -4510,4 +4520,45 @@ test "indexed point reader adapts dense sparse backwards repeated and missing pr
             try std.testing.expectEqual(row.entry.tombstone, found.?.entry.tombstone);
         }
     }
+}
+
+pub fn qualifyControlledPrefixPointReader(control: read_admission.Port) !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    var entries: [97]Entry = undefined;
+    var key_bytes: [96][32]u8 = undefined;
+    for (entries[0..96], 0..) |*entry, i| {
+        entry.* = .{ .namespace_name = if (i < 64) "docs" else "graph", .key = try std.fmt.bufPrint(&key_bytes[i], "shared-key:{d:0>4}", .{i}), .value = "exact", .tombstone = i % 13 == 0 };
+        try appendEntryBytesToList(a, &raw, entry.*);
+    }
+    const wide_key: [128 * 1024]u8 = @splat('z');
+    entries[96] = .{ .namespace_name = "graph", .key = &wide_key, .value = "wide" };
+    try appendEntryBytesToList(a, &raw, entries[96]);
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    var reader = try PrefixPointReader.init(payload, 700, raw.items.len);
+    defer reader.deinit(a);
+    for ([_]usize{ 0, 1, 1, 15, 16, 47, 48, 63, 64, 95, 96, 0, 83, 5, 96 }) |i| {
+        const entry = entries[i];
+        const result = reader.findWithAdmission(a, entry.namespace_name, entry.key, control);
+        const found = result catch |err| {
+            // Rejection invalidates the interrupted cursor. A fresh call can
+            // restart from the same retained payload without a dangling key.
+            try std.testing.expect(reader.current == null);
+            const retried = (try reader.find(a, entry.namespace_name, entry.key)).?;
+            try std.testing.expectEqual(700 + i, retried.index);
+            try std.testing.expectEqualStrings(entry.key, retried.entry.key);
+            try std.testing.expectEqualStrings(entry.value, retried.entry.value);
+            return err;
+        };
+        try std.testing.expectEqual(700 + i, found.?.index);
+        try std.testing.expectEqualStrings(entry.key, found.?.entry.key);
+        try std.testing.expectEqualStrings(entry.value, found.?.entry.value);
+        try std.testing.expectEqual(entry.tombstone, found.?.entry.tombstone);
+    }
+    try std.testing.expect(try reader.findWithAdmission(a, "aaa", "shared-key:0001", control) == null);
+    try std.testing.expect(try reader.findWithAdmission(a, "zzz", "shared-key:0001", control) == null);
+    try std.testing.expect(try reader.findWithAdmission(a, "docs", "shared-key:0005~", control) == null);
 }

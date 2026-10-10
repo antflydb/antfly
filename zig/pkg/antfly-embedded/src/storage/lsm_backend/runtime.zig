@@ -6862,7 +6862,7 @@ const BatchAsyncBlocks = struct {
     fn decodedPayload(self: *@This(), entry: *BatchAsyncBlock, payload: []const u8) !?[]const u8 {
         if (entry.decoded) |bytes| return bytes;
         if (!entry.checksum_validated) {
-            try lsm_table_file.validateBlockPayload(payload, entry.read.checksum);
+            try lsm_table_file.validateBlockPayloadWithAdmission(payload, entry.read.checksum, self.control);
             entry.checksum_validated = true;
         }
         if (entry.read.compression == .none) {
@@ -6883,7 +6883,7 @@ const BatchAsyncBlocks = struct {
             for (self.entries[0..self.limit]) |*idle| if (idle != entry and idle.users == 0) self.clear(idle);
         }
         if (self.decoded_bytes + decoded_len > max_decoded_bytes) return null;
-        const bytes = snappy.decode(try self.reusableAllocatorWithAdmission(self.control), payload) catch |err| switch (err) {
+        const bytes = snappy.decodeWithAdmission(try self.reusableAllocatorWithAdmission(self.control), payload, self.control) catch |err| switch (err) {
             error.OutOfMemory => {
                 // Optional cache admission must not fail an otherwise readable
                 // point or repeatedly ask the allocator for the same block.
@@ -7216,7 +7216,7 @@ fn retainLargeSingletonSnappy(
     try held_values.ensureUnusedCapacity(value_allocator, 1);
     const owned = try value_allocator.alloc(u8, read.logical_len);
     errdefer value_allocator.free(owned);
-    try snappy.decodeInto(payload, owned);
+    try snappy.decodeIntoWithAdmission(payload, owned, read.control);
     const found = (try lsm_table_file.findExactEntryInBlock(index, owned, read.block_index, namespace.name, key)) orelse return error.InvalidTableFile;
     held_values.appendAssumeCapacity(owned);
     if (read_hint) |hint| hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = found.entry.key, .entry_index = found.index };
@@ -7262,13 +7262,13 @@ fn consumeAsyncPointReadWithScratch(
                 const recycled = workspace.allocator();
                 if (prefix_allocator.ptr != recycled.ptr or prefix_allocator.vtable != recycled.vtable) pool.reclaimIdleScratch();
             }
-            const found = (reader.find(pool.prefixAllocator(owner), namespace.name, key) catch |err| fallback: {
+            const found = (reader.findWithAdmission(pool.prefixAllocator(owner), namespace.name, key, read.control) catch |err| fallback: {
                 if (err != error.OutOfMemory or pool.workspace == null or owner.prefix_allocator.?.ptr != pool.workspace.?.allocator().ptr) return err;
                 pool.clearPrefixReader(owner);
                 reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
                 owner.prefix_allocator = scratch;
                 pool.reclaimIdleScratch();
-                break :fallback try reader.find(scratch, namespace.name, key);
+                break :fallback try reader.findWithAdmission(scratch, namespace.name, key, read.control);
             }) orelse {
                 backend.recordPointRunSurvivorMiss();
                 return null;
@@ -7287,18 +7287,18 @@ fn consumeAsyncPointReadWithScratch(
     // The fallback decoder is mandatory scratch, never optional cache memory.
     // None borrows its pinned payload. Snappy scratch is freed before returning.
     const validated = if (read.shared_block) |owner| owner.checksum_validated else false;
-    if (!validated) try lsm_table_file.validateBlockPayload(payload, read.checksum);
+    if (!validated) try lsm_table_file.validateBlockPayloadWithAdmission(payload, read.checksum, read.control);
     if (try retainLargeSingletonSnappy(backend, read, index, payload, read_hint, held_values, value_allocator, namespace, key)) |result| return result;
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = switch (read.compression) {
         .none, .prefix => payload,
         .snappy => blk: {
             if (try snappy.decodedLen(payload) != read.logical_len) return error.InvalidTableFile;
-            break :blk try snappy.decode(scratch, payload);
+            break :blk try snappy.decodeWithAdmission(scratch, payload, read.control);
         },
         .prefix_snappy => blk: {
             try lsm_table_file.validatePrefixDecodedSize(payload, read.logical_len);
-            break :blk try snappy.decode(scratch, payload);
+            break :blk try snappy.decodeWithAdmission(scratch, payload, read.control);
         },
     };
     defer if (read.compression == .snappy or read.compression == .prefix_snappy) scratch.free(decoded);
@@ -7307,7 +7307,7 @@ fn consumeAsyncPointReadWithScratch(
             var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, read.logical_len);
             defer reader.deinit(scratch);
             if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
-            const found = try reader.find(scratch, namespace.name, key) orelse {
+            const found = try reader.findWithAdmission(scratch, namespace.name, key, read.control) orelse {
                 backend.recordPointRunSurvivorMiss();
                 return null;
             };
@@ -8343,13 +8343,13 @@ fn findExactEntryInCachedPrefixWithScratchWithAdmission(
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = if (window.compression == .prefix_snappy) blk: {
         try lsm_table_file.validatePrefixDecodedSize(payload, window.len);
-        break :blk try snappy.decode(scratch, payload);
+        break :blk try snappy.decodeWithAdmission(scratch, payload, control);
     } else payload;
     defer if (window.compression == .prefix_snappy) scratch.free(decoded);
     var reader = try lsm_table_file.PrefixPointReader.init(decoded, block.first_entry_index, window.len);
     defer reader.deinit(scratch);
     if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
-    const found = try reader.find(scratch, namespace.name, key) orelse return null;
+    const found = try reader.findWithAdmission(scratch, namespace.name, key, control) orelse return null;
     if (control) |budget| try budget.checkpoint();
     if (lifetime == .transaction_owned) {
         var entry = found.entry;
@@ -13600,4 +13600,43 @@ pub fn qualifyControlledUncachedReadBatch(control: read_admission.Port, local_ca
         };
         for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
     }
+}
+
+pub fn qualifyControlledLargeSnappyBatch(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-large-snappy", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    const bytes: [128 * 1024]u8 = @splat('x');
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("huge", &bytes);
+        try write.commit();
+    }
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.snappy, handle.runTableIndex().blocks[0].compression);
+    handle.release();
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, &runs);
+    defer a.free(levels);
+    const empty: State = .{};
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    var values: [2]?[]const u8 = @splat(null);
+    const result = (try readManySortedPointFromSnapshotAsyncWithAdmission(&backend, &empty, &.{}, &runs, groups, levels, a, &held, .{ .name = "docs" }, &.{ "huge", "missing" }, &values, false, .transaction_owned, null, null, control)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.misses);
+    try std.testing.expectEqualSlices(u8, &bytes, values[0].?);
+    try std.testing.expect(values[1] == null);
 }

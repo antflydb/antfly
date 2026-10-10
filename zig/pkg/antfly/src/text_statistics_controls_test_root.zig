@@ -1480,3 +1480,46 @@ test "text statistics trusted controls uncached batch stopped checkpoints retire
         }
     }
 }
+
+test "text statistics trusted controls prefix and large Snappy decode checkpoints preserve original phase and retire stopped scratch" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..2) |fixture| {
+            for ([_]usize{ 0, 1, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512 }) |stop_at| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var parent: native.Execution = .{};
+                defer parent.finish();
+                const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+                try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &parent, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const port = admission.Port.init(&payload);
+                const result = if (fixture == 0) sources.storage_lsm_table_file.qualifyControlledPrefixPointReader(port) else sources.storage_lsm_backend_runtime.qualifyControlledLargeSnappyBatch(port);
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, parent.entry.?.class);
+                try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                parent.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
