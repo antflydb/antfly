@@ -1230,20 +1230,50 @@ test "db participant recovery callbacks run outside the apply lock" {
     });
     try db.resolveTransactionIntents(txn_id, .committed, 2_000);
 
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    var barrier: Barrier = .{};
     const ReentrantResolver = struct {
         db: *DB,
+        barrier: *Barrier,
         calls: usize = 0,
 
         fn resolve(ctx: *anyopaque, resolved_txn_id: transactions_mod.TxnId, participant: []const u8, _: transactions_mod.TxnStatus, _: u64) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             try std.testing.expectEqualStrings("remote", participant);
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.RecoveryNotificationBlockedCapture;
+            capture.release();
             // This acquires the DB apply lock. It would deadlock if recovery
             // still held that lock while invoking participant callbacks.
             try self.db.markTransactionParticipantResolved(resolved_txn_id, participant);
             self.calls += 1;
         }
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedRecoveryPublication;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
     };
-    var resolver = ReentrantResolver{ .db = &db };
+    var resolver = ReentrantResolver{ .db = &db, .barrier = &barrier };
+    // Bind capture admission after the transaction's local resolution. This
+    // pass only delivers an existing decision and guards ACK/cleanup stages.
+    db.local_execution.replication_async_effect_mirror = .{ .publisher = resolver.publisher(), .mutation_barrier = &barrier };
+    defer db.local_execution.replication_async_effect_mirror = null;
     const stats = try server_recovery.runDbRecoveryOnce(&db, .{
         .enabled = true,
         .lease_owned = true,

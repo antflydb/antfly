@@ -5950,6 +5950,12 @@ pub const DB = struct {
         self.closed = true;
     }
 
+    /// Check policy before a recovery pass. Physical mutation leases belong to
+    /// each local stage and must not span remote participant notifications.
+    pub fn checkTransactionRecoveryAdmission(self: *DB) !void {
+        try self.enforceReplicationWriteGate();
+    }
+
     /// Admit an external recovery pass without exposing write-gate policy.
     pub fn admitTransactionRecovery(self: *DB) !?MutationBarrier.SharedLease {
         var lease = self.acquireReplicationMutationShared();
@@ -5963,6 +5969,9 @@ pub const DB = struct {
     }
 
     pub fn recoverLocalTransactionRecords(self: *DB, cutoff_ns: u64, now_ns: u64) !transactions_mod.RecoveryStats {
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         return try self.core.recoverTransactions(cutoff_ns, now_ns);
@@ -26383,13 +26392,9 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
-        var replication_mutation = self.acquireReplicationMutationShared();
-        defer if (replication_mutation) |*lease| lease.release();
-        try self.enforceReplicationWriteGate();
+        try self.checkTransactionRecoveryAdmission();
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        var recovery_stats = try self.core.recoverTransactions(cutoff_timestamp, resolution_timestamp);
+        var recovery_stats = try self.recoverLocalTransactionRecords(cutoff_timestamp, resolution_timestamp);
         recovery_stats.resolved_finalized += resolved_finalized;
         return recovery_stats;
     }

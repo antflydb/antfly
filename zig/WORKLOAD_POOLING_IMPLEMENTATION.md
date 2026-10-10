@@ -2554,3 +2554,34 @@ The dedicated recovery receiver cannot replace ordinary DB batch callbacks,
 which retain resident completion behavior. Mandatory completion authority and
 release before remote durability waits remain requirements. CPU transfer inside
 retained service holders and pooling defaults remain disabled/unqualified.
+
+
+### Recovery notifications release capture admission
+
+The one-shot DB recovery pass checks write policy at entry without holding a
+mutation reader across participant callbacks. Finalized intent resolution keeps
+its existing local mutation guards. Participant acknowledgement already acquires
+its own guard and rechecks write policy; local presumed-abort/record cleanup now
+also does so. `DB.recoverTransactions` uses the same separately guarded stages.
+A remote notification can therefore make checkpoint capture progress while a
+durable decision and unresolved participant debt remain in storage.
+
+Two focused tests execute the production notification loop against an actual
+memory-backed transaction manager with guarded fixture DB stages. A physically
+joined control worker captures the real barrier while the original background
+execution is parked at C1/H1; its original operation and 23-byte charge remain
+until retirement. Delivery failure and authority closure before ACK preserve
+the committed decision and unresolved participant, followed by a healthy retry.
+The actual DB integration fixture also binds a real replication mutation barrier
+and requires capture inside its reentrant notification callback. That separately
+compiled fixture remains a cumulative integration gate, not covered by the thin
+fixture count. This does not complete resolution/outbox CPU ownership migration
+or qualify defaults.
+
+All ongoing implementation uses `.worktrees/workload-scheduling` on
+`codex/workload-scheduling`, targeting PR #849. Per-step worktrees and branches
+are no longer created. Existing compiler snapshots remain read-only until their
+validators terminate, after which superseded worktrees can be removed. The
+previous local PR branch tip is preserved in
+`refs/archive/workload-scheduling-before-consolidation` for reconciliation before
+publication; this local consolidation does not update the remote PR.

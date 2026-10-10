@@ -2570,6 +2570,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")
         .dependOn(&b.addRunArtifact(maintenance_shutdown_admission_tests).step);
 
+    const recovery_notification_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/recovery_notification_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, recovery_notification_root, true, true);
+    recovery_notification_root.addImport("antfly_source_root", recovery_notification_root);
+    const recovery_notification_tests = b.addTest(.{
+        .name = "recovery-notification-tests",
+        .root_module = recovery_notification_root,
+        .filters = &.{"transaction recovery notification"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-recovery-notification-test", "Verify recovery releases capture admission during participant notification and retains durable debt")
+        .dependOn(&b.addRunArtifact(recovery_notification_tests).step);
+
     const mutation_root_lease_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/mutation_root_lease_test_root.zig"),
         .target = target,
