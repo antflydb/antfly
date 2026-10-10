@@ -8831,7 +8831,7 @@ pub const DataServer = struct {
         // activity mutex) lets those requests publish completion without a
         // lock cycle, while keeping continuous traffic from reopening the
         // promoted cache-owner race between preflight and the global freeze.
-        var table_request_admission = try self.write_source.acquireHotStandbySeedTableRequestAdmissionLease();
+        var table_request_admission = try self.write_source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(if (control != null) &admission else null);
         defer table_request_admission.release();
 
         // The production provider snapshots live managed DBs. Drain their

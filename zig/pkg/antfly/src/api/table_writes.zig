@@ -10883,6 +10883,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginTableRequestLocked(table_name);
     }
 
+    fn beginTableRequestControlled(self: *ProvisionedTableWriteSource, table_name: []const u8, controls: anytype) !void {
+        const io = self.tableActivityIo();
+        try controls.checkpoint();
+        while (!self.table_activity_mutex.tryLock()) try controls.waitForProgress();
+        defer self.table_activity_mutex.unlock(io);
+        while (true) {
+            try controls.checkpoint();
+            var blocked = self.hot_standby_seed_table_request_admission_closed;
+            if (self.findTableActivityLocked(table_name, null)) |index| {
+                const entry = self.active_table_activities.items[index];
+                blocked = blocked or entry.structural_active or entry.structural_waiters > 0 or entry.structural_reconcile_active or entry.structural_reconcile_queued > 0 or entry.structural_reconcile_waiters > 0 or entry.restore_preparations > 0;
+            }
+            if (blocked) {
+                try @import("group_admission_wait.zig").wait(io, &self.table_activity_mutex, &self.table_activity_ready, controls);
+                continue;
+            }
+            self.activityEntryLocked(table_name, null).table_request_active += 1;
+            return;
+        }
+    }
+
     fn tryBeginTableRequest(self: *ProvisionedTableWriteSource, table_name: []const u8) bool {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
@@ -15561,8 +15582,12 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub fn acquireHotStandbySeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HotStandbySeedTableRequestAdmissionLease {
+        return self.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(null);
+    }
+
+    pub fn acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(self: *ProvisionedTableWriteSource, admission: ?*@import("../storage/hot_standby/operation_admission.zig").Session) !HotStandbySeedTableRequestAdmissionLease {
         const io = self.tableActivityIo();
-        self.table_activity_mutex.lockUncancelable(io);
+        if (admission) |original| try original.lockActivity(io, &self.table_activity_mutex) else self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
         if (self.hot_standby_seed_table_request_admission_closed)
             return error.HASeedCaptureAlreadyInProgress;
@@ -15573,16 +15598,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         while (true) {
+            if (admission) |original| try original.checkpoint();
             var active = false;
             for (self.active_table_activities.items) |activity| {
+                if (admission) |original| try original.checkpoint();
                 if (activity.table_request_active > 0) {
                     active = true;
                     break;
                 }
             }
             if (!active) break;
-            self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
+            if (admission) |original|
+                try original.waitActivity(io, &self.table_activity_mutex, &self.table_activity_ready)
+            else
+                self.table_activity_ready.waitUncancelable(io, &self.table_activity_mutex);
         }
+        if (admission) |original| try original.checkpoint();
         self.table_activity_mutex.unlock(io);
         return .{ .source = self };
     }
@@ -22476,7 +22507,8 @@ pub const ProvisionedTableWriteSource = struct {
             // it would report success without evaluating the predicate.
             return null;
         }
-        self.beginTableRequest(table_req.table_name);
+        var table_admission = @import("group_admission_wait.zig").preDecision(pre_decision, self.tableActivityIo());
+        try self.beginTableRequestControlled(table_req.table_name, &table_admission);
         defer self.endTableRequest(table_req.table_name);
 
         var routing = (try table_catalog.transactionRoutingSnapshotWithBudget(
@@ -36021,6 +36053,214 @@ fn consumerTests() type {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
             thread.await(std.testing.io);
+        }
+
+        test "HA controlled table request admission gives C1 writers and capture CPU through both drain directions" {
+            const NoCatalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const runtime = @import("antfly_runtime_abi");
+            const ha = @import("../storage/hot_standby/operation_admission.zig");
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-ha-controlled-drain", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = NoCatalog.snapshot, .free_admin_snapshot = NoCatalog.free } });
+            defer source.deinit();
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var writer: native.Execution = .{};
+            defer writer.finish();
+            var capture: native.Execution = .{};
+            defer capture.finish();
+            try writer.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .write);
+            source.beginTableRequest("docs");
+            var request_held = true;
+            defer if (request_held) source.endTableRequest("docs");
+            try writer.park(.resource_blocked);
+            try capture.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .background);
+            const State = struct {
+                source: *ProvisionedTableWriteSource,
+                scheduler: *native.Scheduler,
+                waiter: *native.Execution,
+                holder: *native.Execution,
+                reservation: ?*ProvisionedTableWriteSource.HotStandbySeedTableRequestAdmissionLease = null,
+                request_held: *bool,
+                parks: usize = 0,
+                resumes: usize = 0,
+                fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.waiter.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
+                fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    @panic("unexpected yielding checkpoint");
+                }
+                fn current(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    out.* = @intCast(@backingInt(self.waiter.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
+                    return .ok;
+                }
+                fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(reason == @backingInt(runtime.runnable_abi.Wait.resource));
+                    self.parks += 1;
+                    self.waiter.park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+                    std.debug.assert(self.scheduler.stats().operations == 2 and self.scheduler.stats().runnable_slots == 0);
+                    self.holder.enter(if (self.reservation != null) .background else .write) catch |err| return runtime.error_abi.statusFromError(err);
+                    var health: native.Execution = .{};
+                    defer health.finish();
+                    health.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control) catch |err| return runtime.error_abi.statusFromError(err);
+                    std.debug.assert(self.scheduler.stats().runnable_slots == 2);
+                    return .ok;
+                }
+                fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    // The accepted writer or capture can publish retirement
+                    // while the waiter is acquiring CPU, with the mutex free.
+                    std.debug.assert(self.source.table_activity_mutex.tryLock());
+                    self.source.table_activity_mutex.unlock(self.source.tableActivityIo());
+                    std.debug.assert(self.source.hot_standby_seed_table_request_admission_closed);
+                    if (self.reservation) |reservation| reservation.release() else {
+                        self.source.endTableRequest("docs");
+                        self.request_held.* = false;
+                    }
+                    self.holder.finish();
+                    self.resumes += 1;
+                    const phase = std.enums.fromInt(native.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                    self.waiter.enter(phase) catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
+                fn borrow(self: *@This(), class: runtime.runnable_abi.Class) runtime.runnable_abi.Borrowed {
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(class), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter };
+                }
+            };
+            var state: State = .{ .source = &source, .scheduler = &scheduler, .waiter = &capture, .holder = &writer, .request_held = &request_held };
+            const io = std.testing.io;
+            var capture_admission: ha.Session = .{};
+            try capture_admission.bind(.{ .io = runtime.io_abi.Borrow.init(&io), .execution = state.borrow(.background) });
+            var reservation = try source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(&capture_admission);
+            defer reservation.release();
+            try std.testing.expect(source.hot_standby_seed_table_request_admission_closed);
+            try std.testing.expectEqual(@as(usize, 1), state.parks);
+            try std.testing.expectEqual(state.parks, state.resumes);
+            try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+            try capture.park(.resource_blocked);
+            var later: native.Execution = .{};
+            defer later.finish();
+            try later.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 31 }, .write);
+            state = .{ .source = &source, .scheduler = &scheduler, .waiter = &later, .holder = &capture, .reservation = &reservation, .request_held = &request_held };
+            var late_admission = @import("group_admission_wait.zig").preDecision(.{ .execution_runnable = state.borrow(.write) }, source.tableActivityIo());
+            try source.beginTableRequestControlled("docs", &late_admission);
+            request_held = true;
+            try std.testing.expectEqual(@as(usize, 1), state.parks);
+            try std.testing.expectEqual(state.parks, state.resumes);
+            try std.testing.expect(!source.hot_standby_seed_table_request_admission_closed);
+            try std.testing.expectEqual(@as(usize, 1), source.active_table_activities.items[0].table_request_active);
+            try std.testing.expectEqual(@as(u64, 31), scheduler.stats().retained_bytes);
+            source.endTableRequest("docs");
+            request_held = false;
+            later.finish();
+            try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+
+        test "HA controlled table request admission rejection retires only its own reservation and waiter" {
+            const NoCatalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            const runtime = @import("antfly_runtime_abi");
+            const ha = @import("../storage/hot_standby/operation_admission.zig");
+            const State = struct {
+                source: *ProvisionedTableWriteSource,
+                cause: anyerror,
+                external_lock: bool = false,
+                parks: usize = 0,
+                resumes: usize = 0,
+                fn life(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    return .ok;
+                }
+                fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    @panic("unexpected yielding checkpoint");
+                }
+                fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                    out.* = @backingInt(runtime.runnable_abi.Class.background);
+                    return .ok;
+                }
+                fn park(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.parks += 1;
+                    return .ok;
+                }
+                fn enter(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.external_lock) {
+                        std.debug.assert(!self.source.table_activity_mutex.tryLock());
+                    } else {
+                        std.debug.assert(self.source.table_activity_mutex.tryLock());
+                        self.source.table_activity_mutex.unlock(self.source.tableActivityIo());
+                    }
+                    self.resumes += 1;
+                    return runtime.error_abi.statusFromError(self.cause);
+                }
+                fn borrow(self: *@This()) runtime.runnable_abi.Borrowed {
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.background), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter };
+                }
+            };
+            const io = std.testing.io;
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+                var source = ProvisionedTableWriteSource.init("/tmp/unused-ha-drain-rejection", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = NoCatalog.snapshot, .free_admin_snapshot = NoCatalog.free } });
+                defer source.deinit();
+                source.beginTableRequest("docs");
+                var active = true;
+                defer if (active) source.endTableRequest("docs");
+                var state: State = .{ .source = &source, .cause = cause };
+                var admission: ha.Session = .{};
+                try admission.bind(.{ .io = runtime.io_abi.Borrow.init(&io), .execution = state.borrow() });
+                try std.testing.expectError(cause, source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(&admission));
+                try std.testing.expect(!source.hot_standby_seed_table_request_admission_closed);
+                try std.testing.expectEqual(@as(usize, 1), source.active_table_activities.items[0].table_request_active);
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                try std.testing.expectEqual(state.parks, state.resumes);
+                try std.testing.expectError(cause, source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(&admission));
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                source.endTableRequest("docs");
+                active = false;
+                var reservation = try source.acquireHotStandbySeedTableRequestAdmissionLease();
+                defer reservation.release();
+                state = .{ .source = &source, .cause = cause };
+                var incoming = @import("group_admission_wait.zig").preDecision(.{ .execution_runnable = state.borrow() }, source.tableActivityIo());
+                try std.testing.expectError(cause, source.beginTableRequestControlled("later", &incoming));
+                try std.testing.expect(source.hot_standby_seed_table_request_admission_closed);
+                try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                try std.testing.expectEqual(state.parks, state.resumes);
+                try std.testing.expectError(cause, source.beginTableRequestControlled("later", &incoming));
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                reservation.release();
+                try std.testing.expect(source.tryBeginTableRequest("later"));
+                source.endTableRequest("later");
+                try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+                state = .{ .source = &source, .cause = cause, .external_lock = true };
+                var initial: ha.Session = .{};
+                try initial.bind(.{ .io = runtime.io_abi.Borrow.init(&io), .execution = state.borrow() });
+                try std.testing.expect(source.table_activity_mutex.tryLock());
+                var externally_held = true;
+                defer if (externally_held) source.table_activity_mutex.unlock(source.tableActivityIo());
+                try std.testing.expectError(cause, source.acquireHotStandbySeedTableRequestAdmissionLeaseWithAdmission(&initial));
+                try std.testing.expect(!source.table_activity_mutex.tryLock());
+                try std.testing.expect(!source.hot_standby_seed_table_request_admission_closed);
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                try std.testing.expectEqual(state.parks, state.resumes);
+                source.table_activity_mutex.unlock(source.tableActivityIo());
+                externally_held = false;
+            }
         }
 
         test "HA seed request admission drains accepted writes and closes the preflight race" {

@@ -75,6 +75,8 @@ class LiteralSourceOwnership(unittest.TestCase):
             "api_table_writes_test_root.zig",
             "data_runtime_test_root.zig",
             "participant_fanout_control_test_root.zig",
+            "ha_table_request_admission_test_root.zig",
+            "ha_operation_admission_test_root.zig",
             "relational_source_contract_test_root.zig",
         ]
         for name in roots:

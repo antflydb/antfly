@@ -143,7 +143,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "semantic query planning reuses equivalent embeddings across tables and isolates principals",
             "api http server serves retrieval agent response envelope",
         },
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        // Native qualification measured 19.61 GB on macOS; keep this
+        // compiler within the serialized 32 GiB build envelope.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const retrieval_read_owner_run = b.addRunArtifact(retrieval_read_owner_tests);
@@ -2419,6 +2421,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-mutation-service-admission-test", "Verify original mutation admission rejects before effects and releases real DB fences")
         .dependOn(&b.addRunArtifact(mutation_service_admission_tests).step);
+
+    const ha_table_request_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/ha_table_request_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, ha_table_request_admission_root);
+    ha_table_request_admission_root.addImport("antfly_source_root", ha_table_request_admission_root);
+    ha_table_request_admission_root.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const ha_table_request_admission_tests = b.addTest(.{
+        .name = "ha-table-request-admission-tests",
+        .root_module = ha_table_request_admission_root,
+        .filters = &.{"HA controlled table request admission"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-ha-table-request-admission-test", "Verify actual HA table request drain and closed admission with C1 CPU progress")
+        .dependOn(&b.addRunArtifact(ha_table_request_admission_tests).step);
 
     const ha_operation_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/ha_operation_admission_test_root.zig"),

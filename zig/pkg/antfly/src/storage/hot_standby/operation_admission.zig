@@ -31,6 +31,18 @@ pub const Session = struct {
         self.budget = .{ .controls = .{ .original = control.execution, .execution_runnable = control.execution }, .io = self.receiver.io() };
         try self.budget.checkpoint();
     }
+    pub fn checkpoint(self: *Session) !void {
+        try self.budget.checkpoint();
+    }
+    pub fn lockActivity(self: *Session, io: std.Io, mutex: *std.Io.Mutex) !void {
+        try self.budget.checkpoint();
+        while (!mutex.tryLock()) try self.budget.waitForProgress();
+        errdefer mutex.unlock(io);
+        try self.budget.checkpoint();
+    }
+    pub fn waitActivity(self: *Session, io: std.Io, mutex: *std.Io.Mutex, condition: *std.Io.Condition) !void {
+        try @import("../../api/group_admission_wait.zig").wait(io, mutex, condition, &self.budget);
+    }
     pub fn acquireExclusive(self: *Session, barrier: *runtime.mutation_barrier.MutationBarrier) !runtime.mutation_barrier.MutationBarrier.ExclusiveLease {
         return barrier.acquireExclusiveControlled(self.budget.io, &self.budget);
     }
