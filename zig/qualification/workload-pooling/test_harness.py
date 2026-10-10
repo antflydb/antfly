@@ -466,5 +466,166 @@ class RunnableQualificationTests(unittest.TestCase):
             self.assertFalse(compare(baseline, changed)["passed"])
 
 
+class ConcurrencySweepTests(unittest.TestCase):
+    def test_sweep_preserves_limits_and_declares_per_worker_pressure(self):
+        import json
+        import pathlib
+        from run_sweep import sweep_manifest, CONCURRENCIES
+
+        manifest = json.loads(
+            pathlib.Path(__file__).with_name("linux-runnable-pressure.json").read_text()
+        )
+        original = copy.deepcopy(manifest)
+        self.assertEqual((1, 5, 10, 20, 30, 40, 60, 80, 160), CONCURRENCIES)
+        for concurrency in CONCURRENCIES:
+            point = sweep_manifest(manifest, concurrency)
+            self.assertEqual(concurrency, point["client_workers"])
+            for field in (
+                "process_limits",
+                "container_limits",
+                "max_pending_clients",
+                "retained_pressure",
+                "configuration",
+                "candidate_configuration",
+                "runnable_policy",
+            ):
+                self.assertEqual(manifest[field], point[field])
+            for before, after in zip(manifest["phases"], point["phases"]):
+                self.assertEqual(before["thresholds"], after["thresholds"])
+                ratio = (
+                    1
+                    if before.get("workload") == "cheap"
+                    else concurrency / manifest["client_workers"]
+                )
+                self.assertEqual(
+                    before["offered_per_second"] * ratio, after["offered_per_second"]
+                )
+        self.assertEqual(original, manifest)
+        for concurrency in (0, -1, 257, True):
+            with self.assertRaises(ValueError):
+                sweep_manifest(manifest, concurrency)
+
+    def test_offered_write_starvation_cannot_pass_with_query_success(self):
+        from load_clients import runnable_evidence_failures
+
+        measured = RunnableQualificationTests().measured()
+        measured["by_kind"]["write"].update(offered=10, successful=0)
+        measured["runnable_diagnostics"]["grants"][1] = 0
+        failures = runnable_evidence_failures(
+            measured, {"slots": 4, "cleanup_slots": 1}
+        )
+        self.assertIn("offered write work completed no successful operation", failures)
+
+    def test_client_activity_records_peak_and_exact_retirement(self):
+        from load_clients import ClientActivity
+        import threading
+
+        activity = ClientActivity()
+        ready = threading.Barrier(5)
+        release = threading.Event()
+
+        def worker():
+            activity.start()
+            ready.wait()
+            release.wait()
+            activity.finish()
+
+        workers = [threading.Thread(target=worker) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        ready.wait(timeout=5)
+        try:
+            self.assertEqual((4, 4), activity.snapshot())
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(timeout=5)
+        self.assertEqual((0, 4), activity.snapshot())
+        with self.assertRaises(RuntimeError):
+            activity.finish()
+
+    def test_preparation_records_every_point_without_claiming_measurement(self):
+        import json
+        import pathlib
+        import tempfile
+        import run_sweep
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "sweep"
+            manifest = pathlib.Path(__file__).with_name("linux-runnable-pressure.json")
+            with patch(
+                "sys.argv",
+                [
+                    "run_sweep",
+                    "--manifest",
+                    str(manifest),
+                    "--output-dir",
+                    str(output),
+                    "--prepare-only",
+                ],
+            ):
+                self.assertEqual(0, run_sweep.main())
+            summary = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(9, len(summary["points"]))
+            self.assertFalse(summary["passed"])
+            self.assertFalse(summary["measured"])
+            self.assertFalse(summary["automatic_defaults_qualified"])
+            self.assertTrue(
+                all(point["state"] == "prepared" for point in summary["points"])
+            )
+
+    def test_missing_or_failed_matrix_cannot_pass_and_does_not_skip_later_points(self):
+        import json
+        import pathlib
+        import tempfile
+        import run_sweep
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "sweep"
+            manifest = pathlib.Path(__file__).with_name("linux-runnable-pressure.json")
+            calls = []
+
+            def run(argv):
+                calls.append(argv)
+                target = pathlib.Path(argv[argv.index("--output-dir") + 1])
+                if len(calls) != 1:
+                    target.mkdir()
+                    (target / "matrix.json").write_text(
+                        json.dumps({"passed": len(calls) != 2})
+                    )
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "run_sweep",
+                        "--manifest",
+                        str(manifest),
+                        "--output-dir",
+                        str(output),
+                        "--candidate",
+                        "/candidate",
+                        "--baseline",
+                        "/main",
+                    ],
+                ),
+                patch("run_sweep.subprocess.run", side_effect=run),
+            ):
+                self.assertEqual(1, run_sweep.main())
+            summary = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(9, len(calls))
+            self.assertFalse(summary["passed"])
+            self.assertFalse(summary["measured"])
+            self.assertFalse(summary["automatic_defaults_qualified"])
+            self.assertTrue(
+                all(point["state"] == "terminal" for point in summary["points"])
+            )
+            self.assertFalse(summary["points"][0]["passed"])
+            self.assertFalse(summary["points"][1]["passed"])
+            self.assertTrue(summary["points"][-1]["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

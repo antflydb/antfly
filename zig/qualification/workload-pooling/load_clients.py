@@ -45,6 +45,7 @@ def workload_breakdown(results, offered, dropped, elapsed):
             statuses[code] = statuses.get(code, 0) + 1
         kinds[kind] = dict(
             offered=count,
+            submitted=count - dropped.get(kind, 0),
             completed=len(selected),
             generator_dropped=dropped.get(kind, 0),
             successful=len(successful),
@@ -85,10 +86,33 @@ def admission_diagnostics(before, after):
     return delta
 
 
+class ClientActivity:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+
+    def start(self):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+
+    def finish(self):
+        with self.lock:
+            if self.active == 0:
+                raise RuntimeError("client activity retired without a matching start")
+            self.active -= 1
+
+    def snapshot(self):
+        with self.lock:
+            return self.active, self.peak
+
+
 def run_phase(target, phase, manifest, pid):
     # A full client envelope drops the offered operation immediately. This is
     # counted separately from server rejection and never silently retried.
     slots = threading.BoundedSemaphore(manifest["max_pending_clients"])
+    activity = ClientActivity()
     results, resources, controls = [], [], []
     peers, peers_lock = [], threading.Lock()
     local = threading.local()
@@ -109,6 +133,7 @@ def run_phase(target, phase, manifest, pid):
                 )
 
     def operation(index, scheduled):
+        activity.start()
         result = {
             "offered_at_seconds": scheduled - started,
             "kind": operation_kind(index, phase.get("workload", "mixed") == "mixed"),
@@ -217,6 +242,7 @@ def run_phase(target, phase, manifest, pid):
                 local.peer.close()
         finally:
             result["end_to_end_seconds"] = time.monotonic() - scheduled
+            activity.finish()
             slots.release()
         return result
 
@@ -249,6 +275,9 @@ def run_phase(target, phase, manifest, pid):
         monitor.join()
         for peer in peers:
             peer.close()
+    active, peak = activity.snapshot()
+    if active != 0 or peak > manifest["client_workers"]:
+        raise RuntimeError("client concurrency did not retire within its envelope")
     elapsed = time.monotonic() - started
     cpu_seconds = sample(pid)["cpu_seconds"] - cpu_before
     workload_after = workload_snapshot(target, require_waiting=True)
@@ -261,6 +290,9 @@ def run_phase(target, phase, manifest, pid):
     return dict(
         name=phase["name"],
         offered=offered,
+        client_workers=manifest["client_workers"],
+        active_clients_peak=peak,
+        client_workers_used=len(peers),
         submitted=len(futures),
         generator_dropped=dropped,
         completed=len(results),
@@ -392,6 +424,11 @@ def runnable_evidence_failures(measured, policy, minimum_yields=0):
         failures.append("successful queries did not acquire runnable grants")
     if kinds.get("write", {}).get("successful", 0) and diagnostics["grants"][1] == 0:
         failures.append("successful writes did not acquire runnable grants")
+    for kind, count in kinds.items():
+        if count.get("offered", 0) > 0 and count.get("successful", 0) == 0:
+            failures.append(
+                "offered " + kind + " work completed no successful operation"
+            )
     if diagnostics["yields"] < minimum_yields:
         failures.append("runnable yielding was not exercised")
     return failures
@@ -541,6 +578,14 @@ def main():
             ):
                 failures.append(
                     phase["name"] + ": operation accounting did not reconcile"
+                )
+            if any(
+                kind["submitted"] != kind["completed"]
+                or kind["offered"] != kind["submitted"] + kind["generator_dropped"]
+                for kind in measured["by_kind"].values()
+            ):
+                failures.append(
+                    phase["name"] + ": per-kind operation accounting did not reconcile"
                 )
             if measured["successful_per_second"] < limits["successful_per_second_min"]:
                 failures.append(phase["name"] + ": successful throughput below floor")

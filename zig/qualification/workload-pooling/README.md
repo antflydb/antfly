@@ -224,3 +224,34 @@ This profile has not yet passed a current-source runtime matrix. It does not
 complete the concurrency sweep, inference/background fairness, distributed
 progress, durability, or automatic sizing gates. Runtime receipts are required
 before drawing performance conclusions or enabling defaults.
+
+
+## Declared concurrency sweep
+
+`run_sweep.py` creates distinct hashed manifests for client worker ceilings
+1, 5, 10, 20, 30, 40, 60, 80 and the overload point 160, then runs all four
+variants at every point. Mixed burst/overload offer rates scale with worker count
+from the reference profile, keeping the offered rate per worker fixed. Cheap
+low-load/recovery rates, warmup, retained peers, server policy, the pending-client
+bound, resource limits and every existing acceptance threshold stay fixed.
+This is a client worker ceiling; phase receipts report the observed active-client
+peak and workers actually used rather than assuming every worker ran at once.
+Per-kind receipts reconcile offered, submitted, completed and dropped work.
+The runnable variant fails if any offered workload kind has no successful work.
+
+Prepare and inspect the complete declarations before measurement:
+
+```sh
+python3 zig/qualification/workload-pooling/run_sweep.py \
+  --manifest zig/qualification/workload-pooling/linux-runnable-pressure.json \
+  --prepare-only --output-dir /tmp/declared-runnable-sweep
+```
+
+Use a different fresh directory for measurement, supplying `--candidate` and
+`--baseline` instead of `--prepare-only`. Four repetitions rotate every variant
+through every position. Each point retains its own matrix and failures; an early
+failure does not skip later points. Preparation is explicitly unmeasured and
+cannot pass qualification. Missing or failed matrix receipts fail the sweep.
+A point with generator drops fails its existing envelope gate; receipts must be
+reviewed before changing any future workload declaration. No current-source
+sweep has passed, and automatic defaults remain unqualified.
