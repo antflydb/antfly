@@ -598,7 +598,11 @@ pub const ConcurrentBlockCache = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const oldest = self.victim(offset) orelse return;
-        if (oldest.valid_len != 0 and oldest.offset == offset and oldest.valid_len >= length) return;
+        if (oldest.valid_len != 0 and oldest.offset == offset and oldest.valid_len >= length) {
+            self.cache.clock +%= 1;
+            oldest.age = self.cache.clock;
+            return;
+        }
         if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
             if (self.budget == null or !self.budget.?.budget_denied) return err;
             return;

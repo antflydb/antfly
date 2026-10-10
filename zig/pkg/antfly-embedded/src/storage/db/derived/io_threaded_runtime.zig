@@ -265,6 +265,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     // Claims exclude duplicate cleanup; completion alone releases backlog credit.
     last_claimed_truncate_sequence: u64 = 0,
     last_truncated_sequence: u64 = 0,
+    // Shared cleanup backoff survives worker yields and foreground wakes.
+    truncate_retry_not_before_ns: u64 = 0,
+    truncate_retry_backoff: catch_up_policy.RecoverableRetryBackoff = .{},
     force_catch_up_sequence: u64 = 0,
     last_notified_sequence: u64 = 0,
     truncates_in_flight: usize = 0,
@@ -500,6 +503,26 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.unlock(io);
         errdefer self.resumeWorker(name);
         if (close_failed) return RuntimeError.AsyncWorkerFailed;
+        // Structural callers drain cleanup without occupying a shared scheduler
+        // slot. Keep this paused worker in the retention set until completion.
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            const stopping = self.shutdown or worker.stop;
+            const pending = self.computeMinPersistedLocked() > self.last_truncated_sequence;
+            const delay = self.truncate_retry_not_before_ns -| platform_time.monotonicNs();
+            self.mutex.unlock(io);
+            if (stopping) return error.WorkerStopping;
+            if (!pending) break;
+            if (delay > 0) {
+                io.sleep(Io.Duration.fromNanoseconds(@intCast(delay)), .awake) catch {};
+            } else {
+                _ = persistIdleAppliedSequence(self, worker, worker.applied_sequence, io) catch |err| {
+                    self.recordError(io, worker, "pause_truncate", err);
+                    return err;
+                };
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+        }
         _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
             self.recordError(io, worker, "pause_close_session", err);
             return err;
@@ -780,6 +803,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.last_truncated_sequence = @max(self.last_truncated_sequence, truncate_sequence);
                     self.backlog.releaseThrough(truncate_sequence);
                     self.truncates_in_flight -= 1;
+                    self.truncate_retry_not_before_ns = 0;
+                    self.truncate_retry_backoff.reset();
                     self.cond.broadcast(io);
                 }
                 return;
@@ -899,6 +924,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.last_truncated_sequence = @max(self.last_truncated_sequence, truncate_sequence);
                     self.backlog.releaseThrough(truncate_sequence);
                     self.truncates_in_flight -= 1;
+                    self.truncate_retry_not_before_ns = 0;
+                    self.truncate_retry_backoff.reset();
                     self.cond.broadcast(io);
                 }
                 return;
@@ -998,6 +1025,12 @@ fn workerMain(worker: *Worker) void {
                 (runtime.truncates_in_flight == 0 and runtime.computeMinPersistedLocked() > runtime.last_claimed_truncate_sequence))
             {
                 const sequence = worker.applied_sequence;
+                const cleanup_delay = runtime.truncate_retry_not_before_ns -| platform_time.monotonicNs();
+                if (worker.applied_sequence <= worker.persisted_sequence and cleanup_delay > 0) {
+                    worker.next_delay_ms = delayMilliseconds(cleanup_delay);
+                    runtime.mutex.unlock(io);
+                    return;
+                }
                 runtime.mutex.unlock(io);
                 const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
                     if (err == error.WorkerStopping) return;
@@ -1010,7 +1043,10 @@ fn workerMain(worker: *Worker) void {
                 };
                 worker.recoverable_retry_backoff.reset();
                 worker.retry_not_before_ns = 0;
-                worker.next_delay_ms = if (persisted) 0 else 50;
+                runtime.mutex.lockUncancelable(io);
+                const remaining = runtime.truncate_retry_not_before_ns -| platform_time.monotonicNs();
+                runtime.mutex.unlock(io);
+                worker.next_delay_ms = if (remaining > 0) delayMilliseconds(remaining) else if (persisted) 0 else 50;
                 return;
             }
             if (!worker.catch_up_open) {
@@ -1221,7 +1257,7 @@ fn workerMain(worker: *Worker) void {
         if (persisted and caught_up_sequence > worker.persisted_sequence) {
             worker.persisted_sequence = caught_up_sequence;
         }
-        if (runtime.truncates_in_flight == 0 and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
+        if (runtime.truncates_in_flight == 0 and platform_time.monotonicNs() >= runtime.truncate_retry_not_before_ns and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
             const min_persisted = runtime.computeMinPersistedLocked();
             if (min_persisted > runtime.last_claimed_truncate_sequence) {
                 runtime.last_claimed_truncate_sequence = min_persisted;
@@ -1243,22 +1279,10 @@ fn workerMain(worker: *Worker) void {
         }
 
         if (truncate_sequence > 0) {
-            truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
-                runtime.mutex.lockUncancelable(io);
-                runtime.truncates_in_flight -= 1;
-                runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
-                runtime.cond.broadcast(io);
-                runtime.mutex.unlock(io);
-                if (err == error.WorkerStopping) return;
+            completeWorkerTruncateAttempt(runtime, truncate_sequence, io) catch |err| {
                 runtime.recordError(io, worker, "truncate", err);
                 return;
             };
-            runtime.mutex.lockUncancelable(io);
-            runtime.last_truncated_sequence = @max(runtime.last_truncated_sequence, truncate_sequence);
-            runtime.backlog.releaseThrough(truncate_sequence);
-            runtime.truncates_in_flight -= 1;
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
         }
         worker.recoverable_retry_backoff.reset();
         worker.retry_not_before_ns = 0;
@@ -1272,7 +1296,7 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
     if (persisted and sequence > worker.persisted_sequence) {
         worker.persisted_sequence = sequence;
     }
-    if (runtime.truncates_in_flight == 0 and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
+    if (runtime.truncates_in_flight == 0 and platform_time.monotonicNs() >= runtime.truncate_retry_not_before_ns and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
         const min_persisted = runtime.computeMinPersistedLocked();
         if (min_persisted > runtime.last_claimed_truncate_sequence) {
             runtime.last_claimed_truncate_sequence = min_persisted;
@@ -1287,20 +1311,7 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
     runtime.mutex.unlock(io);
 
     if (truncate_sequence > 0) {
-        truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
-            runtime.mutex.lockUncancelable(io);
-            runtime.truncates_in_flight -= 1;
-            runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            return err;
-        };
-        runtime.mutex.lockUncancelable(io);
-        runtime.last_truncated_sequence = @max(runtime.last_truncated_sequence, truncate_sequence);
-        runtime.backlog.releaseThrough(truncate_sequence);
-        runtime.truncates_in_flight -= 1;
-        runtime.cond.broadcast(io);
-        runtime.mutex.unlock(io);
+        try completeWorkerTruncateAttempt(runtime, truncate_sequence, io);
     }
     return persisted;
 }
@@ -1312,31 +1323,56 @@ fn truncateWithVisibilityWait(runtime: *DerivedRuntime, sequence: u64, wait: run
         runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
             if (!catch_up_policy.isRecoverableAdmissionError(err)) return err;
             const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &backoff, err);
-            try wait.check();
-            io.sleep(Io.Duration.fromNanoseconds(@intCast(delay)), .awake) catch {};
+            const retry_at = platform_time.monotonicNs() +| delay;
+            while (true) {
+                try wait.check();
+                const remaining = retry_at -| platform_time.monotonicNs();
+                if (remaining == 0) break;
+                var sleep_ns = @min(remaining, 10 * std.time.ns_per_ms);
+                if (wait.deadline_ns) |deadline| {
+                    const now = if (wait.clock) |clock| clock.nowRealtimeNs() else platform_time.monotonicNs();
+                    sleep_ns = @min(sleep_ns, deadline -| now);
+                }
+                // Poll cancellation while preserving the full retry backoff.
+                io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+            }
             continue;
         };
         return;
     }
 }
 
-fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !void {
-    while (true) {
+fn delayMilliseconds(ns: u64) u64 {
+    return @max(1, (ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
+}
+
+/// A scheduler dispatch attempts cleanup once. Credit and the completion
+/// watermark remain unchanged on failure; another worker can retry the claim
+/// only after the shared backoff expires. No sleep holds a derived-work slot.
+fn completeWorkerTruncateAttempt(runtime: *DerivedRuntime, sequence: u64, io: Io) !void {
+    runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
         runtime.mutex.lockUncancelable(io);
-        // Pause drains active cleanup. Shutdown returns its claim to the
-        // completion watermark; the caller retains credit until success.
-        const stopping = runtime.shutdown or worker.stop or runtime.last_error_name != null or worker.last_error_name != null;
-        runtime.mutex.unlock(io);
-        if (stopping) return error.WorkerStopping;
-        runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
-            if (catch_up_policy.isRecoverableAdmissionError(err)) {
-                sleepAfterRecoverableCatchUpError(worker, err, io);
-                continue;
-            }
-            return err;
-        };
-        return;
-    }
+        defer runtime.mutex.unlock(io);
+        runtime.truncates_in_flight -= 1;
+        runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
+        if (catch_up_policy.isRecoverableAdmissionError(err)) {
+            const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &runtime.truncate_retry_backoff, err);
+            runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() +| delay;
+            runtime.signalWorkers(io);
+            runtime.cond.broadcast(io);
+            return;
+        }
+        runtime.cond.broadcast(io);
+        return err;
+    };
+    runtime.mutex.lockUncancelable(io);
+    defer runtime.mutex.unlock(io);
+    runtime.last_truncated_sequence = @max(runtime.last_truncated_sequence, sequence);
+    runtime.backlog.releaseThrough(sequence);
+    runtime.truncates_in_flight -= 1;
+    runtime.truncate_retry_not_before_ns = 0;
+    runtime.truncate_retry_backoff.reset();
+    runtime.cond.broadcast(io);
 }
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
@@ -1484,22 +1520,6 @@ fn scheduleRecoverableCatchUpRetry(worker: *Worker, err: anyerror) void {
     );
     worker.retry_not_before_ns = platform_time.monotonicNs() +| delay_ns;
     worker.next_delay_ms = @max(1, delay_ns / std.time.ns_per_ms);
-}
-
-fn sleepAfterRecoverableCatchUpError(worker: *Worker, err: anyerror, io: Io) void {
-    const delay_ns = catch_up_policy.recordRecoverableRetry(
-        &worker.runtime.recoverable_retry_counters,
-        worker.runtime.backlog.resource_manager,
-        &worker.recoverable_retry_backoff,
-        err,
-    );
-    if (worker.recoverable_retry_backoff.shouldLog()) {
-        std.log.warn(
-            "derived worker retrying recoverable failure worker={s} error={s} failures={} retry_ms={}",
-            .{ worker.name, @errorName(err), worker.recoverable_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
-        );
-    }
-    io.sleep(Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
 }
 
 fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, io: Io) void {
@@ -2684,10 +2704,17 @@ test "issue1015 truncation contention recovers credit and failed claims remain r
         const io = runtime.ioContext();
         if (failure == error.InvalidData) {
             try std.testing.expectError(failure, persistIdleAppliedSequence(&runtime, worker, 10, io));
-            try std.testing.expectEqual(@as(u64, 0), runtime.last_truncated_sequence);
-            try std.testing.expectEqual(@as(u64, 0), runtime.last_claimed_truncate_sequence);
-            try std.testing.expectEqual(retained, runtime.backlog.retained_bytes);
+        } else {
+            try std.testing.expect(try persistIdleAppliedSequence(&runtime, worker, 10, io));
+            // Notifications and other workers must not defeat runtime backoff.
+            runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+            for (0..100) |_| _ = try persistIdleAppliedSequence(&runtime, worker, 10, io);
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            runtime.truncate_retry_not_before_ns = 0;
         }
+        try std.testing.expectEqual(@as(u64, 0), runtime.last_truncated_sequence);
+        try std.testing.expectEqual(@as(u64, 0), runtime.last_claimed_truncate_sequence);
+        try std.testing.expectEqual(retained, runtime.backlog.retained_bytes);
         try std.testing.expect(try persistIdleAppliedSequence(&runtime, worker, 10, io));
         try std.testing.expectEqual(@as(usize, 2), probe.calls);
         try std.testing.expectEqual(@as(u64, 10), runtime.last_truncated_sequence);
@@ -2759,4 +2786,76 @@ test "issue1015 visibility truncation timeouts release claims and retain cleanup
         try std.testing.expectEqual(@as(u64, 10), runtime.last_truncated_sequence);
         try std.testing.expectEqual(@as(u64, 0), runtime.backlog.retained_bytes);
     }
+}
+
+test "issue1015 cleanup contention yields the shared derived scheduler slot" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        allow_cleanup: std.atomic.Value(bool) = .init(false),
+        cleanup_calls: std.atomic.Value(u32) = .init(0),
+        peer_calls: std.atomic.Value(u32) = .init(0),
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.cleanup_calls.fetchAdd(1, .monotonic);
+            if (!self.allow_cleanup.load(.acquire)) return error.WouldBlock;
+        }
+        fn peer(self: *@This()) ?u64 {
+            _ = self.peer_calls.fetchAdd(1, .monotonic);
+            return null;
+        }
+    };
+    var probe = Probe{};
+    var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    const io = runtime.ioContext();
+    // Four slots is the CPU-limited production scheduler minimum: one per class.
+    const scheduler = try Scheduler.create(alloc, io, 4);
+    runtime.scheduler = scheduler;
+    runtime.owns_scheduler = true;
+    defer runtime.deinit();
+    defer probe.allow_cleanup.store(true, .release);
+    const worker = try alloc.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1 };
+    try runtime.workers.append(alloc, worker);
+    worker.future = try scheduler.registerClass(.derived, worker, workerStep);
+    var deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (probe.cleanup_calls.load(.monotonic) == 0) {
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var peer = try scheduler.registerClass(.derived, &probe, Probe.peer);
+    defer peer.await(io);
+    // Release cleanup before joining the peer, including on assertion failure.
+    defer probe.allow_cleanup.store(true, .release);
+    deadline = platform_time.monotonicNs() + 200 * std.time.ns_per_ms;
+    while (probe.peer_calls.load(.monotonic) == 0 and platform_time.monotonicNs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    std.debug.print("FRESH_CLEANUP_FAIRNESS cleanup_retries={d} peer_dispatches={d} active_derived={d}\n", .{ probe.cleanup_calls.load(.monotonic), probe.peer_calls.load(.monotonic), scheduler.snapshot().active_by_class[@backingInt(Scheduler.Class.derived)] });
+    try std.testing.expect(probe.peer_calls.load(.monotonic) != 0);
+    probe.allow_cleanup.store(true, .release);
+    deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (true) {
+        runtime.mutex.lockUncancelable(io);
+        const complete = runtime.last_truncated_sequence == 1;
+        runtime.mutex.unlock(io);
+        if (complete) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "issue1015 failed registration can still pause and retire retained cleanup" {
+    const alloc = std.testing.allocator;
+    var capture = TestThreadedRuntimeCapture{};
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const worker = try alloc.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "failed"), .kind = .{ .name = "failed", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1, .last_error_name = "InvalidData" };
+    try runtime.workers.append(alloc, worker);
+    try std.testing.expectError(RuntimeError.AsyncWorkerFailed, runtime.failIfUnhealthy());
+    try std.testing.expect(try runtime.pauseWorker("failed"));
+    try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
+    runtime.removeWorker("failed");
+    try runtime.failIfUnhealthy();
 }

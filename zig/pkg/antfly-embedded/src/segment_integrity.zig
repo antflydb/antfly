@@ -260,13 +260,90 @@ pub const PagedSource = struct {
                     take += @intCast(@min(limit - take, page_size));
                 }
                 try self.original.visitRange(absolute, take, &forward, Forward.visit);
+            } else if (self.original.ranges.visit_range != null and @min(length - position, self.directory.offset - absolute) > page_size - within) {
+                // Single-page reads keep fused cache admission; repeated small
+                // visits can then borrow resident bytes without backing reads.
+                // One forward traversal authenticates cold pages with bounded
+                // private scratch, rather than reopening a cursor per page.
+                const remaining = @min(length - position, self.directory.offset - absolute);
+                try self.visitColdRange(absolute, remaining, context, position, consume);
+                position += remaining;
+                continue;
             } else {
-                // Cold range providers authenticate before exposing any bytes.
-                // Keep the existing bounded fused read and shared validation.
                 try self.visitBufferedPage(index, within, take, context, position, consume);
             }
             position += take;
         }
+    }
+
+    /// Scratch belongs to this traversal, not the reader or a shared cache.
+    /// Provider and consumer callbacks run without our locks, so reentrant
+    /// readers are safe. Immutable pages may be validated concurrently.
+    noinline fn visitColdRange(self: *PagedSource, offset: u64, length: u64, context: *anyopaque, relative: u64, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        const Stream = struct {
+            owner: *PagedSource,
+            context: *anyopaque,
+            consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+            requested_start: u64,
+            requested_end: u64,
+            relative: u64,
+            start: u64,
+            position: u64,
+            page: [page_size]u8 = undefined,
+            crc_window: [1024]u8 = undefined,
+            crc_start: usize = 0,
+            crc_count: usize = 0,
+
+            fn expected(self_: *@This(), index: usize) !u32 {
+                if (index < self_.crc_start or index - self_.crc_start >= self_.crc_count) {
+                    self_.crc_start = index;
+                    self_.crc_count = @min(self_.crc_window.len / 4, self_.owner.validations.len - index);
+                    try self_.owner.original.readInto(self_.owner.directory.offset + @as(u64, index) * 4, self_.crc_window[0 .. self_.crc_count * 4]);
+                }
+                return std.mem.readInt(u32, self_.crc_window[(index - self_.crc_start) * 4 ..][0..4], .big);
+            }
+            fn deliver(self_: *@This(), absolute: u64, bytes: []const u8) !void {
+                const first = @max(absolute, self_.requested_start);
+                const last = @min(absolute + bytes.len, self_.requested_end);
+                if (first < last) try self_.consume(self_.context, self_.relative + first - self_.requested_start, bytes[@intCast(first - absolute)..@intCast(last - absolute)]);
+            }
+            fn visit(raw: *anyopaque, provider_relative: u64, bytes: []const u8) !void {
+                const stream: *@This() = @ptrCast(@alignCast(raw));
+                if (provider_relative != stream.position - stream.start) return error.InvalidSegment;
+                var copied: usize = 0;
+                while (copied < bytes.len) {
+                    const index: usize = @intCast(stream.position / page_size);
+                    const within: usize = @intCast(stream.position % page_size);
+                    const page_start = @as(u64, index) * page_size;
+                    const page_length: usize = @intCast(@min(page_size, stream.owner.directory.offset - page_start));
+                    const take = @min(bytes.len - copied, page_length - within);
+                    const validation = &stream.owner.validations[index];
+                    const state = validation.load(.acquire);
+                    if (state == 2) return error.CrcMismatch;
+                    // Always retain cold-page fragments until the full CRC is
+                    // checked. Another validator completing midway cannot
+                    // expose a suffix while dropping our buffered prefix.
+                    @memcpy(stream.page[within..][0..take], bytes[copied..][0..take]);
+                    stream.position += take;
+                    copied += take;
+                    if (within + take == page_length) {
+                        if (state != 1) {
+                            if (Crc32.hash(stream.page[0..page_length]) != try stream.expected(index)) {
+                                validation.store(2, .release);
+                                return error.CrcMismatch;
+                            }
+                            validation.store(1, .release);
+                        }
+                        try stream.deliver(page_start, stream.page[0..page_length]);
+                    }
+                }
+            }
+        };
+        const start = offset / page_size * page_size;
+        const end = @min(self.directory.offset, (offset + length + page_size - 1) / page_size * page_size);
+        var stream = Stream{ .owner = self, .context = context, .consume = consume, .requested_start = offset, .requested_end = offset + length, .relative = relative, .start = start, .position = start };
+        try self.original.visitRange(start, end - start, &stream, Stream.visit);
+        if (stream.position != end) return error.InvalidSegment;
     }
 
     noinline fn visitBufferedPage(self: *PagedSource, index: usize, within: usize, take: usize, context: *anyopaque, relative: u64, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
@@ -410,4 +487,87 @@ test "segment borrowed spans authenticate cold pages and borrow verified ranges"
     try std.testing.expectError(error.CrcMismatch, view.visitRange(0, view.length, &consumer, Consumer.consume));
     try std.testing.expectEqual(@as(usize, 0), consumer.used);
     try std.testing.expectError(error.CrcMismatch, view.visitRange(0, view.length, &consumer, Consumer.consume));
+}
+
+test "segment cold streaming handles fragmented pages, tails, reentrancy and failures within a bounded budget" {
+    const a = std.testing.allocator;
+    const payload_len = 2 * page_size + 37;
+    const bytes = try a.alloc(u8, payload_len + 12);
+    defer a.free(bytes);
+    for (bytes[0..payload_len], 0..) |*byte, index| byte.* = @truncate(index);
+    for (0..3) |index| {
+        const start = index * page_size;
+        std.mem.writeInt(u32, bytes[payload_len + index * 4 ..][0..4], Crc32.hash(bytes[start..@min(start + page_size, payload_len)]), .big);
+    }
+    const directory = Directory{ .offset = payload_len, .length = 12, .checksum = Crc32.hash(bytes[payload_len..]) };
+    const Backend = struct {
+        bytes: []const u8,
+        visits: usize = 0,
+        fail_directory: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_directory and offset >= payload_len) return error.TestIoFailure;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.visits += 1;
+            var position: usize = 0;
+            while (position < length) {
+                const take: usize = @intCast(@min(997, length - position));
+                try consume(context, position, self.bytes[@intCast(offset + position)..][0..take]);
+                position += take;
+            }
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Consumer = struct {
+        expected: []const u8,
+        source: source_mod.Source,
+        used: usize = 0,
+        fail: bool = false,
+        fn consume(raw: *anyopaque, relative: u64, span: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.used, relative);
+            try std.testing.expectEqualSlices(u8, self.expected[self.used..][0..span.len], span);
+            var nested: [7]u8 = undefined;
+            try self.source.readInto(0, &nested);
+            try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6 }, &nested);
+            if (self.fail) return error.TestConsumerFailure;
+            self.used += span.len;
+        }
+    };
+    var backend = Backend{ .bytes = bytes };
+    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } };
+    var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
+    for ([_]usize{ 0, 11, page_size - 3, page_size + 5 }) |start| {
+        const paged = try PagedSource.init(budget.allocator(), original, directory);
+        defer paged.deinit();
+        const end = bytes.len - 2; // includes the authenticated directory tail
+        var consumer = Consumer{ .expected = bytes[start..end], .source = paged.source() };
+        const visits = backend.visits;
+        try paged.source().visitRange(start, end - start, &consumer, Consumer.consume);
+        try std.testing.expectEqual(end - start, consumer.used);
+        try std.testing.expectEqual(@as(usize, 2), backend.visits - visits);
+        try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    const paged = try PagedSource.init(budget.allocator(), original, directory);
+    defer paged.deinit();
+    var consumer = Consumer{ .expected = bytes[0..payload_len], .source = paged.source(), .fail = true };
+    try std.testing.expectError(error.TestConsumerFailure, paged.source().visitRange(0, payload_len, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 0), consumer.used);
+    consumer.fail = false;
+    backend.fail_directory = true;
+    try std.testing.expectError(error.TestIoFailure, paged.source().visitRange(0, payload_len, &consumer, Consumer.consume));
+    try std.testing.expectEqual(page_size, consumer.used); // first page was already verified
+    backend.fail_directory = false;
+    consumer.used = 0;
+    bytes[2 * page_size + 7] ^= 1;
+    try std.testing.expectError(error.CrcMismatch, paged.source().visitRange(0, payload_len, &consumer, Consumer.consume));
+    try std.testing.expectEqual(2 * page_size, consumer.used);
+    bytes[2 * page_size + 7] ^= 1;
+    consumer.used = 0;
+    try std.testing.expectError(error.CrcMismatch, paged.source().visitRange(0, payload_len, &consumer, Consumer.consume));
+    try std.testing.expectEqual(2 * page_size, consumer.used);
 }

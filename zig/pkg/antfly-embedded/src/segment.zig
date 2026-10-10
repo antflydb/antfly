@@ -11525,3 +11525,80 @@ test "borrowed typed ranges preserve native logical cache and coalesce cold read
     std.debug.print("COLD_NATIVE individual_calls={d} grouped_calls={d}\n", .{ cold_individual, cold_group });
     try std.testing.expect(cold_group < cold_individual);
 }
+
+test "segment.cold multi-page borrowing amortizes native traversal" {
+    const a = std.testing.allocator;
+    const native = @import("storage/lite/native.zig");
+    const sources = @import("segment_source.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/borrow-hot.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const pages = 64;
+    const data_len = pages * integrity.page_size;
+    const payload = try a.alloc(u8, data_len + pages * 4);
+    defer a.free(payload);
+    @memset(payload[0..data_len], 'v');
+    for (0..pages) |i| std.mem.writeInt(u32, payload[data_len + i * 4 ..][0..4], Crc32.hash(payload[i * integrity.page_size ..][0..integrity.page_size]), .big);
+    try file.putIndexCatalogRecord("/segment", payload);
+    const checkpoint = file.activeCheckpoint();
+    var value = try file.openIndexValue(a, "/segment", checkpoint);
+    defer value.deinit(a);
+    file.page_cache_enabled.store(false, .monotonic);
+    const Backend = struct {
+        file: *native.NativeFile,
+        value: native.NativeFile.IndexValue,
+        checkpoint: native.CheckpointSlot,
+        cache: ?sources.ConcurrentBlockCache = null,
+        fn rawRead(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.file.readIndexValueInto(self.value, offset, out, self.checkpoint);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cache.?.readInto(offset, out);
+        }
+        fn auth(raw: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cache.?.readAuthenticated(offset, length, within, out, expected);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, consume);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .file = &file, .value = value, .checkpoint = checkpoint };
+    const raw = sources.Source{ .ranges = .{ .ptr = &backend, .length = payload.len, .read_into = Backend.rawRead, .visit_range = Backend.visit, .close = Backend.close } };
+    backend.cache = try sources.ConcurrentBlockCache.init(a, raw, 160 * 1024);
+    defer backend.cache.?.deinit();
+    const facade = backend.cache.?.borrowedSource();
+    const directory = integrity.Directory{ .offset = data_len, .length = pages * 4, .checksum = Crc32.hash(payload[data_len..]) };
+    const paged = try integrity.PagedSource.init(a, facade, directory);
+    defer paged.deinit();
+    const view = try sources.View.init(paged.source(), 0, data_len);
+    const Consumer = struct {
+        fn consume(_: *anyopaque, _: u64, span: []const u8) !void {
+            for (span) |byte| try std.testing.expectEqual(@as(u8, 'v'), byte);
+        }
+    };
+    var context: u8 = 0;
+    var reads = file.test_backing_read_calls.load(.monotonic);
+    try view.visitRange(0, view.length, &context, Consumer.consume);
+    const cold = file.test_backing_read_calls.load(.monotonic) - reads;
+    reads = file.test_backing_read_calls.load(.monotonic);
+    try view.visitRange(0, view.length, &context, Consumer.consume);
+    const verified = file.test_backing_read_calls.load(.monotonic) - reads;
+    try std.testing.expect(cold <= verified * 2);
+    std.debug.print("LITE_COLD_ARTIFACT pages={d} bytes={d} cold_calls={d} verified_calls={d}\n", .{ pages, data_len, cold, verified });
+    // A cold point visit still admits its authenticated page into the logical
+    // cache, preserving the zero-backing-read warm path for small requests.
+    const point = try integrity.PagedSource.init(a, facade, directory);
+    defer point.deinit();
+    try point.source().visitRange(0, 8, &context, Consumer.consume);
+    reads = file.test_backing_read_calls.load(.monotonic);
+    try point.source().visitRange(0, 8, &context, Consumer.consume);
+    try std.testing.expectEqual(reads, file.test_backing_read_calls.load(.monotonic));
+}
