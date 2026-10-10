@@ -820,3 +820,32 @@ until owning finish after physical cleanup or authoritative transfer. Focused
 scheduler/native-owner tests establish these transitions; physical API/storage,
 service-holder CPU loans, runtime pressure and automatic defaults remain separate
 qualification requirements.
+
+### Cleanup activation reports its admitted CPU demand
+
+Runnable ABI 13 changes cleanup activation to return its actual admitted slot
+count after a successful transfer. `Borrowed.activateCleanup` updates that borrow
+only on checked success with a nonzero demand; the owning cleanup task then
+passes the updated value to the physical cleanup callback. Local cleanup, opaque
+owner capsules and SQL adapters report the scheduler entry's demand. Managed
+cleanup reports one slot even when foreground work retained a wider team;
+generic schedulers without a dedicated cleanup lane report their actual existing
+team width.
+
+All previous foreground borrowers must be fenced and physically joined before
+activation, as before resizing a team. Copies do not track subsequent changes
+and convey no permission to run old foreground children in the cleanup phase.
+Version 12 callbacks have the same pointer-sized layout but a different calling
+contract, so the version check rejects them before dispatch. Activation failure,
+malformed success and unsupported callbacks never publish a replacement width.
+Neither observation nor task completion retires the operation, original policy
+class, retained bytes or physical resources.
+
+Focused native verification passed 92 tests: actual reserved cleanup tasks over
+both local and opaque three-slot foreground teams, isolated and generic cleanup,
+original deadline expiry, scheduler closure, callback demand, growth rejection
+and joined accounting. ABI tests cover legacy rejection before dispatch, failed
+activation, zero-width success and successful one- and three-slot reports.
+Full SQL/API/storage integration, holder CPU transfers, bounded outbound
+lifetimes, runtime pressure, performance and default sizing remain separate
+qualification gates.

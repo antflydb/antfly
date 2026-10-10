@@ -897,9 +897,10 @@ pub const Adapter = struct {
                 adapter.cleanup_phase.?.reserveChecked(options) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
-            fn activateCleanup(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            fn activateCleanup(raw: *anyopaque, out_slots: *usize) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
                 adapter.cleanup_phase.?.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
+                out_slots.* = adapter.cleanup_phase.?.execution.entry.?.slots;
                 return .ok;
             }
             fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
@@ -4215,7 +4216,9 @@ test "SQL read resume fences cleanup resource waits retain independent deadline 
         adapter.context.deadline_ns = 0;
         Clock.current = 1000;
         try std.testing.expectError(error.Canceled, adapter.context.ensureActive());
-        try Adapter.checkCleanupStatus(borrow.activate_cleanup.?(borrow.context));
+        var cleanup_slots: usize = 0;
+        try Adapter.checkCleanupStatus(borrow.activate_cleanup.?(borrow.context, &cleanup_slots));
+        try std.testing.expectEqual(execution.entry.?.slots, cleanup_slots);
         try std.testing.expectEqual(class, execution.entry.?.class);
         try std.testing.expectEqual(@as(?u64, 1010), execution.entry.?.options.deadline_ns);
         try Adapter.checkpoint(&adapter);

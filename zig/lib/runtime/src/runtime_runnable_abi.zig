@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 12;
+pub const abi_version: u32 = 13;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -136,7 +136,7 @@ pub const Owner = extern struct {
     reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
     activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     reserve_cleanup: ?*const fn (*anyopaque, *const Cleanup) callconv(.c) errors.Status = null,
-    activate_cleanup: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    activate_cleanup: ?*const fn (*anyopaque, *usize) callconv(.c) errors.Status = null,
     /// Remaining time in the already activated completion's original clock.
     /// Observing this budget conveys no admission or fresh deadline authority.
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
@@ -190,11 +190,16 @@ pub const Owner = extern struct {
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
-    pub fn activateCleanup(self: Owner, handle: *anyopaque) !void {
+    /// Return the actual admitted cleanup demand after a successful transfer.
+    /// The receiver writes it only after acquiring the cleanup CPU grant.
+    pub fn activateCleanup(self: Owner, handle: *anyopaque) !usize {
         if (!self.valid()) return error.UnsupportedVersion;
         const callback = self.activate_cleanup orelse return error.UnsupportedOperation;
-        const status = callback(handle);
+        var slots: usize = 0;
+        const status = callback(handle, &slots);
         if (!status.isOk()) return errors.errorFromStatus(status);
+        if (slots == 0) return error.InvalidRunnableDemand;
+        return slots;
     }
 
     pub fn reserveChild(self: Owner, parent: *anyopaque, options: *const ChildStart) !void {
@@ -270,7 +275,7 @@ pub const Borrowed = extern struct {
     reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
     activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     reserve_cleanup: ?*const fn (*anyopaque, *const Cleanup) callconv(.c) errors.Status = null,
-    activate_cleanup: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    activate_cleanup: ?*const fn (*anyopaque, *usize) callconv(.c) errors.Status = null,
     /// Remaining time in the already activated completion's original clock.
     /// Observing this budget conveys no admission or fresh deadline authority.
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
@@ -353,11 +358,17 @@ pub const Borrowed = extern struct {
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
-    pub fn activateCleanup(self: Borrowed) !void {
+    /// Quiesce every previous borrower before transferring phases. Copies do
+    /// not track this transfer; the activated cleanup callback receives this
+    /// updated snapshot, including the receiver's actual admitted CPU demand.
+    pub fn activateCleanup(self: *Borrowed) !void {
         try self.validate();
         const callback = self.activate_cleanup orelse return error.UnsupportedOperation;
-        const status = callback(self.context);
+        var slots: usize = 0;
+        const status = callback(self.context, &slots);
         if (!status.isOk()) return errors.errorFromStatus(status);
+        if (slots == 0) return error.InvalidRunnableDemand;
+        self.cpu_slots = slots;
     }
 
     /// Update this snapshot only after the parent has admitted the new team.
@@ -887,4 +898,54 @@ test "runnable lifetime ABI observes current phase without replacing parent auth
     borrowed.version -= 1;
     try std.testing.expectError(error.UnsupportedVersion, borrowed.currentClass());
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "runnable lifetime ABI cleanup transfer updates demand only on checked success" {
+    const Fake = struct {
+        slots: usize = 1,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn activate(raw: *anyopaque, out: *usize) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            out.* = self.slots;
+            return if (self.failure) |failure| errors.statusFromError(failure) else .ok;
+        }
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    var borrow: Borrowed = .{ .context = &fake, .cpu_slots = 3, .parent_class = @backingInt(Class.write), .checkpoint = Fake.check, .park = Fake.phase, .enter = Fake.phase, .activate_cleanup = Fake.activate };
+    // ABI 12 has the same layout but a different callback signature.
+    borrow.version = 12;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.activateCleanup());
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    borrow.version = abi_version;
+    borrow.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.activateCleanup());
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    borrow.struct_size = @sizeOf(Borrowed);
+    for ([_]anyerror{ error.DeadlineExceeded, error.InvalidRunnableTransition, error.SchedulerClosed }) |failure| {
+        fake.failure = failure;
+        try std.testing.expectError(failure, borrow.activateCleanup());
+        try std.testing.expectEqual(@as(usize, 3), borrow.cpu_slots);
+    }
+    fake.failure = null;
+    fake.slots = 0;
+    try std.testing.expectError(error.InvalidRunnableDemand, borrow.activateCleanup());
+    try std.testing.expectEqual(@as(usize, 3), borrow.cpu_slots);
+    // Both isolated serial cleanup and legacy admitted teams report actual demand.
+    for ([_]usize{ 1, 3 }) |slots| {
+        fake.slots = slots;
+        try borrow.activateCleanup();
+        try std.testing.expectEqual(slots, borrow.cpu_slots);
+        try std.testing.expectEqual(@backingInt(Class.write), borrow.parent_class);
+    }
+    borrow.activate_cleanup = null;
+    try std.testing.expectError(error.UnsupportedOperation, borrow.activateCleanup());
+    try std.testing.expectEqual(@as(usize, 6), fake.calls);
 }

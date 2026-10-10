@@ -206,10 +206,11 @@ fn reserveCleanupChecked(raw: *anyopaque, options: *const abi.Cleanup) !void {
     };
     if (options.activation_budget != 0) try value.execution.reserveCleanupFor(policy, options.deadline_ns) else try value.execution.reserveCleanup(policy);
 }
-fn activateCleanup(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+fn activateCleanup(raw: *anyopaque, out_slots: *usize) callconv(.c) runtime.error_abi.Status {
     const value = capsule(raw);
     if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
     value.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
+    out_slots.* = value.execution.entry.?.slots;
     return .ok;
 }
 fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {

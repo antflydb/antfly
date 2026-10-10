@@ -2252,7 +2252,8 @@ test "SQL pgwire guarded cleanup checkpoint preserves independent deadline after
     canceled.store(true, .release);
     try std.testing.expectError(error.QueryCanceled, GuardedCatalog.checkpoint(&guarded));
     Clock.current = 1000;
-    const activated = borrow.activate_cleanup.?(borrow.context);
+    var cleanup_slots: usize = 0;
+    const activated = borrow.activate_cleanup.?(borrow.context, &cleanup_slots);
     if (!activated.isOk()) return runtime.error_abi.errorFromStatus(activated);
     try GuardedCatalog.checkpoint(&guarded);
     Clock.current = 1010;

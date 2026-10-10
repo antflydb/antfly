@@ -265,7 +265,7 @@ test "cleanup task local query bridge clears denied receivers before publication
     defer execution.finish();
     try execution.start(&owner, .{ .io = io }, .query);
     var bridge = try local.Cleanup.init(&execution);
-    const borrow = try bridge.borrowed();
+    var borrow = try bridge.borrowed();
     try std.testing.expectError(error.InvalidArgument, borrow.reserveCleanup(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }));
     try std.testing.expect(bridge.io == null and bridge.clock_io == null);
     execution.finish();
@@ -1292,4 +1292,80 @@ test "cleanup task runtime snapshots and control progress while physical shutdow
     active.destroyJoined();
     active_live = false;
     try std.testing.expectEqual(@as(usize, 0), metadata.stats().used_bytes);
+}
+
+test "cleanup task propagates actual admitted width from local and opaque foreground teams" {
+    const local = @import("runnable_local_cleanup.zig");
+    const Fixture = struct {
+        owner: *scheduler.Scheduler,
+        expected_slots: usize,
+        expected_bytes: u64,
+        calls: usize = 0,
+        fn retire(raw: *anyopaque, borrow: runtime.runnable_abi.Borrowed, _: std.Io) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(self.expected_slots, borrow.cpu_slots);
+            try std.testing.expectEqual(runtime.runnable_abi.Class.inference, try borrow.currentClass());
+            try checked(borrow.checkpoint(borrow.context));
+            const stats = self.owner.stats();
+            try std.testing.expectEqual(self.expected_slots, stats.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(self.expected_bytes, stats.retained_bytes);
+            if (self.expected_slots == 1) {
+                try std.testing.expectEqual(@as(usize, 1), stats.cleanup_runnable_slots);
+                if (borrow.resize_team != null) {
+                    var team_borrow = borrow;
+                    try std.testing.expectError(error.InvalidRunnableDemand, team_borrow.resizeTeam(2));
+                }
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |use_local| for ([_]bool{ false, true }) |isolated| {
+        var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        Clock.current.store(0, .release);
+        var owner: owners.State = .{ .owner_alloc = std.testing.allocator, .owner = try scheduler.NodeOwner.init(.{ .slots = 6, .control_slots = 1, .cleanup_slots = if (isolated) 1 else 0 }), .native_now_ns = Clock.now };
+        defer owner.owner.deinit();
+        const port = owner.port();
+        var execution: scheduler.Execution = .{};
+        defer execution.finish();
+        var handle: ?*anyopaque = null;
+        defer if (handle) |value| port.finish(value);
+        var bridge: local.Cleanup = undefined;
+        const borrow = if (use_local) local_borrow: {
+            try execution.startWithSlots(&owner.owner.scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 57 }, .inference, 3);
+            bridge = try local.Cleanup.init(&execution);
+            break :local_borrow try bridge.borrowed();
+        } else owner_borrow: {
+            try checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 3, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .retained_bytes = 57, .out_handle = &handle }));
+            break :owner_borrow try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 3, .inference);
+        };
+        try std.testing.expectEqual(@as(usize, 3), borrow.cpu_slots);
+        var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+        var fixture: Fixture = .{ .owner = &owner.owner.scheduler, .expected_slots = if (isolated) 1 else 3, .expected_bytes = owner.owner.scheduler.stats().retained_bytes };
+        var task = try cleanup.Task.reserve(memory.allocator(), io, borrow, &.{ .io = &io_borrow, .native_deadline = 1, .activation_budget = 1, .deadline_ns = 100 }, &fixture, Fixture.retire);
+        var task_live = true;
+        defer if (task_live) task.deinit();
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        try std.testing.expectEqual(@as(usize, 3), owner.owner.scheduler.stats().runnable_slots);
+        // Expired foreground and closed policy cannot refresh the cleanup fence
+        // or substitute foreground width for the admitted cleanup grant.
+        Clock.current.store(1000, .release);
+        owner.owner.scheduler.close();
+        try task.runAndJoin();
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        try std.testing.expectEqual(@as(usize, 3), borrow.cpu_slots);
+        task.deinit();
+        task_live = false;
+        try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+        execution.finish();
+        if (handle) |value| {
+            port.finish(value);
+            handle = null;
+        }
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+    };
 }

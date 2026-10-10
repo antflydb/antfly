@@ -56,8 +56,9 @@ pub const Cleanup = struct {
         from(raw).reserveChecked(options) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
-    fn activate(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    fn activate(raw: *anyopaque, out_slots: *usize) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
+        out_slots.* = from(raw).execution.entry.?.slots;
         return .ok;
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
