@@ -2204,3 +2204,30 @@ unchanged physical HTTP/SQL fixture and independent archive compositions require
 the cumulative integration snapshot before the observed 503 is qualified fixed.
 Shared background CPU roots, complete wait/cleanup adoption, runtime resource/
 performance matrices and automatic default qualification remain incomplete.
+
+### Shared SQL executor observability and node saturation
+
+SQL execution, control and cleanup roles now expose configured capacity, retained
+capacity, consumer count, peak consumers, retirement, successful acquisitions and
+rejections. Metadata and data health metrics use the same formatter with a bounded
+`role` label. Retained capacity includes physical executor retirement even after
+the last consumer leaves. Each role snapshot is coherent under its own mutex;
+aggregate worker counters and separate role snapshots are not transactional.
+These counts describe executor ownership, not runnable CPU occupancy, queue depth
+or query admission. Borrowed runtimes and unsupported small worker envelopes
+report zero shared-role capacity. Reopening an executor preserves node counters.
+
+The focused shared SQL suite exercises thirty-two imported execution consumers
+with one eleven-slot executor. Eleven execution callbacks and eight cleanup
+callbacks physically block, an additional submission to either saturated role
+fails, and a control callback completes. Releasing idle peers preserves the active
+consumers and all twenty-four role reservations. Every physical callback is
+joined before its consumer releases; final release recovers all worker gates and
+reservations. The test also checks reservation failure, invalid requested sizes,
+metrics text, peak consumer accounting and executor reopening.
+
+This suite instantiates real native executors and capability receivers, but no
+physical DB, HTTP server or pgwire session. It does not establish node-wide fair
+CPU adoption, end-to-end query correctness, defaults, resource envelopes or
+performance qualification. Full cumulative integration remains required for the
+physical shared-runtime SQL case and the health-source call sites.

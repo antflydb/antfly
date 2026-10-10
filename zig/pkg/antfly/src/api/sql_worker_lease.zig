@@ -432,3 +432,97 @@ test "SQL shared worker leases keep runtime alive through shutdown and physical 
     // allocator after this point, including in the failure-cleanup defer.
     try std.testing.expect(deinitialized.load(.acquire));
 }
+
+test "SQL shared worker saturation stays node bounded across thirty two consumers" {
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    const owner = runtime.ptr();
+    const producer = factory(owner).?;
+    var occupied = try Lease.acquireNative(owner, 32);
+    defer occupied.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Lease.acquireImportedShared(std.testing.allocator, producer, .execution, 1));
+    try std.testing.expectEqual(@as(u64, 1), owner.sharedSqlStats(.execution).rejections_total);
+    occupied.release();
+    try std.testing.expectError(error.InvalidWorkerCapacity, owner.acquireSharedSqlWorkers(.execution, 0));
+    try std.testing.expectError(error.InvalidWorkerCapacity, owner.acquireSharedSqlWorkers(.execution, 12));
+    var consumers: [32]Lease = undefined;
+    var acquired: usize = 0;
+    defer for (consumers[0..acquired]) |*lease| lease.release();
+    for (&consumers) |*lease| {
+        lease.* = try Lease.acquireImportedShared(std.testing.allocator, producer, .execution, 1);
+        acquired += 1;
+    }
+    const execution = owner.sharedSqlStats(.execution);
+    try std.testing.expectEqual(@as(usize, 11), execution.capacity);
+    try std.testing.expectEqual(@as(usize, 11), execution.retained_capacity);
+    try std.testing.expectEqual(@as(usize, 32), execution.borrowers);
+    try std.testing.expectEqual(@as(usize, 32), execution.peak_borrowers);
+    try std.testing.expectEqual(@as(u64, 32), execution.acquisitions_total);
+    try std.testing.expectEqual(@as(u64, 3), execution.rejections_total);
+    var cleanup = try Lease.acquireImportedShared(std.testing.allocator, producer, .cleanup, 1);
+    defer cleanup.release();
+    var control = try Lease.acquireImportedShared(std.testing.allocator, producer, .control, 1);
+    defer control.release();
+    try std.testing.expectEqual(@as(usize, 24), owner.laneStats().reserved_workers);
+    const Block = struct {
+        entered: std.Io.Event = .unset,
+        stop: std.Io.Event = .unset,
+        io: std.Io,
+        fn run(self: *@This()) void {
+            self.entered.set(self.io);
+            self.stop.waitUncancelable(self.io);
+        }
+        fn probe() u32 {
+            return 42;
+        }
+    };
+    // Use distinct imported receivers for execution submissions. The producer
+    // still rejects the twelfth concurrent task across all consumers together.
+    var blocks: [19]Block = undefined;
+    var futures: [19]std.Io.Future(void) = undefined;
+    var launched: usize = 0;
+    defer {
+        for (blocks[0..launched]) |*block| block.stop.set(std.testing.io);
+        for (futures[0..launched], blocks[0..launched]) |*future, block| future.await(block.io);
+    }
+    for (&blocks, &futures, 0..) |*block, *future, i| {
+        block.* = .{ .io = if (i < 11) consumers[i].io() else cleanup.io() };
+        future.* = try block.io.concurrent(Block.run, .{block});
+        launched += 1;
+        try block.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } });
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, consumers[31].io().concurrent(Block.probe, .{}));
+    try std.testing.expectError(error.ConcurrencyUnavailable, cleanup.io().concurrent(Block.probe, .{}));
+    var health = try control.io().concurrent(Block.probe, .{});
+    try std.testing.expectEqual(@as(u32, 42), health.await(control.io()));
+    // Idle consumers may retire while other consumers are physically active.
+    for (consumers[11..]) |*lease| lease.release();
+    try std.testing.expectEqual(@as(usize, 11), owner.sharedSqlStats(.execution).borrowers);
+    try std.testing.expectEqual(@as(usize, 24), owner.laneStats().reserved_workers);
+    var metrics: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer metrics.deinit();
+    try @import("sql_worker_metrics.zig").append(&metrics.writer, owner);
+    const text = metrics.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_executor_sql_borrowers{role=\"execution\"} 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_executor_sql_retained_capacity{role=\"execution\"} 11\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "antfly_executor_sql_rejections_total{role=\"execution\"} 3\n") != null);
+    for (blocks[0..launched]) |*block| block.stop.set(std.testing.io);
+    for (futures[0..launched], blocks[0..launched]) |*future, block| future.await(block.io);
+    launched = 0;
+    for (&consumers) |*lease| lease.release();
+    cleanup.release();
+    control.release();
+    const retired = owner.sharedSqlStats(.execution);
+    try std.testing.expectEqual(@as(usize, 0), retired.borrowers);
+    try std.testing.expectEqual(@as(usize, 0), retired.retained_capacity);
+    try std.testing.expect(!retired.retiring);
+    try std.testing.expectEqual(@as(usize, 32), retired.peak_borrowers);
+    try std.testing.expectEqual(@as(usize, 0), owner.laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), owner.laneStats().worker_active_leases);
+    // Reopening starts a new physical executor while counters remain node-wide.
+    var reopened = try Lease.acquireNativeShared(owner, .execution, 1);
+    defer reopened.release();
+    try std.testing.expectEqual(@as(u64, 33), owner.sharedSqlStats(.execution).acquisitions_total);
+    try std.testing.expectEqual(@as(usize, 1), owner.sharedSqlStats(.execution).borrowers);
+    try std.testing.expectEqual(@as(usize, 11), owner.laneStats().reserved_workers);
+}

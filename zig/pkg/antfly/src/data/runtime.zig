@@ -2472,6 +2472,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
         if (self.data_server.backend_runtime) |backend_runtime| {
+            try @import("../api/sql_worker_metrics.zig").append(writer, backend_runtime);
             const lanes = backend_runtime.laneStats();
             try health_metrics.appendPromMetric(writer, "antfly_executor_api_active_leases", "gauge", "Active API executor lifetime leases", lanes.api_active_leases);
             try health_metrics.appendPromMetric(writer, "antfly_executor_api_peak_leases", "gauge", "Peak API executor lifetime leases", lanes.api_peak_leases);

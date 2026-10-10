@@ -1745,7 +1745,46 @@ pub const BackendRuntime = struct {
         workers: ?WorkerLease = null,
         borrowers: usize = 0,
         retiring: bool = false,
+        peak_borrowers: usize = 0,
+        acquisitions_total: u64 = 0,
+        rejections_total: std.atomic.Value(u64) = .init(0),
     };
+    pub const SharedSqlStats = struct {
+        capacity: usize,
+        retained_capacity: usize,
+        borrowers: usize,
+        peak_borrowers: usize,
+        retiring: bool,
+        acquisitions_total: u64,
+        rejections_total: u64,
+    };
+    fn sharedSqlCapacity(self: *const BackendRuntime, role: SharedSqlRole) usize {
+        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) return 0;
+        return switch (role) {
+            .execution => (self.lane_limits.worker_capacity / 2) -| 5,
+            .control => 5,
+            .cleanup => self.lane_limits.worker_capacity / 4,
+        };
+    }
+    /// Each role is sampled under its mutex. Different roles and the aggregate
+    /// worker counters are independent observations, not a transactional view.
+    pub fn sharedSqlStats(self: *const BackendRuntime, role: SharedSqlRole) SharedSqlStats {
+        const pool = &@constCast(self).shared_sql_workers[@backingInt(role)];
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        const capacity = self.sharedSqlCapacity(role);
+        return .{
+            .capacity = capacity,
+            // Retirement still owns the executor until its physical join and
+            // all role bookkeeping have completed, even with zero borrowers.
+            .retained_capacity = if (pool.workers != null or pool.retiring) capacity else 0,
+            .borrowers = pool.borrowers,
+            .peak_borrowers = pool.peak_borrowers,
+            .retiring = pool.retiring,
+            .acquisitions_total = pool.acquisitions_total,
+            .rejections_total = pool.rejections_total.load(.monotonic),
+        };
+    }
     pub const SharedSqlLease = struct {
         runtime: ?*BackendRuntime,
         role: SharedSqlRole,
@@ -1782,21 +1821,29 @@ pub const BackendRuntime = struct {
         }
     };
     pub fn acquireSharedSqlWorkers(self: *BackendRuntime, role: SharedSqlRole, minimum: usize) !SharedSqlLease {
-        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) return error.BackendRuntimeUnavailable;
-        const capacity: usize = switch (role) {
-            .execution => (self.lane_limits.worker_capacity / 2) -| 5,
-            .control => 5,
-            .cleanup => self.lane_limits.worker_capacity / 4,
-        };
-        if (minimum == 0 or minimum > capacity) return error.InvalidWorkerCapacity;
-        _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
-        errdefer self.worker_lane_gate.release(self.io());
         const pool = &self.shared_sql_workers[@backingInt(role)];
+        if (self.borrowed_io != null or self.lane_limits.worker_capacity < 10) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeUnavailable;
+        }
+        const capacity = self.sharedSqlCapacity(role);
+        if (minimum == 0 or minimum > capacity) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.InvalidWorkerCapacity;
+        }
+        _ = self.worker_lane_gate.tryAcquire() orelse {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        };
+        errdefer self.worker_lane_gate.release(self.io());
+        errdefer _ = pool.rejections_total.fetchAdd(1, .monotonic);
         lockAtomic(&pool.mutex);
         defer pool.mutex.unlock();
         if (pool.retiring) return error.WorkerCapacityExceeded;
         if (pool.workers == null) pool.workers = try self.acquireWorkers(.{ .capacity = capacity });
         pool.borrowers += 1;
+        pool.peak_borrowers = @max(pool.peak_borrowers, pool.borrowers);
+        pool.acquisitions_total +|= 1;
         return .{ .runtime = self, .role = role, .capacity = capacity, .executor_io = pool.workers.?.io() };
     }
 

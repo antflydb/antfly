@@ -745,3 +745,11 @@ separate and consume the remaining runtime worker budget. Per-API preparation,
 query, write and session ceilings remain per-API; the node runnable owner is the
 shared CPU/operation policy where configured. This executor ledger does not
 qualify automatic defaults or complete background CPU/wait-holder adoption.
+
+Shared SQL role snapshots distinguish retained executor capacity from consumers.
+A role remains retained throughout the final physical join and pool bookkeeping;
+zero consumers alone does not establish retirement. Metrics must not interpret
+these counts as runnable CPU grants or query queue depth. SQL consumers still join
+their own submitted tasks before releasing a shared lease. The saturation fixture
+holds nineteen actual callbacks across execution and cleanup, admits control work,
+and joins all callbacks before any corresponding consumer is retired.
