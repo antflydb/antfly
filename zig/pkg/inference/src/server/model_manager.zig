@@ -50,6 +50,7 @@ const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
 const encoder_decoder = @import("../pipelines/encoder_decoder.zig");
 const vision_config = @import("../readers/vision_config.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const EmbeddingPipeline = embedding_mod.EmbeddingPipeline;
 const EmbeddingConfig = embedding_mod.EmbeddingConfig;
 const PoolingStrategy = embedding_mod.PoolingStrategy;
@@ -3581,6 +3582,19 @@ fn admittedSessionCudaLimit(
     );
 }
 
+fn qwenEmbeddingAdmissionConfig(
+    backend: backends.BackendType,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) ?@import("../architectures/gpt.zig").Config {
+    if (backend != .metal) return null;
+    const manifest = man orelse return null;
+    if (manifest.model_type != .embedder or !manifest.isLastTokenDecoderEmbedder()) return null;
+    const cfg = config orelse return null;
+    if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(cfg)) return null;
+    return cfg;
+}
+
 fn attachSessionRunAdmission(
     allocator: std.mem.Allocator,
     session: *backends.Session,
@@ -3604,6 +3618,11 @@ fn attachSessionRunAdmission(
         resident.host_weight_bytes,
         resident.backend_weight_bytes,
     ) catch std.math.maxInt(usize);
+    const qwen_cfg = if (backend_runtime.backend == .metal and
+        metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+        session_factory.getGptConfig(session.*)
+    else
+        null;
     session.run_admission = .{
         .controller = controller,
         .backend_class = backend_class,
@@ -3611,14 +3630,91 @@ fn attachSessionRunAdmission(
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .backend_workspace_reserved = backend_runtime.backend == .onnx and
             backend_runtime.onnx_execution_provider == .cuda,
-        .model_profile = if (man) |manifest| .{
-            .hidden_size = manifest.hidden_size,
-            .intermediate_size = manifest.intermediate_size,
-            .attention_heads = manifest.num_attention_heads,
-            .quadratic_attention = backend_runtime.backend == .onnx and
-                backend_runtime.onnx_execution_provider != .cuda,
-        } else .{},
+        .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
+}
+
+fn sessionRunAdmissionModelProfile(
+    backend_runtime: backends.BackendRuntime,
+    man: ?*const manifest_mod.ModelManifest,
+    config: ?@import("../architectures/gpt.zig").Config,
+) @import("../backends/session.zig").RunAdmission.ModelProfile {
+    const manifest = man orelse return .{};
+    const qwen_cfg = qwenEmbeddingAdmissionConfig(backend_runtime.backend, man, config);
+    return .{
+        .hidden_size = manifest.hidden_size,
+        .intermediate_size = manifest.intermediate_size,
+        .attention_heads = manifest.num_attention_heads,
+        .quadratic_attention = backend_runtime.backend == .onnx and backend_runtime.onnx_execution_provider != .cuda,
+        .qwen_dense_workspace = qwen_cfg != null,
+        .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
+        .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
+    };
+}
+
+test "Qwen embedding admission preserves reranker capacity and gates dense workspace" {
+    const Session = @import("../backends/session.zig").Session;
+    const Probe = struct {
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } }};
+        }
+    };
+    var cfg = @import("../architectures/gpt.zig").Config{
+        .family = .qwen3,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .silu,
+        .hidden_size = 1024,
+        .intermediate_size = 3072,
+        .num_hidden_layers = 28,
+        .num_attention_heads = 16,
+        .num_key_value_heads = 8,
+        .attention_head_dim = 128,
+    };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .reranker,
+        .hidden_size = 1024,
+        .intermediate_size = 3072,
+        .num_attention_heads = 16,
+        .pooling = .last,
+        // Even a legacy last-pooling/document-prefix reranker must not qualify.
+        .embedding_profile = .{ .document = .{ .prefix = "Document: " } },
+    };
+    var controller = runtime.tier.memory.AdmissionController{};
+    var session = Session{
+        .ptr = &controller,
+        .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.outputInfo, .backend = undefined, .close = undefined },
+        .run_admission = .{
+            .controller = &controller,
+            .backend_class = .gpu,
+            .limits = .{ .scratch_limit_bytes = 384 * runtime.tier.memory.bytes_per_mib },
+            .static_workspace_bytes = 80 * runtime.tier.memory.bytes_per_mib,
+            .check_live_memory = false,
+            .model_profile = sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg),
+        },
+    };
+    try std.testing.expect(!session.run_admission.?.model_profile.qwen_dense_workspace);
+    var permit = try session.admit(.{ .batch = 4, .sequence = 256, .input_bytes = 4 * 256 * 24 });
+    defer permit.deinit();
+    permit.deinit();
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+
+    manifest.model_type = .generator;
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg).qwen_dense_workspace);
+    manifest.model_type = .embedder;
+    manifest.embedding_style = .qwen3_embedding;
+    const embedding_profile = sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg);
+    try std.testing.expect(embedding_profile.qwen_dense_workspace);
+    try std.testing.expectEqual(@as(usize, 2048), embedding_profile.query_width);
+    try std.testing.expectEqual(@as(usize, 1024), embedding_profile.kv_width);
+    session.run_admission.?.model_profile = embedding_profile;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admit(.{ .batch = 4, .sequence = 256, .input_bytes = 4 * 256 * 24 }));
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .native }, &manifest, cfg).qwen_dense_workspace);
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, null).qwen_dense_workspace);
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, null, cfg).qwen_dense_workspace);
+    cfg.family = .qwen3_vl;
+    try std.testing.expect(!sessionRunAdmissionModelProfile(.{ .backend = .metal }, &manifest, cfg).qwen_dense_workspace);
 }
 
 pub const ModelHandle = struct {
@@ -5921,6 +6017,38 @@ pub const ModelManager = struct {
         return .{ .manager = self, .model = model };
     }
 
+    /// Pin the same cached publication selected by ordinary request loading,
+    /// including required-backend and A4B policy keys. Never load cold assets
+    /// or join a load flight while reading request-admission metadata.
+    pub fn acquireCachedFromDir(self: *ModelManager, model_dir: []const u8) !?ModelHandle {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            self.session_manager.preferred_backends,
+            &required_backend_scratch,
+        );
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        const model = (try self.lookupLoadedModelLocked(
+            model_dir,
+            effective_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+        )) orelse return null;
+        model.active_handles += 1;
+        return .{ .manager = self, .model = model };
+    }
+
+    /// Return owned warm-request metadata without holding a second runtime
+    /// owner through execution or integrity recovery. Cold paths still inspect
+    /// the manifest before loading assets.
+    pub fn copyCachedQwenEmbeddingManifest(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDir(model_dir)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (model.manifest.embedding_style != .qwen3_embedding or model.session.backend() != .metal) return null;
+        return try model.manifest.clone(allocator);
+    }
+
     /// Pin one handle for every currently published model. Callers may release
     /// load_lock before taking per-model locks without racing model eviction or
     /// retirement destruction. Metrics/listing observation does not renew TTL;
@@ -7977,6 +8105,8 @@ test "explicit backend lookup reuses only a matching default alias" {
         var aliases = manager.loaded_aliases.iterator();
         while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
         manager.loaded_aliases.deinit(allocator);
+        var loaded = manager.loaded.iterator();
+        while (loaded.next()) |entry| allocator.free(entry.key_ptr.*);
         manager.loaded.deinit(allocator);
         manager.in_flight_loads.deinit(allocator);
     }
@@ -8014,6 +8144,21 @@ test "explicit backend lookup reuses only a matching default alias" {
     try std.testing.expect(matching == &model);
     try std.testing.expect(mismatching == null);
     try std.testing.expect(policy_free == &model);
+
+    // Startup preloads need not publish the path-only alias. Warm admission
+    // must use the identical backend-qualified key used by request execution.
+    const alias = manager.loaded_aliases.fetchRemove("model").?;
+    allocator.free(alias.key);
+    try manager.loaded.put(allocator, try backendVariantCacheKey(allocator, "model", .metal, null), &model);
+    manager.session_manager.preferred_backends = &.{.metal};
+    model.active_handles = 0;
+    model.retired = false;
+    var cached = (try manager.acquireCachedFromDir("model")).?;
+    try std.testing.expect(cached.get() == &model);
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    cached.release();
+    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
+    try std.testing.expect((try manager.acquireCachedFromDir("cold model")) == null);
 }
 
 test "explicit A4B loads ignore unqualified model aliases" {
@@ -8262,6 +8407,43 @@ test "loaded model snapshot final retired observation keeps protected cleanup an
     spinLock(&watchdog.mutex);
     defer watchdog.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), watchdog.entries.items.len);
+}
+
+test "warm Qwen admission copy releases its pin and permits single-model recovery" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.metal} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    model.manifest.embedding_style = .qwen3_embedding;
+    model.manifest.hidden_size = 1024;
+    model.manifest.embedding_profile.query.prefix = try allocator.dupe(u8, "Instruct: retrieve\nQuery: ");
+    model.manifest.inputs = try allocator.alloc([]const u8, 1);
+    model.manifest.inputs[0] = try allocator.dupe(u8, "text");
+    var inference = try manager.publishLoadedModel(model, true, null);
+    defer inference.release();
+
+    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, manager.copyCachedQwenEmbeddingManifest(failure.allocator(), "teardown-fixture"));
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    try std.testing.expect(!probe.closed);
+    var copy = (try manager.copyCachedQwenEmbeddingManifest(allocator, "teardown-fixture")) orelse return error.MissingTestModel;
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    inference.retire();
+    try std.testing.expect(probe.closed);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    // Metadata remains usable after all old runtime storage has been freed.
+    try std.testing.expectEqual(@as(u32, 1024), copy.hidden_size);
+    try std.testing.expectEqualStrings("Instruct: retrieve\nQuery: ", copy.queryPrefix());
+    try std.testing.expectEqualStrings("text", copy.inputs[0]);
+    // The same hard cap that admitted one model admits its replacement now.
+    var replacement = try manager.acquireAmountsWithEviction(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_weight_bytes = 64 });
+    defer replacement.release();
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expect((try manager.copyCachedQwenEmbeddingManifest(allocator, "teardown-fixture")) == null);
 }
 
 test "failed loaded model retires from lookup while active handles unwind" {

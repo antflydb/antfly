@@ -27,6 +27,7 @@ const metal_runtime = @import("metal_runtime.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const metal_tensor = @import("metal_tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
+const memory = @import("../runtime/tier/memory.zig");
 
 const MetalTensor = metal_tensor.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
@@ -90,6 +91,9 @@ comptime {
 pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    embedding_workspace_leases: [64]?memory.AdmissionLease = @splat(null),
+    embedding_workspace_lease_count: usize = 0,
+    embedding_workspace_bytes: usize = 0,
     /// Protected by the model's shared-provider execution lease. Entries own
     /// their names and raw slots, never a request tensor or allocator. The
     /// admission pointer belongs to the same drained model WeightStore.
@@ -179,6 +183,44 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         return metal_runtime.termite_metal_decode_runtime_ready(runtime) != 0;
     }
 
+    pub fn trimEmbeddingWorkspace(self: *MetalNativeProvider) !void {
+        if (metal_runtime.termite_metal_decode_runtime_trim_embedding_workspace(self.raw_decode_runtime) != 0)
+            return error.MetalWorkspaceBusy;
+        self.releaseEmbeddingWorkspaceLeases();
+    }
+
+    fn releaseEmbeddingWorkspaceLeases(self: *MetalNativeProvider) void {
+        for (self.embedding_workspace_leases[0..self.embedding_workspace_lease_count]) |*lease| {
+            if (lease.*) |*owned| owned.release();
+            lease.* = null;
+        }
+        self.embedding_workspace_lease_count = 0;
+        self.embedding_workspace_bytes = 0;
+    }
+
+    /// Called with the model execution gate held, after all GPU frames drain.
+    /// Transfer exactly the newly retained bytes; the request still owns its
+    /// other peak reservation until this transition succeeds.
+    pub fn retainEmbeddingWorkspace(self: *MetalNativeProvider, lease: *?memory.AdmissionLease) !void {
+        const stats = metal_runtime.runtimeMemorySnapshot(self.raw_decode_runtime);
+        if (stats.frame_retained_bytes != 0) return error.MetalWorkspaceBusy;
+        const bytes = metal_runtime.termite_metal_decode_runtime_embedding_workspace_bytes(self.raw_decode_runtime);
+        if (bytes == std.math.maxInt(usize)) return error.InvalidMetalWorkspaceAccounting;
+        if (stats.attention_span_bytes != 0 or bytes < self.embedding_workspace_bytes)
+            return error.InvalidMetalWorkspaceAccounting;
+        const growth = bytes - self.embedding_workspace_bytes;
+        if (growth == 0) return;
+        if (self.embedding_workspace_lease_count == self.embedding_workspace_leases.len)
+            return error.ResourceLimitExceeded;
+        if (lease.*) |*owned| {
+            try owned.retain(.{ .backend_scratch_bytes = growth });
+            self.embedding_workspace_leases[self.embedding_workspace_lease_count] = owned.*;
+            lease.* = null;
+            self.embedding_workspace_lease_count += 1;
+            self.embedding_workspace_bytes = bytes;
+        }
+    }
+
     pub fn reserveDecoderRuntime(self: *MetalNativeProvider, scratch_bytes: usize, token_bytes: usize) !bool {
         const runtime = self.raw_decode_runtime orelse return false;
         return metal_runtime.termite_metal_decode_runtime_reserve(runtime, scratch_bytes, token_bytes) == 0;
@@ -241,6 +283,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
+        self.releaseEmbeddingWorkspaceLeases();
         for (&self.jit_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
         for (&self.jit_exact_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
     }

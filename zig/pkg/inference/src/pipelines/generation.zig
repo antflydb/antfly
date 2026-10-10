@@ -2015,6 +2015,74 @@ fn hasSamplingPenalties(config: GenerationConfig) bool {
         config.presence_penalty != 0;
 }
 
+fn compiledSampleRequestEligible(
+    config: GenerationConfig,
+    has_grammar: bool,
+    has_suppress_token_ids: bool,
+) bool {
+    return !isPureGreedyConfig(config) and
+        !has_grammar and
+        config.grammar == null and
+        !has_suppress_token_ids;
+}
+
+fn metalCompiledSampledDecodeDefaultEligible(cfg: gpt_mod.Config) bool {
+    // Default promotion covers Gemma4 E2B. Other model geometries retain their
+    // explicit opt-in, and the exact sampling contract is checked separately.
+    return cfg.family == .gemma and cfg.gemma4_channel_protocol and
+        !cfg.gemma4_mtp_assistant and cfg.hidden_size == 1536 and
+        cfg.num_hidden_layers == 35 and cfg.num_attention_heads == 8 and
+        cfg.num_key_value_heads == 1 and cfg.attention_head_dim == 256 and
+        cfg.global_head_dim == 512 and cfg.sliding_window == 512 and
+        cfg.intermediate_size == 6144 and cfg.num_kv_shared_layers == 20;
+}
+
+fn metalCompiledSampledDecodeEnabled(cfg: gpt_mod.Config) bool {
+    return metal_runtime.qualifiedM4FeatureEnabled(
+        "ANTFLY_INFERENCE_METAL_RESIDENT_NUCLEUS",
+        metalCompiledSampledDecodeDefaultEligible(cfg),
+    );
+}
+
+test "compiled sampled decode defaults only to qualified Gemma4 E2B geometry" {
+    const e2b: gpt_mod.Config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 1,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .sliding_window = 512,
+        .intermediate_size = 6144,
+        .num_kv_shared_layers = 20,
+    };
+    try std.testing.expect(metalCompiledSampledDecodeDefaultEligible(e2b));
+    inline for (.{ "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "attention_head_dim", "global_head_dim", "sliding_window", "intermediate_size", "num_kv_shared_layers" }) |field| {
+        var other = e2b;
+        @field(other, field) += 1;
+        try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    }
+    var other = e2b;
+    other.family = .qwen3;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    other = e2b;
+    other.gemma4_channel_protocol = false;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+    other = e2b;
+    other.gemma4_mtp_assistant = true;
+    try std.testing.expect(!metalCompiledSampledDecodeDefaultEligible(other));
+}
+
+test "compiled sampled decode rejects grammar and static suppression before submission" {
+    const sampled = GenerationConfig{ .temperature = 0.8, .top_p = 0.95 };
+    try std.testing.expect(compiledSampleRequestEligible(sampled, false, false));
+    try std.testing.expect(!compiledSampleRequestEligible(sampled, true, false));
+    try std.testing.expect(!compiledSampleRequestEligible(sampled, false, true));
+    try std.testing.expect(!compiledSampleRequestEligible(.{}, false, false));
+}
+
 /// The only materialization a prefill chunk is allowed to produce. Keeping
 /// this separate from chunk position prevents an intermediate chunk from
 /// accidentally invoking the vocabulary projection just because its output
@@ -2160,6 +2228,26 @@ fn wholeModelPrefillChunkSize(configured_chunk: usize, scheduler_chunk: usize, p
     else
         runtime.tier.memory.generation_default_prefill_chunk_tokens;
     return @max(@min(@min(requested, if (scheduler_chunk > 0) scheduler_chunk else requested), prompt_tokens), 1);
+}
+
+/// Select the geometry used by whole-model prefill after request admission.
+/// Split-SWA execution needs a bounded chunk even when no explicit value was
+/// provided. Full-history execution preserves its legacy single-pass default,
+/// but must honor a non-zero admitted chunk so execution cannot exceed the
+/// scratch geometry reserved by the server.
+fn wholeModelExecutionPrefillChunkSize(
+    backend_kind: ?ops.BackendKind,
+    configured_chunk: usize,
+    scheduler_chunk: usize,
+    prompt_tokens: usize,
+    bounded_swa_prefill: bool,
+) usize {
+    // Only the Metal whole-model runtime supports incremental prefill today.
+    // ONNX and PJRT reset their runtime on every prefill call, so splitting a
+    // prompt would discard the KV state produced by the preceding chunk.
+    if (backend_kind != .metal) return @max(prompt_tokens, 1);
+    if (!bounded_swa_prefill and configured_chunk == 0) return @max(prompt_tokens, 1);
+    return wholeModelPrefillChunkSize(configured_chunk, scheduler_chunk, prompt_tokens);
 }
 
 fn validateSpeculativeK(draft_requested: bool, speculative_k: u32) !void {
@@ -4028,14 +4116,13 @@ pub const NativeGenerationPipeline = struct {
         );
         const runtime_prepare_token_hint = if (self.compiled_partition_backend != null and
             self.compiled_attachment_target == .whole_model and
-            self.graph_cache != null and
-            decode_state.isPaged() and
-            self.cb.kind() == .metal and
-            whole_model_kv_policy == .split_swa_ring)
-            wholeModelPrefillChunkSize(
+            self.graph_cache != null)
+            wholeModelExecutionPrefillChunkSize(
+                self.compiled_partition_backend,
                 config.prefill_chunk_size,
                 if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
                 prompt_token_count,
+                whole_model_kv_policy == .split_swa_ring,
             )
         else
             prompt_token_count;
@@ -5293,14 +5380,13 @@ pub const NativeGenerationPipeline = struct {
                 self.kv_dtype orelse .f16,
             );
             const bounded_swa_prefill = whole_model_kv_policy == .split_swa_ring;
-            const prefill_chunk_size = if (bounded_swa_prefill)
-                wholeModelPrefillChunkSize(
-                    config.prefill_chunk_size,
-                    if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
-                    prompt_ids.len,
-                )
-            else
-                prompt_ids.len;
+            const prefill_chunk_size = wholeModelExecutionPrefillChunkSize(
+                self.compiled_partition_backend,
+                config.prefill_chunk_size,
+                if (self.scheduler_lease) |lease| lease.prefill_chunk_size else 0,
+                prompt_ids.len,
+                bounded_swa_prefill,
+            );
             const max_speculative_rows = @min(
                 @as(usize, @intCast(config.speculative_k)),
                 @as(usize, runtime.tier.memory.generation_max_speculative_k),
@@ -6343,6 +6429,17 @@ pub const NativeGenerationPipeline = struct {
                         .{ tokens_generated, query_seq_len, input_ids.len },
                     );
 
+                    if (try self.forwardSampledCompiledModelToken(
+                        input_ids,
+                        seq_len.*,
+                        &decode_context,
+                        config,
+                        token_ids[0..seq_len.*],
+                        token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                    )) |token| {
+                        break :blk .{ .token = token, .grammar_complete = false };
+                    }
+
                     if (try self.forwardGreedyCompiledModelToken(
                         input_ids,
                         1,
@@ -7282,6 +7379,58 @@ pub const NativeGenerationPipeline = struct {
             seq_len,
             decode_context,
             self.gpt_config.vocab_size,
+        )) orelse return null;
+        if (token_id < 0) return error.InvalidModelOutput;
+        return @intCast(token_id);
+    }
+
+    fn forwardSampledCompiledModelToken(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        config: GenerationConfig,
+        token_history: []const i64,
+        has_grammar: bool,
+    ) !?usize {
+        // Greedy requests do not need a sampling feature lookup per token.
+        if (isPureGreedyConfig(config)) return null;
+        if (self.cb.kind() != .metal) return null;
+        if (!metalCompiledSampledDecodeEnabled(self.gpt_config)) return null;
+        // Grammar and static model suppression are not represented by the
+        // resident sampler contract. Decline before submission so the
+        // canonical one-logits-frame host path applies them exactly.
+        if (!compiledSampleRequestEligible(
+            config,
+            has_grammar,
+            self.gpt_config.suppressTokenIds().len != 0,
+        )) return null;
+        try self.rejectUnsupportedDeepSeekV4GraphMode();
+        const cache = self.graph_cache orelse return null;
+        if (self.compiled_partition_backend == null or self.compiled_attachment_target != .whole_model) return null;
+        if (input_ids.len != 1 or decode_context.attention_mode != .paged_decode) return null;
+
+        const token_id = (try graph_mod.execution.graphForwardCompiledModelSampledToken(
+            self,
+            cache,
+            .{
+                .decode = .{
+                    .execution_control = self.execution_control,
+                    .token_id = input_ids[0],
+                    .position = seq_len - 1,
+                    .attention_mode = .paged_decode,
+                },
+                .sampling = .{
+                    .temperature = config.temperature,
+                    .top_p = config.top_p,
+                    .top_k = config.top_k,
+                    .min_p = config.min_p,
+                    .repetition_penalty = config.repetition_penalty,
+                    .frequency_penalty = config.frequency_penalty,
+                    .presence_penalty = config.presence_penalty,
+                },
+                .token_history = token_history,
+            },
         )) orelse return null;
         if (token_id < 0) return error.InvalidModelOutput;
         return @intCast(token_id);
@@ -13581,6 +13730,36 @@ test "whole-model prefill stays bounded and speculative width is validated" {
     try std.testing.expectEqual(@as(usize, 256), wholeModelPrefillChunkSize(0, 0, 2000));
     try std.testing.expectEqual(@as(usize, 128), wholeModelPrefillChunkSize(512, 128, 2000));
     try std.testing.expectEqual(@as(usize, 64), wholeModelPrefillChunkSize(256, 0, 64));
+    // Full-history whole-model execution remains a single pass when callers
+    // provide no admitted chunk, preserving the legacy direct-CLI behavior.
+    try std.testing.expectEqual(
+        @as(usize, 4031),
+        wholeModelExecutionPrefillChunkSize(.metal, 0, 0, 4031, false),
+    );
+    // Once admission supplies a non-zero geometry, runtime preparation and
+    // execution must both use it for full-history as well as split-SWA KV.
+    try std.testing.expectEqual(
+        @as(usize, 2048),
+        wholeModelExecutionPrefillChunkSize(.metal, 2048, 0, 4031, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1024),
+        wholeModelExecutionPrefillChunkSize(.metal, 2048, 1024, 4031, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 256),
+        wholeModelExecutionPrefillChunkSize(.metal, 0, 0, 4031, true),
+    );
+    // ONNX and PJRT whole-model runtimes do not retain incremental prefill
+    // state across calls, so admission geometry must not split their prompt.
+    try std.testing.expectEqual(
+        @as(usize, 4031),
+        wholeModelExecutionPrefillChunkSize(.onnx, 2048, 1024, 4031, false),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 4031),
+        wholeModelExecutionPrefillChunkSize(.pjrt, 2048, 1024, 4031, false),
+    );
     try validateSpeculativeK(true, runtime.tier.memory.generation_max_speculative_k);
     try std.testing.expectError(
         error.InvalidSpeculativeK,

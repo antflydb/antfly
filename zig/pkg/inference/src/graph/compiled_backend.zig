@@ -129,6 +129,13 @@ pub const Definition = struct {
         request: model_runtime.ForwardRequest,
         vocab_size: usize,
     ) anyerror!?i64 = null,
+    execute_model_sample_direct: ?*const fn (
+        allocator: std.mem.Allocator,
+        cache: *cache_mod.GraphCache,
+        context: AttachContext,
+        mode: CompileMode,
+        request: model_runtime.SampledDecodeRequest,
+    ) anyerror!?i64 = null,
     prepare_model_runtime_direct: ?*const fn (
         allocator: std.mem.Allocator,
         cache: *cache_mod.GraphCache,

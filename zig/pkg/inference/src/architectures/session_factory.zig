@@ -7444,6 +7444,52 @@ pub fn attachGraphRuntimeStrategy(session: Session, strategy: graph_runtime.Stra
 
 pub const MetalWorkloadProfileExport = if (build_options.enable_metal) metal_runtime.WorkloadProfileExport else void;
 
+fn qwenWorkspaceProvider(session: Session) !*@import("../backends/metal_native_provider.zig").MetalNativeProvider {
+    if (comptime !build_options.enable_metal) return error.UnsupportedBackend;
+    if (session.vtable != &arch_vtable) return error.UnsupportedBackend;
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (arch.backend_type != .metal) return error.UnsupportedBackend;
+    return gpuBackendData(arch).shared_metal_native_provider orelse error.MissingMetalNativeProvider;
+}
+
+/// All workspace methods require the caller's model execution gate. The
+/// managed backend is retired before inspecting or reclaiming physical buffers.
+pub fn qwenMetalWorkspaceCredit(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !usize {
+    if (comptime !build_options.enable_metal) return 0;
+    var compute = try getComputeBackendWithControl(session, allocator, control);
+    compute.deinit();
+    const provider = try qwenWorkspaceProvider(session);
+    // A denied larger-shape probe must not discard reusable buffers. The
+    // profile includes replacement overlap, and the native guard limits every
+    // fresh allocation to the incremental permit after retained credit.
+    if (provider.embedding_workspace_lease_count == provider.embedding_workspace_leases.len or
+        (provider.embedding_workspace_bytes == 0 and metal_runtime.termite_metal_decode_runtime_embedding_workspace_bytes(provider.raw_decode_runtime) != 0))
+        try provider.trimEmbeddingWorkspace();
+    return provider.embedding_workspace_bytes;
+}
+
+pub fn trimQwenMetalWorkspace(session: Session) !void {
+    if (comptime !build_options.enable_metal) return;
+    try (try qwenWorkspaceProvider(session)).trimEmbeddingWorkspace();
+}
+
+pub fn beginQwenMetalWorkspace(session: Session, bytes: usize) !void {
+    if (comptime !build_options.enable_metal) return;
+    const provider = try qwenWorkspaceProvider(session);
+    if (metal_runtime.termite_metal_decode_runtime_begin_embedding_workspace(provider.raw_decode_runtime, bytes) != 0)
+        return error.MetalWorkspaceBusy;
+}
+
+pub fn finishQwenMetalWorkspace(session: Session, lease: *?runtime.tier.memory.AdmissionLease) !void {
+    if (comptime !build_options.enable_metal) return;
+    const provider = try qwenWorkspaceProvider(session);
+    errdefer provider.trimEmbeddingWorkspace() catch platform.inference_process_supervisor.restartWorker();
+    const result = metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(provider.raw_decode_runtime);
+    if (result < 0) return error.MetalWorkspaceBusy;
+    if (result > 0) return error.ResourceLimitExceeded;
+    try provider.retainEmbeddingWorkspace(lease);
+}
+
 /// Starts an explicit pre-serving/benchmark census on an architecture session.
 /// Unsupported or non-Metal sessions return false; there is no backend-pointer
 /// downcast outside this factory.
