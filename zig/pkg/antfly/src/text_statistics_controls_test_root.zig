@@ -2353,3 +2353,42 @@ test "text statistics trusted controls cache metadata is charged before allocati
         }
     }
 }
+
+test "text statistics trusted controls reclaimer chunks precharge growth preserve stable cells and retire original stopped ownership" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        calls: usize = 0,
+        stop_at: usize,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for ([_]bool{ false, true }) |grow| {
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048 }) |stop_at| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 60 * std.time.ns_per_s, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_resource_manager.qualifyControlledReclaimerChunks(admission.Port.init(&payload), grow);
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}

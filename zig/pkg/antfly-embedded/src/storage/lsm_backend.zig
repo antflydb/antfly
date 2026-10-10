@@ -7394,7 +7394,7 @@ pub const Backend = struct {
             // First read/cache admission occurs at the backend's stable address.
             if (control != null and (payload.reservation == null or payload.reservation.?.manager != manager)) return false;
             if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = (if (control) |budget| manager.registerReclaimerWithAdmission(.lsm_block_table_cache, self, reclaimLocalBlocks, budget) else manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks)) catch |err| {
-                if (err == error.OutOfMemory) return false;
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
                 return err;
             };
         }
@@ -27561,7 +27561,7 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     const resources = @import("resource_manager.zig");
     const a = std.testing.allocator;
     const cost = @sizeOf(SharedBytes) + 8;
-    const metadata = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
+    const metadata = resources.ResourceManager.qualifyReclaimerChunkBytes() + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
     const parent_limit = 2 * cost + metadata;
     var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
     defer parent.deinit(a);
@@ -27572,7 +27572,10 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     try manager.installMemoryParent(parent.memoryParentPort());
     var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
     defer backend.close();
-    if (fixture == 2) try std.testing.expect(try backend.prepareLocalCacheEntries(control));
+    if (fixture == 2) {
+        try std.testing.expect(try backend.prepareLocalCacheEntries(control));
+        backend.local_block_cache_reclaimer = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &backend, Backend.reclaimLocalBlocks, control);
+    }
     if (fixture == 2 or fixture == 4) {
         const old = blk: {
             const bytes = try a.dupe(u8, "oldbytes");
@@ -27650,7 +27653,7 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
     var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
     defer parent.deinit(a);
     var options: resources.Options = .{ .identity_allocator = a };
-    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = resources.ResourceManager.qualifyReclaimerChunkBytes() + cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(a);
     try manager.installMemoryParent(parent.memoryParentPort());
@@ -27658,6 +27661,7 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
     defer backend.close();
     try std.testing.expect(try backend.prepareLocalCacheEntries(control));
     if (stage >= 3) {
+        backend.local_block_cache_reclaimer = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &backend, Backend.reclaimLocalBlocks, control);
         const old = blk: {
             const bytes = try a.dupe(u8, "oldbytes");
             errdefer a.free(bytes);
@@ -27762,8 +27766,9 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
     const path = "/physically-charged-cache-path";
     const payload_cost = @sizeOf(SharedBytes) + 8;
     const path_cost = @sizeOf(SharedBytes) + path.len;
+    const registry_cost = resource_manager_mod.ResourceManager.qualifyReclaimerChunkBytes();
     const slab_cost = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
-    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost } });
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost + registry_cost } });
     defer parent.deinit(a);
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
     defer manager.deinit(a);
@@ -27793,7 +27798,7 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
         try std.testing.expectEqual(@as(u64, payload_cost), manager.snapshot().memory.used_bytes);
         return;
     }
-    const charged = payload_cost + path_cost + slab_cost;
+    const charged = payload_cost + path_cost + slab_cost + registry_cost;
     try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, charged), parent.snapshot().memory.used_bytes);
     value_owned = false;

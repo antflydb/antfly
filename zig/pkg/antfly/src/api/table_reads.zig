@@ -7881,7 +7881,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(controls);
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, controls, null)).textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls);
+        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = controls.execution_deadline_ns }, controls.cancellation)).textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls);
     }
 
     fn textStatsGroupLocalPhysical(
@@ -14343,13 +14343,12 @@ fn collectHostedAlgebraicDistributedPartials(
             },
             .remote => |remote| blk: {
                 var authority_rejection: ?anyerror = null;
-                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req, &authority_rejection) catch |err| {
+                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req, &authority_rejection) catch {
                     if (authority_rejection) |cause| return cause;
                     // Capability/transport fallback is permitted only while
                     // the original query still owns execution and its budget.
                     try checkQueryDeadline(group_req);
                     if (group_req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
-                    _ = err;
                     return null;
                 }) orelse return null;
                 defer response.deinit(alloc);
