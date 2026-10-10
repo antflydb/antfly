@@ -80,3 +80,19 @@ chunk target, allowing an oversized individual value as the established exceptio
 Admission includes both input and output directories and peak decoded scratch.
 Copying removes codec work and value allocations, but still performs compressed
 source reads, output writes, and integrity checks; it is not zero total cost.
+
+Sorted monotonic readers use `Cursor.nextAtOrAfter` to binary-search indexed
+chunk bounds before decoding. The cursor never rewinds: within a decoded chunk
+it seeks row IDs without constructing skipped values, and across chunks it jumps
+directly to the first remaining candidate. Historical columns keep a forward
+scan. An intact copied prefix therefore does not force later survivors to decode
+the intervening deleted chunks.
+
+Compressed copying consumes bounded borrowed source spans through `View.visitRange`.
+Contiguous sources avoid staging; native artifact leases expose the same immutable
+range visitor used by their authentication provider. The page facade verifies
+cold contiguous pages before exposing their slices and borrows verified native
+ranges directly. Cold range providers and providers without a visitor retain
+bounded buffered reads and CRC checks. Visitors are synchronous, spans are capped
+at 64 KiB, and callers discard private output if any provider or sink operation
+fails. No borrowed slice escapes a callback.

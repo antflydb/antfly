@@ -174,5 +174,19 @@
     "descriptor_read_batch": 64,
     "fragmented_stream_span_descriptors": 0,
     "measurement": "Forced file-backed production plan; replace its coordinate owner with an empty run after preparation. Both fields still merge successfully. Fragmented and duplicate/gapped fixtures cover the original-coordinate fallback. No end-to-end throughput claim."
+  },
+  "monotonic_typed_gap": {
+    "logical_value_bytes": 4194304,
+    "source_chunks": 66,
+    "selected_documents": 127,
+    "copied_prefix_documents": 126,
+    "before_decoded_chunks": 63,
+    "after_decoded_chunks": 1,
+    "measurement": "Native Debug sorted typed helper with an intact two-chunk prefix and one surviving value in a distant partial chunk. Output tail verified; operation counts, not throughput."
+  },
+  "typed_borrowed_copy": {
+    "before_staging_copy_bytes": "compressed payload length",
+    "after_staging_copy_bytes": 0,
+    "measurement": "Native Debug range-provider copy fixture tracks readInto bytes after reader initialization; visitor slices append directly. Page-facade fixtures verify contiguous borrowing on cold pages, native-range borrowing on verified pages, and fail-closed cold corruption. Cold range providers retain bounded buffered authentication."
   }
 }

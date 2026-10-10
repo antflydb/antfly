@@ -269,7 +269,7 @@ pub const Registry = struct {
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
+        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .visit_range = State.visit, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
     }
 };
 

@@ -109,6 +109,51 @@ pub const Source = union(enum) {
         }
     }
 
+    /// Visit bounded immutable spans. Consumers must discard private output on
+    /// any error; providers may fail after delivering a prefix. Never retain slices.
+    pub fn visitRange(self: Source, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > self.len() or length > self.len() - offset) return error.EndOfStream;
+        if (length == 0) return;
+        const Checked = struct {
+            context: *anyopaque,
+            consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+            length: u64,
+            position: u64 = 0,
+            fn visit(raw: *anyopaque, relative: u64, bytes: []const u8) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                if (relative != state.position or bytes.len == 0 or bytes.len > state.length - state.position) return error.InvalidData;
+                var used: usize = 0;
+                while (used < bytes.len) {
+                    const take = @min(bytes.len - used, 64 * 1024);
+                    try state.consume(state.context, state.position, bytes[used..][0..take]);
+                    used += take;
+                    state.position += take;
+                }
+            }
+        };
+        var checked = Checked{ .context = context, .consume = consume, .length = length };
+        if (self == .contiguous) {
+            try Checked.visit(&checked, 0, self.contiguous[@intCast(offset)..][0..@intCast(length)]);
+        } else if (self.ranges.visit_range) |visit| {
+            try visit(self.ranges.ptr, offset, length, &checked, Checked.visit);
+        } else {
+            try self.visitBuffered(offset, length, &checked, Checked.visit);
+        }
+        if (checked.position != length) return error.EndOfStream;
+    }
+
+    // Keep exceptional staging off the borrowed fast path's stack frame.
+    noinline fn visitBuffered(self: Source, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        var buffer: [64 * 1024]u8 = undefined;
+        var position: u64 = 0;
+        while (position < length) {
+            const take: usize = @intCast(@min(buffer.len, length - position));
+            try self.readInto(offset + position, buffer[0..take]);
+            try consume(context, position, buffer[0..take]);
+            position += take;
+        }
+    }
+
     pub fn prefetch(self: Source, offset: u64, length: u64) void {
         if (offset > self.len() or length > self.len() - offset or length == 0) return;
         if (self == .ranges) if (self.ranges.prefetch) |hint| hint(self.ranges.ptr, offset, length);
@@ -615,6 +660,11 @@ pub const View = struct {
         return .{ .source = source, .offset = offset, .length = length };
     }
 
+    pub fn visitRange(self: View, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > self.length or length > self.length - offset) return error.EndOfStream;
+        try self.source.visitRange(self.offset + offset, length, context, consume);
+    }
+
     pub fn readInto(self: View, offset: u64, out: []u8) !void {
         if (offset > self.length or out.len > self.length - offset) return error.EndOfStream;
         try self.source.readInto(self.offset + offset, out);
@@ -629,3 +679,64 @@ pub const SharedOwner = struct {
     retain: *const fn (*anyopaque) void,
     release: *const fn (*anyopaque) void,
 };
+
+test "range visitors preserve borrowing bound spans and reject malformed providers" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 160 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'v');
+    const Backend = struct {
+        bytes: []const u8,
+        mode: enum { normal, gap, short, failure } = .normal,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .short) return;
+            if (self.mode == .failure) return error.TestIoFailure;
+            try consume(context, if (self.mode == .gap) 1 else 0, self.bytes[@intCast(offset)..][0..@intCast(length)]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Consumer = struct {
+        bytes: []const u8,
+        borrowed: bool,
+        used: usize = 0,
+        max_span: usize = 0,
+        fn consume(raw: *anyopaque, relative: u64, span: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.used, relative);
+            try std.testing.expectEqualSlices(u8, self.bytes[self.used..][0..span.len], span);
+            if (self.borrowed) try std.testing.expectEqual(@intFromPtr(self.bytes.ptr) + self.used, @intFromPtr(span.ptr));
+            self.used += span.len;
+            self.max_span = @max(self.max_span, span.len);
+        }
+    };
+    var backend = Backend{ .bytes = bytes };
+    const source = Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } };
+    const view = try View.init(source, 7, bytes.len - 14);
+    var consumer = Consumer{ .bytes = bytes[7 .. bytes.len - 7], .borrowed = true };
+    try view.visitRange(0, view.length, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 0), backend.reads);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), consumer.max_span);
+    try std.testing.expectEqual(view.length, consumer.used);
+    for ([_]Backend{ .{ .bytes = bytes, .mode = .gap }, .{ .bytes = bytes, .mode = .short }, .{ .bytes = bytes, .mode = .failure } }, 0..) |state, i| {
+        backend = state;
+        consumer.used = 0;
+        const failure = [_]anyerror{ error.InvalidData, error.EndOfStream, error.TestIoFailure };
+        try std.testing.expectError(failure[i], view.visitRange(0, view.length, &consumer, Consumer.consume));
+        try std.testing.expectEqual(@as(usize, 0), consumer.used);
+    }
+    backend.mode = .normal;
+    var fallback = source;
+    fallback.ranges.visit_range = null;
+    consumer.borrowed = false;
+    consumer.used = 0;
+    try (try View.init(fallback, 7, bytes.len - 14)).visitRange(0, view.length, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 3), backend.reads);
+    try std.testing.expectError(error.EndOfStream, view.visitRange(view.length, 1, &consumer, Consumer.consume));
+}

@@ -5227,8 +5227,7 @@ fn writeMergeTypedDocValuesSectionsInOrder(
             const reader = readers[record.ref.input_idx] orelse continue;
             const scan = &scans[record.ref.input_idx];
             if (scan.cursor) |*cursor| {
-                if (scan.current == null) scan.current = try cursor.next();
-                while (scan.current != null and scan.current.?.doc_id < record.ref.doc_id) scan.current = try cursor.next();
+                if (scan.current == null or scan.current.?.doc_id < record.ref.doc_id) scan.current = try cursor.nextAtOrAfter(record.ref.doc_id);
                 if (scan.current) |entry| if (entry.doc_id == record.ref.doc_id) {
                     try addMergedTypedDocValue(&writer, out_doc_id, entry.value);
                 };
@@ -11383,4 +11382,48 @@ test "file source spans support multiple typed fields without coordinate reads a
         }
     }
     std.debug.print("PREPARED_SPANS documents=32 fields=2 sidecar_bytes=20 original_coordinate_reads=0 typed_decodes=0\n", .{});
+}
+
+test "monotonic typed selections seek across deleted chunks" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var values = typed_dv.TypedDocValuesWriter.init(a, .bytes_val, 128);
+    defer values.deinit();
+    const value: [1024]u8 = @splat('x');
+    for (0..4096) |doc| {
+        try writer.addStoredDoc("doc", "{}");
+        try values.add(@intCast(doc), .{ .bytes_val = &value });
+    }
+    try writer.addSectionOwned(try writer.addField("value"), .typed_doc_values, try values.build());
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    var column = (try reader.typedDocValuesScoped(a, "value")).?;
+    defer column.deinit();
+    const prefix = @as(usize, column.chunkInfo(1).?.last) + 1;
+    const tail = column.chunkInfo(column.num_chunks - 2).?.last;
+    const records = try a.alloc(SortedMergeDoc, prefix + 1);
+    defer a.free(records);
+    for (records[0..prefix], 0..) |*record, doc| record.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(doc) } };
+    records[prefix] = .{ .ref = .{ .input_idx = 0, .doc_id = tail } };
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (prefix..4096) |doc| if (doc != tail) {
+        try deleted.add(@intCast(doc));
+    };
+    const inputs = [_]MergeInput{.{ .reader = &reader, .deleted = deleted }};
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    var decoded: usize = 0;
+    try std.testing.expect(try writeMergeTypedDocValuesSectionsInOrder(a, &sink, &inputs, "value", records, &decoded));
+    var result = try typed_dv.TypedDocValuesReader.init(a, output.out.items);
+    defer result.deinit();
+    const actual = (try result.getBytesAlloc(@intCast(prefix))).?;
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(u8, &value, actual);
+    std.debug.print("MONOTONIC_TYPED_GAP source_chunks={d} selected={d} prefix={d} tail={d} decoded={d}\n", .{ column.num_chunks, records.len, prefix, tail, decoded });
+    try std.testing.expectEqual(@as(usize, 1), decoded);
 }
