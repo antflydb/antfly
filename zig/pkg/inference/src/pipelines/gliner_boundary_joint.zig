@@ -365,7 +365,7 @@ fn finite(values: []const f32, length: usize) !void {
 pub fn buildNative(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, input: Input, options_: Options) !Candidates {
     var options = options_;
     options.control = options.control orelse input.core.control;
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     if (options.control) |control| try control.check();
     const core = input.core;
