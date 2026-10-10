@@ -279,7 +279,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
         pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
+        pub const resolveTransactionIntentsInternalWithControls = commit.resolveTransactionIntentsInternalWithControls;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
+        pub const resolveTransactionIntentsPreparedWithControls = commit.resolveTransactionIntentsPreparedWithControls;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
         pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
@@ -833,7 +835,9 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalWithControls = Implementation.resolveTransactionIntentsInternalWithControls;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
+            pub const resolveTransactionIntentsPreparedWithControls = Implementation.resolveTransactionIntentsPreparedWithControls;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
             pub const unchangedDerivedReplayTargetsServiceable = Implementation.unchangedDerivedReplayTargetsServiceable;

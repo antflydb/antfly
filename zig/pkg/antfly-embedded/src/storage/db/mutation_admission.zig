@@ -40,6 +40,19 @@ pub fn acquireReplicationMutationShared(owner: anytype, controls: ?lock.ApplyRwL
     return barrier.acquireShared();
 }
 
+/// While a durable resolution retains replication/snapshot service leases,
+/// dependent capture holders have not all adopted mandatory CPU reentry yet.
+/// Keep the original lifetime, but prohibit CPU transfer inside that graph.
+pub fn retainedLeaseControls(controls: ?lock.ApplyRwLock.Acquisition) ?lock.ApplyRwLock.Acquisition {
+    var result = controls orelse return null;
+    result.execution_wait = null;
+    return result;
+}
+
+pub fn checkLifetime(controls: ?lock.ApplyRwLock.Acquisition) !void {
+    if (controls) |original| try original.lifetime.check();
+}
+
 test "mutation apply admission rechecks activation after original CPU resumption" {
     const std = @import("std");
     const native = @import("../../common/runnable_scheduler.zig");
@@ -348,4 +361,48 @@ test "mutation apply admission replication barrier preserves original CPU lifeti
             try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
         }
     }
+}
+
+test "mutation apply admission retained resolution lease checks original lifetime without CPU transfer" {
+    const std = @import("std");
+    const Owner = struct {
+        core: struct {
+            apply_mutex: lock.ApplyRwLock,
+            pub fn unlockApply(self: *@This()) void {
+                self.apply_mutex.unlockExclusive();
+            }
+        },
+        pub fn enforcePortableRuntimeGate(_: *@This()) !void {}
+        pub fn lockApplyForPortableRuntime(_: *@This()) !void {
+            @panic("controlled resolution cannot fall back to legacy admission");
+        }
+    };
+    const State = struct {
+        checks: usize = 0,
+        fn life(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= 3) return error.DeadlineExceeded;
+        }
+        fn transition(_: *anyopaque) !void {
+            @panic("retained lease admission must not transfer CPU");
+        }
+    };
+    var owner: Owner = .{ .core = .{ .apply_mutex = .{ .io = std.testing.io } } };
+    var state: State = .{};
+    const original: lock.ApplyRwLock.Acquisition = .{
+        .lifetime = .{ .context = &state, .check_fn = State.life },
+        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
+    };
+    owner.core.apply_mutex.lockShared();
+    var held = true;
+    defer if (held) owner.core.apply_mutex.unlockShared();
+    try std.testing.expectError(error.DeadlineExceeded, lockApply(&owner, retainedLeaseControls(original)));
+    try std.testing.expect(original.execution_wait != null);
+    try std.testing.expectEqual(@as(usize, 3), state.checks);
+    try std.testing.expectError(error.DeadlineExceeded, checkLifetime(retainedLeaseControls(original)));
+    owner.core.apply_mutex.unlockShared();
+    held = false;
+    try std.testing.expect(owner.core.apply_mutex.tryLockExclusive());
+    owner.core.apply_mutex.unlockExclusive();
 }

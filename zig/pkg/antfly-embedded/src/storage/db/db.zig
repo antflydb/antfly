@@ -23786,6 +23786,14 @@ pub const DB = struct {
         );
     }
 
+    /// The synchronous completion caller owns this token through physical
+    /// resolution. Preserve its finite lifetime without minting another owner.
+    pub fn resolveTransactionIntentsWithSyncLevelAndExecution(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, sync_level: types.SyncLevel, cancellation: types.CancellationToken, borrow: @import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+        const admission = @import("../../api/mutation_admission_controls.zig");
+        var budget = admission.init(.{ .cancellation = cancellation }, borrow, self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, cancellation, null, null, admission.acquisition(&budget));
+    }
+
     pub fn resolveReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -23808,8 +23816,10 @@ pub const DB = struct {
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
+    pub const resolveTransactionIntentsInternalWithControls = local_mutation.resolveTransactionIntentsInternalWithControls;
 
     pub const resolveTransactionIntentsPrepared = local_mutation.resolveTransactionIntentsPrepared;
+    pub const resolveTransactionIntentsPreparedWithControls = local_mutation.resolveTransactionIntentsPreparedWithControls;
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
         try self.resolveTransactionIntents(txn_id, .aborted, timestamp_ns);

@@ -16743,6 +16743,11 @@ pub const ProvisionedTableWriteSource = struct {
                 return batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req, context);
             }
             const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            if (context.execution_runnable != null) if (req.transaction) |operation| if (operation == .resolve) {
+                const resolve = operation.resolve;
+                _ = (try owner_source.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, resolve.txn_id, resolve.status, resolve.commit_version, 0, req.sync_level, context)) orelse return error.StorageKernelOwnerUnavailable;
+                return;
+            };
             _ = (try owner_source.batchGroupLocal(alloc, group_id, table_name, req)) orelse return error.StorageKernelOwnerUnavailable;
             return;
         }
@@ -16755,6 +16760,9 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             // This is a primary admission, not replay. Preserve native HA
             // durable outbox and synchronous durability policy checks.
+            if (context.execution_runnable != null) if (req.transaction) |operation| if (operation == .resolve) {
+                return applyReplicatedTransactionMutationInternalWithExecution(alloc, lease.db, table_name, group_id, req, context.cancellation, null, context.execution_runnable);
+            };
             try lease.db.batch(req);
         }
     }
@@ -23775,10 +23783,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
-            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
+            try applyReplicatedTransactionMutationInternalWithExecution(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
-            }, cancellation);
+            }, cancellation, null, context.execution_runnable);
             // Transaction resolution already honors the requested sync level.
             // In particular, `.write` must not become coupled to an external
             // enrichment provider merely because the ordinary batch route now
@@ -23790,10 +23798,10 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
+            try applyReplicatedTransactionMutationInternalWithExecution(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
-            }, cancellation);
+            }, cancellation, null, context.execution_runnable);
             if (status == .committed) try drainManagedDbBeforeClose(&db);
             if (status == .committed) self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
@@ -26979,7 +26987,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
             try ensurePreDecisionContextActive(context);
-            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, req, context.cancellation);
+            try applyReplicatedTransactionMutationInternalWithExecution(alloc, cached.db, table_name, group_id, req, context.cancellation, null, context.execution_runnable);
         } else try cached.db.batchReplicatedApply(req);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
@@ -28075,6 +28083,8 @@ fn applyReplicatedTransactionMutationWithCancellation(
 const applyReplicatedTransactionMutationAtRaftEntry = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry;
 
 const applyReplicatedTransactionMutationInternal = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutationInternal;
+
+const applyReplicatedTransactionMutationInternalWithExecution = @import("../storage/server_transaction_dispatch.zig").applyReplicatedTransactionMutationInternalWithExecution;
 
 const batchWritesAsTransactionWrites = physical_local_write.batchWritesAsTransactionWrites;
 
@@ -43905,6 +43915,43 @@ fn implementationTests() type {
             try db.batch(.{ .writes = &.{.{ .key = "doc:expired", .value = "{}" }} });
             var row = (try db.lookup(alloc, "doc:expired", .{})).?;
             defer row.deinit(alloc);
+        }
+
+        test "bound resolution original lifetime rejection preserves prepared intents for retry" {
+            const alloc = std.testing.allocator;
+            var path = try TestDirectory.init("antfly-bound-resolution-controls");
+            defer path.cleanup();
+            var db = try db_mod.DB.open(alloc, path.path(), .{});
+            defer db.close();
+            const txn = try db.beginTransaction(10_000);
+            try db.writeTransaction(txn, .{ .writes = &.{.{ .key = "doc:resolve-budget", .value = "{}" }} });
+            const errors = @import("antfly_runtime_abi").error_abi;
+            const State = struct {
+                checks: usize = 0,
+                reject: bool = true,
+                fn lifetime(raw: *anyopaque) callconv(.c) errors.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.checks += 1;
+                    return if (self.reject and self.checks >= 4) errors.statusFromError(error.DeadlineExceeded) else .ok;
+                }
+                fn checkpoint(_: *anyopaque) callconv(.c) errors.Status {
+                    @panic("resolution must not yield inside a retained service lease");
+                }
+                fn phase(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+                    @panic("uncontended resolution must not transfer CPU");
+                }
+            };
+            var state: State = .{};
+            const borrow: runnable_abi.Borrowed = .{ .context = &state, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = State.checkpoint, .check_lifetime = State.lifetime, .park = State.phase, .enter = State.phase };
+            try std.testing.expectError(error.DeadlineExceeded, db.resolveTransactionIntentsWithSyncLevelAndExecution(txn, .committed, 10_001, .write, .none, borrow));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(txn));
+            try std.testing.expect(try db.lookup(alloc, "doc:resolve-budget", .{}) == null);
+            state.reject = false;
+            try db.resolveTransactionIntentsWithSyncLevelAndExecution(txn, .committed, 10_001, .write, .none, borrow);
+            var row = (try db.lookup(alloc, "doc:resolve-budget", .{})).?;
+            defer row.deinit(alloc);
+            // Idempotent completion uses the same transaction identity.
+            try db.resolveTransactionIntentsWithSyncLevelAndExecution(txn, .committed, 10_001, .write, .none, borrow);
         }
 
         test "bound batch controls retain original owner through native snapshot admission" {

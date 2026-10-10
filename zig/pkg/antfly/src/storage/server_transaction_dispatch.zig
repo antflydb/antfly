@@ -68,6 +68,19 @@ pub fn applyReplicatedTransactionMutationInternal(
     visibility_cancellation: db_mod.types.CancellationToken,
     raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
+    return applyReplicatedTransactionMutationInternalWithExecution(alloc, db, table_name, group_id, req, visibility_cancellation, raft_entry, null);
+}
+
+pub fn applyReplicatedTransactionMutationInternalWithExecution(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    visibility_cancellation: db_mod.types.CancellationToken,
+    raft_entry: ?db_mod.OrderedApplyReceipt,
+    execution: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
@@ -160,13 +173,10 @@ pub fn applyReplicatedTransactionMutationInternal(
                     if (defer_coordinator_ack) null else local_participant,
                 );
             } else {
-                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
-                    resolve.txn_id,
-                    resolve.status,
-                    resolve.commit_version,
-                    req.sync_level,
-                    visibility_cancellation,
-                );
+                if (execution) |original|
+                    try db.resolveTransactionIntentsWithSyncLevelAndExecution(resolve.txn_id, resolve.status, resolve.commit_version, req.sync_level, visibility_cancellation, original)
+                else
+                    try db.resolveTransactionIntentsWithSyncLevelAndCancellation(resolve.txn_id, resolve.status, resolve.commit_version, req.sync_level, visibility_cancellation);
                 const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,

@@ -2384,7 +2384,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const local_commit_control_tests = b.addTest(.{
         .name = "local-commit-control-tests",
         .root_module = local_commit_control_root,
-        .filters = &.{ "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries", "bound batch controls retain original owner through native snapshot admission", "bound transaction original lifetime rejection after BEGIN durably aborts" },
+        .filters = &.{ "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries", "bound batch controls retain original owner through native snapshot admission", "bound transaction original lifetime rejection after BEGIN durably aborts", "bound resolution original lifetime rejection preserves prepared intents for retry" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const local_commit_control_run = addFilteredTestRunArtifact(b, local_commit_control_tests);

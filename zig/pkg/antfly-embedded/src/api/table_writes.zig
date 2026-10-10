@@ -1268,10 +1268,17 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return txnResolveGroupLocalControlled(ptr, group_id, table_name, txn_id, status, commit_version, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalControlled(ptr: *anyopaque, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken, borrow: ?runnable_abi.Borrowed) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
-        try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
+        if (borrow) |original|
+            try db.resolveTransactionIntentsWithSyncLevelAndExecution(txn_id, status, commit_version, sync_level, cancellation, original)
+        else
+            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
         db.markTransactionParticipantResolved(txn_id, participant) catch |err| switch (err) {
@@ -1280,11 +1287,12 @@ pub const BoundTableWriteSource = struct {
         };
     }
 
-    pub fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+    pub fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, _: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
         try ensurePreDecisionContextActive(context);
         // The ordinary bound DB is not a hidden restore owner.
         if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
-        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation);
+        _ = alloc;
+        return txnResolveGroupLocalControlled(ptr, group_id, table_name, txn_id, status, commit_version, sync_level, context.cancellation, context.execution_runnable);
     }
 
     pub fn txnStatusGroupLocal(

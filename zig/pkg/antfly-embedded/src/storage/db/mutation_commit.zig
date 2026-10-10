@@ -3573,10 +3573,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
         ) !void {
+            return self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, null);
+        }
+
+        pub fn resolveTransactionIntentsInternalWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPrepared(
+            self.resolveTransactionIntentsPreparedWithControls(
                 txn_id,
                 status,
                 commit_version,
@@ -3585,6 +3599,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 ordered_receipt,
                 resolved_participant,
                 &preparation.guard,
+                controls,
             ) catch |err| return preparation.mapError(err);
         }
 
@@ -3599,18 +3614,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolved_participant: ?[]const u8,
             preparation: *PreparedRowAllocator,
         ) !void {
+            return self.resolveTransactionIntentsPreparedWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, preparation, null);
+        }
+
+        pub fn resolveTransactionIntentsPreparedWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            preparation: *PreparedRowAllocator,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
+            const admission = @import("mutation_admission.zig");
+            try admission.checkLifetime(controls);
+            const retained = admission.retainedLeaseControls(controls);
             const alloc = preparation.allocator();
             var staging_progress = if (self.local_execution.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
             defer if (staging_progress) |*progress| progress.deinit();
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
             const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
             const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
-            var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
+            var replication_mutation = if (!bypass_replication_write_gate) try admission.acquireReplicationMutationShared(self, controls) else null;
             defer if (replication_mutation) |*lease| lease.release();
             if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
             if (status != .committed) {
-                try self.lockApplyForPortableRuntime();
+                try admission.lockApply(self, retained);
                 defer self.core.unlockApply();
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
@@ -3638,15 +3671,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var attempts: usize = 0;
             while (attempts < 8) : (attempts += 1) {
+                try admission.checkLifetime(retained);
                 const schema_namespace = self.core.schemaNamespaceGeneration();
                 var intents = try self.core.collectTransactionIntentBatch(alloc, txn_id);
                 defer intents.deinit(alloc);
+                try admission.checkLifetime(retained);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
                 defer alloc.free(intent_keys);
-                for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
-                for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[i] = write.key;
+                }
+                for (intents.deletes, 0..) |key, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[intents.writes.len + i] = key;
+                }
                 if (intents.writes.len == 0 and intents.deletes.len == 0) {
-                    try self.lockApplyForPortableRuntime();
+                    try admission.lockApply(self, retained);
                     if (schema_namespace != self.core.schemaNamespaceGeneration()) {
                         self.core.unlockApply();
                         return error.PreparedGenerationChanged;
@@ -3685,12 +3726,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
                 defer alloc.free(writes);
-                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    writes[i] = .{ .key = write.key, .value = write.value };
+                }
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
-                for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
-                    try durable_rows.put(alloc, intents.writes[i].key, row);
-                };
+                for (intents.prepared_rows, 0..) |maybe_row, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    if (maybe_row) |row| try durable_rows.put(alloc, intents.writes[i].key, row);
+                }
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = writes,
                     .deletes = intents.deletes,
@@ -3699,6 +3744,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .restore_staging_scope = restore_scope,
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,
+                    .admission_controls = retained,
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,

@@ -1662,3 +1662,22 @@ and private dispatch and an actual scheduler-owned local participant child.
 Deeper native storage/Raft waits still retain CPU, physical integration remains
 required, and ordinary bound DBs do not serve hidden restore owners. No public
 DTO serialization or new completion owner/deadline is introduced.
+
+Execution-aware bound, direct managed and hosted local resolution now reaches
+the native DB's original completion budget. Native resolution carries the same
+lifetime through replication barrier acquisition, apply/snapshot admission and
+bounded intent-key/prepared-row copying, preserving the legacy resolution
+entrypoints and ordered replay behavior. An admission rejection leaves durable
+transaction intents for an idempotent retry; it does not turn a committed
+decision into an abort. Scoped hidden restore delegation also preserves the
+execution callback rather than using an unscoped batch callback for resolution.
+
+Only acquisition of the initial replication lease may release CPU in this
+portion of native completion. Once replication/snapshot service leases are
+retained, admission uses original non-yielding lifetime checks until all capture
+holders adopt the complete CPU reentry dependency graph. The complete intent
+collector, deeper backend/replication/sync/Raft waits and capture holders remain
+open. Focused native controls/participant/private-ABI coverage passes 108 tests;
+the new physical prepared-intent rejection/retry fixture is selected for full
+integration and has not yet run. Physical integration and default qualification
+are still required.
