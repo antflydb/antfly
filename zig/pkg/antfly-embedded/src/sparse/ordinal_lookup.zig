@@ -17,9 +17,16 @@ const std = @import("std");
 const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
 /// Same-transaction native identity resolution. A missing block proof requests
 /// the legacy point-lookup path; it must never be interpreted as an empty set.
+pub const KeyFilter = struct {
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+};
 pub const Lookup = struct {
     ptr: *anyopaque,
     one: *const fn (*anyopaque, []const u8) anyerror!?u32,
+    /// Sequential native identity window in the same pinned read transaction.
+    /// False requests the exact legacy key predicate, never an empty selection.
+    native_range: ?*const fn (*anyopaque, std.mem.Allocator, u32, u32, KeyFilter, *Bitmap) anyerror!bool = null,
     /// Bounded directory translation, when supported by this generation.
     bounded_block: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, *const Bitmap, *Bitmap, *WorkBudget) anyerror!bool = null,
     block: *const fn (*anyopaque, std.mem.Allocator, []const u8, u32, *const Bitmap, *Bitmap) anyerror!bool,
@@ -96,6 +103,8 @@ pub const Selection = struct {
     budget: ?*MaskBudget = null,
     /// Unmaterialized constraints remain exact candidate predicates.
     residual: bool = false,
+    /// Complete physical membership can be translated in reached native windows.
+    deferred: bool = false,
     include: ?Bitmap = null,
     exclude: ?Bitmap = null,
     pub fn initBounded(a: std.mem.Allocator, bytes: usize) !Selection {

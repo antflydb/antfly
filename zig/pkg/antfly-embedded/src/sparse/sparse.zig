@@ -222,6 +222,7 @@ pub const KeyPredicate = struct {
     constraint_revision: ?*const fn (*anyopaque) u64 = null,
     /// Resolve exact include/exclude masks without expanding a complement.
     select_constraints: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("ordinal_lookup.zig").Selection = null,
+    select_range: ?*const fn (*anyopaque, Allocator, OrdinalLookup, u32, u32) anyerror!?@import("ordinal_lookup.zig").Selection = null,
     /// Resolve an exact positive physical selection against this read transaction.
     /// Null retains the key predicate path (for example exclusion-only queries).
     select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
@@ -239,10 +240,61 @@ const AdaptiveOrdinalConstraints = struct {
     exclude: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
     resolved: bool = false,
     budget: ?*@import("ordinal_lookup.zig").MaskBudget = null,
-    fn deinit(self: *@This()) void {
+    deferred: bool = false,
+    window: ?std.heap.ArenaAllocator = null,
+    range: ?@import("ordinal_lookup.zig").Selection = null,
+    range_first: u32 = 0,
+    range_last: u32 = 0,
+    fn clear(self: *@This()) void {
         if (self.include) |*bitmap| bitmap.deinit();
         if (self.exclude) |*bitmap| bitmap.deinit();
         if (self.budget) |budget| budget.destroy();
+        if (self.range) |*selection| selection.deinit();
+        self.range = null;
+    }
+    fn deinit(self: *@This()) void {
+        self.clear();
+        if (self.window) |*arena| arena.deinit();
+    }
+    fn ensureRange(self: *@This(), doc: u32) !void {
+        if (!self.deferred) return;
+        if (self.range != null and doc >= self.range_first and doc <= self.range_last) return;
+        if (self.range) |*selection| selection.deinit();
+        self.range = null;
+        if (self.window == null) self.window = .init(self.a);
+        _ = self.window.?.reset(.retain_capacity);
+        self.range_first = doc & ~@as(u32, 1023);
+        self.range_last = self.range_first | 1023;
+        const select = self.predicate.?.select_range orelse {
+            self.deferred = false;
+            return;
+        };
+        var selected = (try select(self.predicate.?.ptr, self.window.?.allocator(), self.lookup, self.range_first, self.range_last)) orelse {
+            self.deferred = false;
+            return;
+        };
+        errdefer selected.deinit();
+        if (selected.residual or selected.deferred) {
+            selected.deinit();
+            self.deferred = false;
+            return;
+        }
+        try selected.prepareRead();
+        self.range = selected;
+    }
+    fn allowsOrdinal(self: *@This(), doc: u32) !bool {
+        try self.refresh();
+        if (self.include) |*bitmap| if (!bitmap.contains(doc)) return false;
+        if (self.exclude) |*bitmap| if (bitmap.contains(doc)) return false;
+        try self.ensureRange(doc);
+        if (self.range) |*selection| {
+            if (selection.include) |*bitmap| if (!bitmap.contains(doc)) return false;
+            if (selection.exclude) |*bitmap| if (bitmap.contains(doc)) return false;
+        }
+        return true;
+    }
+    fn resolvedAt(self: *const @This(), doc: u32) bool {
+        return self.resolved or (self.range != null and doc >= self.range_first and doc <= self.range_last);
     }
     fn load(self: *@This()) !void {
         const predicate = self.predicate orelse return;
@@ -254,11 +306,12 @@ const AdaptiveOrdinalConstraints = struct {
         errdefer selected.deinit();
         if (selected.include) |*bitmap| try bitmap.prepareRead();
         if (selected.exclude) |*bitmap| try bitmap.prepareRead();
-        self.deinit();
+        self.clear();
         self.include = selected.include;
         self.exclude = selected.exclude;
         self.budget = selected.budget;
-        self.resolved = !selected.residual;
+        self.resolved = !selected.residual and !selected.deferred;
+        self.deferred = selected.deferred;
         self.revision = if (predicate.constraint_revision) |get| get(predicate.ptr) else 0;
     }
     fn refresh(self: *@This()) !void {
@@ -4766,13 +4819,33 @@ pub const SparseIndex = struct {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
                 return selectPhysicalBlockBounded(ctx.txn, a, prefix, high, rows, result, ctx.cancellation, work);
             }
+            fn nativeRange(raw: *anyopaque, _: Allocator, first: u32, last: u32, filter: @import("ordinal_lookup.zig").KeyFilter, result: *@import("../encoding/roaring.zig").RoaringBitmap) !bool {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                if (@as(u64, last) + 1 - first > 1024) return error.InvalidSparsePhysicalMap;
+                if (!try completeLocatorMap(ctx.txn)) return false;
+                var cursor = try ctx.txn.openCursor();
+                defer cursor.close();
+                var key: [9]u8 = undefined;
+                var next = try cursor.seekAtOrAfter(revKey(&key, first));
+                while (next) |entry| {
+                    try checkSearchCancellation(ctx.cancellation);
+                    if (entry.key.len != 9 or entry.key[0] != key_rev) break;
+                    const ordinal = std.mem.readInt(u64, entry.key[1..9], .big);
+                    if (ordinal > last) break;
+                    if (ordinal < first) return error.InvalidSparsePhysicalMap;
+                    if (try filter.allows(filter.ptr, entry.value)) try result.add(@intCast(ordinal));
+                    next = try cursor.next();
+                }
+                return true;
+            }
             fn lookup(raw: *anyopaque, key: []const u8) !?u32 {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
                 return ctx.index.docNumForDocIdTxn(ctx.txn, key);
             }
         };
         var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
-        var ordinal_state: AdaptiveOrdinalConstraints = .{ .a = alloc, .predicate = constraints.key_predicate, .lookup = .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block, .bounded_block = Lookup.boundedBlock } };
+        const complete_native_map = try completeLocatorMap(&txn);
+        var ordinal_state: AdaptiveOrdinalConstraints = .{ .a = alloc, .predicate = constraints.key_predicate, .lookup = .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block, .bounded_block = Lookup.boundedBlock, .native_range = if (complete_native_map) Lookup.nativeRange else null } };
         defer ordinal_state.deinit();
         try ordinal_state.load();
         if (constraints.key_predicate == null and ordinal_state.include == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
@@ -4809,7 +4882,7 @@ pub const SparseIndex = struct {
             complete: bool,
             identities: ?backend_erased.Cursor = null,
         };
-        var decisions: Decisions = .{ .complete = try completeLocatorMap(&txn) };
+        var decisions: Decisions = .{ .complete = complete_native_map };
         defer if (decisions.identities) |*cursor| cursor.close();
         const ScoreSource = enum { segment, delta };
         const AccumulateContext = struct {
@@ -4838,9 +4911,10 @@ pub const SparseIndex = struct {
             }
             pub fn nextCandidate(ctx: *@This(), first: u32) !u64 {
                 try ctx.ordinals.refresh();
+                try ctx.ordinals.ensureRange(first);
                 const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
-                var includes: [1]*const Bitmap = undefined;
-                var excludes: [1]*const Bitmap = undefined;
+                var includes: [2]*const Bitmap = undefined;
+                var excludes: [2]*const Bitmap = undefined;
                 var ni: usize = 0;
                 var ne: usize = 0;
                 if (ctx.ordinals.include) |*bitmap| {
@@ -4851,7 +4925,19 @@ pub const SparseIndex = struct {
                     excludes[0] = bitmap;
                     ne = 1;
                 }
-                return Bitmap.candidateLowerBound(first, 0x1_0000_0000, includes[0..ni], excludes[0..ne]);
+                var end: u64 = 0x1_0000_0000;
+                if (ctx.ordinals.range) |*selection| {
+                    end = @as(u64, ctx.ordinals.range_last) + 1;
+                    if (selection.include) |*bitmap| {
+                        includes[ni] = bitmap;
+                        ni += 1;
+                    }
+                    if (selection.exclude) |*bitmap| {
+                        excludes[ne] = bitmap;
+                        ne += 1;
+                    }
+                }
+                return Bitmap.candidateLowerBound(first, end, includes[0..ni], excludes[0..ne]);
             }
             pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
                 if (ctx.ordinals.include) |*bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
@@ -4859,7 +4945,7 @@ pub const SparseIndex = struct {
                 return true;
             }
             fn allowsKey(ctx: *@This(), doc_num: u32) !bool {
-                if (!ctx.ordinals.resolved) if (ctx.key_predicate) |predicate| {
+                if (!ctx.ordinals.resolvedAt(doc_num)) if (ctx.key_predicate) |predicate| {
                     if (ctx.decisions.values.get(doc_num)) |allowed| return allowed;
                     if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
                     var owned: ?[]u8 = null;
@@ -4888,8 +4974,7 @@ pub const SparseIndex = struct {
                 return true;
             }
             pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
-                if (ctx.ordinals.include) |*bitmap| if (!bitmap.contains(doc_num)) return false;
-                if (ctx.ordinals.exclude) |*bitmap| if (bitmap.contains(doc_num)) return false;
+                if (!try ctx.ordinals.allowsOrdinal(doc_num)) return false;
                 if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
@@ -4907,8 +4992,7 @@ pub const SparseIndex = struct {
                 for (decoded.doc_nums, 0..) |doc_num, di| {
                     try ctx.ordinals.refresh();
                     if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
-                    if (ctx.ordinals.include) |*bitmap| if (!bitmap.contains(doc_num)) continue;
-                    if (ctx.ordinals.exclude) |*bitmap| if (bitmap.contains(doc_num)) continue;
+                    if (!try ctx.ordinals.allowsOrdinal(doc_num)) continue;
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
@@ -8183,4 +8267,115 @@ test "sparse broad physical masks seek through the bounded native directory" {
     var work: ordinals.WorkBudget = .{ .blocks = 1 };
     try std.testing.expectError(error.OrdinalPlanningBudgetExceeded, selectPhysicalBlockBounded(&txn, a, prefix, 0, &physical, &partial, null, &work));
     try std.testing.expect(partial.cardinality() < physical.cardinality());
+}
+
+test "sparse lazy native windows intersect reached postings and preserve spill legacy and signed scores" {
+    const a = std.testing.allocator;
+    const ordinals = @import("ordinal_lookup.zig");
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "lazy-native-windows");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 32 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 10000);
+    for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d:0>5}", .{i}), .vec = if (i < 9900) .{ .indices = &.{1}, .values = &.{1} } else .{ .indices = &.{ 1, 2 }, .values = &.{ 1, 2 } } };
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try idx.batch(&.{}, &.{"doc-09901"});
+    const Predicate = struct {
+        ranges: usize = 0,
+        rows: usize = 0,
+        fallback: usize = 0,
+        fail: bool = false,
+        fn selected(key: []const u8) !bool {
+            const row = try std.fmt.parseInt(u32, key[4..], 10);
+            return row >= 9900 and row % 7 != 0;
+        }
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.fallback += 1;
+            return selected(key);
+        }
+        fn windowKey(raw: *anyopaque, value: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.rows += 1;
+            if (self.fail) return error.TestWindowFailed;
+            return selected(value);
+        }
+        fn select(_: *anyopaque, _: Allocator, _: OrdinalLookup) !?ordinals.Selection {
+            return .{ .residual = true, .deferred = true };
+        }
+        fn range(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup, first: u32, last: u32) !?ordinals.Selection {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ranges += 1;
+            var result: ordinals.Selection = .{ .include = Bitmap.init(alloc) };
+            errdefer result.deinit();
+            const translate = lookup.native_range orelse {
+                result.deinit();
+                return null;
+            };
+            if (!try translate(lookup.ptr, alloc, first, last, .{ .ptr = self, .allows = windowKey }, &result.include.?)) {
+                result.deinit();
+                return null;
+            }
+            return result;
+        }
+    };
+    var selected_ids: std.ArrayList([]const u8) = .empty;
+    defer selected_ids.deinit(a);
+    for (writes[9900..]) |write| if (try Predicate.selected(write.doc_id)) {
+        try selected_ids.append(a, write.doc_id);
+    };
+    for ([_]f32{ 1, -1, 0 }) |weight| {
+        // A rare dimension starts in the last window. No directory walk over
+        // intervening windows is required, even with an archive-wide predicate.
+        const query: SparseVector = .{ .indices = &.{2}, .values = &.{weight} };
+        const expected = try idx.searchConstrained(a, &query, 9, .{ .filter_doc_ids = selected_ids.items });
+        defer SparseIndex.freeResults(a, expected);
+        var predicate: Predicate = .{};
+        const actual = try idx.searchConstrained(a, &query, 9, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } });
+        defer SparseIndex.freeResults(a, actual);
+        try std.testing.expect(predicate.ranges <= 2);
+        try std.testing.expect(predicate.rows <= 2048);
+        try std.testing.expectEqual(@as(usize, 0), predicate.fallback);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |left, right| {
+            try std.testing.expectEqualStrings(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+    }
+    // Exercise changing ordinal windows across multiple dimensions while
+    // preserving canonical signed f32 accumulation.
+    const query: SparseVector = .{ .indices = &.{ 1, 2 }, .values = &.{ -1, 0.25 } };
+    const expected = try idx.searchConstrained(a, &query, 9, .{ .filter_doc_ids = selected_ids.items, .max_score_docs = 1 });
+    defer SparseIndex.freeResults(a, expected);
+    var predicate: Predicate = .{};
+    const actual = try idx.searchConstrained(a, &query, 9, .{ .max_score_docs = 1, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } });
+    defer SparseIndex.freeResults(a, actual);
+    try std.testing.expectEqual(@as(usize, 0), predicate.fallback);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |left, right| {
+        try std.testing.expectEqualStrings(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
+    predicate = .{ .fail = true };
+    try std.testing.expectError(error.TestWindowFailed, idx.searchConstrained(a, &query, 9, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } }));
+    // Old generations without a complete directory proof retain exact keys.
+    // Disabling DAAT also forces spill with a one-score memory allowance.
+    var txn = try idx.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.delete(metaKey(meta_complete_locators));
+    try txn.commit();
+    predicate = .{};
+    const legacy = try idx.searchConstrained(a, &query, 9, .{ .max_score_docs = 1, .score_spill = .{ .io = std.testing.io, .directory = "/tmp", .chunk_records = 32, .chunk_bytes = 1024 }, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } });
+    defer SparseIndex.freeResults(a, legacy);
+    try std.testing.expectEqual(@as(usize, 1), predicate.ranges);
+    try std.testing.expect(predicate.fallback > 0);
+    for (expected, legacy) |left, right| {
+        try std.testing.expectEqualStrings(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
 }

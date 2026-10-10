@@ -278,7 +278,9 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
 ):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
-    count = 10003
+    # Exceed the 64 native directory-block planning budget so completed broad
+    # memberships exercise lazy ordinal windows in both real source formats.
+    count = 70003
     rows = pa.table(
         {
             "body": [
@@ -558,6 +560,22 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
                 ),
             )
             assert {h["_source"]["amount"] for h in excluded["hits"]["hits"]} == {0, 1}
+            for weight in (-1, 0):
+                signed_excluded = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        embeddings={
+                            "sparse_native": {"indices": [1], "values": [weight]}
+                        },
+                        exclusion_query=category,
+                    ),
+                )
+                assert {
+                    (h["_source"]["amount"], h["_score"])
+                    for h in signed_excluded["hits"]["hits"]
+                } == {(0, weight), (1, weight)}
             dense_base = dict(
                 sparse_base,
                 embeddings={"dense_native": [1, 0]},

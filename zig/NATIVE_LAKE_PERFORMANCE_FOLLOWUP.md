@@ -947,3 +947,106 @@ Validation uses Zig 0.17.0:
 Representative archive-scale cold/warm throughput and peak process memory
 remain unmeasured. Fuzzy positional expansion continues through its existing
 authoritative execution path.
+
+## Two-phase verification, lazy sparse windows and parallel ranked pages
+
+The final review identified execution opportunities rather than a confirmed
+correctness defect. These refinements keep the same public API, artifact formats,
+visibility checks and score/document-ID ordering.
+
+Boolean navigation now exposes a monotone approximation independently of exact
+verification. Required clauses and minimum-should-match pivots align posting heads
+without unpacking phrase positions. Complete native include/exclude masks and
+deletions reject candidates before verification. Cheap exact required/prohibited
+clauses run before positional clauses, while score additions retain the established
+clause order. Repeated verification of a current document is cached. Incomplete
+adaptive providers still refine verified batches; completing providers immediately
+supply immutable masks to navigation. A 10,000-document phrase joined with a
+one-document term must verify one document and read two position records, in either
+clause order; a one-document native mask has the same work bound.
+
+Sparse planning retains the existing 4 MiB compressed-mask allowance. Generations
+with native ordinal-window support eagerly translate at most 64 physical directory
+blocks; legacy generations retain their 4,096-block/point planning allowance.
+Exhaustion discards every partial mask. Complete memberships then translate only
+reached 1,024-ordinal windows using a sequential reverse-identity cursor in the same
+pinned read transaction. Include/exclude membership is applied together and the
+window is prepared for bitmap seeks. The query retains one reusable window arena;
+changing windows and membership revisions invalidate its mask. An empty window
+advances posting navigation to its boundary, allowing a rare posting to jump over
+intervening directory windows. No archive-wide complement or matching-ID list is
+built. Missing completeness proofs retain exact per-candidate predicates; storage,
+cancellation and allocation errors propagate. Streaming and bounded spill scoring
+share this constraint state and preserve canonical quantized signed arithmetic.
+
+Supported Boolean scoring on query-bound remote snapshots with multiple segments
+and at least 4,096 documents uses the shared CPU/I/O scheduler. The most promising
+segment seeds the global cutoff. At most four lanes own separate field readers,
+position buffers and heaps bounded by the requested page window. Each lane has an 8 MiB live scratch
+allowance; scheduler admission accounts concurrent lanes within a 32 MiB operator
+allowance for lane workspaces. Request-owned planning/statistics, seed scratch,
+the global result heap and independently bounded read caches are separate. A
+cancellation-aware blocking coordinator serializes adaptive producer calls and
+winner admission, so query-owned providers and their stored request allocators
+are never accessed concurrently. The global winner heap is reserved before workers start, and its
+atomic score/document-ID cutoff lets other lanes prune conservatively. Completed
+provider masks also publish once through atomics, avoiding per-document coordinator
+locks during posting navigation. Local counts and diagnostics merge only after a
+segment succeeds. Explicit worker cap
+exhaustion discards partial local results and retries that segment on the caller;
+ordinary allocation errors propagate. Saturation runs required work inline. Every
+exit joins or cancels outstanding tasks before releasing snapshot/statistics state
+and scheduler leases. Small or unbound snapshots retain serial scoring.
+
+Ranked native search-after requests admit only hits strictly following the cursor
+into a heap of at most `k + offset`; matching hits before the cursor still contribute
+to total-hit accounting. Supported leaves compose with the Boolean scorer instead
+of requesting an all-hit window. Distributed BM25 field/term statistics are loaded
+once, shared read-only by workers and used for both scores and bounds. An analyzed
+match uses an override only when it covers every analyzed term, preserving the
+previous partial-statistics fallback, zero-frequency segment fallback and corpus
+frequency clamping. Existing distributed phrase constant-score semantics remain
+unchanged. Aggregations and fuzzy positional expansion retain
+the established authoritative paths. Competitive pruning continues reporting
+lower-bound totals.
+
+The real Parquet/Iceberg regression now writes 70,003 rows, crossing the eager
+native-directory budget, and checks broad includes/exclusions, signed/zero sparse
+scores, positional conjunctions, sorted cursor pages and restart. Native unit
+regressions additionally cover late rare-window seeks, deleted rows, forced spill,
+legacy proof fallback, distributed and partial statistics, cursor ties and offsets,
+threaded scoring, scheduler saturation, worker cap retries, provider/read errors,
+cancellation and allocation-failure ownership. Representative 50-million-row
+throughput and peak process RSS still require separate measurement.
+
+### Qualification of the two-phase/lazy-window/parallel refinement
+
+`origin/main` at `f599f36da5` is included; a fresh fetch found no newer main
+commits. The generated control source catalog matches the current ownership
+graph. Qualification uses Zig 0.17.0.
+
+- Debug: 67 sparse, 26 focused text/scorer and six API tests passed with no
+  failures or leaks; one optimized-only benchmark skipped.
+- ReleaseFast: 67 sparse, 394 bounded-reader, 27 text/scorer and six API tests
+  passed with no failures or leaks. The sparse regression explicitly removes
+  the complete-map proof and supplies a one-score memory allowance plus spill
+  I/O to exercise the legacy disk-spill path.
+- The phrase fixture contains 9,999 documents with the right terms in the wrong
+  positions, followed by one exact match. Both required-clause orders and native
+  bitmap gating verify only that final document and read two position records.
+- Threaded native scoring preserves exact winners/scores and publishes completed
+  masks after the twentieth producer batch, without stale extra producer calls.
+  Scheduler saturation runs inline; injected cap exhaustion retries every
+  uncommitted segment. Read/provider errors and cancellation release all worker
+  and byte leases. Cursor regressions preserve standalone and nested score
+  arithmetic, ties and offsets across complete, partial, zero and overcount
+  distributed statistics.
+- The production Debug server builds. All four real-data E2Es passed against it
+  in 183.78 seconds: independent Iceberg snapshots/schema IDs/partitions/deletes
+  and restart; 70,003-row Parquet and Iceberg indexed includes/exclusions,
+  signed/zero sparse ranking, positional conjunctions, sorting/cursor pages and
+  persistence; quantized sparse score/ranking preservation. Iceberg remains in
+  `e2e-full`; the entire suite was not run.
+- Zig formatting, Python lint/formatting, generated catalog equality and
+  `git diff --check` passed. Archive-scale throughput and peak process RSS remain
+  unmeasured.

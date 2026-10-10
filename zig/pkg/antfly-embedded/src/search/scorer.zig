@@ -60,6 +60,8 @@ pub const SearchDiagnostics = struct {
     wand_chunks_skipped: u64 = 0,
     boolean_candidates_scored: u64 = 0,
     boolean_chunks_skipped: u64 = 0,
+    boolean_parallel_tasks: u64 = 0,
+    boolean_workspace_retries: u64 = 0,
     phrase_candidates_verified: u64 = 0,
     phrase_position_records_decoded: u64 = 0,
     phrase_matches_scored: u64 = 0,
@@ -91,7 +93,7 @@ fn scoredHitWorseThan(a: ScoredHit, b: ScoredHit) bool {
     return a.score < b.score;
 }
 
-fn scoredHitBetterThan(a: ScoredHit, b: ScoredHit) bool {
+pub fn scoredHitBetterThan(a: ScoredHit, b: ScoredHit) bool {
     if (a.score == b.score) return a.doc_id < b.doc_id;
     return a.score > b.score;
 }
