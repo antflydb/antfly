@@ -1294,7 +1294,11 @@ pub const SegmentReader = struct {
     }
 
     pub fn invertedIndexScoped(self: *const SegmentReader, allocator: Allocator, field_name: []const u8) !?inverted.ScopedInvertedIndexReader {
-        if (self.native) |native| return native.range.invertedIndexScoped(allocator, field_name, .{});
+        return self.invertedIndexScopedWithOptions(allocator, field_name, .{});
+    }
+
+    pub fn invertedIndexScopedWithOptions(self: *const SegmentReader, allocator: Allocator, field_name: []const u8, options: inverted.ScopedInvertedIndexReader.Options) !?inverted.ScopedInvertedIndexReader {
+        if (self.native) |native| return native.range.invertedIndexScoped(allocator, field_name, options);
         const data = (try self.getSection(field_name, .inverted_text)) orelse return null;
         var scoped = try inverted.ScopedInvertedIndexReader.initContiguous(allocator, data);
         if (self.postings_loader) |loader| {

@@ -8421,3 +8421,21 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
         try std.testing.expectEqual(left.score, right.score);
     }
 }
+
+test "sparse planning caps do not hide backing allocation failures after optional growth" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var budget: @import("ordinal_lookup.zig").MaskBudget = .{ .backing = failing.allocator(), .limit = 16 };
+    const a = budget.allocator();
+    const bytes = try a.alloc(u8, 8);
+    defer a.free(bytes);
+    try std.testing.expect(!a.resize(bytes, 32));
+    try std.testing.expect(budget.exhausted);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    try std.testing.expect(!budget.exhausted);
+    try std.testing.expect(a.remap(bytes, 32) == null);
+    try std.testing.expect(budget.exhausted);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    try std.testing.expect(!budget.exhausted);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 32));
+    try std.testing.expect(budget.exhausted);
+}

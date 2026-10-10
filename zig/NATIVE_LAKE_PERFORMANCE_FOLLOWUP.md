@@ -1084,3 +1084,121 @@ Qualification uses Zig 0.17.0.
 - Zig formatting, generated catalog equality and `git diff --check` passed.
   Representative 50-million-row cold/warm throughput and peak process RSS remain
   unmeasured; work-count regressions do not replace archive-scale benchmarks.
+
+## Preflight sparse translation and share prepared text segments
+
+The next refinement removes two avoidable setup costs and improves fragmented
+snapshot planning without changing query syntax, artifact formats, ranking, or
+result-size limits.
+
+Sparse selection planning now counts effective 1,024-row physical directory
+windows before native translation. It applies completed include/exclude
+subtraction first and stops as soon as both directory and point budgets cannot
+finish. Broad selections therefore enter deferred membership without reading and
+discarding the first 64 native blocks. A selection with many directory windows
+but at most 4,096 effective rows uses exact identity point seeks instead; a
+one-row difference between broad include/exclude sets still gets an upfront
+ordinal mask. Coordinates retain independent file/group/high-row windows,
+including the final u32/u64 rows. The preflight uses bounded compressed scratch,
+checks cancellation, and retains existing ordinary-error propagation and
+whole-selection fallback rules.
+
+Text node construction no longer consumes the first posting. Approximation
+initializes each iterator at the useful target selected by the range and native
+masks. Metadata bounds remain conservative until that iterator has a current
+posting. First and long impact-range seeks use binary navigation; adjacent
+sequential crossings retain a constant-time path. Consequently a late range
+neither decodes document zero nor linearly re-walks its impact-ID prefix.
+
+Query-bound remote scoring shares a query-scoped prepared segment cache when
+ranges reuse segments or a fragmented snapshot needs metadata planning. Each
+prepared entry owns the lowered Boolean tree, one reader per field, unique term
+lookups, immutable decoded impact IDs, and its segment ceiling. Scoring clones
+only mutable node/iterator state; repeated phrase positions keep independent
+iterators, while their immutable navigation is shared. Preparation uses the
+established lowering and f32 score grouping. Small single-range queries and
+serial scoring without a prepass avoid this extra preparation.
+
+At most four entries reside at once, each with an 8 MiB live allocation cap,
+including navigation and backing-cache slabs. The aggregate preparation allowance
+is 32 MiB plus fixed coordinator/entry records. It is separate from the existing
+32 MiB concurrent scoring-lane allowance, request plans/statistics, seed/retry
+scratch, result heaps, and independently bounded source caches. Concurrent field
+caches reserve four hot slabs and one fill slab before publication, preserving
+the existing 64 KiB read grain; mutable payload
+and position decoder buffers remain lane-owned. Cached slab allocations use a
+locked direct backing allocator rather than a shared mutable arena.
+
+Cache misses are singleflight per segment. Construction and source reads run
+outside the coordinator mutex. Cancellation-aware waiters borrow reference-counted
+leases, and eviction destroys only idle readers after every borrowing iterator
+has closed. Explicit preparation caps memoize an unavailable entry and retain
+conservative planning plus authoritative per-range construction. Ordinary
+allocation/storage errors propagate. Optional resize/remap cap denials cannot
+misclassify a later backing allocation failure as optimization exhaustion.
+Cached hits still check the current read
+capability; prepared readers never survive the query or its pinned snapshot.
+
+For snapshots with more than 16 segments, the shared scheduler admits up to four
+metadata-planning lanes under the preparation allowance. Each lane claims segments
+from one atomic queue. Scalar score ceilings remain in the query's segment plans
+even when an idle prepared tree is evicted. Saturation runs required work inline,
+and every error/cancellation path joins tasks before releasing plans, statistics,
+cache entries, or scheduler leases. Healthy snapshots avoid the prepass and its
+all-impact-table ceiling calculations.
+
+Exact phrase segment ceilings now use authenticated first-term frequency/norm
+limits with the complete phrase IDF. Later phrase terms constrain presence, while
+start frequency remains bounded by the first term so stacked/repeated positions
+cannot undercut the ceiling. Saturated frequency metadata widens to u32; missing
+legacy metadata and signed/unsupported configurations retain conservative bounds.
+Distributed constant-score phrase behavior is unchanged.
+
+Work-count regressions cover the 64/65-window boundary, zero-directory-read broad
+fallback, fragmented exact point seeks, subtraction, full-width coordinates,
+late range initialization, one preparation across three ranges, borrowed impact
+navigation, eviction with an active reader, explicit cache caps, ordinary
+allocation failures, canceled singleflight waiters, and cached capability errors.
+A threaded 20-segment positional fixture verifies parallel planning and exact
+ranking: its authenticated phrase ceilings permit scoring one segment and pruning
+19, with signed/zero boosts retaining differential checks. Representative
+50-million-row cold/warm throughput and peak process RSS remain unmeasured.
+
+### Qualification of shared segment preparation
+
+A final fetch confirms `origin/main` at `551b8b3895` is already included;
+merging it reports no additional commits or conflicts. Qualification uses
+Zig 0.17.0.
+
+- Debug: 68 sparse, 30 focused text/scorer and seven API tests passed (105
+  checks), with no failures or leaks; one optimized-only benchmark skipped.
+- ReleaseFast: 68 sparse, 398 bounded-reader, 31 focused text/scorer and seven
+  API tests passed (504 checks), with no failures or leaks.
+- The production Debug server builds. Generated control-catalog equality,
+  Zig formatting and `git diff --check` pass.
+- The 65-window broad-selection fixture invokes zero native directory callbacks.
+  Exactly 64 windows retain eager translation; include-minus-exclude can reduce
+  that broad membership to one row, and 65 fragmented rows use 65 exact point
+  seeks instead of exhausting the directory budget. Full-width coordinates and
+  allocation-failure cleanup retain explicit checks.
+- A 12,288-row remote segment uses one immutable preparation for three ranges.
+  Cloned iterators own zero impact-ID capacity and borrow the prepared arrays;
+  a range beginning at document 8,192 initializes its decoder at that range,
+  without first consuming document zero. Existing exact-score, signed/zero,
+  cursor, live-cutoff and discarded-winner retry checks remain enabled.
+- Threaded metadata planning admits scheduler tasks for a 20-segment phrase
+  fixture; only its high-impact segment is scored and 19 are pruned. Active
+  reader leases survive cache eviction. Explicit caps retain exact per-range
+  fallback; exhaustive ordinary allocation failures, cached read-context errors
+  and canceled singleflight waiters preserve ownership. A separate allocator
+  regression verifies denied resize/remap probes cannot hide later backing
+  allocation failures.
+- All four real-data E2Es passed against that server in 177.97 seconds:
+  independent Iceberg snapshots/schema IDs/partitions/deletes and restart;
+  70,003-row Parquet and Iceberg indexed predicates, signed/zero sparse ranking,
+  phrases, sorted cursor pages and persistence; quantized sparse score/ranking
+  preservation. Iceberg remains in `e2e-full`; the entire suite was not run.
+
+Representative 50-million-row cold/warm throughput and peak process RSS remain
+unmeasured. No archive speedup is inferred from these work-count regressions or
+the fixture's total runtime.

@@ -61,6 +61,10 @@ pub const MaskBudget = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn permits(self: *@This(), old: usize, len: usize) bool {
+        // Resize/remap are optional allocator probes. If one is capped and a
+        // subsequent permitted allocation fails in the backing allocator, that
+        // ordinary failure must not inherit the earlier cap classification.
+        self.exhausted = false;
         if (len <= old or len - old <= self.limit - self.live) return true;
         self.exhausted = true;
         return false;

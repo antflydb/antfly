@@ -340,6 +340,26 @@ pub const ConcurrentBlockCache = struct {
         return .{ .cache = cache };
     }
 
+    /// Reserve the complete bounded cache before sharing an immutable reader.
+    /// No slab growth is then needed while its posting iterators run in parallel.
+    pub fn preallocate(self: *ConcurrentBlockCache) !void {
+        @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+        defer self.fill_mutex.unlock();
+        try self.ensureBudget();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.fill.len == 0) self.fill = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
+            if (self.budget != null and self.budget.?.budget_denied) return error.CacheBudgetExceeded;
+            return err;
+        };
+        for (&self.cache.slots) |*slot| if (slot.bytes.len == 0) {
+            slot.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
+                if (self.budget != null and self.budget.?.budget_denied) return error.CacheBudgetExceeded;
+                return err;
+            };
+        };
+    }
+
     pub fn deinit(self: *ConcurrentBlockCache) void {
         if (self.budget) |*budget| budget.reservation.manager.unregisterReclaimer(self.reclaimer);
         self.bufferAllocator().free(self.fill);

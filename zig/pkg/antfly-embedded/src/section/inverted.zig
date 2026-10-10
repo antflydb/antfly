@@ -3063,6 +3063,18 @@ pub const BlockMaxInfo = struct {
         return self.maxImpactAtOrdinalWithScorer(ordinal, scorer);
     }
 
+    /// Authenticated ceiling for a supplied term or phrase IDF. A saturated
+    /// frequency is an open-ended bound, never an exact 65,535 occurrences.
+    pub fn maxImpactAllWithIdf(self: BlockMaxInfo, avg_dl: f32, idf: f32, config: BM25Config) f32 {
+        var maximum: f32 = 0;
+        for (0..self.chunkCount()) |ordinal| {
+            const limits = self.frequencyNormAtOrdinal(ordinal).?;
+            if (limits.frequency == 0) continue;
+            maximum = @max(maximum, bm25ScoreWithIdf(limits.frequency, limits.norm, avg_dl, idf, config));
+        }
+        return maximum;
+    }
+
     /// Conservative maximum impact over every stored chunk in this postings
     /// list. This supports segment ordering/pruning without decoding postings.
     pub fn maxImpactAll(self: BlockMaxInfo, doc_count: u32, doc_freq: u32, avg_dl: f32, config: BM25Config) f32 {
@@ -3158,6 +3170,8 @@ pub const TermPostings = struct {
     max_position_record_bytes: usize = 1024 * 1024,
     skip_data: ?[]const u8 = null,
     impact_chunk_ids_data: ?[]const u8 = null,
+    /// Immutable decoded navigation retained by the prepared reader's owner.
+    prepared_impact_chunk_ids: ?[]const u32 = null,
     impact_chunk_count: u32 = 0,
     inline_single_doc: bool = false,
     inline_doc_id: u32 = 0,
@@ -3188,6 +3202,15 @@ pub const TermPostings = struct {
             try bitmap.add(hit.doc_id);
         }
         return bitmap;
+    }
+
+    /// Caller owns this immutable navigation array and must keep it alive for
+    /// every iterator borrowing `prepared_impact_chunk_ids`.
+    pub fn decodedImpactChunkIds(self: *const TermPostings, alloc: Allocator) ![]u32 {
+        if (self.prepared_impact_chunk_ids) |ids| return alloc.dupe(u32, ids);
+        var iter = try self.iterator(alloc);
+        defer iter.deinit();
+        return iter.impact_chunk_ids.toOwnedSlice(alloc);
     }
 
     /// Create a postings iterator that yields (doc_id, freq, norm, positions) tuples.
@@ -3226,6 +3249,7 @@ pub const TermPostings = struct {
             .max_position_record_bytes = self.max_position_record_bytes,
             .skip_data = self.skip_data,
             .impact_chunk_ids_data = self.impact_chunk_ids_data,
+            .borrowed_impact_chunk_ids = self.prepared_impact_chunk_ids,
             .impact_chunk_count = self.impact_chunk_count,
         };
         if (self.metadata_owner) |owner| owner.retain(owner.ptr);
@@ -3879,6 +3903,7 @@ pub const PostingsIterator = struct {
     impact_chunk_ids_data: ?[]const u8 = null,
     impact_chunk_count: u32 = 0,
     impact_chunk_ids: std.ArrayListUnmanaged(u32) = .empty,
+    borrowed_impact_chunk_ids: ?[]const u32 = null,
     current_impact_ordinal: usize = 0,
     current_impact_valid: bool = false,
     last_returned_doc: u32 = 0,
@@ -3984,7 +4009,12 @@ pub const PostingsIterator = struct {
         return self.chunk_meta_count;
     }
 
+    fn impactChunkIds(self: *const PostingsIterator) []const u32 {
+        return self.borrowed_impact_chunk_ids orelse self.impact_chunk_ids.items;
+    }
+
     fn decodeImpactChunkIds(self: *PostingsIterator) !void {
+        if (self.borrowed_impact_chunk_ids != null) return;
         if (!usesSeparateImpactRanges(self.version) or self.impact_chunk_count == 0) return;
         const data = self.impact_chunk_ids_data orelse return error.InvalidData;
         if (data.len == 0) return error.InvalidData;
@@ -4038,13 +4068,29 @@ pub const PostingsIterator = struct {
     }
 
     inline fn noteReturnedDoc(self: *PostingsIterator, doc_id: u32) void {
-        if (!usesSeparateImpactRanges(self.version) or self.impact_chunk_ids.items.len == 0) return;
+        const ids = self.impactChunkIds();
+        if (!usesSeparateImpactRanges(self.version) or ids.len == 0) return;
         const wanted_chunk = doc_id / impact_range_doc_count;
         var ordinal = if (self.current_impact_valid) self.current_impact_ordinal else 0;
-        while (ordinal + 1 < self.impact_chunk_ids.items.len and self.impact_chunk_ids.items[ordinal] < wanted_chunk) ordinal += 1;
-        if (self.impact_chunk_ids.items[ordinal] == wanted_chunk) {
+        if (ids[ordinal] != wanted_chunk) {
+            if (self.current_impact_valid and ordinal + 1 < ids.len and ids[ordinal + 1] >= wanted_chunk) {
+                ordinal += 1;
+            } else {
+                // Range starts and long competitive seeks must not re-walk the
+                // archive's impact-ID prefix. Sequential block crossings retain
+                // the cheap adjacent-entry path above.
+                var low: usize = if (self.current_impact_valid) ordinal else 0;
+                var high: usize = ids.len;
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    if (ids[mid] < wanted_chunk) low = mid + 1 else high = mid;
+                }
+                ordinal = low;
+            }
+        }
+        self.current_impact_valid = ordinal < ids.len and ids[ordinal] == wanted_chunk;
+        if (self.current_impact_valid) {
             self.current_impact_ordinal = ordinal;
-            self.current_impact_valid = true;
             self.last_returned_doc = doc_id;
         }
     }
@@ -5001,10 +5047,10 @@ pub const PostingsIterator = struct {
     };
 
     pub fn currentBlockCursor(self: *const PostingsIterator) ?BlockCursor {
-        if (self.impact_chunk_ids.items.len > 0) {
-            if (!self.current_impact_valid or self.current_impact_ordinal >= self.impact_chunk_ids.items.len) return null;
+        if (self.impactChunkIds().len > 0) {
+            if (!self.current_impact_valid or self.current_impact_ordinal >= self.impactChunkIds().len) return null;
             const lo = self.current_impact_ordinal;
-            const wanted_chunk = self.impact_chunk_ids.items[lo];
+            const wanted_chunk = self.impactChunkIds()[lo];
             const min_doc = wanted_chunk * impact_range_doc_count;
             return .{
                 .ordinal = lo,
@@ -5026,9 +5072,9 @@ pub const PostingsIterator = struct {
 
     pub fn advanceBlockCursor(self: *const PostingsIterator, cursor: *BlockCursor) !bool {
         const next_ordinal = cursor.ordinal + 1;
-        if (self.impact_chunk_ids.items.len > 0) {
-            if (next_ordinal >= self.impact_chunk_ids.items.len) return false;
-            const chunk_id = self.impact_chunk_ids.items[next_ordinal];
+        if (self.impactChunkIds().len > 0) {
+            if (next_ordinal >= self.impactChunkIds().len) return false;
+            const chunk_id = self.impactChunkIds()[next_ordinal];
             const min_doc = chunk_id * impact_range_doc_count;
             cursor.* = .{
                 .ordinal = next_ordinal,
@@ -5085,7 +5131,7 @@ pub const PostingsIterator = struct {
     }
 
     pub fn loadBlockCursor(self: *PostingsIterator, cursor: BlockCursor) !?Hit {
-        if (self.impact_chunk_ids.items.len > 0) return self.advanceTo(cursor.min_doc);
+        if (self.impactChunkIds().len > 0) return self.advanceTo(cursor.min_doc);
         try self.loadChunk(cursor.ordinal);
         return try self.next();
     }
@@ -5121,14 +5167,14 @@ pub const PostingsIterator = struct {
         bound_table: ?*const BM25BoundTable,
         allow_equal_prune: bool,
     ) !CompetitiveBlockAdvance {
-        if (self.impact_chunk_ids.items.len > 0) {
+        if (self.impactChunkIds().len > 0) {
             const current = self.currentBlockCursor() orelse return .{ .hit = null, .chunks_skipped = 0 };
             var ordinal = current.ordinal + 1;
             var skipped: u32 = 1;
             while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
                 const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
                 if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
-                    const target = self.impact_chunk_ids.items[ordinal] * impact_range_doc_count;
+                    const target = self.impactChunkIds()[ordinal] * impact_range_doc_count;
                     return .{ .hit = try self.advanceTo(target), .chunks_skipped = skipped };
                 }
                 skipped +|= 1;
@@ -5157,15 +5203,15 @@ pub const PostingsIterator = struct {
     /// posting in the next stored chunk. Stored chunk ordinals are monotonic,
     /// so aligned front-block pruning does not need a target-doc search.
     pub fn advanceToNextStoredChunk(self: *PostingsIterator) !?Hit {
-        if (self.impact_chunk_ids.items.len > 0) {
+        if (self.impactChunkIds().len > 0) {
             const current = self.currentBlockCursor() orelse return try self.next();
             const next_ordinal = current.ordinal + 1;
-            if (next_ordinal >= self.impact_chunk_ids.items.len) {
+            if (next_ordinal >= self.impactChunkIds().len) {
                 self.next_chunk_index = self.chunkCount();
                 self.chunk_doc_pos = self.doc_values.items.len;
                 return null;
             }
-            return self.advanceTo(self.impact_chunk_ids.items[next_ordinal] * impact_range_doc_count);
+            return self.advanceTo(self.impactChunkIds()[next_ordinal] * impact_range_doc_count);
         }
         if (self.current_chunk_index == std.math.maxInt(usize)) return try self.next();
         const next_ordinal = self.current_chunk_index + 1;
@@ -7830,6 +7876,8 @@ test "v29 impact frequency escape remains a conservative upper bound" {
         try std.testing.expectEqual(std.math.maxInt(u32), limits.frequency);
         try std.testing.expectEqual(if (metadata.version == wire_version_legacy) @as(u32, 37) else fieldNormFromId(7), limits.norm);
         try std.testing.expect(metadata.frequencyNormAtOrdinal(1) == null);
+        const upper = metadata.maxImpactAllWithIdf(100, 2, .{});
+        try std.testing.expect(upper >= bm25ScoreWithIdf(100000, limits.norm, 100, 2, .{}));
     }
 }
 
@@ -7853,6 +7901,18 @@ test "v29 adaptive impact IDs use runs and round-trip" {
     try iter.decodeImpactChunkIds();
     try std.testing.expectEqualSlices(u32, &ids, iter.impact_chunk_ids.items);
     try std.testing.expectEqual(@as(?usize, 37), findEncodedImpactChunkOrdinal(encoded.items, ids.len, ids[37]));
+    var borrowed: PostingsIterator = .{ .alloc = alloc, .version = wire_version_separate_impact_ranges, .borrowed_impact_chunk_ids = &ids };
+    defer borrowed.deinit();
+    try borrowed.decodeImpactChunkIds();
+    try std.testing.expectEqual(@as(usize, 0), borrowed.impact_chunk_ids.capacity);
+    borrowed.noteReturnedDoc(ids[80] * impact_range_doc_count);
+    try std.testing.expectEqual(@as(usize, 80), borrowed.currentBlockCursor().?.ordinal);
+    borrowed.noteReturnedDoc(ids[81] * impact_range_doc_count);
+    try std.testing.expectEqual(@as(usize, 81), borrowed.currentBlockCursor().?.ordinal);
+    borrowed.noteReturnedDoc(ids[99] * impact_range_doc_count);
+    try std.testing.expectEqual(@as(usize, 99), borrowed.currentBlockCursor().?.ordinal);
+    borrowed.noteReturnedDoc((ids[99] + 1) * impact_range_doc_count);
+    try std.testing.expect(borrowed.currentBlockCursor() == null);
 }
 
 test "v29 one-payload-block postings omit sparse impact range IDs" {
@@ -9372,6 +9432,10 @@ pub const ScopedInvertedIndexReader = struct {
     version: u8,
 
     pub const Options = struct {
+        /// Prepare dictionaries/navigation on one lane, then share immutable
+        /// lookups and the backing range cache across independent iterators.
+        concurrent: bool = false,
+        cache_allocator: ?Allocator = null,
         cache_bytes: usize = 256 * 1024,
         navigation_bytes: usize = std.math.maxInt(usize),
         dictionary_block_bytes: usize = std.math.maxInt(usize),
@@ -9393,13 +9457,16 @@ pub const ScopedInvertedIndexReader = struct {
         context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
         errdefer context.destroy();
         const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow, .prefetch = if (backing.source == .ranges and backing.source.ranges.prefetch != null) Context.prefetch else null } };
-        context.cache = try @import("../segment_source.zig").BlockCache.init(allocator, source, options.cache_bytes);
-        context.native = try RangeInvertedIndexReader.init(allocator, try @import("../segment_source.zig").View.init(context.cache.?.borrowedSource(), 0, view.length), options.dictionary_block_bytes);
+        if (options.concurrent) {
+            context.shared_cache = try @import("../segment_source.zig").ConcurrentBlockCache.init(options.cache_allocator orelse allocator, source, options.cache_bytes);
+            try context.shared_cache.?.preallocate();
+        } else context.cache = try @import("../segment_source.zig").BlockCache.init(allocator, source, options.cache_bytes);
+        context.native = try RangeInvertedIndexReader.init(allocator, try @import("../segment_source.zig").View.init(context.cachedSource(), 0, view.length), options.dictionary_block_bytes);
         return .{ .context = context, .doc_count = context.native.doc_count, .total_field_len = context.native.total_field_len, .chunk_size = context.native.chunk_size, .version = context.native.version };
     }
 
     fn backingView(self: *const ScopedInvertedIndexReader, offset: u64, length: u64) !@import("../segment_source.zig").View {
-        return @import("../segment_source.zig").View.init(self.context.?.cache.?.borrowedSource(), offset, length);
+        return @import("../segment_source.zig").View.init(self.context.?.cachedSource(), offset, length);
     }
 
     pub fn deinit(self: *ScopedInvertedIndexReader) void {
@@ -9707,6 +9774,7 @@ pub const ScopedInvertedIndexReader = struct {
         navigation: std.heap.ArenaAllocator,
         dictionary: @import("../segment_source.zig").Scratch,
         cache: ?@import("../segment_source.zig").BlockCache = null,
+        shared_cache: ?@import("../segment_source.zig").ConcurrentBlockCache = null,
         native: RangeInvertedIndexReader = undefined,
         over_budget: bool = false,
 
@@ -9714,7 +9782,12 @@ pub const ScopedInvertedIndexReader = struct {
             self.navigation.deinit();
             self.dictionary.deinit();
             if (self.cache) |*cache| cache.deinit();
+            if (self.shared_cache) |*cache| cache.deinit();
             self.allocator.destroy(self);
+        }
+
+        fn cachedSource(self: *Context) @import("../segment_source.zig").Source {
+            return if (self.shared_cache) |*cache| cache.borrowedSource() else self.cache.?.borrowedSource();
         }
 
         fn retain(ptr: *anyopaque) void {
