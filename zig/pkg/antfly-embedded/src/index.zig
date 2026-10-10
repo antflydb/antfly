@@ -951,10 +951,12 @@ pub const IndexSnapshot = struct {
     /// Installed only on a query facade. Shared scoring caches retain values,
     /// never the caller's credentials, publication lease or read capability.
     text_statistics: ?TextStatistics = null,
+    pub const TextCandidate = struct { segment_idx: usize, doc_offset: u32 };
     pub const TextStatistics = struct {
         ptr: *anyopaque,
         check: *const fn (*anyopaque) anyerror!void,
         hierarchical: bool = false,
+        candidates: ?*const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!?[]const TextCandidate = null,
         summaries: ?*const fn (*anyopaque, Allocator, usize, []const u8, []const []const u8, f32, inverted.BM25Config, []TextTermSummary) anyerror!void = null,
         prepare: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8) anyerror!void = null,
         planning: ?*const fn (*anyopaque, Allocator, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!?TextTermSummary = null,

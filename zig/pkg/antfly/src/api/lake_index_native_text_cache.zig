@@ -320,6 +320,7 @@ const Entry = struct {
     segment_summaries: []const ?corpus.statistics.Ref = &.{},
     term_directory: corpus.term_directory.Roots = .{},
     statistics_identities: []const [32]u8 = &.{},
+    statistics_ordinals: []const corpus.statistics.IdentityOrdinal = &.{},
     domain: [32]u8 = @splat(0),
     identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
@@ -446,6 +447,16 @@ const Entry = struct {
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
+        if (root.statistics_version >= 1) {
+            const ordinals = try a.alloc(corpus.statistics.IdentityOrdinal, root.segments.len);
+            var offset: u32 = 0;
+            for (ordinals, self.statistics_identities, snapshot.segments, 0..) |*ordinal, id, segment, i| {
+                ordinal.* = .{ .identity = id, .segment_idx = i, .doc_offset = offset };
+                offset = try std.math.add(u32, offset, segment.reader.doc_count);
+            }
+            std.mem.sort(corpus.statistics.IdentityOrdinal, ordinals, {}, corpus.statistics.identityLess);
+            self.statistics_ordinals = ordinals;
+        }
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
     fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64) anyerror!local.index.ReplacementSegmentData {
@@ -494,7 +505,7 @@ const Entry = struct {
         lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
         const snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
         if (self.statistics_version >= 1) {
-            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .allocator = self.allocator };
+            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .allocator = self.allocator };
             snapshot.text_statistics = lease.statistics.interface();
         }
         return .{ .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };

@@ -1424,7 +1424,15 @@ segment prepass composes coarse bounds from these immutable records without
 opening per-segment statistics or dictionaries. Identity ranges are conservative
 supersets; gaps never imply that a document matches. A rare term appearing in one
 segment has a singleton range. Broad terms can cover most segments in their
-buckets, and the in-memory segment inventory is still visited.
+buckets. Directory-version-2 branches also retain exact segment counts. For a
+term with at most 4,096 segments, the request enumerates its exact identities
+within a bounded read budget, then resolves them through a generation-owned
+sorted identity/ordinal/offset table. Positive necessary Boolean clauses and
+phrase groups intersect these sets; required alternatives union them. The
+planner allocates and visits only the resulting candidates. Unknown sets,
+optional clauses and prohibitions retain conservative full-inventory behavior.
+Union overflow, legacy directories and exhausted budgets fall back for the
+entire term, never to a truncated membership set.
 
 Surviving segments refine their bounds with batched exact leaf lookups when a
 competitive cutoff exists, before preparing dictionaries and postings. Nested
@@ -1433,21 +1441,36 @@ verification. Baselines, optional clauses, prohibitions, signed boosts and
 unsupported scoring configurations retain conservative behavior. Exact posting
 scores and their addition order are unchanged. Raw envelopes are independent of
 BM25 parameters; parameter changes derive new ceilings from the same metadata.
+The request's shared preparation coordinator singleflights exact segment-bound
+refinement across scoring ranges in a separate four-entry scalar cache. Builds
+use the already admitted lane scratch space; warm values recheck statistics and
+range-reader authority. Bounds retain no borrowed readers or scratch allocations.
 
 Incremental publication streams only changed segment contributions into a
 bounded spill sorter, feeds both statistics builders from a single authenticated
 summary cursor, updates exact leaves with sorted COW batches, and recomputes
-each affected hash bucket once. Initial construction streams sorted leaves and
-branch aggregates. Empty changes preserve both root references. Unchanged file
+each affected hash bucket once. Directory-version-2 leaf pages authenticate
+bounded raw envelopes and record counts in both their headers and parent routing
+entries. Range folding consumes whole covered subtree envelopes and reads only
+boundary descendants; legacy or missing reductions descend to exact records.
+Sparse changes use COW, while dense changes stream-merge sorted unique mutations
+with the prior leaves. Initial construction streams sorted leaves and branch
+aggregates. Empty changes preserve both root references. Unchanged file
 summaries and native segments remain reusable, including when adding a directory
 to a statistics-version-1 seed. Both tree roots belong to the corpus manifest and
 the existing durable page-GC frontier, including reader-only pinned generations.
+The page reference and reclamation graph remain unchanged. Trees without a
+reducer keep their existing wire encoding. Generic edits without a reducer safely
+drop summaries on modified paths. A directory-version-1 seed is rebuilt from
+its authenticated segment summaries without rereading Parquet data.
 
 Legacy publications retain exact dictionary/summary readers. Legacy 12-byte
 summaries remain decodable. Missing optional directory roots choose the exact
 path; referenced missing or malformed pages fail validation. An unusually long
 legacy-accepted term that exceeds the escaped directory key limit disables the
-optional directory for that publication. Exhausting the request's preparation
+optional directory for that publication. The same overflow in a query term
+selects the exact native summary reader during competitive refinement instead
+of failing the query. Exhausting the request's preparation
 cache leaves an entire term unprepared and uses exact summaries for that term.
 The current publication remains readable if a new build exceeds its budgets.
 
@@ -1459,9 +1482,12 @@ new ordered tree, avoiding individual old-count seeks. Counts use checked wide
 arithmetic, negative results fail, and zero results are omitted. No vocabulary
 or all-update array is retained in memory.
 
-Automatic selection uses the already available contribution count: at least
-`max(4096, prior_term_count / 4)` chooses streaming merge. This is an upper estimate
-of distinct changes, so heavy repetition may select a merge conservatively.
+Automatic selection counts distinct nonzero signed deltas in a bounded replay
+of the finished spill stream: at least `max(4096, prior_term_count / 4)` chooses
+streaming merge. Repetition and cancellation cannot force a vocabulary rewrite.
+Directory publication uses the same threshold against its prior leaf count.
+Rewind reuses existing owned spill runs and their bounded merge heads without
+retaining all changes or duplicating temporary files; leased streams cannot rewind.
 Explicit strategy overrides support differential tests and profiling; the builder
 exposes the selected strategy and point-seek count. Empty deltas retain the prior
 root, including fully cancelling deltas. Existing publication admission,
@@ -1487,24 +1513,34 @@ released with the query lease.
 
 ### Qualification
 
-With Zig 0.17.0, Debug qualification passed 46 focused tests (one optimized-only
-benchmark skipped), all 241 lake integration tests and the production server
-build. ReleaseFast passed all 47 focused tests, including the collector
-benchmark. These runs reported no failures or allocator leaks. Zig formatting,
+With Zig 0.17.0, Debug qualification passed 49 focused tests (one optimized-only
+benchmark skipped), all 243 lake integration tests and the production server
+build. ReleaseFast passed all 50 focused tests, including the collector
+benchmark. All 16 page-tree tests also passed independently, including generic
+legacy encoding, integrity, snapshot retention, allocation failure and recovery.
+Final qualification reported no failures or allocator leaks. Zig formatting,
 Python lint/format checks and `git diff --check` also pass.
 
 Regressions cover scalar-bound tightening, conservative envelope coarsening over
 custom BM25 configurations, saturation, dense-merge/COW equivalence, zero dense
 point seeks, changed/removed directory contributions, unchanged-root reuse, rare
 planning across 10,000 identities, reordered generation identities, missing pages,
-allocation failure and bounded-cache fallback. Publication and GC integration
+allocation failure and bounded-cache fallback. Refinement regressions also
+verify one plan among 10,000 segments, necessary-clause candidate algebra,
+subtree reuse for a 10,000-record bucket, COW/dense directory equivalence,
+repeated spilling contributions selecting COW from one distinct delta, and
+shared exact bounds rejecting revoked authority. Publication and GC integration
 cover version-2 roots and directory retention/reclamation.
 
 Real-data fixtures now include 17-file Parquet and Iceberg corpora, forcing the
 fragmented parallel text path. They compare nested Boolean and phrase results,
-zero/negative scores, repeated requests and cold restart. All six real-data
-E2Es passed in 202 seconds: the five Iceberg/Parquet SQL fixtures and the native
-sparse metadata score/ranking regression. Iceberg remains in `e2e-full`.
+zero/negative scores, repeated requests and cold restart. They also cover the
+oversized-term competitive-refinement fallback, limit-1 ranking, broad
+alternatives and prohibited-only queries. All six real-data E2Es passed across
+the initial run and a targeted retry after reclaiming obsolete build outputs;
+the disk safety floor remained enabled. These are the five Iceberg/Parquet SQL
+fixtures and the native sparse metadata score/ranking regression. Iceberg
+remains in `e2e-full`.
 
 Representative archive benchmarks remain pending. Qualification uses work-count
 assertions; it makes no archive-scale throughput claim. Measure cold/warm latency,

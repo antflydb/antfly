@@ -2112,6 +2112,20 @@ pub const Sort = struct {
         self.leased_reads = leased;
         self.finished = true;
     }
+    /// Replay a finished owned-row stream without rebuilding or materializing it.
+    /// Leased streams have outstanding block ownership and cannot be rewound.
+    pub fn rewind(self: *Sort) !void {
+        try self.finish();
+        if (self.leased_reads) return error.UnsupportedSpillRewind;
+        try self.manager.checkpoint(self.manager.context);
+        self.offset = 0;
+        for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count]) |*file, *arena, *head| {
+            head.* = null;
+            _ = arena.reset(.retain_capacity);
+            file.*.?.rewind();
+            head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
+        }
+    }
     pub fn next(self: *Sort, a: Allocator) !?Row {
         return self.nextImpl(a, true);
     }

@@ -2972,7 +2972,7 @@ const StreamingBoolNode = struct {
 };
 
 const StreamingBoolStats = struct {
-    const Frequency = struct { value: u32 = 0, local: bool = false };
+    const Frequency = struct { value: u32 = 0, local: bool = false, candidates: ?[]const index_mod.IndexSnapshot.TextCandidate = null };
     const Field = struct { average: f32, frequencies: std.StringHashMapUnmanaged(Frequency) = .empty };
     a: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -3054,6 +3054,10 @@ const StreamingBoolStats = struct {
                 for (requested) |*key| key.* = keys.next().?.*;
                 try prepare(reader.ptr, self.a, field.key_ptr.*, requested);
             };
+            if (self.snap.text_statistics) |reader| if (reader.candidates) |candidate_reader| {
+                var terms = frequencies.iterator();
+                while (terms.next()) |entry| entry.value_ptr.candidates = try candidate_reader(reader.ptr, self.a, field.key_ptr.*, entry.key_ptr.*);
+            };
             var count: usize = 0;
             var entries = frequencies.iterator();
             while (entries.next()) |entry| if (entry.value_ptr.local) {
@@ -3103,6 +3107,64 @@ const LoweredText = struct {
     groups: []const []const []const u8 = &.{},
     slop: u32 = 0,
     scored: bool = false,
+
+    const Candidate = index_mod.IndexSnapshot.TextCandidate;
+    /// null denotes unknown membership. Only positive necessary clauses may
+    /// narrow candidates; prohibitions and optional clauses cannot drop a segment.
+    fn mergeCandidates(a: Allocator, left: ?[]const Candidate, right: ?[]const Candidate, intersection: bool) !?[]const Candidate {
+        if (left == null or right == null) return if (intersection) left orelse right else null;
+        const capacity = if (intersection) @min(left.?.len, right.?.len) else @min(4096, left.?.len + right.?.len);
+        const out = try a.alloc(Candidate, capacity);
+        var i: usize = 0;
+        var j: usize = 0;
+        var count: usize = 0;
+        while (i < left.?.len or j < right.?.len) {
+            const order: std.math.Order = if (i == left.?.len) .gt else if (j == right.?.len) .lt else std.math.order(left.?[i].segment_idx, right.?[j].segment_idx);
+            if (order == .eq or !intersection) {
+                if (count == out.len) {
+                    a.free(out);
+                    return null;
+                }
+                out[count] = if (order == .gt) right.?[j] else left.?[i];
+                count += 1;
+            }
+            if (order != .gt) i += 1;
+            if (order != .lt) j += 1;
+        }
+        return out[0..count];
+    }
+    fn termCandidates(stats: *StreamingBoolStats, field: []const u8, term: []const u8) !?[]const Candidate {
+        const entry = (stats.fields.get(field) orelse return error.InvalidArgument).frequencies.get(term) orelse return error.InvalidArgument;
+        if (entry.local and entry.value == 0) return &.{};
+        return entry.candidates;
+    }
+    fn candidateSegments(self: *const LoweredText, a: Allocator, stats: *StreamingBoolStats) anyerror!?[]const Candidate {
+        switch (self.kind) {
+            .none => return &.{},
+            .term => return termCandidates(stats, self.term.?.field, self.term.?.term),
+            .phrase => {
+                var required: ?[]const Candidate = null;
+                for (self.groups) |group| {
+                    var alternatives: ?[]const Candidate = &.{};
+                    for (group) |term| alternatives = try mergeCandidates(a, alternatives, try termCandidates(stats, self.field, term), false);
+                    required = try mergeCandidates(a, required, alternatives, true);
+                }
+                return required;
+            },
+            .boolean => {
+                if (self.minimum > self.should.len) return &.{};
+                var required: ?[]const Candidate = null;
+                for (self.must) |child| required = try mergeCandidates(a, required, try child.candidateSegments(a, stats), true);
+                if (self.minimum != 0) {
+                    var alternatives: ?[]const Candidate = &.{};
+                    for (self.should) |child| alternatives = try mergeCandidates(a, alternatives, try child.candidateSegments(a, stats), false);
+                    required = try mergeCandidates(a, required, alternatives, true);
+                }
+                return required;
+            },
+            .all, .bitmap => return null,
+        }
+    }
 
     const Lowerer = struct {
         a: Allocator,
@@ -3710,6 +3772,7 @@ const StreamingBoolPrepared = struct {
 /// pin readers through iterator destruction; only idle entries can be evicted.
 const StreamingBoolPreparedCache = struct {
     const Slot = struct { segment: ?usize = null, owner: ?*StreamingBoolPrepared = null, users: usize = 0, building: bool = false, age: u64 = 0 };
+    const BoundSlot = struct { segment: ?usize = null, upper: f32 = std.math.inf(f32), building: bool = false, age: u64 = 0 };
     const Lease = struct {
         cache: *StreamingBoolPreparedCache,
         slot: *Slot,
@@ -3736,6 +3799,66 @@ const StreamingBoolPreparedCache = struct {
     clock: u64 = 0,
     preparations: platform_atomic.Value(u64) = .init(0),
     reuses: platform_atomic.Value(u64) = .init(0),
+    bounds: [4]BoundSlot = @splat(.{}),
+    bound_clock: u64 = 0,
+    bound_refinements: platform_atomic.Value(u64) = .init(0),
+    bound_reuses: platform_atomic.Value(u64) = .init(0),
+    /// Query-owned scalar singleflight. Syntax, BM25 and constraints are fixed
+    /// for this cache; warm bounds still check this facade's current authority.
+    fn checkBoundContext(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !void {
+        if (self.snap.text_statistics) |reader| try reader.check(reader.ptr);
+        if (self.snap.segments[plan.segment_idx].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+    }
+    fn buildExactBound(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
+        const upper = try exactStreamingBoolBound(self.snap, self.bq, self.request, self.stats, self.producers, plan, a);
+        try self.checkBoundContext(plan);
+        return upper;
+    }
+    fn exactBound(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
+        try self.checkBoundContext(plan);
+        try self.mutex.lock(self.io);
+        while (true) {
+            var found: ?*BoundSlot = null;
+            var victim: ?*BoundSlot = null;
+            for (&self.bounds) |*slot| {
+                if (slot.segment == plan.segment_idx) found = slot;
+                if (!slot.building and (victim == null or slot.segment == null or slot.age < victim.?.age)) victim = slot;
+            }
+            if (found) |slot| {
+                if (!slot.building) {
+                    self.bound_clock +%= 1;
+                    slot.age = self.bound_clock;
+                    const upper = slot.upper;
+                    self.mutex.unlock(self.io);
+                    try self.checkBoundContext(plan);
+                    _ = self.bound_reuses.fetchAdd(1, .monotonic);
+                    return upper;
+                }
+            } else if (victim) |slot| {
+                self.bound_clock +%= 1;
+                slot.* = .{ .segment = plan.segment_idx, .building = true, .age = self.bound_clock };
+                self.mutex.unlock(self.io);
+                const upper = self.buildExactBound(plan, a) catch |err| {
+                    self.mutex.lockUncancelable(self.io);
+                    slot.* = .{};
+                    self.changed.broadcast(self.io);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.lockUncancelable(self.io);
+                slot.upper = upper;
+                slot.building = false;
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
+                _ = self.bound_refinements.fetchAdd(1, .monotonic);
+                return upper;
+            }
+            self.changed.wait(self.io, &self.mutex) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+    }
     fn deinit(self: *@This()) void {
         for (&self.slots) |*slot| {
             std.debug.assert(slot.users == 0 and !slot.building);
@@ -3833,7 +3956,7 @@ const StreamingBoolPlanning = struct {
 
     fn execute(self: *@This()) !u64 {
         const scheduler = StreamingBoolParallel.scheduler;
-        const lanes = @min(4, scheduler.global().fanout(self.plans.len, 32 * 1024 * 1024, self.cache.entry_bytes));
+        const lanes = @max(1, @min(4, scheduler.global().fanout(self.plans.len, 32 * 1024 * 1024, self.cache.entry_bytes)));
         var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
         defer for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) {
             task.cancel(self.cache.io) catch {};
@@ -3856,11 +3979,16 @@ fn planStreamingBoolSegments(a: Allocator, scratch: *std.heap.ArenaAllocator, sn
     return planStreamingBoolSegmentsCached(a, scratch, snap, bq, request, stats, producers, null);
 }
 fn planStreamingBoolSegmentsCached(a: Allocator, scratch: *std.heap.ArenaAllocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, cache: ?*StreamingBoolPreparedCache) ![]index_mod.IndexSnapshot.TextSegmentPlan {
-    const plans = try a.alloc(index_mod.IndexSnapshot.TextSegmentPlan, snap.segments.len);
+    const candidates = if (stats.lowered) |root| try root.candidateSegments(stats.a, stats) else null;
+    const plans = try a.alloc(index_mod.IndexSnapshot.TextSegmentPlan, if (candidates) |selected| selected.len else snap.segments.len);
     errdefer a.free(plans);
     const enabled = snap.segments.len > 16;
     var offset: u32 = 0;
-    for (snap.segments, plans, 0..) |*segment, *plan, i| {
+    for (plans, 0..) |*plan, position| {
+        const i = if (candidates) |selected| selected[position].segment_idx else position;
+        if (i >= snap.segments.len) return error.InvalidArgument;
+        const segment = &snap.segments[i];
+        if (candidates) |selected| offset = selected[position].doc_offset;
         var upper = std.math.inf(f32);
         if (enabled and cache == null and segment.reader.doc_count != 0) {
             segment.beginAccess();
@@ -3907,6 +4035,12 @@ fn scoreStreamingBoolSegment(snap: *const index_mod.IndexSnapshot, bq: BoolQuery
 fn scoreStreamingBoolRange(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, work: StreamingBoolParallel.Work, arena: *std.heap.ArenaAllocator, collector: *FastTopK, shared: ?*StreamingBoolParallel) !void {
     return scoreStreamingBoolRangeCached(snap, bq, request, stats, producers, work, arena, collector, shared, if (shared) |owner| owner.prepared else null);
 }
+fn exactStreamingBoolBound(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
+    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .exact_summaries = true };
+    defer refinement.deinit();
+    return (try refinement.buildRequest(bq)).segmentBound();
+}
+
 fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, work: StreamingBoolParallel.Work, arena: *std.heap.ArenaAllocator, collector: *FastTopK, shared: ?*StreamingBoolParallel, cache: ?*StreamingBoolPreparedCache) !void {
     const plan = work.plan;
     try collector.flushPending();
@@ -3929,9 +4063,7 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
         // Coarse hierarchy bounds avoid all leaf reads in the initial prepass.
         // Refine a surviving segment in one batched exact-statistics read before
         // opening its dictionaries, postings or prepared scoring state.
-        var refinement: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .exact_summaries = true };
-        defer refinement.deinit();
-        const ceiling = try (try refinement.buildRequest(bq)).segmentBound();
+        const ceiling = if (cache) |prepared| try prepared.exactBound(plan, arena.allocator()) else try exactStreamingBoolBound(snap, bq, request, stats, producers, plan, arena.allocator());
         if (std.math.isFinite(ceiling) and (ceiling < cutoff.score or (ceiling == cutoff.score and @as(u64, offset) + work.first > cutoff.doc_id))) {
             collector.pruned = true;
             if (request.diagnostics) |diagnostics| diagnostics.segments_pruned +|= 1;
@@ -9219,4 +9351,78 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ writer.snapshot(), request.query });
+}
+
+test "streaming boolean term candidates avoid inventory plans and exact bounds reuse current authority" {
+    const a = std.testing.allocator;
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("row", "{}");
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    const replacements = try a.alloc(index_mod.ReplacementSegmentData, 10000);
+    defer a.free(replacements);
+    for (replacements, 0..) |*replacement, i| replacement.* = .{ .id = i + 1, .data = .fromNative(.{ .contiguous = bytes }) };
+    try writer.replaceSegmentsManyData(&.{}, replacements);
+    const Provider = struct {
+        revoked: bool = false,
+        fn check(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).revoked) return error.Canceled;
+        }
+        fn frequencies(_: *anyopaque, _: Allocator, _: []const u8, terms: []const []const u8, output: []u32) !void {
+            for (terms, output) |term, *count| count.* = if (std.mem.eql(u8, term, "missing")) 0 else 1;
+        }
+        fn summary(_: *anyopaque, _: Allocator, _: usize, _: []const u8, _: []const u8, _: f32, _: inverted.BM25Config) !index_mod.IndexSnapshot.TextTermSummary {
+            return .{ .frequency = 1, .tf_upper = 2 };
+        }
+        fn candidates(_: *anyopaque, _: Allocator, _: []const u8, term: []const u8) !?[]const index_mod.IndexSnapshot.TextCandidate {
+            if (std.mem.eql(u8, term, "rare")) return &.{.{ .segment_idx = 4321, .doc_offset = 4321 }};
+            if (std.mem.eql(u8, term, "missing")) return &.{};
+            return null;
+        }
+    };
+    var provider: Provider = .{};
+    const snapshot = try writer.acquireSnapshotWithReadContext(&provider);
+    defer snapshot.release();
+    snapshot.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary, .candidates = Provider.candidates, .hierarchical = true };
+    const rare: SearchQuery = .{ .term = .{ .field = "body", .term = "rare" } };
+    const common: SearchQuery = .{ .term = .{ .field = "body", .term = "common" } };
+    const missing: SearchQuery = .{ .term = .{ .field = "body", .term = "missing" } };
+    const bq: BoolQuery = .{ .must = &.{ common, .{ .bool_query = .{ .should = &.{ rare, missing }, .min_should = 1 } } } };
+    const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 1, .include_stored = false };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var stats: StreamingBoolStats = .{ .a = arena.allocator(), .snap = snapshot, .count = 10000 };
+    try stats.collect(request.query);
+    try stats.load();
+    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false, .bitmap = false };
+    stats.lowered = try lowerer.lower(request.query);
+    const plans = try planStreamingBoolSegments(a, &scratch, snapshot, bq, request, &stats, .{});
+    defer a.free(plans);
+    try std.testing.expectEqual(@as(usize, 1), plans.len);
+    try std.testing.expectEqual(@as(usize, 4321), plans[0].segment_idx);
+    try std.testing.expectEqual(@as(u32, 4321), plans[0].doc_offset);
+    const phrase = try lowerer.lower(.{ .term_phrase = .{ .field = "body", .terms = &.{ "common", "rare" } } });
+    try std.testing.expectEqual(@as(usize, 1), (try phrase.candidateSegments(stats.a, &stats)).?.len);
+    const optional = try lowerer.lower(.{ .bool_query = .{ .should = &.{rare}, .pure_should_optional = true } });
+    try std.testing.expect((try optional.candidateSegments(stats.a, &stats)) == null);
+    const prohibited = try lowerer.lower(.{ .bool_query = .{ .must_not = &.{rare} } });
+    try std.testing.expect((try prohibited.candidateSegments(stats.a, &stats)) == null);
+    const broad_or = try lowerer.lower(.{ .bool_query = .{ .should = &.{ rare, common }, .min_should = 1 } });
+    try std.testing.expect((try broad_or.candidateSegments(stats.a, &stats)) == null);
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    var cache: StreamingBoolPreparedCache = .{ .io = threaded.io(), .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .producers = .{} };
+    defer cache.deinit();
+    const first = try cache.exactBound(plans[0], scratch.allocator());
+    _ = scratch.reset(.free_all);
+    try std.testing.expectEqual(first, try cache.exactBound(plans[0], scratch.allocator()));
+    try std.testing.expectEqual(@as(u64, 1), cache.bound_refinements.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), cache.bound_reuses.load(.monotonic));
+    provider.revoked = true;
+    try std.testing.expectError(error.Canceled, cache.exactBound(plans[0], scratch.allocator()));
 }

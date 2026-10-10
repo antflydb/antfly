@@ -201,6 +201,7 @@ pub const Builder = struct {
     strategy: Strategy = .auto,
     selected: Strategy = .auto,
     point_seeks: u64 = 0,
+    distinct_changes: u64 = 0,
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         return .{ .a = a, .sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
@@ -264,12 +265,17 @@ pub const Builder = struct {
             var initial: Initial = .{ .deltas = &deltas };
             return tree.buildSorted(self.a, store, &initial);
         }
+        // Count actual nonzero keys in a bounded replay of the sorted deltas.
+        // Repeated contributions and cancellations never force a vocabulary rewrite.
+        while (try deltas.next()) |_| if (deltas.delta != 0) {
+            self.distinct_changes += 1;
+        };
+        if (self.distinct_changes == 0) return prior;
+        deltas.current = null;
+        _ = deltas.scratch.reset(.free_all);
+        try self.sort.rewind();
         var pending = try deltas.next();
-        while (pending != null and deltas.delta == 0) pending = try deltas.next();
-        if (pending == null) return prior;
-        // Contribution count is available without a second scan. It is an
-        // upper estimate of distinct changes; explicit strategies aid profiling.
-        self.selected = if (self.strategy == .auto) (if (self.ordinal >= @max(4096, prior.?.records / 4)) .merge else .cow) else self.strategy;
+        self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(4096, prior.?.records / 4)) .merge else .cow) else self.strategy;
         if (self.selected == .merge) {
             const Merge = struct {
                 old: *tree.Cursor,
@@ -347,6 +353,11 @@ fn decodeFrequency(bytes: []const u8) !u64 {
     return count;
 }
 
+pub const IdentityOrdinal = struct { identity: [32]u8, segment_idx: usize, doc_offset: u32 };
+pub fn identityLess(_: void, left: IdentityOrdinal, right: IdentityOrdinal) bool {
+    return std.mem.order(u8, &left.identity, &right.identity) == .lt;
+}
+
 /// Query-owned capability. The corpus owner retains refs only, never this reader.
 pub const Reader = struct {
     read: @import("lake_index_seekable_text.zig").Read,
@@ -356,6 +367,8 @@ pub const Reader = struct {
     allocator: A = std.heap.page_allocator,
     directory: directory_mod.Roots = .{},
     identities: []const [32]u8 = &.{},
+    ordinals: []const IdentityOrdinal = &.{},
+    candidate_bytes: usize = 0,
     plans: std.StringHashMapUnmanaged([]const directory_mod.Branch) = .empty,
     plan_bytes: usize = 0,
     plan_limit: usize = 4 * 1024 * 1024,
@@ -369,7 +382,7 @@ pub const Reader = struct {
         self.plans.deinit(self.allocator);
     }
     pub fn interface(self: *Reader) local.index.IndexSnapshot.TextStatistics {
-        return .{ .ptr = self, .check = checkInterface, .frequencies = frequencies, .summary = summary, .prepare = prepare, .planning = planning, .summaries = summaries, .hierarchical = self.directory.leaves != null };
+        return .{ .ptr = self, .check = checkInterface, .frequencies = frequencies, .summary = summary, .prepare = prepare, .planning = planning, .summaries = summaries, .hierarchical = self.directory.leaves != null, .candidates = candidates };
     }
     fn checkInterface(raw: *anyopaque) !void {
         return @as(*Reader, @ptrCast(@alignCast(raw))).check();
@@ -433,8 +446,8 @@ pub const Reader = struct {
                 return err;
             }) |record| {
                 if (record.key.len != prefix.len + 1 or !std.mem.startsWith(u8, record.key, prefix) or count == branches.len) return error.InvalidNativeLakeTermDirectory;
-                const branch = try directory_mod.Branch.decode(record.value);
-                if (branch.first[0] != record.key[prefix.len]) return error.InvalidNativeLakeTermDirectory;
+                const branch = if (self.directory.version == 2) try directory_mod.Branch.decode(record.value) else try directory_mod.Branch.decodeLegacy(record.value);
+                if (branch.first[0] != branch.last[0] or branch.first[0] != record.key[prefix.len]) return error.InvalidNativeLakeTermDirectory;
                 branches[count] = branch;
                 count += 1;
                 self.planning_branch_reads += 1;
@@ -449,6 +462,71 @@ pub const Reader = struct {
             self.plan_bytes += retained;
         }
         try self.check();
+    }
+    /// Small term inventories enumerate exact immutable identities. Broad terms
+    /// remain unknown, never truncated memberships. Ordinals/offsets are built
+    /// once by the immutable corpus owner and carry no request capabilities.
+    fn candidates(raw: *anyopaque, a: A, field: []const u8, term: []const u8) !?[]const local.index.IndexSnapshot.TextCandidate {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.check();
+        if (self.directory.version != 2 or self.directory.leaves == null or self.ordinals.len != self.segments.len) return null;
+        const key = try keyAlloc(a, field, term);
+        defer a.free(key);
+        const branches = self.plans.get(key) orelse return null;
+        var count: u64 = 0;
+        for (branches) |branch| count +|= branch.count;
+        const Candidate = local.index.IndexSnapshot.TextCandidate;
+        if (count > 4096 or count * @sizeOf(Candidate) > self.plan_limit -| self.candidate_bytes) return null;
+        if (count == 0) return &.{};
+        const prefix = directory_mod.prefixAlloc(a, key) catch |err| switch (err) {
+            error.NativeLakeTermDirectoryKeyTooLarge => return null,
+            else => return err,
+        };
+        defer a.free(prefix);
+        const end = try a.dupe(u8, prefix);
+        defer a.free(end);
+        end[end.len - 1] = 1;
+        var store = self.read.store;
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = self, .read = readPage } };
+        var cursor = tree.Cursor.init(a, pages.store(), self.directory.leaves, prefix, end) catch |err| switch (err) {
+            error.ArtifactReadBudgetExceeded => return null,
+            else => return err,
+        };
+        defer cursor.deinit();
+        const result = try a.alloc(Candidate, @intCast(count));
+        errdefer a.free(result);
+        var position: usize = 0;
+        while (cursor.next() catch |err| switch (err) {
+            error.ArtifactReadBudgetExceeded => {
+                a.free(result);
+                return null;
+            },
+            else => return err,
+        }) |record| {
+            if (position == result.len or record.key.len != prefix.len + 32 or !std.mem.startsWith(u8, record.key, prefix)) return error.InvalidNativeLakeTermDirectory;
+            _ = try Summary.decode(record.value);
+            const id = record.key[prefix.len..][0..32];
+            var lo: usize = 0;
+            var hi = self.ordinals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, &self.ordinals[mid].identity, id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.ordinals.len or !std.mem.eql(u8, &self.ordinals[lo].identity, id)) return error.InvalidNativeLakeTermDirectory;
+            result[position] = .{ .segment_idx = self.ordinals[lo].segment_idx, .doc_offset = self.ordinals[lo].doc_offset };
+            position += 1;
+        }
+        if (position != result.len) return error.InvalidNativeLakeTermDirectory;
+        std.mem.sort(Candidate, result, {}, struct {
+            fn less(_: void, left: Candidate, right: Candidate) bool {
+                return left.segment_idx < right.segment_idx;
+            }
+        }.less);
+        self.candidate_bytes += result.len * @sizeOf(Candidate);
+        try self.check();
+        return result;
     }
     fn planning(raw: *anyopaque, a: A, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?local.index.IndexSnapshot.TextTermSummary {
         const self: *Reader = @ptrCast(@alignCast(raw));
@@ -508,12 +586,17 @@ pub const Reader = struct {
             var root = self.segments[segment];
             if (self.directory.leaves != null) {
                 if (self.identities.len != self.segments.len) return error.InvalidNativeLakeTermDirectory;
-                const prefix = try directory_mod.prefixAlloc(a, key);
-                defer a.free(prefix);
-                lookup_key = try a.alloc(u8, prefix.len + 32);
-                @memcpy(lookup_key[0..prefix.len], prefix);
-                @memcpy(lookup_key[prefix.len..], &self.identities[segment]);
-                root = self.directory.leaves;
+                const prefix = directory_mod.prefixAlloc(a, key) catch |err| switch (err) {
+                    error.NativeLakeTermDirectoryKeyTooLarge => null,
+                    else => return err,
+                };
+                if (prefix) |encoded| {
+                    defer a.free(encoded);
+                    lookup_key = try a.alloc(u8, encoded.len + 32);
+                    @memcpy(lookup_key[0..encoded.len], encoded);
+                    @memcpy(lookup_key[encoded.len..], &self.identities[segment]);
+                    root = self.directory.leaves;
+                }
             }
             defer if (lookup_key.ptr != key.ptr) a.free(lookup_key);
             const value = try self.lookup(a, cache.store(), root, lookup_key);
@@ -782,7 +865,7 @@ test "external lake text statistics dense streaming merge equals COW with no poi
     defer initial.deinit();
     try initial.add(memory.store(), contribution, 1);
     const prior = try initial.finish(memory.store(), null);
-    var second: Source = .{ .next_id = 1000, .end = 7000 };
+    var second: Source = .{ .next_id = 3000, .end = 9000 };
     const added = try tree.buildSorted(a, memory.store(), &second);
     var cow = Builder.init(a, &manager);
     defer cow.deinit();
@@ -808,6 +891,22 @@ test "external lake text statistics dense streaming merge equals COW with no poi
         try std.testing.expectEqualSlices(u8, record.value, actual.value);
     }
     try std.testing.expect((try right.next()) == null);
+    // Thousands of repeated, mostly cancelling contributions change one key.
+    // Strategy selection must reflect one nonzero delta, including spilled replay.
+    var repeated = Builder.init(a, &manager);
+    defer repeated.deinit();
+    repeated.sort.memory_bytes = 64 * 1024;
+    repeated.sort.parallel_runs = false;
+    var repeat_value: [Summary.max_bytes]u8 = undefined;
+    const repeat_summary: Summary = .{ .frequency = 1, .max_frequency = 1, .min_norm = 10 };
+    for (0..8193) |i| try repeated.addRecord(.{ .key = "\x00\x00\x00\x00", .value = repeat_summary.encode(&repeat_value) }, if (i < 4097) 1 else -1);
+    const repeated_root = try repeated.finish(memory.store(), prior);
+    try std.testing.expectEqual(Builder.Strategy.cow, repeated.selected);
+    try std.testing.expectEqual(@as(u64, 1), repeated.distinct_changes);
+    try std.testing.expectEqual(@as(u64, 1), repeated.point_seeks);
+    var repeated_cursor = try tree.Cursor.init(a, memory.store(), repeated_root, "", null);
+    defer repeated_cursor.deinit();
+    try std.testing.expectEqual(@as(u64, 2), try decodeFrequency((try repeated_cursor.next()).?.value));
     var canceled_delta = Builder.init(a, &manager);
     defer canceled_delta.deinit();
     try canceled_delta.add(memory.store(), contribution, -1);
@@ -855,14 +954,33 @@ test "external lake text statistics hierarchy plans rare terms across ten thousa
         id.* = directory_mod.identity(&encoded);
         ref.* = null; // Missing native summary trees must never be opened.
     }
+    const ordinals = try a.alloc(IdentityOrdinal, ids.len);
+    defer a.free(ordinals);
+    for (ordinals, ids, 0..) |*ordinal, id, i| ordinal.* = .{ .identity = id, .segment_idx = i, .doc_offset = @intCast(i * 2) };
+    std.mem.sort(IdentityOrdinal, ordinals, {}, identityLess);
     var builder = directory_mod.Builder.init(a, &manager);
     defer builder.deinit();
     try builder.add(pages.store(), summary, ids[4321], 1);
     const roots = try builder.finish(pages.store(), .{});
-    var reader: Reader = .{ .allocator = a, .read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, .domain = @splat(6), .global = null, .segments = segments, .identities = ids, .directory = roots };
+    var reader: Reader = .{ .allocator = a, .read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, .domain = @splat(6), .global = null, .segments = segments, .identities = ids, .ordinals = ordinals, .directory = roots };
     defer reader.deinit();
     try Reader.prepare(&reader, a, "body", &.{ "rare", "absent" });
     try std.testing.expectEqual(@as(u64, 1), reader.planning_branch_reads);
+    const selected = (try Reader.candidates(&reader, a, "body", "rare")).?;
+    defer a.free(selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(@as(usize, 4321), selected[0].segment_idx);
+    try std.testing.expectEqual(@as(u32, 8642), selected[0].doc_offset);
+    const absent = (try Reader.candidates(&reader, a, "body", "absent")).?;
+    defer a.free(absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+    const long_term = try a.alloc(u8, tree.max_key_bytes - 40);
+    defer a.free(long_term);
+    @memset(long_term, 'x');
+    try std.testing.expect((try Reader.candidates(&reader, a, "body", long_term)) == null);
+    var fallback: [1]local.index.IndexSnapshot.TextTermSummary = undefined;
+    try Reader.summaries(&reader, a, 4321, "body", &.{long_term}, 100, .{}, &fallback);
+    try std.testing.expectEqual(@as(u32, 0), fallback[0].frequency);
     var admitted: usize = 0;
     for (0..ids.len) |ordinal| {
         const planned = (try Reader.planning(&reader, a, ordinal, "body", "rare", 100, .{})).?;
@@ -895,9 +1013,12 @@ test "external lake text statistics hierarchy plans rare terms across ten thousa
     try std.testing.expectError(error.FileNotFound, Reader.prepare(&invalid, a, "body", &.{"rare"}));
     const Check = struct {
         fn run(alloc: A, template: *const Reader) !void {
-            var fresh: Reader = .{ .allocator = alloc, .read = template.read, .domain = template.domain, .global = null, .segments = template.segments, .identities = template.identities, .directory = template.directory };
+            var fresh: Reader = .{ .allocator = alloc, .read = template.read, .domain = template.domain, .global = null, .segments = template.segments, .identities = template.identities, .ordinals = template.ordinals, .directory = template.directory };
             defer fresh.deinit();
             try Reader.prepare(&fresh, alloc, "body", &.{ "rare", "absent" });
+            const candidates_ = (try Reader.candidates(&fresh, alloc, "body", "rare")).?;
+            defer alloc.free(candidates_);
+            try std.testing.expectEqual(@as(usize, 1), candidates_.len);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&reader});

@@ -788,6 +788,20 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 rare,
             ]
         }
+        # An absent term may fit the native summary key while exceeding only
+        # the optional escaped directory key. Exact refinement must fall back.
+        large = call(
+            "POST",
+            "/tables/fragmented/query",
+            {
+                "full_text_search": {
+                    "disjuncts": [rare, {"term": "x" * 262112, "field": "body"}]
+                },
+                "fields": ["amount"],
+                "limit": 1,
+            },
+        )["hits"]["hits"]
+        assert len(large) == 1 and large[0]["_source"]["amount"] in expected
         baseline = None
         for restart in (False, False, True):
             if restart:
@@ -797,6 +811,24 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 assert {hit["_source"]["amount"] for hit in hits} == expected
                 assert all(hit["_score"] > 0 for hit in hits)
             hits = query(nested)
+            top = call(
+                "POST",
+                "/tables/fragmented/query",
+                {
+                    "full_text_search": nested,
+                    "fields": ["amount"],
+                    "limit": 1,
+                },
+            )["hits"]["hits"]
+            assert top == hits[:1]
+            # Unknown/broad optional sets and prohibitions must retain the full
+            # inventory, even when the positive rare term has exact candidates.
+            broad = query({"disjuncts": [{"term": "common", "field": "body"}, rare]})
+            assert len(broad) == 10
+            assert expected <= {h["_source"]["amount"] for h in broad}
+            excluded = query({"must_not": {"disjuncts": [rare]}})
+            assert len(excluded) == 10
+            assert not (expected & {h["_source"]["amount"] for h in excluded})
             if baseline is None:
                 baseline = hits
             else:

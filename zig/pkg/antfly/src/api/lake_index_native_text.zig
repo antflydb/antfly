@@ -105,6 +105,7 @@ pub const Root = struct {
     term_directory: term_directory.Roots = .{},
     pub fn validate(self: Root) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
+        if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
@@ -305,7 +306,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.statistics_version == 2 and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.statistics_version == 2 and root.term_directory.version == 2 and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -411,7 +412,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer stats_builder.deinit();
         var directory_builder = term_directory.Builder.init(a, &spill_manager);
         defer directory_builder.deinit();
-        const prior_directory: term_directory.Roots = if (seed) |old| old.term_directory else .{};
+        const prior_directory: term_directory.Roots = if (seed) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
         const incremental_directory = prior_directory.leaves != null;
         var stats_reads: u64 = 512 * 1024 * 1024;
         var stats_writes: u64 = 512 * 1024 * 1024;
