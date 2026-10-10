@@ -1438,7 +1438,7 @@ pub const Backend = struct {
         offset: u64 = 0,
         len: u32 = 0,
         misses: u8 = 0,
-        promoting: bool = false,
+        promotion: std.atomic.Value(runtime_mod.LocalBlockPromotion.State) = .init(.idle),
         cooldown: u8 = 0,
         access: u64 = 0,
     };
@@ -7202,27 +7202,46 @@ pub const Backend = struct {
     /// Called under the backend mutex. Fixed metadata records two misses before
     /// promotion; one promoter owns the attempt and budget denials back off.
     pub fn beginLocalBlockPromotion(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, decoded_len: usize) bool {
-        if (!self.localBlockCacheEligible(decoded_len)) return false;
+        return self.beginLocalBlockPromotionClaim(path, run_id, offset, len, decoded_len) != null;
+    }
+
+    pub fn beginLocalBlockPromotionClaim(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, decoded_len: usize) ?runtime_mod.LocalBlockPromotion {
+        if (!self.localBlockCacheEligible(decoded_len)) return null;
         const path_hash = std.hash.Wyhash.hash(0, path);
         const access = self.nextLocalCacheAccess();
         var victim: ?usize = null;
         for (&self.local_block_heat, 0..) |*heat, i| {
+            const active = reconcileLocalBlockPromotion(heat);
             if (heat.valid and heat.run_id == run_id and heat.path_hash == path_hash and heat.offset == offset and heat.len == len) {
                 heat.access = access;
-                if (heat.promoting) return false;
+                if (active) return null;
                 if (heat.cooldown != 0) {
                     heat.cooldown -= 1;
-                    return false;
+                    return null;
                 }
                 heat.misses +|= 1;
-                if (heat.misses < 2) return false;
-                heat.promoting = true;
-                return true;
+                if (heat.misses < 2) return null;
+                heat.promotion.store(.active, .monotonic);
+                return .{ .completion = &heat.promotion };
             }
-            if (!heat.promoting and (victim == null or !heat.valid or heat.access < self.local_block_heat[victim.?].access)) victim = i;
+            if (!active and (victim == null or !heat.valid or heat.access < self.local_block_heat[victim.?].access)) victim = i;
         }
-        const slot = victim orelse return false;
+        const slot = victim orelse return null;
         self.local_block_heat[slot] = .{ .valid = true, .run_id = run_id, .path_hash = path_hash, .offset = offset, .len = len, .misses = 1, .access = access };
+        return null;
+    }
+
+    // Called only under the backend mutex. Completion publication is the sole
+    // cross-thread mutation; active slots cannot be evicted or reassigned.
+    fn reconcileLocalBlockPromotion(heat: *LocalBlockHeat) bool {
+        const state = heat.promotion.load(.acquire);
+        // Keep one snapshot for selection: a completion racing this load is
+        // reconciled on the next pass, before its cooldown can be bypassed.
+        if (state == .active) return true;
+        if (state != .admitted and state != .denied) return false;
+        heat.misses = 0;
+        heat.cooldown = if (state == .admitted) 0 else 64;
+        heat.promotion.store(.idle, .monotonic);
         return false;
     }
 
@@ -7230,9 +7249,8 @@ pub const Backend = struct {
         const path_hash = std.hash.Wyhash.hash(0, path);
         for (&self.local_block_heat) |*heat| {
             if (!heat.valid or heat.run_id != run_id or heat.path_hash != path_hash or heat.offset != offset or heat.len != len) continue;
-            heat.promoting = false;
-            heat.misses = 0;
-            heat.cooldown = if (admitted) 0 else 64;
+            heat.promotion.store(if (admitted) .admitted else .denied, .release);
+            _ = reconcileLocalBlockPromotion(heat);
             return;
         }
     }
@@ -26421,6 +26439,71 @@ test "lsm local hot compressed point reads promote and repeated batches deduplic
         try std.testing.expectEqual(@as(usize, 1), batch.held_blocks.items.len);
         try std.testing.expectEqual(@as(usize, 0), batch.held_values.items.len);
     }
+}
+
+pub fn qualifyLocalPromotionRetirement(control: @import("../common/read_admission.zig").Port, admitted: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{ .local_block_cache_bytes = 4096, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    var claims: [64]?runtime_mod.LocalBlockPromotion = @splat(null);
+    defer {
+        for (&claims) |*claim| if (claim.*) |*owned| owned.finish(false);
+        for (&backend.local_block_heat) |*heat| std.debug.assert(heat.promotion.load(.acquire) != .active);
+    }
+    const first_path = try a.dupe(u8, "/local-promotion:0");
+    var first_path_alive = true;
+    defer if (first_path_alive) a.free(first_path);
+    for (&claims, 0..) |*claim, i| {
+        try control.checkpoint();
+        var bytes: [64]u8 = undefined;
+        const path = if (i == 0) first_path else try std.fmt.bufPrint(&bytes, "/local-promotion:{d}", .{i});
+        std.debug.assert(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) == null);
+        claim.* = backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) == null);
+    }
+    // No active slot may be reassigned to a newcomer. Borrowed request paths
+    // can die before completion: the token owns only fixed backend metadata.
+    a.free(first_path);
+    first_path_alive = false;
+    const first_completion = claims[0].?.completion.?;
+    const expected: runtime_mod.LocalBlockPromotion.State = if (admitted) .admitted else .denied;
+    const result = blk: {
+        std.debug.assert(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) == null);
+        const checkpoint = control.checkpoint();
+        // The original scope can already be rejected, and the backend mutex is
+        // unavailable. Every completion must still publish without waiting.
+        for (&claims) |*claim| if (claim.*) |*owned| owned.finish(admitted);
+        claims[0].?.finish(!admitted);
+        std.debug.assert(first_completion.load(.acquire) == expected);
+        break :blk checkpoint;
+    };
+    try result;
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    const misses: usize = if (admitted) 1 else 65;
+    for (0..misses) |_| try std.testing.expect(backend.beginLocalBlockPromotionClaim("/local-promotion:0", 0, 0, 40, 40) == null);
+    var retry = backend.beginLocalBlockPromotionClaim("/local-promotion:0", 0, 0, 40, 40) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retry.completion.? == first_completion);
+    retry.finish(true);
+    // Reuse after full-table reconciliation consumes each completed election
+    // once. A stale finished token cannot change the new owner's outcome.
+    claims[0].?.finish(false);
+    try std.testing.expectEqual(runtime_mod.LocalBlockPromotion.State.admitted, first_completion.load(.acquire));
+    try std.testing.expect(backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) == null);
+    var newcomer = backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) orelse return error.TestUnexpectedResult;
+    newcomer.finish(false);
+    // The legacy mutex-held entry points keep the same election and backoff.
+    try std.testing.expect(!backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/legacy", 66, 0, 40, false);
+    for (0..65) |_| try std.testing.expect(!backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/legacy", 66, 0, 40, true);
 }
 
 test "lsm local byte budget evicts cache ownership but charges pinned payload until final release" {

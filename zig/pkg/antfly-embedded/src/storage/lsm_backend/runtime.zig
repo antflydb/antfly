@@ -8800,9 +8800,20 @@ fn localBlockCacheEligible(backend: anytype, bytes: usize) bool {
     return localBlockCacheEnabled(backend);
 }
 
-fn beginLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool) bool {
-    return beginLocalBlockPromotionWithAdmission(backend, run, index, window, locked, null) catch unreachable;
-}
+/// One elected attempt in backend-owned fixed metadata. The backend and its
+/// read pin outlive this token. Finish only after physical decoder work joins.
+/// Completion stores no borrowed path, scope, allocator or callback.
+pub const LocalBlockPromotion = struct {
+    pub const State = enum(u8) { idle, active, admitted, denied };
+    completion: ?*std.atomic.Value(@This().State),
+
+    pub fn finish(self: *@This(), admitted: bool) void {
+        const completion = self.completion orelse return;
+        self.completion = null;
+        // Final access: a cache pass can immediately reconcile/reuse the slot.
+        completion.store(if (admitted) .admitted else .denied, .release);
+    }
+};
 
 fn beginLocalBlockPromotionWithAdmission(
     backend: anytype,
@@ -8811,21 +8822,13 @@ fn beginLocalBlockPromotionWithAdmission(
     window: lsm_table_file.EntryDataWindow,
     locked: bool,
     control: ?read_admission.Port,
-) !bool {
-    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotion")) return false;
-    if (window.compression != .prefix and window.compression != .prefix_snappy) return false;
-    const path = run.path orelse return false;
+) !?LocalBlockPromotion {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotionClaim")) return null;
+    if (window.compression != .prefix and window.compression != .prefix_snappy) return null;
+    const path = run.path orelse return null;
     const held = if (locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, held);
-    return backend.beginLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
-}
-
-fn finishLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool, admitted: bool) void {
-    if (comptime !@hasDecl(@TypeOf(backend.*), "finishLocalBlockPromotion")) return;
-    const path = run.path orelse return;
-    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
-    defer unlockBackend(@TypeOf(backend.*), backend, held);
-    backend.finishLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), admitted);
+    return backend.beginLocalBlockPromotionClaim(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
 }
 
 fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
@@ -9182,12 +9185,15 @@ fn findExactEntryWithLocalIndexBlockMetaWithOutput(
         if (namespace.retainDataBlocks()) if (try joinLocalBlockDecodeWithAdmission(backend, run, index, window, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         };
-        if (namespace.retainDataBlocks() and try beginLocalBlockPromotionWithAdmission(backend, run, index, window, false, control)) {
-            var admitted = false;
-            defer finishLocalBlockPromotion(backend, run, index, window, false, admitted);
-            const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, false, namespace.retainDataBlocks(), control);
-            admitted = lease.cache_admitted;
-            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        if (namespace.retainDataBlocks()) {
+            if (try beginLocalBlockPromotionWithAdmission(backend, run, index, window, false, control)) |claim| {
+                var promotion = claim;
+                var admitted = false;
+                defer promotion.finish(admitted);
+                const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, false, namespace.retainDataBlocks(), control);
+                admitted = lease.cache_admitted;
+                return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+            }
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
@@ -9254,12 +9260,15 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
         if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, true, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
-        if (namespace.retainDataBlocks() and try beginLocalBlockPromotionWithAdmission(backend, run, index, window, true, control)) {
-            var admitted = false;
-            defer finishLocalBlockPromotion(backend, run, index, window, true, admitted);
-            const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, true, namespace.retainDataBlocks(), control);
-            admitted = lease.cache_admitted;
-            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        if (namespace.retainDataBlocks()) {
+            if (try beginLocalBlockPromotionWithAdmission(backend, run, index, window, true, control)) |claim| {
+                var promotion = claim;
+                var admitted = false;
+                defer promotion.finish(admitted);
+                const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, true, namespace.retainDataBlocks(), control);
+                admitted = lease.cache_admitted;
+                return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+            }
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
