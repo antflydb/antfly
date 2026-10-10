@@ -592,6 +592,11 @@ test "decision functions OpenAI HTTP routing alignment provenance budgets and er
 }
 
 test "decision functions remote transport parks its parent and discards failed resumptions" {
+    try qualifyRemoteTransportRetirement();
+}
+
+pub fn qualifyRemoteTransportRetirement() !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
     const a = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -649,14 +654,14 @@ test "decision functions remote transport parks its parent and discards failed r
             };
         }
     };
-    const good = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const good = "{\"model\":\"test-model\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
     for (0..5) |scenario| {
         var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
         Check.owner = &scheduler;
         Check.close_owner = scenario == 3;
         var server = try httpx.TestServer.start(a, io, &.{.{
             .method = .POST,
-            .path = "/decide",
+            .path = "/decisions",
             .assert_request = Check.request,
             .respond = .{
                 .status = if (scenario == 2) 429 else 200,

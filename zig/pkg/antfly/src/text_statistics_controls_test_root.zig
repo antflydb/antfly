@@ -1523,3 +1523,7 @@ test "text statistics trusted controls prefix and large Snappy decode checkpoint
         }
     }
 }
+
+test "text statistics trusted controls decision transport uses current Antfly protocol and retires original parent" {
+    try sources.functions_runtime.qualifyRemoteTransportRetirement();
+}
