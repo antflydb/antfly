@@ -280,6 +280,8 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
                     try self.markPages(a, root.domain, root.term_statistics, false);
+                    try self.markPages(a, root.domain, root.term_directory.branches, false);
+                    try self.markPages(a, root.domain, root.term_directory.leaves, false);
                     for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
                     for (root.manifests) |manifest| {
                         if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
@@ -447,6 +449,14 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const segment_statistics = (try tree.buildSorted(a, stats_pages.store(), &summary_source)).?;
     var old_source: StatisticsSource = .{ .value = "old reader only statistics" };
     const old_statistics = (try tree.buildSorted(a, stats_pages.store(), &old_source)).?;
+    var branch_source: StatisticsSource = .{ .value = "term hierarchy branches" };
+    const term_branches = (try tree.buildSorted(a, stats_pages.store(), &branch_source)).?;
+    var leaf_source: StatisticsSource = .{ .value = "term hierarchy leaves" };
+    const term_leaves = (try tree.buildSorted(a, stats_pages.store(), &leaf_source)).?;
+    var old_branch_source: StatisticsSource = .{ .value = "old term hierarchy branches" };
+    const old_term_branches = (try tree.buildSorted(a, stats_pages.store(), &old_branch_source)).?;
+    var old_leaf_source: StatisticsSource = .{ .value = "old term hierarchy leaves" };
+    const old_term_leaves = (try tree.buildSorted(a, stats_pages.store(), &old_leaf_source)).?;
     const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
         .file = .{ .id = "part", .digest = @splat(7) },
         .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
@@ -455,11 +465,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = global_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
-    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = old_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 2, .term_statistics = old_statistics, .term_directory = .{ .branches = old_term_branches, .leaves = old_term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var old_text_upload = try store.put(old_text_bytes);
     defer old_text_upload.deinit(a);
     var old_text_ref = text_ref;
@@ -566,12 +576,14 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
-    for ([_]tree.Ref{ global_statistics, segment_statistics }) |ref| {
+    for ([_]tree.Ref{ global_statistics, segment_statistics, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);
         try std.testing.expectEqual(ref.bytes, retained_statistics.len);
     }
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_branches)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_leaves)));
     const retained_holes = try store.getAlloc(hole_upload.artifact_id);
     defer a.free(retained_holes);
     try std.testing.expectEqualSlices(u8, hole_bytes, retained_holes);

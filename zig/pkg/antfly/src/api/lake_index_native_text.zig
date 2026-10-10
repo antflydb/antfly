@@ -28,6 +28,7 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const statistics = @import("lake_index_text_statistics.zig");
+pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 pub const metadata_version: u16 = 9;
@@ -101,10 +102,15 @@ pub const Root = struct {
     manifests: []const artifacts.ChunkRef = &.{},
     statistics_version: u8 = 0,
     term_statistics: ?statistics.Ref = null,
+    term_directory: term_directory.Roots = .{},
     pub fn validate(self: Root) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
-        if (self.statistics_version > 1 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
+        if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
+        if ((self.term_directory.branches == null) != (self.term_directory.leaves == null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.term_directory.branches) |ref| try ref.validate();
+        if (self.term_directory.leaves) |ref| try ref.validate();
         try self.binding.validate();
         if (self.binding.sidecar_kind != .text) return error.InvalidNativeLakeTextCorpus;
         if (self.file_groups.len > 16384) return error.InvalidNativeLakeTextCorpus;
@@ -117,7 +123,7 @@ pub const Root = struct {
         var segment_position: usize = 0;
         for (self.file_groups) |group| {
             try group.validate(self.domain);
-            if (self.statistics_version == 1 and group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+            if (self.statistics_version >= 1 and group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
             for (group.segments) |segment| {
                 if (segment_position >= self.segments.len or (!std.mem.eql(u8, segment.artifact_id, self.segments[segment_position].artifact_id) or !std.mem.eql(u8, segment.checksum, self.segments[segment_position].checksum) or segment.byte_len != self.segments[segment_position].byte_len)) return error.InvalidNativeLakeTextCorpus;
                 segment_position += 1;
@@ -299,7 +305,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.statistics_version == 1 and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.statistics_version == 2 and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -310,7 +316,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.statistics_version != 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
+            if (root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
@@ -403,6 +409,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer spill_manager.deinit();
         var stats_builder = statistics.Builder.init(a, &spill_manager);
         defer stats_builder.deinit();
+        var directory_builder = term_directory.Builder.init(a, &spill_manager);
+        defer directory_builder.deinit();
+        const prior_directory: term_directory.Roots = if (seed) |old| old.term_directory else .{};
+        const incremental_directory = prior_directory.leaves != null;
         var stats_reads: u64 = 512 * 1024 * 1024;
         var stats_writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope.?;
@@ -410,13 +420,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (seed) |old| for (old.file_groups) |group| {
             const current = plan.by_id.get(group.file.id);
             if (current != null and !plan.changed[current.?]) continue;
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, -1);
+            for (group.summaries, group.segments) |ref, segment| {
+                try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), -1, &stats_builder, if (incremental_directory) &directory_builder else null);
+            }
         };
-        for (groups, plan.changed) |group, changed| if (changed) {
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, 1);
-        };
+        for (groups, plan.changed) |group, changed| {
+            for (group.summaries, group.segments) |ref, segment| {
+                if (changed or !incremental_directory) try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), 1, if (changed) &stats_builder else null, &directory_builder);
+            }
+        }
         const global_statistics = try stats_builder.finish(stats_pages.store(), if (seed) |old| old.term_statistics else null);
-        var root: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
+        var root: Root = .{ .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
         // Publish one immutable manifest per file. Large corpora do not put
         // every native segment reference (twice) into the root artifact.
@@ -483,3 +498,15 @@ const StatisticsCheckpoint = struct {
         try self.cancellation.check();
     }
 };
+
+/// Feed both indexes from a single authenticated summary cursor, including
+/// version-1 upgrades where only the new directory needs unchanged metadata.
+fn addStatisticsContribution(a: A, store: @import("../serverless/graph_segment/page_tree.zig").Store, root: ?statistics.Ref, segment: [32]u8, sign: i64, global: ?*statistics.Builder, directory: ?*term_directory.Builder) !void {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    var cursor = try tree.Cursor.init(a, store, root, "", null);
+    defer cursor.deinit();
+    while (try cursor.next()) |record| {
+        if (global) |builder| try builder.addRecord(record, sign);
+        if (directory) |builder| try builder.addRecord(record, segment, sign);
+    }
+}

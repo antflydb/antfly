@@ -954,6 +954,10 @@ pub const IndexSnapshot = struct {
     pub const TextStatistics = struct {
         ptr: *anyopaque,
         check: *const fn (*anyopaque) anyerror!void,
+        hierarchical: bool = false,
+        summaries: ?*const fn (*anyopaque, Allocator, usize, []const u8, []const []const u8, f32, inverted.BM25Config, []TextTermSummary) anyerror!void = null,
+        prepare: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8) anyerror!void = null,
+        planning: ?*const fn (*anyopaque, Allocator, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!?TextTermSummary = null,
         frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
         summary: *const fn (*anyopaque, Allocator, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!TextTermSummary,
     };
@@ -987,6 +991,29 @@ pub const IndexSnapshot = struct {
             return value;
         }
         return null;
+    }
+    /// Batch only cold exact summaries, reusing routing pages across terms.
+    pub fn prefetchTextTermSummaries(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, terms: []const []const u8, average: f32, config: inverted.BM25Config) !void {
+        const reader = self.text_statistics orelse return;
+        const batch = reader.summaries orelse return;
+        try reader.check(reader.ptr);
+        var missing: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer missing.deinit(a);
+        const owner = self.scoringCache();
+        for (terms) |term| {
+            const key = try textSummaryKey(a, segment, field, term, average, config);
+            defer a.free(key);
+            while (!owner.text_summary_mu.tryLock()) spinOrYield();
+            const warm = owner.text_summaries.contains(key);
+            owner.text_summary_mu.unlock();
+            if (!warm) try missing.append(a, term);
+        }
+        if (missing.items.len == 0) return;
+        const values = try a.alloc(TextTermSummary, missing.items.len);
+        defer a.free(values);
+        try batch(reader.ptr, a, segment, field, missing.items, average, config, values);
+        try reader.check(reader.ptr);
+        for (missing.items, values) |term, value| try self.rememberTextTermSummary(segment, field, term, average, config, value);
     }
     pub fn rememberTextTermSummary(self: *const IndexSnapshot, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config, value: TextTermSummary) !void {
         const owner = self.scoringCache();
@@ -1549,7 +1576,17 @@ pub const IndexSnapshot = struct {
         };
         if (!cold) return;
         if (self.text_statistics) |reader| {
-            try reader.frequencies(reader.ptr, alloc, field, terms, output);
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer names.deinit(alloc);
+            for (terms, missing) |term, miss| if (miss) try names.append(alloc, term);
+            const values = try alloc.alloc(u32, names.items.len);
+            defer alloc.free(values);
+            try reader.frequencies(reader.ptr, alloc, field, names.items, values);
+            var position: usize = 0;
+            for (output, missing) |*value, miss| if (miss) {
+                value.* = values[position];
+                position += 1;
+            };
             try self.checkScoringReadContext();
             for (terms, output, missing) |term, value, miss| if (miss) self.cacheTermDocFreq(field, term, value);
             return;
@@ -4099,4 +4136,43 @@ test "external lake range segment admission defers dictionary diagnostics across
     } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
     try std.testing.expect(unpublished[0].prepared_reader == null);
     try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+}
+
+test "text statistics mixed warm cold batches fetch only missing slots" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("one", "{}");
+    const bytes = try segment.build();
+    try writer.addSegmentWithIdData(1, .fromOwnedHeap(bytes));
+    const Provider = struct {
+        calls: usize = 0,
+        revoked: bool = false,
+        fn check(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).revoked) return error.Canceled;
+        }
+        fn frequencies(raw: *anyopaque, _: Allocator, _: []const u8, terms: []const []const u8, output: []u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), terms.len);
+            try std.testing.expectEqualStrings(if (self.calls == 0) "warm" else "cold", terms[0]);
+            self.calls += 1;
+            @memset(output, 1);
+        }
+        fn summary(_: *anyopaque, _: Allocator, _: usize, _: []const u8, _: []const u8, _: f32, _: inverted.BM25Config) !IndexSnapshot.TextTermSummary {
+            return error.TestUnexpectedSummary;
+        }
+    };
+    var provider: Provider = .{};
+    const facade = try writer.acquireSnapshotWithReadContext(&provider);
+    defer facade.release();
+    facade.text_statistics = .{ .ptr = &provider, .check = Provider.check, .frequencies = Provider.frequencies, .summary = Provider.summary };
+    var output: [3]u32 = undefined;
+    try facade.termDocFreqs(a, "body", &.{"warm"}, output[0..1]);
+    try facade.termDocFreqs(a, "body", &.{ "warm", "cold", "warm" }, &output);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1 }, &output);
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    provider.revoked = true;
+    try std.testing.expectError(error.Canceled, facade.termDocFreqs(a, "body", &.{"warm"}, output[0..1]));
 }

@@ -664,3 +664,150 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
+    tmp_path, source_format
+):
+    """Seventeen physical files force hierarchical and parallel text planning."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / source_format
+    expected = {3 * 256, 11 * 256, 16 * 256}
+    batches = [
+        pa.table(
+            {
+                "amount": range(part * 256, (part + 1) * 256),
+                "body": [
+                    "common phrase quasar"
+                    if part * 256 + row in expected
+                    else "common phrase"
+                    for row in range(256)
+                ],
+            }
+        )
+        for part in range(17)
+    ]
+    if source_format == "iceberg":
+        pytest.importorskip("fastavro")
+        pytest.importorskip("pyiceberg")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+
+        catalog = SqlCatalog(
+            "fragmented",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("fragmented")
+        table = catalog.create_table(
+            "fragmented.items",
+            schema=Schema(
+                NestedField(1, "amount", LongType(), required=False),
+                NestedField(2, "body", StringType(), required=False),
+            ),
+        )
+        for batch in batches:
+            table.append(batch)
+        assert len(table.inspect.files()) == 17
+        _export_table(table, root)
+    else:
+        objects = root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        for ordinal, batch in enumerate(batches):
+            output = io.BytesIO()
+            pq.write_table(batch, output, compression="snappy")
+            payload = output.getvalue()
+            (objects / f"part-{ordinal:02}.parquet").write_bytes(
+                b"AFOBJ001"
+                + struct.pack("<QI", len(payload), 0)
+                + hashlib.sha256(payload).hexdigest().encode()
+                + payload
+            )
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/fragmented",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "fragmented",
+                        "format": source_format,
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 300
+        while True:
+            resource = call("GET", "/tables/fragmented/indexes/body_text")
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+
+        def query(text):
+            return call(
+                "POST",
+                "/tables/fragmented/query",
+                {"full_text_search": text, "fields": ["amount"], "limit": 10},
+            )["hits"]["hits"]
+
+        rare = {"term": "quasar", "field": "body"}
+        nested = {
+            "conjuncts": [
+                {"term": "common", "field": "body"},
+                {"disjuncts": [rare, {"term": "missing", "field": "body"}]},
+            ]
+        }
+        phrase = {
+            "conjuncts": [
+                {"match_phrase": "common phrase", "field": "body"},
+                rare,
+            ]
+        }
+        baseline = None
+        for restart in (False, False, True):
+            if restart:
+                server.restart()
+            for text in (nested, phrase):
+                hits = query(text)
+                assert {hit["_source"]["amount"] for hit in hits} == expected
+                assert all(hit["_score"] > 0 for hit in hits)
+            hits = query(nested)
+            if baseline is None:
+                baseline = hits
+            else:
+                assert hits == baseline
+            for boost in (0, -1):
+                signed = query({"conjuncts": [dict(rare, boost=boost)]})
+                assert {hit["_source"]["amount"] for hit in signed} == expected
+                assert all(
+                    hit["_score"] == 0 if boost == 0 else hit["_score"] < 0
+                    for hit in signed
+                )
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

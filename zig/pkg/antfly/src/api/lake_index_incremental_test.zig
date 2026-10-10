@@ -102,8 +102,10 @@ test "external lake incremental native publication appends replaces removes and 
                 const native = @import("lake_index_native_text.zig");
                 const root = try native.loadRoot(ca, store, declaration.artifact, .none, null);
                 try std.testing.expectEqual(expected, root.file_groups.len);
-                try std.testing.expectEqual(@as(u8, 1), root.statistics_version);
+                try std.testing.expectEqual(@as(u8, 2), root.statistics_version);
                 try std.testing.expect(root.term_statistics != null);
+                try std.testing.expect(root.term_directory.branches != null);
+                try std.testing.expect(root.term_directory.leaves != null);
                 for (root.file_groups) |group| try std.testing.expectEqual(group.segments.len, group.summaries.len);
                 var writer = try native.loadWriter(a, store, root, .none, null, null);
                 defer writer.deinit();

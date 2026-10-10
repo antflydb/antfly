@@ -3048,6 +3048,12 @@ const StreamingBoolStats = struct {
         var fields = self.fields.iterator();
         while (fields.next()) |field| {
             const frequencies = &field.value_ptr.frequencies;
+            if (self.snap.text_statistics) |reader| if (reader.prepare) |prepare| {
+                const requested = try self.a.alloc([]const u8, frequencies.count());
+                var keys = frequencies.keyIterator();
+                for (requested) |*key| key.* = keys.next().?.*;
+                try prepare(reader.ptr, self.a, field.key_ptr.*, requested);
+            };
             var count: usize = 0;
             var entries = frequencies.iterator();
             while (entries.next()) |entry| if (entry.value_ptr.local) {
@@ -3236,6 +3242,8 @@ const StreamingBoolBuilder = struct {
     planning: bool = false,
     compute_bounds: bool = true,
     summaries_only: bool = false,
+    exact_summaries: bool = false,
+    summary_fields: std.StringHashMapUnmanaged(void) = .empty,
     shared_readers: bool = false,
     shared_cache_allocator: ?Allocator = null,
     position_mode: bool = false,
@@ -3313,6 +3321,17 @@ const StreamingBoolBuilder = struct {
     }
     fn summaryTerm(self: *@This(), field: []const u8, term: []const u8, average: f32) !index_mod.IndexSnapshot.TextTermSummary {
         const index = (@intFromPtr(self.segment) - @intFromPtr(self.snap.segments.ptr)) / @sizeOf(index_mod.SegmentEntry);
+        if (self.summaries_only and !self.exact_summaries) if (self.snap.text_statistics) |reader| if (reader.planning) |planning| {
+            if (try planning(reader.ptr, self.a, index, field, term, average, self.config)) |summary| return summary;
+        };
+        if (self.snap.text_statistics != null and !self.summary_fields.contains(field)) {
+            const frequencies = &(self.stats.fields.getPtr(field) orelse return error.InvalidArgument).frequencies;
+            const names = try self.a.alloc([]const u8, frequencies.count());
+            var keys = frequencies.keyIterator();
+            for (names) |*name| name.* = keys.next().?.*;
+            try self.snap.prefetchTextTermSummaries(self.a, index, field, names, average, self.config);
+            try self.summary_fields.put(self.a, field, {});
+        }
         if (try self.snap.cachedTextTermSummary(self.a, index, field, term, average, self.config)) |summary| {
             if (self.diagnostics) |d| d.boolean_summary_hits += 1;
             return summary;
@@ -3905,6 +3924,20 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
     try collector.beginSegment(offset, segment.reader.doc_count);
     segment.beginAccess();
     defer segment.endAccess();
+    _ = arena.reset(.retain_capacity);
+    if (snap.text_statistics) |reader| if (reader.hierarchical) if (streamingCutoff(collector, shared)) |cutoff| {
+        // Coarse hierarchy bounds avoid all leaf reads in the initial prepass.
+        // Refine a surviving segment in one batched exact-statistics read before
+        // opening its dictionaries, postings or prepared scoring state.
+        var refinement: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .exact_summaries = true };
+        defer refinement.deinit();
+        const ceiling = try (try refinement.buildRequest(bq)).segmentBound();
+        if (std.math.isFinite(ceiling) and (ceiling < cutoff.score or (ceiling == cutoff.score and @as(u64, offset) + work.first > cutoff.doc_id))) {
+            collector.pruned = true;
+            if (request.diagnostics) |diagnostics| diagnostics.segments_pruned +|= 1;
+            return;
+        }
+    };
     _ = arena.reset(.retain_capacity);
     var lease = if (cache) |prepared| try prepared.get(plan) else null;
     defer if (lease) |*selected| selected.release();
