@@ -2625,3 +2625,22 @@ marker and migration cursor remain unchanged after rejection and permits a
 healthy migration afterwards; it is selected by the cumulative producer-
 maintenance gate and remains unqualified until that gate runs. This does not
 supply CPU lending for graph service holders or enable pooling defaults.
+
+
+### Outbox deletion checks authority after apply acquisition
+
+Both normal batch completion and the idempotent transaction-outbox completion
+path recheck replication write authority after taking the cleanup apply lock.
+Waiting for that lock cannot carry an earlier authority check into deletion
+under a subsequently fenced generation. Failed authority retains durable debt.
+
+The server DB integration suite now includes actual no-intents resolver cases
+with both batch and replay outboxes: replay reply loss clears only the proven
+batch obligation; fencing after remote completion retains both; fencing at the
+cleanup apply grant also retains both. A physically joined worker captures the
+real mutation barrier during each remote completion. The fixture checks every
+local tail was appended first, retained committed status and pending payloads,
+then a healthy retry retires the remaining obligations without a leaked reader.
+These cases are pending cumulative `antfly-server-db-test` compilation/execution;
+format checking or the existing six helper-level lease checks do not qualify
+their DB behavior. Full integration and pooling defaults remain unqualified.

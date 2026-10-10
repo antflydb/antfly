@@ -4272,3 +4272,123 @@ test "server index status reports ready for converged plural-source dense artifa
     };
     try engine.test_support.expectPluralSourceDenseConvergence(Observer.observe);
 }
+
+test "db transaction outbox retirement preserves partial acknowledgement and fenced debt" {
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const Outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Failure = enum { replay_reply_loss, fence_after_reply, fence_at_cleanup_apply };
+    const Fixture = struct {
+        db: *DB,
+        barrier: *Barrier,
+        transition: *std.atomic.Mutex,
+        failure: ?Failure,
+        closed: bool = false,
+        appended: usize = 0,
+        completed: usize = 0,
+        expected_appends: usize = 2,
+        captured: bool = false,
+
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(mirror: contract.AsyncEffectMirror, kind: Outbox.Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            // Appends still belong to the protected local commit/tail phase.
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var unexpected = lease;
+                unexpected.release();
+                return error.OutboxAppendOutsideMutationProtection;
+            }
+            try std.testing.expectEqualStrings(if (kind == .batch) "batch-debt" else "replay-debt", payload);
+            self.appended += 1;
+            return if (kind == .batch) 1 else 2;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: Outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedOutboxRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn capture(self: *@This()) void {
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var owned = lease;
+                owned.release();
+                self.captured = true;
+            }
+        }
+        fn complete(mirror: contract.AsyncEffectMirror, lsn: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(self.expected_appends, self.appended);
+            try std.testing.expect(self.transition.tryLock());
+            self.transition.unlock();
+            try std.testing.expect(self.db.core.apply_mutex.tryLockShared());
+            self.db.core.apply_mutex.unlockShared();
+            self.captured = false;
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            try std.testing.expect(self.captured);
+            self.completed += 1;
+            if (self.failure == .replay_reply_loss and lsn == 2) return error.InjectedOutboxReplyLoss;
+            if (self.failure == .fence_after_reply) self.closed = true;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            // Close when cleanup has obtained the exclusive apply fence. The
+            // post-grant check must reject deletion, including on empty retries.
+            if (self.failure == .fence_at_cleanup_apply and self.completed != 0) {
+                if (self.db.core.apply_mutex.tryLockShared()) self.db.core.apply_mutex.unlockShared() else self.closed = true;
+            }
+            if (self.closed) return error.Forbidden;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]Failure{ .replay_reply_loss, .fence_after_reply, .fence_at_cleanup_apply }) |failure| {
+        var directory = try TestDirectory.init("transaction-outbox-retirement");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const txn = try db.beginTransaction(1_000);
+        try db.commitTransaction(txn, 2_000);
+        const batch_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn);
+        const replay_key = transactions_mod.makeTransactionReplicationReplayOutboxKey(txn);
+        // Model durable obligations surviving a restart before notification.
+        // The real DB resolver must retire its reader on this no-intents retry.
+        try db.core.store.putBatch(&.{ .{ .key = &batch_key, .value = "batch-debt" }, .{ .key = &replay_key, .value = "replay-debt" } }, &.{});
+        var barrier: Barrier = .{};
+        var transition: std.atomic.Mutex = .unlocked;
+        var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .transition = &transition, .failure = failure };
+        const mirror: contract.AsyncEffectMirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier, .transition_mutex = &transition, .requirements = .{ .synchronous = true, .durable_outbox = true } };
+        db.local_execution.replication_async_batch_mirror = mirror;
+        db.local_execution.replication_async_effect_mirror = mirror;
+        db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
+        defer {
+            db.local_execution.replication_async_batch_mirror = null;
+            db.local_execution.replication_async_effect_mirror = null;
+            db.local_execution.replication_write_gate = null;
+        }
+        try std.testing.expectError(if (failure == .replay_reply_loss) error.InjectedOutboxReplyLoss else error.Forbidden, db.commitTransaction(txn, 2_000));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn));
+        var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(failure != .replay_reply_loss, pending.batch_payload != null);
+        try std.testing.expect(pending.replay_payload != null);
+        try std.testing.expectEqual(@as(usize, if (failure == .replay_reply_loss) 2 else 1), fixture.completed);
+        fixture.failure = null;
+        fixture.closed = false;
+        fixture.appended = 0;
+        fixture.completed = 0;
+        fixture.expected_appends = if (pending.batch_payload == null) 1 else 2;
+        try db.commitTransaction(txn, 2_000);
+        try std.testing.expectEqual(fixture.expected_appends, fixture.completed);
+        var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+        defer remaining.deinit(alloc);
+        try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
+        var capture = barrier.tryAcquireExclusive() orelse return error.OutboxRetirementLeakedMutationReader;
+        capture.release();
+    }
+}

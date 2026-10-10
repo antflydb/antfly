@@ -2980,6 +2980,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try self.enforceReplicationWriteGate();
                     lockApply(self);
                     defer self.core.unlockApply();
+                    // Apply acquisition can wait behind another mutation. A
+                    // fence during that wait must retain delivery debt.
+                    try self.enforceReplicationWriteGate();
                     if (opts.transaction_resolution) |resolution| {
                         if (transaction_replication_batch_payload != null)
                             try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
@@ -3439,6 +3442,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.enforceReplicationWriteGate();
                 try self.lockApplyForPortableRuntime();
                 defer self.core.unlockApply();
+                try self.enforceReplicationWriteGate();
                 try self.core.clearTransactionReplicationOutbox(txn_id, if (i == 0) .batch else .replay);
             }
         }
