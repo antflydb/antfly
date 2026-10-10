@@ -1,0 +1,527 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const types = @import("types.zig");
+
+pub fn lookupJson(
+    alloc: Allocator,
+    raw: []const u8,
+    opts: types.LookupOptions,
+) !types.LookupResult {
+    if (opts.fields.len == 0 and opts.include_all_fields) {
+        return .{ .json = try alloc.dupe(u8, raw) };
+    }
+
+    var projected = try projectLookupJsonValue(alloc, raw, opts);
+    defer freeJsonValue(alloc, &projected);
+
+    return .{
+        .json = try std.json.Stringify.valueAlloc(alloc, projected, .{}),
+    };
+}
+
+pub fn projectLookupJsonValue(
+    alloc: Allocator,
+    raw: []const u8,
+    opts: types.LookupOptions,
+) !std.json.Value {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+
+    return try projectLookupValue(alloc, parsed.value, opts);
+}
+
+/// Project an already decoded source without a JSON encode/parse round trip.
+/// The returned tree owns its keys and values; root remains borrowed.
+pub fn projectLookupValue(alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {
+    if (root != .object) {
+        if (opts.fields.len == 0 and opts.include_all_fields) {
+            return try cloneJsonValue(alloc, root);
+        }
+        return std.json.Value{ .object = std.json.ObjectMap.empty };
+    }
+
+    return try projectValue(false, alloc, root, opts);
+}
+
+/// Container-owned projection borrowing immutable string/number lexemes.
+/// Keep root alive until serialization completes; release with deinitProjectionView.
+pub fn projectLookupView(alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {
+    if (root != .object) return if (opts.fields.len == 0 and opts.include_all_fields) try cloneProjectionValue(true, alloc, root) else .{ .object = .empty };
+    return projectValue(true, alloc, root, opts);
+}
+pub fn deinitProjectionView(alloc: Allocator, value: *std.json.Value) void {
+    freeProjectionValue(true, alloc, value);
+}
+
+fn projectValue(comptime borrowed: bool, alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {
+    if (opts.fields.len == 0) {
+        return if (opts.include_all_fields)
+            try cloneProjectionValue(borrowed, alloc, root)
+        else
+            std.json.Value{ .object = std.json.ObjectMap.empty };
+    }
+
+    var includes = std.ArrayListUnmanaged([]const u8).empty;
+    defer includes.deinit(alloc);
+    var excludes = std.ArrayListUnmanaged([]const u8).empty;
+    defer excludes.deinit(alloc);
+
+    for (opts.fields) |field| {
+        if (field.len > 0 and field[0] == '-') {
+            try excludes.append(alloc, field[1..]);
+        } else {
+            try includes.append(alloc, field);
+        }
+    }
+
+    var result = if (includes.items.len > 0)
+        std.json.Value{ .object = std.json.ObjectMap.empty }
+    else
+        try cloneProjectionValue(borrowed, alloc, root);
+    errdefer freeProjectionValue(borrowed, alloc, &result);
+
+    if (includes.items.len > 0) {
+        for (includes.items) |pattern| {
+            try applyIncludePattern(borrowed, alloc, root.object, &result.object, pattern);
+        }
+    }
+
+    for (excludes.items) |pattern| {
+        try applyExcludePattern(borrowed, alloc, &result.object, pattern);
+    }
+
+    return result;
+}
+
+fn applyIncludePattern(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    src: std.json.ObjectMap,
+    dst: *std.json.ObjectMap,
+    pattern: []const u8,
+) Allocator.Error!void {
+    var parts = std.mem.tokenizeScalar(u8, pattern, '.');
+    var path = std.ArrayListUnmanaged([]const u8).empty;
+    defer path.deinit(alloc);
+    while (parts.next()) |part| try path.append(alloc, part);
+    if (path.items.len == 0) return;
+    try applyIncludeRecursive(borrowed, alloc, src, dst, path.items, 0);
+}
+
+pub fn applyIncludePath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
+    return applyIncludeRecursive(false, alloc, src, dst, parts, 0);
+}
+
+fn applyIncludeRecursive(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    src: std.json.ObjectMap,
+    dst: *std.json.ObjectMap,
+    parts: []const []const u8,
+    depth: usize,
+) Allocator.Error!void {
+    if (depth >= parts.len) return;
+
+    const part = parts[depth];
+    if (std.mem.eql(u8, part, "*")) {
+        var it = src.iterator();
+        while (it.next()) |entry| {
+            try includeField(borrowed, alloc, entry.key_ptr.*, entry.value_ptr.*, dst, parts, depth);
+        }
+        return;
+    }
+
+    if (src.get(part)) |value| {
+        try includeField(borrowed, alloc, part, value, dst, parts, depth);
+    }
+}
+
+fn includeField(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    key: []const u8,
+    value: std.json.Value,
+    dst: *std.json.ObjectMap,
+    parts: []const []const u8,
+    depth: usize,
+) Allocator.Error!void {
+    if (depth == parts.len - 1) {
+        try putCloneProjectionValue(borrowed, alloc, dst, key, value);
+        return;
+    }
+
+    switch (value) {
+        .object => |obj| {
+            const nested = try ensureObjectValue(borrowed, alloc, dst, key);
+            try applyIncludeRecursive(borrowed, alloc, obj, nested, parts, depth + 1);
+        },
+        .array => |arr| {
+            if (depth + 1 < parts.len) {
+                if (parseArrayIndex(parts[depth + 1])) |idx| {
+                    if (idx >= arr.items.len) return;
+
+                    var projected_items = std.json.Array.init(alloc);
+                    errdefer {
+                        for (projected_items.items) |*item| freeProjectionValue(borrowed, alloc, item);
+                        projected_items.deinit();
+                    }
+
+                    const item = arr.items[idx];
+                    if (depth + 1 == parts.len - 1) {
+                        try projected_items.ensureTotalCapacity(1);
+                        projected_items.appendAssumeCapacity(try cloneProjectionValue(borrowed, alloc, item));
+                    } else switch (item) {
+                        .object => |item_obj| {
+                            var projected_item = std.json.Value{ .object = std.json.ObjectMap.empty };
+                            errdefer freeProjectionValue(borrowed, alloc, &projected_item);
+                            try applyIncludeRecursive(borrowed, alloc, item_obj, &projected_item.object, parts, depth + 2);
+                            if (projected_item.object.count() > 0) {
+                                try projected_items.append(projected_item);
+                            } else {
+                                freeProjectionValue(borrowed, alloc, &projected_item);
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (projected_items.items.len == 0) return;
+                    try putProjectionValue(borrowed, alloc, dst, key, .{ .array = projected_items });
+                    return;
+                }
+            }
+
+            var projected_items = std.json.Array.init(alloc);
+            errdefer {
+                for (projected_items.items) |*item| freeProjectionValue(borrowed, alloc, item);
+                projected_items.deinit();
+            }
+
+            for (arr.items) |item| {
+                switch (item) {
+                    .object => |item_obj| {
+                        var projected_item = std.json.Value{ .object = std.json.ObjectMap.empty };
+                        errdefer freeProjectionValue(borrowed, alloc, &projected_item);
+                        try applyIncludeRecursive(borrowed, alloc, item_obj, &projected_item.object, parts, depth + 1);
+                        if (projected_item.object.count() > 0) {
+                            try projected_items.append(projected_item);
+                        } else {
+                            freeProjectionValue(borrowed, alloc, &projected_item);
+                        }
+                    },
+                    else => {},
+                }
+            }
+
+            if (projected_items.items.len == 0) return;
+            try putProjectionValue(borrowed, alloc, dst, key, .{ .array = projected_items });
+        },
+        else => {},
+    }
+}
+
+fn applyExcludePattern(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    doc: *std.json.ObjectMap,
+    pattern: []const u8,
+) Allocator.Error!void {
+    var parts_iter = std.mem.tokenizeScalar(u8, pattern, '.');
+    var parts = std.ArrayListUnmanaged([]const u8).empty;
+    defer parts.deinit(alloc);
+    while (parts_iter.next()) |part| try parts.append(alloc, part);
+    if (parts.items.len == 0) return;
+
+    try applyExcludeRecursive(borrowed, alloc, doc, parts.items, 0);
+}
+
+fn applyExcludeRecursive(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    doc: *std.json.ObjectMap,
+    parts: []const []const u8,
+    depth: usize,
+) Allocator.Error!void {
+    if (depth >= parts.len) return;
+
+    const part = parts[depth];
+    const is_last = depth == parts.len - 1;
+
+    if (std.mem.eql(u8, part, "*")) {
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer keys.deinit(alloc);
+        var it = doc.iterator();
+        while (it.next()) |entry| try keys.append(alloc, entry.key_ptr.*);
+
+        for (keys.items) |key| {
+            if (is_last) {
+                if (doc.fetchSwapRemove(key)) |entry| {
+                    alloc.free(entry.key);
+                    var removed = entry.value;
+                    freeProjectionValue(borrowed, alloc, &removed);
+                }
+            } else if (doc.getPtr(key)) |value| {
+                try descendExclude(borrowed, alloc, value, parts, depth + 1);
+            }
+        }
+        return;
+    }
+
+    if (is_last) {
+        if (doc.fetchSwapRemove(part)) |entry| {
+            alloc.free(entry.key);
+            var removed = entry.value;
+            freeProjectionValue(borrowed, alloc, &removed);
+        }
+        return;
+    }
+
+    if (doc.getPtr(part)) |value| {
+        try descendExclude(borrowed, alloc, value, parts, depth + 1);
+    }
+}
+
+fn descendExclude(comptime borrowed: bool, alloc: Allocator, value: *std.json.Value, parts: []const []const u8, depth: usize) Allocator.Error!void {
+    switch (value.*) {
+        .object => |*nested| try applyExcludeRecursive(borrowed, alloc, nested, parts, depth),
+        .array => |*arr| {
+            const part = parts[depth];
+            if (parseArrayIndex(part)) |idx| {
+                if (idx >= arr.items.len) return;
+                const is_last = depth == parts.len - 1;
+                if (is_last) {
+                    var removed = arr.orderedRemove(idx);
+                    freeProjectionValue(borrowed, alloc, &removed);
+                    return;
+                }
+                if (arr.items[idx] == .object) try applyExcludeRecursive(borrowed, alloc, &arr.items[idx].object, parts, depth + 1);
+                return;
+            }
+            for (arr.items) |*item| {
+                if (item.* == .object) try applyExcludeRecursive(borrowed, alloc, &item.object, parts, depth);
+            }
+        },
+        else => {},
+    }
+}
+
+fn parseArrayIndex(part: []const u8) ?usize {
+    if (part.len == 0) return null;
+    for (part) |ch| {
+        if (ch < '0' or ch > '9') return null;
+    }
+    return std.fmt.parseInt(usize, part, 10) catch null;
+}
+
+fn ensureObjectValue(
+    comptime borrowed: bool,
+    alloc: Allocator,
+    dst: *std.json.ObjectMap,
+    key: []const u8,
+) !*std.json.ObjectMap {
+    if (dst.getPtr(key)) |existing| {
+        if (existing.* == .object) return &existing.object;
+        freeProjectionValue(borrowed, alloc, existing);
+        existing.* = .{ .object = std.json.ObjectMap.empty };
+        return &existing.object;
+    }
+
+    try putProjectionValue(borrowed, alloc, dst, key, .{ .object = std.json.ObjectMap.empty });
+    return &dst.getPtr(key).?.object;
+}
+
+const owned_json = @import("../../common/owned_json.zig");
+const putOwnedValue = owned_json.put;
+const cloneJsonValue = owned_json.clone;
+const freeJsonValue = owned_json.deinit;
+
+fn cloneProjectionValue(comptime borrowed: bool, a: Allocator, value: std.json.Value) Allocator.Error!std.json.Value {
+    if (!borrowed) return cloneJsonValue(a, value);
+    switch (value) {
+        .object => |object| {
+            var result: std.json.Value = .{ .object = .empty };
+            errdefer freeProjectionValue(true, a, &result);
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| try putCloneProjectionValue(true, a, &result.object, entry.key_ptr.*, entry.value_ptr.*);
+            return result;
+        },
+        .array => |array| {
+            var result: std.json.Value = .{ .array = std.json.Array.init(a) };
+            errdefer freeProjectionValue(true, a, &result);
+            try result.array.ensureTotalCapacity(array.items.len);
+            for (array.items) |item| result.array.appendAssumeCapacity(try cloneProjectionValue(true, a, item));
+            return result;
+        },
+        else => return value,
+    }
+}
+fn freeProjectionValue(comptime borrowed: bool, a: Allocator, value: *std.json.Value) void {
+    if (!borrowed) return freeJsonValue(a, value);
+    switch (value.*) {
+        .object => |*object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                a.free(entry.key_ptr.*);
+                freeProjectionValue(true, a, entry.value_ptr);
+            }
+            object.deinit(a);
+        },
+        .array => |*array| {
+            for (array.items) |*item| freeProjectionValue(true, a, item);
+            array.deinit();
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+fn putCloneProjectionValue(comptime borrowed: bool, a: Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) Allocator.Error!void {
+    var owned = try cloneProjectionValue(borrowed, a, value);
+    errdefer freeProjectionValue(borrowed, a, &owned);
+    try putProjectionValue(borrowed, a, object, key, owned);
+}
+fn putProjectionValue(comptime borrowed: bool, a: Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) Allocator.Error!void {
+    if (!borrowed) return putOwnedValue(a, object, key, value);
+    if (object.getPtr(key)) |existing| {
+        freeProjectionValue(true, a, existing);
+        existing.* = value;
+        return;
+    }
+    const name = try a.dupe(u8, key);
+    errdefer a.free(name);
+    try object.put(a, name, value);
+}
+
+test "document query lookupJson projects nested fields and exclusions" {
+    const alloc = std.testing.allocator;
+
+    const raw =
+        \\{"title":"alpha","author":{"name":"ann","age":42},"tags":[{"name":"db","score":1},{"name":"zig","score":2}],"body":"hello"}
+    ;
+
+    var result = try lookupJson(alloc, raw, .{
+        .fields = &.{ "title", "author.name", "tags.name", "-body" },
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.object.get("title") != null);
+    try std.testing.expect(parsed.value.object.get("body") == null);
+    try std.testing.expectEqualStrings("ann", parsed.value.object.get("author").?.object.get("name").?.string);
+    const tags = parsed.value.object.get("tags").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqualStrings("db", tags[0].object.get("name").?.string);
+}
+
+test "document query lookupJson returns full document when include_all_fields" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"title\":\"alpha\",\"body\":\"hello\"}";
+
+    var result = try lookupJson(alloc, raw, .{});
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualStrings(raw, result.json);
+}
+
+test "document query lookupJson returns no stored fields for an explicit empty projection" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"title\":\"alpha\",\"body\":\"hello\"}";
+
+    var result = try lookupJson(alloc, raw, .{
+        .fields = &.{},
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualStrings("{}", result.json);
+}
+
+test "document query lookupJson supports indexed array paths" {
+    const alloc = std.testing.allocator;
+
+    const raw =
+        \\{"title":"alpha","tags":[{"name":"db","score":1},{"name":"zig","score":2}],"body":"hello"}
+    ;
+
+    var result = try lookupJson(alloc, raw, .{
+        .fields = &.{"tags.1.name"},
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+
+    const tags = parsed.value.object.get("tags").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), tags.len);
+    try std.testing.expectEqualStrings("zig", tags[0].object.get("name").?.string);
+}
+
+test "document query lookupJson supports indexed array exclusions" {
+    const alloc = std.testing.allocator;
+
+    const raw =
+        \\{"title":"alpha","tags":[{"name":"db","score":1},{"name":"zig","score":2}],"body":"hello"}
+    ;
+
+    var result = try lookupJson(alloc, raw, .{
+        .fields = &.{ "tags", "-tags.1.score" },
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    defer parsed.deinit();
+
+    const tags = parsed.value.object.get("tags").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tags.len);
+    try std.testing.expectEqual(@as(i64, 1), tags[0].object.get("score").?.integer);
+    try std.testing.expect(tags[1].object.get("score") == null);
+}
+
+fn projectionViewScenario(a: Allocator) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"body":"large immutable text","nested":{"visible":"keep","private":"omit"},"tags":[{"name":"db","score":1},{"name":"zig","score":2}],"amount":9007199254740993}
+    , .{});
+    defer parsed.deinit();
+    const cases = [_]types.LookupOptions{
+        .{},
+        .{ .fields = &.{ "body", "nested.*", "tags.name", "amount", "-nested.private" }, .include_all_fields = false },
+        .{ .fields = &.{ "tags.1.name", "-body" }, .include_all_fields = false },
+        .{ .fields = &.{ "-nested.private", "-tags.*.score" } },
+        .{ .fields = &.{ "body", "body", "nested", "nested.visible" }, .include_all_fields = false },
+    };
+    for (cases) |options| {
+        var view = try projectLookupView(a, parsed.value, options);
+        defer deinitProjectionView(a, &view);
+        var owned = try projectLookupValue(a, parsed.value, options);
+        defer freeJsonValue(a, &owned);
+        const encoded = try std.json.Stringify.valueAlloc(a, view, .{});
+        defer a.free(encoded);
+        const expected = try std.json.Stringify.valueAlloc(a, owned, .{});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, encoded);
+        if (view.object.get("body")) |body| try std.testing.expect(body.string.ptr == parsed.value.object.get("body").?.string.ptr);
+        try std.testing.expect(parsed.value.object.get("nested").?.object.get("private") != null);
+    }
+}
+test "external lake projection views borrow lexemes and own containers across allocation failures" {
+    try projectionViewScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, projectionViewScenario, .{});
+}

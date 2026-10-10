@@ -141,7 +141,7 @@ test "resident session Metal runtime allocation failures preserve direct and sta
         };
         defer session.deinit();
         const harness = Harness{ .session = &session, .cb = &cb, .inputs = .{ .{ .node_id = x, .value = input_x }, .{ .node_id = pool, .value = input_pool }, .{ .node_id = multiplier, .value = input_multiplier } }, .cotangent = cotangent };
-        try std.testing.checkAllAllocationFailures(a, attempt, .{harness});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, attempt, .{harness});
         try std.testing.expect(!session.base().active_tape);
         try fixture.expectValues(a, &cb, input_x, &.{ 1, 2, 3 }, 0, 0, "OOM original input");
         try fixture.expectValues(a, &cb, input_multiplier, &.{ 4, 5 }, 0, 0, "OOM deferred input");

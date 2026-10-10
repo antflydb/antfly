@@ -15,7 +15,7 @@
 
 //! Embedded inference without a database: `antfly_inference_open`/`close`
 //! plus the `/ai/v1`-mirroring JSON call surface (embed, rerank, chunk,
-//! generate, generate/batch, rewrite, extract, read, transcribe, models,
+//! generate, generate/batch, rewrite, decide, extract, read, transcribe, models,
 //! pull). See `zig/CAPI.md`'s "Inference" and "Inference In Process"
 //! sections and the `Embedded inference without a database` block in
 //! `zig/pkg/antfly-embedded/include/antfly.h`.
@@ -528,6 +528,15 @@ impl Inference {
     pub fn rewrite(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
         self.call_json(request.as_ref(), |h, req, out| unsafe {
             sys::antfly_inference_rewrite_json(h, req, out)
+        })
+    }
+
+    /// Answers named choice, ordinal score, and Boolean questions.
+    /// `POST /decisions`; accepts DecideRequest and returns DecideResponse JSON
+    /// from `specs/openapi/inference/api.yaml`. Models must support typed decisions.
+    pub fn decide(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
+        self.call_json(request.as_ref(), |h, req, out| unsafe {
+            sys::antfly_inference_decide_json(h, req, out)
         })
     }
 

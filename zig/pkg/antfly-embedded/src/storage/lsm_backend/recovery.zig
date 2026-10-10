@@ -1,0 +1,433 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const backend_types = @import("../backend_types.zig");
+const repository_mod = @import("repository.zig");
+const compaction_mod = @import("compaction.zig");
+const runtime_mod = @import("runtime.zig");
+const storage_io = @import("storage_io.zig");
+const platform = @import("antfly_platform");
+
+fn openDebugLogsEnabled() bool {
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+}
+
+pub fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
+    if (@hasDecl(BackendType, "beginOpenPhase")) return backend.beginOpenPhase(phase);
+    return 0;
+}
+
+pub fn finishOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype, start_ns: u64) void {
+    if (@hasDecl(BackendType, "finishOpenPhase")) backend.finishOpenPhase(phase, start_ns);
+}
+
+pub fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, loaded_manifest: bool) void {
+    if (@hasDecl(BackendType, "recordOpenManifestLoaded")) backend.recordOpenManifestLoaded(loaded_manifest);
+}
+
+pub fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
+}
+
+fn cleanupRecoveredRunFiles(comptime BackendType: type, backend: *BackendType, stage: []const u8, before_wal_replay: bool) void {
+    if (!@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) return;
+
+    const phase_start = beginOpenPhase(BackendType, backend, .cleaning_recovered_run_temps);
+    defer finishOpenPhase(BackendType, backend, .cleaning_recovered_run_temps, phase_start);
+
+    const stats = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+        std.log.warn("lsm backend open skipped recovered run cleanup root={?s} stage={s} err={}", .{ backend.root_dir, stage, err });
+        return;
+    };
+    if (@hasDecl(BackendType, "recordRecoveredRunFileCleanup")) backend.recordRecoveredRunFileCleanup(stats, before_wal_replay);
+    if (stats.files_deleted > 0) {
+        std.log.warn(
+            "lsm backend open recovered run cleanup complete root={s} stage={s} files_deleted={d} bytes_deleted={d}",
+            .{ backend.root_dir.?, stage, stats.files_deleted, stats.bytes_deleted },
+        );
+    }
+}
+
+pub fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenSuccess")) backend.finishOpenSuccess();
+}
+
+pub fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
+    if (@hasDecl(BackendType, "finishOpenFailure")) backend.finishOpenFailure();
+}
+
+pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
+    var backend: BackendType = undefined;
+    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    return backend;
+}
+
+pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    if (@hasDecl(BackendType, "initInPlace")) {
+        BackendType.initInPlace(backend, allocator, backend_options);
+    } else {
+        backend.* = BackendType.init(allocator, backend_options);
+    }
+    backend.root_dir = try allocator.dupe(u8, root_dir);
+    const debug_open = openDebugLogsEnabled();
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open begin root={s} read_only={any} create_if_missing={any} wal_enabled={any} storage_provided={any}",
+            .{
+                backend.root_dir.?,
+                options.read_only,
+                options.create_if_missing,
+                backend.options.wal_enabled,
+                backend_options.storage != null,
+            },
+        );
+    }
+
+    {
+        const phase_start = beginOpenPhase(BackendType, backend, .initializing_storage);
+        defer finishOpenPhase(BackendType, backend, .initializing_storage, phase_start);
+        if (backend_options.storage) |storage| {
+            backend.storage = storage;
+        } else {
+            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
+            errdefer std.heap.page_allocator.destroy(owned);
+            owned.* = try storage_io.NativeStorage.initWithPool(
+                std.heap.page_allocator,
+                backend_options.io_runtime,
+                backend_options.native_storage_pool,
+            );
+            backend.storage_owner = owned;
+            backend.storage = owned.storage();
+        }
+    }
+    errdefer cleanup(BackendType, backend, false);
+    errdefer finishOpenFailure(BackendType, backend);
+    if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
+
+    if (@hasDecl(BackendType, "acquireRootLockState")) {
+        try backend.acquireRootLockState(options.create_if_missing);
+    }
+    if (@hasDecl(BackendType, "acquireRootWriterLock")) {
+        try backend.acquireRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "prepareWalOperationLockFile")) {
+        try backend.prepareWalOperationLockFile();
+    }
+
+    cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
+
+    const loaded_manifest = blk: {
+        const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
+        defer finishOpenPhase(BackendType, backend, .opening_manifest, phase_start);
+        var loaded_runs: std.ArrayListUnmanaged(repository_mod.Run) = .empty;
+        defer {
+            for (loaded_runs.items) |*run| run.deinit(allocator);
+            loaded_runs.deinit(allocator);
+        }
+        const loaded = try repository_mod.loadManifestWithRecoveryState(
+            backend.storage.?,
+            allocator,
+            backend.root_dir.?,
+            &backend.manifest_backing,
+            &backend.next_run_id,
+            &loaded_runs,
+            &backend.obsolete_paths,
+            if (@hasField(BackendType, "recovered_manifest")) &backend.recovered_manifest else null,
+        );
+        try compaction_mod.appendOwnedRuns(&backend.runs, allocator, &loaded_runs);
+        break :blk loaded;
+    };
+    recordOpenManifestLoaded(BackendType, backend, loaded_manifest);
+    if (loaded_manifest) {
+        for (0..@import("run_store.zig").count(backend)) |rank| {
+            const run = @import("run_store.zig").at(backend, rank).*;
+            const path = run.path orelse return error.RunStateUnavailable;
+            // Check the manifest bound first so old oversized manifests retain
+            // their precise FileTooBig diagnosis even when the referenced file
+            // has already been removed by an operator.
+            repository_mod.validateManifestRunSize(run.size_bytes) catch |err| {
+                // The caller receives the concrete open error. Keep the
+                // structured rejection diagnostic at warning level so an
+                // expected corruption/size-admission test does not violate the
+                // project's invariant that error logs represent unhandled
+                // failures rather than successfully rejected input.
+                std.log.warn(
+                    "lsm backend open rejected invalid manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            const physical_size = backend.storage.?.fileSize(path) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected unavailable manifest run root={s} run_id={} path={s} manifest_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, err },
+                );
+                return err;
+            };
+            repository_mod.validateManifestRunPhysicalSize(run.size_bytes, physical_size) catch |err| {
+                std.log.warn(
+                    "lsm backend open rejected mismatched manifest run root={s} run_id={} path={s} manifest_bytes={} physical_bytes={} err={}",
+                    .{ backend.root_dir.?, run.id, path, run.size_bytes, physical_size, err },
+                );
+                return err;
+            };
+        }
+    }
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open manifest loaded root={s} loaded={any} runs={d} obsolete_paths={d} next_run_id={d}",
+            .{
+                backend.root_dir.?,
+                loaded_manifest,
+                @import("run_store.zig").count(backend),
+                backend.obsolete_paths.count(),
+                backend.next_run_id,
+            },
+        );
+    }
+    if (!loaded_manifest and options.create_if_missing) {
+        const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
+        defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
+        try repository_mod.ensureOpenDirsWithStorage(backend.storage.?, backend.root_dir.?);
+        // A durable file or manifest below a newly-created root cannot make
+        // the root's own parent entry survive a crash. Publish that structural
+        // boundary once, before any transaction can report full durability.
+        // Existing-manifest opens skip this path and pay no startup fsync.
+        if (backend.options.backend.durability == .full) {
+            try backend.storage.?.syncParentAbsolute(backend.root_dir.?);
+        }
+        if (debug_open) std.log.info("lsm backend open ensured dirs root={s}", .{backend.root_dir.?});
+    }
+    {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+
+        if (@hasDecl(BackendType, "replayWalIntoMutable")) {
+            if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
+            const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
+            defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
+            try backend.replayWalIntoMutable();
+            recordOpenReplayComplete(BackendType, backend);
+            if (debug_open) {
+                std.log.info(
+                    "lsm backend open wal replay done root={s} mutable_entries={d} immutable_memtables={d}",
+                    .{
+                        backend.root_dir.?,
+                        backend.mutable.entryCount(),
+                        if (@hasField(BackendType, "immutable_memtables")) backend.immutable_memtables.items.len else 0,
+                    },
+                );
+            }
+        }
+        const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
+        defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) compaction_mod.sortRuns(backend.runs.items);
+        if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        // Build cold metadata before publishing the opened backend. Subsequent
+        // writes maintain this root incrementally, including before first read.
+        if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
+        if (loaded_manifest and @hasDecl(BackendType, "cleanupOrphanedRunFilesForManifest")) {
+            if (backend.cleanupOrphanedRunFilesForManifest()) |orphan_stats| {
+                if (orphan_stats.cleaned()) {
+                    std.log.warn(
+                        "lsm backend open orphan run cleanup complete root={s} files_deleted={d} bytes_deleted={d}",
+                        .{ backend.root_dir.?, orphan_stats.files_deleted, orphan_stats.bytes_deleted },
+                    );
+                }
+            } else |err| {
+                std.log.warn("lsm backend open skipped orphan run cleanup root={?s} err={}", .{ backend.root_dir, err });
+            }
+        }
+    }
+    cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
+    if (@hasDecl(BackendType, "noteRecoveredWriteMutationLocked") and backend.mutable.entryCount() > 0) {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+        backend.noteRecoveredWriteMutationLocked();
+    } else if (@hasDecl(BackendType, "noteWriteMutationLocked") and backend.mutable.entryCount() > 0) {
+        const locked = runtime_mod.lockBackend(BackendType, backend);
+        defer runtime_mod.unlockBackend(BackendType, backend, locked);
+        backend.noteWriteMutationLocked();
+    }
+    if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
+        backend.refreshMaintenanceDebtHint();
+    }
+    finishOpenSuccess(BackendType, backend);
+    if (debug_open) {
+        std.log.info(
+            "lsm backend open done root={s} runs={d} mutable_entries={d}",
+            .{ backend.root_dir.?, @import("run_store.zig").count(backend), backend.mutable.entryCount() },
+        );
+    }
+}
+
+pub fn close(comptime BackendType: type, backend: *BackendType) void {
+    cleanup(BackendType, backend, true);
+}
+
+pub fn abandon(comptime BackendType: type, backend: *BackendType) void {
+    cleanup(BackendType, backend, false);
+}
+
+fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool) void {
+    if (finalize_deferred and backend.root_dir != null and !backend.options.backend.read_only) {
+        if (@hasDecl(BackendType, "finalizeDeferredStorageWork")) {
+            backend.finalizeDeferredStorageWork() catch |err| {
+                // A canceled close can leave below-threshold writes only in
+                // memory when the WAL is disabled. Keep that failed durability
+                // boundary at error level. With a WAL, committed mutations can
+                // be replayed after a canceled close-time flush.
+                if (err == error.FileNotFound or (err == error.Canceled and backend.options.wal_enabled)) {
+                    std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
+                } else {
+                    std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
+                }
+            };
+        } else if (backend.mutable.entryCount() > 0) {
+            compaction_mod.flushMutable(BackendType, backend) catch |err| {
+                std.log.err("lsm backend close skipped mutable flush root={?s} err={}", .{ backend.root_dir, err });
+            };
+        }
+    }
+    if (@hasDecl(BackendType, "drainRetiredLedgers")) backend.drainRetiredLedgers();
+    if (@hasDecl(BackendType, "drainRetiredMemtables")) backend.drainRetiredMemtables();
+    if (@hasField(BackendType, "mutable_read_snapshot")) {
+        if (backend.mutable_read_snapshot) |state| {
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+    }
+    backend.mutable.deinit(backend.allocator);
+    if (@hasField(BackendType, "immutable_memtables")) {
+        for (backend.immutable_memtables.items) |state| {
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+        backend.immutable_memtables.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "immutable_wal_ranges")) {
+        backend.immutable_wal_ranges.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "retired_immutable_memtables")) {
+        for (backend.retired_immutable_memtables.items) |state| {
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+        backend.retired_immutable_memtables.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "immutable_memtable_pins")) {
+        backend.immutable_memtable_pins.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_pins")) {
+        backend.mutable_snapshot_pins.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "retired_mutable_snapshots")) {
+        for (backend.retired_mutable_snapshots.items) |state| {
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+        backend.retired_mutable_snapshots.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "retired_mutable_snapshot_by_state")) {
+        backend.retired_mutable_snapshot_by_state.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_reader_refs")) {
+        backend.mutable_snapshot_reader_refs.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "mutable_snapshot_reader_ref_by_state")) {
+        backend.mutable_snapshot_reader_ref_by_state.deinit(backend.allocator);
+    }
+    if (@hasDecl(BackendType, "invalidateReadVersion")) backend.invalidateReadVersion();
+    if (@hasDecl(BackendType, "destroyRunMetadata")) backend.destroyRunMetadata();
+    for (0..@import("run_store.zig").count(backend)) |rank| {
+        const run = @import("run_store.zig").at(backend, rank);
+        if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+        if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
+        if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) run.deinit(backend.allocator);
+    }
+    backend.runs.deinit(backend.allocator);
+    if (@hasField(BackendType, "obsolete_paths")) {
+        if (comptime @hasField(@TypeOf(backend.obsolete_paths), "items")) for (backend.obsolete_paths.items) |*obsolete| {
+            obsolete.deinit(backend.allocator);
+        };
+        backend.obsolete_paths.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "obsolete_runs")) {
+        for (backend.obsolete_runs.items) |*runs| {
+            for (runs.items) |*run| {
+                if (@hasDecl(BackendType, "releaseRunVersionRef")) backend.releaseRunVersionRef(run);
+                if (@hasDecl(BackendType, "forgetRunSnapshotRef")) backend.forgetRunSnapshotRef(run);
+                run.deinit(backend.allocator);
+            }
+            runs.deinit(backend.allocator);
+        }
+        backend.obsolete_runs.deinit(backend.allocator);
+    }
+    if (@hasDecl(BackendType, "deinitOutputCleanup")) backend.deinitOutputCleanup();
+    if (@hasField(BackendType, "run_state_cache")) {
+        for (backend.run_state_cache.items) |*cached| cached.deinit(backend.allocator);
+        backend.run_state_cache.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "run_index_cache")) {
+        for (backend.run_index_cache.items) |*cached| cached.deinit(backend.allocator);
+        backend.run_index_cache.deinit(backend.allocator);
+    }
+    if (@hasDecl(BackendType, "deinitRunSources")) backend.deinitRunSources();
+    if (@hasField(BackendType, "local_reader")) backend.local_reader.deinit();
+    if (@hasField(BackendType, "point_reader")) backend.point_reader.deinit();
+    if (@hasField(BackendType, "run_block_cache")) {
+        for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
+        backend.run_block_cache.deinit(backend.allocator);
+        if (@hasField(BackendType, "run_block_cache_bytes")) backend.run_block_cache_bytes = 0;
+    }
+    if (@hasField(BackendType, "run_table_cache")) {
+        for (backend.run_table_cache.items) |*cached| cached.deinit(backend.allocator);
+        backend.run_table_cache.deinit(backend.allocator);
+    }
+    if (@hasField(BackendType, "manifest_backing")) {
+        if (backend.manifest_backing) |raw| backend.allocator.free(raw);
+    }
+    if (@hasField(BackendType, "obsolete_reclaim_after")) {
+        if (backend.obsolete_reclaim_after) |path| backend.allocator.free(path);
+    }
+    if (@hasDecl(BackendType, "releaseRootWriterLock")) {
+        backend.releaseRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "closeWalOperationLockFile")) {
+        backend.closeWalOperationLockFile();
+    }
+    if (@hasDecl(BackendType, "releaseRootLockState")) {
+        backend.releaseRootLockState();
+    }
+    if (@hasField(BackendType, "storage_owner")) {
+        if (backend.storage_owner) |owned| {
+            owned.deinit();
+            std.heap.page_allocator.destroy(owned);
+        }
+    }
+    if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);
+    if (@hasField(BackendType, "bulk_snapshot_accounts")) backend.bulk_snapshot_accounts.deinit(backend.allocator);
+    if (@hasField(BackendType, "retired_memory_head")) {
+        while (backend.retired_memory_head) |state| {
+            backend.retired_memory_head = state.retired_next;
+            state.deinit(backend.allocator);
+            backend.allocator.destroy(state);
+        }
+    }
+    if (@hasDecl(BackendType, "releaseTrackedResourceUsage")) backend.releaseTrackedResourceUsage();
+    backend.* = undefined;
+}

@@ -3589,6 +3589,7 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.ObjectTablePlacementUnsupported => return ctx.status(400).text("object tables do not accept num_shards or replication sources"),
             error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
@@ -4190,6 +4191,7 @@ const ParsedRuntimeIndexSourceReplayStatus = struct {
     published_sequence: ?u64 = null,
     target_sequence: ?u64 = null,
     failed: ?bool = null,
+    producer_complete: ?bool = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -4609,6 +4611,7 @@ fn cloneParsedRuntimeIndexStatus(
             .published_sequence = source.published_sequence orelse 0,
             .target_sequence = source.target_sequence orelse 0,
             .failed = source.failed orelse false,
+            .producer_complete = source.producer_complete orelse false,
         };
         source_count += 1;
     }

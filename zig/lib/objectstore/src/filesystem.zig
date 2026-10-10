@@ -35,6 +35,15 @@ pub const FilesystemClient = struct {
     durable_dirs: durable_directory.Cache = .{},
     next_staging_cleanup_seconds: std.atomic.Value(i64) = .init(0),
 
+    /// Native artifact discovery metadata lives outside framed object files.
+    /// Payload I/O still goes through Client; these paths only authorize the
+    /// local inventory adapter for this exact bucket.
+    pub fn artifactDirectoriesAlloc(self: *FilesystemClient, alloc: Allocator, bucket: []const u8) !struct { objects: []u8, inventory: []u8 } {
+        const objects = try objectRootAlloc(alloc, self.root_dir, bucket);
+        errdefer alloc.free(objects);
+        return .{ .objects = objects, .inventory = try std.fs.path.join(alloc, &.{ self.root_dir, "buckets", bucket, "artifact-inventory" }) };
+    }
+
     pub fn init(alloc: Allocator, root_dir: []const u8) !FilesystemClient {
         const io_impl = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(io_impl);

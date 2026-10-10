@@ -1,0 +1,3524 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Sha256 = @import("antfly_hash").Sha256;
+const coverage_identity = @import("coverage_identity.zig");
+const Allocator = std.mem.Allocator;
+
+pub const user_namespace: u8 = 0x01;
+pub const replay_namespace: u8 = 0x02;
+pub const identity_namespace: u8 = 0x03;
+pub const replay_all_kind: u8 = 0xfe;
+
+pub const primary_kind: u8 = 0x10;
+pub const ttl_kind: u8 = 0x11;
+pub const relational_row_kind: u8 = 0x12;
+/// One reverse ownership record per document/physical relational index.
+pub const relational_index_reverse_kind: u8 = 0x13;
+pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
+pub const relational_columnar_prefix = "\x00\x00__columnar__:";
+pub const relational_columnar_dirty_prefix = relational_columnar_prefix ++ "dirty:";
+pub const relational_columnar_mutation_key = "\x00\x00__columnar__:mutation";
+
+pub fn relationalColumnarDirtyKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
+    const raw = (try decodeStoredDocumentRowKeyAlloc(alloc, row_key)) orelse return error.InvalidInternalUserKey;
+    defer alloc.free(raw);
+    return std.mem.concat(alloc, u8, &.{ relational_columnar_dirty_prefix, raw });
+}
+
+/// Opaque committed mutation identity. The counter and all primary/dirty writes
+/// share one store transaction; aborted identities are never visible to readers.
+pub const ColumnarMutationToken = [8]u8;
+
+pub fn relationalColumnarMutationToken(version: u64) ColumnarMutationToken {
+    var token: ColumnarMutationToken = undefined;
+    std.mem.writeInt(u64, &token, version, .little);
+    return token;
+}
+
+/// Mutation identity plus current packed-row size (zero denotes a tombstone).
+/// Cost metadata shares the primary commit; it needs no primary read or hash.
+pub const ColumnarDirtyRecord = [16]u8;
+pub fn relationalColumnarDirtyRecord(token: ColumnarMutationToken, bytes: usize) ColumnarDirtyRecord {
+    var record: ColumnarDirtyRecord = undefined;
+    @memcpy(record[0..8], &token);
+    std.mem.writeInt(u64, record[8..16], bytes, .little);
+    return record;
+}
+
+pub fn invalidatesRelationalColumns(key: []const u8) bool {
+    // Row-count catalog updates do not alter a layout. Schema publication
+    // writes this key atomically with its catalog and invalidates the epoch.
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema");
+}
+pub const artifact_kind: u8 = 0x20;
+pub const chunk_record_kind: u8 = 0x30;
+pub const derived_embedding_kind: u8 = 0x31;
+pub const graph_edge_record_kind: u8 = 0x32;
+/// Durable document-owned retirement of an exact primary graph relationship.
+pub const graph_retirement_kind: u8 = 0x50;
+pub const asset_state_kind: u8 = 0x33;
+/// Durable document-owned target for an explicitly requested producer rerun.
+pub const asset_reprocess_intent_kind: u8 = 0x52;
+pub const graph_asset_state_kind: u8 = 0x34;
+pub const document_unit_record_kind: u8 = 0x35;
+pub const derived_coverage_kind: u8 = 0x36;
+pub const document_unit_navigation_summary_kind: u8 = 0x37;
+pub const document_unit_navigation_block_kind: u8 = 0x38;
+/// Private reverse ownership index for graph-edge precedence. Records are
+/// grouped by logical edge, then by the source-state that emitted it.
+pub const graph_edge_contender_kind: u8 = 0x39;
+/// Private PDF page-vector staging. Components are encoded independently so
+/// arbitrary document, artifact, embedding, and unit names cannot alias a
+/// user-visible asset-state key or another staging generation.
+pub const pdf_page_embedding_stage_kind: u8 = 0x40;
+/// Attempt-private resolved document units. Document extraction writes these
+/// records only while one source is being prepared, replays them through the
+/// materialization sinks, and removes the whole attempt prefix afterwards.
+/// Keeping the spool in its own kind prevents it from being mistaken for a
+/// user-visible artifact or from participating in artifact source indexes.
+pub const document_extraction_unit_spool_kind: u8 = 0x41;
+/// Store-local typed results produced by consumers of a shared PDF window.
+/// These attempts and their registry must stay outside document ranges: shard
+/// transfer must not copy temporary rows without their recovery metadata.
+pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Companion row of a resolution artifact recording the entity keys its
+/// canonical mentions last promoted (local id -> doc ref). The promoter
+/// diffs it on replay so a re-keyed mention tombstones the previously
+/// promoted document with a merged_into redirect instead of orphaning it.
+pub const promoted_keys_state_kind: u8 = 0x44;
+/// Ordered producer output-set inventory. Kept outside public artifact keys,
+/// but inside the owning document range for snapshot/retained transfer.
+pub const producer_stream_manifest_kind: u8 = 0x45;
+pub const producer_generation_row_kind: u8 = 0x46;
+pub const producer_generation_head_kind: u8 = 0x47;
+pub const producer_generation_state_kind: u8 = 0x48;
+pub const producer_generation_clock_kind: u8 = 0x49;
+/// Extraction output generations must not alias chunk streams with the same
+/// producer name. Their rows contain the extraction's named output directory.
+pub const extraction_stream_manifest_kind: u8 = 0x4a;
+pub const extraction_generation_row_kind: u8 = 0x4b;
+pub const extraction_generation_head_kind: u8 = 0x4c;
+pub const extraction_generation_state_kind: u8 = 0x4d;
+pub const extraction_generation_clock_kind: u8 = 0x4e;
+pub const extraction_generation_name_kind: u8 = 0x4f;
+pub const extraction_generation_ordinal_kind: u8 = 0x50;
+pub const extraction_generation_directory_kind: u8 = 0x51;
+/// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
+/// of document existence and the current enrichment configuration.
+pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
+pub const graph_edge_contender_count_kind: u8 = 0x00;
+pub const graph_edge_contender_record_kind: u8 = 0x01;
+pub const graph_edge_ttl_lifetime_kind: u8 = 0x02;
+pub const graph_edge_ttl_tombstone_kind: u8 = 0x03;
+pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
+pub const derived_coverage_outcome_count_kind: u8 = 0xff;
+
+pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
+pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
+pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
+pub const replay_meta_latest_sequence_kind: u8 = 0x03;
+pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
+/// Latest document-store mutation applied from the local data Raft log. The
+/// value stores term/index and is committed in the same primary batch as the
+/// document effects so restart replay cannot repeat non-idempotent transforms.
+pub const ordered_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
+pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
+pub const asset_artifact_source_index_kind: u8 = 0x21;
+pub const document_child_range_outbox_kind: u8 = 0x22;
+pub const artifact_repair_issue_kind: u8 = 0x23;
+pub const artifact_repair_summary_kind: u8 = 0x24;
+pub const artifact_repair_kind_issue_kind: u8 = 0x25;
+pub const artifact_repair_kind_index_ready_kind: u8 = 0x26;
+pub const artifact_repair_kind_index_progress_kind: u8 = 0x27;
+pub const artifact_repair_summary_ready_kind: u8 = 0x28;
+pub const artifact_repair_summary_progress_kind: u8 = 0x29;
+pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
+pub const managed_index_admission_kind: u8 = 0x2b;
+pub const index_artifact_cleanup_kind: u8 = 0x2c;
+pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
+pub const artifact_repair_completion_kind: u8 = 0x2e;
+/// Private completion marker used to hand resolution artifacts from the
+/// resolver to the DB writer. Keep replay metadata kinds centralized here so
+/// independently-owned protocols cannot silently alias one another.
+pub const resolution_handoff_kind: u8 = 0x2f;
+/// Failure-only indexes that preserve every source sequence associated with a
+/// coalesced repair issue. The sequence index serves synchronous visibility
+/// checks; the issue index supports bounded per-artifact retirement pages.
+pub const enrichment_terminal_failure_sequence_kind: u8 = 0x3a;
+pub const enrichment_terminal_failure_issue_kind: u8 = 0x3b;
+/// Durable incarnation token for one live coalesced terminal enrichment issue.
+pub const enrichment_terminal_failure_generation_kind: u8 = 0x3c;
+pub const enrichment_terminal_failure_generation_counter_kind: u8 = 0x3d;
+/// Latest committed derived-log revision that changed an artifact stream.
+/// The artifact name is length-prefixed so arbitrary user names cannot alias
+/// another replay metadata protocol or one another.
+pub const artifact_source_revision_kind: u8 = 0x3e;
+/// Generation-fenced graph contenders keyed by logical edge rather than by the
+/// artifact state that produced them. The record lives under the edge source's
+/// document prefix so range splits preserve graph ownership. Records are
+/// ordered by source priority and state identity so winner fallback can stop at
+/// the first surviving record.
+pub const graph_global_edge_contender_kind: u8 = 0x3f;
+/// Deadline-first accelerator for graph contribution expiration. The source
+/// contender and lifetime remain document-owned; cleanup validates them under
+/// the primary writer before acting on an index entry.
+pub const graph_edge_expiration_index_prefix = [_]u8{ replay_namespace, 0xff, 0x44 };
+pub const table_storage_settings_key = [_]u8{ replay_namespace, 0xff, 0x40 };
+pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
+    replay_namespace,
+    0xff,
+    enrichment_terminal_failure_generation_counter_kind,
+};
+pub const embedding_artifact_repair_issue_kind: u8 = artifact_repair_issue_kind;
+pub const identity_doc_to_ordinal_kind: u8 = 0x01;
+pub const identity_ordinal_to_doc_kind: u8 = 0x02;
+pub const identity_ordinal_state_kind: u8 = 0x03;
+pub const identity_canonical_to_ordinal_kind: u8 = 0x04;
+pub const identity_visibility_chunk_kind: u8 = 0x05;
+pub const identity_visibility_deleted_chunk_kind: u8 = 0x06;
+pub const identity_namespace_key = [_]u8{ identity_namespace, 0xff, 0x00 };
+pub const identity_next_ordinal_key = [_]u8{ identity_namespace, 0xff, 0x01 };
+pub const identity_visibility_summary_key = [_]u8{ identity_namespace, 0xff, 0x02 };
+pub const identity_visibility_manifest_key = [_]u8{ identity_namespace, 0xff, 0x03 };
+
+pub fn isInternalMetadataKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    return key[0] == replay_namespace or key[0] == identity_namespace;
+}
+
+pub fn isInternalUserKey(key: []const u8) bool {
+    return key.len > 0 and key[0] == user_namespace;
+}
+
+pub fn identityVisibilityChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
+}
+
+pub fn identityVisibilityDeletedChunkKey(chunk_id: u32) [6]u8 {
+    var key: [6]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_visibility_deleted_chunk_kind;
+    std.mem.writeInt(u32, key[2..6], chunk_id, .big);
+    return key;
+}
+
+pub fn parseIdentityVisibilityDeletedChunkKey(key: []const u8) ?u32 {
+    if (key.len != 6) return null;
+    if (key[0] != identity_namespace or key[1] != identity_visibility_deleted_chunk_kind) return null;
+    return std.mem.readInt(u32, key[2..6], .big);
+}
+
+pub fn encodedBodyLen(bytes: []const u8) usize {
+    var extra: usize = 0;
+    for (bytes) |b| {
+        if (b == 0) extra += 1;
+    }
+    return bytes.len + extra;
+}
+
+pub fn encodedComponentLen(bytes: []const u8) usize {
+    return encodedBodyLen(bytes) + 2;
+}
+
+pub fn encodeBody(out: []u8, bytes: []const u8) usize {
+    var pos: usize = 0;
+    for (bytes) |b| {
+        if (b == 0) {
+            out[pos] = 0;
+            out[pos + 1] = 0xff;
+            pos += 2;
+        } else {
+            out[pos] = b;
+            pos += 1;
+        }
+    }
+    return pos;
+}
+
+pub fn encodeComponent(out: []u8, bytes: []const u8) usize {
+    const pos = encodeBody(out, bytes);
+    out[pos] = 0;
+    out[pos + 1] = 0;
+    return pos + 2;
+}
+
+pub fn appendEncodedComponent(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, bytes: []const u8) !void {
+    const start = list.items.len;
+    try list.resize(alloc, start + encodedComponentLen(bytes));
+    _ = encodeComponent(list.items[start..], bytes);
+}
+
+pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i + 1 < key.len) : (i += 1) {
+        if (key[i] != 0) continue;
+        if (key[i + 1] == 0) return i;
+        if (key[i + 1] == 0xff) {
+            i += 1;
+            continue;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Exclusive cut after one document's complete physical key family. The
+/// terminator ends in zero, so incrementing its final byte cannot overflow or
+/// skip a logical key extending this one (including embedded NUL/0xff bytes).
+/// `key` must not alias `out`; callers can reuse the buffer across cursor seeks.
+pub fn documentPrefixSuccessor(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) ![]const u8 {
+    if (key.len == 0 or key[0] != user_namespace) return error.InvalidInternalUserKey;
+    const end = (findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey) + 2;
+    try out.resize(alloc, end);
+    @memcpy(out.items, key[0..end]);
+    out.items[end - 1] = 1;
+    return out.items;
+}
+
+pub fn decodeBodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
+    var out = try alloc.alloc(u8, maxDecodedLen(body));
+    errdefer alloc.free(out);
+
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    while (in_pos < body.len) {
+        const b = body[in_pos];
+        if (b != 0) {
+            out[out_pos] = b;
+            in_pos += 1;
+            out_pos += 1;
+            continue;
+        }
+
+        if (in_pos + 1 >= body.len or body[in_pos + 1] != 0xff) return error.InvalidInternalUserKey;
+        out[out_pos] = 0;
+        in_pos += 2;
+        out_pos += 1;
+    }
+
+    return try alloc.realloc(out, out_pos);
+}
+
+pub fn decodeBodyView(body: []const u8) !?[]const u8 {
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        if (body[i] != 0) continue;
+        if (i + 1 >= body.len or body[i + 1] != 0xff) return error.InvalidInternalUserKey;
+        return null;
+    }
+    return body;
+}
+
+pub fn decodeBodyIntoList(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    body: []const u8,
+) ![]const u8 {
+    out.clearRetainingCapacity();
+    try out.resize(alloc, maxDecodedLen(body));
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    while (in_pos < body.len) {
+        const byte = body[in_pos];
+        if (byte != 0) {
+            out.items[out_pos] = byte;
+            in_pos += 1;
+            out_pos += 1;
+            continue;
+        }
+        if (in_pos + 1 >= body.len or body[in_pos + 1] != 0xff)
+            return error.InvalidInternalUserKey;
+        out.items[out_pos] = 0;
+        in_pos += 2;
+        out_pos += 1;
+    }
+    out.shrinkRetainingCapacity(out_pos);
+    return out.items;
+}
+
+fn maxDecodedLen(body: []const u8) usize {
+    return body.len;
+}
+
+pub fn appendDocumentPrefix(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, doc_key: []const u8) !void {
+    try list.append(alloc, user_namespace);
+    try appendEncodedComponent(list, alloc, doc_key);
+}
+
+pub fn appendDocumentRangeLower(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, prefix: []const u8) !void {
+    try list.append(alloc, user_namespace);
+    const start = list.items.len;
+    try list.resize(alloc, start + encodedBodyLen(prefix));
+    _ = encodeBody(list.items[start..], prefix);
+}
+
+pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = primary_kind;
+    return key;
+}
+
+pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
+    key[0] = user_namespace;
+    const pos = 1 + encodeComponent(key[1..], doc_key);
+    key[pos] = relational_row_kind;
+    return key;
+}
+
+pub fn ttlKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, ttl_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExactPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentRangeLowerAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentRangeLower(&list, alloc, prefix);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentRangeUpperAlloc(alloc: Allocator, prefix: []const u8) !?[]u8 {
+    const lower = try documentRangeLowerAlloc(alloc, prefix);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+pub fn artifactRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, asset_state_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, pdf_page_embedding_stage_kind);
+    try appendEncodedComponent(&list, alloc, page_artifact_name);
+    try appendEncodedComponent(&list, alloc, embedding_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
+    unit_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageAttemptRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name, attempt_id);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, unit_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn pdfPageEmbeddingStageAttemptRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    page_artifact_name: []const u8,
+    embedding_name: []const u8,
+    attempt_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const root = try pdfPageEmbeddingStageRootPrefixAlloc(alloc, doc_key, page_artifact_name, embedding_name);
+    defer alloc.free(root);
+    try list.appendSlice(alloc, root);
+    try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_extraction_unit_spool_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentExtractionUnitSpoolRootPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    attempt_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(artifact_root);
+    try list.appendSlice(alloc, artifact_root);
+    try appendEncodedComponent(&list, alloc, attempt_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &.{ replay_namespace, 0xff, shared_pdf_consumer_kind });
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn sharedPdfConsumerAttemptKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ &shared_pdf_consumer_attempt_prefix, doc_key });
+}
+
+pub fn sharedPdfConsumerAttemptDocumentKey(key: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, key, &shared_pdf_consumer_attempt_prefix))
+        return error.InvalidSharedPdfAttemptKey;
+    return key[shared_pdf_consumer_attempt_prefix.len..];
+}
+
+pub fn documentExtractionUnitSpoolKeyAlloc(
+    alloc: Allocator,
+    root: []const u8,
+    unit_index: u64,
+) ![]u8 {
+    var key = try alloc.alloc(u8, root.len + @sizeOf(u64));
+    @memcpy(key[0..root.len], root);
+    std.mem.writeInt(u64, key[root.len..][0..@sizeOf(u64)], unit_index, .big);
+    return key;
+}
+
+pub fn graphAssetStateRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_asset_state_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphAssetStateIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_asset_state_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Restore-only ownership segments are deterministic children of the logical
+/// graph state key. Keeping them below the document prefix preserves split,
+/// backup cleanup, and index-retirement ownership without introducing a
+/// second routing identity.
+pub fn graphAssetStateSegmentKeyAlloc(alloc: Allocator, state_key: []const u8, segment_index: u32) ![]u8 {
+    if (!isGraphAssetStateRootKey(state_key)) return error.InvalidInternalUserKey;
+    const out = try alloc.alloc(u8, state_key.len + 1 + @sizeOf(u32));
+    @memcpy(out[0..state_key.len], state_key);
+    out[state_key.len] = 0xff;
+    std.mem.writeInt(u32, out[state_key.len + 1 ..][0..4], segment_index, .big);
+    return out;
+}
+
+pub fn graphAssetStateSegmentPrefixAlloc(alloc: Allocator, state_key: []const u8) ![]u8 {
+    if (!isGraphAssetStateRootKey(state_key)) return error.InvalidInternalUserKey;
+    const out = try alloc.alloc(u8, state_key.len + 1);
+    @memcpy(out[0..state_key.len], state_key);
+    out[state_key.len] = 0xff;
+    return out;
+}
+
+pub fn graphEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphGlobalEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderCountKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_count_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderEdgePrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_record_kind);
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_key: []const u8,
+    state_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_record_kind);
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    var state_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(state_key, &state_digest, .{});
+    try appendEncodedComponent(&list, alloc, &state_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Durable source-specific lifetime survives a paged contender rebuild. It
+/// remains under the owning document prefix for split, merge, and backup.
+pub fn graphEdgeTtlLifetimeKeyAlloc(
+    alloc: Allocator,
+    edge_key: []const u8,
+    index_name: []const u8,
+    generation: u64,
+    state_key: []const u8,
+) ![]u8 {
+    if (!isGraphEdgeArtifactKey(edge_key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(edge_key, 1) orelse return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, edge_key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_ttl_lifetime_kind);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .big);
+    try list.appendSlice(alloc, &generation_buf);
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    var state_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(state_key, &state_digest, .{});
+    try appendEncodedComponent(&list, alloc, &state_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// An expired source revision stays suppressed while its producer asset is
+/// unchanged. Like lifetime rows, tombstones follow their owning document
+/// through backup and range movement.
+pub fn graphEdgeTtlTombstoneKeyAlloc(
+    alloc: Allocator,
+    edge_key: []const u8,
+    index_name: []const u8,
+    generation: u64,
+    state_key: []const u8,
+) ![]u8 {
+    const lifetime = try graphEdgeTtlLifetimeKeyAlloc(alloc, edge_key, index_name, generation, state_key);
+    errdefer alloc.free(lifetime);
+    const doc_term = findComponentTerminator(lifetime, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(lifetime, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    lifetime[index_term + 2] = graph_edge_ttl_tombstone_kind;
+    return lifetime;
+}
+
+/// Synthetic owner identity for explicit graph writes on a sourced graph
+/// index. It uses the existing document-local graph-state namespace so split,
+/// merge, and backup carry the same stable contributor identity.
+pub const graph_direct_state_name = "\x00direct";
+
+pub fn graphDirectStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_asset_state_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, graph_direct_state_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphGlobalEdgeContenderIndexPrefixAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+) ![]u8 {
+    // Compatibility cleanup prefix for contender records written by prerelease
+    // builds. New contender records live in the owning document keyspace and
+    // are removed by the graph-artifact cleanup scan.
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &.{ replay_namespace, 0xff, graph_global_edge_contender_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphGlobalEdgeContenderEdgePrefixAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    generation: u64,
+    edge_key: []const u8,
+) ![]u8 {
+    if (!isGraphEdgeArtifactKey(edge_key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(edge_key, 1) orelse return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, edge_key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .big);
+    try list.appendSlice(alloc, &generation_buf);
+    var edge_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphGlobalEdgeContenderKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    generation: u64,
+    edge_key: []const u8,
+    source_priority: usize,
+    state_key: []const u8,
+) ![]u8 {
+    if (source_priority > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const edge_prefix = try graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, generation, edge_key);
+    defer alloc.free(edge_prefix);
+    try list.appendSlice(alloc, edge_prefix);
+    var priority_buf: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &priority_buf, @intCast(source_priority), .big);
+    try list.appendSlice(alloc, &priority_buf);
+    try appendEncodedComponent(&list, alloc, state_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn isGraphGlobalEdgeContenderKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_global_edge_contender_kind) return false;
+    pos += 1;
+    const index_term = findComponentTerminator(key, pos) orelse return false;
+    pos = index_term + 2;
+    if (key.len - pos < @sizeOf(u64)) return false;
+    pos += @sizeOf(u64);
+    const edge_term = findComponentTerminator(key, pos) orelse return false;
+    pos = edge_term + 2;
+    if (key.len - pos < @sizeOf(u32)) return false;
+    pos += @sizeOf(u32);
+    const state_term = findComponentTerminator(key, pos) orelse return false;
+    return state_term + 2 == key.len;
+}
+
+pub fn matchesGraphGlobalEdgeContenderIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphGlobalEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    return componentEquals(key, doc_term + 2 + 1, index_name);
+}
+
+/// Move an authenticated contender into a receiver's physical incarnation.
+/// Logical edge/state hashes remain unchanged; only the fenced generation is
+/// owner-local. Tombstones use this same operation as live records.
+pub fn rebindGraphGlobalEdgeContenderKeyAlloc(alloc: Allocator, key: []const u8, source_generation: u64, receiver_generation: u64) ![]u8 {
+    if (!isGraphGlobalEdgeContenderKey(key) or source_generation == 0 or receiver_generation == 0)
+        return error.InvalidGraphEdgeContender;
+    const doc_end = (findComponentTerminator(key, 1) orelse unreachable) + 2;
+    const generation_offset = (findComponentTerminator(key, doc_end + 1) orelse unreachable) + 2;
+    if (std.mem.readInt(u64, key[generation_offset..][0..8], .big) != source_generation)
+        return error.GraphGenerationMismatch;
+    const rebound = try alloc.dupe(u8, key);
+    std.mem.writeInt(u64, rebound[generation_offset..][0..8], receiver_generation, .big);
+    return rebound;
+}
+
+pub fn artifactTypePrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_type: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, artifact_type);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactNamedPrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_type: []const u8, artifact_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, artifact_type);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
+    return coverage_identity.fromHashBits(std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json));
+}
+
+/// Returns a versioned fingerprint of the fields that define generated output.
+/// Object order, credentials, rate limits, and top-level execution tuning are
+/// intentionally ignored.
+pub fn derivedCoverageConfigFingerprint(alloc: Allocator, config_json: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed.deinit();
+
+    var hasher = std.hash.Wyhash.init(0x6472_636f_7665_7232);
+    hasher.update("antfly-derived-coverage-config-v2\x00");
+    try hashCanonicalJsonValue(alloc, &hasher, parsed.value, .root);
+    return hasher.final();
+}
+
+const CoverageFingerprintContext = enum {
+    root,
+    embedder,
+    other,
+};
+
+fn hashCanonicalJsonValue(
+    alloc: Allocator,
+    hasher: *std.hash.Wyhash,
+    value: std.json.Value,
+    context: CoverageFingerprintContext,
+) !void {
+    switch (value) {
+        .null => hasher.update("n"),
+        .bool => |flag| hasher.update(if (flag) "b1" else "b0"),
+        .integer => |number| {
+            hasher.update("i");
+            var buf: [32]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .float => |number| {
+            hasher.update("f");
+            var buf: [64]u8 = undefined;
+            hashLengthPrefixed(hasher, std.fmt.bufPrint(&buf, "{d}", .{number}) catch unreachable);
+        },
+        .number_string => |number| {
+            hasher.update("r");
+            hashLengthPrefixed(hasher, number);
+        },
+        .string => |string| {
+            hasher.update("s");
+            hashLengthPrefixed(hasher, string);
+        },
+        .array => |array| {
+            hasher.update("a");
+            hashUsize(hasher, array.items.len);
+            for (array.items) |item| try hashCanonicalJsonValue(alloc, hasher, item, .other);
+        },
+        .object => |object| {
+            var keys = try alloc.alloc([]const u8, object.count());
+            defer alloc.free(keys);
+            var key_count: usize = 0;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                if (!derivedCoverageConfigKeyIsSemantic(context, entry.key_ptr.*)) continue;
+                keys[key_count] = entry.key_ptr.*;
+                key_count += 1;
+            }
+            std.mem.sort([]const u8, keys[0..key_count], {}, struct {
+                fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.lessThan);
+
+            hasher.update("o");
+            hashUsize(hasher, key_count);
+            for (keys[0..key_count]) |key| {
+                hashLengthPrefixed(hasher, key);
+                const child_context: CoverageFingerprintContext = if (context == .root and std.mem.eql(u8, key, "embedder")) .embedder else .other;
+                try hashCanonicalJsonValue(alloc, hasher, object.get(key).?, child_context);
+            }
+        },
+    }
+}
+
+fn derivedCoverageConfigKeyIsSemantic(context: CoverageFingerprintContext, key: []const u8) bool {
+    if (context == .root and std.mem.eql(u8, key, "execution")) return false;
+    if (context != .embedder) return true;
+    return !std.mem.eql(u8, key, "api_key") and !std.mem.eql(u8, key, "requests_per_minute") and !std.mem.eql(u8, key, "burst") and !std.mem.eql(u8, key, "rate_limit");
+}
+
+fn hashLengthPrefixed(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    hashUsize(hasher, bytes.len);
+    hasher.update(bytes);
+}
+
+fn hashUsize(hasher: *std.hash.Wyhash, value: usize) void {
+    var buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &buf, @intCast(value), .little);
+    hasher.update(&buf);
+}
+
+pub fn derivedCoverageGenerationForConfig(coverage_generation: u64, config_json: []const u8) u64 {
+    if (coverage_generation != 0) return coverage_generation;
+    return derivedCoverageGeneration(config_json);
+}
+
+test "derived coverage config fingerprint is semantic and execution independent" {
+    const alloc = std.testing.allocator;
+    const first = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"field\":\"body\",\"dims\":384,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"},\"embedder\":{\"model\":\"clipclap\",\"api_key\":\"first\",\"requests_per_minute\":10},\"execution\":{\"embedding\":{\"batch_items\":16}}}",
+    );
+    const reordered = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\"},\"execution\":{\"embedding\":{\"batch_items\":1024}},\"embedder\":{\"requests_per_minute\":1000,\"api_key\":\"rotated\",\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const changed = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"content\",\"kind\":\"dense_embedding\"},\"dims\":384,\"field\":\"body\"}",
+    );
+    const semantic_burst = try derivedCoverageConfigFingerprint(
+        alloc,
+        "{\"generator\":{\"source_field\":\"body\",\"kind\":\"dense_embedding\",\"burst\":2},\"embedder\":{\"model\":\"clipclap\"},\"dims\":384,\"field\":\"body\"}",
+    );
+
+    try std.testing.expectEqual(first, reordered);
+    const limited = try derivedCoverageConfigFingerprint(alloc,
+        \\{"generator":{"source_field":"body","kind":"dense_embedding"},"embedder":{"model":"clipclap","rate_limit":{"tokens_per_minute":60000,"max_concurrency":2}},"dims":384,"field":"body"}
+    );
+    try std.testing.expectEqual(first, limited);
+    try std.testing.expect(first != changed);
+    try std.testing.expect(first != semantic_burst);
+}
+
+pub fn derivedCoverageOutcomePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeGenerationPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeMarkerPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try list.append(alloc, derived_coverage_outcome_marker_kind);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeDocKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    generation: u64,
+    key: []const u8,
+) ![]u8 {
+    const prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
+    defer alloc.free(prefix);
+    if (!std.mem.startsWith(u8, key, prefix)) return error.InvalidDerivedCoverageOutcomeKey;
+    const component_start = prefix.len;
+    const component_end = findComponentTerminator(key, component_start) orelse
+        return error.InvalidDerivedCoverageOutcomeKey;
+    if (component_end + 2 != key.len) return error.InvalidDerivedCoverageOutcomeKey;
+    return decodeBodyAlloc(alloc, key[component_start..component_end]) catch
+        return error.InvalidDerivedCoverageOutcomeKey;
+}
+
+pub fn derivedCoverageOutcomeCountKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try list.append(alloc, derived_coverage_outcome_count_kind);
+    try appendEncodedComponent(&list, alloc, outcome);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn encodeDerivedCoverageOutcomeCount(out: *[8]u8, count: u64) []const u8 {
+    std.mem.writeInt(u64, out, count, .little);
+    return out[0..];
+}
+
+pub fn decodeDerivedCoverageOutcomeCount(raw: []const u8) !u64 {
+    if (raw.len != 8) return error.InvalidDerivedCoverageOutcomeCount;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+pub fn assetArtifactSourceIndexRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetArtifactSourceIndexPrefixAlloc(alloc: Allocator, source_artifact: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    try appendEncodedComponent(&list, alloc, source_artifact);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn assetArtifactSourceIndexKeyAlloc(alloc: Allocator, source_artifact: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, asset_artifact_source_index_kind });
+    try appendEncodedComponent(&list, alloc, source_artifact);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentChildRangeOutboxRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, document_child_range_outbox_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentChildRangeOutboxKeyAlloc(alloc: Allocator, sequence: u64, ordinal: u32) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, document_child_range_outbox_kind });
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    const ordinal_be = std.mem.nativeToBig(u32, ordinal);
+    try list.appendSlice(alloc, std.mem.asBytes(&ordinal_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind });
+}
+
+pub fn enrichmentTerminalFailureSequencePrefixAlloc(alloc: Allocator, sequence: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind });
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureSequenceKeyAlloc(alloc: Allocator, sequence: u64, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const prefix = try enrichmentTerminalFailureSequencePrefixAlloc(alloc, sequence);
+    defer alloc.free(prefix);
+    try list.appendSlice(alloc, prefix);
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureSequence(key: []const u8) !u64 {
+    const prefix = [_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_sequence_kind };
+    if (!std.mem.startsWith(u8, key, &prefix) or key.len < prefix.len + @sizeOf(u64) + 2)
+        return error.InvalidInternalUserKey;
+    return std.mem.bigToNative(u64, std.mem.bytesToValue(u64, key[prefix.len..][0..@sizeOf(u64)]));
+}
+
+pub fn enrichmentTerminalFailureIssuePrefixAlloc(alloc: Allocator, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_issue_kind });
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureIssueKeyAlloc(alloc: Allocator, issue_key: []const u8, sequence: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    const prefix = try enrichmentTerminalFailureIssuePrefixAlloc(alloc, issue_key);
+    defer alloc.free(prefix);
+    try list.appendSlice(alloc, prefix);
+    const sequence_be = std.mem.nativeToBig(u64, sequence);
+    try list.appendSlice(alloc, std.mem.asBytes(&sequence_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn enrichmentTerminalFailureGenerationKeyAlloc(alloc: Allocator, issue_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, enrichment_terminal_failure_generation_kind });
+    try appendEncodedComponent(&list, alloc, issue_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn managedIndexAdmissionKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, managed_index_admission_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn managedIndexAdmissionRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, managed_index_admission_kind });
+}
+
+pub fn managedIndexAdmissionNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, managed_index_admission_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupKeyAlloc(alloc: Allocator, index_name: []const u8, coverage_generation: u64) ![]u8 {
+    if (coverage_generation == 0) return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    const generation_be = std.mem.nativeToBig(u64, coverage_generation);
+    try list.appendSlice(alloc, std.mem.asBytes(&generation_be));
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try alloc.dupe(u8, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+}
+
+pub fn indexArtifactCleanupIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn indexArtifactCleanupNameAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_start = prefix.len;
+    const name_end = findComponentTerminator(key, name_start) orelse return error.InvalidInternalUserKey;
+    if (name_end + 2 + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    return try decodeBodyAlloc(alloc, key[name_start..name_end]);
+}
+
+pub fn indexArtifactCleanupCoverageGeneration(key: []const u8) !u64 {
+    const prefix = [_]u8{ replay_namespace, 0xff, index_artifact_cleanup_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+    const name_end = findComponentTerminator(key, prefix.len) orelse return error.InvalidInternalUserKey;
+    const generation_start = name_end + 2;
+    if (generation_start + @sizeOf(u64) != key.len) return error.InvalidInternalUserKey;
+    const generation = std.mem.bigToNative(u64, std.mem.bytesToValue(u64, key[generation_start..][0..@sizeOf(u64)]));
+    if (generation == 0) return error.InvalidInternalUserKey;
+    return generation;
+}
+
+pub fn artifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    repair_artifact_kind: []const u8,
+    issue_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, issue_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub const ArtifactRepairIssueKeyParts = struct {
+    index_name: []u8,
+    repair_artifact_kind: []u8,
+    issue_id: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.repair_artifact_kind);
+        alloc.free(self.issue_id);
+        self.* = undefined;
+    }
+};
+
+/// Decode the authoritative identity embedded in a primary repair-issue key.
+/// Cleanup uses this when the value is malformed, so callers never have to
+/// trust corrupt payload fields to locate secondary or completion metadata.
+pub fn artifactRepairIssueKeyPartsAlloc(
+    alloc: Allocator,
+    key: []const u8,
+) !ArtifactRepairIssueKeyParts {
+    const prefix = [_]u8{ replay_namespace, 0xff, artifact_repair_issue_kind };
+    if (!std.mem.startsWith(u8, key, &prefix)) return error.InvalidInternalUserKey;
+
+    var pos = prefix.len;
+    const index_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const index_name = try decodeBodyAlloc(alloc, key[pos..index_end]);
+    errdefer alloc.free(index_name);
+
+    pos = index_end + 2;
+    const kind_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    const repair_artifact_kind = try decodeBodyAlloc(alloc, key[pos..kind_end]);
+    errdefer alloc.free(repair_artifact_kind);
+
+    pos = kind_end + 2;
+    const issue_end = findComponentTerminator(key, pos) orelse return error.InvalidInternalUserKey;
+    if (issue_end + 2 != key.len) return error.InvalidInternalUserKey;
+    const issue_id = try decodeBodyAlloc(alloc, key[pos..issue_end]);
+    errdefer alloc.free(issue_id);
+
+    return .{
+        .index_name = index_name,
+        .repair_artifact_kind = repair_artifact_kind,
+        .issue_id = issue_id,
+    };
+}
+
+/// Durable single-flight fence for producer repair work. Repair issues remain
+/// indexed per consumer, while this key is canonical per physical artifact so
+/// a successful regeneration is never repeated for sibling consumer records,
+/// later cursor pages, or after restart.
+pub fn artifactRepairCompletionKeyAlloc(
+    alloc: Allocator,
+    repair_artifact_kind: []const u8,
+    issue_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_completion_kind });
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, issue_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueKindRootPrefixAlloc(alloc: Allocator, repair_artifact_kind: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_issue_kind });
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueKindIndexPrefixAlloc(
+    alloc: Allocator,
+    repair_artifact_kind: []const u8,
+    index_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_issue_kind });
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairIssueKindKeyAlloc(
+    alloc: Allocator,
+    repair_artifact_kind: []const u8,
+    index_name: []const u8,
+    issue_id: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_issue_kind });
+    try appendEncodedComponent(&list, alloc, repair_artifact_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, issue_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairKindIndexReadyKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_index_ready_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairKindIndexProgressKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_kind_index_progress_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryReadyKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_ready_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryProgressKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_progress_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryRootKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryIndexKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Exact durable repair-debt counter for one configured artifact source of an
+/// index. The extra encoded component keeps this in the existing summary
+/// namespace so publication/rebuild invalidation remains atomic with the
+/// root and per-index counters.
+pub fn artifactRepairSummarySourceKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryRebuildRootKeyAlloc(alloc: Allocator) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_rebuild_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryRebuildIndexKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_rebuild_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryRebuildSourceKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_rebuild_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueRootPrefixAlloc(alloc: Allocator) ![]u8 {
+    return try artifactRepairIssueRootPrefixAlloc(alloc);
+}
+
+pub fn embeddingArtifactRepairIssueIndexPrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    return try artifactRepairIssueIndexPrefixAlloc(alloc, index_name);
+}
+
+pub fn chunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, "chunk");
+    try appendEncodedComponent(&list, alloc, artifact_name);
+
+    try list.append(alloc, chunk_record_kind);
+    const be = std.mem.nativeToBig(u32, chunk_id);
+    try list.appendSlice(alloc, std.mem.asBytes(&be));
+
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentUnitChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, unit_id: []const u8, chunk_id: u32) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, "chunk");
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    try list.append(alloc, document_unit_record_kind);
+    try appendEncodedComponent(&list, alloc, unit_id);
+
+    const be = std.mem.nativeToBig(u32, chunk_id);
+    try list.append(alloc, chunk_record_kind);
+    try list.appendSlice(alloc, std.mem.asBytes(&be));
+
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn documentUnitArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, unit_id: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, "asset");
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    try list.append(alloc, document_unit_record_kind);
+    try appendEncodedComponent(&list, alloc, unit_id);
+
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn embeddingArtifactKeyForDocumentAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return artifactNamedPrefixAlloc(alloc, doc_key, "embedding", artifact_name);
+}
+
+/// Resolution artifacts record the entity-resolution decisions for a source
+/// document. They are stored like asset artifacts but under the "resolution"
+/// artifact type so they stay distinct from extractor-produced asset artifacts:
+/// [0x01][doc][0x00 0x00][0x20]["resolution"][0x00 0x00][name][0x00 0x00]
+pub fn resolutionArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return artifactNamedPrefixAlloc(alloc, doc_key, "resolution", artifact_name);
+}
+
+pub fn derivedEmbeddingArtifactKeyAlloc(alloc: Allocator, base_internal_key: []const u8, artifact_name: []const u8) ![]u8 {
+    if (!isInternalUserKey(base_internal_key)) return error.InvalidInternalUserKey;
+
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, base_internal_key);
+    try list.append(alloc, derived_embedding_kind);
+    const start = list.items.len;
+    try list.resize(alloc, start + encodedComponentLen(artifact_name));
+    _ = encodeComponent(list.items[start..], artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedEmbeddingArtifactPrefixAlloc(alloc: Allocator, base_internal_key: []const u8, artifact_name: []const u8) ![]u8 {
+    return derivedEmbeddingArtifactKeyAlloc(alloc, base_internal_key, artifact_name);
+}
+
+pub fn graphArtifactIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    return artifactNamedPrefixAlloc(alloc, doc_key, "graph", index_name);
+}
+
+pub fn graphEdgeArtifactPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, artifact_kind);
+    try appendEncodedComponent(&list, alloc, "graph");
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_record_kind);
+    if (edge_type.len > 0) try appendEncodedComponent(&list, alloc, edge_type);
+
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeArtifactKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+    target_doc_key: []const u8,
+) ![]u8 {
+    const total_len = 1 +
+        encodedComponentLen(doc_key) +
+        1 +
+        encodedComponentLen("graph") +
+        encodedComponentLen(index_name) +
+        1 +
+        encodedComponentLen(edge_type) +
+        encodedComponentLen(target_doc_key);
+    const out = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(out);
+
+    var pos: usize = 0;
+    out[pos] = user_namespace;
+    pos += 1;
+    pos += encodeComponent(out[pos..], doc_key);
+    out[pos] = artifact_kind;
+    pos += 1;
+    pos += encodeComponent(out[pos..], "graph");
+    pos += encodeComponent(out[pos..], index_name);
+    out[pos] = graph_edge_record_kind;
+    pos += 1;
+    pos += encodeComponent(out[pos..], edge_type);
+    pos += encodeComponent(out[pos..], target_doc_key);
+    std.debug.assert(pos == out.len);
+    return out;
+}
+
+/// Versioned relationship identity extension. Empty IDs retain the original
+/// tuple key. Ownership and logical endpoints are independent for fact edges.
+pub const GraphRelationshipSuffix = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
+    logical_source: []const u8 = "",
+};
+
+pub fn appendGraphRelationshipSuffix(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, identity: GraphRelationshipSuffix) !void {
+    if (identity.edge_id.len == 0 and identity.owner_document.len == 0 and identity.logical_source.len == 0) return;
+    if (identity.edge_id.len == 0) return error.InvalidGraphEdges;
+    try list.append(alloc, 1); // relationship key extension version
+    try appendEncodedComponent(list, alloc, identity.edge_id);
+    try appendEncodedComponent(list, alloc, identity.owner_document);
+    try appendEncodedComponent(list, alloc, identity.logical_source);
+}
+
+/// Components are encoded, borrowed slices; callers decode only after budget
+/// admission. Reject unknown versions and trailing bytes instead of truncating.
+pub fn parseGraphRelationshipSuffix(key: []const u8, start: usize) ?GraphRelationshipSuffix {
+    if (start == key.len) return .{};
+    if (start > key.len) return null;
+    const legacy_end = findComponentTerminator(key, start) orelse return null;
+    if (legacy_end + 2 == key.len) return .{ .logical_source = key[start..legacy_end] };
+    if (key[start] != 1) {
+        const source_end = findComponentTerminator(key, start) orelse return null;
+        if (source_end + 2 != key.len) return null;
+        return .{ .logical_source = key[start..source_end] };
+    }
+    var pos = start + 1;
+    const id_end = findComponentTerminator(key, pos) orelse return null;
+    if (id_end == pos) return null;
+    const id = key[pos..id_end];
+    pos = id_end + 2;
+    const owner_end = findComponentTerminator(key, pos) orelse return null;
+    const owner = key[pos..owner_end];
+    pos = owner_end + 2;
+    const source_end = findComponentTerminator(key, pos) orelse return null;
+    if (source_end + 2 != key.len) return null;
+    return .{ .edge_id = id, .owner_document = owner, .logical_source = key[pos..source_end] };
+}
+
+pub fn graphRelationshipArtifactKeyAlloc(alloc: Allocator, owner: []const u8, index_name: []const u8, edge_type: []const u8, target: []const u8, source: []const u8, edge_id: []const u8) ![]u8 {
+    if (edge_id.len == 0) return graphEdgeArtifactKeyWithSourceAlloc(alloc, owner, index_name, edge_type, target, source);
+    const base = try graphEdgeArtifactKeyAlloc(alloc, owner, index_name, edge_type, target);
+    defer alloc.free(base);
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, base);
+    try appendGraphRelationshipSuffix(&list, alloc, .{ .edge_id = edge_id, .logical_source = if (std.mem.eql(u8, owner, source)) "" else source });
+    return list.toOwnedSlice(alloc);
+}
+
+/// Graph edge artifact key with an explicit topological source node distinct
+/// from the owning document. Ownership (routing, retirement, replacement
+/// manifests, split ranges) stays with `doc_key` — the leading component —
+/// while replay applies the edge from `source_node` (e.g. a resolver-minted
+/// canonical entity key for autoschema entity->entity relations, see
+/// zig/AUTOSCHEMA.md). A source equal to the owner encodes as the legacy
+/// five-component key so unchanged producers keep byte-identical rows.
+pub fn graphEdgeArtifactKeyWithSourceAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+    target_doc_key: []const u8,
+    source_node: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, source_node, doc_key))
+        return graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    const base = try graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    defer alloc.free(base);
+    const out = try alloc.alloc(u8, base.len + encodedComponentLen(source_node));
+    errdefer alloc.free(out);
+    @memcpy(out[0..base.len], base);
+    const written = encodeComponent(out[base.len..], source_node);
+    std.debug.assert(base.len + written == out.len);
+    return out;
+}
+
+pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isDerivedEmbeddingArtifactKey(key)) return null;
+
+    const doc_term = findComponentTerminator(key, 1).?;
+    var pos = doc_term + 2;
+    if (key[pos] == artifact_kind) {
+        pos += 1;
+
+        const type_term = findComponentTerminator(key, pos).?;
+        pos = type_term + 2;
+
+        const name_term = findComponentTerminator(key, pos).?;
+        pos = name_term + 2;
+
+        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return error.InvalidInternalUserKey;
+    }
+
+    if (key[pos] != derived_embedding_kind) return error.InvalidInternalUserKey;
+    return try alloc.dupe(u8, key[0..pos]);
+}
+
+pub fn isPrimaryDocumentKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == primary_kind;
+}
+
+pub fn isRelationalRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == relational_row_kind;
+}
+
+pub fn isStoredDocumentRowKey(key: []const u8) bool {
+    return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+pub fn isRelationalIndexReverseKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    const start = term + 3;
+    if (start > key.len or key.len - start != 12 or key[term + 2] != relational_index_reverse_kind) return false;
+    return std.mem.readInt(u64, key[start..][0..8], .big) != 0;
+}
+
+pub fn isTtlKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == ttl_kind;
+}
+
+pub fn decodePrimaryDocumentKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isPrimaryDocumentKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+/// Decode a primary-row identity without allocating in the common case. Keys
+/// containing escaped NUL bytes reuse caller-owned scratch across scan rows.
+pub fn decodeStoredDocumentRowKeyScratch(
+    scratch: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    key: []const u8,
+) !?[]const u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    const body = key[1..term];
+    return (try decodeBodyView(body)) orelse try decodeBodyIntoList(scratch, alloc, body);
+}
+
+pub fn decodeDocumentComponentAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isInternalUserKey(key)) return null;
+    const term = findComponentTerminator(key, 1) orelse return null;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn isChunkArtifactRecordKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "chunk")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    pos = name_term + 2;
+
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return false;
+        pos = unit_term + 2;
+    }
+
+    return pos + 5 == key.len and key[pos] == chunk_record_kind;
+}
+
+pub fn matchesChunkArtifactName(key: []const u8, artifact_name: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "chunk")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (!componentEquals(key, pos, artifact_name)) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return false;
+        pos = unit_term + 2;
+    }
+
+    return pos + 5 == key.len and key[pos] == chunk_record_kind;
+}
+
+pub fn matchesEmbeddingArtifactName(key: []const u8, artifact_name: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "embedding")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (!componentEquals(key, pos, artifact_name)) return false;
+    return findComponentTerminator(key, pos).? + 2 == key.len;
+}
+
+pub fn isDerivedEmbeddingArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len) return false;
+
+    switch (key[pos]) {
+        primary_kind, ttl_kind => return false,
+        artifact_kind => {
+            pos += 1;
+
+            const type_term = findComponentTerminator(key, pos) orelse return false;
+            pos = type_term + 2;
+
+            const name_term = findComponentTerminator(key, pos) orelse return false;
+            pos = name_term + 2;
+
+            if (pos == key.len) return false;
+            pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return false;
+        },
+        else => return false,
+    }
+
+    if (pos >= key.len or key[pos] != derived_embedding_kind) return false;
+    pos += 1;
+
+    const embedding_term = findComponentTerminator(key, pos) orelse return false;
+    return embedding_term + 2 == key.len;
+}
+
+pub fn matchesDerivedEmbeddingArtifactName(key: []const u8, artifact_name: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len) return false;
+
+    switch (key[pos]) {
+        primary_kind, ttl_kind => return false,
+        artifact_kind => {
+            pos += 1;
+
+            const type_term = findComponentTerminator(key, pos) orelse return false;
+            pos = type_term + 2;
+
+            const name_term = findComponentTerminator(key, pos) orelse return false;
+            pos = name_term + 2;
+
+            if (pos == key.len) return false;
+            pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return false;
+        },
+        else => return false,
+    }
+
+    if (pos >= key.len or key[pos] != derived_embedding_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, artifact_name)) return false;
+    return findComponentTerminator(key, pos).? + 2 == key.len;
+}
+
+/// Stable logical identity for the artifact family represented by either a
+/// document embedding key or a derived/chunk embedding key. Hash decoded name
+/// bytes so embedded NULs have the same identity as the caller's configured
+/// artifact name without allocating during a corpus scan.
+pub fn embeddingArtifactScopeHash(key: []const u8) ?u64 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len) return null;
+
+    if (key[pos] == artifact_kind) {
+        pos += 1;
+        const type_term = findComponentTerminator(key, pos) orelse return null;
+        if (componentEquals(key, pos, "embedding")) {
+            pos = type_term + 2;
+            const name_term = findComponentTerminator(key, pos) orelse return null;
+            if (name_term + 2 == key.len) return hashEncodedComponentBody(key[pos..name_term]);
+        }
+        pos = type_term + 2;
+        const name_term = findComponentTerminator(key, pos) orelse return null;
+        pos = name_term + 2;
+        if (pos == key.len) return null;
+        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return null;
+    } else return null;
+
+    if (pos >= key.len or key[pos] != derived_embedding_kind) return null;
+    pos += 1;
+    const embedding_term = findComponentTerminator(key, pos) orelse return null;
+    if (embedding_term + 2 != key.len) return null;
+    return hashEncodedComponentBody(key[pos..embedding_term]);
+}
+
+pub fn embeddingArtifactScopeHashForName(artifact_name: []const u8) u64 {
+    return std.hash.XxHash64.hash(0, artifact_name);
+}
+
+fn hashEncodedComponentBody(body: []const u8) ?u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    var pos: usize = 0;
+    var literal_start: usize = 0;
+    while (pos < body.len) {
+        if (body[pos] != 0) {
+            pos += 1;
+            continue;
+        }
+        if (pos + 1 >= body.len or body[pos + 1] != 0xff) return null;
+        if (literal_start < pos) hasher.update(body[literal_start..pos]);
+        hasher.update("\x00");
+        pos += 2;
+        literal_start = pos;
+    }
+    if (literal_start < body.len) hasher.update(body[literal_start..]);
+    return hasher.final();
+}
+
+fn skipDerivedEmbeddingBaseRecordSuffix(key: []const u8, pos: usize) ?usize {
+    var cursor = pos;
+    if (cursor < key.len and key[cursor] == document_unit_record_kind) {
+        cursor += 1;
+        const unit_term = findComponentTerminator(key, cursor) orelse return null;
+        cursor = unit_term + 2;
+    }
+    if (cursor < key.len and key[cursor] == chunk_record_kind) {
+        cursor += 1 + @sizeOf(u32);
+    }
+    if (cursor > key.len) return null;
+    return cursor;
+}
+
+pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
+    return isGraphRelationshipRecordKey(key, artifact_kind);
+}
+
+pub fn isGraphRetirementKey(key: []const u8) bool {
+    return isGraphRelationshipRecordKey(key, graph_retirement_kind);
+}
+
+fn isGraphRelationshipRecordKey(key: []const u8, owner_kind: u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != owner_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "graph")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    const index_term = findComponentTerminator(key, pos) orelse return false;
+    pos = index_term + 2;
+
+    if (pos >= key.len or key[pos] != graph_edge_record_kind) return false;
+    pos += 1;
+
+    const edge_type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = edge_type_term + 2;
+
+    const target_term = findComponentTerminator(key, pos) orelse return false;
+    return parseGraphRelationshipSuffix(key, target_term + 2) != null;
+}
+
+pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
+    return matchesGraphRelationshipIndexName(key, index_name, false);
+}
+
+pub fn matchesGraphRetirementIndexName(key: []const u8, index_name: []const u8) bool {
+    return matchesGraphRelationshipIndexName(key, index_name, true);
+}
+
+fn matchesGraphRelationshipIndexName(key: []const u8, index_name: []const u8, retired: bool) bool {
+    if (if (retired) !isGraphRetirementKey(key) else !isGraphEdgeArtifactKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2 + 1;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
+    return componentEquals(key, pos, index_name);
+}
+
+fn graphAssetStateRootEnd(key: []const u8) ?usize {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_asset_state_kind) return null;
+    pos += 1;
+    const index_term = findComponentTerminator(key, pos) orelse return null;
+    pos = index_term + 2;
+    const state_term = findComponentTerminator(key, pos) orelse return null;
+    return state_term + 2;
+}
+
+pub fn isGraphAssetStateRootKey(key: []const u8) bool {
+    return (graphAssetStateRootEnd(key) orelse return false) == key.len;
+}
+
+pub fn isGraphAssetStateKey(key: []const u8) bool {
+    const end = graphAssetStateRootEnd(key) orelse return false;
+    return end == key.len or
+        (key.len == end + 1 + @sizeOf(u32) and key[end] == 0xff);
+}
+
+pub fn matchesGraphAssetStateIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphAssetStateKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    return componentEquals(key, index_start, index_name);
+}
+
+pub fn isGraphEdgeContenderKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_edge_contender_kind) return false;
+    pos += 1;
+    const index_term = findComponentTerminator(key, pos) orelse return false;
+    pos = index_term + 2;
+    if (pos >= key.len) return false;
+    if (key[pos] == graph_edge_contender_count_kind) return pos + 1 == key.len;
+    if (key[pos] == graph_edge_ttl_lifetime_kind or key[pos] == graph_edge_ttl_tombstone_kind) {
+        pos += 1;
+        if (key.len - pos < @sizeOf(u64)) return false;
+        pos += @sizeOf(u64);
+    } else if (key[pos] == graph_edge_contender_record_kind) {
+        pos += 1;
+    } else return false;
+    const edge_term = findComponentTerminator(key, pos) orelse return false;
+    pos = edge_term + 2;
+    const state_term = findComponentTerminator(key, pos) orelse return false;
+    return state_term + 2 == key.len;
+}
+
+/// Only membership rows carry a GEC1 contender, unlike count and TTL rows.
+pub fn isGraphEdgeContenderMembershipKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const index_term = findComponentTerminator(key, doc_term + 3).?;
+    return key[index_term + 2] == graph_edge_contender_record_kind;
+}
+
+pub fn isGraphEdgeTtlLifetimeKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    const index_term = findComponentTerminator(key, index_start) orelse return false;
+    return key[index_term + 2] == graph_edge_ttl_lifetime_kind;
+}
+
+pub fn isGraphEdgeTtlTombstoneKey(key: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    const index_term = findComponentTerminator(key, index_start) orelse return false;
+    return key[index_term + 2] == graph_edge_ttl_tombstone_kind;
+}
+
+pub fn graphEdgeTtlStateKeyGeneration(key: []const u8) !u64 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const generation_pos = index_term + 3;
+    return std.mem.readInt(u64, key[generation_pos..][0..8], .big);
+}
+
+pub fn rebindGraphEdgeTtlStateKeyGenerationAlloc(alloc: Allocator, key: []const u8, generation: u64) ![]u8 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const out = try alloc.dupe(u8, key);
+    std.mem.writeInt(u64, out[index_term + 3 ..][0..8], generation, .big);
+    return out;
+}
+
+/// TTL state and global contributors share an authenticated edge digest.
+/// Probe only that edge's contributors when an imported state row arrives;
+/// no document-wide reverse scan or reversible hash encoding is required.
+pub fn graphGlobalEdgeContenderPrefixForTtlStateAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    if (!isGraphEdgeTtlLifetimeKey(key) and !isGraphEdgeTtlTombstoneKey(key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey;
+    const index_term = findComponentTerminator(key, doc_term + 3) orelse return error.InvalidInternalUserKey;
+    const generation_pos = index_term + 3;
+    const edge_term = findComponentTerminator(key, generation_pos + 8) orelse return error.InvalidInternalUserKey;
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    try list.appendSlice(alloc, key[doc_term + 3 .. index_term + 2]);
+    try list.appendSlice(alloc, key[generation_pos .. edge_term + 2]);
+    return list.toOwnedSlice(alloc);
+}
+
+test "graph edge ttl lifetime key follows owner and index" {
+    const alloc = std.testing.allocator;
+    const edge = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "links", "cites", "doc:b");
+    defer alloc.free(edge);
+    const key = try graphEdgeTtlLifetimeKeyAlloc(alloc, edge, "links", 7, "source:one");
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeTtlLifetimeKey(key));
+    try std.testing.expect(isGraphEdgeContenderKey(key));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(key, "links"));
+    const owner_prefix = try graphEdgeContenderRootPrefixAlloc(alloc, "doc:a");
+    defer alloc.free(owner_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, key, owner_prefix));
+    const tombstone = try graphEdgeTtlTombstoneKeyAlloc(alloc, edge, "links", 7, "source:one");
+    defer alloc.free(tombstone);
+    try std.testing.expect(isGraphEdgeTtlTombstoneKey(tombstone));
+    try std.testing.expect(isGraphEdgeContenderKey(tombstone));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(tombstone, "links"));
+    try std.testing.expect(std.mem.startsWith(u8, tombstone, owner_prefix));
+    const rebound = try rebindGraphEdgeTtlStateKeyGenerationAlloc(alloc, tombstone, 9);
+    defer alloc.free(rebound);
+    try std.testing.expectEqual(@as(u64, 7), try graphEdgeTtlStateKeyGeneration(tombstone));
+    try std.testing.expectEqual(@as(u64, 9), try graphEdgeTtlStateKeyGeneration(rebound));
+    const expected_rebound = try graphEdgeTtlTombstoneKeyAlloc(alloc, edge, "links", 9, "source:one");
+    defer alloc.free(expected_rebound);
+    try std.testing.expectEqualSlices(u8, expected_rebound, rebound);
+    const global_prefix = try graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "links", 7, edge);
+    defer alloc.free(global_prefix);
+    for ([_][]const u8{ key, tombstone }) |state| {
+        const from_state = try graphGlobalEdgeContenderPrefixForTtlStateAlloc(alloc, state);
+        defer alloc.free(from_state);
+        try std.testing.expectEqualSlices(u8, global_prefix, from_state);
+    }
+}
+
+pub fn matchesGraphEdgeContenderIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    return componentEquals(key, doc_term + 2 + 1, index_name);
+}
+
+pub fn componentEquals(key: []const u8, start: usize, raw: []const u8) bool {
+    const term = findComponentTerminator(key, start) orelse return false;
+    var in_pos = start;
+    var raw_pos: usize = 0;
+    while (in_pos < term) {
+        if (raw_pos >= raw.len) return false;
+        const b = key[in_pos];
+        if (b != 0) {
+            if (raw[raw_pos] != b) return false;
+            in_pos += 1;
+            raw_pos += 1;
+            continue;
+        }
+        if (in_pos + 1 >= term or key[in_pos + 1] != 0xff) return false;
+        if (raw[raw_pos] != 0) return false;
+        in_pos += 2;
+        raw_pos += 1;
+    }
+    return raw_pos == raw.len;
+}
+
+/// Returns true if key is an embedding artifact: [0x01][doc][0x00 0x00][0x20]["embedding"][0x00 0x00][name][0x00 0x00]
+pub fn isEmbeddingArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    // Check artifact type is "embedding"
+    if (!componentEquals(key, pos, "embedding")) return false;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
+    // Must have exactly one more component (the artifact name)
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    return name_term + 2 == key.len;
+}
+
+pub fn isAssetArtifactKey(key: []const u8) bool {
+    return assetArtifactNameBody(key) != null;
+}
+
+/// Validates a top-level asset key and borrows its encoded name component.
+/// Decode only this component when the caller does not need document identity.
+pub inline fn assetArtifactNameBody(key: []const u8) ?[]const u8 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
+    pos += 1;
+    if (!componentEquals(key, pos, "asset")) return null;
+    const type_term = findComponentTerminator(key, pos) orelse return null;
+    pos = type_term + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    return if (name_term + 2 == key.len) key[pos..name_term] else null;
+}
+
+pub fn matchesAssetArtifactName(key: []const u8, artifact_name: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "asset")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (!componentEquals(key, pos, artifact_name)) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+
+    if (pos == key.len) return true;
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return false;
+        return unit_term + 2 == key.len;
+    }
+    return false;
+}
+
+pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "asset")) return false;
+    pos = findComponentTerminator(key, pos).? + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    pos = name_term + 2;
+    if (pos >= key.len or key[pos] != document_unit_record_kind) return false;
+    pos += 1;
+    const unit_term = findComponentTerminator(key, pos) orelse return false;
+    return unit_term + 2 == key.len;
+}
+
+/// Logical, document-owned cached producer results that can cross a restore
+/// namespace unchanged. Projection ownership, coverage counters, temporary
+/// producer attempts, and store/identity metadata must be rebuilt, not copied.
+/// Match complete encodings so a valid prefix never authorizes arbitrary state.
+pub fn isRestoreArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const kind_pos = doc_term + 2;
+    if (kind_pos >= key.len) return false;
+    const name_pos = kind_pos + 1;
+    switch (key[kind_pos]) {
+        asset_state_kind, asset_reprocess_intent_kind, document_unit_navigation_summary_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return name_term + 2 == key.len;
+        },
+        document_unit_navigation_block_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return key.len - (name_term + 2) == @sizeOf(u32);
+        },
+        artifact_kind => {
+            if (componentEquals(key, name_pos, "embedding")) return isEmbeddingArtifactKey(key);
+            if (componentEquals(key, name_pos, "chunk")) {
+                if (isChunkArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == chunk_record_kind;
+            }
+            if (componentEquals(key, name_pos, "asset")) {
+                if (isAssetArtifactKey(key) or isDocumentUnitArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == derived_embedding_kind;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+test "restore artifacts admit only complete logical producer cache records" {
+    const accepted = [_][]const u8{
+        "\x01doc\x00\x00\x20embedding\x00\x00vec\x00\x00",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00\x31vec\x00\x00",
+        "\x01doc\x00\x00\x33pages\x00\x00",
+        "\x01doc\x00\x00\x37pages\x00\x00",
+        "\x01doc\x00\x00\x38pages\x00\x00\x00\x00\x00\x03",
+        "\x01doc\x00\xffid\x00\x00\x20asset\x00\x00pages\x00\xffname\x00\x00",
+    };
+    for (accepted) |key| {
+        try std.testing.expect(isRestoreArtifactKey(key));
+        const extended = try std.mem.concat(std.testing.allocator, u8, &.{ key, "\x00" });
+        defer std.testing.allocator.free(extended);
+        try std.testing.expect(!isRestoreArtifactKey(extended));
+        try std.testing.expect(!isRestoreArtifactKey(key[0 .. key.len - 1]));
+    }
+    const rejected = [_][]const u8{
+        "",                                                               "doc",                                                         "\x01doc",                                                                          "\x01doc\x00\x00",                               "\x01doc\x00\x00\x10",
+        "\x01doc\x00\x00\x12",                                            "\x01doc\x00\x00\x13index\x00\x00",                            "\x01doc\x00\x00\x34graph\x00\x00asset\x00\x00",                                    "\x01doc\x00\x00\x36index\x00\x00",              "\x01doc\x00\x00\x39graph\x00\x00",
+        "\x01doc\x00\x00\x3fgraph\x00\x00",                               "\x01doc\x00\x00\x40pages\x00\x00",                            "\x01doc\x00\x00\x41pages\x00\x00",                                                 "\x01doc\x00\x00\x20graph\x00\x00edges\x00\x00", "\x01doc\x00\x00\x20resolution\x00\x00entities\x00\x00",
+        "\x01doc\x00\x00\x20unknown\x00\x00asset\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00", &replay_meta_init_key,                           &identity_namespace_key,
+    };
+    for (rejected) |key| try std.testing.expect(!isRestoreArtifactKey(key));
+}
+
+/// Parent-owned compact hierarchy summary. Keeping navigation metadata outside
+/// the unit payload namespace lets sequential browsing seek without loading
+/// every page body or reparsing the complete extraction state.
+pub fn documentUnitNavigationSummaryKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_summary_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// A fixed-size parent-owned block of unit keys and fingerprints. The block
+/// number is big-endian so the keys retain traversal order for diagnostics and
+/// repair tooling even though the query path performs direct point reads.
+pub fn documentUnitNavigationBlockKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    block_index: u32,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).fromOwnedSlice(
+        try documentUnitNavigationBlockPrefixAlloc(alloc, doc_key, artifact_name),
+    );
+    defer list.deinit(alloc);
+    var encoded_index: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_index, block_index, .big);
+    try list.appendSlice(alloc, &encoded_index);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Prefix shared by every compact navigation block for one extraction
+/// artifact. Repair and deletion paths use it to reclaim exact persisted keys
+/// when the state record is missing or corrupt.
+pub fn documentUnitNavigationBlockPrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, document_unit_navigation_block_kind);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+/// Returns true if key is a summary artifact: [0x01][doc][0x00 0x00][0x20]["summary"][0x00 0x00][name][0x00 0x00]
+pub fn isSummaryArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "summary")) return false;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    return name_term + 2 == key.len;
+}
+
+/// Returns true if key is a resolution artifact: [0x01][doc][0x00 0x00][0x20]["resolution"][0x00 0x00][name][0x00 0x00]
+pub fn isResolutionArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    pos += 1;
+    if (!componentEquals(key, pos, "resolution")) return false;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return false;
+    return name_term + 2 == key.len;
+}
+
+/// Parse a resolution artifact key, returning (doc_key, artifact_name).
+/// Returns null if the key is not a resolution artifact key.
+pub fn parseResolutionArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struct { doc_key: []u8, artifact_name: []u8 } {
+    if (!isResolutionArtifactKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    var pos = doc_term + 2 + 1; // past artifact_kind byte
+    const type_term = findComponentTerminator(key, pos).?;
+    pos = type_term + 2;
+
+    const name_term = findComponentTerminator(key, pos).?;
+    const artifact_name = try decodeBodyAlloc(alloc, key[pos..name_term]);
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
+/// Parse an asset artifact key, returning (doc_key, artifact_name).
+/// Returns null if the key is not an asset artifact key.
+pub fn parseAssetArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struct { doc_key: []u8, artifact_name: []u8 } {
+    if (!isAssetArtifactKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    var pos = doc_term + 2 + 1; // past artifact_kind byte
+    const type_term = findComponentTerminator(key, pos).?;
+    pos = type_term + 2;
+
+    const name_term = findComponentTerminator(key, pos).?;
+    const artifact_name = try decodeBodyAlloc(alloc, key[pos..name_term]);
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
+/// Parse an embedding artifact key, returning (doc_key, artifact_name).
+/// Returns null if the key is not an embedding artifact key.
+pub fn parseEmbeddingArtifactKeyAlloc(alloc: Allocator, key: []const u8) !?struct { doc_key: []u8, artifact_name: []u8 } {
+    if (!isEmbeddingArtifactKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    // Skip [0x00 0x00][artifact_kind][encoded("embedding")][0x00 0x00]
+    var pos = doc_term + 2 + 1; // past artifact_kind byte
+    const type_term = findComponentTerminator(key, pos).?;
+    pos = type_term + 2;
+
+    // Decode artifact name
+    const name_term = findComponentTerminator(key, pos).?;
+    const artifact_name = try decodeBodyAlloc(alloc, key[pos..name_term]);
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
+pub fn parseEmbeddingArtifactKeyView(key: []const u8) !?struct { doc_key: []const u8, artifact_name: []const u8 } {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    const doc_key = (try decodeBodyView(key[1..doc_term])) orelse return null;
+
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
+    pos += 1;
+
+    if (!componentEquals(key, pos, "embedding")) return null;
+    const type_term = findComponentTerminator(key, pos) orelse return null;
+    pos = type_term + 2;
+
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    if (name_term + 2 != key.len) return null;
+    const artifact_name = (try decodeBodyView(key[pos..name_term])) orelse return null;
+
+    return .{ .doc_key = doc_key, .artifact_name = artifact_name };
+}
+
+/// Returns a borrowed artifact stream name for the common unescaped key path.
+/// Derived embeddings return their terminal embedding name rather than the
+/// chunk/asset source name. Callers that accept arbitrary binary components
+/// must fall back to the allocating decoder when this returns null.
+pub fn artifactNameView(key: []const u8) !?[]const u8 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
+    pos += 1;
+
+    const type_term = findComponentTerminator(key, pos) orelse return null;
+    const artifact_type = (try decodeBodyView(key[pos..type_term])) orelse return null;
+    pos = type_term + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    const base_name = (try decodeBodyView(key[pos..name_term])) orelse return null;
+    pos = name_term + 2;
+    if (pos == key.len) return base_name;
+
+    if (std.mem.eql(u8, artifact_type, "graph") or std.mem.eql(u8, artifact_type, "resolution")) return base_name;
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return null;
+        pos = unit_term + 2;
+    }
+    if (pos < key.len and key[pos] == chunk_record_kind) {
+        if (pos + 1 + @sizeOf(u32) > key.len) return null;
+        pos += 1 + @sizeOf(u32);
+    }
+    if (pos == key.len) return base_name;
+    if (key[pos] != derived_embedding_kind) return null;
+    pos += 1;
+    const derived_term = findComponentTerminator(key, pos) orelse return null;
+    if (derived_term + 2 != key.len) return null;
+    return (try decodeBodyView(key[pos..derived_term])) orelse null;
+}
+
+pub fn parseGraphEdgeArtifactKeyAlloc(
+    alloc: Allocator,
+    key: []const u8,
+) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8, edge_id: []u8, logical_source: []u8, source_node: ?[]u8 = null } {
+    if (!isGraphEdgeArtifactKey(key)) return null;
+
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+
+    var pos = doc_term + 2 + 1;
+    const type_term = findComponentTerminator(key, pos).?;
+    pos = type_term + 2;
+
+    const index_term = findComponentTerminator(key, pos).?;
+    const index_name = try decodeBodyAlloc(alloc, key[pos..index_term]);
+    errdefer alloc.free(index_name);
+    pos = index_term + 2;
+
+    if (key[pos] != graph_edge_record_kind) return error.InvalidInternalUserKey;
+    pos += 1;
+
+    const edge_type_term = findComponentTerminator(key, pos).?;
+    const edge_type = try decodeBodyAlloc(alloc, key[pos..edge_type_term]);
+    errdefer alloc.free(edge_type);
+    pos = edge_type_term + 2;
+
+    const target_term = findComponentTerminator(key, pos).?;
+    const target_doc_key = try decodeBodyAlloc(alloc, key[pos..target_term]);
+    errdefer alloc.free(target_doc_key);
+    const suffix = parseGraphRelationshipSuffix(key, target_term + 2).?;
+    const edge_id = try decodeBodyAlloc(alloc, suffix.edge_id);
+    errdefer alloc.free(edge_id);
+    const logical_source = try decodeBodyAlloc(alloc, suffix.logical_source);
+    errdefer alloc.free(logical_source);
+
+    return .{
+        .doc_key = doc_key,
+        .index_name = index_name,
+        .edge_type = edge_type,
+        .target_doc_key = target_doc_key,
+        .edge_id = edge_id,
+        .logical_source = logical_source,
+        .source_node = if (logical_source.len > 0) logical_source else null,
+    };
+}
+
+// Local, derived directory. Portable imports rebuild it from primary artifacts.
+pub fn graphRetirementKeyAlloc(alloc: Allocator, artifact: []const u8) ![]u8 {
+    if (!isGraphEdgeArtifactKey(artifact)) return error.InvalidInternalUserKey;
+    const key = try alloc.dupe(u8, artifact);
+    key[findComponentTerminator(key, 1).? + 2] = graph_retirement_kind;
+    return key;
+}
+
+pub fn graphRetirementArtifactKeyAlloc(alloc: Allocator, retired: []const u8) ![]u8 {
+    if (!isGraphRetirementKey(retired)) return error.InvalidInternalUserKey;
+    const key = try alloc.dupe(u8, retired);
+    key[findComponentTerminator(key, 1).? + 2] = artifact_kind;
+    return key;
+}
+
+pub fn graphRetirementPrefixAlloc(alloc: Allocator, owner: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendDocumentPrefix(&out, alloc, owner);
+    try out.append(alloc, graph_retirement_kind);
+    return out.toOwnedSlice(alloc);
+}
+
+pub const graph_retirement_present_key = "\x00\x00__graph_retirement__:present:v1";
+
+pub const graph_incoming_cursor_key = "\x00\x00__graph_incoming__:cursor:v3";
+
+pub const graph_incoming_prefix = "\x00\x00__graph_incoming__:v1:";
+pub const graph_directory_reset_key = "\x00\x00__graph_incoming__:reset:v1";
+pub const graph_incoming_legacy_ready_key = "\x00\x00__graph_incoming__:ready:v2";
+pub const graph_incoming_ready_key = "\x00\x00__graph_incoming__:ready:v3";
+pub const graph_owning_table_key = "\x00\x00__metadata__:graph_owning_table:v1";
+pub const graph_retirement_count_key = "\x00\x00__graph_retirement__:count:v2";
+pub const graph_retirement_ref_prefix = "\x00\x00__graph_retirement__:refs:v2:";
+
+pub fn graphRetirementRefKeyAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(key, &digest, .{});
+    return std.mem.concat(alloc, u8, &.{ graph_retirement_ref_prefix, &digest });
+}
+
+pub fn graphIncomingPrefixAlloc(alloc: Allocator, target: []const u8) ![]u8 {
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendEncodedComponent(&encoded, alloc, target);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded.items, &digest, .{});
+    return try std.mem.concat(alloc, u8, &.{ graph_incoming_prefix, &digest });
+}
+
+/// Only source-owned relationships follow endpoint deletion. Fact-owned
+/// relationships retain their own document lifecycle, including absent endpoints.
+/// Fixed-size hashes keep directory keys within backend key-size limits; values
+/// carry the authoritative full artifact identity.
+pub fn graphInlineTargetComponent(artifact: []const u8) ?[]const u8 {
+    if (!isGraphEdgeArtifactKey(artifact)) return null;
+    var pos = findComponentTerminator(artifact, 1).? + 3;
+    pos = findComponentTerminator(artifact, pos).? + 2; // artifact type
+    pos = findComponentTerminator(artifact, pos).? + 3; // index and record kind
+    pos = findComponentTerminator(artifact, pos).? + 2; // edge type
+    const target_end = findComponentTerminator(artifact, pos).? + 2;
+    const suffix = parseGraphRelationshipSuffix(artifact, target_end).?;
+    if (suffix.logical_source.len != 0) return null;
+    return artifact[pos..target_end];
+}
+
+pub fn graphIncomingKeyAlloc(alloc: Allocator, artifact: []const u8) !?[]u8 {
+    const target = graphInlineTargetComponent(artifact) orelse return null;
+    var target_digest: [32]u8 = undefined;
+    var artifact_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(target, &target_digest, .{});
+    std.crypto.hash.Blake3.hash(artifact, &artifact_digest, .{});
+    return try std.mem.concat(alloc, u8, &.{ graph_incoming_prefix, &target_digest, &artifact_digest });
+}
+
+pub fn nextPrefixAlloc(alloc: Allocator, prefix: []const u8) !?[]u8 {
+    var out = try alloc.dupe(u8, prefix);
+    errdefer alloc.free(out);
+
+    var i = out.len;
+    while (i > 0) {
+        i -= 1;
+        if (out[i] == 0xff) continue;
+        out[i] += 1;
+        return try alloc.realloc(out, i + 1);
+    }
+
+    alloc.free(out);
+    return null;
+}
+
+pub fn replayEntryKey(hint_ordinal: u8, sequence: u64) [replay_key_len]u8 {
+    var key: [replay_key_len]u8 = undefined;
+    key[0] = replay_namespace;
+    key[1] = hint_ordinal;
+    std.mem.writeInt(u64, key[2..], sequence, .big);
+    return key;
+}
+
+pub fn replayRangeLower(hint_ordinal: u8, from_sequence: u64) [replay_key_len]u8 {
+    return replayEntryKey(hint_ordinal, from_sequence);
+}
+
+pub fn replayRangeUpper(hint_ordinal: u8) [2]u8 {
+    return .{ replay_namespace, hint_ordinal + 1 };
+}
+
+pub fn replayLatestSequenceKey(hint_ordinal: u8) [4]u8 {
+    return .{ replay_namespace, 0xff, replay_meta_latest_sequence_kind, hint_ordinal };
+}
+
+pub fn artifactSourceRevisionKeyAlloc(alloc: Allocator, artifact_name: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 3 + encodedComponentLen(artifact_name));
+    key[0] = replay_namespace;
+    key[1] = 0xff;
+    key[2] = artifact_source_revision_kind;
+    _ = encodeComponent(key[3..], artifact_name);
+    return key;
+}
+
+pub fn identityDocToOrdinalKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 2 + encodedComponentLen(doc_id));
+    key[0] = identity_namespace;
+    key[1] = identity_doc_to_ordinal_kind;
+    _ = encodeComponent(key[2..], doc_id);
+    return key;
+}
+
+pub fn identityOrdinalToDocKey(ordinal: u32) [1 + 1 + @sizeOf(u32)]u8 {
+    var key: [1 + 1 + @sizeOf(u32)]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_ordinal_to_doc_kind;
+    std.mem.writeInt(u32, key[2..][0..4], ordinal, .big);
+    return key;
+}
+
+pub fn identityOrdinalStateKey(ordinal: u32) [1 + 1 + @sizeOf(u32)]u8 {
+    var key: [1 + 1 + @sizeOf(u32)]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_ordinal_state_kind;
+    std.mem.writeInt(u32, key[2..][0..4], ordinal, .big);
+    return key;
+}
+
+pub fn identityCanonicalToOrdinalKey(canonical_doc_id: u64) [1 + 1 + @sizeOf(u64)]u8 {
+    var key: [1 + 1 + @sizeOf(u64)]u8 = undefined;
+    key[0] = identity_namespace;
+    key[1] = identity_canonical_to_ordinal_kind;
+    std.mem.writeInt(u64, key[2..][0..8], canonical_doc_id, .big);
+    return key;
+}
+
+pub fn parseIdentityOrdinalKey(key: []const u8, kind: u8) ?u32 {
+    if (key.len != 1 + 1 + @sizeOf(u32)) return null;
+    if (key[0] != identity_namespace or key[1] != kind) return null;
+    return std.mem.readInt(u32, key[2..][0..4], .big);
+}
+
+pub fn parseIdentityCanonicalKey(key: []const u8) ?u64 {
+    if (key.len != 1 + 1 + @sizeOf(u64)) return null;
+    if (key[0] != identity_namespace or key[1] != identity_canonical_to_ordinal_kind) return null;
+    return std.mem.readInt(u64, key[2..][0..8], .big);
+}
+
+pub fn parseReplayEntrySequence(key: []const u8, hint_ordinal: u8) ?u64 {
+    if (key.len != replay_key_len) return null;
+    if (key[0] != replay_namespace or key[1] != hint_ordinal) return null;
+    return std.mem.readInt(u64, key[2..10], .big);
+}
+
+pub fn isReplayEntryKey(key: []const u8) bool {
+    return key.len == replay_key_len and key[0] == replay_namespace;
+}
+
+pub fn isReplayMetaInitKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, &replay_meta_init_key);
+}
+
+test "internal key primary round trip with zero bytes" {
+    const alloc = std.testing.allocator;
+    const raw = "ab\x00cd";
+    const key = try documentKeyAlloc(alloc, raw);
+    defer alloc.free(key);
+
+    try std.testing.expect(isPrimaryDocumentKey(key));
+
+    const decoded = (try decodePrimaryDocumentKeyAlloc(alloc, key)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(raw, decoded);
+}
+
+test "internal key prefix bounds preserve raw prefix grouping" {
+    const alloc = std.testing.allocator;
+    const lower = try documentRangeLowerAlloc(alloc, "ab");
+    defer alloc.free(lower);
+    const upper = (try documentRangeUpperAlloc(alloc, "ab")).?;
+    defer alloc.free(upper);
+
+    const exact = try documentKeyAlloc(alloc, "ab");
+    defer alloc.free(exact);
+    const extended = try documentKeyAlloc(alloc, "abz");
+    defer alloc.free(extended);
+    const outside = try documentKeyAlloc(alloc, "ac");
+    defer alloc.free(outside);
+
+    try std.testing.expect(std.mem.order(u8, lower, exact) != .gt);
+    try std.testing.expect(std.mem.order(u8, lower, extended) != .gt);
+    try std.testing.expect(std.mem.order(u8, exact, upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, extended, upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, outside, upper) != .lt);
+}
+
+test "internal key ordering matches raw document id ordering for adversarial bytes" {
+    const alloc = std.testing.allocator;
+    const raw_ids = [_][]const u8{
+        "",
+        ":",
+        ":i:",
+        ":e:",
+        ":t",
+        "\x00",
+        "\x00\x00",
+        "\xff",
+        "abc\x00def",
+        "abc\xffdef",
+        "abc:",
+    };
+
+    for (raw_ids) |lhs| {
+        const lhs_key = try documentKeyAlloc(alloc, lhs);
+        defer alloc.free(lhs_key);
+        for (raw_ids) |rhs| {
+            const rhs_key = try documentKeyAlloc(alloc, rhs);
+            defer alloc.free(rhs_key);
+            try std.testing.expectEqual(std.mem.order(u8, lhs, rhs), std.mem.order(u8, lhs_key, rhs_key));
+        }
+    }
+}
+
+test "internal key round trips adversarial document ids" {
+    const alloc = std.testing.allocator;
+    const raw_ids = [_][]const u8{
+        "",
+        ":",
+        ":i:",
+        ":e:",
+        ":t",
+        "\x00",
+        "\x00\x00",
+        "\xff",
+        "abc\x00def",
+        "abc\xffdef",
+        "abc:",
+    };
+
+    for (raw_ids) |raw| {
+        const key = try documentKeyAlloc(alloc, raw);
+        defer alloc.free(key);
+        const decoded = (try decodePrimaryDocumentKeyAlloc(alloc, key)).?;
+        defer alloc.free(decoded);
+        try std.testing.expectEqualSlices(u8, raw, decoded);
+    }
+}
+
+test "internal key binary prefix bounds select only matching document ids" {
+    const alloc = std.testing.allocator;
+    const raw_ids = [_][]const u8{
+        "",
+        "\x00",
+        "\x00a",
+        "\x00\x00",
+        "\x00\xff",
+        "\x01",
+        "abc",
+        "abc\x00def",
+        "abc\xffdef",
+        "abd",
+    };
+    const prefixes = [_][]const u8{
+        "\x00",
+        "abc",
+        "abc\x00",
+    };
+
+    for (prefixes) |prefix| {
+        const lower = try documentRangeLowerAlloc(alloc, prefix);
+        defer alloc.free(lower);
+        const upper = try documentRangeUpperAlloc(alloc, prefix);
+        defer if (upper) |u| alloc.free(u);
+
+        for (raw_ids) |raw| {
+            const key = try documentKeyAlloc(alloc, raw);
+            defer alloc.free(key);
+            const in_range = std.mem.order(u8, key, lower) != .lt and
+                (upper == null or std.mem.order(u8, key, upper.?) == .lt);
+            try std.testing.expectEqual(std.mem.startsWith(u8, raw, prefix), in_range);
+        }
+    }
+}
+
+test "internal key encoded shard boundaries contain encoded primary keys" {
+    const alloc = std.testing.allocator;
+    const lower = try documentRangeLowerAlloc(alloc, "ab\x00");
+    defer alloc.free(lower);
+    const upper = (try documentRangeUpperAlloc(alloc, "ab\x00")).?;
+    defer alloc.free(upper);
+
+    const inside = try documentKeyAlloc(alloc, "ab\x00c");
+    defer alloc.free(inside);
+    const outside_before = try documentKeyAlloc(alloc, "ab");
+    defer alloc.free(outside_before);
+    const outside_after = try documentKeyAlloc(alloc, "ab\x01");
+    defer alloc.free(outside_after);
+
+    try std.testing.expect(std.mem.order(u8, inside, lower) != .lt);
+    try std.testing.expect(std.mem.order(u8, inside, upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, outside_before, lower) == .lt);
+    try std.testing.expect(std.mem.order(u8, outside_after, upper) != .lt);
+}
+
+test "replay entry key round trip" {
+    const key = replayEntryKey(3, 42);
+    try std.testing.expect(isReplayEntryKey(&key));
+    try std.testing.expectEqual(@as(?u64, 42), parseReplayEntrySequence(&key, 3));
+    try std.testing.expectEqual(@as(?u64, null), parseReplayEntrySequence(&key, 2));
+
+    const lower = replayRangeLower(3, 42);
+    const upper = replayRangeUpper(3);
+    try std.testing.expect(std.mem.order(u8, &lower, &key) != .gt);
+    try std.testing.expect(std.mem.order(u8, &key, &upper) == .lt);
+}
+
+test "isEmbeddingArtifactKey round trip" {
+    const alloc = std.testing.allocator;
+    const key = try embeddingArtifactKeyForDocumentAlloc(alloc, "my-doc", "my-index");
+    defer alloc.free(key);
+
+    try std.testing.expect(isEmbeddingArtifactKey(key));
+    try std.testing.expect(!isPrimaryDocumentKey(key));
+    try std.testing.expect(!isSummaryArtifactKey(key));
+    try std.testing.expect(!isDerivedEmbeddingArtifactKey(key));
+
+    const parsed = (try parseEmbeddingArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualStrings("my-doc", parsed.doc_key);
+    try std.testing.expectEqualStrings("my-index", parsed.artifact_name);
+
+    const view = (try parseEmbeddingArtifactKeyView(key)).?;
+    try std.testing.expectEqualStrings("my-doc", view.doc_key);
+    try std.testing.expectEqualStrings("my-index", view.artifact_name);
+}
+
+test "embedding artifact scope hash is shared by direct and derived keys" {
+    const alloc = std.testing.allocator;
+    const artifact_name = "dense\x00shared";
+    const direct = try embeddingArtifactKeyForDocumentAlloc(alloc, "doc", artifact_name);
+    defer alloc.free(direct);
+    const chunk = try chunkArtifactKeyAlloc(alloc, "doc", "chunks", 4);
+    defer alloc.free(chunk);
+    const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, artifact_name);
+    defer alloc.free(derived);
+
+    const expected = embeddingArtifactScopeHashForName(artifact_name);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(direct).?);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(derived).?);
+    try std.testing.expect(embeddingArtifactScopeHash(chunk) == null);
+}
+
+test "embedding artifact key round trip with zero bytes in doc key" {
+    const alloc = std.testing.allocator;
+    const raw = "ab\x00cd";
+    const key = try embeddingArtifactKeyForDocumentAlloc(alloc, raw, "dense");
+    defer alloc.free(key);
+
+    const parsed = (try parseEmbeddingArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualStrings(raw, parsed.doc_key);
+    try std.testing.expectEqualStrings("dense", parsed.artifact_name);
+    try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyView(key));
+}
+
+test "embedding artifact key round trip with arbitrary doc and artifact bytes" {
+    const alloc = std.testing.allocator;
+    const raw_doc = "ab\x00:i:\xff";
+    const raw_name = "dense\x00name\xff";
+    const key = try embeddingArtifactKeyForDocumentAlloc(alloc, raw_doc, raw_name);
+    defer alloc.free(key);
+
+    const parsed = (try parseEmbeddingArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualSlices(u8, raw_doc, parsed.doc_key);
+    try std.testing.expectEqualSlices(u8, raw_name, parsed.artifact_name);
+    try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyView(key));
+}
+
+test "matchesEmbeddingArtifactName matches exact embedding artifact name" {
+    const alloc = std.testing.allocator;
+    const key = try embeddingArtifactKeyForDocumentAlloc(alloc, "my-doc", "my-index");
+    defer alloc.free(key);
+
+    try std.testing.expect(matchesEmbeddingArtifactName(key, "my-index"));
+    try std.testing.expect(!matchesEmbeddingArtifactName(key, "other-index"));
+}
+
+test "derivedEmbeddingBaseKeyAlloc returns chunk artifact key" {
+    const alloc = std.testing.allocator;
+    const chunk_key = try chunkArtifactKeyAlloc(alloc, "doc1", "chunks", 7);
+    defer alloc.free(chunk_key);
+    const embedding_key = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "dense");
+    defer alloc.free(embedding_key);
+
+    const base = (try derivedEmbeddingBaseKeyAlloc(alloc, embedding_key)).?;
+    defer alloc.free(base);
+    try std.testing.expectEqualStrings(chunk_key, base);
+}
+
+test "document unit chunk artifact key is recognized as chunk record" {
+    const alloc = std.testing.allocator;
+    const key = try documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 3);
+    defer alloc.free(key);
+
+    try std.testing.expect(isChunkArtifactRecordKey(key));
+    try std.testing.expect(matchesChunkArtifactName(key, "document_chunks_v1"));
+    try std.testing.expect(!matchesChunkArtifactName(key, "other_chunks_v1"));
+}
+
+test "document unit chunk derived embedding key is recognized" {
+    const alloc = std.testing.allocator;
+    const chunk_key = try documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks_v1", "page:000001", 3);
+    defer alloc.free(chunk_key);
+    const embedding_key = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "dense");
+    defer alloc.free(embedding_key);
+
+    try std.testing.expect(isDerivedEmbeddingArtifactKey(embedding_key));
+    try std.testing.expect(matchesDerivedEmbeddingArtifactName(embedding_key, "dense"));
+    try std.testing.expect(!matchesDerivedEmbeddingArtifactName(embedding_key, "other"));
+    const base = (try derivedEmbeddingBaseKeyAlloc(alloc, embedding_key)).?;
+    defer alloc.free(base);
+    try std.testing.expectEqualStrings(chunk_key, base);
+}
+
+test "matchesDerivedEmbeddingArtifactName matches exact derived embedding artifact name" {
+    const alloc = std.testing.allocator;
+    const chunk_key = try chunkArtifactKeyAlloc(alloc, "doc1", "chunks", 7);
+    defer alloc.free(chunk_key);
+    const embedding_key = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "dense");
+    defer alloc.free(embedding_key);
+
+    try std.testing.expect(matchesDerivedEmbeddingArtifactName(embedding_key, "dense"));
+    try std.testing.expect(!matchesDerivedEmbeddingArtifactName(embedding_key, "other"));
+}
+
+test "isSummaryArtifactKey" {
+    const alloc = std.testing.allocator;
+    const key = try artifactNamedPrefixAlloc(alloc, "doc1", "summary", "my-summary");
+    defer alloc.free(key);
+
+    try std.testing.expect(isSummaryArtifactKey(key));
+    try std.testing.expect(!isEmbeddingArtifactKey(key));
+    try std.testing.expect(!isPrimaryDocumentKey(key));
+}
+
+test "parseEmbeddingArtifactKeyAlloc returns null for non-embedding" {
+    const alloc = std.testing.allocator;
+    const doc_key = try documentKeyAlloc(alloc, "doc1");
+    defer alloc.free(doc_key);
+    try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyAlloc(alloc, doc_key));
+}
+
+test "artifact name view resolves direct and derived streams without allocation" {
+    const alloc = std.testing.allocator;
+    const direct = try embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "document_vectors");
+    defer alloc.free(direct);
+    try std.testing.expectEqualStrings("document_vectors", (try artifactNameView(direct)).?);
+
+    const chunk = try chunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks", 7);
+    defer alloc.free(chunk);
+    try std.testing.expectEqualStrings("document_chunks", (try artifactNameView(chunk)).?);
+    const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "chunk_vectors");
+    defer alloc.free(derived);
+    try std.testing.expectEqualStrings("chunk_vectors", (try artifactNameView(derived)).?);
+}
+
+test "graph edge artifact key round trip" {
+    const alloc = std.testing.allocator;
+    const key = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "links", "doc:b");
+    defer alloc.free(key);
+
+    try std.testing.expect(isGraphEdgeArtifactKey(key));
+    try std.testing.expect(!isEmbeddingArtifactKey(key));
+    try std.testing.expect(matchesGraphEdgeIndexName(key, "gr_v1"));
+    try std.testing.expect(!matchesGraphEdgeIndexName(key, "gr_v10"));
+
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.index_name);
+    defer alloc.free(parsed.edge_type);
+    defer alloc.free(parsed.target_doc_key);
+    try std.testing.expectEqualStrings("doc:a", parsed.doc_key);
+    try std.testing.expectEqualStrings("gr_v1", parsed.index_name);
+    try std.testing.expectEqualStrings("links", parsed.edge_type);
+    try std.testing.expectEqualStrings("doc:b", parsed.target_doc_key);
+    try std.testing.expect(parsed.source_node == null);
+}
+
+test "graph edge artifact key carries an explicit source node" {
+    const alloc = std.testing.allocator;
+
+    // Source equal to the owner degrades to the legacy five-component key.
+    const legacy = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "doc:a");
+    defer alloc.free(legacy);
+    const plain = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly");
+    defer alloc.free(plain);
+    try std.testing.expectEqualSlices(u8, plain, legacy);
+
+    const key = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "person/ada");
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeArtifactKey(key));
+    try std.testing.expect(matchesGraphEdgeIndexName(key, "gr_v1"));
+
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.index_name);
+    defer alloc.free(parsed.edge_type);
+    defer alloc.free(parsed.target_doc_key);
+    defer if (parsed.source_node) |source| alloc.free(source);
+    try std.testing.expectEqualStrings("doc:a", parsed.doc_key);
+    try std.testing.expectEqualStrings("works_at", parsed.edge_type);
+    try std.testing.expectEqualStrings("org/antfly", parsed.target_doc_key);
+    try std.testing.expectEqualStrings("person/ada", parsed.source_node.?);
+}
+
+test "graph asset state key matches exact index name" {
+    const alloc = std.testing.allocator;
+    const key = try graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(key);
+    var full = std.ArrayListUnmanaged(u8).empty;
+    defer full.deinit(alloc);
+    try full.appendSlice(alloc, key);
+    try appendEncodedComponent(&full, alloc, "relations_v1");
+
+    try std.testing.expect(isGraphAssetStateKey(full.items));
+    try std.testing.expect(matchesGraphAssetStateIndexName(full.items, "gr_v1"));
+    try std.testing.expect(!matchesGraphAssetStateIndexName(full.items, "gr_v10"));
+}
+
+test "graph edge contender keys are edge and state scoped" {
+    const alloc = std.testing.allocator;
+    const edge_key = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "links", "doc:b");
+    defer alloc.free(edge_key);
+    const state_key = try graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(state_key);
+    const key = try graphEdgeContenderKeyAlloc(alloc, "doc:a", "gr_v1", edge_key, state_key);
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeContenderKey(key));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(key, "gr_v1"));
+    try std.testing.expect(!matchesGraphEdgeContenderIndexName(key, "gr_v10"));
+
+    const prefix = try graphEdgeContenderEdgePrefixAlloc(alloc, "doc:a", "gr_v1", edge_key);
+    defer alloc.free(prefix);
+    try std.testing.expect(std.mem.startsWith(u8, key, prefix));
+
+    const count_key = try graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(count_key);
+    try std.testing.expect(isGraphEdgeContenderKey(count_key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey(count_key));
+    try std.testing.expect(isGraphEdgeContenderMembershipKey(key));
+    try std.testing.expect(!isGraphEdgeContenderMembershipKey("invalid"));
+}
+
+test "global graph contender keys are generation fenced and priority ordered" {
+    const alloc = std.testing.allocator;
+    const edge_key = try graphEdgeArtifactKeyAlloc(alloc, "shared\x00source", "gr\x00v1", "links", "shared\xfftarget");
+    defer alloc.free(edge_key);
+    const state_a = "state:a";
+    const state_b = "state:b";
+    const preferred = try graphGlobalEdgeContenderKeyAlloc(alloc, "gr\x00v1", 42, edge_key, 0, state_b);
+    defer alloc.free(preferred);
+    const fallback = try graphGlobalEdgeContenderKeyAlloc(alloc, "gr\x00v1", 42, edge_key, 1, state_a);
+    defer alloc.free(fallback);
+
+    try std.testing.expect(isGraphGlobalEdgeContenderKey(preferred));
+    const owner_prefix = try documentExactPrefixAlloc(alloc, "shared\x00source");
+    defer alloc.free(owner_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, preferred, owner_prefix));
+    try std.testing.expect(matchesGraphGlobalEdgeContenderIndexName(preferred, "gr\x00v1"));
+    try std.testing.expect(!matchesGraphGlobalEdgeContenderIndexName(preferred, "gr\x00v10"));
+    try std.testing.expectEqual(std.math.Order.lt, std.mem.order(u8, preferred, fallback));
+
+    const edge_prefix = try graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "gr\x00v1", 42, edge_key);
+    defer alloc.free(edge_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, preferred, edge_prefix));
+
+    const other_generation = try graphGlobalEdgeContenderEdgePrefixAlloc(alloc, "gr\x00v1", 43, edge_key);
+    defer alloc.free(other_generation);
+    try std.testing.expect(!std.mem.startsWith(u8, preferred, other_generation));
+}
+
+test "graph edge artifact key round trip with arbitrary source and target ids" {
+    const alloc = std.testing.allocator;
+    const source = "doc\x00:i:\xffsource";
+    const target = "\x00target:out:\xff";
+    const edge_type = "links\x00typed";
+    const key = try graphEdgeArtifactKeyAlloc(alloc, source, "gr\x00v1", edge_type, target);
+    defer alloc.free(key);
+
+    try std.testing.expect(isGraphEdgeArtifactKey(key));
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.index_name);
+    defer alloc.free(parsed.edge_type);
+    defer alloc.free(parsed.target_doc_key);
+    try std.testing.expectEqualSlices(u8, source, parsed.doc_key);
+    try std.testing.expectEqualSlices(u8, "gr\x00v1", parsed.index_name);
+    try std.testing.expectEqualSlices(u8, edge_type, parsed.edge_type);
+    try std.testing.expectEqualSlices(u8, target, parsed.target_doc_key);
+}
+
+test "resolution artifact key round-trips and is distinct from asset" {
+    const alloc = std.testing.allocator;
+    const key = try resolutionArtifactKeyAlloc(alloc, "doc:article-123", "resolution_v1");
+    defer alloc.free(key);
+
+    try std.testing.expect(isResolutionArtifactKey(key));
+    try std.testing.expect(!isAssetArtifactKey(key));
+    try std.testing.expect(!isSummaryArtifactKey(key));
+
+    const asset = try artifactNamedPrefixAlloc(alloc, "doc:article-123", "asset", "relations_v1");
+    defer alloc.free(asset);
+    try std.testing.expect(!isResolutionArtifactKey(asset));
+
+    const parsed = (try parseResolutionArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualStrings("doc:article-123", parsed.doc_key);
+    try std.testing.expectEqualStrings("resolution_v1", parsed.artifact_name);
+}
+
+test "parseAssetArtifactKeyAlloc returns doc key and artifact name" {
+    const alloc = std.testing.allocator;
+    const key = try artifactNamedPrefixAlloc(alloc, "doc:article-123", "asset", "relations_v1");
+    defer alloc.free(key);
+    const parsed = (try parseAssetArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try std.testing.expectEqualStrings("doc:article-123", parsed.doc_key);
+    try std.testing.expectEqualStrings("relations_v1", parsed.artifact_name);
+
+    const res = try resolutionArtifactKeyAlloc(alloc, "doc:article-123", "resolution_v1");
+    defer alloc.free(res);
+    try std.testing.expect((try parseAssetArtifactKeyAlloc(alloc, res)) == null);
+}
+
+test "matchesAssetArtifactName matches top-level and document unit assets" {
+    const alloc = std.testing.allocator;
+    const asset = try artifactNamedPrefixAlloc(alloc, "doc:article-123", "asset", "document_units_v1");
+    defer alloc.free(asset);
+    const unit = try documentUnitArtifactKeyAlloc(alloc, "doc:article-123", "document_units_v1", "page:000001");
+    defer alloc.free(unit);
+    const chunk = try documentUnitChunkArtifactKeyAlloc(alloc, "doc:article-123", "document_units_v1", "page:000001", 0);
+    defer alloc.free(chunk);
+
+    try std.testing.expect(matchesAssetArtifactName(asset, "document_units_v1"));
+    try std.testing.expect(matchesAssetArtifactName(unit, "document_units_v1"));
+    try std.testing.expect(!matchesAssetArtifactName(unit, "other_units_v1"));
+    try std.testing.expect(!matchesAssetArtifactName(chunk, "document_units_v1"));
+}
+
+test "document unit navigation keys are parent scoped and block ordered" {
+    const alloc = std.testing.allocator;
+    const doc_key = "doc\x00:a";
+    const artifact_name = "document\x00units:v1";
+    const summary = try documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
+    defer alloc.free(summary);
+    const block_zero = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0);
+    defer alloc.free(block_zero);
+    const block_one = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 1);
+    defer alloc.free(block_one);
+    const block_large = try documentUnitNavigationBlockKeyAlloc(alloc, doc_key, artifact_name, 0x0100_0000);
+    defer alloc.free(block_large);
+
+    try std.testing.expect(isInternalUserKey(summary));
+    try std.testing.expect(isInternalUserKey(block_zero));
+    try std.testing.expect(!std.mem.eql(u8, summary, block_zero));
+    try std.testing.expect(std.mem.lessThan(u8, block_zero, block_one));
+    try std.testing.expect(std.mem.lessThan(u8, block_one, block_large));
+
+    const unit = try documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001");
+    defer alloc.free(unit);
+    const chunk = try documentUnitChunkArtifactKeyAlloc(alloc, doc_key, artifact_name, "page:000001", 0);
+    defer alloc.free(chunk);
+    try std.testing.expect(isDocumentUnitArtifactRecordKey(unit));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(chunk));
+    try std.testing.expect(!isDocumentUnitArtifactRecordKey(summary));
+}
+
+test "asset artifact source index keys group by source artifact" {
+    const alloc = std.testing.allocator;
+    const root = try assetArtifactSourceIndexRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const prefix = try assetArtifactSourceIndexPrefixAlloc(alloc, "relations_v1");
+    defer alloc.free(prefix);
+    const key = try assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:article-123");
+    defer alloc.free(key);
+    const other = try assetArtifactSourceIndexKeyAlloc(alloc, "other_v1", "doc:article-123");
+    defer alloc.free(other);
+
+    try std.testing.expect(std.mem.startsWith(u8, prefix, root));
+    try std.testing.expect(std.mem.startsWith(u8, key, prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, other, prefix));
+}
+
+test "terminal enrichment failure indexes preserve sequence order and issue ownership" {
+    try std.testing.expect(resolution_handoff_kind != enrichment_terminal_failure_sequence_kind);
+    try std.testing.expect(resolution_handoff_kind != enrichment_terminal_failure_issue_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_issue_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_generation_kind);
+    try std.testing.expect(enrichment_terminal_failure_issue_kind != enrichment_terminal_failure_generation_kind);
+    try std.testing.expect(enrichment_terminal_failure_sequence_kind != enrichment_terminal_failure_generation_counter_kind);
+    try std.testing.expect(enrichment_terminal_failure_issue_kind != enrichment_terminal_failure_generation_counter_kind);
+    try std.testing.expect(enrichment_terminal_failure_generation_kind != enrichment_terminal_failure_generation_counter_kind);
+
+    const alloc = std.testing.allocator;
+    const repair_issue_key = "\x02\xff\x23repair\x00issue";
+    const root = try enrichmentTerminalFailureSequenceRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const first = try enrichmentTerminalFailureSequenceKeyAlloc(alloc, 10, repair_issue_key);
+    defer alloc.free(first);
+    const second = try enrichmentTerminalFailureSequenceKeyAlloc(alloc, 20, repair_issue_key);
+    defer alloc.free(second);
+    const issue_prefix = try enrichmentTerminalFailureIssuePrefixAlloc(alloc, repair_issue_key);
+    defer alloc.free(issue_prefix);
+    const reverse = try enrichmentTerminalFailureIssueKeyAlloc(alloc, repair_issue_key, 10);
+    defer alloc.free(reverse);
+    const generation = try enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+    defer alloc.free(generation);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, root));
+    try std.testing.expect(std.mem.lessThan(u8, first, second));
+    try std.testing.expectEqual(@as(u64, 10), try enrichmentTerminalFailureSequence(first));
+    try std.testing.expectEqual(@as(u64, 20), try enrichmentTerminalFailureSequence(second));
+    try std.testing.expect(std.mem.startsWith(u8, reverse, issue_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, generation, issue_prefix));
+    try std.testing.expectError(error.InvalidInternalUserKey, enrichmentTerminalFailureSequence(reverse));
+
+    const handoff_prefix = [_]u8{ replay_namespace, 0xff, resolution_handoff_kind };
+    try std.testing.expect(!std.mem.startsWith(u8, first, &handoff_prefix));
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        enrichmentTerminalFailureSequence(&handoff_prefix),
+    );
+}
+
+test "derived coverage outcome keys are generation scoped" {
+    const alloc = std.testing.allocator;
+    const old_generation = derivedCoverageGeneration("{\"source\":\"body\",\"model\":\"a\"}");
+    const new_generation = derivedCoverageGeneration("{\"source\":\"body\",\"model\":\"b\"}");
+
+    const index_prefix = try derivedCoverageOutcomePrefixAlloc(alloc, "semantic_idx");
+    defer alloc.free(index_prefix);
+    const old_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", old_generation);
+    defer alloc.free(old_prefix);
+    const new_prefix = try derivedCoverageOutcomeMarkerPrefixAlloc(alloc, "semantic_idx", new_generation);
+    defer alloc.free(new_prefix);
+    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1");
+    defer alloc.free(old_key);
+    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1");
+    defer alloc.free(new_key);
+    const skipped_count_key = try derivedCoverageOutcomeCountKeyAlloc(alloc, "semantic_idx", new_generation, "skipped");
+    defer alloc.free(skipped_count_key);
+    const produced_count_key = try derivedCoverageOutcomeCountKeyAlloc(alloc, "semantic_idx", new_generation, "produced");
+    defer alloc.free(produced_count_key);
+
+    try std.testing.expect(std.mem.startsWith(u8, old_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, new_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, skipped_count_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, produced_count_key, index_prefix));
+    try std.testing.expect(!std.mem.eql(u8, skipped_count_key, produced_count_key));
+    try std.testing.expect(std.mem.startsWith(u8, old_key, old_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, new_key, new_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, skipped_count_key, new_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, old_key, new_prefix));
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+
+    var encoded_count: [8]u8 = undefined;
+    const encoded = encodeDerivedCoverageOutcomeCount(&encoded_count, 42);
+    try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageOutcomeCount(encoded));
+}
+
+test "artifact repair issue keys expose authoritative encoded identity" {
+    const alloc = std.testing.allocator;
+    const key = try artifactRepairIssueKeyAlloc(
+        alloc,
+        "semantic\x00index",
+        "embedding",
+        "artifact\x00identity",
+    );
+    defer alloc.free(key);
+
+    var parts = try artifactRepairIssueKeyPartsAlloc(alloc, key);
+    defer parts.deinit(alloc);
+    try std.testing.expectEqualStrings("semantic\x00index", parts.index_name);
+    try std.testing.expectEqualStrings("embedding", parts.repair_artifact_kind);
+    try std.testing.expectEqualStrings("artifact\x00identity", parts.issue_id);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(
+        error.InvalidInternalUserKey,
+        artifactRepairIssueKeyPartsAlloc(alloc, malformed),
+    );
+}
+
+test "managed index admission keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "full\x00text";
+    const key = try managedIndexAdmissionKeyAlloc(alloc, name);
+    defer alloc.free(key);
+    const decoded = try managedIndexAdmissionNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, managedIndexAdmissionNameAlloc(alloc, malformed));
+}
+
+test "index artifact cleanup keys round trip encoded names" {
+    const alloc = std.testing.allocator;
+    const name = "dense\x00index";
+    const generation: u64 = 0x1234_5678_9abc_def0;
+    const root = try indexArtifactCleanupRootPrefixAlloc(alloc);
+    defer alloc.free(root);
+    const key = try indexArtifactCleanupKeyAlloc(alloc, name, generation);
+    defer alloc.free(key);
+    try std.testing.expect(std.mem.startsWith(u8, key, root));
+    const decoded = try indexArtifactCleanupNameAlloc(alloc, key);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+    try std.testing.expectEqual(generation, try indexArtifactCleanupCoverageGeneration(key));
+
+    const malformed = try std.mem.concat(alloc, u8, &.{ key, "trailing" });
+    defer alloc.free(malformed);
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupNameAlloc(alloc, malformed));
+    try std.testing.expectError(error.InvalidInternalUserKey, indexArtifactCleanupCoverageGeneration(malformed));
+}
+
+test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {
+    const alloc = std.testing.allocator;
+    const key = try documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(key);
+    try std.testing.expect(isPrimaryDocumentKey(key));
+    const decoded = (try decodePrimaryDocumentKeyAlloc(alloc, key)).?;
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("person/ada_lovelace", decoded);
+
+    // An asset artifact key is not a primary document key.
+    const asset = try artifactNamedPrefixAlloc(alloc, "person/ada_lovelace", "asset", "relations_v1");
+    defer alloc.free(asset);
+    try std.testing.expect(!isPrimaryDocumentKey(asset));
+    try std.testing.expect((try decodePrimaryDocumentKeyAlloc(alloc, asset)) == null);
+}
+
+test "stored document row keys round trip document and relational keyspaces" {
+    const alloc = std.testing.allocator;
+    const document_id = "person/ada\x00lovelace";
+    const primary = try documentKeyAlloc(alloc, document_id);
+    defer alloc.free(primary);
+    const relational = try relationalRowKeyAlloc(alloc, document_id);
+    defer alloc.free(relational);
+
+    try std.testing.expect(isStoredDocumentRowKey(primary));
+    try std.testing.expect(isStoredDocumentRowKey(relational));
+    try std.testing.expect(!std.mem.eql(u8, primary, relational));
+
+    const decoded_primary = (try decodeStoredDocumentRowKeyAlloc(alloc, primary)).?;
+    defer alloc.free(decoded_primary);
+    const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
+    defer alloc.free(decoded_relational);
+    try std.testing.expectEqualStrings(document_id, decoded_primary);
+    try std.testing.expectEqualStrings(document_id, decoded_relational);
+}
+
+test "document extraction spool keys isolate attempts and preserve unit order" {
+    const alloc = std.testing.allocator;
+    const artifact_root = try documentExtractionUnitSpoolArtifactRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+    );
+    defer alloc.free(artifact_root);
+    const first_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "7:fingerprint-a",
+    );
+    defer alloc.free(first_root);
+    const second_root = try documentExtractionUnitSpoolRootPrefixAlloc(
+        alloc,
+        "doc\x00one",
+        "pages\x00v1",
+        "8:fingerprint-b",
+    );
+    defer alloc.free(second_root);
+    const first = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 1);
+    defer alloc.free(first);
+    const second = try documentExtractionUnitSpoolKeyAlloc(alloc, first_root, 2);
+    defer alloc.free(second);
+
+    try std.testing.expect(std.mem.startsWith(u8, first, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, second, first_root));
+    try std.testing.expect(std.mem.startsWith(u8, first_root, artifact_root));
+    try std.testing.expect(std.mem.startsWith(u8, second_root, artifact_root));
+    try std.testing.expect(!std.mem.startsWith(u8, first, second_root));
+    try std.testing.expect(std.mem.order(u8, first, second) == .lt);
+}
+
+test "graph relationship artifact identity is versioned and owner scoped" {
+    const alloc = std.testing.allocator;
+    const legacy = try graphRelationshipArtifactKeyAlloc(alloc, "a", "facts", "RELATES_TO", "b", "a", "");
+    defer alloc.free(legacy);
+    const old = try graphEdgeArtifactKeyAlloc(alloc, "a", "facts", "RELATES_TO", "b");
+    defer alloc.free(old);
+    try std.testing.expectEqualSlices(u8, old, legacy);
+    const explicit = try graphRelationshipArtifactKeyAlloc(alloc, "fact\x00:1", "facts", "RELATES_TO", "b\x00", "a\x1f", "uuid\x00:1");
+    defer alloc.free(explicit);
+    try std.testing.expect(isGraphEdgeArtifactKey(explicit));
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, explicit)).?;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.index_name);
+        alloc.free(parsed.edge_type);
+        alloc.free(parsed.target_doc_key);
+        alloc.free(parsed.edge_id);
+        alloc.free(parsed.logical_source);
+    }
+    try std.testing.expectEqualStrings("fact\x00:1", parsed.doc_key);
+    try std.testing.expectEqualStrings("a\x1f", parsed.logical_source);
+    try std.testing.expectEqualStrings("uuid\x00:1", parsed.edge_id);
+    const corrupt = try std.mem.concat(alloc, u8, &.{ explicit, "x" });
+    defer alloc.free(corrupt);
+    try std.testing.expect(!isGraphEdgeArtifactKey(corrupt));
+    const owned_legacy = try graphRelationshipArtifactKeyAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a", "");
+    defer alloc.free(owned_legacy);
+    const old_owned = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "fact", "facts", "RELATES_TO", "b", "a");
+    defer alloc.free(old_owned);
+    try std.testing.expectEqualSlices(u8, old_owned, owned_legacy);
+}
+
+/// Allocation-free format admission for primary artifact transfers.
+pub fn graphArtifactHasRelationshipId(key: []const u8) bool {
+    if (!isGraphEdgeArtifactKey(key)) return false;
+    var pos = findComponentTerminator(key, 1).? + 3;
+    pos = findComponentTerminator(key, pos).? + 2;
+    pos = findComponentTerminator(key, pos).? + 3;
+    pos = findComponentTerminator(key, pos).? + 2;
+    pos = findComponentTerminator(key, pos).? + 2;
+    return parseGraphRelationshipSuffix(key, pos).?.edge_id.len != 0;
+}
+
+/// Durable endpoint cleanup is owner-local control state. Source snapshots
+/// must drain it before copying a range; native whole-store recovery retains it.
+pub const graph_endpoint_cleanup_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup:v1:";
+pub fn graphEndpointCleanupKeyAlloc(alloc: Allocator, endpoint: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(endpoint, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.concat(alloc, u8, &.{ graph_endpoint_cleanup_prefix, &hex });
+}
+
+/// Local admission summary. Missing summaries conservatively fence old queues.
+pub const graph_endpoint_cleanup_generation_key = "\x00\x00__metadata__:graph_endpoint_cleanup_generation:v2";
+pub const graph_endpoint_cleanup_count_key = "\x00\x00__metadata__:graph_endpoint_cleanup_active_count:v1";
+pub const graph_endpoint_cleanup_ref_prefix = "\x00\x00__metadata__:graph_endpoint_cleanup_active:v1:";
+pub fn isGraphEndpointCleanupControlKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, graph_owner_replay_prefix) or std.mem.startsWith(u8, key, graph_endpoint_cleanup_prefix) or
+        std.mem.startsWith(u8, key, graph_endpoint_cleanup_ref_prefix) or std.mem.eql(u8, key, graph_endpoint_cleanup_count_key) or std.mem.eql(u8, key, graph_endpoint_cleanup_generation_key);
+}
+
+pub const graph_owner_replay_prefix = "\x00\x00__metadata__:graph_owner_replay:v1:";
+pub fn isGraphOwnerReplayJobKey(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, graph_owner_replay_prefix) or key.len != graph_owner_replay_prefix.len + 64) return false;
+    for (key[graph_owner_replay_prefix.len..]) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}

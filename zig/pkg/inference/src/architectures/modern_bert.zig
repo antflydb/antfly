@@ -42,6 +42,77 @@ fn metalEncoderFrameEnabled() bool {
     return !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_ENCODER_FRAME");
 }
 
+const MetalTrace = struct {
+    enabled: bool = false,
+    per_layer: bool = false,
+    started_ns: u64 = 0,
+    started: ops.NativeQuantTimingStats = .{},
+
+    fn init(cb: *const ComputeBackend) MetalTrace {
+        if (cb.kind() != .metal) return .{};
+        const aggregate = platform.env.getenvBool("TERMITE_METAL_TRACE_MODERNBERT_STAGES");
+        const per_layer = platform.env.getenvBool("TERMITE_METAL_TRACE_MODERNBERT_LAYERS");
+        if (!aggregate and !per_layer) return .{};
+        return .{
+            .enabled = true,
+            .per_layer = per_layer,
+            .started_ns = platform.time.monotonicNs(),
+            .started = cb.debugTimingSnapshot().provider,
+        };
+    }
+
+    fn now(self: MetalTrace) u64 {
+        return if (self.per_layer) platform.time.monotonicNs() else 0;
+    }
+
+    fn snapshot(self: MetalTrace, cb: *const ComputeBackend) ops.NativeQuantTimingStats {
+        return if (self.per_layer) cb.debugTimingSnapshot().provider else .{};
+    }
+
+    fn emitLayer(
+        self: MetalTrace,
+        cb: *const ComputeBackend,
+        layer: usize,
+        started_ns: u64,
+        before: ops.NativeQuantTimingStats,
+    ) void {
+        if (!self.per_layer) return;
+        const after = cb.debugTimingSnapshot().provider;
+        std.debug.print(
+            "metal_modernbert_layer_profile altered_cadence=true layer={d} host_ms={d:.3} frame_begins={d} submissions={d} wait_ms={d:.3} gpu_ms={d:.3} linear_calls={d}\n",
+            .{
+                layer,
+                @as(f64, @floatFromInt(platform.time.monotonicNs() -| started_ns)) / 1.0e6,
+                after.decoder_runtime_frame_begins -| before.decoder_runtime_frame_begins,
+                after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits,
+                @as(f64, @floatFromInt(after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos)) / 1.0e6,
+                after.decoder_runtime_apply_linear_calls -| before.decoder_runtime_apply_linear_calls,
+            },
+        );
+    }
+
+    fn emitAggregate(self: MetalTrace, cb: *const ComputeBackend, tokens: usize, layers: usize) void {
+        if (!self.enabled) return;
+        const after = cb.debugTimingSnapshot().provider;
+        std.debug.print(
+            "metal_modernbert_profile altered_cadence={s} tokens={d} layers={d} host_ms={d:.3} frame_begins={d} submissions={d} wait_ms={d:.3} gpu_ms={d:.3} linear_calls={d} provider_lifetime_device_peak_bytes={d}\n",
+            .{
+                if (self.per_layer) "true" else "false",
+                tokens,
+                layers,
+                @as(f64, @floatFromInt(platform.time.monotonicNs() -| self.started_ns)) / 1.0e6,
+                after.decoder_runtime_frame_begins -| self.started.decoder_runtime_frame_begins,
+                after.decoder_runtime_frame_submits -| self.started.decoder_runtime_frame_submits,
+                @as(f64, @floatFromInt(after.decoder_runtime_frame_wait_nanos -| self.started.decoder_runtime_frame_wait_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(after.decoder_runtime_frame_gpu_nanos -| self.started.decoder_runtime_frame_gpu_nanos)) / 1.0e6,
+                after.decoder_runtime_apply_linear_calls -| self.started.decoder_runtime_apply_linear_calls,
+                after.metal_tensor_device_owned_peak_live_bytes,
+            },
+        );
+    }
+};
+
 /// Hugging Face ModernBERT combines Q/K/V and uses four bias-free linears per
 /// layer. Keep those weights in fixed provider-owned slots rather than letting
 /// each request allocate dynamic slots and upload the same matrices again.
@@ -140,6 +211,15 @@ fn preplanMetalModernBertEncoder(
     // first it avoids even loading the 88 projection weights from safetensors.
     if (metalModernBertEncoderSlotsPrepared(cb, config)) return true;
 
+    // The measured 1B encoder path keeps packed checkpoint weights,
+    // but prepare reusable F16 MPS matrices for encoder-shaped GEMMs. Bound
+    // the shape and per-matrix staging (largest matrix is 52.5 MiB in F32;
+    // all 112 resident F16 matrices total 1,875,378,176 bytes). The override
+    // retains the direct-quant path for controlled comparisons.
+    const prefer_f16_mps = config.metal_f16_weight_mirrors and hidden == 1792 and intermediate == 3840 and
+        layer_count == 28 and heads == 28 and
+        platform.env.getenvBoolDefault("TERMITE_METAL_MODERNBERT_1B_F16_MIRRORS", true);
+
     const qkv_zero_bias = try makeZeroBias(cb, allocator, hidden * 3);
     defer cb.free(qkv_zero_bias);
     const ffn_in_zero_bias = try makeZeroBias(cb, allocator, intermediate * 2);
@@ -168,11 +248,14 @@ fn preplanMetalModernBertEncoder(
                 .out_dim = output_dim,
                 // Native F16 safetensors reach Metal directly through the
                 // prepare path. No F32 mirror is required for this layout.
-                .retain_dense_fallback = false,
+                .retain_dense_fallback = prefer_f16_mps,
+                .dense_fallback_max_bytes = if (prefer_f16_mps) 64 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = prefer_f16_mps,
+                .prefer_f16_mps_fallback = prefer_f16_mps,
                 // MPS GEMM outruns the hand-written dense kernels here
                 // (Laya-large 3.1x, OpenDecider-nano 1.4x on M4 Max); BF16
                 // weights are expanded to F32 for it.
-                .prefer_f32_mps_fallback = !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
+                .prefer_f32_mps_fallback = !prefer_f16_mps and !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
             }))) return false;
         }
     }
@@ -202,6 +285,9 @@ fn preplanMetalModernBertEncoder(
 // ---------------------------------------------------------------------------
 
 pub const Config = struct {
+    /// Execution preference enabled by the measured GLiNER decision path.
+    /// Checkpoint parsing leaves other ModernBERT callers unchanged.
+    metal_f16_weight_mirrors: bool = false,
     laya: ?@import("../models/laya.zig").Config = null,
     vocab_size: u32 = 50368,
     hidden_size: u32 = 768,
@@ -257,50 +343,106 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidModernBertConfig;
     const obj = parsed.value.object;
     var config = Config{};
     if (obj.get("laya")) |value| config.laya = try @import("../models/laya.zig").Config.parse(value);
-    if (obj.get("vocab_size")) |value| config.vocab_size = jsonU32(value) orelse config.vocab_size;
-    if (obj.get("hidden_size")) |value| config.hidden_size = jsonU32(value) orelse config.hidden_size;
-    if (obj.get("num_hidden_layers")) |value| config.num_hidden_layers = jsonU32(value) orelse config.num_hidden_layers;
-    if (obj.get("num_attention_heads")) |value| config.num_attention_heads = jsonU32(value) orelse config.num_attention_heads;
-    if (obj.get("intermediate_size")) |value| config.intermediate_size = jsonU32(value) orelse config.intermediate_size;
-    if (obj.get("max_position_embeddings")) |value| config.max_position_embeddings = jsonU32(value) orelse config.max_position_embeddings;
-    if (obj.get("global_attn_every_n_layers")) |value| config.global_attn_every_n_layers = jsonU32(value) orelse config.global_attn_every_n_layers;
-    if (obj.get("local_attention")) |value| config.local_attention_window = jsonU32(value) orelse config.local_attention_window;
-    if (obj.get("global_rope_theta")) |value| config.global_rope_theta = jsonF32(value) orelse config.global_rope_theta;
-    if (obj.get("local_rope_theta")) |value| config.local_rope_theta = jsonF32(value) orelse config.local_rope_theta;
-    if (obj.get("layer_norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
-    if (obj.get("norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
+    if (obj.get("vocab_size")) |value| config.vocab_size = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("hidden_size")) |value| config.hidden_size = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("num_hidden_layers")) |value| config.num_hidden_layers = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("num_attention_heads")) |value| config.num_attention_heads = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("intermediate_size")) |value| config.intermediate_size = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("max_position_embeddings")) |value| config.max_position_embeddings = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("global_attn_every_n_layers")) |value| config.global_attn_every_n_layers = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("local_attention")) |value| config.local_attention_window = jsonU32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("global_rope_theta")) |value| config.global_rope_theta = jsonF32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("local_rope_theta")) |value| config.local_rope_theta = jsonF32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("layer_norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse return error.InvalidModernBertConfig;
+    if (obj.get("norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse return error.InvalidModernBertConfig;
     // Transformers 5 nests the rope settings per layer type (Ettin, for
     // example, uses 160000 for sliding layers too) and lists each layer's
     // type instead of `global_attn_every_n_layers`.
-    if (obj.get("rope_parameters")) |value| if (value == .object) {
-        if (ropeTheta(value.object, "full_attention")) |theta| config.global_rope_theta = theta;
-        if (ropeTheta(value.object, "sliding_attention")) |theta| config.local_rope_theta = theta;
-    };
+    if (obj.get("rope_parameters")) |value| {
+        if (value != .object) return error.InvalidModernBertConfig;
+        config.global_rope_theta = try ropeTheta(value.object, "full_attention");
+        config.local_rope_theta = try ropeTheta(value.object, "sliding_attention");
+    }
     if (obj.get("layer_types")) |value| try checkLayerTypes(value, config);
 
     // `modernbert` is Transformers' public checkpoint layout. Keep the
     // historical layout available to the fused-chunker training code.
     if (obj.get("model_type")) |value| {
-        if (value == .string and isModernBertModel(value.string)) {
-            config.checkpoint_layout = .huggingface_fused_qkv_no_bias;
-            // Transformers' `rotate_half` layout is split-half, not
-            // consecutive (interleaved) pairs.
-            config.rope_interleaved = false;
-        }
+        if (value != .string or !isModernBertModel(value.string)) return error.InvalidModernBertConfig;
+        config.checkpoint_layout = .huggingface_fused_qkv_no_bias;
+        // Transformers' `rotate_half` layout is split-half, not
+        // consecutive (interleaved) pairs.
+        config.rope_interleaved = false;
+        try requireOptionalString(obj, "hidden_activation", "gelu");
+        // `position_embedding_type` is not checked: Transformers' ModernBERT
+        // neither defines nor reads it and always applies RoPE. Checkpoints
+        // carry leftover values ("absolute" in answerdotai/ModernBERT-base
+        // and Laya, "sans_pos" in Ettin) that do not change the model.
+        try requireOptionalBool(obj, "attention_bias", false);
+        try requireOptionalBool(obj, "mlp_bias", false);
+        try requireOptionalBool(obj, "norm_bias", false);
     }
     if (config.laya) |laya| {
         if (config.hidden_size < 64 or config.hidden_size % 64 != 0 or config.num_attention_heads == 0 or config.hidden_size % config.num_attention_heads != 0 or config.num_hidden_layers == 0 or laya.max_len > config.max_position_embeddings) return error.InvalidLayaConfig;
     }
+    try validateConfig(config);
     return config;
 }
 
-fn ropeTheta(params: std.json.ObjectMap, layer_type: []const u8) ?f32 {
-    const entry = params.get(layer_type) orelse return null;
-    if (entry != .object) return null;
-    return jsonF32(entry.object.get("rope_theta") orelse return null);
+/// Validate the geometry shared by CPU, Metal, and CUDA execution. Keeping
+/// this separate from JSON parsing also protects callers that construct a
+/// Config directly (training fixtures and embedded manifests do both).
+pub fn validateConfig(config: Config) !void {
+    if (config.vocab_size == 0 or
+        config.hidden_size == 0 or
+        config.num_hidden_layers == 0 or
+        config.num_attention_heads == 0 or
+        config.intermediate_size == 0 or
+        config.max_position_embeddings == 0 or
+        config.global_attn_every_n_layers == 0 or
+        config.local_attention_window == 0 or
+        config.hidden_size % config.num_attention_heads != 0)
+    {
+        return error.InvalidModernBertConfig;
+    }
+    // Every supported ModernBERT checkpoint applies full-head RoPE. Both the
+    // interleaved and split-half layouts require an even head dimension.
+    const head_dim = config.hidden_size / config.num_attention_heads;
+    if (head_dim < 2 or head_dim % 2 != 0) return error.InvalidModernBertConfig;
+    if (!std.math.isFinite(config.global_rope_theta) or config.global_rope_theta <= 0 or
+        !std.math.isFinite(config.local_rope_theta) or config.local_rope_theta <= 0 or
+        !std.math.isFinite(config.layer_norm_eps) or config.layer_norm_eps <= 0 or
+        !std.math.isFinite(config.lora_alpha) or config.lora_alpha < 0)
+        return error.InvalidModernBertConfig;
+}
+
+fn ropeTheta(params: std.json.ObjectMap, layer_type: []const u8) !f32 {
+    const entry = params.get(layer_type) orelse return error.InvalidModernBertConfig;
+    if (entry != .object) return error.InvalidModernBertConfig;
+    var fields = entry.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "rope_theta") and !std.mem.eql(u8, field.key_ptr.*, "rope_type"))
+            return error.UnsupportedModernBertRope;
+    }
+    if (entry.object.get("rope_type")) |kind| {
+        if (kind != .string or !std.mem.eql(u8, kind.string, "default")) return error.UnsupportedModernBertRope;
+    }
+    const value = entry.object.get("rope_theta") orelse return error.InvalidModernBertConfig;
+    return jsonF32(value) orelse return error.InvalidModernBertConfig;
+}
+
+fn requireOptionalString(obj: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
+    const value = obj.get(key) orelse return;
+    if (value != .string or !std.mem.eql(u8, value.string, expected)) return error.UnsupportedModernBertConfig;
+}
+
+fn requireOptionalBool(obj: std.json.ObjectMap, key: []const u8, expected: bool) !void {
+    const value = obj.get(key) orelse return;
+    if (value != .bool or value.bool != expected) return error.UnsupportedModernBertConfig;
 }
 
 /// The encoder places full attention on every `global_attn_every_n_layers`-th
@@ -363,6 +505,9 @@ pub fn forwardCT(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    try validateConfig(config);
+    const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+    if (batch == 0 or seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len != total or attention_mask.len != total) return error.InvalidInputShape;
     return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null);
 }
 
@@ -407,8 +552,11 @@ pub fn forwardPackedCT(
     input_ids: []const i64,
     packed_row: Packed,
 ) !CT {
+    try validateConfig(config);
     const seq_len = input_ids.len;
-    if (seq_len == 0 or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    // Independent packed branches restart their logical positions, so their
+    // combined physical rows can exceed the model's positional window.
+    if (seq_len == 0 or seq_len > @import("../models/laya.zig").max_packed_len_limit or packed_row.positions.len != seq_len) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
@@ -451,10 +599,12 @@ pub fn forwardBranchesCT(
     packed_row: Packed,
     branches: Branches,
 ) !CT {
+    try validateConfig(config);
     const rows = branch_ids.len;
     if (rows == 0 or packed_row.positions.len != rows or branches.keys.len != config.num_hidden_layers or branches.values.len != config.num_hidden_layers) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
-    const seq_len = branches.prefix_rows + rows;
+    const seq_len = std.math.add(usize, branches.prefix_rows, rows) catch return error.InvalidInputShape;
+    if (seq_len > @import("../models/laya.zig").max_packed_len_limit) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
     @memset(mask, 1);
@@ -472,6 +622,7 @@ pub fn forwardCapturingCT(
     first_position: usize,
     capture: Capture,
 ) !CT {
+    try validateConfig(config);
     if (capture.layers() != config.num_hidden_layers or @max(capture.values.len, capture.value_tensors.len) != config.num_hidden_layers) return error.InvalidInputShape;
     const n = input_ids.len;
     const mask = try allocator.alloc(i64, n);
@@ -485,7 +636,8 @@ pub fn forwardCapturingCT(
     defer allocator.free(key_positions);
     const ranges = try allocator.alloc(u32, 6 * n);
     defer allocator.free(ranges);
-    if (first_position + n > config.max_position_embeddings) return error.InvalidInputShape;
+    const end_position = std.math.add(usize, first_position, n) catch return error.InvalidInputShape;
+    if (n == 0 or end_position > config.max_position_embeddings) return error.InvalidInputShape;
     for (positions, key_positions, 0..) |*p, *k, i| {
         p.* = @intCast(first_position + i);
         k.* = @intCast(first_position + i);
@@ -506,6 +658,7 @@ fn forwardImpl(
     branches: ?Branches,
     capture: ?Capture,
 ) !CT {
+    const trace = MetalTrace.init(cb);
     const zero_bias: ?CT = if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias)
         try makeZeroBias(cb, allocator, config.hidden_size)
     else
@@ -539,11 +692,23 @@ fn forwardImpl(
     // would mask padding and the local window with a host-built
     // `[heads, seq, seq]` bias per layer, and every linear would multiply the
     // padding rows too.
-    const row_segments = if (packed_row == null and branches == null and capture == null and cb.kind() == .metal and metalRowSegmentsEnabled())
+    const row_segments = if (packed_row == null and branches == null and capture == null and
+        ((cb.kind() == .metal and metalRowSegmentsEnabled()) or cb.kind() == .native))
         try rowSegments(allocator, input_ids, attention_mask, batch, seq_len)
     else
         null;
     defer if (row_segments) |rows| rows.deinit(allocator);
+
+    // One request-owned position upload, retained across all encoder layers.
+    // No cross-request cache or new synchronization boundary is introduced.
+    const fusion_positions: ?CT = if (cb.kind() == .metal and !config.rope_interleaved and
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias and
+        !@import("antfly_platform").env.getenvBool("TERMITE_METAL_DISABLE_GLINER_QKV_ROPE"))
+    blk: {
+        const rows = row_segments orelse break :blk null;
+        break :blk try cb.fromInt32Shape(rows.positions, &.{@intCast(rows.tokens)});
+    } else null;
+    defer if (fusion_positions) |positions| cb.free(positions);
 
     var hidden = if (row_segments) |rows|
         try embeddingsBlock(cb, config, zero_bias, rows.ids, rows.tokens, resident_slots)
@@ -553,6 +718,8 @@ fn forwardImpl(
 
     // 2. Encoder layers
     for (0..config.num_hidden_layers) |layer_idx| {
+        const layer_started_ns = trace.now();
+        const layer_started = trace.snapshot(cb);
         try cb.checkExecutionControl();
         const new_hidden = try encoderLayer(
             cb,
@@ -569,10 +736,21 @@ fn forwardImpl(
             branches,
             capture,
             row_segments,
+            fusion_positions,
         );
         cb.free(hidden);
         hidden = new_hidden;
-        if (cb.execution_control != null and encoder_frame_active and
+        if (trace.per_layer and encoder_frame_active) {
+            // Diagnostic-only attribution fence. This deliberately changes the
+            // production two-layer command-buffer cadence and is unsuitable for
+            // end-to-end latency claims.
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            encoder_frame_active = false;
+            trace.emitLayer(cb, layer_idx, layer_started_ns, layer_started);
+            try cb.checkExecutionControl();
+            if (layer_idx + 1 < config.num_hidden_layers)
+                encoder_frame_active = try cb.decoderRuntimeBeginFrame();
+        } else if (cb.execution_control != null and encoder_frame_active and
             (layer_idx + 1) % 2 == 0 and layer_idx + 1 < config.num_hidden_layers)
         {
             try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -607,6 +785,7 @@ fn forwardImpl(
         encoder_frame_active = false;
     }
     try cb.checkExecutionControl();
+    trace.emitAggregate(cb, if (row_segments) |rows| rows.tokens else batch * seq_len, @intCast(config.num_hidden_layers));
     return hidden;
 }
 
@@ -659,6 +838,7 @@ fn encoderLayer(
     branches: ?Branches,
     capture: ?Capture,
     row_segments: ?RowSegments,
+    fusion_positions: ?CT,
 ) !CT {
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
@@ -700,6 +880,8 @@ fn encoderLayer(
         total,
         H,
         if (resident_slots) modernBertLinearSlot(layer_idx, .qkv) else null,
+        fusion_positions,
+        rope_theta,
         &name_buf,
     );
     defer cb.free(qkv.q);
@@ -710,16 +892,16 @@ fn encoderLayer(
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
     const rope_positions: ?[]const i64 = if (packed_row) |row| row.positions else if (row_segments) |rows| rows.rope_positions else null;
-    const Q = if (rope_positions) |positions|
+    const Q = if (qkv.rotated) qkv.q else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.q, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(Q);
-    const K = if (rope_positions) |positions|
+    defer if (!qkv.rotated) cb.free(Q);
+    const K = if (qkv.rotated) qkv.k else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.k, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(K);
+    defer if (!qkv.rotated) cb.free(K);
 
     if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
     var joined: [2]?CT = .{ null, null };
@@ -790,7 +972,15 @@ fn encoderLayer(
 
     // Residual: add the projected attention output to the *original* (pre-norm)
     // hidden state — pre-norm residual pattern.
-    const hidden_after_attn = try cb.add(attn_proj, hidden);
+    const mlp_ln_w = try getLayerWeight(cb, layer_idx, "mlp_norm.weight", &name_buf);
+    defer cb.free(mlp_ln_w);
+    const mlp_ln_b = if (zero_bias) |bias| bias else try getLayerWeight(cb, layer_idx, "mlp_norm.bias", &name_buf);
+    defer if (zero_bias == null) cb.free(mlp_ln_b);
+    const fused_norm = if (cb.kind() == .metal)
+        try cb.addLayerNormSumCentered(attn_proj, hidden, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps)
+    else
+        null;
+    const hidden_after_attn = if (fused_norm) |fused| fused.sum else try cb.add(attn_proj, hidden);
     defer cb.free(hidden_after_attn);
 
     // -----------------------------------------------------------------------
@@ -798,17 +988,12 @@ fn encoderLayer(
     // -----------------------------------------------------------------------
 
     // Pre-FFN LayerNorm
-    const mlp_ln_w = try getLayerWeight(cb, layer_idx, "mlp_norm.weight", &name_buf);
-    defer cb.free(mlp_ln_w);
-    const normed_ffn = if (try slottedLayerNorm(cb, hidden_after_attn, if (resident_slots) modernBertNormSlot(layer_idx, .mlp) else null, config)) |normed|
+    const normed_ffn = if (fused_norm) |fused| fused.normed else if (try slottedLayerNorm(cb, hidden_after_attn, if (resident_slots) modernBertNormSlot(layer_idx, .mlp) else null, config)) |normed|
         normed
     else if (zero_bias) |bias|
         try cb.layerNorm(hidden_after_attn, mlp_ln_w, bias, H, config.layer_norm_eps)
-    else blk: {
-        const mlp_ln_b = try getLayerWeight(cb, layer_idx, "mlp_norm.bias", &name_buf);
-        defer cb.free(mlp_ln_b);
-        break :blk try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
-    };
+    else
+        try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
     defer cb.free(normed_ffn);
 
     // GeGLU feed-forward (Wi and Wo both have no bias in ModernBERT's MLP)
@@ -839,6 +1024,7 @@ const QkvProjection = struct {
     q: CT,
     k: CT,
     v: CT,
+    rotated: bool = false,
 };
 
 fn projectQkv(
@@ -849,6 +1035,8 @@ fn projectQkv(
     rows: usize,
     hidden_size: usize,
     slot: ?usize,
+    fusion_positions: ?CT,
+    rope_theta: f32,
     name_buf: *[256]u8,
 ) !QkvProjection {
     if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias) {
@@ -864,6 +1052,10 @@ fn projectQkv(
             slot,
         );
         defer cb.free(qkv);
+        if (fusion_positions) |positions| {
+            if (try cb.packedQkvRope(qkv, positions, hidden_size, hidden_size / config.num_attention_heads, rope_theta)) |fused|
+                return .{ .q = fused.first, .k = fused.second, .v = fused.third, .rotated = true };
+        }
         // Use direct slices instead of splitLastDim3: Metal's generic split
         // has a GLiNER-only device gate, while sliceLastDim is device-resident
         // for every dense [rows, columns] ModernBERT activation.
@@ -1766,6 +1958,22 @@ fn putTestWeight(
     try store.resident_weights.put(allocator, owned_name, weight_source.LoadedWeight{ .tensor = tensor });
 }
 
+fn putTinyHfLayer(allocator: std.mem.Allocator, store: *native_compute.WeightStore, layer: usize, include_attn_norm: bool) !void {
+    var name_buf: [128]u8 = undefined;
+    if (include_attn_norm) try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.attn_norm.weight", .{layer}), &.{4}, &.{ 1, 1, 1, 1 });
+    try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp_norm.weight", .{layer}), &.{4}, &.{ 1, 1, 1, 1 });
+    var qkv: [48]f32 = @splat(0);
+    var projection: [16]f32 = @splat(0);
+    for (0..3) |block| {
+        for (0..4) |d| qkv[(block * 4 + d) * 4 + d] = 0.25;
+    }
+    for (0..4) |d| projection[d * 4 + d] = 0.5;
+    try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.attn.Wqkv.weight", .{layer}), &.{ 12, 4 }, &qkv);
+    try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.attn.Wo.weight", .{layer}), &.{ 4, 4 }, &projection);
+    try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.Wi.weight", .{layer}), &.{ 8, 4 }, &(@as([32]f32, @splat(0))));
+    try putTestWeight(allocator, store, try std.fmt.bufPrint(&name_buf, "model.layers.{d}.mlp.Wo.weight", .{layer}), &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
+}
+
 test "HuggingFace ModernBERT config selects fused bias-free checkpoint layout" {
     const cfg = try parseConfig(std.testing.allocator, "{\"model_type\":\"modernbert\",\"hidden_size\":768,\"num_hidden_layers\":22,\"num_attention_heads\":12,\"intermediate_size\":1152,\"vocab_size\":50368,\"max_position_embeddings\":8192,\"local_attention\":128,\"global_attn_every_n_layers\":3}");
     try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, cfg.checkpoint_layout);
@@ -1788,6 +1996,52 @@ test "ModernBERT row segments drop padding and refuse inner padding" {
     try std.testing.expect((try rowSegments(a, &.{ 1, 2, 3 }, &.{ 0, 0, 0 }, 1, 3)) == null);
 }
 
+test "native ModernBERT row segments preserve two-row padded global and local forwards" {
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer deinitTestWeightStore(a, &store);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try putTestWeight(a, &store, "model.embeddings.tok_embeddings.weight", &.{ 8, 4 }, &.{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+        1, 1, 0, 0,
+        0, 1, 1, 0,
+        0, 0, 1, 1,
+        1, 0, 0, 1,
+    });
+    try putTestWeight(a, &store, "model.embeddings.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try putTestWeight(a, &store, "model.final_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
+    try putTinyHfLayer(a, &store, 0, false);
+    try putTinyHfLayer(a, &store, 1, true);
+    const cfg = Config{
+        .vocab_size = 8,
+        .hidden_size = 4,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 2,
+        .intermediate_size = 4,
+        .max_position_embeddings = 8,
+        .global_attn_every_n_layers = 2,
+        .local_attention_window = 2,
+        .checkpoint_layout = .huggingface_fused_qkv_no_bias,
+        .rope_interleaved = false,
+    };
+    const batched = try forward(&cb, a, cfg, &.{ 0, 1, 2, 3, 4, 0 }, &.{ 1, 1, 1, 1, 1, 0 }, 2, 3);
+    defer a.free(batched);
+    const first = try forward(&cb, a, cfg, &.{ 0, 1, 2 }, &.{ 1, 1, 1 }, 1, 3);
+    defer a.free(first);
+    const second = try forward(&cb, a, cfg, &.{ 3, 4 }, &.{ 1, 1 }, 1, 2);
+    defer a.free(second);
+    for (batched[0..12], first) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+    for (batched[12..20], second) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+    // Restored padding maps to a valid row within its own segment. Consumers
+    // ignore it via the original attention mask, but it must never cross rows.
+    for (batched[20..24], second[0..4]) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+}
+
 test "Transformers 5 ModernBERT config reads per-layer-type rope and layer types" {
     const cfg = try parseConfig(std.testing.allocator,
         \\{"model_type":"modernbert","num_hidden_layers":4,"norm_eps":1e-6,
@@ -1800,6 +2054,130 @@ test "Transformers 5 ModernBERT config reads per-layer-type rope and layer types
     try std.testing.expectError(error.UnsupportedModernBertLayerTypes, parseConfig(std.testing.allocator,
         \\{"model_type":"modernbert","num_hidden_layers":3,
         \\"layer_types":["full_attention","full_attention","sliding_attention"]}
+    ));
+}
+
+test "GLiNER2.5 Decide 1B ModernBERT geometry is accepted exactly" {
+    const cfg = try parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","vocab_size":50378,"hidden_size":1792,
+        \\"intermediate_size":3840,"num_hidden_layers":28,"num_attention_heads":28,
+        \\"max_position_embeddings":7999,"local_attention":128,
+        \\"global_attn_every_n_layers":3,"position_embedding_type":"sans_pos",
+        \\"layer_types":["full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention"],
+        \\"rope_parameters":{"full_attention":{"rope_theta":160000.0},"sliding_attention":{"rope_theta":160000.0}}}
+    );
+    try std.testing.expectEqual(@as(u32, 1792), cfg.hidden_size);
+    try std.testing.expectEqual(@as(u32, 3840), cfg.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 28), cfg.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 28), cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 64), cfg.hidden_size / cfg.num_attention_heads);
+    try std.testing.expectEqual(@as(u32, 50378), cfg.vocab_size);
+    try std.testing.expectEqual(@as(u32, 7999), cfg.max_position_embeddings);
+    try std.testing.expectEqual(@as(u32, 128), cfg.local_attention_window);
+    try std.testing.expectEqual(@as(f32, 160000), cfg.global_rope_theta);
+    try std.testing.expectEqual(@as(f32, 160000), cfg.local_rope_theta);
+}
+
+test "ModernBERT rejects unsafe execution geometry" {
+    for ([_][]const u8{
+        "[]",
+        "{\"model_type\":\"modernbert\",\"hidden_size\":0}",
+        "{\"model_type\":\"modernbert\",\"num_attention_heads\":0}",
+        "{\"model_type\":\"modernbert\",\"hidden_size\":768,\"num_attention_heads\":7}",
+        "{\"model_type\":\"modernbert\",\"hidden_size\":15,\"num_attention_heads\":3}",
+        "{\"model_type\":\"modernbert\",\"global_attn_every_n_layers\":0}",
+        "{\"model_type\":\"modernbert\",\"local_attention\":0}",
+        "{\"model_type\":\"modernbert\",\"hidden_size\":\"1792\"}",
+        "{\"model_type\":\"modernbert\",\"vocab_size\":-1}",
+        "{\"model_type\":\"modernbert\",\"global_rope_theta\":0}",
+        "{\"model_type\":\"modernbert\",\"norm_eps\":-0.001}",
+        "{\"model_type\":\"modernbert\",\"rope_parameters\":[]}",
+        "{\"model_type\":\"modernbert\",\"rope_parameters\":{\"full_attention\":{\"rope_theta\":\"160000\"}}}",
+        "{\"model_type\":\"modernbert\",\"rope_parameters\":{\"full_attention\":{\"rope_theta\":160000}}}",
+        "{\"model_type\":17}",
+        "{\"model_type\":\"bert\"}",
+    }) |json| {
+        try std.testing.expectError(error.InvalidModernBertConfig, parseConfig(std.testing.allocator, json));
+    }
+    var invalid = Config{};
+    invalid.global_rope_theta = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidModernBertConfig, validateConfig(invalid));
+    invalid = Config{};
+    invalid.layer_norm_eps = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidModernBertConfig, validateConfig(invalid));
+}
+
+test "ModernBERT rejects declared semantics its fused kernels do not implement" {
+    const prefix = "{\"model_type\":\"modernbert\",";
+    for ([_][]const u8{
+        "\"hidden_activation\":\"relu\"}",
+        "\"hidden_activation\":false}",
+        "\"attention_bias\":true}",
+        "\"attention_bias\":\"false\"}",
+        "\"mlp_bias\":true}",
+        "\"norm_bias\":true}",
+    }) |suffix| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.UnsupportedModernBertConfig, parseConfig(std.testing.allocator, json));
+    }
+    for ([_][]const u8{
+        "{\"model_type\":\"modernbert\",\"rope_parameters\":{\"full_attention\":{\"rope_theta\":160000,\"rope_type\":\"linear\"},\"sliding_attention\":{\"rope_theta\":160000}}}",
+        "{\"model_type\":\"modernbert\",\"rope_parameters\":{\"full_attention\":{\"rope_theta\":160000,\"factor\":2},\"sliding_attention\":{\"rope_theta\":160000}}}",
+    }) |json| try std.testing.expectError(error.UnsupportedModernBertRope, parseConfig(std.testing.allocator, json));
+
+    const supported = try parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","hidden_activation":"gelu","position_embedding_type":"sans_pos",
+        \\"attention_bias":false,"mlp_bias":false,"norm_bias":false,
+        \\"rope_parameters":{"full_attention":{"rope_theta":160000,"rope_type":"default"},"sliding_attention":{"rope_theta":160000}}}
+    );
+    try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, supported.checkpoint_layout);
+
+    // Transformers ignores `position_embedding_type` for ModernBERT; the
+    // reference answerdotai/ModernBERT and Laya checkpoints declare
+    // "absolute" and still use RoPE.
+    for ([_][]const u8{ "\"absolute\"", "\"sans_pos\"", "null" }) |value| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, "\"position_embedding_type\":", value, "}" });
+        defer std.testing.allocator.free(json);
+        const parsed = try parseConfig(std.testing.allocator, json);
+        try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, parsed.checkpoint_layout);
+        try std.testing.expect(!parsed.rope_interleaved);
+    }
+}
+
+test "ModernBERT accepts prepared Laya legacy position metadata without changing RoPE" {
+    const prefix =
+        \\{"model_type":"modernbert","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"intermediate_size":96,"max_position_embeddings":128,
+        \\"global_rope_theta":160000,"local_rope_theta":10000,
+        \\"laya":{"head_layers":2,"max_len":128,"head_max_len":64},
+    ;
+    const baseline = try parseConfig(std.testing.allocator, prefix ++ "\"attention_bias\":false}");
+    for ([_][]const u8{ "\"sans_pos\"", "\"absolute\"", "null", "false", "\"relative\"" }) |position_type| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{s}\"position_embedding_type\":{s}}}", .{ prefix, position_type });
+        defer std.testing.allocator.free(json);
+        const config = try parseConfig(std.testing.allocator, json);
+        try std.testing.expectEqualDeep(baseline, config);
+        try std.testing.expect(config.laya != null);
+        try std.testing.expect(!config.rope_interleaved);
+        try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, config.checkpoint_layout);
+    }
+    for ([_][]const u8{
+        "\"position_embedding_type\":\"absolute\",\"hidden_activation\":\"relu\"}",
+        "\"position_embedding_type\":\"absolute\",\"attention_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"mlp_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"norm_bias\":true}",
+    }) |suffix| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.UnsupportedModernBertConfig, parseConfig(std.testing.allocator, json));
+    }
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","laya":null}
+    ));
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","max_position_embeddings":128,
+        \\"laya":{"max_len":512,"head_max_len":64}}
     ));
 }
 
@@ -1828,6 +2206,10 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     try putTestWeight(allocator, &store, "model.layers.0.mlp_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
     try putTestWeight(allocator, &store, "model.layers.0.mlp.Wi.weight", &.{ 8, 4 }, &(@as([32]f32, @splat(0))));
     try putTestWeight(allocator, &store, "model.layers.0.mlp.Wo.weight", &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "classifier.0.weight", &.{ 8, 4 }, &(@as([32]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "classifier.0.bias", &.{8}, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    try putTestWeight(allocator, &store, "classifier.2.weight", &.{ 1, 8 }, &.{ 1, 1, 1, 1, 1, 1, 1, 1 });
+    try putTestWeight(allocator, &store, "classifier.2.bias", &.{1}, &.{0.5});
 
     const output = try forward(&cb, allocator, .{
         .vocab_size = 4,
@@ -1840,6 +2222,32 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     }, &.{ 0, 1 }, &.{ 1, 1 }, 1, 2);
     defer allocator.free(output);
     try std.testing.expectEqual(@as(usize, 8), output.len);
+
+    // The GLiNER2.5 span classifier consumes raw [L] marker states from the
+    // selected encoder. Exercise its exact H -> 2H -> 1 geometry against the
+    // miniature ModernBERT output so a DeBERTa-only head assumption cannot
+    // creep back into the runtime route.
+    const hidden = try cb.fromFloat32Shape(output, &.{ 2, 4 });
+    defer cb.free(hidden);
+    const marker = (try cb.takeRows(hidden, &.{1}, 1, 4)) orelse return error.TestUnexpectedResult;
+    defer cb.free(marker);
+    const w0 = try cb.getWeight("classifier.0.weight");
+    defer cb.free(w0);
+    const b0 = try cb.getWeight("classifier.0.bias");
+    defer cb.free(b0);
+    const first_linear = try cb.linear(marker, w0, b0, 1, 4, 8);
+    defer cb.free(first_linear);
+    const first = try cb.relu(first_linear);
+    defer cb.free(first);
+    const w2 = try cb.getWeight("classifier.2.weight");
+    defer cb.free(w2);
+    const b2 = try cb.getWeight("classifier.2.bias");
+    defer cb.free(b2);
+    const logits = try cb.linear(first, w2, b2, 1, 8, 1);
+    defer cb.free(logits);
+    const values = try cb.toFloat32(logits, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{36.5}, values);
 }
 
 test "HuggingFace ModernBERT GeGLU uses exact erf activation" {
@@ -1861,4 +2269,38 @@ test "HuggingFace ModernBERT GeGLU uses exact erf activation" {
     defer a.free(values);
     // GELU(-2) = -1 * (1 + erf(-sqrt(2))). Tanh gives -0.0454023.
     try std.testing.expectApproxEqAbs(@as(f32, -0.0455002639), values[0], 3e-7);
+}
+
+test "ModernBERT packed GeGLU preserves odd rows widths and exact activation" {
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitTestWeightStore(a, &store);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1, 7, 17 }) |width| {
+        const rows = 3;
+        const source = try a.alloc(f32, rows * width * 2);
+        defer a.free(source);
+        for (source, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 31)) / 4 - 4;
+        const input = try cb.fromFloat32Shape(source, &.{ rows, @intCast(width * 2) });
+        defer cb.free(input);
+        const fused = (try cb.packedGegluExact(input, rows, width)) orelse return error.MissingPackedGeglu;
+        defer cb.free(fused);
+        const gate = try cb.sliceLastDim(input, 0, width);
+        defer cb.free(gate);
+        const value = try cb.sliceLastDim(input, width, width * 2);
+        defer cb.free(value);
+        const activated = (try cb.geluExact(gate)).?;
+        defer cb.free(activated);
+        const expected = try cb.multiply(activated, value);
+        defer cb.free(expected);
+        const actual_values = try cb.toFloat32(fused, a);
+        defer a.free(actual_values);
+        const expected_values = try cb.toFloat32(expected, a);
+        defer a.free(expected_values);
+        for (actual_values, expected_values) |actual, reference|
+            try std.testing.expectApproxEqAbs(reference, actual, 2e-6);
+        try std.testing.expect(try cb.packedGegluExact(input, rows + 1, width) == null);
+    }
 }

@@ -748,15 +748,19 @@ test "gliner boundary long executor profile includes effective caps and excludes
     left.control = .{ .check_fn = Cancel.check };
     var second = std.crypto.hash.sha2.Sha256.init(.{});
     hashOptions(&second, left);
-    try std.testing.expectEqualSlices(u8, &first.finalResult(), &second.finalResult());
+    const first_digest = first.finalResult();
+    const second_digest = second.finalResult();
+    try std.testing.expectEqualSlices(u8, &first_digest, &second_digest);
     left.record_limits.max_instances -= 1;
     var third = std.crypto.hash.sha2.Sha256.init(.{});
     hashOptions(&third, left);
-    try std.testing.expect(!std.mem.eql(u8, &second.finalResult(), &third.finalResult()));
+    const third_digest = third.finalResult();
+    try std.testing.expect(!std.mem.eql(u8, &second_digest, &third_digest));
     left.joint_solver.profile = .native;
     var fourth = std.crypto.hash.sha2.Sha256.init(.{});
     hashOptions(&fourth, left);
-    try std.testing.expect(!std.mem.eql(u8, &third.finalResult(), &fourth.finalResult()));
+    const fourth_digest = fourth.finalResult();
+    try std.testing.expect(!std.mem.eql(u8, &third_digest, &fourth_digest));
 }
 
 test "gliner boundary long executor profile excludes browser encoder execution scope" {
@@ -1038,7 +1042,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
 
 test "gliner boundary long executor fake windows preserve global decisions ownership and atomic limits" {
     for ([_]FakeMergeMode{ .success, .output_limit, .cancelled, .exhausted }) |mode| try exerciseFakeMerge(std.testing.allocator, mode);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
 }
 
 // The current Zig arena can reject a larger speculative resize then try a

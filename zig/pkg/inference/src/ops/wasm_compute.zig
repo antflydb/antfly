@@ -5801,8 +5801,8 @@ fn exerciseActivationDotAllocationFailures(allocator: std.mem.Allocator, use_gpu
 }
 
 test "wasm_compute: activation dot allocation failures preserve operands and metadata ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
 }
 
 test "wasm_compute: streamed weight and temporary parameter releases invalidate GPU cache" {

@@ -1,7 +1,7 @@
 # Functions in the query DSL and SQL
 
 Status: initial implementation on `design/decision-functions`, 2026-10-02.
-Antfly and Jev providers, DSL evaluation, SQL decision expressions, completed
+Antfly, Jev, and OpenAI providers, DSL evaluation, SQL decision expressions, completed
 MATCH evaluation, and versioned decision asset enrichment are implemented.
 Traversal inference, cross-request caching, error-to-NULL policies, and native
 SQL record types remain future extensions.
@@ -17,10 +17,8 @@ evaluate expressions over existing node, edge, and tuple bindings.
 Start with registered built-ins and a closed expression vocabulary. Arbitrary
 scripts and user-defined functions are outside the initial scope.
 
-Initial decision providers are `antfly` (Antfly inference) and `jev`; both ship
-with the initial implementation. OpenAI Decisions is deferred because it is in
-private preview. The shared provider interface permits future adapters without
-adding them to the initial implementation scope.
+Decision providers are `antfly` (Antfly inference), `jev`, and `openai`
+(OpenAI Decisions). All use the same query functions and named decider registry.
 
 ## Preferred names
 
@@ -37,8 +35,10 @@ adding them to the initial implementation scope.
 | Physical decision operator | `DecisionEval` |
 | Evaluation scopes | `candidates`, `matches` |
 
-Use identical built-in names across query languages. Preserve `/decide`, the
-public proxy route `/ai/v1/decide`, and `noul` in the inference contract.
+Use identical built-in names across query languages. Standalone decisions use
+`/decisions` and `/ai/v1/decisions`, text `input`, named question and answer
+arrays, and predicate `probability`. Jev/Laya wire names remain private adapter
+details. See [the current contract](../docs/guides/decisions.md).
 Query users access Boolean probability through `ai_probability`.
 
 ## Shared expressions and binding
@@ -157,14 +157,14 @@ later improve member access and metadata. Convenience calls return scalar types.
 
 ```sql
 WITH classified AS (
-  SELECT id, ai_decide(transcript, $1, 'support-decider') AS decision
+  SELECT id, ai_probability(transcript,
+    'The input requests a refund.', 'support-decider') AS refund_probability
   FROM conversations
   WHERE status = 'open'
 )
-SELECT id, decision
+SELECT id, refund_probability
 FROM classified
-WHERE CAST(decision -> 'answers' -> 'asks_for_refund' ->> 'noul'
-           AS DOUBLE PRECISION) >= 0.8;
+WHERE refund_probability >= 0.8;
 ```
 
 This example uses matches scope. SQL never introduces a hidden candidate cap;
@@ -280,9 +280,9 @@ published decisions. Use pinned models and secret references for durable specs.
     "config": {
       "version": "support-v1",
       "decider": {"provider": "antfly", "model": "your-decision-model"},
-      "questions": {
-        "refund": {"type": "noul", "instructions": "The customer asks for a refund."}
-      }
+      "questions": [
+        {"name": "refund", "type": "predicate", "instructions": "The customer asks for a refund."}
+      ]
     }
   }
 }
@@ -312,7 +312,8 @@ collection and coordinator merging.
       "max_input_tokens": 1000000,
       "batch_size": 32
     },
-    "jev-decider": {"provider": "jev", "model": "jev-latest"}
+    "jev-decider": {"provider": "jev", "model": "jev-latest"},
+    "safety-decider": {"provider": "openai", "model": "gpt-6-luna"}
   }
 }
 ```
@@ -321,11 +322,37 @@ Jev defaults to `https://api.typesafe.ai/v1/systemone` and resolves credentials
 from configured `api_key` (including secret references) or `TYPESAFE_API_KEY`.
 Antfly inherits the inference URL or uses the embedded provider callback;
 explicit URLs select HTTP. Provider rate limits reuse shared provider quotas.
-Both adapters preserve row alignment and validate complete distributions. The
+All adapters preserve row alignment and validate complete distributions. The
 input token budget reserves the serialized request byte count conservatively
 before inference; reported usage retains the provider's actual token count. The
 portable subset uses text input and instructions, string choice descriptions,
-and 2–64 ordered score levels for Antfly or 2–10 for Jev.
+and 2–64 ordered score levels for Antfly or 2–10 for Jev and OpenAI.
+
+OpenAI defaults to `https://api.openai.com/v1/decisions` and resolves credentials
+from configured `api_key` (including secret references) or `OPENAI_API_KEY`.
+A model is required; `gpt-6-luna` is the model in OpenAI’s launch example.
+Custom `url` values are base URLs including `/v1` when required; the adapter
+appends `/decisions`. Requests and responses use generated types from the
+vendored official OpenAPI spec in `specs/openai-openapi.yaml`.
+
+`ai_decide` accepts the public named question array with `choice`, `score`, and
+`predicate` kinds. The adapter maps convenience-function arguments to that
+contract and preserves explicit score labels. It validates response order,
+names, types, and complete distributions before returning the public named
+answer array. Jev's map and `noul` vocabulary stay private to its adapter. Detailed usage
+fields and the resolved model are preserved. A refusal produces
+`InvalidDecisionOutput` and fails the query; it never becomes zero or NULL.
+
+```sql
+SELECT ai_probability($1,
+  'The proposed command is safe and authorized by the user request.',
+  'safety-decider');
+```
+
+`$1` contains the caller-supplied text context, such as command, working
+directory, and user request. The function evaluates that text without executing
+the command or inspecting the working directory. Probability thresholds require
+validation for the chosen model and task; probabilities are not assumed calibrated.
 
 DSL evaluation rejects cursor pagination, simultaneous reranking/pruning,
 and ordinary aggregations. Approximate vector retrieval cannot use matches
@@ -354,13 +381,13 @@ inference; actual usage is checked after each response as well. A failing batch
 may already have consumed upstream tokens. No automatic retries or provider
 fallback occur.
 
-Implementation lives in `pkg/antfly/src/functions/`, SQL demand evaluation in
+Implementation lives in `pkg/antfly-embedded/src/functions/`, SQL demand evaluation in
 `sql/decision_eval.zig`, and the query coordinator in `api/table_reads.zig`.
 OpenAPI sources and generated Zig, Go, TypeScript, and Python contracts include
 the new evaluation surface.
 
 Validation: `zig build functions-test`, `zig build sql-test`, and the API query
-contract tests. The function tests cover both HTTP protocols, credentials,
+contract tests. The function tests cover all three HTTP protocols, credentials,
 usage, budgets, cancellation, binding reuse, NULL inputs, candidate analytics,
 incomplete matches, graph tuples, public parsing, and materialized provenance.
 
@@ -378,11 +405,11 @@ assignments, VALUES, conflict arms, and RETURNING as well as SELECT stages.
 
 1. Expressions/descriptors: type checking, dependencies, capabilities, no I/O
    during planning.
-2. Antfly and Jev adapters/DecisionEval: row alignment, batch cardinality,
+2. Antfly, Jev, and OpenAI adapters/DecisionEval: row alignment, batch cardinality,
    cancellation, NULLs, malformed outputs, capability parity, and bounded memory.
 3. Candidate DSL/SQL projection and filtering: global windows, binding reuse,
    authorization, Boolean logic, and three-valued SQL semantics.
-4. Matches analytics with Antfly and Jev: full population, budget failure,
+4. Matches analytics with Antfly, Jev, and OpenAI: full population, budget failure,
    aggregation, joins, and unsupported probability operations.
 5. Graph-match expressions/materialization: tuple dependencies, invalidation,
    provenance, and pagination. Traversal inference follows.
@@ -390,6 +417,7 @@ assignments, VALUES, conflict arms, and RETURNING as well as SELECT stages.
 ## References
 
 - [DECIDE.md](DECIDE.md): inference contract and provider integration.
+- [OpenAI Decisions API](https://developers.openai.com/api/reference/resources/decisions/methods/create): upstream request and response contract.
 - [MotherDuck prompt_jev](https://motherduck.com/blog/motherduck-supports-jev/):
   structured classification composed with SQL.
 - [Postgres function attributes](https://www.postgresql.org/docs/current/sql-createfunction.html)

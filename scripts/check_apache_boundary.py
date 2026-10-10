@@ -37,7 +37,7 @@ from license_headers import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "zig/tools"))
 from audit_embedded_source_boundary import production_source
 
-SOURCE_ROOT = "zig/pkg/antfly-embedded/src/local/"
+SOURCE_ROOT = "zig/pkg/antfly-embedded/src/"
 SERVER_SOURCE_ROOT = "zig/pkg/antfly/src/"
 ENTRYPOINTS = (
     "public_capi_root.zig",
@@ -67,7 +67,7 @@ SOURCE_MODULES = {
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "onnx_c": ("zig/pkg/inference/src/backends/onnx_c.h",),
     "ortgenai_c": ("zig/pkg/inference/src/backends/ortgenai_c.h",),
-    "antfly_local_sources": ("zig/pkg/antfly-embedded/src/local/source_catalog.zig",),
+    "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),
     "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
     "sql_parser": ("zig/lib/sql/root.zig",),
     "antfly_public_server_openapi": (
@@ -143,6 +143,10 @@ SOURCE_MODULES = {
     "antfly_embedded_api": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
+    "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_decision_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
+    ),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),
@@ -233,7 +237,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",
     ),
     "antfly_resolver": ("zig/lib/resolver/src/mod.zig",),
-    "antfly_root": ("zig/pkg/antfly-embedded/src/local/capi_embedded_root.zig",),
+    "antfly_root": ("zig/pkg/antfly-embedded/src/capi_embedded_root.zig",),
     "antfly_s3_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig",
     ),
@@ -247,10 +251,8 @@ SOURCE_MODULES = {
     "antfly_sort_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_sort_openapi/root.zig",
     ),
-    "antfly_source_root": ("zig/pkg/antfly-embedded/src/local/embedded_root.zig",),
-    "antfly_storage_root": (
-        "zig/pkg/antfly-embedded/src/local/capi_embedded_root.zig",
-    ),
+    "antfly_source_root": ("zig/pkg/antfly-embedded/src/embedded_root.zig",),
+    "antfly_storage_root": ("zig/pkg/antfly-embedded/src/capi_embedded_root.zig",),
     "antfly_synthesizing": ("zig/lib/synthesizing/src/mod.zig",),
     "antfly_transcribing": ("zig/lib/transcribing/src/mod.zig",),
     "antfly_vector": ("zig/lib/vector/src/mod.zig",),
@@ -260,10 +262,10 @@ SOURCE_MODULES = {
     "cuda_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
     "embedded_api_surface": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
     "embedded_db_surface": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
-    "embedded_support": ("zig/pkg/antfly-embedded/src/local/embedded_root.zig",),
+    "embedded_support": ("zig/pkg/antfly-embedded/src/embedded_root.zig",),
     "embedded_surface": ("zig/pkg/antfly-embedded/src/engine/root.zig",),
     "enrichment_compute_abi": (
-        "zig/pkg/antfly-embedded/src/local/storage/enrichment_compute_abi.zig",
+        "zig/pkg/antfly-embedded/src/storage/enrichment_compute_abi.zig",
     ),
     "handlebars": ("zig/lib/handlebars/src/handlebars.zig",),
     "httpx": ("zig/lib/httpx/src/httpx.zig",),
@@ -294,15 +296,11 @@ SOURCE_MODULES = {
     "inference_tokenizer": ("zig/lib/tokenizer/src/tokenizer.zig",),
     "jinja": ("zig/lib/jinja/src/jinja.zig",),
     "kernel_error_identity": (
-        "zig/pkg/antfly-embedded/src/local/runtime_failure_identity.zig",
+        "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig",
     ),
-    "kernel_owner_abi": (
-        "zig/pkg/antfly-embedded/src/local/storage/kernel_owner_abi.zig",
-    ),
+    "kernel_owner_abi": ("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig",),
     "lmdb_engine": ("zig/lib/lmdb/src/root.zig",),
-    "local_query_client": (
-        "zig/pkg/antfly-embedded/src/local/storage/query_client.zig",
-    ),
+    "local_query_client": ("zig/pkg/antfly-embedded/src/storage/query_client.zig",),
     "metal_jit_identity": ("zig/pkg/inference/tools/jit_identity.zig",),
     "ml": ("zig/lib/ml/src/root.zig",),
     "ml_tabular": ("zig/lib/ml/tabular/src/root.zig",),
@@ -317,20 +315,16 @@ SOURCE_MODULES = {
     "prometheus": ("zig/lib/prometheus/src/root.zig",),
     "protobuf": ("zig/lib/protobuf/src/root.zig",),
     "raft_engine": ("zig/lib/raft/src/root.zig",),
-    "runtime_failure_abi": (
-        "zig/pkg/antfly-embedded/src/local/runtime_failure_abi.zig",
-    ),
+    "runtime_failure_abi": ("zig/pkg/antfly-embedded/src/runtime_failure_abi.zig",),
     "runtime_failure_identity": (
-        "zig/pkg/antfly-embedded/src/local/runtime_failure_identity.zig",
+        "zig/pkg/antfly-embedded/src/runtime_failure_identity.zig",
     ),
-    "runtime_memory_abi": ("zig/pkg/antfly-embedded/src/local/runtime_memory_abi.zig",),
+    "runtime_memory_abi": ("zig/pkg/antfly-embedded/src/runtime_memory_abi.zig",),
     "sentencepiece_proto": (
         "zig/lib/protobuf/src/codegen_main.zig",
         "zig/lib/tokenizer/tools/patch_sentencepiece_proto.zig",
     ),
-    "snowball": (
-        "zig/pkg/antfly-embedded/src/local/search/snowball/generated/root.zig",
-    ),
+    "snowball": ("zig/pkg/antfly-embedded/src/search/snowball/generated/root.zig",),
     "structlog": ("zig/lib/structlog/src/root.zig",),
     "usermgr_storage": ("zig/pkg/antfly/src/usermgr/storage_imports.zig",),
     "vopr": ("zig/lib/vopr/src/root.zig",),

@@ -1,0 +1,183 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+
+const persistent_mod = @import("../../persistent.zig");
+const merger_mod = @import("../../../merger.zig");
+const index_mod = @import("../../../index.zig");
+
+pub fn needsMerge(
+    alloc: Allocator,
+    index: *persistent_mod.PersistentIndex,
+    policy: merger_mod.MergePolicy,
+) !bool {
+    const snap = index.snapshot();
+    if (snap.segments.len < 2) return false;
+    // Scheduling and planning must agree about force-drain debt. A policy
+    // miss above the tier target still needs a task, including after reopen.
+    if (snap.segments.len > policy.max_segments_per_tier) return true;
+
+    const infos = try buildSegmentInfosAlloc(alloc, snap);
+    defer alloc.free(infos);
+
+    const planned = (try policy.plan(alloc, infos)) orelse return false;
+    alloc.free(planned);
+    return true;
+}
+
+/// Force-drain the smallest eligible segments from an already-filtered
+/// candidate list (segments not currently in flight or quarantined). Used
+/// when the tiered policy finds nothing to merge (every eligible segment
+/// floors to the same effective size under floor_segment_size, or no pair
+/// fits under max_segment_size) while the index still holds more live
+/// segments than its steady-state tier target, so producer admission always
+/// has a merge in flight to wait on instead of retrying
+/// TextMergeBackpressureTimeout against a scheduler that gave up.
+pub fn planForceDrainFromInfos(
+    alloc: Allocator,
+    infos: []const merger_mod.SegmentInfo,
+    max_segments_at_once: usize,
+) ![]usize {
+    const plan_len = @min(infos.len, max_segments_at_once);
+    const candidates = try alloc.dupe(merger_mod.SegmentInfo, infos);
+    defer alloc.free(candidates);
+
+    std.mem.sort(merger_mod.SegmentInfo, candidates, {}, struct {
+        fn lessThan(_: void, a: merger_mod.SegmentInfo, b: merger_mod.SegmentInfo) bool {
+            if (a.has_deletions != b.has_deletions) return a.has_deletions;
+            if (a.size != b.size) return a.size < b.size;
+            return a.index < b.index;
+        }
+    }.lessThan);
+
+    const planned = try alloc.alloc(usize, plan_len);
+    for (planned, 0..) |*seg_idx, i| seg_idx.* = candidates[i].index;
+    return planned;
+}
+
+pub fn planPolicyMergeAlloc(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    policy: merger_mod.MergePolicy,
+) !?[]usize {
+    if (snap.segments.len < 2) return null;
+
+    const infos = try buildSegmentInfosAlloc(alloc, snap);
+    defer alloc.free(infos);
+    return try policy.plan(alloc, infos);
+}
+
+pub fn planForceCompactAlloc(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    max_segments_at_once: usize,
+) ![]usize {
+    const plan_len = @min(snap.segments.len, max_segments_at_once);
+    const candidates = try buildSegmentInfosAlloc(alloc, snap);
+    defer alloc.free(candidates);
+
+    std.mem.sort(merger_mod.SegmentInfo, candidates, {}, struct {
+        fn lessThan(_: void, a: merger_mod.SegmentInfo, b: merger_mod.SegmentInfo) bool {
+            if (a.has_deletions != b.has_deletions) return a.has_deletions;
+            if (a.size != b.size) return a.size < b.size;
+            return a.index < b.index;
+        }
+    }.lessThan);
+
+    const planned = try alloc.alloc(usize, plan_len);
+    for (planned, 0..) |*seg_idx, i| seg_idx.* = candidates[i].index;
+    return planned;
+}
+
+pub fn applyPlannedMerge(
+    alloc: Allocator,
+    index: *persistent_mod.PersistentIndex,
+    snap: *const index_mod.IndexSnapshot,
+    planned: []const usize,
+    target_segment_bytes: u64,
+    merge_error_prefix: []const u8,
+    apply_error_prefix: []const u8,
+) !bool {
+    const old_ids = try alloc.alloc(u64, planned.len);
+    defer alloc.free(old_ids);
+    for (planned, 0..) |seg_idx, i| {
+        old_ids[i] = snap.segments[seg_idx].id;
+    }
+
+    if (comptime @import("builtin").os.tag != .freestanding) {
+        if (index.prepareMergedSegmentToFile(snap, planned)) |prepared| {
+            return index.replaceSegmentsIfActiveManyPrepared(old_ids, prepared) catch |err| switch (err) {
+                error.EmptySegment => try index.removeSegmentsIfActive(old_ids),
+                else => {
+                    logErr(apply_error_prefix, err);
+                    return err;
+                },
+            };
+        } else |err| switch (err) {
+            error.Unsupported => {},
+            error.EmptySegment => return try index.removeSegmentsIfActive(old_ids),
+            else => {
+                logErr(merge_error_prefix, err);
+                return err;
+            },
+        }
+    }
+
+    var merged = merger_mod.mergeSegmentsBounded(alloc, snap, planned, .{
+        .target_segment_bytes = @intCast(target_segment_bytes),
+    }) catch |err| {
+        logErr(merge_error_prefix, err);
+        return err;
+    };
+    errdefer merger_mod.freeMergedSegments(alloc, merged);
+
+    const applied = index.replaceSegmentsIfActiveManyOwned(old_ids, merged) catch |err| {
+        merged = &.{};
+        if (err == error.EmptySegment) {
+            return try index.removeSegmentsIfActive(old_ids);
+        }
+        logErr(apply_error_prefix, err);
+        return err;
+    };
+    merged = &.{};
+    return applied;
+}
+
+fn buildSegmentInfosAlloc(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+) ![]merger_mod.SegmentInfo {
+    const infos = try alloc.alloc(merger_mod.SegmentInfo, snap.segments.len);
+    for (snap.segments, 0..) |seg, i| {
+        const deletion_summary = seg.deletionSummary();
+        infos[i] = .{
+            .index = i,
+            .size = seg.data.len(),
+            .doc_count = seg.reader.doc_count,
+            .deleted_count = deletion_summary.count,
+            .has_deletions = deletion_summary.has_deletions,
+        };
+    }
+    return infos;
+}
+
+fn logErr(prefix: []const u8, err: anyerror) void {
+    if (builtin.os.tag != .freestanding) {
+        std.log.err("{s}: {s}", .{ prefix, @errorName(err) });
+    }
+}

@@ -1,0 +1,141 @@
+{
+  "date": "2026-10-05",
+  "source_base": "479e4af31ff2b22e47ff1165d62af021adfc2127",
+  "command": "zig build sql-test pgwire-test sql-native-pipeline-bench -Doptimize=ReleaseSafe -j2 --summary all",
+  "source_files_sha256": {
+    "zig/pkg/antfly-embedded/src/local/sql/aggregate_partial.zig": "d29bb9b5e1d96c57291f5734f447869d285022f0954c526f9f41597f3c42ad31",
+    "zig/pkg/antfly-embedded/src/local/sql/partition_join.zig": "ca2362ad771a8b4e40f78c8d7abf36f913dbe8181fba5f1571d04cf17100f157",
+    "zig/pkg/antfly-embedded/src/local/sql/read_stream.zig": "2075f28e1afbfa6382059356ac8fc7291f0bd21957d55c66659395c6fb39c3ae",
+    "zig/pkg/antfly-embedded/src/local/sql/refinement_bench.zig": "dd905265b26cd8268dada8f7a7c259bf85de9802b32099e938bbfa586d54103f",
+    "zig/pkg/antfly-embedded/src/local/sql/result_cursor.zig": "ea09df4f473edbc91ca809a5ebde3e2ca53f0b6883518c1362d9408451d2d851",
+    "zig/pkg/antfly-embedded/src/local/sql/spill.zig": "f26b7518c2591950d6f29193f072cbb4efc76d905e539d1e66b997e05221aaad",
+    "zig/pkg/antfly-embedded/src/local/sql/typed_store.zig": "55116817cc18231441cc3e10b6721081500e1f40485761a2f075b7c383cdc683",
+    "zig/pkg/antfly-embedded/src/local/sql/vector_eval.zig": "a58f96ebfaa0400ca920a2902cdc840783238ea632f622d514e60d52e3c1fdf3"
+  },
+  "notes": [
+    "Local ReleaseSafe fixtures with equal-output checks and three samples; no timing assertions.",
+    "Native server builds ran concurrently. Allocation counts are more useful than timing comparisons.",
+    "Join: 100,000 rows per side, eight integer columns per side, 16 MiB statement allowance.",
+    "Delivery: 4,096 rows, 1,024-byte repeated payload, 137-row maximum pages, 256 KiB page admission.",
+    "Lease pages retain cursor ownership through terminal cleanup; sorted pages bound decoded capacity.",
+    "Sorted leasing retains more decoded memory than gather delivery in this fixture; timings overlap."
+  ],
+  "before_join": [
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 0,
+      "ns": 1885832791,
+      "allocations": 1278080,
+      "peak_bytes": 9698850,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 1,
+      "ns": 2027220291,
+      "allocations": 1273681,
+      "peak_bytes": 9698850,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 2,
+      "ns": 2148808417,
+      "allocations": 1244396,
+      "peak_bytes": 9698850,
+      "checksum": 79999200000
+    }
+  ],
+  "after": [
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 16286167,
+      "lease_ns": 13343167,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 17579417,
+      "lease_ns": 13380708,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 16377417,
+      "lease_ns": 13295417,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 40322958,
+      "lease_ns": 39896000,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 308673
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 43864250,
+      "lease_ns": 38936333,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 308673
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 41788250,
+      "lease_ns": 48157458,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 308673
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 0,
+      "ns": 1806839416,
+      "allocations": 365596,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 1,
+      "ns": 1490971250,
+      "allocations": 365596,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 2,
+      "ns": 1680832833,
+      "allocations": 365596,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    }
+  ]
+}

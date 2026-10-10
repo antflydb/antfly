@@ -1,6 +1,6 @@
 # Embedded and server source ownership
 
-The local DB and its dependency closure live in `zig/pkg/antfly-embedded/src/local`.
+The local DB and its dependency closure live in `zig/pkg/antfly-embedded/src`.
 The server consumes this implementation through the internal `antfly_local_sources`
 module. The embedded and shared owners are Apache-2.0; the server coordination owner
 remains ELv2. See [LICENSING.md](../../LICENSING.md) for authoritative package
@@ -10,13 +10,23 @@ classification and third-party exceptions.
 
 | Owner | Responsibility |
 | --- | --- |
-| `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, portable lake readers, Lite, public C API and file CLI |
+| `pkg/antfly-embedded/src` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, portable lake readers, Lite, public C API and file CLI |
 | `pkg/antfly-embedded/src/inference` | Antfly Inference providers and embedding integration |
 | `pkg/inference` | Model execution, inference host and native provider exports |
 | `lib/credentials` | Credential-source identities and native AWS discovery/cache shared by lake, backups and Bedrock |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |
 | `build_support/embedded` | Local storage profiles, public C API, native provider archives and browser build |
 | `build_support/antfly` | Shared module composition, dependency configuration, runtime contracts and test collection |
+
+The package uses one implementation tree under `src/`. `storage/` owns the DB,
+WAL, LSM and local durability; `api/` owns embedded operations and their shared
+contracts; `metadata/` owns local catalog contracts; `inference/` owns Antfly
+provider integration and managed embedding. These directories also contain the
+shared contracts previously next to the local implementation. `sql/`, `search/`
+and `graph/` own execution, while `capi/` and `cmd/` own product entry points.
+`root.zig`, `db.zig`, `api.zig` and `engine/` remain the configured public Zig
+surfaces. `source_catalog.zig` remains the private server bridge. Source locations
+do not change named module identities, test ownership or licensing boundaries.
 
 Portable local transaction receipts and replication records remain with the DB.
 Raft application, hot-standby lifecycle, and durability policy remain server features
@@ -41,7 +51,7 @@ coordinated snapshot publication and cluster restore remain server operations.
 Table-drop cleanup fences are shared local contracts. Metadata protocol activation,
 membership barriers, and reallocation requests remain server coordination.
 Native SQL owns its pull stream, typed execution batches, parallel scheduling,
-spill operators, and result cursors in `src/local/sql`. Row-source value/identity
+spill operators, and result cursors in `src/sql`. Row-source value/identity
 contracts and external-table schema bindings belong to the local engine.
 Embedded lake querying is an intentional product capability, similar to using
 DuckDB against files and object storage. Portable Parquet/Iceberg readers,
@@ -108,7 +118,7 @@ the product entry points. Server adapters can use the local implementation, but
 production local code cannot import the server tree. Test-only fixture capabilities
 are supplied explicitly through a named module and share the consumer's types.
 
-Files under `src/local/` omit the redundant `local_` prefix. The query execution
+Files under `src/` omit the redundant `local_` prefix. The query execution
 contracts live in `api/query_execution_contract.zig`, separate from the public
 query contracts in `api/query_contract.zig`. Import aliases can retain `local_`
 when they distinguish these implementations from server coordination at a call site.

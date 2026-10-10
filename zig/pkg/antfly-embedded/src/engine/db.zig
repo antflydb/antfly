@@ -400,6 +400,7 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         resolved.transaction_recovery = .{ .enabled = false };
         resolved.text_merge = .{ .enabled = false };
         resolved.sparse_compaction = .{ .enabled = false };
+        resolved.graph_metric_maintenance = .{ .start_background_loop = false };
     }
     return resolved;
 }

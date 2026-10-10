@@ -21,7 +21,10 @@ zig/CAPI.md "Inference" and antfly.h).
 from __future__ import annotations
 
 import glob
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -106,6 +109,70 @@ def test_embed_missing_model_raises_not_found(tmp_path: Path) -> None:
         with pytest.raises(errors.NotFoundError) as exc_info:
             inf.embed({"model": "nonexistent/does-not-exist", "input": "hello"})
         assert "MODEL_NOT_FOUND" in str(exc_info.value)
+
+
+def test_decide_errors_and_closed_handle(tmp_path: Path) -> None:
+    inf = antfly_embedded.Inference.open(models_dir=tmp_path)
+    try:
+        with pytest.raises(errors.InvalidArgumentError, match="INVALID_REQUEST"):
+            inf.decide({})
+        with pytest.raises(errors.NotFoundError, match="MODEL_NOT_FOUND"):
+            inf.decide(
+                {
+                    "model": "no/such-model",
+                    "input": "refund",
+                    "questions": [{"name": "refund", "type": "predicate", "instructions": "Refund?"}],
+                }
+            )
+    finally:
+        inf.close()
+    with pytest.raises(errors.InvalidArgumentError):
+        inf.decide({})
+
+
+def test_decide_real_runtime_returns_all_answer_types_and_raw_json(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[4] / "scripts/testing/create_decision_fixture.py"
+    model = subprocess.check_output([sys.executable, str(script), str(tmp_path)], text=True).strip()
+    request = {
+        "model": model,
+        "input": "Refund the duplicate charge.",
+        "questions": [
+            {
+                "name": "route",
+                "type": "choice",
+                "instructions": "Which team?",
+                "choices": [
+                    {"value": "billing", "description": "Charges"},
+                    {"value": "support", "description": "Product"},
+                ],
+            },
+            {
+                "name": "urgency",
+                "type": "score",
+                "instructions": "How urgent?",
+                "levels": [{"label": "Routine"}, {"label": "Soon"}, {"label": "Immediate"}],
+            },
+            {"name": "refund", "type": "predicate", "instructions": "Refund requested?"},
+        ],
+    }
+    with antfly_embedded.Inference.open(models_dir=tmp_path) as inf:
+        result = inf.decide(request)
+        assert result["model"] == model
+        route, urgency, refund = result["answers"]
+        assert route["name"] == "route" and route["choice"] == "billing"
+        assert route["probabilities"] == [
+            {"value": "billing", "probability": 0.5},
+            {"value": "support", "probability": 0.5},
+        ]
+        assert urgency["score"] == pytest.approx(1.0)
+        assert [level["label"] for level in urgency["probabilities"]] == ["Routine", "Soon", "Immediate"]
+        assert sum(level["probability"] for level in urgency["probabilities"]) == pytest.approx(1.0)
+        assert refund["type"] == "predicate" and refund["probability"] == pytest.approx(0.5)
+        assert result["usage"]["input_tokens"] > 0
+        assert result["usage"]["output_tokens"] == 0
+        raw = inf.decide(json.dumps(request), raw=True)
+        assert isinstance(raw, bytes)
+        assert json.loads(raw) == result
 
 
 def test_pull_missing_model_field_raises_invalid_argument(tmp_path: Path) -> None:

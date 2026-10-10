@@ -9,7 +9,7 @@ Runners:
 
 | Runner | Location | Command |
 |---|---|---|
-| Reference (raw C ABI via `antfly.h`) | `zig/pkg/antfly-embedded/src/local/capi/conformance_runner.zig` | `zig build capi-conformance` |
+| Reference (raw C ABI via `antfly.h`) | `zig/pkg/antfly-embedded/src/capi/conformance_runner.zig` | `zig build capi-conformance` |
 | Go | `go/pkg/embedded/conformance_cgo_test.go` | `go test -tags libantfly -run Conformance` |
 | Python | `py/packages/embedded/tests/test_conformance.py` | `uv run pytest tests/test_conformance.py` |
 | Rust | `rs/crates/embedded/tests/conformance.rs` | `cargo test -p antfly-embedded --features libantfly --test conformance` |
@@ -106,3 +106,13 @@ Values written as JSON objects in a case (`value`, `request`, `config`,
 | `close` | | closes the current handle; only `reopen` or `restore_open` may follow | none |
 
 `batch` timestamps are nanoseconds and must increase within a case.
+
+### SQL driver conformance
+
+`sql/cases.json` is shared by Go's database/sql tests, Python's PEP 249 tests,
+Rust's SQLx tests, and TypeScript's connection tests. Expected integer cells
+are decimal strings. Cases cover positional binding, exact int64, booleans,
+text, JSON, NULL, and SQLSTATE. Driver tests additionally exercise transaction
+isolation, savepoints, foreign keys, catalog reopen, and streaming past 128
+rows. Run Rust with `--features libantfly,sqlx --test sqlx`; the other packages
+discover SQL tests with their ordinary native-library test commands.

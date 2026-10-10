@@ -494,6 +494,65 @@ pub fn apply(alloc: Allocator, store: Store, prior: ?Ref, changes: []const Mutat
     return root;
 }
 
+/// Retain a strictly ordered subset whose membership the caller has already
+/// authenticated against prior. Counts let a complete branch survive without
+/// fetching any descendant pages. Empty branches are dropped without reads.
+/// This is intentionally separate from apply: unknown keys are mutations,
+/// never evidence that an old branch is wholly retained.
+pub fn retainKnown(alloc: Allocator, store: Store, prior: ?Ref, keys: []const []const u8) !?Ref {
+    try store.check(store.ptr);
+    for (keys, 0..) |key, i| if (key.len == 0 or (i != 0 and !less(keys[i - 1], key))) return error.UnsortedGraphPageMutations;
+    const root = prior orelse return if (keys.len == 0) null else error.InvalidGraphPage;
+    try root.validate();
+    if (keys.len > root.records) return error.InvalidGraphPage;
+    if (keys.len == root.records) return root;
+    if (keys.len == 0) return null;
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    try retainPage(alloc, store, root, keys, &children);
+    if (children.items.len != 1) return error.InvalidGraphPage;
+    var result = children.items[0].ref;
+    while (result.height != 0) {
+        var page = try load(alloc, store, result);
+        defer page.deinit(alloc);
+        if (page.entries.len != 1) break;
+        result = page.entries[0].child.?;
+    }
+    return result;
+}
+fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, out: *Children) anyerror!void {
+    try store.check(store.ptr);
+    if (keys.len == 0) return;
+    if (keys.len > ref.records) return error.InvalidGraphPage;
+    if (keys.len == ref.records) return appendChild(alloc, out, keys[0], ref);
+    var page = try load(alloc, store, ref);
+    defer page.deinit(alloc);
+    if (ref.height == 0) {
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(alloc);
+        var next: usize = 0;
+        for (page.entries) |entry| if (next < keys.len and std.mem.eql(u8, entry.key, keys[next])) {
+            try entries.append(alloc, entry);
+            next += 1;
+        };
+        if (next != keys.len) return error.InvalidGraphPage;
+        return pack(alloc, store, entries.items, 0, out);
+    }
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    var begin: usize = 0;
+    for (page.entries, 0..) |entry, i| {
+        var end = begin;
+        while (end < keys.len and (i + 1 == page.entries.len or less(keys[end], page.entries[i + 1].key))) : (end += 1) {}
+        try retainPage(alloc, store, entry.child.?, keys[begin..end], &children);
+        begin = end;
+    }
+    try rebalance(alloc, store, &children);
+    const entries = try childEntries(alloc, children.items);
+    defer alloc.free(entries);
+    try pack(alloc, store, entries, ref.height, out);
+}
+
 /// Construct an initial tree from a strictly ordered stream. Only one pending
 /// page per height is retained; leaf records and every level's routing entries
 /// are released as soon as their page is persisted. The source's borrowed
@@ -580,6 +639,38 @@ const SortedBuilder = struct {
     }
 };
 
+/// Resolve a sorted membership batch by visiting each affected subtree once.
+/// Unrelated leaves are never scanned; all pages retain normal integrity and
+/// parent separator validation. Duplicate query keys are supported.
+pub fn containsMany(alloc: Allocator, store: Store, root: ?Ref, keys: []const []const u8, found: []bool) !void {
+    if (keys.len != found.len) return error.InvalidGraphPage;
+    for (keys, 0..) |key, index| if (index != 0 and less(key, keys[index - 1])) return error.InvalidGraphPage;
+    @memset(found, false);
+    if (root) |ref| if (keys.len != 0) try containsPage(alloc, store, ref, keys, found, null, null);
+}
+fn containsPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, found: []bool, first: ?[]const u8, end: ?[]const u8) !void {
+    var page = try load(alloc, store, ref);
+    defer page.deinit(alloc);
+    if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+    if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+    var position: usize = 0;
+    if (ref.height == 0) {
+        for (keys, found) |key, *present| {
+            while (position < page.entries.len and less(page.entries[position].key, key)) position += 1;
+            present.* = position < page.entries.len and std.mem.eql(u8, page.entries[position].key, key);
+        }
+        return;
+    }
+    while (position < keys.len and less(keys[position], page.entries[0].key)) position += 1;
+    for (page.entries, 0..) |entry, index| {
+        const upper = if (index + 1 < page.entries.len) page.entries[index + 1].key else end;
+        const begin = position;
+        while (position < keys.len and (upper == null or less(keys[position], upper.?))) position += 1;
+        if (position != begin) try containsPage(alloc, store, entry.child.?, keys[begin..position], found[begin..position], entry.key, upper);
+        if (position == keys.len) break;
+    }
+}
+
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
 pub const Cursor = struct {
@@ -588,6 +679,8 @@ pub const Cursor = struct {
     frames: [max_height + 1]Frame = undefined,
     depth: usize = 0,
     upper: ?[]const u8,
+    lower: []const u8 = "",
+    reverse: bool = false,
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
     pub const Record = struct { key: []const u8, value: []const u8 };
@@ -598,6 +691,72 @@ pub const Cursor = struct {
         if (upper) |bound| if (!less(lower, bound)) return self;
         if (root) |ref| try self.descend(ref, lower, null, null);
         return self;
+    }
+
+    /// Reverse traversal of the same half-open range. Seek one root-to-leaf
+    /// path at the upper bound, then visit preceding siblings lazily.
+    pub fn initReverse(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8) !Cursor {
+        var self: Cursor = .{ .alloc = alloc, .store = store, .upper = upper, .lower = lower, .reverse = true };
+        errdefer self.deinit();
+        if (upper) |bound| if (!less(lower, bound)) return self;
+        if (root) |ref| try self.descendReverse(ref, upper, null, null);
+        return self;
+    }
+
+    fn descendReverse(self: *Cursor, first: Ref, upper: ?[]const u8, first_key: ?[]const u8, end_key: ?[]const u8) !void {
+        var ref = first;
+        var expected_first = first_key;
+        var expected_end = end_key;
+        while (true) {
+            if (self.depth == self.frames.len) return error.InvalidGraphPage;
+            var page = try load(self.alloc, self.store, ref);
+            errdefer page.deinit(self.alloc);
+            if (expected_first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+            if (expected_end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+            var lo: usize = 0;
+            var hi = page.entries.len;
+            if (upper) |bound| {
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (less(page.entries[mid].key, bound)) lo = mid + 1 else hi = mid;
+                }
+            } else lo = hi;
+            if (ref.height == 0 or lo == 0) {
+                self.frames[self.depth] = .{ .page = page, .next = lo, .end = expected_end };
+                self.depth += 1;
+                return;
+            }
+            const index = lo - 1;
+            self.frames[self.depth] = .{ .page = page, .next = index, .end = expected_end };
+            self.depth += 1;
+            ref = page.entries[index].child.?;
+            expected_first = page.entries[index].key;
+            if (index + 1 < page.entries.len) expected_end = page.entries[index + 1].key;
+        }
+    }
+
+    fn previous(self: *Cursor) !?Record {
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.next == 0) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            }
+            frame.next -= 1;
+            const entry = frame.page.entries[frame.next];
+            if (entry.child) |child| {
+                const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
+                try self.descendReverse(child, null, entry.key, end);
+            } else {
+                if (less(entry.key, self.lower)) {
+                    self.deinit();
+                    return null;
+                }
+                return .{ .key = entry.key, .value = entry.value };
+            }
+        }
+        return null;
     }
 
     /// Resume an ordered stream by its stable record offset without reading
@@ -671,6 +830,7 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !?Record {
         try self.store.check(self.store.ptr);
+        if (self.reverse) return self.previous();
         while (self.depth != 0) {
             const frame = &self.frames[self.depth - 1];
             if (frame.next == frame.page.entries.len) {
@@ -729,6 +889,16 @@ fn countInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper
 /// Optional visitRecord callbacks borrow leaf bytes only for the duration of
 /// the call and run before visit, allowing body-before-page reclamation without
 /// reloading the leaf.
+/// Visit one authenticated page without recursively loading its descendants.
+/// Durable collectors can checkpoint the child frontier between pages.
+pub fn walkPage(alloc: Allocator, store: Store, root: Ref, visitor: anytype) anyerror!void {
+    var page = try load(alloc, store, root);
+    defer page.deinit(alloc);
+    for (page.entries) |entry| {
+        if (entry.child) |child| try visitor.child(child) else try visitor.record(entry.key, entry.value);
+    }
+}
+
 pub fn walkPostOrder(alloc: Allocator, store: Store, root: Ref, visitor: anytype, allow_missing: bool) anyerror!void {
     try store.check(store.ptr);
     if (try visitor.skip(root)) return;
@@ -1028,7 +1198,7 @@ fn allocationExercise(alloc: Allocator) !void {
 }
 
 test "serverless graph page tree releases every allocation on failed build update and scan" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }
 
 test "serverless graph page tree interrupted uploads never change the published root" {
@@ -1192,4 +1362,110 @@ test "serverless graph pages bound long indivisible keys and branch packing make
     defer cursor.deinit();
     for (changes) |change| try std.testing.expectEqualStrings(change.key, (try cursor.next()).?.key);
     try std.testing.expectEqual(null, try cursor.next());
+}
+
+test "external lake batched membership visits shared routing paths once" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var names: [2000][8]u8 = undefined;
+    var changes: [2000]Mutation = undefined;
+    const value = @as([128]u8, @splat(42));
+    for (&names, &changes, 0..) |*name, *change, index| {
+        std.mem.writeInt(u64, name, index * 2, .big);
+        change.* = .{ .key = name, .value = &value };
+    }
+    const root = (try apply(a, backing.store(), null, &changes)).?;
+    var query_names: [256][8]u8 = undefined;
+    var keys: [256][]const u8 = undefined;
+    var found: [256]bool = undefined;
+    for (&query_names, &keys, 0..) |*name, *key, index| {
+        std.mem.writeInt(u64, name, 1800 + index, .big);
+        key.* = name;
+    }
+    const reads = backing.reads;
+    try containsMany(a, backing.store(), root, &keys, &found);
+    for (found, 0..) |present, index| try std.testing.expectEqual(index % 2 == 0, present);
+    try std.testing.expect(backing.reads - reads < 8);
+    try containsMany(a, backing.store(), null, &keys, &found);
+    for (found) |present| try std.testing.expect(!present);
+    std.mem.swap([]const u8, &keys[0], &keys[1]);
+    try std.testing.expectError(error.InvalidGraphPage, containsMany(a, backing.store(), root, &keys, &found));
+}
+
+test "external lake contribution retention adopts full branches and removes obsolete keys" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const keep = try a.alloc([]const u8, count);
+    defer a.free(keep);
+    const value = @as([128]u8, @splat(42));
+    for (names, changes, keep, 0..) |*name, *change, *key, i| {
+        std.mem.writeInt(u64, name, i, .big);
+        change.* = .{ .key = name, .value = &value };
+        key.* = name;
+    }
+    const prior = (try apply(a, backing.store(), null, changes)).?;
+    const reads = backing.reads;
+    const writes = backing.writes;
+    try std.testing.expect(prior.eql((try retainKnown(a, backing.store(), prior, keep)).?));
+    try std.testing.expectEqual(reads, backing.reads);
+    try std.testing.expectEqual(writes, backing.writes);
+    const retained = (try retainKnown(a, backing.store(), prior, keep[0..1500])).?;
+    try std.testing.expectEqual(@as(u64, 1500), retained.records);
+    // Only the frontier and a partially retained leaf need reads.
+    try std.testing.expect(backing.reads - reads < 8);
+    var cursor = try Cursor.init(a, backing.store(), retained, "", null);
+    defer cursor.deinit();
+    var index: usize = 0;
+    while (try cursor.next()) |row| : (index += 1) {
+        try std.testing.expectEqualSlices(u8, &names[index], row.key);
+        try std.testing.expectEqualSlices(u8, &value, row.value);
+    }
+    try std.testing.expectEqual(@as(usize, 1500), index);
+    try std.testing.expect(try retainKnown(a, backing.store(), prior, &.{}) == null);
+    // Prior generations remain immutable and readable after the cut.
+    try std.testing.expectEqual(@as(u64, 2000), try countRange(a, backing.store(), prior, "", null));
+}
+
+test "external lake reverse tree seeks bounded ranges across leaves" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const Source = struct {
+        index: u64 = 0,
+        key: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.index == 10000) return null;
+            std.mem.writeInt(u64, &self.key, self.index, .big);
+            self.index += 1;
+            return .{ .key = &self.key, .value = "value" };
+        }
+    };
+    var source: Source = .{};
+    const root = try buildSorted(a, backing.store(), &source);
+    for ([_][2]u64{ .{ 0, 10000 }, .{ 0, 1 }, .{ 228, 500 }, .{ 9990, 10000 }, .{ 500, 500 }, .{ 10001, 11000 } }) |bounds| {
+        var lower: [8]u8 = undefined;
+        var upper: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lower, bounds[0], .big);
+        std.mem.writeInt(u64, &upper, bounds[1], .big);
+        var reverse = try Cursor.initReverse(a, backing.store(), root, &lower, &upper);
+        defer reverse.deinit();
+        var expected = @min(bounds[1], 10000);
+        while (try reverse.next()) |record| {
+            expected -= 1;
+            try std.testing.expectEqual(expected, std.mem.readInt(u64, record.key[0..8], .big));
+        }
+        try std.testing.expectEqual(@min(bounds[0], 10000), expected);
+    }
+    const before = backing.reads;
+    var last = try Cursor.initReverse(a, backing.store(), root, "", null);
+    defer last.deinit();
+    try std.testing.expectEqual(@as(u64, 9999), std.mem.readInt(u64, (try last.next()).?.key[0..8], .big));
+    try std.testing.expect(backing.reads - before <= root.?.height + 1);
 }

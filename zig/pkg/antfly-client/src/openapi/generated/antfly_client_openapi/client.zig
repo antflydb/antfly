@@ -378,7 +378,7 @@ pub const CreateTableResponse = union(enum) {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
-    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN. Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
     consistency: ?[]const u8 = null,
 };
 
@@ -515,10 +515,10 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Answer named choice, ordinal score, and Boolean questions
-    /// POST /ai/v1/decide
+    /// Answer named decision questions
+    /// POST /ai/v1/decisions
     pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decide", .{self.base_url});
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);

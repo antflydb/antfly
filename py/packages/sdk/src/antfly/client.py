@@ -41,6 +41,8 @@ from antfly.client_generated.models import (
     GraphTraverseQuery,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
+    InferenceDecideRequest,
+    InferenceDecideResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
@@ -842,6 +844,25 @@ class AntflyClient:
                 f"{self.max_write_request_bytes}"
             )
         return encoded
+
+    def decide(self, request: InferenceDecideRequest | Mapping[str, Any]) -> InferenceDecideResponse:
+        """Answer named choice, multi-choice, score, and predicate questions."""
+        body = request.to_dict() if isinstance(request, InferenceDecideRequest) else dict(request)
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/decisions", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            raw, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            if truncated:
+                raise AntflyException(f"decision response exceeded {self.max_json_response_bytes} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError("response must be a JSON object")
+                return InferenceDecideResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise AntflyException(f"decision returned invalid JSON: {exc}") from exc
 
     def extract(self, request: ExtractionRequest | Mapping[str, Any]) -> ExtractionResponse:
         """Run canonical atomic extraction, preserving explicit schema versions.

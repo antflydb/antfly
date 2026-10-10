@@ -732,6 +732,9 @@ importers:
       '@types/node':
         specifier: ^25.9.3
         version: 25.9.3
+      kysely:
+        specifier: ^0.29.6
+        version: 0.29.6
       tsup:
         specifier: ^8.5.1
         version: 8.5.1(jiti@2.7.0)(postcss@8.5.15)(supports-color@10.2.2)(tsx@4.22.4)(typescript@5.9.3)(yaml@2.9.0)
@@ -7039,6 +7042,10 @@ packages:
 
   zwitch@2.0.4:
     resolution: {integrity: sha512-bXE4cR/kVZhKZX/RjPEflHaKVhUVl85noU3v6b8apfQEc1x4A+zBxjZ4lN8LqGd6WZ3dl98pY4o717VFmoPp+A==}
+
+  kysely@0.29.6:
+    resolution: {integrity: sha512-hHaB8C/rfzDDtr/t8YZwxAuPJTT0zHyaPoVzcXwDYhYNAgH/4sIfVhi/XLLIY+bL/FqaIJnjATDbi8ObSELmxg==}
+    engines: {node: '>=22.0.0'}
 
 snapshots:
 
@@ -13584,3 +13591,5 @@ snapshots:
       react: 19.2.7
 
   zwitch@2.0.4: {}
+
+  kysely@0.29.6: {}

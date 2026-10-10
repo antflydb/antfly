@@ -1076,6 +1076,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
@@ -1086,6 +1087,8 @@ const LocalStandaloneMetadata = struct {
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
+                .get_lake_index_lifecycle = if (durable) getLakeIndexLifecycle else null,
+                .mutate_lake_index_lifecycle = if (durable) mutateLakeIndexLifecycle else null,
                 .publish_vector_migration_table = publishVectorMigrationTable,
                 .begin_vector_migration_command = beginVectorMigrationCommand,
                 .end_vector_migration_command = endVectorMigrationCommand,
@@ -1267,6 +1270,35 @@ const LocalStandaloneMetadata = struct {
         // owner and rehydrates durable attempts before enabling dispatch.
         try server.prepareRestoreLeadership(term);
         self.prepared_restore_term = term;
+    }
+
+    fn getLakeIndexLifecycle(ptr: *anyopaque, alloc: std.mem.Allocator, table_id: u64, request: LifecycleRequest) ![]u8 {
+        try request.ensureActive();
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getLakeIndexLifecycle(alloc, group_ids.main_metadata_group_id, table_id);
+    }
+
+    fn mutateLakeIndexLifecycle(ptr: *anyopaque, table_id: u64, revision: u64, mutation: @import("../metadata/lake_index_lifecycle.zig").Mutation, request: LifecycleRequest) !void {
+        try request.ensureActive();
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+        const before = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, group_ids.main_metadata_group_id, table_id));
+        if (before.revision != revision) return error.CatalogGenerationChanged;
+        _ = try lifecycle.encode(a, try mutation.apply(a, before));
+        try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .mutate_lake_index_lifecycle = .{ .table_id = table_id, .expected_revision = revision, .mutation = mutation } });
+        self.epoch = @max(1, try store.standaloneRevision());
+        self.durable_revision = self.epoch;
+        const observed = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, group_ids.main_metadata_group_id, table_id));
+        if (observed.revision <= revision or !mutation.observed(observed)) return error.MetadataMutationOutcomeUnknown;
     }
 
     fn getBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64, request: LifecycleRequest) !?[]u8 {
@@ -2419,6 +2451,19 @@ const LocalStandaloneMetadata = struct {
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
+        if (call == .lake_index_lifecycle_work) {
+            try context.ensureActive();
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).lakeIndexLifecycleWork(alloc, group_ids.main_metadata_group_id, call.lake_index_lifecycle_work);
+        }
+        if (call == .lake_index_lifecycle_mutate) {
+            if (!context.setting_admin) return error.Forbidden;
+            const write = call.lake_index_lifecycle_mutate;
+            try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
+            return alloc.dupe(u8, "{}");
+        }
         if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
@@ -2435,7 +2480,7 @@ const LocalStandaloneMetadata = struct {
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
-        if (!lockAtomicUntil(&self.mutex, context.deadline_ns)) return error.DeadlineExceeded;
+        if (!lockAtomicUntil(&self.mutex, (try context.platformDeadline()).deadline_ns)) return error.DeadlineExceeded;
         var locked = true;
         defer if (locked) self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
@@ -2450,6 +2495,7 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -2803,7 +2849,7 @@ const LocalStandaloneMetadata = struct {
                     const namespace = try state.namespaceFor(command.database, command.namespace);
                     const explicit = if (command.tablespace) |n| (state.find(.tablespace, 0, n) orelse return error.TablespaceNotFound).id else 0;
                     const policy = if (try state.effectiveTablespace(namespace, explicit)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
-                    if (req.num_shards == null) req.num_shards = policy.min_ranges;
+                    if ((req.storage orelse antfly.common.table_storage.Settings{}).engine == .local and req.num_shards == null) req.num_shards = policy.min_ranges;
                     table = try self.deriveCreatedTableRecord(name, req);
                     if (policy.placement_role) |role| table.?.placement_role = role;
                     // Standalone owns one local replica; policy metadata remains
@@ -2842,8 +2888,8 @@ const LocalStandaloneMetadata = struct {
                     const namespace = try state.namespaceFor(command.database, command.namespace);
                     const policy = if (try state.effectiveTablespace(namespace, delta.upserts[0].tablespace_id)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
                     current.placement_role = policy.placement_role orelse "data";
-                    current.min_ranges = policy.min_ranges orelse 1;
-                    if (self.storage_engine == .lite and current.min_ranges != 1) return error.InvalidCreateTableRequest;
+                    current.min_ranges = if (current.storage.engine == .object) 0 else policy.min_ranges orelse 1;
+                    if (self.storage_engine == .lite and current.storage.engine == .local and current.min_ranges != 1) return error.InvalidCreateTableRequest;
                     try mutation.upsertTable(self, current);
                 }
                 try mutation.applyCatalog(self, delta);
@@ -2867,12 +2913,19 @@ const LocalStandaloneMetadata = struct {
                 if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
             }
         }
-        const replicated = !self.vector_source_storage_allowed or
+        const replicated = (!self.vector_source_storage_allowed and (req.storage orelse antfly.common.table_storage.Settings{}).engine == .local) or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
+        try antfly.public_api.tables.validateObjectCreateDefinition(self.alloc, req);
         var resolved_req = req;
         resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, self.storage_engine != .local);
         var table = try deriveStandaloneTableRecord(self.storage_engine, table_name, resolved_req);
-        if (self.lifecycle_store) |store| table.table_id = try store.resolveTableCreateIdentity(group_ids.main_metadata_group_id, table.table_id);
+        if (self.lifecycle_store) |store| {
+            table.table_id = try store.resolveTableCreateIdentity(group_ids.main_metadata_group_id, table.table_id);
+        }
+        // Range-less standalone mutations do not advance data topology fences.
+        // The epoch commits with the table row and survives catalog reopen.
+        if (table.storage.engine == .object) table.object_storage_generation = std.math.add(u64, self.epoch, 1) catch return error.ObjectTableGenerationExhausted;
         return table;
     }
 
@@ -2924,7 +2977,7 @@ const LocalStandaloneMetadata = struct {
         var parsed = try std.json.parseFromSlice(CatalogCreate, self.alloc, record.payload, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         const value = parsed.value;
-        if ((value.schema_version != 3 and value.schema_version != 4) or value.ranges.len == 0 or
+        if ((value.schema_version != 3 and value.schema_version != 4) or (value.ranges.len == 0 and value.table.storage.engine != .object) or
             (value.schema_version == 3 and value.binding != null)) return error.InvalidHACatalogRecord;
         if (value.binding) |binding| {
             if (binding.delta.removes.len != 0 or binding.delta.upserts.len != 1) return error.InvalidHACatalogRecord;
@@ -3143,7 +3196,7 @@ const LocalStandaloneMetadata = struct {
             alloc.free(ranges);
         }
         if (self.storage_engine == .lite and ranges.len != 1) return error.InvalidBackupRequest;
-        table.desired_replica_count = 1;
+        table.desired_replica_count = if (table.storage.engine == .object) 0 else 1;
 
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -4353,6 +4406,7 @@ fn deriveStandaloneTableRecord(
 ) !antfly.metadata.TableRecord {
     var resolved_req = req;
     const replicated = if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false;
+    try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
     resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
@@ -4360,7 +4414,7 @@ fn deriveStandaloneTableRecord(
     var table = antfly.public_api.tables.deriveTableRecord(table_name, resolved_req);
     // A standalone process owns the only replica regardless of whether its
     // local persistence is directory-backed or Lite single-file storage.
-    table.desired_replica_count = 1;
+    table.desired_replica_count = if (table.storage.engine == .object) 0 else 1;
     return table;
 }
 
@@ -5199,6 +5253,8 @@ pub fn runFromIterator(
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
+            .native_lake_artifact_base_dir = data_dir,
+            .backup_staging_root = data_dir,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
@@ -14348,6 +14404,28 @@ test "system catalog standalone routing generation retains old identity through 
     try std.testing.expectEqual(revision, old.snapshot.value.catalog_revision);
     try std.testing.expect(!old.table_indexes.contains("new"));
     try std.testing.expect(current.table_indexes.contains("new"));
+
+    // Pgwire supplies an Io awake deadline, whose epoch need not agree with
+    // the platform clock used by the catalog mutex. A valid remaining budget
+    // must survive that boundary, while an expired one must still fail.
+    const FakeClock = struct {
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = value.* };
+        }
+    };
+    var clock_now: u64 = 10;
+    var clock_vtable = std.testing.io.vtable.*;
+    clock_vtable.now = FakeClock.now;
+    const clock_io: std.Io = .{ .userdata = &clock_now, .vtable = &clock_vtable };
+    const context: antfly.public_api.operation.RequestContext = .{
+        .deadline_ns = clock_now + std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io),
+    };
+    const page = try metadata.statusSource().systemCatalog(alloc, context, .{ .list_tables = .{} });
+    defer alloc.free(page);
+    clock_now = context.deadline_ns.?;
+    try std.testing.expectError(error.DeadlineExceeded, metadata.statusSource().systemCatalog(alloc, context, .{ .list_tables = .{} }));
 }
 
 test "system catalog standalone imports main checkpoints and current logical seeds atomically" {
@@ -14568,4 +14646,40 @@ test "system catalog offline migration publishes rows and fences server startup"
     defer reopened.deinit();
     try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
+}
+
+test "standalone table storage defaults persist for object tables across reopen and recreate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var previous_generation: u64 = 0;
+    var previous_table_id: u64 = 0;
+    {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, a, "objects", .{ .storage = .{ .engine = .object } });
+        const table = metadata.manager.findTableByName("objects").?;
+        try std.testing.expectEqual(@as(u32, 0), table.min_ranges);
+        try std.testing.expectEqual(@as(u16, 0), table.desired_replica_count);
+        try std.testing.expectEqual(@as(usize, 0), metadata.manager.ranges.count());
+        previous_generation = table.object_storage_generation;
+        previous_table_id = table.table_id;
+        try std.testing.expectError(error.ObjectTablePlacementUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "invalid", .{ .storage = .{ .engine = .object }, .num_shards = 1 }));
+    }
+    {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try std.testing.expectEqual(.object, metadata.manager.findTableByName("objects").?.storage.engine);
+        try std.testing.expectEqual(previous_generation, metadata.manager.findTableByName("objects").?.object_storage_generation);
+        var dropped = try LocalStandaloneMetadata.dropTableExact(&metadata, a, "objects");
+        defer dropped.deinit(a);
+        try LocalStandaloneMetadata.createTable(&metadata, a, "objects", .{ .storage = .{ .engine = .object } });
+        const recreated = metadata.manager.findTableByName("objects").?;
+        try std.testing.expect(recreated.table_id != previous_table_id or recreated.object_storage_generation != previous_generation);
+        try std.testing.expectEqual(@as(usize, 0), metadata.manager.ranges.count());
+    }
 }

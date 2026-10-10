@@ -691,6 +691,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
     types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
         model: model.into(),
+        model_identity: None,
         provider: types::AntflyEmbedderConfigProvider::Antfly,
         retrieval: None,
     })
@@ -767,6 +768,7 @@ impl Default for types::CreateGraphIndexRequest {
 impl Default for types::CreateAlgebraicIndexRequest {
     fn default() -> Self {
         Self {
+            aggregates: Vec::new(),
             derive_from_schema: None,
             description: None,
             enrichments: Vec::new(),
@@ -801,6 +803,24 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn algebraic_index_aggregate_recipes_round_trip() {
+        let default = super::types::CreateAlgebraicIndexRequest::default();
+        assert!(default.aggregates.is_empty());
+
+        let recipe = serde_json::json!({
+            "name": "count_by_category",
+            "op": "count",
+            "group_by": ["category"]
+        });
+        let request: super::types::CreateAlgebraicIndexRequest = serde_json::from_value(
+            serde_json::json!({"type": "algebraic", "aggregates": [recipe.clone()]}),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["aggregates"][0], recipe);
+    }
+
     #[test]
     fn graph_index_default_and_metric_configuration_round_trip() {
         let default = super::types::CreateGraphIndexRequest::default();

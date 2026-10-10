@@ -59,7 +59,7 @@ var selected_names: std.AutoHashMapUnmanaged(*std.Build.Module, []const []const 
 
 var physical_sources: std.StringHashMapUnmanaged(bool) = .empty;
 
-fn controlOnly(consumer: *std.Build.Module) bool {
+pub fn controlOnly(consumer: *std.Build.Module) bool {
     const module = consumer.import_table.get("storage_source_options") orelse return false;
     const path = module.root_source_file orelse return false;
     if (path != .generated) return false;
@@ -80,7 +80,7 @@ fn sourceText(b: *std.Build, path: []const u8) ?[]const u8 {
 /// facade remains a control contract; it deliberately does not resolve DB.
 fn requiresPhysical(b: *std.Build, path: []const u8) bool {
     if (physical_sources.get(path)) |value| return value;
-    const local = paths.authored(b, b.path("pkg/antfly-embedded/src/local")).?;
+    const local = paths.authored(b, b.path("pkg/antfly-embedded/src")).?;
     var pending: std.ArrayList([]const u8) = .empty;
     pending.append(b.allocator, path) catch @panic("OOM");
     var seen = std.StringHashMap(void).init(b.allocator);
@@ -88,6 +88,9 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
     const result = search: while (index < pending.items.len) : (index += 1) {
         const current = pending.items[index];
         if (!std.mem.startsWith(u8, current, local)) continue;
+        if (std.mem.endsWith(u8, current, "/storage/db/db.zig") or
+            std.mem.endsWith(u8, current, "/storage/query.zig") or
+            std.mem.endsWith(u8, current, "/storage/write.zig")) break :search true;
         if (std.mem.endsWith(u8, current, "/storage/db/selected_root.zig")) continue;
         if ((seen.getOrPut(current) catch @panic("OOM")).found_existing) continue;
         if (physical_sources.get(current)) |value| {
@@ -114,7 +117,7 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
 }
 
 fn physicalName(b: *std.Build, name: []const u8) bool {
-    const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/local/source_catalog.zig")).?;
+    const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/source_catalog.zig")).?;
     const text = sourceText(b, catalog) orelse return false;
     const marker = b.fmt("pub const {s} = @import(\"", .{name});
     const offset = findMarker(text, 0, marker) orelse return false;
@@ -238,7 +241,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         .root_module = root,
         .filters = tests.filters,
         .max_rss = partition_max_rss,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     partitions.put(b.allocator, tests, artifact) catch @panic("OOM");
     return artifact;
@@ -420,6 +423,16 @@ pub fn add(b: *std.Build) void {
                         const extra = inventory(b, local, inv);
                         run.addArg(previous.?);
                         run.addFileArg(extra.captureStdErr(.{}));
+                        // Audit controls precede the runtime passthrough separator.
+                        // addFileArg also records the inventory dependency.
+                        const path_arg = run.argv.pop().?;
+                        const flag_arg = run.argv.pop().?;
+                        var insert: usize = 0;
+                        while (insert < run.argv.items.len) : (insert += 1) {
+                            const current = run.argv.items[insert];
+                            if (current == .bytes and std.mem.eql(u8, current.bytes, "--")) break;
+                        }
+                        run.argv.insertSlice(b.allocator, insert, &.{ flag_arg, path_arg }) catch @panic("OOM");
                     }
                 }
             }

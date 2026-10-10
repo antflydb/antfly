@@ -675,7 +675,7 @@ test "gliner boundary engine routed states clean up every allocation failure" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ &config, &prepared, &states });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ &config, &prepared, &states });
 }
 
 test "gliner boundary engine eager encoder host allocation cleanup on padded batch" {
@@ -736,7 +736,7 @@ test "gliner boundary engine eager encoder host allocation cleanup on padded bat
     };
     // Backend tensors use their stable allocator; inject each architecture/
     // routing host failure, including the padding-mask and relative-ID paths.
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &cb, &config, &prepared });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &cb, &config, &prepared });
 }
 
 test "gliner boundary engine Python parity pinned small checkpoint CPU encoder and routing" {

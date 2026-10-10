@@ -55,3 +55,36 @@ backend artifacts remain available for consumers enabling acceleration.
 Third-party dependencies retain their own licenses.
 A downloaded package has no dependency on a monorepo checkout. Development
 checkouts can use the same package entry point under `zig/pkg/antfly-embedded`.
+
+## Graph metric maintenance
+
+Active writable native databases automatically maintain configured graph metrics in
+bounded background ticks. Background metrics refresh after graph updates;
+manual metrics build after refresh or rebuild requests. Queued work resumes on
+reopen. The default combined runtime uses a fresh incarnation identity and a
+durable ownership lease. Read-only, standby, and hidden restore owners retain
+their existing background-worker gates. Databases without configured metrics
+do not start a graph metric worker or acquire its lease. Adding the first
+metric starts maintenance; removing the last metric parks the worker and
+releases its lease.
+
+Callers that drive graph maintenance themselves can open with
+`.graph_metric_maintenance = .{ .start_background_loop = false }`. The existing
+`start_index_workers`, `start_optional_runtimes`, and
+`start_optional_runtime_workers` controls also apply. Explicit coordinator and
+worker configurations retain their supplied identities and budgets. Tuning
+maintenance intervals or budgets preserves automatic identity and lease defaults;
+explicit `automatic_identity = false` and `lease_owned = false` remain available
+for external drivers. Unspecified clocks inherit the backend clock. Borrowed
+scheduler owners must call `DB.beginTeardown()` before draining their tasks,
+then close the database after the drain.
+
+## Source organization
+
+The implementation lives directly under `src/`: `storage/` contains the local
+DB, `api/` its operations and contracts, `metadata/` local catalog contracts, and
+`inference/` provider integration. SQL, search, graph, lake readers and C API
+implementations share this Apache owner. `src/root.zig` and the configured
+`src/engine/` modules expose the public Zig API; `src/source_catalog.zig` is an
+internal bridge for server consumers. See the [ownership design](../../../docs/design/embedded-source-ownership.md)
+for the embedded/server boundary.

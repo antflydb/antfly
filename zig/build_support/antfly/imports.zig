@@ -298,22 +298,23 @@ pub const AntflyRootImports = struct {
     fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         self.configureBase(mod, link_libc);
         inline for (.{
-            "bloom",           "chunking",           "common_openapi",    "credentials",
-            "embeddings",      "embeddings_openapi", "extracting",        "generating",
-            "google",          "handlebars",         "hash",              "httpx",
-            "image",           "indexes_openapi",    "inference_chunker", "json",
-            "logging_openapi", "metadata_openapi",   "objectstore",       "openai_api",
-            "pdf",             "query_openapi",      "reader_config",     "readers",
-            "regex",           "reranking",          "scraping",          "synthesizing",
-            "transcribing",    "vector",             "fst",               "schema_openapi",
+            "bloom",          "chunking",           "common_openapi",    "credentials",
+            "embeddings",     "embeddings_openapi", "extracting",        "generating",
+            "google",         "handlebars",         "hash",              "httpx",
+            "image",          "indexes_openapi",    "inference_chunker", "inference_api",
+            "json",           "logging_openapi",    "metadata_openapi",  "objectstore",
+            "openai_api",     "pdf",                "query_openapi",     "reader_config",
+            "readers",        "regex",              "reranking",         "scraping",
+            "synthesizing",   "transcribing",       "vector",            "fst",
+            "schema_openapi",
         }) |field| self.addImport(mod, field);
     }
 
     const storage_imports = .{
-        "admin_openapi",            "casbin",           "extraction_openapi", "inference_api",
-        "inference_config_openapi", "internal_openapi", "matcher",            "middleware_openapi",
-        "raft_engine",              "resolver",         "s3_openapi",         "scraping_openapi",
-        "vectorindex",
+        "admin_openapi",            "casbin",           "extraction_openapi",
+        "inference_config_openapi", "internal_openapi", "matcher",
+        "middleware_openapi",       "raft_engine",      "resolver",
+        "s3_openapi",               "scraping_openapi", "vectorindex",
     };
     const api_imports = .{
         "exa_api",
@@ -334,13 +335,21 @@ pub const AntflyRootImports = struct {
         "usermgr_server_openapi",
     };
 
+    // Native API processes and serverless hosts both own object-table runtimes.
+    // Keep the bootstrap/remote inference contracts identical for those owners.
+    const object_runtime_imports = .{
+        "inference_api", "inference_config_openapi", "middleware_openapi",
+        "s3_openapi",    "scraping_openapi",         "vectorindex",
+        "matcher",
+    };
+
     /// Public local C API: no server provisioning, quorum observer, or routers.
     pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         inline for (.{
-            "casbin",           "extraction_openapi", "inference_api", "inference_config_openapi",
-            "matcher",          "middleware_openapi", "resolver",      "s3_openapi",
-            "scraping_openapi", "vectorindex",
+            "casbin",     "extraction_openapi", "inference_config_openapi",
+            "matcher",    "middleware_openapi", "resolver",
+            "s3_openapi", "scraping_openapi",   "vectorindex",
         }) |field| self.addImport(mod, field);
         mod.addImport("antfly_lite_options", self.lite_options);
         mod.addImport("antfly_font", self.font);
@@ -368,7 +377,9 @@ pub const AntflyRootImports = struct {
         const options = b.addOptions();
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
-        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
+        // Document/media compute has no physical storage handle, including in
+        // the independently compiled public embedded enrichment archive.
+        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);
@@ -381,17 +392,17 @@ pub const AntflyRootImports = struct {
         self.configureDatabase(mod, link_libc);
         self.configureServerContracts(mod);
         inline for (api_imports) |field| self.addImport(mod, field);
+        inline for (object_runtime_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
+        // Native remote corpora share local analysis and scoring semantics.
+        addSnowballModule(mod.owner, mod);
+        self.addImport(mod, "vectorindex");
     }
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
-        inline for (.{
-            "inference_api", "inference_config_openapi", "middleware_openapi",
-            "s3_openapi",    "scraping_openapi",         "vectorindex",
-            "matcher",
-        }) |field| self.addImport(mod, field);
+        inline for (object_runtime_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
     }
 

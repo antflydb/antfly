@@ -181,8 +181,11 @@ try {
 }
 ```
 
+For decision question types and examples, see the
+[typed decision guide](../../../docs/guides/decisions.md).
+
 - **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
-  `rewrite`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
+  `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
   a bare form (parsed JSON) and a `...Raw` form (raw `Buffer`), following the
   same convention as `Database`. Binary inputs (images, audio) go inline in
   the request JSON, as base64 or `data:` URIs. Responses are always
@@ -398,3 +401,55 @@ then pulls the same model to completion with progress callbacks.
 ## License
 
 Apache-2.0
+
+## SQL, Kysely, and multiple tables
+
+`Connection` provides a promise-based SQL session over a `Database`:
+
+```ts
+import { create, Connection } from "@antfly/embedded";
+const database = await create("app.aflite");
+const connection = await Connection.open(database);
+await connection.execute("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)");
+await connection.transaction(async tx => {
+  await tx.execute("INSERT INTO people (id,name) VALUES ($1,$2)", [1n, "Ada"]);
+});
+const result = await connection.query("SELECT id,name FROM people");
+for await (const page of connection.stream("SELECT id,name FROM people", [], 128)) {
+  console.log(page.rows);
+}
+await connection.close();
+await database.close();
+```
+
+`query` reads all native cursor pages; `stream` yields bounded pages. Integer
+columns use `bigint`, SQL NULL uses `null`, and JSON uses JavaScript values.
+Use bigint parameters when values exceed JavaScript's safe integer range.
+Errors carry `sqlstate` and an optional `transactionId`.
+
+Install Kysely 0.29 and import the optional dialect subpath:
+
+```ts
+import { Kysely } from "kysely";
+import { AntflyDialect } from "@antfly/embedded/kysely";
+const sql = new Kysely<{ people: { id: bigint; name: string } }>({
+  dialect: new AntflyDialect({ database }),
+});
+const people = await sql.selectFrom("people").selectAll().execute();
+await sql.destroy(); // The caller still owns database.
+```
+
+`createTable`, `listTables`, `openTable`, and `dropTable` expose the shared
+document catalog. Table handles reuse existing schema, index, enrichment,
+search, and document methods. Close them before dropping their tables;
+database close invalidates them.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+READ COMMITTED, savepoints, transactional DDL restrictions, and commit outcomes.

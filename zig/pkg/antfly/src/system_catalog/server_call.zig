@@ -24,6 +24,9 @@ const TableStatusTarget = domain.TableStatusTarget;
 const Target = domain.Target;
 
 pub const Call = union(enum) {
+    lake_index_lifecycle_read: u64,
+    lake_index_lifecycle_work: ?u64,
+    lake_index_lifecycle_mutate: @import("../metadata/lake_index_lifecycle.zig").Write,
     setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     policy_snapshot: @import("antfly_local_sources").system_catalog_policies.SnapshotRequest,
     policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
@@ -76,7 +79,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
+            .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
     }
@@ -87,6 +90,8 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .lake_index_lifecycle_read,
+            .lake_index_lifecycle_work,
             .setting_snapshot,
             .policy_snapshot,
             .policy_install_snapshot,
@@ -134,4 +139,15 @@ test "store-root enrollment status is an admin-bound read, not a mutation" {
     } };
     try std.testing.expect(query.requiresAdministrativeGrant());
     try std.testing.expect(!query.isMutation());
+}
+
+test "native lake lifecycle calls bind private read and mutation grants" {
+    const read: Call = .{ .lake_index_lifecycle_read = 4 };
+    const write: Call = .{ .lake_index_lifecycle_mutate = .{ .table_id = 4, .expected_revision = 7, .mutation = .{ .release = @splat(9) } } };
+    try std.testing.expect(read.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!read.requiresAdministrativeGrant());
+    try std.testing.expect(!read.isMutation());
+    try std.testing.expect(write.requiresAdministrativeGrant());
+    try std.testing.expect(write.isMutation());
+    try std.testing.expect(!write.requiresSettingAuthorityReadGrant());
 }

@@ -98,11 +98,14 @@ per-call deadline; 0 means none -- see "Inference runs in-process" below for
 what it can and cannot interrupt). It raises `UnsupportedError` if this
 build does not link the inference runtime or the runtime cannot start.
 
+For decision question types and examples, see the
+[typed decision guide](../../../docs/guides/decisions.md).
+
 Each call takes the request JSON and returns the response JSON of the
 matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,
 `rerank()`, `chunk()`, `generate()`, `generate_batch()` (up to 128
 non-streaming requests per call; per-item failures are reported in the
-response, not raised), `rewrite()`, `extract()`, `read()` (OCR),
+response, not raised), `rewrite()`, `decide()`, `extract()`, `read()` (OCR),
 `transcribe()`, and `list_models()`. Requests accept the same `dict` / `str`
 / `bytes` JSON forms as `Database` methods, and responses honor the same
 `raw=True` convention. `generate()` and `generate_batch()` requests always
@@ -216,18 +219,18 @@ format, not JSON, and always return raw `bytes`.
 A `Database` is safe for concurrent use by multiple threads; share one
 handle rather than opening one per thread. `libantfly` runs in serialized
 threading mode (`antfly_embedded.threading_mode() ==
-antfly_embedded.THREADING_SERIALIZED`): reads such as `search()`, `lookup()`,
-and `scan()` run in parallel with each other and with writes, `batch()` and
-transaction calls on one handle queue instead of failing with `BusyError`,
-and schema or index changes wait for in-flight calls. `close()` waits for
+antfly_embedded.THREADING_SERIALIZED`). Lite calls queue on a connection and
+coordinate with other connections to the file. Streaming SQL cursors retain
+their original snapshots while other connections publish new commits. Schema
+or index changes wait for in-flight calls. `close()` waits for
 in-flight calls on other threads to finish; calls made after `close()`
 raise `InvalidArgumentError`. See `zig/CAPI.md`'s "Thread Safety" section
 for the full C ABI contract.
 
-Only one writer handle may be open per file at a time, across processes.
-Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for another writer to close instead of failing immediately with
-`BusyError`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Native operations queue within a process and take a kernel writer lease across
+processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
+to wait for a competing operation. Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 
@@ -290,7 +293,7 @@ inventory; retry until it is `true` or your own deadline expires.
   select the destination kind).
 - **Embedded inference (no database)**: `Inference.open()`, `embed()`,
   `rerank()`, `chunk()`, `generate()`, `generate_stream()`,
-  `generate_batch()`, `rewrite()`, `extract()`, `read()`, `transcribe()`,
+  `generate_batch()`, `rewrite()`, `decide()`, `extract()`, `read()`, `transcribe()`,
   `list_models()`, `pull()` (with a `PullProgress` dataclass for progress
   callbacks; both `pull()` and `generate_stream()` accept a callback that
   can cancel the call by returning `False`). See "Embedded inference (no
@@ -328,3 +331,44 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `tests/test_conformance.py` runs every case in
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
+
+## SQL and multiple tables
+
+The PEP 249 interface provides independent connections, native streaming
+cursors, positional `:1`, `:2`, … parameters (also accepting native `$1` syntax), and SQLSTATE-bearing exceptions:
+
+```python
+from antfly_embedded import dbapi
+
+connection = dbapi.connect("app.aflite")
+cursor = connection.cursor()
+cursor.execute("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+cursor.execute("INSERT INTO people (id,name) VALUES (:1,:2)", (1, "Ada"))
+connection.commit()
+for row in cursor.execute("SELECT id,name FROM people"):
+    print(row)
+connection.close()
+```
+
+Connections own independent native handles and use READ COMMITTED transactions.
+By default, the first data statement starts a transaction; `commit()` and
+`rollback()` finish it. `autocommit=True` executes statements independently.
+DDL outside an active transaction commits immediately. Closing a connection
+discards its staged writes. `fetchmany`, `fetchall`, and iteration read every
+cursor page, including queries longer than 128 rows. Integers preserve all
+signed 64 bits. SQL NULL maps to `None`; JSON maps to Python values.
+
+`Database.create_table`, `list_tables`, `open_table`, and `drop_table` expose
+the same catalog for document workloads. Table handles reuse all existing
+document, schema, index, enrichment, and search methods. Close them before
+dropping a table; database close invalidates them.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+savepoints, supported isolation, and unknown commit outcomes.

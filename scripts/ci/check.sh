@@ -20,6 +20,8 @@ repo_root=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)
 policy="$repo_root/scripts/ci/check_toolchain_policy.py"
 policy_python=${ANTFLY_POLICY_PYTHON:-python3}
 
+source "$repo_root/scripts/ci/disposable_cargo_target.sh"
+
 section() {
   echo
   echo "==> $*"
@@ -65,6 +67,15 @@ check_memoryaf() {
 }
 
 check_sdk() {
+  if [[ ${CI:-false} == true ]]; then
+    with_disposable_cargo_target check_sdk_impl
+  else
+    check_sdk_impl
+  fi
+}
+
+check_sdk_impl() {
+  "$policy_python" -m unittest discover -s "$repo_root/scripts/ci" -p test_disposable_cargo_target.py
   if [[ -z ${ANTFLY_POLICY_PYTHON:-} ]]; then
     local build_python
     build_python=$(python3 "$policy" --get python-build)
@@ -171,6 +182,10 @@ check_lite_bindings() {
   section "Checking the Rust Lite binding"
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
     --package antfly-embedded --package antfly-embedded-sys
+  # The SQLx driver is optional; compile it here so its MSRV and API stay
+  # covered even though its integration tests need a native libantfly.
+  cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
+    --package antfly-embedded --features sqlx
 }
 
 check_release() {

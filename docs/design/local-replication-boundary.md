@@ -1,7 +1,7 @@
 # Local storage and server replication boundary
 
 The contract refactor (#958) is merged. The physical local-engine move (#953)
-places the DB and its dependency closure under `antfly-embedded/src/local`;
+places the DB and its dependency closure under `antfly-embedded/src`;
 the Apache/ELv2 licensing and release changes follow in #893. Existing licenses
 are preserved here. Raft and hot-standby runtime implementations remain server owned.
 
@@ -15,7 +15,7 @@ are preserved here. Raft and hot-standby runtime implementations remain server o
 | Admission and publication callbacks | Remote durability policy, waits, and telemetry |
 | Background-work permission supplied by admission | Whether a particular role may run background mutations |
 
-`antfly-embedded/src/local/storage/db/replication_contract.zig` contains borrowed ports. Its write gate
+`antfly-embedded/src/storage/db/replication_contract.zig` contains borrowed ports. Its write gate
 has borrowed, captured, and generation-pinned forms, without server role tags.
 The DB checks admission and asks whether background work is allowed. Captured
 admission equality is supplied by its adapter; opaque bytes are never compared

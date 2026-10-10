@@ -95,6 +95,9 @@ pub const Result = struct {
     columns: []const Column = &.{},
     rows: []const []const std.json.Value = &.{},
     sql_nulls: ?[]const []const bool = null,
+    /// Borrowed typed cells owned by this result's lease. A transport reads
+    /// cells directly; scroll/hold stores clone only at their ownership edge.
+    cells: ?Cells = null,
     rows_affected: u64 = 0,
     command_tag: []const u8,
     session_id: ?[]const u8 = null,
@@ -111,6 +114,49 @@ pub const Result = struct {
         if (self.owner) |owner| owner.release(owner.context);
         self.owner = null;
     }
+
+    pub fn rowCount(self: Result) usize {
+        return if (self.cells) |cells| cells.count else self.rows.len;
+    }
+
+    pub fn cell(self: Result, alloc: std.mem.Allocator, row: usize, column: usize) !Cell {
+        if (row >= self.rowCount() or column >= self.columns.len) return error.InvalidResult;
+        if (self.cells) |cells| {
+            if (self.rows.len != 0 or self.sql_nulls != null or cells.width != self.columns.len) return error.InvalidResult;
+            return cells.read(cells.context, alloc, std.math.add(usize, cells.begin, row) catch return error.InvalidResult, column);
+        }
+        if (self.rows[row].len != self.columns.len) return error.InvalidResult;
+        if (self.sql_nulls) |flags| if (flags.len != self.rows.len or flags[row].len != self.columns.len) return error.InvalidResult;
+        const value = self.rows[row][column];
+        return .{ .value = value, .sql_null = if (self.sql_nulls) |flags| flags[row][column] else value == .null };
+    }
+
+    /// A borrowed delivery view; only the original result releases its owner.
+    pub fn view(self: Result, begin: usize, count: usize) !Result {
+        if (begin > self.rowCount() or count > self.rowCount() - begin) return error.InvalidResult;
+        var result = self;
+        result.owner = null;
+        if (result.cells) |*cells| {
+            cells.begin = std.math.add(usize, cells.begin, begin) catch return error.InvalidResult;
+            cells.count = count;
+        } else {
+            result.rows = self.rows[begin..][0..count];
+            if (self.sql_nulls) |flags| {
+                if (flags.len != self.rows.len) return error.InvalidResult;
+                result.sql_nulls = flags[begin..][0..count];
+            }
+        }
+        return result;
+    }
+};
+
+pub const Cell = struct { value: std.json.Value, sql_null: bool };
+pub const Cells = struct {
+    context: *anyopaque,
+    begin: usize = 0,
+    count: usize,
+    width: usize,
+    read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Cell,
 };
 
 pub const Backend = struct {

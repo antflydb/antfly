@@ -19,9 +19,11 @@
  * (see zig/CAPI.md "Inference" and antfly.h), and the same coverage as
  * go/pkg/embedded/inference_cgo_test.go and py/packages/embedded/tests/test_inference.py.
  */
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { CancelledError, InvalidArgumentError, NotFoundError } from "../src/errors.js";
 import { Inference } from "../src/inference.js";
@@ -131,6 +133,96 @@ describeWithLibrary("Inference", () => {
         expect(err.message).toContain("MODEL_NOT_FOUND");
         expect(err.body).toBeTruthy();
         expect((err.body as { error?: string }).error).toBe("MODEL_NOT_FOUND");
+      } finally {
+        await inf.close();
+      }
+    });
+
+    it("decide preserves validation and missing-model errors and rejects closed handles", async () => {
+      const inf = await Inference.open({ modelsDir: tempModelsDir() });
+      try {
+        await expect(inf.decide({})).rejects.toMatchObject({
+          body: { error: "INVALID_REQUEST" },
+        });
+        await expect(
+          inf.decideRaw({
+            model: "no/such-model",
+            input: "refund",
+            questions: [{ name: "refund", type: "predicate", instructions: "Refund?" }],
+          })
+        ).rejects.toMatchObject({ body: { error: "MODEL_NOT_FOUND" } });
+      } finally {
+        await inf.close();
+      }
+      await expect(inf.decide({})).rejects.toBeInstanceOf(InvalidArgumentError);
+    });
+
+    it("decide returns every answer type and raw JSON through the real runtime", async () => {
+      const modelsDir = tempModelsDir();
+      const script = fileURLToPath(
+        new URL("../../../../scripts/testing/create_decision_fixture.py", import.meta.url)
+      );
+      const model = execFileSync(
+        process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3"),
+        [script, modelsDir],
+        { encoding: "utf8" }
+      ).trim();
+      const request = {
+        model,
+        input: "Refund the duplicate charge.",
+        questions: [
+          {
+            name: "route",
+            type: "choice",
+            instructions: "Which team?",
+            choices: [
+              { value: "billing", description: "Charges" },
+              { value: "support", description: "Product" },
+            ],
+          },
+          {
+            name: "urgency",
+            type: "score",
+            instructions: "How urgent?",
+            levels: [{ label: "Routine" }, { label: "Soon" }, { label: "Immediate" }],
+          },
+          { name: "refund", type: "predicate", instructions: "Refund requested?" },
+        ],
+      };
+      const inf = await Inference.open({ modelsDir });
+      try {
+        const result = await inf.decide(request);
+        expect(result).toMatchObject({
+          model,
+          answers: [
+            {
+              name: "route",
+              type: "choice",
+              decision_method: "typed",
+              choice: "billing",
+              probabilities: [
+                { value: "billing", probability: 0.5 },
+                { value: "support", probability: 0.5 },
+              ],
+            },
+            {
+              name: "urgency",
+              type: "score",
+              decision_method: "typed",
+              score: expect.closeTo(1),
+              probabilities: [
+                { value: 0, label: "Routine", probability: expect.closeTo(1 / 3) },
+                { value: 1, label: "Soon", probability: expect.closeTo(1 / 3) },
+                { value: 2, label: "Immediate", probability: expect.closeTo(1 / 3) },
+              ],
+            },
+            { name: "refund", type: "predicate", decision_method: "typed", probability: 0.5 },
+          ],
+          usage: { input_tokens: expect.any(Number), output_tokens: 0 },
+        });
+        const raw = await inf.decideRaw(JSON.stringify(request));
+        expect(Buffer.isBuffer(raw)).toBe(true);
+        expect(JSON.parse(raw.toString("utf8"))).toEqual(result);
       } finally {
         await inf.close();
       }

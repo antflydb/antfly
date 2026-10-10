@@ -150,8 +150,8 @@ typedef struct antfly_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    /* Milliseconds to keep retrying while another writer holds the writer
-     * lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    /* Milliseconds to retry a Lite operation while another process holds the
+     * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[8];
 } antfly_open_options;
@@ -330,7 +330,9 @@ antfly_error_code antfly_db_capabilities_json(antfly_db *db, antfly_buffer *out)
 /*
  * Portable .afb backups work across storage kinds: a backup of either kind
  * restores or imports into either kind. antfly_db_import_backup requires an
- * empty database. antfly_restore_backup_json and
+ * empty database with no open table handles, SQL sessions, or cursors.
+ * Archives contain the complete catalog and every live table namespace.
+ * Backup/import require the database handle. antfly_restore_backup_json and
  * antfly_restore_backup_file_json create a new database at dest_path whose
  * storage kind comes from `options` (NULL means directory storage); other
  * option fields apply when the restored database is opened. `replace`
@@ -450,10 +452,37 @@ antfly_error_code antfly_db_scan_hashes(
 );
 antfly_error_code antfly_db_stats_json(antfly_db *db, antfly_buffer *out);
 antfly_error_code antfly_db_search_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
-/* Single embedded table SQL; uses SQLRequest statement/parameters/limit.
- * Sessions, DDL, qualified catalog names and managed owners are unsupported.
+/* Database SQL; uses statement/parameters/limit and optional session_id.
+ * Logical tables are resolved from the durable database catalog.
  * Always free a nonempty out buffer, including SQL diagnostics on error. */
-antfly_error_code antfly_db_sql_json(antfly_db *db, antfly_slice table_name, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_sql_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+
+/* Logical tables have independent schemas, indexes, and document identities.
+ * Dropped table IDs are never reused. The root document table is "default". */
+antfly_error_code antfly_db_create_table_json(antfly_db *db, antfly_slice table_name, antfly_slice schema_json);
+/* A table handle supports the document/schema/index/enrichment APIs. Close it
+ * with antfly_db_close. Database close invalidates all its table handles. DROP
+ * requires its table handles and SQL cursors to be closed first. */
+antfly_error_code antfly_db_open_table(antfly_db *db, antfly_slice table_name, antfly_db **out_table);
+antfly_error_code antfly_db_drop_table(antfly_db *db, antfly_slice table_name);
+antfly_error_code antfly_db_list_tables_json(antfly_db *db, antfly_buffer *out);
+
+/* Describe binds without executing; returns columns and parameter_types. */
+antfly_error_code antfly_db_sql_describe_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+
+/* Sessions are connection-local; close abandons staged writes and cursors.
+ * BEGIN ISOLATION LEVEL READ COMMITTED is supported, with savepoints.
+ * Stronger isolation is rejected. COMMIT uses a durable native decision. */
+antfly_error_code antfly_db_sql_session_open(antfly_db *db, uint64_t *out_session);
+antfly_error_code antfly_db_sql_session_close(antfly_db *db, uint64_t session);
+
+/* Cursors belong to db. Requests contain statement and parameters. Fetch
+ * returns {"result": <SQL result>, "exhausted": bool}. Fetch sizes are 1..4096.
+ * Explicit close releases snapshots; database close releases every cursor.
+ * Error buffers contain SQLSTATE diagnostics and must also be freed. */
+antfly_error_code antfly_db_sql_open_cursor_json(antfly_db *db, antfly_slice request_json, uint64_t *out_cursor, antfly_buffer *out_error);
+antfly_error_code antfly_db_sql_fetch_cursor_json(antfly_db *db, uint64_t cursor, uint32_t rows, antfly_buffer *out);
+antfly_error_code antfly_db_sql_close_cursor(antfly_db *db, uint64_t cursor);
 antfly_error_code antfly_db_search_dense(
     antfly_db *db,
     antfly_slice index_name,
@@ -542,7 +571,7 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * use and stay cached until the handle closes. Each call takes the request
  * JSON and returns the response JSON of the matching /ai/v1 route of the
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
- * rerank, chunk, generate, generate/batch, rewrite, extract, read (OCR),
+ * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (OCR),
  * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
  * or data: URIs. The _json calls return complete responses: a generate
  * request with "stream": true fails with ANTFLY_INVALID_ARGUMENT; use
@@ -632,6 +661,9 @@ antfly_error_code antfly_inference_generate_stream_json(
  * are reported in the response. */
 antfly_error_code antfly_inference_generate_batch_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+/* Named choice, ordinal score, and Boolean questions. Uses DecideRequest and
+ * DecideResponse from specs/openapi/inference/api.yaml; no database required. */
+antfly_error_code antfly_inference_decide_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);

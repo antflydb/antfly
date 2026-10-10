@@ -117,6 +117,9 @@ detail.
 
 ### Embedded inference without a database
 
+For typed decision requests and answer semantics, see the
+[decision guide](../../../docs/guides/decisions.md).
+
 [`Inference`] opens the same embedded inference runtime on its own, with no
 database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
 covering models directory, resource budgets, and a per-call timeout) and
@@ -125,7 +128,7 @@ waits for in-flight calls, idempotent, safe from any thread).
 
 Each method mirrors one `/ai/v1` route of the inference HTTP API and takes/
 returns raw JSON bytes: `embed`, `rerank`, `chunk`, `generate`,
-`generate_batch`, `rewrite`, `extract`, `read` (OCR), `transcribe`, and
+`generate_batch`, `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, and
 `list_models`. Unlike `Database`'s `*_json` methods, these return
 [`InferenceResult<Vec<u8>>`] on failure: [`InferenceError`] carries both the
 mapped [`Error`] and the runtime's JSON error body
@@ -208,10 +211,10 @@ returns.
 `Database` is `Send + Sync` and safe for concurrent use from any thread,
 like `*sql.DB` in Go: share one handle rather than opening one per thread.
 `libantfly` runs in serialized threading mode
-(`threading_mode() == THREADING_SERIALIZED`): reads such as `search_json`,
-`lookup_json`, and `scan_json` run in parallel with each other and with
-writes, `batch` and transaction calls on one handle queue instead of failing
-with `Busy`, and schema or index changes wait for in-flight calls.
+(`threading_mode() == THREADING_SERIALIZED`). Lite calls queue on a connection
+and coordinate with other connections to the file. Streaming SQL cursors retain
+their original snapshots while other connections publish new commits. Schema
+or index changes wait for in-flight calls.
 
 `close` takes `&self`, not `self` by value, specifically so it can be called
 on a `Database` shared across threads (e.g. `Arc<Database>`) without every
@@ -228,9 +231,11 @@ hang under sustained concurrent read load. The internal gate instead blocks
 *new* reads once a close is requested (like Go's `sync.RWMutex`), guaranteeing
 close completes in bounded time.
 
-Only one writer handle may be open per file at a time, across processes. Set
-`OpenOptions::busy_timeout` to wait for another writer to close instead of
-failing immediately with `Busy`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Connections queue within a process; a kernel writer lease serializes complete
+native operations across processes. `OpenOptions::busy_timeout` waits for an
+operation holding that lease, like `sqlite3_busy_timeout`. Closing a connection
+does not close another connection to the same file.
 
 ## API surface
 
@@ -254,7 +259,7 @@ failing immediately with `Busy`, like `sqlite3_busy_timeout`.
   directly into an empty, already-open handle.
 - `Inference::open`/`open_default` (with [`InferenceOptions`]) open an
   embedded inference runtime with no database; `embed`, `rerank`, `chunk`,
-  `generate`, `generate_batch`, `rewrite`, `extract`, `read`, `transcribe`,
+  `generate`, `generate_batch`, `rewrite`, `decide`, `extract`, `read`, `transcribe`,
   `list_models`, and `pull` mirror the `/ai/v1` inference HTTP API 1:1.
   `generate_stream` streams a generate request chunk by chunk, and both it
   and `pull` accept a callback that can cancel the call by returning
@@ -296,3 +301,52 @@ Some conformance/concurrency cases (full-text search under concurrent write
 pressure) need substantially more native stack than a typical fixed-size OS
 thread gets by default; these tests run their bodies on an explicitly
 large-stack thread rather than relying on the test harness's default.
+
+## SQLx and multiple tables
+
+Enable `sqlx` and `libantfly` for the SQLx 0.9 driver (Rust 1.94 or newer):
+
+```rust
+use antfly_embedded::sqlx::{Antfly, AntflyConnectOptions};
+use sqlx::ConnectOptions;
+
+let mut connection = AntflyConnectOptions::new("app.aflite").connect().await?;
+sqlx::query::<Antfly>("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+    .execute(&mut connection).await?;
+sqlx::query::<Antfly>("INSERT INTO people (id,name) VALUES ($1,$2)")
+    .bind(1_i64).bind("Ada").execute(&mut connection).await?;
+let rows = sqlx::query::<Antfly>("SELECT id,name FROM people")
+    .fetch_all(&mut connection).await?;
+```
+
+SQLx can open independent connections alongside a `Database` used for
+documents, search, or inference. Each path-opened SQLx connection owns a native
+handle and worker; its default busy timeout is five seconds. To use an existing
+handle and its settings, pass
+`AntflyConnectOptions::new(path).with_database(Arc::clone(&database))`.
+Connections never explicitly close a shared handle.
+
+`AntflyPool`, transactions, nested savepoints, `query`, `query_as`, streaming,
+prepare/describe, and SQLSTATE database errors use native SQL sessions.
+Native work runs on a dedicated worker with the required native stack,
+keeping FFI calls off Tokio executor threads. File owners are shared across
+pooled connections. Integer bindings and decoding preserve signed 64-bit
+values. Byte parameters represent UTF-8 text; JSON uses `serde_json::Value`.
+The upstream `query!` macro does not register custom database drivers; use
+runtime queries and the driver's describe support.
+
+With `serde`, `Database` provides `create_table_json`, `list_tables_json`,
+`drop_table`, and database-level `sql_json`. `open_table` returns a table
+handle borrowing its database; existing document, schema, index, enrichment,
+and search methods operate on that table. Close handles before dropping
+their tables.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+READ COMMITTED, transactional DDL restrictions, and commit outcomes.

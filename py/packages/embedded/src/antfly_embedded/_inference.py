@@ -105,7 +105,7 @@ def _error_from_body(code: int, body: bytes) -> errors.AntflyError:
 
 class Inference:
     """An embedded Antfly inference handle: embeddings, reranking, chunking,
-    generation, rewriting, extraction, OCR, transcription, and model pulls,
+    generation, rewriting, typed decisions, extraction, OCR, transcription, and model pulls,
     with no database attached.
 
     Do not construct directly; use Inference.open().
@@ -322,6 +322,13 @@ class Inference:
 
     def rewrite(self, request: JSONInput, *, raw: bool = False) -> Any:
         return self._json_call(self._lib.antfly_inference_rewrite_json, request, raw=raw)
+
+    def decide(self, request: JSONInput, *, raw: bool = False) -> Any:
+        """Answer named choice, ordinal score, and Boolean questions.
+
+        Uses the same DecideRequest/DecideResponse JSON as POST /ai/v1/decisions.
+        """
+        return self._json_call(self._lib.antfly_inference_decide_json, request, raw=raw)
 
     def extract(self, request: JSONInput, *, raw: bool = False) -> Any:
         return self._json_call(self._lib.antfly_inference_extract_json, request, raw=raw)

@@ -10,6 +10,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+iceberg = ["pyiceberg[sql-sqlite]>=0.12,<0.13", "fastavro>=1.12,<2"]
 lake = ["pyarrow>=18", "psycopg[binary]>=3.2"]
 
 [tool.pytest.ini_options]
@@ -24,6 +25,7 @@ markers = [
     "standalone_integration: requires local antfly standalone plus a live inference generator model",
     "ha_standby: starts local Zig antfly standalone primary/standby processes for HA replication",
     "real_model: requires local or downloadable model weights",
+    "iceberg_integration: requires independent PyIceberg and PyArrow writers; runs in e2e-full",
     "postgres_integration: requires a local PostgreSQL instance",
     "slow: marks tests that are too long-running for required E2E base CI",
     "scale: marks corpus-scale correctness gates run by dedicated scale CI",

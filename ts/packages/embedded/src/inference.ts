@@ -146,7 +146,7 @@ function toPullProgress(decoded: DecodedPullProgress): PullProgress {
 
 /**
  * An embedded Antfly inference runtime handle: no database, just model
- * inference (embed, rerank, chunk, generate, rewrite, extract, read/OCR,
+ * inference (embed, rerank, chunk, generate, rewrite, decide, extract, read/OCR,
  * transcribe) via the libantfly antfly_inference_* C ABI. Models load on
  * first use and stay cached until close().
  *
@@ -378,6 +378,15 @@ export class Inference implements AsyncDisposable {
   }
   async rewrite(request: JsonInput): Promise<unknown> {
     return parseJson(await this.rewriteRaw(request));
+  }
+
+  /** Named choice, ordinal score, and Boolean questions using DecideRequest JSON. */
+  decideRaw(request: JsonInput): Promise<Buffer> {
+    return this.#invokeJson(this.#native.inferenceDecideJson, request);
+  }
+  /** Parsed DecideResponse from the same contract as POST /ai/v1/decisions. */
+  async decide(request: JsonInput): Promise<unknown> {
+    return parseJson(await this.decideRaw(request));
   }
 
   extractRaw(request: JsonInput): Promise<Buffer> {

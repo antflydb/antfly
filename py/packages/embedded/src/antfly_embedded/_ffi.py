@@ -70,7 +70,7 @@ class ABIVersionError(RuntimeError):
 
 # The Antfly C ABI version this binding was written against
 # (antfly_abi_version() in antfly.h).
-SUPPORTED_ABI_VERSION = 2
+SUPPORTED_ABI_VERSION = 3
 
 # The only threading contract libantfly implements (ANTFLY_THREADING_SERIALIZED).
 THREADING_SERIALIZED = 1
@@ -334,6 +334,16 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
         _ERR,
     ),
     ("antfly_db_scan_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_sql_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_open_table", [_VOID_P, AntflySlice, ctypes.POINTER(_VOID_P)], _ERR),
+    ("antfly_db_create_table_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
+    ("antfly_db_drop_table", [_VOID_P, AntflySlice], _ERR),
+    ("antfly_db_list_tables_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_sql_session_open", [_VOID_P, ctypes.POINTER(ctypes.c_uint64)], _ERR),
+    ("antfly_db_sql_session_close", [_VOID_P, ctypes.c_uint64], _ERR),
+    ("antfly_db_sql_open_cursor_json", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_uint64), _BUF_P], _ERR),
+    ("antfly_db_sql_fetch_cursor_json", [_VOID_P, ctypes.c_uint64, ctypes.c_uint32, _BUF_P], _ERR),
+    ("antfly_db_sql_close_cursor", [_VOID_P, ctypes.c_uint64], _ERR),
     ("antfly_db_stats_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_search_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_search_dense_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),
@@ -378,6 +388,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ),
     ("antfly_inference_generate_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_rewrite_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_decide_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_extract_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_read_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_transcribe_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),

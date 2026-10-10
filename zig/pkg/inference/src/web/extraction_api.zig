@@ -251,7 +251,7 @@ pub fn run(handle: u32, json: []const u8, validate_only: bool) !void {
             result = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .valid = true, .encoded_tokens = plan.prompt_tokens }, .{});
         } else {
             var cb = model.compute.computeBackend();
-            const bytes = try span_v2.executePlanned(&cb, a, model.config.decide, &request, &plan, options);
+            const bytes = try span_v2.executePlanned(&cb, a, .{ .deberta = model.config.decide }, &request, &plan, options);
             defer a.free(bytes);
             result = try ctx.allocator.dupe(u8, bytes);
         }

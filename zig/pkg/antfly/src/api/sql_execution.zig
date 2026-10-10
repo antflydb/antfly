@@ -109,6 +109,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 }
 
 pub const Adapter = struct {
+    /// A transport may consume borrowed result columns within the same policy,
+    /// settings and snapshot scope as ordinary execution. Mutation and active
+    /// transaction paths continue to own their acknowledgement result.
+    read_delivery: ?struct {
+        ptr: *anyopaque,
+        deliver: *const fn (*anyopaque, std.mem.Allocator, *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!@import("antfly_local_sources").sql_runtime.Result,
+    } = null,
     server: *http_server.ApiHttpServer,
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
@@ -512,6 +519,12 @@ pub const Adapter = struct {
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
+        if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
+            if (try @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, statement_backend, compiled, parameters, limits)) |stream| {
+                defer stream.close();
+                return delivery.deliver(delivery.ptr, alloc, stream);
+            }
+        };
         return @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
@@ -519,7 +532,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -609,7 +622,19 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
-        if (binding.external_base_source != null and action != .read) return error.ExternalLakeReadOnly;
+        if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
+        if (binding.external_base_source != null) binding.external_indexes = .{
+            .catalog_json = definition.lake_index_catalog_json,
+            .indexes_json = definition.indexes_json,
+            .schema_json = definition.schema_json,
+            .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
+                .table_id = table.table_id,
+                .name = table.name,
+                .schema_json = definition.schema_json,
+                .read_schema_json = definition.read_schema_json,
+                .indexes_json = definition.indexes_json,
+            }),
+        };
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
         self.revision = snapshot.revision;
         self.target = target;
@@ -784,13 +809,160 @@ pub const Adapter = struct {
         return openNativeScan(ptr, alloc, table, request);
     }
 
+    const AggregateArtifactCursor = struct {
+        a: std.mem.Allocator,
+        adapter: *Adapter,
+        table: catalog.Table,
+        store: @import("lake_index_store.zig").Store,
+        reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
+        arena: std.heap.ArenaAllocator,
+        artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef,
+        recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe,
+        read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
+        child: catalog.AggregatePartialCursor,
+        fused: [256]bool = @splat(false),
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            self.adapter.context.ensureActive() catch return true;
+            return false;
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.verify(a, self.table);
+            const cursor = self.child;
+            const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
+                try self.adapter.context.ensureActive();
+                return err;
+            };
+            try self.adapter.context.ensureActive();
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.child;
+            cursor.close(cursor.ptr);
+            self.store.deinit();
+            self.destroyControl();
+        }
+        /// Both failed opens and completed cursors release dependent owners
+        /// before freeing the descriptor that holds those owners.
+        fn destroyControl(self: *@This()) void {
+            const a = self.a;
+            if (self.reader_lease) |lease| lease.deinit();
+            self.arena.deinit();
+            a.destroy(self);
+        }
+        fn openMember(raw: *anyopaque, slot: usize) !catalog.AggregatePartialCursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.verify(self.a, self.table);
+            const recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot .. slot + 1] };
+            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+            errdefer reader.cursor().close(reader);
+            if (self.recipe.inputs.len > 1) {
+                try reader.setOutputSlot(@intCast(slot));
+                self.fused[slot] = true;
+                for (self.artifacts[slot + 1 ..], slot + 1..) |artifact, index| {
+                    if (self.fused[index]) continue;
+                    const input_recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[index .. index + 1] };
+                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+                    defer candidate.cursor().close(candidate);
+                    if (try reader.fuse(candidate, @intCast(index))) self.fused[index] = true;
+                }
+            }
+            return reader.cursor();
+        }
+    };
+    fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        if (table.external_base_source == null or table.external_indexes == null) return null;
+        const local = @import("antfly_local_sources");
+        const artifact_api = @import("lake_index_aggregate_artifact.zig");
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var state = try local.metadata_lake_index_catalog.parse(sa, table.external_indexes.?.catalog_json);
+        defer state.deinit();
+        const publication = state.value.published orelse return null;
+        if (recipe.inputs.len == 0 or recipe.inputs.len > 256) return null;
+        const identities = try sa.alloc([]const u8, recipe.inputs.len);
+        for (identities, 0..) |*identity, slot| identity.* = try @import("lake_index_native_aggregates.zig").recipeIdentity(sa, .{ .keys = recipe.keys, .inputs = recipe.inputs[slot .. slot + 1] });
+        const eligible = for (identities) |identity| {
+            const present = for (publication.declarations) |decl| {
+                if (decl.artifact.kind == .algebraic_segment and artifact_api.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break true;
+            } else false;
+            if (!present) break false;
+        } else true;
+        if (!eligible and publication.directory == null) return null;
+        try self.verify(sa, table);
+        try self.checkLakeRead(sa, table);
+        try self.server.prepareLakeCache();
+        const normalized = try self.context.platformDeadline();
+        var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
+        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
+        defer source.deinit();
+        const owner = try a.create(AggregateArtifactCursor);
+        owner.a = a;
+        owner.reader_lease = null;
+        owner.arena = .init(a);
+        var keep_owner = false;
+        defer if (!keep_owner) owner.destroyControl();
+        owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
+            try context.ensureActive();
+            if (err == error.OutOfMemory) return err;
+            return null;
+        };
+        var keep_store = false;
+        defer if (!keep_store) owner.store.deinit();
+        if (self.server.source.lakeIndexLifecycleAuthority(self.context)) |authority| {
+            owner.reader_lease = self.server.lake_reader_leases.acquire(self.server.embedding_provider_runtime.io, authority, table.id, publication.generation, context) catch |err| {
+                try context.ensureActive();
+                if (err == error.OutOfMemory or err == error.MetadataMutationOutcomeUnknown) return err;
+                return null;
+            };
+            context = owner.reader_lease.?.readContext();
+        }
+        var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
+        defer selected.deinit();
+        const owned = owner.arena.allocator();
+        const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
+        for (references, identities) |*reference, identity| {
+            const declaration = for (selected.publication().declarations) |decl| {
+                if (decl.artifact.kind == .algebraic_segment and artifact_api.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
+            } else return null;
+            reference.* = declaration.artifact;
+            reference.name = try owned.dupe(u8, reference.name);
+            reference.artifact_id = try owned.dupe(u8, reference.artifact_id);
+            reference.checksum = try owned.dupe(u8, reference.checksum);
+        }
+        try self.verify(sa, table);
+        // From this point errors propagate: selected immutable state cannot be
+        // replaced with a fresh scan halfway through consumption.
+        owner.fused = @splat(false);
+        owner.a = a;
+        owner.adapter = self;
+        owner.table = table;
+        owner.artifacts = references;
+        owner.recipe = recipe;
+        owner.read_context = context;
+        owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
+            const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember });
+            break :composed composition.cursor();
+        }) catch |err| {
+            try self.context.ensureActive();
+            return err;
+        };
+        keep_store = true;
+        keep_owner = true;
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.close };
+    }
+
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
-        try self.verify(alloc, table);
-        try self.checkLakeRead(alloc, table);
-        const cursor = try @import("lake_sql_cursor.zig").openWithCache(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, &self.server.lake_read_cache, self.server.embedding_provider_runtime.io);
-        errdefer cursor.close(cursor.ptr);
-        try self.verify(alloc, table);
-        return cursor;
+        const statement = try self.openLakeStatement(alloc, &.{.{ .table = table, .request = request }});
+        errdefer statement.close(statement.ptr);
+        const owner = try alloc.create(SingleStatementCursor);
+        owner.* = .{ .alloc = alloc, .statement = statement };
+        return owner.asCursor();
     }
 
     fn checkLakeRead(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
@@ -851,6 +1023,7 @@ pub const Adapter = struct {
             if (request.table.external_base_source != null) {
                 try self.verify(scratch.allocator(), request.table);
                 try self.checkLakeRead(scratch.allocator(), request.table);
+                try self.server.prepareLakeCache();
                 if (owner.sources.contains(request.table.id)) continue;
                 const source = try alloc.create(@import("antfly_local_sources").serverless_query_lake_serving.ServingSource);
                 errdefer alloc.destroy(source);
@@ -867,7 +1040,14 @@ pub const Adapter = struct {
         var native_index: usize = 0;
         for (requests, owner.cursors) |request, *cursor| {
             if (request.table.external_base_source != null) {
-                cursor.* = try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, request.request, self.context, owner.sources.get(request.table.id).?);
+                cursor.* = if (request.request.index_range != null)
+                    try @import("lake_index_sql_rows.zig").openPinned(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)
+                else
+                    (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)) orelse fallback: {
+                        var physical_scan = request.request;
+                        physical_scan.index_equality = null;
+                        break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);
+                    };
                 errdefer cursor.close(cursor.ptr);
                 try self.verify(scratch.allocator(), request.table);
             } else {
@@ -883,10 +1063,54 @@ pub const Adapter = struct {
     const SingleStatementCursor = struct {
         alloc: std.mem.Allocator,
         statement: catalog.StatementRead,
+        fn asCursor(self: *@This()) catalog.Cursor {
+            const child = self.statement.cursors[0];
+            return .{
+                .ptr = self,
+                .next = next,
+                .close = close,
+                .next_columns = if (child.next_columns != null) nextColumns else null,
+                .set_dynamic_filter = if (child.set_dynamic_filter != null) setDynamicFilter else null,
+                .count_rows = if (child.count_rows != null) countRows else null,
+                // Cursor's contract keeps children inside their parent's lifetime.
+                // The statement therefore pins their shared source until close.
+                .split_scan = if (child.split_scan != null) splitScan else null,
+                .split_ordered = if (child.split_ordered != null) splitOrdered else null,
+                .order_satisfied = child.order_satisfied,
+                .estimated_rows = child.estimated_rows,
+                .estimated_bytes = child.estimated_bytes,
+                .ordered_split_bytes = child.ordered_split_bytes,
+            };
+        }
+        fn countRows(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.count_rows.?(child.ptr);
+        }
+        fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.split_scan.?(child.ptr, alloc, maximum);
+        }
+        fn splitOrdered(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.split_ordered.?(child.ptr, alloc, maximum);
+        }
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.statement.cursors[0];
             return cursor.next(cursor.ptr, alloc, limit);
+        }
+        fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return if (cursor.set_dynamic_filter) |install| try install(cursor.ptr, filter) else false;
+        }
+        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return (cursor.next_columns orelse return error.UnsupportedSqlExecution)(cursor.ptr, alloc, limit);
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2729,7 +2953,13 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
 
 test "SQL document reads reject the relational stateless fallback before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
-    var adapter = Adapter{ .server = undefined, .identity = &identity, .context = .{} };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var server: http_server.ApiHttpServer = undefined;
+    // Backend construction borrows the executor. Catalog and transport remain
+    // poisoned so rejected requests cannot touch those authorities.
+    server.embedding_provider_runtime.io = io_impl.io();
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.scan(&adapter, std.testing.allocator, .{
         .id = 1,
         .physical_name = "docs",
@@ -2750,7 +2980,13 @@ test "SQL no-op mutations authorize read and write before consulting catalog" {
     var identity: ?http_server.AuthenticatedIdentity = .{ .username = @constCast("writer"), .permissions = &permission };
     // Reaching server/catalog would be invalid: denied read-and-write bindings
     // must fail before metadata access, including contradictory/no-op writes.
-    var adapter = Adapter{ .server = undefined, .identity = &identity, .context = .{} };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var server: http_server.ApiHttpServer = undefined;
+    // Backend construction borrows the executor. Catalog and transport remain
+    // poisoned so rejected requests cannot touch those authorities.
+    server.embedding_provider_runtime.io = io_impl.io();
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     const compiler = @import("antfly_local_sources").sql_compiler;
     const runtime = @import("antfly_local_sources").sql_runtime;
     for ([_][]const u8{ "DELETE FROM docs WHERE _id = NULL", "UPDATE docs SET name = 'x' WHERE _id = 'a' AND _id = 'b'" }) |statement| {
@@ -3039,4 +3275,74 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
         .{ .status = 400, .body = "{malformed receipt", .expected = error.SqlMutationOutcomeUnknown },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, classifyMutationFailure(case.status, case.body).err);
+}
+
+test "SQL lake statement wrapper preserves ordering counts estimates and split source lifetime" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        statement_closed: bool = false,
+        children: usize = 0,
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn count(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.statement_closed);
+            return 12345;
+        }
+        fn childClose(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.statement_closed);
+            self.children -= 1;
+        }
+        fn split(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.statement_closed);
+            const children = try alloc.alloc(catalog.Cursor, @min(maximum, 2));
+            for (children) |*child| child.* = .{ .ptr = self, .next = next, .close = childClose, .count_rows = count };
+            self.children += children.len;
+            return children;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.children == 0);
+            self.statement_closed = true;
+        }
+    };
+    var fixture: Fixture = .{};
+    const physical: catalog.Cursor = .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close, .order_satisfied = true, .estimated_rows = 12345, .estimated_bytes = 98765, .ordered_split_bytes = 64, .count_rows = Fixture.count, .split_scan = Fixture.split, .split_ordered = Fixture.split };
+    const owner = try a.create(Adapter.SingleStatementCursor);
+    owner.* = .{ .alloc = a, .statement = .{ .ptr = &fixture, .cursors = &.{physical}, .close = Fixture.close } };
+    const wrapped = owner.asCursor();
+    try std.testing.expect(wrapped.order_satisfied);
+    try std.testing.expectEqual(physical.estimated_rows, wrapped.estimated_rows);
+    try std.testing.expectEqual(physical.estimated_bytes, wrapped.estimated_bytes);
+    try std.testing.expectEqual(physical.ordered_split_bytes, wrapped.ordered_split_bytes);
+    try std.testing.expect(wrapped.next_columns == null and wrapped.set_dynamic_filter == null);
+    try std.testing.expectEqual(@as(?u64, 12345), try wrapped.count_rows.?(wrapped.ptr));
+    for ([_]*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]catalog.Cursor{ wrapped.split_scan.?, wrapped.split_ordered.? }) |split| {
+        const children = (try split(wrapped.ptr, a, 4)).?;
+        for (children) |child| {
+            try std.testing.expectEqual(@as(?u64, 12345), try child.count_rows.?(child.ptr));
+            child.close(child.ptr);
+        }
+        a.free(children);
+    }
+    wrapped.close(wrapped.ptr);
+    try std.testing.expect(fixture.statement_closed);
+}
+
+test "lake SQL failed aggregate admission releases control before its descriptor" {
+    const FailedOpen = struct {
+        fn open(a: std.mem.Allocator) !void {
+            const owner = try a.create(Adapter.AggregateArtifactCursor);
+            owner.a = a;
+            owner.reader_lease = null;
+            owner.arena = .init(a);
+            defer owner.destroyControl();
+            _ = try owner.arena.allocator().alloc(u8, 128);
+            return error.NativeArtifactStorageRequired;
+        }
+    };
+    try std.testing.expectError(error.NativeArtifactStorageRequired, FailedOpen.open(std.testing.allocator));
 }

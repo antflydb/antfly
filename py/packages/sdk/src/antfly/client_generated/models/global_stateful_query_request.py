@@ -65,6 +65,8 @@ class GlobalStatefulQueryRequest:
 
     Attributes:
         table (str): Name of the table to query. Example: wikipedia.
+        remote_snapshot (str | Unset): Opaque remote index snapshot token returned by a previous query. Required when
+            replaying search_after or search_before against an external table; a changed publication returns 409.
         evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
             offset/limit. Candidates require candidate_count; matches require
             max_rows and fail if the full qualifying population exceeds that budget.
@@ -385,6 +387,7 @@ class GlobalStatefulQueryRequest:
     """
 
     table: str
+    remote_snapshot: str | Unset = UNSET
     evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
@@ -538,6 +541,8 @@ class GlobalStatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         table = self.table
+
+        remote_snapshot = self.remote_snapshot
 
         evaluate: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evaluate, Unset):
@@ -835,6 +840,8 @@ class GlobalStatefulQueryRequest:
                 "table": table,
             }
         )
+        if remote_snapshot is not UNSET:
+            field_dict["remote_snapshot"] = remote_snapshot
         if evaluate is not UNSET:
             field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
@@ -965,6 +972,8 @@ class GlobalStatefulQueryRequest:
 
         d = dict(src_dict)
         table = d.pop("table")
+
+        remote_snapshot = d.pop("remote_snapshot", UNSET)
 
         _evaluate = d.pop("evaluate", UNSET)
         evaluate: QueryEvaluation | Unset
@@ -1860,6 +1869,7 @@ class GlobalStatefulQueryRequest:
 
         global_stateful_query_request = cls(
             table=table,
+            remote_snapshot=remote_snapshot,
             evaluate=evaluate,
             table_target=table_target,
             query=query,

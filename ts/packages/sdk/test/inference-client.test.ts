@@ -46,6 +46,7 @@ describe("InferenceClient", () => {
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
     expect(typeof client.extract).toBe("function");
+    expect(typeof client.decide).toBe("function");
     expect(typeof client.extractRaw).toBe("function");
     expect(typeof client.classify).toBe("function");
     expect(typeof client.extractEntities).toBe("function");
@@ -90,6 +91,78 @@ describe("InferenceClient", () => {
 
 describe("InferenceClient with mock fetch", () => {
   const originalFetch = global.fetch;
+
+  it("decide sends named questions and preserves complete answers", async () => {
+    const request = {
+      model: "decision-model",
+      input: "Refund the charge.",
+      questions: [
+        {
+          name: "route",
+          type: "choice" as const,
+          instructions: "Which team?",
+          choices: [
+            { value: "billing", description: "Charges" },
+            { value: "support", description: "Product" },
+          ],
+        },
+        {
+          name: "urgency",
+          type: "score" as const,
+          instructions: "How urgent?",
+          levels: [{ label: "Routine" }, { label: "Soon" }],
+        },
+        { name: "refund", type: "predicate" as const, instructions: "Refund requested?" },
+      ],
+    };
+    const response = {
+      model: "decision-model",
+      answers: [
+        {
+          name: "route",
+          type: "choice",
+          decision_method: "typed",
+          choice: "billing",
+          confidence: 0.5,
+          confidence_method: "normalized_inverse_entropy",
+          act_probability: 0.8,
+          probabilities: [
+            { value: "billing", probability: 0.9 },
+            { value: "support", probability: 0.1 },
+          ],
+        },
+        {
+          name: "urgency",
+          type: "score",
+          decision_method: "typed",
+          score: 0.7,
+          confidence: 0.3,
+          confidence_method: "normalized_inverse_entropy",
+          probabilities: [
+            { value: 0, label: "Routine", probability: 0.3 },
+            { value: 1, label: "Soon", probability: 0.7 },
+          ],
+        },
+        { name: "refund", type: "predicate", decision_method: "typed", probability: 0.95 },
+      ],
+      usage: { input_tokens: 20, output_tokens: 0 },
+    };
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const sent = input as Request;
+      expect(sent.url).toBe("http://localhost:8080/ai/v1/decisions");
+      expect(sent.method).toBe("POST");
+      expect(sent.headers.get("Authorization")).toBe("Bearer secret");
+      expect(await sent.json()).toEqual(request);
+      return new Response(JSON.stringify(response), {
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const client = new InferenceClient({
+      baseUrl: "http://localhost:8080",
+      headers: { Authorization: "Bearer secret" },
+    });
+    expect(await client.decide(request)).toEqual(response);
+  });
 
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());

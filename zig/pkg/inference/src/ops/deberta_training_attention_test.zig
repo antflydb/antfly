@@ -350,7 +350,7 @@ test "replay DeBERTa training attention owned OOM cancellation exact scratch and
             defer allocator.free(gradient);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{ fixture, options });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{ fixture, options });
     const Cancel = struct {
         checks: usize = 0,
         stop: usize,
@@ -440,7 +440,7 @@ test "replay DeBERTa training attention native hooks retain physical i32 and vie
     const a = std.testing.allocator;
     var fixture = try Fixture.init(a, 5, 0.125);
     defer fixture.deinit();
-    try std.testing.checkAllAllocationFailures(a, backendCase, .{fixture});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, backendCase, .{fixture});
 }
 
 test "replay DeBERTa training attention native hooks reject unsupported types and absent profile" {

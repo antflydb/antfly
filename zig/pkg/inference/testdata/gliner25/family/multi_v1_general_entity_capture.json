@@ -1,0 +1,1105 @@
+{
+  "artifacts": {
+    "contract_sha256": "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
+    "generator_sha256": "4e9fee278e8e4757f1ee03aec87208dfc7cbb58eb7a009b30e8f525c8eb9cde5",
+    "requests_sha256": "0362626845854c6f3893c9640b4a8c207b0463168dd2083cedcbeeda5c2e98dc"
+  },
+  "format_version": 1,
+  "model": {
+    "architecture": "boundary",
+    "compatibility": {
+      "gliner25_boundary_converter": true,
+      "reason": "The checkpoint is the released multilingual boundary profile; runtime quality and backend qualification remain separate gates."
+    },
+    "encoder_family": "deberta-v2",
+    "model_sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+    "model_size_bytes": 1149461028,
+    "parameter_count": 287355159,
+    "profile": "multi_v1",
+    "qualification": false,
+    "repo": "fastino/gliner2.5-multi-v1",
+    "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+    "sidecars": {
+      "config.json": {
+        "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+        "size_bytes": 3151
+      },
+      "encoder_config/config.json": {
+        "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+        "size_bytes": 857
+      },
+      "tokenizer.json": {
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+        "size_bytes": 16035853
+      },
+      "tokenizer_config.json": {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    },
+    "status": "verified",
+    "tensor_count": 334,
+    "tensor_header_sha256": "013eacdfc5811df532e5afc637b013307dd93787b7dfdc95e5c404a9d6ca4e6c"
+  },
+  "native_runtime_qualified": false,
+  "production_qualified": false,
+  "qualification": false,
+  "requests": [
+    {
+      "encoded": {
+        "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "end_mappings": [1, 2],
+        "input_ids": [275, 250104, 260, 266, 188457, 275, 250106, 260, 330, 260, 272, 260, 272, 250103, 260, 263, 260, 261],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities",
+            "(",
+            "[E]",
+            "x",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 1],
+        "text_tokens": [
+          "a",
+          "."
+        ]
+      },
+      "id": "bare_short",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "x",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.6265342235565186,
+                "source": {
+                  "end": 2,
+                  "start": 0
+                },
+                "text": "a."
+              }
+            ]
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "x"
+        ]
+      },
+      "native_schema_json": "{\"entities\":[\"x\"]}",
+      "output": {
+        "entities": {
+          "x": [
+            {
+              "confidence": 0.6265342235565186,
+              "end": 2,
+              "start": 0,
+              "text": "a."
+            }
+          ]
+        }
+      },
+      "schema": {
+        "entities": [
+          "x"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "a"
+          }
+        ],
+        "pass": false
+      },
+      "text": "a"
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [
+          5, 12, 17, 20, 27, 30, 39, 48, 51, 58, 59, 63, 68, 75, 84, 91, 99, 103, 113, 114, 122, 123, 127, 134, 143, 144,
+          151, 155, 161, 169, 170, 176, 185, 189, 196, 201, 206, 212, 217, 221, 231, 236, 241, 247, 252, 254, 258, 265,
+          268, 279, 280, 290, 300, 306, 314, 315, 324, 330, 331, 339, 348, 349, 353, 366, 374, 375, 379, 387, 395, 399,
+          407, 410, 415, 422, 427, 435, 443, 450, 456, 464, 474, 479, 489, 490, 496, 501, 506, 513, 514, 520, 525, 532,
+          543, 544, 548, 552, 561, 567, 572, 580, 582, 591, 598, 604, 608, 614, 623, 629, 634, 641, 645, 653, 662, 663
+        ],
+        "input_ids": [
+          275, 250104, 260, 266, 188457, 275, 250106, 2986, 250106, 29661, 250106, 8939, 260, 272, 260, 272, 250103,
+          2225, 542, 16854, 346, 2778, 646, 282, 100668, 528, 8349, 10754, 352, 122513, 277, 260, 261, 288, 4645, 20779,
+          264, 23325, 1060, 7427, 19150, 333, 16538, 264, 260, 262, 260, 53972, 260, 262, 306, 2822, 260, 263, 73780,
+          260, 261, 260, 6769, 288, 2263, 19621, 260, 262, 2225, 542, 260, 46044, 288, 27398, 2128, 515, 260, 166259,
+          90401, 306, 17687, 346, 534, 2778, 646, 260, 2221, 5170, 260, 263, 1547, 11475, 282, 260, 218455, 260, 261,
+          62126, 264, 22706, 346, 2947, 7815, 260, 262, 17673, 17232, 260, 262, 44358, 260, 30780, 260, 262, 306, 327,
+          182307, 2479, 260, 261, 288, 5836, 27643, 264, 288, 6246, 289, 2115, 260, 85362, 264, 3535, 27674, 260, 51972,
+          4757, 296, 260, 4945, 260, 49931, 260, 86102, 1625, 29113, 260, 261, 2225, 542, 899, 14867, 260, 109739, 260,
+          262, 260, 166259, 899, 27672, 50546, 260, 262, 306, 288, 8349, 7667, 899, 104693, 260, 263, 32355, 8989, 3355,
+          288, 2263, 17231, 40433, 6845, 27891, 333, 260, 158973, 54804, 260, 261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities",
+            "(",
+            "[E]",
+            "person",
+            "[E]",
+            "organization",
+            "[E]",
+            "location",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0, 6, 13, 18, 21, 28, 31, 40, 49, 52, 58, 60, 64, 69, 76, 85, 92, 100, 104, 113, 115, 122, 124, 128, 135, 143,
+          145, 152, 156, 162, 169, 171, 177, 186, 190, 197, 202, 207, 213, 218, 222, 232, 237, 242, 248, 253, 255, 259,
+          266, 269, 279, 281, 291, 301, 307, 314, 316, 325, 330, 332, 340, 348, 350, 354, 367, 374, 376, 380, 388, 396,
+          400, 408, 411, 416, 423, 428, 436, 444, 451, 457, 465, 475, 480, 489, 491, 497, 502, 507, 513, 515, 521, 526,
+          533, 543, 545, 549, 553, 562, 568, 573, 581, 583, 592, 599, 605, 609, 615, 624, 630, 635, 642, 646, 654, 662
+        ],
+        "text_tokens": [
+          "alice",
+          "joined",
+          "acme",
+          "in",
+          "london",
+          "as",
+          "research",
+          "director",
+          "on",
+          "monday",
+          ".",
+          "the",
+          "team",
+          "builds",
+          "reliable",
+          "search",
+          "systems",
+          "for",
+          "hospitals",
+          ",",
+          "schools",
+          ",",
+          "and",
+          "public",
+          "agencies",
+          ".",
+          "during",
+          "the",
+          "first",
+          "meeting",
+          ",",
+          "alice",
+          "reviewed",
+          "the",
+          "launch",
+          "plan",
+          "with",
+          "priya",
+          "shah",
+          "and",
+          "confirmed",
+          "that",
+          "acme",
+          "would",
+          "open",
+          "a",
+          "new",
+          "office",
+          "in",
+          "manchester",
+          ".",
+          "engineers",
+          "discussed",
+          "model",
+          "quality",
+          ",",
+          "response",
+          "speed",
+          ",",
+          "privacy",
+          "controls",
+          ",",
+          "and",
+          "multilingual",
+          "support",
+          ".",
+          "the",
+          "company",
+          "expects",
+          "the",
+          "project",
+          "to",
+          "help",
+          "nurses",
+          "find",
+          "patient",
+          "records",
+          "faster",
+          "while",
+          "keeping",
+          "sensitive",
+          "data",
+          "protected",
+          ".",
+          "alice",
+          "will",
+          "lead",
+          "hiring",
+          ",",
+          "priya",
+          "will",
+          "manage",
+          "operations",
+          ",",
+          "and",
+          "the",
+          "research",
+          "group",
+          "will",
+          "publish",
+          "a",
+          "progress",
+          "report",
+          "after",
+          "the",
+          "first",
+          "customer",
+          "trial",
+          "next",
+          "spring",
+          "for",
+          "british",
+          "partners",
+          "."
+        ]
+      },
+      "id": "bare_long",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.989690899848938,
+                "source": {
+                  "end": 217,
+                  "start": 207
+                },
+                "text": "Priya Shah"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9892661571502686,
+                "source": {
+                  "end": 176,
+                  "start": 171
+                },
+                "text": "Alice"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9875877499580383,
+                "source": {
+                  "end": 5,
+                  "start": 0
+                },
+                "text": "Alice"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.985020637512207,
+                "source": {
+                  "end": 496,
+                  "start": 491
+                },
+                "text": "Alice"
+              }
+            ]
+          },
+          {
+            "name": "organization",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.9957295060157776,
+                "source": {
+                  "end": 241,
+                  "start": 237
+                },
+                "text": "Acme"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9932695031166077,
+                "source": {
+                  "end": 17,
+                  "start": 13
+                },
+                "text": "Acme"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.8297324180603027,
+                "source": {
+                  "end": 662,
+                  "start": 646
+                },
+                "text": "British partners"
+              }
+            ]
+          },
+          {
+            "name": "location",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.9981106519699097,
+                "source": {
+                  "end": 279,
+                  "start": 269
+                },
+                "text": "Manchester"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9957444071769714,
+                "source": {
+                  "end": 27,
+                  "start": 21
+                },
+                "text": "London"
+              }
+            ]
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "person",
+          "organization",
+          "location"
+        ]
+      },
+      "native_schema_json": "{\"entities\":[\"person\",\"organization\",\"location\"]}",
+      "output": {
+        "entities": {
+          "location": [
+            {
+              "confidence": 0.9981106519699097,
+              "end": 279,
+              "start": 269,
+              "text": "Manchester"
+            },
+            {
+              "confidence": 0.9957444071769714,
+              "end": 27,
+              "start": 21,
+              "text": "London"
+            }
+          ],
+          "organization": [
+            {
+              "confidence": 0.9957295060157776,
+              "end": 241,
+              "start": 237,
+              "text": "Acme"
+            },
+            {
+              "confidence": 0.9932695031166077,
+              "end": 17,
+              "start": 13,
+              "text": "Acme"
+            },
+            {
+              "confidence": 0.8297324180603027,
+              "end": 662,
+              "start": 646,
+              "text": "British partners"
+            }
+          ],
+          "person": [
+            {
+              "confidence": 0.989690899848938,
+              "end": 217,
+              "start": 207,
+              "text": "Priya Shah"
+            },
+            {
+              "confidence": 0.9892661571502686,
+              "end": 176,
+              "start": 171,
+              "text": "Alice"
+            },
+            {
+              "confidence": 0.9875877499580383,
+              "end": 5,
+              "start": 0,
+              "text": "Alice"
+            },
+            {
+              "confidence": 0.985020637512207,
+              "end": 496,
+              "start": 491,
+              "text": "Alice"
+            }
+          ]
+        }
+      },
+      "schema": {
+        "entities": [
+          "person",
+          "organization",
+          "location"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Alice"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Acme"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "London"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Alice joined Acme in London as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Alice reviewed the launch plan with Priya Shah and confirmed that Acme would open a new office in Manchester. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Alice will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring for British partners."
+    },
+    {
+      "encoded": {
+        "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "end_mappings": [1, 2],
+        "input_ids": [
+          275, 250104, 260, 266, 188457, 250111, 260, 330, 268, 260, 330, 275, 250106, 260, 330, 260, 272, 260, 272,
+          250103, 260, 263, 260, 261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] x: x",
+            "(",
+            "[E]",
+            "x",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 1],
+        "text_tokens": [
+          "a",
+          "."
+        ]
+      },
+      "id": "described_short",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "x",
+            "values": []
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "x"
+        ],
+        "entity_definitions": {
+          "x": {
+            "description": "x"
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"x\"],\"entity_definitions\":{\"x\":{\"description\":\"x\"}}}",
+      "output": {
+        "entities": {
+          "x": []
+        }
+      },
+      "schema": {
+        "entities": {
+          "x": "x"
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "a"
+          }
+        ],
+        "pass": false
+      },
+      "text": "a"
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [
+          5, 12, 17, 20, 27, 30, 39, 48, 51, 58, 59, 63, 68, 75, 84, 91, 99, 103, 113, 114, 122, 123, 127, 134, 143, 144,
+          151, 155, 161, 169, 170, 176, 185, 189, 196, 201, 206, 212, 217, 221, 231, 236, 241, 247, 252, 254, 258, 265,
+          268, 279, 280, 290, 300, 306, 314, 315, 324, 330, 331, 339, 348, 349, 353, 366, 374, 375, 379, 387, 395, 399,
+          407, 410, 415, 422, 427, 435, 443, 450, 456, 464, 474, 479, 489, 490, 496, 501, 506, 513, 514, 520, 525, 532,
+          543, 544, 548, 552, 561, 567, 572, 580, 582, 591, 598, 604, 608, 614, 623, 629, 634, 641, 645, 653, 662, 663
+        ],
+        "input_ids": [
+          275, 250104, 260, 266, 188457, 250111, 2986, 268, 299, 260, 55979, 6921, 250111, 29661, 268, 299, 5836, 632,
+          73569, 250111, 8939, 268, 299, 9417, 632, 2555, 275, 250106, 2986, 250106, 29661, 250106, 8939, 260, 272, 260,
+          272, 250103, 2225, 542, 16854, 346, 2778, 646, 282, 100668, 528, 8349, 10754, 352, 122513, 277, 260, 261, 288,
+          4645, 20779, 264, 23325, 1060, 7427, 19150, 333, 16538, 264, 260, 262, 260, 53972, 260, 262, 306, 2822, 260,
+          263, 73780, 260, 261, 260, 6769, 288, 2263, 19621, 260, 262, 2225, 542, 260, 46044, 288, 27398, 2128, 515, 260,
+          166259, 90401, 306, 17687, 346, 534, 2778, 646, 260, 2221, 5170, 260, 263, 1547, 11475, 282, 260, 218455, 260,
+          261, 62126, 264, 22706, 346, 2947, 7815, 260, 262, 17673, 17232, 260, 262, 44358, 260, 30780, 260, 262, 306,
+          327, 182307, 2479, 260, 261, 288, 5836, 27643, 264, 288, 6246, 289, 2115, 260, 85362, 264, 3535, 27674, 260,
+          51972, 4757, 296, 260, 4945, 260, 49931, 260, 86102, 1625, 29113, 260, 261, 2225, 542, 899, 14867, 260, 109739,
+          260, 262, 260, 166259, 899, 27672, 50546, 260, 262, 306, 288, 8349, 7667, 899, 104693, 260, 263, 32355, 8989,
+          3355, 288, 2263, 17231, 40433, 6845, 27891, 333, 260, 158973, 54804, 260, 261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] person: A named individual [DESCRIPTION] organization: A company or institution [DESCRIPTION] location: A city or place",
+            "(",
+            "[E]",
+            "person",
+            "[E]",
+            "organization",
+            "[E]",
+            "location",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0, 6, 13, 18, 21, 28, 31, 40, 49, 52, 58, 60, 64, 69, 76, 85, 92, 100, 104, 113, 115, 122, 124, 128, 135, 143,
+          145, 152, 156, 162, 169, 171, 177, 186, 190, 197, 202, 207, 213, 218, 222, 232, 237, 242, 248, 253, 255, 259,
+          266, 269, 279, 281, 291, 301, 307, 314, 316, 325, 330, 332, 340, 348, 350, 354, 367, 374, 376, 380, 388, 396,
+          400, 408, 411, 416, 423, 428, 436, 444, 451, 457, 465, 475, 480, 489, 491, 497, 502, 507, 513, 515, 521, 526,
+          533, 543, 545, 549, 553, 562, 568, 573, 581, 583, 592, 599, 605, 609, 615, 624, 630, 635, 642, 646, 654, 662
+        ],
+        "text_tokens": [
+          "alice",
+          "joined",
+          "acme",
+          "in",
+          "london",
+          "as",
+          "research",
+          "director",
+          "on",
+          "monday",
+          ".",
+          "the",
+          "team",
+          "builds",
+          "reliable",
+          "search",
+          "systems",
+          "for",
+          "hospitals",
+          ",",
+          "schools",
+          ",",
+          "and",
+          "public",
+          "agencies",
+          ".",
+          "during",
+          "the",
+          "first",
+          "meeting",
+          ",",
+          "alice",
+          "reviewed",
+          "the",
+          "launch",
+          "plan",
+          "with",
+          "priya",
+          "shah",
+          "and",
+          "confirmed",
+          "that",
+          "acme",
+          "would",
+          "open",
+          "a",
+          "new",
+          "office",
+          "in",
+          "manchester",
+          ".",
+          "engineers",
+          "discussed",
+          "model",
+          "quality",
+          ",",
+          "response",
+          "speed",
+          ",",
+          "privacy",
+          "controls",
+          ",",
+          "and",
+          "multilingual",
+          "support",
+          ".",
+          "the",
+          "company",
+          "expects",
+          "the",
+          "project",
+          "to",
+          "help",
+          "nurses",
+          "find",
+          "patient",
+          "records",
+          "faster",
+          "while",
+          "keeping",
+          "sensitive",
+          "data",
+          "protected",
+          ".",
+          "alice",
+          "will",
+          "lead",
+          "hiring",
+          ",",
+          "priya",
+          "will",
+          "manage",
+          "operations",
+          ",",
+          "and",
+          "the",
+          "research",
+          "group",
+          "will",
+          "publish",
+          "a",
+          "progress",
+          "report",
+          "after",
+          "the",
+          "first",
+          "customer",
+          "trial",
+          "next",
+          "spring",
+          "for",
+          "british",
+          "partners",
+          "."
+        ]
+      },
+      "id": "described_long",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.995669960975647,
+                "source": {
+                  "end": 217,
+                  "start": 207
+                },
+                "text": "Priya Shah"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9944378137588501,
+                "source": {
+                  "end": 176,
+                  "start": 171
+                },
+                "text": "Alice"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9933891296386719,
+                "source": {
+                  "end": 5,
+                  "start": 0
+                },
+                "text": "Alice"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9916616678237915,
+                "source": {
+                  "end": 496,
+                  "start": 491
+                },
+                "text": "Alice"
+              }
+            ]
+          },
+          {
+            "name": "organization",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.9984720349311829,
+                "source": {
+                  "end": 241,
+                  "start": 237
+                },
+                "text": "Acme"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9974278807640076,
+                "source": {
+                  "end": 17,
+                  "start": 13
+                },
+                "text": "Acme"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.8862056136131287,
+                "source": {
+                  "end": 662,
+                  "start": 646
+                },
+                "text": "British partners"
+              }
+            ]
+          },
+          {
+            "name": "location",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.9991452693939209,
+                "source": {
+                  "end": 279,
+                  "start": 269
+                },
+                "text": "Manchester"
+              },
+              {
+                "attributes": [],
+                "confidence": 0.9977511763572693,
+                "source": {
+                  "end": 27,
+                  "start": 21
+                },
+                "text": "London"
+              }
+            ]
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "person",
+          "organization",
+          "location"
+        ],
+        "entity_definitions": {
+          "location": {
+            "description": "A city or place"
+          },
+          "organization": {
+            "description": "A company or institution"
+          },
+          "person": {
+            "description": "A named individual"
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"person\",\"organization\",\"location\"],\"entity_definitions\":{\"person\":{\"description\":\"A named individual\"},\"organization\":{\"description\":\"A company or institution\"},\"location\":{\"description\":\"A city or place\"}}}",
+      "output": {
+        "entities": {
+          "location": [
+            {
+              "confidence": 0.9991452693939209,
+              "end": 279,
+              "start": 269,
+              "text": "Manchester"
+            },
+            {
+              "confidence": 0.9977511763572693,
+              "end": 27,
+              "start": 21,
+              "text": "London"
+            }
+          ],
+          "organization": [
+            {
+              "confidence": 0.9984720349311829,
+              "end": 241,
+              "start": 237,
+              "text": "Acme"
+            },
+            {
+              "confidence": 0.9974278807640076,
+              "end": 17,
+              "start": 13,
+              "text": "Acme"
+            },
+            {
+              "confidence": 0.8862056136131287,
+              "end": 662,
+              "start": 646,
+              "text": "British partners"
+            }
+          ],
+          "person": [
+            {
+              "confidence": 0.995669960975647,
+              "end": 217,
+              "start": 207,
+              "text": "Priya Shah"
+            },
+            {
+              "confidence": 0.9944378137588501,
+              "end": 176,
+              "start": 171,
+              "text": "Alice"
+            },
+            {
+              "confidence": 0.9933891296386719,
+              "end": 5,
+              "start": 0,
+              "text": "Alice"
+            },
+            {
+              "confidence": 0.9916616678237915,
+              "end": 496,
+              "start": 491,
+              "text": "Alice"
+            }
+          ]
+        }
+      },
+      "schema": {
+        "entities": {
+          "location": "A city or place",
+          "organization": "A company or institution",
+          "person": "A named individual"
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Alice"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Acme"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "London"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Alice joined Acme in London as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Alice reviewed the launch plan with Priya Shah and confirmed that Acme would open a new office in Manchester. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Alice will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring for British partners."
+    }
+  ],
+  "runtime": {
+    "absent_packages": [
+      "peft"
+    ],
+    "compatibility": [
+      {
+        "classes": [
+          "PeftModel",
+          "LoraLayer"
+        ],
+        "executed_peft_code": false,
+        "name": "inference_only_peft_type_import_shim",
+        "reason": "pinned GLiNER2 ExtractorCollator eagerly imports trainer-only PEFT types"
+      }
+    ],
+    "device": "cpu",
+    "dtype": "float32",
+    "packages": {
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "pydantic": "2.12.3",
+      "safetensors": "0.7.0",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "transformers": "4.55.4"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "python": "3.12.3",
+    "pythonhashseed": 0,
+    "threads": 2,
+    "unicode": "15.0.0"
+  },
+  "scope": "upstream_multilingual_family_reference",
+  "semantic_pass": false,
+  "source": {
+    "checkout": "/private/tmp/antfly-gliner-family-upstream",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner-family-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner-family-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner-family-upstream/gliner2/auto.py",
+      "gliner2.classification": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/__init__.py",
+      "gliner2.classification.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/candidates.py",
+      "gliner2.classification.compiler": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/compiler.py",
+      "gliner2.classification.constraints": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/constraints.py",
+      "gliner2.classification.decoding": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/__init__.py",
+      "gliner2.classification.decoding.base": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/base.py",
+      "gliner2.classification.decoding.beam": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/beam.py",
+      "gliner2.classification.decoding.exact": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/exact.py",
+      "gliner2.classification.decoding.independent": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/independent.py",
+      "gliner2.classification.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/engine.py",
+      "gliner2.classification.errors": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/errors.py",
+      "gliner2.classification.result": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/result.py",
+      "gliner2.classification.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/schema.py",
+      "gliner2.classification.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/scoring.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner-family-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/schema_model.py",
+      "gliner2.joint_ie": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/__init__.py",
+      "gliner2.joint_ie.calibration": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/calibration.py",
+      "gliner2.joint_ie.candidate_scores": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/candidate_scores.py",
+      "gliner2.joint_ie.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/candidates.py",
+      "gliner2.joint_ie.compiler": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/compiler.py",
+      "gliner2.joint_ie.constraints": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/constraints.py",
+      "gliner2.joint_ie.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/engine.py",
+      "gliner2.joint_ie.lattice": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/lattice.py",
+      "gliner2.joint_ie.result": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/result.py",
+      "gliner2.joint_ie.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/schema.py",
+      "gliner2.joint_ie.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/scoring.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner-family-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.boundary_preprocessing": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/boundary_preprocessing.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner-family-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/trainer.py",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner-family-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner-family-upstream/gliner2/utils/sync_probe.py"
+    },
+    "package_version": "2.0.0",
+    "repo": "https://github.com/fastino-ai/GLiNER2",
+    "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf"
+  },
+  "status": "captured"
+}

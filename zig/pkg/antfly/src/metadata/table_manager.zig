@@ -45,6 +45,9 @@ pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+        lhs.storage.engine == rhs.storage.engine and
+        lhs.object_storage_generation == rhs.object_storage_generation and
+        std.mem.eql(u8, &lhs.object_storage_identity, &rhs.object_storage_identity) and
         lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
@@ -52,6 +55,7 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
         std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
         std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
+        std.mem.eql(u8, lhs.lake_index_catalog_json, rhs.lake_index_catalog_json) and
         std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
         std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
         std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
@@ -59,6 +63,32 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
         lhs.desired_replica_count == rhs.desired_replica_count and
         lhs.min_ranges == rhs.min_ranges;
+}
+
+/// Engine changes require an explicit data migration. Initial object document
+/// tables pin their physical store once and retain an immutable data definition.
+/// Lake tables keep the existing metadata-fenced sidecar update lifecycle.
+pub fn validateObjectTableMutation(a: std.mem.Allocator, before: TableRecord, after: TableRecord) !void {
+    if (before.storage.engine != after.storage.engine) return error.ImmutableTableStorageSettings;
+    if (before.storage.engine != .object) return;
+    if (before.object_storage_generation != after.object_storage_generation) return error.ImmutableTableStorageSettings;
+    if (!std.mem.allEqual(u8, &before.object_storage_identity, 0) and !std.mem.eql(u8, &before.object_storage_identity, &after.object_storage_identity)) return error.ImmutableTableStorageSettings;
+    var schema = try std.json.parseFromSlice(std.json.Value, a, before.schema_json, .{});
+    defer schema.deinit();
+    const external = isExternalObjectSchema(schema.value);
+    var replacement_schema = try std.json.parseFromSlice(std.json.Value, a, after.schema_json, .{});
+    defer replacement_schema.deinit();
+    if (external != isExternalObjectSchema(replacement_schema.value)) return error.ObjectTableDefinitionConflict;
+    if (after.min_ranges != 0 or after.desired_replica_count != 0 or after.storage.dense_embeddings != .primary_lsm or after.storage_migration != null) return error.ObjectTablePlacementUnsupported;
+    if (!external and (!std.mem.eql(u8, before.schema_json, after.schema_json) or !std.mem.eql(u8, before.read_schema_json, after.read_schema_json) or !std.mem.eql(u8, before.indexes_json, after.indexes_json))) return error.ObjectTableDefinitionConflict;
+}
+
+fn isExternalObjectSchema(root: std.json.Value) bool {
+    if (root != .object) return false;
+    const source = root.object.get("base_source") orelse return false;
+    if (source != .object) return false;
+    const kind = source.object.get("kind") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "external");
 }
 
 pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
@@ -83,6 +113,13 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
             hasher.update(&bytes);
         }
     }
+    if (table.storage.engine != .local) {
+        hashTableDefinitionPart(&hasher, "object-table-engine-v1");
+        var generation: [8]u8 = undefined;
+        std.mem.writeInt(u64, &generation, table.object_storage_generation, .little);
+        hasher.update(&generation);
+        hasher.update(&table.object_storage_identity);
+    }
     // Preserve fingerprints of existing default-mode tables.
     if (table.storage.dense_embeddings != .primary_lsm)
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
@@ -94,6 +131,10 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     hashTableDefinitionPart(&hasher, table.schema_json);
     hashTableDefinitionPart(&hasher, table.read_schema_json);
     if (table.relational_retirement_json.len != 0) hashTableDefinitionPart(&hasher, table.relational_retirement_json);
+    if (table.lake_index_catalog_json.len != 0) {
+        hashTableDefinitionPart(&hasher, "lake-index-catalog-v1");
+        hashTableDefinitionPart(&hasher, table.lake_index_catalog_json);
+    }
     hashTableDefinitionPart(&hasher, table.indexes_json);
     hashTableDefinitionPart(&hasher, table.replication_sources_json);
     hashTableDefinitionPart(&hasher, table.placement_role);
@@ -1212,6 +1253,7 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     published_sequence: u64 = 0,
     target_sequence: u64 = 0,
     failed: bool = false,
+    producer_complete: bool = false,
 };
 
 pub const max_schema_progress_batch = 64;
@@ -1396,6 +1438,7 @@ pub const TableManager = struct {
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
         if (self.tables.get(record.table_id)) |existing| {
+            try validateObjectTableMutation(self.alloc, existing, record);
             if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))
                 return error.VectorMigrationActive;
         }
@@ -2714,6 +2757,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
             .failed = source.failed,
+            .producer_complete = source.producer_complete,
         };
         source_count += 1;
     }

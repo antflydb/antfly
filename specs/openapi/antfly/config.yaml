@@ -13,13 +13,47 @@ components:
       properties:
         provider:
           type: string
-          enum: [antfly, jev]
+          enum: [antfly, jev, openai]
+        decision_method:
+          type: string
+          enum: [typed, embedding_similarity]
+          default: typed
+          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
         model:
           type: string
-          description: Required for Antfly; Jev defaults to jev-latest.
+          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+        model_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedding_options:
+          type: object
+          additionalProperties: false
+          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+          properties:
+            calibration_id:
+              type: string
+              pattern: '^[A-Za-z0-9_-]{1,64}$'
+              description: Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities.
+            task_type:
+              type: string
+              enum: [CLUSTERING, CLASSIFICATION]
+              default: CLUSTERING
+            dimensions:
+              type: integer
+              enum: [768, 512, 256, 128]
+              default: 768
+            min_similarity:
+              type: number
+              minimum: -1
+              maximum: 1
+            min_margin:
+              type: number
+              minimum: 0
+              maximum: 2
         url:
           type: string
-          description: Provider base URL; endpoint path is selected by provider.
+          description: Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
         api_key:
           type: string
           description: API key or secret reference. Defaults to the provider environment variable.
@@ -190,6 +224,8 @@ components:
           $ref: "#/components/schemas/SecretsConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
+        lake_cache:
+          $ref: "#/components/schemas/LakeCacheConfig"
         transaction_sessions:
           $ref: "#/components/schemas/TransactionSessionConfig"
         ha:
@@ -1486,6 +1522,50 @@ components:
         prefix:
           type: string
 
+    LakeCacheConfig:
+      type: object
+      additionalProperties: false
+      description: Disposable node-local cache for versioned Parquet and Iceberg reads.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        root:
+          type: string
+          minLength: 1
+          description: Defaults to cache/lake-ranges beneath local storage, or the Lite file directory.
+        max_memory_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 67108864
+        max_disk_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 10737418240
+        max_entries:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 16384
+        max_write_queue_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 33554432
+        max_write_queue_entries:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 16
+        protected_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 268435456
+          description: Metadata/sidecar reservation, capped at one quarter of disk capacity; zero disables it.
+
     StorageConfig:
       type: object
       additionalProperties: false
@@ -1525,6 +1605,16 @@ components:
               - required: [lite]
               - required: [local]
       properties:
+        artifacts:
+          allOf:
+            - $ref: "#/components/schemas/ObjectStorageLocation"
+          description: >-
+            Shared Antfly-owned artifact storage, independent of the primary
+            storage engine. Native remote-table index generations use this
+            location. Connection and bucket are required when configured;
+            the connection must have storage.primary capability. Distributed
+            serving requires shared storage. Standalone deployments may use
+            the local storage directory when this location is absent.
         engine:
           $ref: "#/components/schemas/StorageEngine"
         lite:
