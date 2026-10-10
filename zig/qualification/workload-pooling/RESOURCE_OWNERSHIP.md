@@ -183,27 +183,26 @@ fan-out, including when a caller leaves the parallel default enabled. The parent
 and its adapter outlive evaluation. Ordinary writes do not borrow this read
 checkpoint; their accepted completion obligations remain unchanged.
 
-## Shared execution owner still required
+## Shared execution owner startup and lifetime
 
-Opt-in standalone now creates an opaque API-kernel-owned `NodeOwner` whose
-lifetime outlives individual API borrowers. Checked create/close/destroy exports
-keep its scheduler and native errors inside the API archive. API destruction
-releases its borrow after worker joins; standalone closes the node owner before
-transport/provider joins and destroys it after consumers retire. The native API
-gate qualifies the borrower and factory contracts; complete production startup
-and shutdown of this new wiring remain pending. Inference and maintenance do
-not yet acquire this shared owner. Standalone already
-shares managed memory with inference through `inference_bridge.ResourceBudget`,
-but that ABI carries no execution grant. Inference HTTP dispatch and embedded
-provider invocation live in the separate inference archive
-(`pkg/inference/src/host/host.zig`). Its request-count gate is independent of
-runnable capacity. DataServer's work-cost port is a pacing/accounting hook, not
-an execution owner.
+Opt-in standalone creates an opaque API-kernel-owned `NodeOwner` before storage
+runtime construction. Checked create/close/destroy exports keep its scheduler
+and native errors inside the API archive. API, inference and both local and
+compiled-context storage runtimes retain checked ports to the same owner.
+Storage releases its lease after executor lanes, recurring registrations and
+durable jobs join. Standalone closes the owner before normal consumer shutdown
+and destroys it after all retained consumers retire. Focused maintenance checks
+cover runtime retention and physical lane drain; complete compiled-context and
+production startup/shutdown qualification remain pending.
 
-The next integration needs checked archive callbacks for stable request-owned
-execution capsules, borrowing the new node owner across inference and background
-consumer lifetimes. Independently admitted inference requests use the inference
-class. An embedded provider invoked synchronously by an already scheduled SQL
+Recurring storage callbacks still require explicit CPU stage admission and
+mandatory holder reentry. Distributed DataServer startup must also receive the
+node owner; its existing work-cost port is only pacing/accounting authority.
+Default scheduling remains disabled until these paths and the full release
+gates are qualified.
+
+Checked archive callbacks carry stable request-owned execution capsules.
+Independently admitted inference requests use the inference class. An embedded provider invoked synchronously by an already scheduled SQL
 worker must inherit that worker's grant rather than acquire a second ordinary
 slot: with one ordinary slot, nested acquisition would wait on its own parent.
 Inherited grants remain confined to that worker; concurrent children need their
@@ -921,3 +920,26 @@ fingerprint. These focused checks do not prove the separately compiled HA seed
 fixture has passed; that fixture remains part of cumulative integration. Holder
 CPU loans and mandatory reentry still need implementation before background
 callbacks may safely share the node CPU budget.
+
+### Node execution owner at background runtime birth
+
+Standalone now creates its node execution owner before opening storage contexts
+or constructing the local backend runtime. Both receive the same checked
+runnable port. Runtime-services request version 2 carries that optional port
+into the compiled storage context; the provider validates and copies it before
+constructing its runtime. BackendRuntime retains the owner before any work can
+start, unwinds that lease on construction failure, and releases it only after
+all executor lanes, maintenance registrations and durable jobs have joined.
+The runtime exposes a synchronous borrowed port for explicitly adopted CPU
+stages; the enclosing runtime lifetime must cover those consumers.
+
+Native maintenance qualification covers actual lane-draining teardown, copied
+port lifetime, exact shutdown rejection, malformed owner versions and allocation
+rollback. A compiled context fixture additionally checks checked transport,
+retention, rejection and destruction, but remains pending full integration.
+The old runtime-services request version is rejected before the appended port
+is inspected. Whole standalone startup and shutdown remain integration gates.
+
+Existing recurring callbacks still need stage-level CPU admission, bounded
+physical waits and mandatory holder reentry. Creating their shared owner at
+birth is a prerequisite; it does not grant them CPU or qualify default sizing.

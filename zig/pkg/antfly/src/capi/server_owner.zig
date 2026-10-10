@@ -766,6 +766,7 @@ pub fn storageOwnerContextCreateWithRuntime(
 /// an ABI function returns a scalar failure status.
 pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
     const request = services.context;
+    const runnable_owner = if (services.runnable_owner) |owner| try @import("antfly_runtime_abi").runnable_abi.Owner.read(owner) else null;
     const bridge = if (services.allocator) |value| blk: {
         if (!value.valid()) return error.InvalidArgument;
         break :blk value.*;
@@ -796,6 +797,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
         .backend = .manual,
         .borrowed_io = .{ .general = io.io() },
     };
+    runtime_config.runnable_owner = runnable_owner;
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();

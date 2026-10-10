@@ -4661,6 +4661,15 @@ pub fn runFromIterator(
         return err;
     };
     const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
+        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
+    const storage_runnable_port = if (runnable_node_owner) |*owner| try owner.executionPort() else null;
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
@@ -4672,6 +4681,7 @@ pub fn runFromIterator(
                 .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
             },
             .memory_limit_bytes = process_memory_limit_bytes,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -4679,7 +4689,7 @@ pub fn runFromIterator(
         try storage_kernel_context.configureSecrets(&secret_store);
     }
 
-    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{ .runnable_owner = storage_runnable_port });
     defer node_backend_runtime.deinit();
     // The linked inference archive retains std.Io for its full node lifetime.
     // Keep the corresponding host lane lease until after node destruction.
@@ -5269,14 +5279,6 @@ pub fn runFromIterator(
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
-    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
-        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
-    else
-        null;
-    defer if (runnable_node_owner) |*owner| {
-        owner.close() catch @panic("runnable node owner close failed");
-        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
-    };
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
         .bind_host = public_listener.bind_host,
         .bind_port = public_listener.bind_port,

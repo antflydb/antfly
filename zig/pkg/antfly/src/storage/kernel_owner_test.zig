@@ -4351,6 +4351,8 @@ test "opaque context rejects invalid runtime contracts before allocation" {
     const services = @import("kernel_runtime_services.zig");
     var context = client.Context{};
     try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = services.abi_version + 1 }));
+    // Reject the old request prefix before inspecting its appended owner port.
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = 1, .runnable_owner = @ptrFromInt(1) }));
     try std.testing.expect(context.handle == null);
     const alloc = std.testing.allocator;
     var bridge = services.memory.Allocator.fromStd(&alloc);
@@ -4537,4 +4539,56 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "opaque context retains the node runnable owner across runtime birth and destruction" {
+    const runtime = @import("antfly_runtime_abi");
+    const services = @import("kernel_runtime_services.zig");
+    const Probe = struct {
+        references: usize = 0,
+        rejected: bool = false,
+        fn retain(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return runtime.error_abi.statusFromError(error.SchedulerClosed);
+            self.references += 1;
+            return .ok;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.references != 0);
+            self.references -= 1;
+        }
+        fn unavailable(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.ExecutionWaitUnsupported);
+        }
+        fn transition(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return unavailable(raw);
+        }
+        fn start(raw: *anyopaque, _: *const runtime.runnable_abi.Start) callconv(.c) runtime.error_abi.Status {
+            return unavailable(raw);
+        }
+        fn finish(_: *anyopaque) callconv(.c) void {
+            @panic("birth does not grant CPU");
+        }
+    };
+    var probe: Probe = .{ .rejected = true };
+    var port: runtime.runnable_abi.Owner = .{ .context = &probe, .retain = Probe.retain, .release = Probe.release, .start = Probe.start, .checkpoint = Probe.unavailable, .park = Probe.transition, .enter = Probe.transition, .finish = Probe.finish };
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    const alloc = std.testing.allocator;
+    var bridge = services.memory.Allocator.fromStd(&alloc);
+    var context = client.Context{};
+    try std.testing.expectError(error.SchedulerClosed, context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port }));
+    try std.testing.expect(context.handle == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+    probe.rejected = false;
+    port.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port }));
+    try std.testing.expect(context.handle == null);
+    port.version += 1;
+    try context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor, .runnable_owner = &port });
+    defer if (context.handle != null) context.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    port.version = 0; // Provider retained its own copy of the checked port.
+    context.deinit();
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
 }

@@ -22,6 +22,7 @@ const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
 
@@ -462,6 +463,10 @@ pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
+    /// The node owner is retained before any runtime work can start and
+    /// released after every lane, recurring callback and durable job joins.
+    /// Callbacks must explicitly adopt CPU stages and mandatory reentry.
+    runnable_owner: ?runnable_abi.Owner = null,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Value-semantic executor limits. Separate lanes preserve isolation for
     /// nested submissions; validation keeps their simultaneously activatable
@@ -957,6 +962,7 @@ const OwnerRegistry = struct {
 };
 
 pub const BackendRuntime = struct {
+    runnable_owner_lease: ?runnable_abi.Lease = null,
     alloc: Allocator,
     backend: Backend,
     lane_limits: threaded_io_limits.BackendRuntimeLaneLimits,
@@ -1018,6 +1024,9 @@ pub const BackendRuntime = struct {
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
 
+        var runnable_owner_lease = if (config.runnable_owner) |owner| try runnable_abi.Lease.init(owner) else null;
+        errdefer if (runnable_owner_lease) |*lease| lease.deinit();
+
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
         owner_registry.* = OwnerRegistry.init(alloc);
@@ -1032,6 +1041,7 @@ pub const BackendRuntime = struct {
         errdefer native_storage_pool.deinit();
 
         var runtime = BackendRuntime{
+            .runnable_owner_lease = runnable_owner_lease,
             .alloc = alloc,
             .backend = config.backend,
             .lane_limits = config.lane_limits,
@@ -1069,6 +1079,12 @@ pub const BackendRuntime = struct {
         }
 
         return runtime;
+    }
+
+    /// Borrow only while the runtime is retained through the consumer join.
+    /// Independently started capsules retain their own node-owner lease.
+    pub fn runnableOwner(self: *const BackendRuntime) ?runnable_abi.Owner {
+        return if (self.runnable_owner_lease) |lease| lease.owner else null;
     }
 
     pub fn maintenanceScheduler(self: *BackendRuntime) !*MaintenanceScheduler {
@@ -1164,6 +1180,7 @@ pub const BackendRuntime = struct {
         self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
+        if (self.runnable_owner_lease) |*lease| lease.deinit();
         self.* = undefined;
     }
 
@@ -4416,4 +4433,88 @@ test "maintenance runtime closes all callback classes before waiting for an API 
     try std.testing.expectEqual(@as(usize, 0), retired.active);
     try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
     try std.testing.expect(!deinitialized.load(.acquire));
+}
+
+const TestRunnableOwner = struct {
+    const errors = @import("antfly_runtime_abi").error_abi;
+    references: std.atomic.Value(usize) = .init(0),
+    reject: bool = false,
+    fn retain(raw: *anyopaque) callconv(.c) errors.Status {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject) return errors.statusFromError(error.SchedulerClosed);
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return .ok;
+    }
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.references.fetchSub(1, .acq_rel) > 0);
+    }
+    fn unsupported(_: *anyopaque) callconv(.c) errors.Status {
+        return errors.statusFromError(error.ExecutionWaitUnsupported);
+    }
+    fn transition(raw: *anyopaque, _: c_int) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn start(raw: *anyopaque, _: *const runnable_abi.Start) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn finish(_: *anyopaque) callconv(.c) void {
+        @panic("test consumer must not manufacture a CPU grant");
+    }
+    fn port(self: *@This()) runnable_abi.Owner {
+        return .{ .context = self, .retain = retain, .release = release, .start = start, .checkpoint = unsupported, .park = transition, .enter = transition, .finish = finish };
+    }
+};
+
+test "maintenance runtime retains its node owner until physical lane retirement" {
+    var owner: TestRunnableOwner = .{};
+    var port = owner.port();
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io }, .runnable_owner = port });
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    port.version = 0;
+    try std.testing.expect(runtime.ptr().runnableOwner().?.valid());
+    var lane = try runtime.ptr().acquireApiLane();
+    var draining = try std.testing.io.concurrent(struct {
+        fn run(handle: *BackendRuntimeHandle) void {
+            handle.deinit();
+        }
+    }.run, .{&runtime});
+    var released = false;
+    var joined = false;
+    defer {
+        if (!released) lane.release();
+        if (!joined) draining.cancel(std.testing.io);
+    }
+    // This exact lane lease pins the runtime while destruction waits for it.
+    const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1));
+    while (runtime.ptr().api_lane_gate.state.load(.acquire) & LaneLeaseGate.closed_bit == 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    lane.release();
+    released = true;
+    draining.await(std.testing.io);
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime owner rejection and allocation rollback preserve exact ownership" {
+    var owner: TestRunnableOwner = .{ .reject = true };
+    try std.testing.expectError(error.SchedulerClosed, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    owner.reject = false;
+    var port = owner.port();
+    port.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = port }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    for (0..3) |allocation| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = allocation });
+        try std.testing.expectError(error.OutOfMemory, BackendRuntime.init(failing.allocator(), .{ .backend = .manual, .runnable_owner = owner.port() }));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    }
+    var runtime = try BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() });
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
 }
