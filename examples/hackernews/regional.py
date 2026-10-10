@@ -357,13 +357,25 @@ def main():
         }
         (args.output / "regional.json").write_text(json.dumps(report, indent=2) + "\n")
     finally:
+        cleanup = {"pod": pod_name, "created": created, "deleted": not created}
         try:
             if created:
                 run(
                     kubectl
-                    + ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
+                    + [
+                        "delete",
+                        "pod",
+                        pod_name,
+                        "--wait=true",
+                        "--timeout=60s",
+                        "--ignore-not-found",
+                    ]
                 )
+                cleanup["deleted"] = True
         finally:
+            (args.output / "cleanup.json").write_text(
+                json.dumps(cleanup, indent=2) + "\n"
+            )
             credentials.cleanup()
 
 

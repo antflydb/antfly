@@ -345,6 +345,18 @@ def main():
         verdict = assess(
             json.loads((args.output / "regional" / "regional.json").read_text()), config
         )
+    cleanup_path = args.output / "regional" / "cleanup.json"
+    cleanup = (
+        json.loads(cleanup_path.read_text())
+        if cleanup_path.exists()
+        else {"deleted": False}
+    )
+    verdict["cleanup"] = cleanup
+    if not cleanup["deleted"]:
+        verdict["passed"] = False
+        verdict["failures"].append(
+            "Owned pod cleanup not confirmed; inspect the pod before any retry"
+        )
     if completed.returncode:
         verdict["engine_failures"] = [
             json.loads(path.read_text())
