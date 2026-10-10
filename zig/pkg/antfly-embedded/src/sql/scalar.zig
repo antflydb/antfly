@@ -3663,7 +3663,7 @@ const Evaluator = struct {
                     .positive => if (value == .integer or value == .float) value else error.SqlTypeMismatch,
                     .negative => switch (value) {
                         .integer => |v| .{ .integer = std.math.negate(v) catch return error.SqlNumericOutOfRange },
-                        .float => |v| finite(-v),
+                        .float => |v| .{ .float = -v },
                         else => error.SqlTypeMismatch,
                     },
                     else => unreachable,
@@ -4299,18 +4299,18 @@ const Evaluator = struct {
             },
             .abs => return switch (first) {
                 .integer => |v| .{ .integer = if (v < 0) std.math.negate(v) catch return error.SqlNumericOutOfRange else v },
-                .float => |v| finite(@abs(v)),
+                .float => |v| .{ .float = @abs(v) },
                 else => error.SqlTypeMismatch,
             },
-            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) finite(switch (function) {
+            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) .{ .float = switch (function) {
                 .ceil => @ceil(first.float),
                 .floor => @floor(first.float),
                 .trunc => @trunc(first.float),
                 else => roundTiesEven(first.float),
-            }) else error.SqlTypeMismatch,
+            } } else error.SqlTypeMismatch,
             .sign => return switch (first) {
                 .integer => |value| .{ .integer = if (value < 0) -1 else if (value > 0) 1 else 0 },
-                .float => |value| if (!std.math.isFinite(value)) error.SqlNumericOutOfRange else finite(if (value < 0) -1 else if (value > 0) 1 else 0),
+                .float => |value| .{ .float = if (value < 0) -1 else if (value > 0) 1 else 0 },
                 else => error.SqlTypeMismatch,
             },
             .sqrt => {
@@ -4319,7 +4319,12 @@ const Evaluator = struct {
                 if (std.math.isNan(v) or std.math.isPositiveInf(v)) return .{ .float = v };
                 return finite(@sqrt(v));
             },
-            .power => return finite(std.math.pow(f64, try asFloat(first), try asFloat(values[1]))),
+            .power => {
+                const base = try arithmeticNumber(first);
+                const exponent = try arithmeticNumber(values[1]);
+                const result = std.math.pow(f64, base, exponent);
+                return if (std.math.isFinite(base) and std.math.isFinite(exponent)) finite(result) else .{ .float = result };
+            },
             .mod => return arithmetic(.modulo, first, values[1]),
             else => {},
         }
@@ -4660,16 +4665,24 @@ pub fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
             else => unreachable,
         } };
     }
-    const a = try asFloat(left);
-    const b = try asFloat(right);
-    return finite(switch (op) {
+    const a = try arithmeticNumber(left);
+    const b = try arithmeticNumber(right);
+    const result = switch (op) {
         .add => a + b,
         .subtract => a - b,
         .multiply => a * b,
-        .divide => if (b == 0) return error.SqlDivisionByZero else a / b,
+        .divide => if (b == 0 and !std.math.isNan(a)) return error.SqlDivisionByZero else a / b,
         .modulo => if (b == 0) return error.SqlDivisionByZero else @rem(a, b),
         else => unreachable,
-    });
+    };
+    return if (std.math.isFinite(a) and std.math.isFinite(b)) finite(result) else .{ .float = result };
+}
+fn arithmeticNumber(value: Json) !f64 {
+    return switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .float => |v| v,
+        else => error.SqlTypeMismatch,
+    };
 }
 fn compareIntFloat(integer: i64, number: f64) !std.math.Order {
     if (!std.math.isFinite(number)) return error.SqlNumericOutOfRange;

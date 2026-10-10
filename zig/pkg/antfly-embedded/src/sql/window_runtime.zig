@@ -387,11 +387,17 @@ const Tree = struct {
             .sum => {
                 if (self.spec.type != .integer) {
                     for ([_]f128{ right.number, right.compensation }) |value| {
+                        if (!std.math.isFinite(result.number) or !std.math.isFinite(value)) {
+                            result.number += value;
+                            result.compensation = 0;
+                            continue;
+                        }
                         const sum = result.number + value;
+                        if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
                         result.compensation += if (@abs(result.number) >= @abs(value)) (result.number - sum) + value else (value - sum) + result.number;
                         result.number = sum;
                     }
-                    if (!std.math.isFinite(result.number) or !std.math.isFinite(result.compensation)) return error.SqlNumericOutOfRange;
+                    if (!std.math.isFinite(result.compensation)) return error.SqlNumericOutOfRange;
                 }
             },
             else => {},
@@ -440,7 +446,7 @@ const Tree = struct {
 
 fn finite(value: f128) !f64 {
     const result: f64 = @floatCast(value);
-    if (!std.math.isFinite(result)) return error.SqlNumericOutOfRange;
+    if (std.math.isFinite(value) and !std.math.isFinite(result)) return error.SqlNumericOutOfRange;
     return result;
 }
 

@@ -134,6 +134,7 @@ const Encoder = struct {
     }
 };
 const Decoder = struct {
+    sql_floating: bool = false,
     a: A,
     bytes: []const u8,
     position: usize = 0,
@@ -162,7 +163,7 @@ const Decoder = struct {
             3 => Datum.json(.{ .integer = try self.integer(i64) }),
             4 => blk: {
                 const value: f64 = @bitCast(try self.integer(u64));
-                if (!std.math.isFinite(value)) return error.InvalidSqlSpill;
+                if (!std.math.isFinite(value) and !self.sql_floating) return error.InvalidSqlSpill;
                 break :blk Datum.json(.{ .float = value });
             },
             5 => Datum.json(.{ .string = try self.text() }),
@@ -215,7 +216,8 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string };
+    const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
+    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };
     if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
     const signature = try decoder.raw(5);
     if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
@@ -223,13 +225,13 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
     const sum = try decoder.integer(i128);
     var numbers: [3]f64 = undefined;
-    for (&numbers) |*v| {
+    for (&numbers, 0..) |*v, i| {
         v.* = @bitCast(try decoder.integer(u64));
-        if (!std.math.isFinite(v.*)) return error.InvalidSqlSpill;
+        if (!std.math.isFinite(v.*) and !(sql_floating and ((i == 0 and spec.kind == .sum) or (i == 2 and spec.kind == .avg)))) return error.InvalidSqlSpill;
     }
     if (spec.kind == .sum and spec.input_element == .float32) {
         const rounded: f32 = @floatCast(numbers[0]);
-        if (numbers[0] != @as(f64, rounded) or numbers[1] != 0 or numbers[2] != 0) return error.InvalidSqlSpill;
+        if ((numbers[0] != @as(f64, rounded) and !(std.math.isNan(numbers[0]) and std.math.isNan(rounded))) or numbers[1] != 0 or numbers[2] != 0) return error.InvalidSqlSpill;
     }
     const numeric_flag = try decoder.integer(u8);
     const exact = spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg);
@@ -440,18 +442,20 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         } else {
             // Include the incoming compensation when composing local sums.
             for ([_]f64{ source.number_sum, -source.compensation }) |value| {
-                const adjusted = value - target.compensation;
-                const sum = target.number_sum + adjusted;
-                if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
-                target.compensation = (sum - target.number_sum) - adjusted;
-                target.number_sum = sum;
+                try operators.Aggregate.addFloatSum(&target.number_sum, &target.compensation, value);
             }
         },
         .avg => {
             const fraction = @as(f64, @floatFromInt(source.count)) / @as(f64, @floatFromInt(total));
             const delta = source.mean - target.mean;
-            target.mean = if (target.count == 0) source.mean else if (std.math.isFinite(delta)) target.mean + delta * fraction else target.mean * (1 - fraction) + source.mean * fraction;
-            if (!std.math.isFinite(target.mean)) return error.SqlNumericOutOfRange;
+            if (target.count == 0) {
+                target.mean = source.mean;
+            } else if (!std.math.isFinite(target.mean) or !std.math.isFinite(source.mean)) {
+                target.mean += source.mean;
+            } else {
+                target.mean = if (std.math.isFinite(delta)) target.mean + delta * fraction else target.mean * (1 - fraction) + source.mean * fraction;
+                if (!std.math.isFinite(target.mean)) return error.SqlNumericOutOfRange;
+            }
         },
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
@@ -552,4 +556,31 @@ test "SQL aggregate wire signature uses stable explicit IDs" {
     try std.testing.expectEqual(@as(u64, 0), decoded.count);
     try std.testing.expectEqual(@as(u8, 3), typeId(.number));
     try std.testing.expectEqual(@as(u8, 7), typeId(.uuid));
+}
+
+test "SQL floating special values survive partial codec and combination" {
+    const a = std.testing.allocator;
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+        for ([_]operators.Aggregate.Kind{ .sum, .avg }) |operation| {
+            var source = try operators.Aggregate.initTyped(a, operation, .number, kind);
+            defer source.deinit();
+            try source.update(Datum.json(.{ .float = std.math.inf(f64) }));
+            const saved = try cell(a, source);
+            defer a.free(saved.value.string);
+            var restored = try decode(a, saved, .{ .kind = operation, .input_type = .number, .input_element = kind });
+            defer restored.deinit();
+            try merge(&restored, source);
+            try std.testing.expect(std.math.isPositiveInf((try restored.finish()).value.float));
+            var opposite = try operators.Aggregate.initTyped(a, operation, .number, kind);
+            defer opposite.deinit();
+            try opposite.update(Datum.json(.{ .float = -std.math.inf(f64) }));
+            try merge(&restored, opposite);
+            try std.testing.expect(std.math.isNan((try restored.finish()).value.float));
+            const nan_saved = try cell(a, restored);
+            defer a.free(nan_saved.value.string);
+            var nan_restored = try decode(a, nan_saved, .{ .kind = operation, .input_type = .number, .input_element = kind });
+            defer nan_restored.deinit();
+            try std.testing.expect(std.math.isNan((try nan_restored.finish()).value.float));
+        }
+    }
 }

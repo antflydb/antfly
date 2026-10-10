@@ -4913,3 +4913,102 @@ test "SQL special floats preserve prepared derived values on allocation failures
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
 }
+
+test "SQL floating special values survive ordinary and window reducers" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT to_jsonb(sum(x)) FROM (VALUES ('Infinity'::real),(1::real)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(avg(x)) FROM (VALUES ('Infinity'::real),('Infinity'::real),(1::real)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(sum(x)) FROM (VALUES ('Infinity'::real),('-Infinity'::real)) t(x)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(sum(x)) FROM (VALUES (1::double precision),('Infinity'::double precision),(2::double precision)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(avg(x) OVER ()) FROM (VALUES ('Infinity'::double precision),('Infinity'::double precision)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(sum(x) OVER ()) FROM (VALUES ('Infinity'::real),('-Infinity'::real)) t(x)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(avg(x) OVER ()) FROM (VALUES ('Infinity'::real),('-Infinity'::real)) t(x)", .expected = "NaN" },
+
+        .{ .sql = "SELECT to_jsonb(avg(x)) FROM (VALUES ('NaN'::double precision),(1::double precision)) t(x)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(sum(x)) FROM (VALUES ('Infinity'::double precision),('-Infinity'::double precision)) t(x)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(avg(x) OVER ()) FROM (VALUES ('Infinity'::double precision),(1::double precision)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(sum(x) OVER ()) FROM (VALUES ('NaN'::double precision),(1::double precision)) t(x)", .expected = "NaN" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        for (result.output.rows) |row| try std.testing.expectEqualStrings(case.expected, row[0].string);
+    }
+}
+
+test "SQL floating special values propagate through arithmetic and functions" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT to_jsonb('Infinity'::real + 1::real)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb('Infinity'::double precision - 'Infinity'::double precision)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(-('Infinity'::real))", .expected = "-Infinity" },
+        .{ .sql = "SELECT to_jsonb(abs('NaN'::real))", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(floor('Infinity'::double precision))", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb('Infinity'::real * 0::real)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb('Infinity'::double precision / 'Infinity'::double precision)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb('NaN'::double precision / 0::double precision)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(round('NaN'::double precision))", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(ceil('-Infinity'::real))", .expected = "-Infinity" },
+        .{ .sql = "SELECT to_jsonb(trunc('Infinity'::real))", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(power('Infinity'::double precision,2))", .expected = "Infinity" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+    }
+}
+
+test "SQL floating special values do not weaken finite overflow or division errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT '1e308'::double precision + '1e308'::double precision",
+        "SELECT sum(x) FROM (VALUES ('3e38'::real),('3e38'::real)) t(x)",
+        "SELECT sum(x) FROM (VALUES ('1e308'::double precision),('1e308'::double precision)) t(x)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var compiled = try compiler.compile(a, "SELECT 'Infinity'::double precision / 0::double precision", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+}
+
+test "SQL floating special values leave moving frames when their rows leave" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var compiled = try compiler.compile(a, "SELECT to_jsonb(sum(x) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)),to_jsonb(avg(x) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM (VALUES (1,'Infinity'::double precision),(2,1::double precision),(3,2::double precision)) t(k,x) ORDER BY k", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    for (result.output.rows[0..2]) |row| for (row) |cell| try std.testing.expectEqualStrings("Infinity", cell.string);
+    for (result.output.rows[2], [_][]const u8{ "3", "1.5" }) |value, expected| {
+        const actual = try std.json.Stringify.valueAlloc(a, value, .{});
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "SQL floating special values unwind prepared reducer allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fixture: TestBackend = .{ .row_count = 0 };
+            var backend = fixture.iface();
+            backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }};
+            var result = try execute(a, backend, compiled, &.{.{ .float = std.math.nan(f64) }}, .{});
+            defer result.deinit();
+            for (result.output.rows[0]) |value| try std.testing.expectEqualStrings("NaN", value.string);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT to_jsonb(sum(x)),to_jsonb(avg(x)),to_jsonb(abs(max(x))) FROM (VALUES ($1),(1::double precision)) t(x)", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
+}

@@ -515,7 +515,7 @@ pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
         .positive => if (value.value == .integer or value.value == .float) value else error.SqlTypeMismatch,
         .negative => switch (value.value) {
             .integer => |v| Datum.json(.{ .integer = std.math.negate(v) catch return error.SqlNumericOutOfRange }),
-            .float => |v| if (std.math.isFinite(v)) Datum.json(.{ .float = -v }) else error.SqlNumericOutOfRange,
+            .float => |v| Datum.json(.{ .float = -v }),
             else => error.SqlTypeMismatch,
         },
         .not => if (value.value == .bool) Datum.json(.{ .bool = !value.value.bool }) else error.SqlTypeMismatch,

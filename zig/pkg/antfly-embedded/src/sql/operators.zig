@@ -449,7 +449,7 @@ pub const Aggregate = struct {
             } else {
                 const number: f64 = switch (value.value) {
                     .integer => |v| @floatFromInt(v),
-                    .float => |v| if (std.math.isFinite(v)) v else return error.SqlNumericOutOfRange,
+                    .float => |v| v,
                     else => return error.SqlTypeMismatch,
                 };
                 if (self.kind == .sum) {
@@ -459,17 +459,17 @@ pub const Aggregate = struct {
                     } else if (self.input_element == .float32) {
                         self.number_sum = try addRealSum(self.number_sum, number);
                     } else {
-                        const adjusted = number - self.compensation;
-                        const total = self.number_sum + adjusted;
-                        if (!std.math.isFinite(total)) return error.SqlNumericOutOfRange;
-                        self.compensation = (total - self.number_sum) - adjusted;
-                        self.number_sum = total;
+                        try addFloatSum(&self.number_sum, &self.compensation, number);
                     }
                 } else {
                     const n: f64 = @floatFromInt(self.count + 1);
                     const delta = number - self.mean;
-                    self.mean = if (std.math.isFinite(delta)) self.mean + delta / n else self.mean * ((n - 1) / n) + number / n;
-                    if (!std.math.isFinite(self.mean)) return error.SqlNumericOutOfRange;
+                    if (!std.math.isFinite(self.mean) or !std.math.isFinite(number)) {
+                        self.mean += number;
+                    } else {
+                        self.mean = if (std.math.isFinite(delta)) self.mean + delta / n else self.mean * ((n - 1) / n) + number / n;
+                        if (!std.math.isFinite(self.mean)) return error.SqlNumericOutOfRange;
+                    }
                 }
             },
             .bool_and, .bool_or => {
@@ -504,8 +504,23 @@ pub const Aggregate = struct {
         const a: f32 = @floatCast(left);
         const b: f32 = @floatCast(right);
         const sum: f32 = a + b;
-        if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
+        if (std.math.isFinite(left) and std.math.isFinite(right) and !std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
         return sum;
+    }
+
+    /// Compensation applies only to finite transitions. Special inputs retain
+    /// IEEE sums; finite inputs that overflow still raise a range error.
+    pub fn addFloatSum(sum: *f64, compensation: *f64, value: f64) !void {
+        if (!std.math.isFinite(sum.*) or !std.math.isFinite(value)) {
+            sum.* += value;
+            compensation.* = 0;
+            return;
+        }
+        const adjusted = value - compensation.*;
+        const total = sum.* + adjusted;
+        if (!std.math.isFinite(total)) return error.SqlNumericOutOfRange;
+        compensation.* = (total - sum.*) - adjusted;
+        sum.* = total;
     }
 
     pub fn finish(self: *const Aggregate) !Datum {
