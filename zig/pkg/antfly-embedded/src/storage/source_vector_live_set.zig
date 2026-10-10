@@ -267,54 +267,94 @@ pub const LiveSet = struct {
 
     pub const Iterator = struct {
         set: *const LiveSet,
-        map: Map.Iterator,
+        keys: Map.KeyIterator,
+        values: Map.ValueIterator,
         reader: usize = 0,
         row: usize = 0,
         next_bit: usize = 0,
+        pending_bit: ?usize = null,
         digest: Digest = undefined,
         dims: u32 = undefined,
 
-        pub fn next(self: *Iterator) ?struct { key_ptr: *const Digest, value_ptr: *const u32 } {
-            if (self.map.next()) |entry| return .{ .key_ptr = entry.key_ptr, .value_ptr = entry.value_ptr };
-            const source = if (self.set.source) |*s| s else return null;
-            if (self.set.locator != null) {
-                while (self.next_bit / 64 < self.set.bits.len) {
+        pub const Entry = struct { key_ptr: *const Digest, value_ptr: *const u32 };
+        pub const Step = union(enum) { item: Entry, yielded, done };
+
+        /// Each step examines one hash slot, bitmap word, reader transition
+        /// or physical row. Yielding preserves the immutable cut and cursor;
+        /// callers own admission and lifetime checks between invocations.
+        pub fn nextStep(self: *Iterator, max_steps: usize) Step {
+            for (0..max_steps) |_| {
+                if (self.keys.len != 0) {
+                    // Advance paired public field iterators exactly one slot.
+                    // std's next() can search an entire sparse capacity.
+                    const used = self.keys.metadata[0].isUsed();
+                    const entry: Entry = .{ .key_ptr = &self.keys.items[0], .value_ptr = &self.values.items[0] };
+                    self.keys.len -= 1;
+                    self.values.len -= 1;
+                    self.keys.metadata += 1;
+                    self.values.metadata += 1;
+                    self.keys.items += 1;
+                    self.values.items += 1;
+                    if (used) return .{ .item = entry };
+                    continue;
+                }
+                const source = if (self.set.source) |*src| src else return .done;
+                if (self.set.locator != null) {
+                    if (self.pending_bit) |bit| {
+                        if (self.set.offsets[self.reader + 1] <= bit) {
+                            self.reader += 1;
+                            continue;
+                        }
+                        const identity = source.readers[self.reader].sourceIdentityAt(bit - self.set.offsets[self.reader]);
+                        self.pending_bit = null;
+                        self.digest = identity.key[0..32].*;
+                        self.dims = identity.dims;
+                        return .{ .item = .{ .key_ptr = &self.digest, .value_ptr = &self.dims } };
+                    }
+                    if (self.next_bit / 64 >= self.set.bits.len) return .done;
                     const word_index = self.next_bit / 64;
                     const word = self.set.bits[word_index] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @intCast(self.next_bit % 64)));
-                    if (word == 0) {
-                        self.next_bit = (word_index + 1) * 64;
-                        continue;
+                    if (word == 0) self.next_bit = (word_index + 1) * 64 else {
+                        const bit = word_index * 64 + @ctz(word);
+                        self.next_bit = bit + 1;
+                        self.pending_bit = bit;
                     }
-                    const bit = word_index * 64 + @ctz(word);
-                    self.next_bit = bit + 1;
-                    while (self.set.offsets[self.reader + 1] <= bit) self.reader += 1;
-                    const identity = source.readers[self.reader].sourceIdentityAt(bit - self.set.offsets[self.reader]);
-                    self.digest = identity.key[0..32].*;
-                    self.dims = identity.dims;
-                    return .{ .key_ptr = &self.digest, .value_ptr = &self.dims };
+                    continue;
                 }
-                return null;
-            }
-            while (self.reader < source.readers.len) {
+                if (self.reader >= source.readers.len) return .done;
                 const reader = source.readers[self.reader];
-                while (self.row < reader.count) {
-                    const row = self.row;
-                    self.row += 1;
-                    if (!self.set.isSet(self.set.offsets[self.reader] + row)) continue;
-                    const identity = reader.sourceIdentityAt(row);
-                    std.debug.assert(identity.vector and identity.key.len == 32);
-                    self.digest = identity.key[0..32].*;
-                    self.dims = identity.dims;
-                    return .{ .key_ptr = &self.digest, .value_ptr = &self.dims };
+                if (self.row >= reader.count) {
+                    self.row = 0;
+                    self.reader += 1;
+                    continue;
                 }
-                self.row = 0;
-                self.reader += 1;
+                const row = self.row;
+                self.row += 1;
+                if (!self.set.isSet(self.set.offsets[self.reader] + row)) continue;
+                const identity = reader.sourceIdentityAt(row);
+                std.debug.assert(identity.vector and identity.key.len == 32);
+                self.digest = identity.key[0..32].*;
+                self.dims = identity.dims;
+                return .{ .item = .{ .key_ptr = &self.digest, .value_ptr = &self.dims } };
             }
-            return null;
+            return .yielded;
+        }
+        pub fn next(self: *Iterator) ?Entry {
+            while (true) switch (self.nextStep(std.math.maxInt(usize))) {
+                .item => |entry| return entry,
+                .done => return null,
+                .yielded => {},
+            };
         }
     };
     pub fn iterator(self: *const LiveSet) Iterator {
-        return .{ .set = self, .map = self.map.iterator() };
+        var keys = self.map.keyIterator();
+        var values = self.map.valueIterator();
+        if (self.map.count() == 0) {
+            keys.len = 0;
+            values.len = 0;
+        }
+        return .{ .set = self, .keys = keys, .values = values };
     }
     pub const ValueIterator = struct {
         entries: Iterator,

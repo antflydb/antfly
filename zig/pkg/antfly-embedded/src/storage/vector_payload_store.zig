@@ -692,16 +692,20 @@ pub const Store = struct {
                 switch (self.phase) {
                     .fill => {
                         if (self.iterator == null) self.iterator = collection.live.iterator();
-                        if (self.iterator.?.next()) |item| {
-                            const hash = vector_block.keyHash(&item.key_ptr.*);
-                            collection.items[self.written] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
-                            self.written += 1;
-                        } else {
-                            std.debug.assert(self.written == collection.items.len);
-                            self.iterator = null;
-                            self.heap_remaining = collection.items.len / 2;
-                            self.sort_end = collection.items.len;
-                            self.phase = .heap;
+                        switch (self.iterator.?.nextStep(1)) {
+                            .item => |item| {
+                                const hash = vector_block.keyHash(&item.key_ptr.*);
+                                collection.items[self.written] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
+                                self.written += 1;
+                            },
+                            .yielded => {},
+                            .done => {
+                                std.debug.assert(self.written == collection.items.len);
+                                self.iterator = null;
+                                self.heap_remaining = collection.items.len / 2;
+                                self.sort_end = collection.items.len;
+                                self.phase = .heap;
+                            },
                         }
                     },
                     .heap => {
@@ -7490,7 +7494,7 @@ test "source vector payloads default background planning resumes original lifeti
         fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
             const self: *@This() = @ptrCast(@alignCast(raw_control));
             self.calls += 1;
-            if (self.calls >= 16 and self.plan.phase == self.phase) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            if (self.calls >= 16 and self.plan.written != 0 and self.plan.phase == self.phase) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
             return .ok;
         }
     };
@@ -7534,8 +7538,12 @@ test "source vector payloads production planning quantum returns before finishin
         try collection.live.put(digest, @intCast(i + 1));
     }
     try collection.plan.advance(&collection, 4096, null);
-    try std.testing.expectEqual(@as(usize, 4096), collection.plan.written);
+    try std.testing.expect(collection.plan.written > 0 and collection.plan.written < count);
+    try std.testing.expectEqual(collection.live.map.capacity() - 4096, collection.plan.iterator.?.keys.len);
     try std.testing.expectEqual(.fill, collection.plan.phase);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.fill, collection.plan.phase);
+    try std.testing.expectEqual(@as(usize, count), collection.plan.written);
     try collection.plan.advance(&collection, 4096, null);
     try std.testing.expectEqual(.sort, collection.plan.phase);
     try std.testing.expect(collection.plan.sort_end > 1);
@@ -7545,4 +7553,87 @@ test "source vector payloads production planning quantum returns before finishin
     try collection.plan.advance(&collection, 4096, null);
     try std.testing.expectEqual(.done, collection.plan.phase);
     for (expected, items) |a, b| try std.testing.expectEqualDeep(a, b);
+}
+
+test "source vector payloads bounded live iteration yields across sparse fallback slots" {
+    var live = LiveSet.init(std.testing.allocator);
+    defer live.deinit();
+    try live.map.ensureTotalCapacity(65536);
+    var digest: payload.Digest = @splat(0);
+    var selected = false;
+    for (0..1024) |i| {
+        std.mem.writeInt(u64, digest[0..8], @intCast(i), .little);
+        try live.put(digest, 7);
+        var ordinary = live.map.iterator();
+        _ = ordinary.next().?;
+        if (ordinary.index > 32) {
+            selected = true;
+            break;
+        }
+        live.map.clearRetainingCapacity();
+    }
+    try std.testing.expect(selected);
+    var iterator = live.iterator();
+    try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(0)));
+    try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(32)));
+    try std.testing.expectEqual(live.map.capacity() - 32, iterator.keys.len);
+    var seen: usize = 0;
+    var turns: usize = 0;
+    while (true) : (turns += 1) switch (iterator.nextStep(32)) {
+        .yielded => try std.testing.expect(turns < live.map.capacity()),
+        .done => break,
+        .item => |entry| {
+            seen += 1;
+            try std.testing.expectEqualSlices(u8, &digest, entry.key_ptr);
+            try std.testing.expectEqual(@as(u32, 7), entry.value_ptr.*);
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 1), seen);
+    var legacy = live.iterator();
+    try std.testing.expectEqualSlices(u8, &digest, legacy.next().?.key_ptr);
+    try std.testing.expect(legacy.next() == null);
+}
+
+test "source vector payloads bounded live iteration resumes sparse physical bitmap rows and locator words" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-live-bitmap", false);
+    defer source.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var preparations: [128]payload.Prepared = undefined;
+    for (&preparations, 0..) |*item, i| {
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, @intCast(i), .little);
+        item.* = .{ .reference = try payload.Reference.forArtifact(&identity, artifact), .artifact = artifact };
+    }
+    try Store.prepare(&source, &preparations);
+    try source.checkpoint();
+    try std.testing.expect(source.opened.readers.len != 0);
+    const reader = source.opened.readers[source.opened.readers.len - 1];
+    const last = reader.sourceIdentityAt(reader.count - 1);
+    for ([_]bool{ false, true }) |indexed| {
+        var live = LiveSet.init(alloc);
+        defer live.deinit();
+        try live.enableBitmapsMode(&source.opened, indexed);
+        try live.put(last.key[0..32].*, last.dims);
+        var iterator = live.iterator();
+        try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(1)));
+        var seen: usize = 0;
+        var turns: usize = 0;
+        while (true) : (turns += 1) switch (iterator.nextStep(1)) {
+            .yielded => try std.testing.expect(turns < 1024),
+            .done => break,
+            .item => |entry| {
+                seen += 1;
+                try std.testing.expectEqualSlices(u8, last.key, entry.key_ptr);
+                try std.testing.expectEqual(last.dims, entry.value_ptr.*);
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 1), seen);
+        var legacy = live.iterator();
+        try std.testing.expectEqualSlices(u8, last.key, legacy.next().?.key_ptr);
+        try std.testing.expect(legacy.next() == null);
+    }
 }

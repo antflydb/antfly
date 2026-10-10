@@ -1976,3 +1976,29 @@ mandatory cleanup CPU and complete dependency-graph reentry still need bounds an
 fair execution ownership. Linux validation remains unqualified after host disk
 exhaustion; Docker Desktop restart failed while stopping helper processes.
 Resource/performance gates and automatic shared-execution defaults remain open.
+
+### Bounded live-set search for collection planning
+
+The live-set iterator now exposes a resumable step API. One search step visits
+one paired hash slot, bitmap word, reader boundary or physical row. Bitmap hits
+retain their pending bit while advancing across reader boundaries; sparse map and
+bitmap searches return a yield without losing the next identity. The planner uses
+one search step per original-lifetime checkpoint, closing the preceding iterator
+search gap inside its 4,096-step maintenance turn. Legacy iterator callers retain
+entry order and their existing unscoped API through the same cursor.
+
+Paired public Zig field iterators keep keys and values synchronized without a
+new key array or allocation. A source cut must remain immutable for the iterator's
+lifetime, as before. Physical fixtures cover sparse fallback capacity, bitmap row
+search and indexed bitmap word search against real immutable source blocks,
+including zero work, repeated yields and legacy sequence equivalence. The large
+planner test now counts search slots rather than assuming every step finds a live
+item. The focused source suite passes 86 checks; the ownership audit passes 13.
+These source fixtures open no DB/server, and macOS checks do not qualify Linux.
+
+Legacy callers other than the planner still need admission transport. Locator
+construction and live-location verification, selective/inline planning, reader
+construction, collection copy/publication, metadata rebuild and mandatory cleanup
+remain separate bounded-work and fair CPU-ownership adoption. Full archive/API/DB
+integration, Linux recovery/validation and resource/performance/default gates
+remain open. No automatic shared-execution defaults are enabled by these checks.
