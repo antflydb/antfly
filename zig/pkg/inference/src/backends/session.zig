@@ -86,6 +86,9 @@ pub const RunAdmission = struct {
         intermediate_size: usize = 0,
         attention_heads: usize = 0,
         quadratic_attention: bool = false,
+        qwen_dense_workspace: bool = false,
+        query_width: usize = 0,
+        kv_width: usize = 0,
     };
 
     controller: *memory.AdmissionController,
@@ -207,7 +210,7 @@ pub const RunAdmission = struct {
                 .backend_scratch_bytes = if (self.backend_workspace_reserved)
                     0
                 else
-                    workspace,
+                    workspace - @min(workspace, request.retained_backend_workspace_bytes),
             },
         };
     }
@@ -226,10 +229,22 @@ pub const RunAdmission = struct {
             try mulBytes(profile.intermediate_size, 3),
         );
         const floats_per_token = @max(attention_floats, ffn_floats);
+        // Qwen's prepared frame retains graph-plan hot slots, head-norm/RoPE
+        // staging, and fp16 K/V. Its Q width may exceed the hidden width.
+        const frame_floats = if (profile.qwen_dense_workspace)
+            // 21 retained slots: 3Q + 4KV + 8max(Q,H) + 5I. Reserve
+            // replacement overlap as well as head staging and fp16 KV.
+            try mulBytes(try addBytes(
+                try addBytes(try mulBytes(profile.query_width, 3), try mulBytes(profile.kv_width, 4)),
+                try addBytes(try mulBytes(@max(profile.query_width, profile.hidden_size), 8), try mulBytes(profile.intermediate_size, 5)),
+            ), 2)
+        else
+            floats_per_token;
         var peak = try mulBytes(
-            try mulBytes(tokens, floats_per_token),
+            try mulBytes(tokens, frame_floats),
             @sizeOf(f32),
         );
+        if (profile.qwen_dense_workspace) peak = try addBytes(peak, try self.qwenTransientWorkspaceBytes(tokens));
 
         if (profile.quadratic_attention and profile.attention_heads > 0) {
             const score_elements = try mulBytes(
@@ -242,6 +257,14 @@ pub const RunAdmission = struct {
             peak = @max(peak, try mulBytes(score_elements, @sizeOf(f32)));
         }
         return peak;
+    }
+
+    /// Retained slots cannot fund fresh upload, head staging, pooling, and
+    /// shape-dependent temporary allocations on a smaller subsequent frame.
+    pub fn qwenTransientWorkspaceBytes(self: RunAdmission, tokens: usize) !usize {
+        const profile = self.model_profile;
+        const floats = try addBytes(try addBytes(try mulBytes(profile.hidden_size, 12), profile.kv_width), try mulBytes(profile.intermediate_size, 4));
+        return addBytes(16 * 1024 * 1024, try mulBytes(try mulBytes(tokens, floats), @sizeOf(f32)));
     }
 };
 
@@ -259,6 +282,9 @@ pub const RunRequest = struct {
     /// CPU preprocessing with backend execution without a release/reacquire
     /// gap or transient double charge.
     pre_admitted_host_bytes: usize = 0,
+    /// Only an exclusive backend owner may provide this credit. Its retained
+    /// leases remain charged, and fresh allocations are bounded separately.
+    retained_backend_workspace_bytes: usize = 0,
 
     pub fn fromTensors(tensors: []const Tensor) !RunRequest {
         var input_bytes: usize = 0;
@@ -737,6 +763,20 @@ pub const Session = struct {
                 try admission.acquireRequest(request, self.outputInfo())
             else
                 null,
+        };
+    }
+
+    /// Preserve the exact denial constraint for bounded batch planning. A
+    /// failed reservation publishes no lease; a fit probe is never a permit.
+    pub fn admitWithPressure(self: Session, request: RunRequest, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        return .{
+            .session = self,
+            .request = request,
+            .lease = if (self.run_admission) |admission| blk: {
+                if (admission.controller.consumeForcedRunDenialForTesting()) return error.ResourceTemporarilyUnavailable;
+                break :blk try admission.controller.tryAcquireWithPressure(admission.backend_class, admission.limits, try admission.estimateRequest(request, self.outputInfo()), admission.check_live_memory, pressure);
+            } else null,
         };
     }
 
@@ -1415,6 +1455,58 @@ test "controlled blocked backend expires and admission unwinds" {
     };
     try std.testing.expectError(error.Timeout, permit.runWithControl(&.{}, std.testing.allocator, control));
     permit.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "run admission credits retained Qwen workspace once and keeps hard limits" {
+    var controller = memory.AdmissionController{};
+    const admission = RunAdmission{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .limits = .{ .scratch_limit_bytes = 384 * memory.bytes_per_mib },
+        .static_workspace_bytes = 1,
+        .check_live_memory = false,
+        .model_profile = .{
+            .hidden_size = 1024,
+            .intermediate_size = 3072,
+            .attention_heads = 16,
+            .qwen_dense_workspace = true,
+            .query_width = 2048,
+            .kv_width = 1024,
+        },
+    };
+    const request = RunRequest{ .batch = 2, .sequence = 256, .input_bytes = 512 * 12, .output_bytes = 2 * 1024 * 4 };
+    const peak = try admission.estimateRequest(request, &.{});
+    var narrow = admission;
+    narrow.model_profile.query_width = 1024;
+    try std.testing.expect(peak.backend_scratch_bytes > (try narrow.estimateRequest(request, &.{})).backend_scratch_bytes);
+    var retained = try admission.acquireRequest(request, &.{});
+    defer retained.release();
+    const retained_bytes = 160 * memory.bytes_per_mib;
+    try retained.retain(.{ .backend_scratch_bytes = retained_bytes });
+    var credited = request;
+    credited.retained_backend_workspace_bytes = retained_bytes;
+    var next = try admission.acquireRequest(credited, &.{});
+    defer next.release();
+    try std.testing.expectEqual(peak, controller.snapshot());
+    var larger = credited;
+    larger.batch = 8;
+    larger.input_bytes *= 4;
+    larger.output_bytes = request.output_bytes.? * 4;
+    try std.testing.expectError(error.ResourceLimitExceeded, admission.acquireRequest(larger, &.{}));
+    try std.testing.expectEqual(peak, controller.snapshot());
+    next.release();
+    try std.testing.expectEqual(retained_bytes, controller.snapshot().backend_scratch_bytes);
+    var smaller = RunRequest{ .batch = 7, .sequence = 20, .input_bytes = 140 * 12, .output_bytes = 7 * 1024 * 4 };
+    smaller.retained_backend_workspace_bytes = retained_bytes;
+    const fresh = try admission.qwenTransientWorkspaceBytes(140);
+    smaller.workspace_bytes = retained_bytes + fresh;
+    var small_permit = try admission.acquireRequest(smaller, &.{});
+    defer small_permit.release();
+    try std.testing.expectEqual(fresh, small_permit.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(retained_bytes + fresh, controller.snapshot().backend_scratch_bytes);
+    small_permit.release();
+    retained.release();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }
 

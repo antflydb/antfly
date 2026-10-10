@@ -50,6 +50,9 @@ pub const GlinerConfig = struct {
     model_type: []const u8 = "",
     capabilities: []const []const u8 = &.{},
     classification_head: ClassificationHead = .none,
+    /// Physical decision batches are bounded before allocating padded inputs.
+    decision_batch_size: usize = 64,
+    decision_batch_tokens: usize = 16384,
     // Special token IDs parsed from added_tokens.json
     token_p: i32 = 0, // [P]
     token_c: i32 = 0, // [C]
@@ -148,22 +151,18 @@ fn encodeDecisionTask(
 }
 
 fn decisionTextIds(a: std.mem.Allocator, tok: Tokenizer, text_value: []const u8) ![]i32 {
-    var words = std.ArrayListUnmanaged([]const u8).empty;
-    defer words.deinit(a);
-    var starts = std.ArrayListUnmanaged(usize).empty;
-    defer starts.deinit(a);
-    var ends = std.ArrayListUnmanaged(usize).empty;
-    defer ends.deinit(a);
-    try splitIntoWords(a, text_value, &words, &starts, &ends);
+    const processor = @import("gliner_boundary_processor.zig");
+    const add_period = text_value.len == 0 or std.mem.indexOfScalar(u8, ".!?", text_value[text_value.len - 1]) == null;
+    const effective = if (add_period) try std.mem.concat(a, u8, &.{ text_value, "." }) else text_value;
+    defer if (add_period) a.free(effective);
+    const ranges = try processor.sourceWordRanges(a, effective, .{});
+    defer a.free(ranges);
     var ids = std.ArrayListUnmanaged(i32).empty;
     errdefer ids.deinit(a);
-    var lower = std.ArrayListUnmanaged(u8).empty;
-    defer lower.deinit(a);
-    for (words.items) |word| {
-        lower.clearRetainingCapacity();
-        try lower.ensureUnusedCapacity(a, word.len);
-        for (word) |c| lower.appendAssumeCapacity(std.ascii.toLower(c));
-        try tok.encodeInto(a, lower.items, &ids);
+    for (ranges) |range| {
+        const lower = try processor.lowerTextWord(a, effective[range.start..range.end]);
+        defer a.free(lower);
+        try tok.encodeInto(a, lower, &ids);
     }
     return ids.toOwnedSlice(a);
 }
@@ -877,25 +876,54 @@ pub const GlinerPipeline = struct {
             };
             initialized += 1;
         }
-        for (prepared.rows) |row| {
-            const outputs = try self.runDecisionRow(row);
+        // Sort only the row indexes. Each result retains its original request
+        // and task indexes, including tasks split across encoder invocations.
+        const order = try a.alloc(usize, prepared.rows.len);
+        defer a.free(order);
+        for (order, 0..) |*index, i| index.* = i;
+        std.mem.sort(usize, order, prepared.rows, struct {
+            fn less(rows: []const PreparedDecisionRow, left: usize, right: usize) bool {
+                const l = rows[left].input_ids.len;
+                const r = rows[right].input_ids.len;
+                return if (l == r) left < right else l < r;
+            }
+        }.less);
+        if (self.config.decision_batch_size == 0 or self.config.decision_batch_tokens == 0) return error.InvalidDecisionBatchLimits;
+        var first: usize = 0;
+        while (first < order.len) {
+            var end = first + 1;
+            while (end < order.len and end - first < self.config.decision_batch_size) : (end += 1) {
+                const tokens = try std.math.mul(usize, end - first + 1, prepared.rows[order[end]].input_ids.len);
+                if (tokens > self.config.decision_batch_tokens) break;
+            }
+            const indexes = order[first..end];
+            const outputs = try self.runDecisionRows(prepared.rows, indexes);
             defer {
                 for (outputs) |*output| output.deinit();
                 a.free(outputs);
             }
-            if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2 or outputs[0].shape[0] != 1 or outputs[0].shape[1] != @as(i64, @intCast(row.marker_positions.len)))
+            if (outputs.len != 1 or outputs[0].dtype != .f32 or outputs[0].shape.len != 2 or
+                outputs[0].shape[0] != @as(i64, @intCast(indexes.len)) or outputs[0].shape[1] <= 0)
                 return error.UnexpectedOutputShape;
+            const labels: usize = @intCast(outputs[0].shape[1]);
             const logits = outputs[0].asFloat32();
+            if (logits.len != try std.math.mul(usize, indexes.len, labels)) return error.UnexpectedOutputShape;
             for (logits) |logit| if (!std.math.isFinite(logit)) return error.InvalidDecisionLogits;
-            var source: usize = 0;
-            for (row.task_indexes) |task_index| {
-                const range = prepared.task_ranges[row.request_index][task_index];
-                const count = range.end - range.start;
-                @memcpy(results[row.request_index].raw_logits[range.start..range.end], logits[source..][0..count]);
-                source += count;
+            for (indexes, 0..) |index, physical_row| {
+                const row = prepared.rows[index];
+                if (row.marker_positions.len > labels) return error.UnexpectedOutputShape;
+                var source: usize = 0;
+                for (row.task_indexes) |task_index| {
+                    const range = prepared.task_ranges[row.request_index][task_index];
+                    const count = range.end - range.start;
+                    if (count > row.marker_positions.len - source) return error.UnexpectedOutputShape;
+                    @memcpy(results[row.request_index].raw_logits[range.start..range.end], logits[physical_row * labels + source ..][0..count]);
+                    source += count;
+                }
+                if (source != row.marker_positions.len) return error.UnexpectedOutputShape;
+                results[row.request_index].execution_chunks += 1;
             }
-            if (source != logits.len) return error.UnexpectedOutputShape;
-            results[row.request_index].execution_chunks += 1;
+            first = end;
         }
         for (results, prepared.requests) |*result, request| {
             const decoded = try decodeDecisionTasks(a, request.tasks, result.raw_logits, result.task_ranges);
@@ -905,24 +933,50 @@ pub const GlinerPipeline = struct {
         return results;
     }
 
-    fn runDecisionRow(self: *GlinerPipeline, row: PreparedDecisionRow) ![]Tensor {
+    fn runDecisionRows(self: *GlinerPipeline, rows: []const PreparedDecisionRow, indexes: []const usize) ![]Tensor {
         const a = self.allocator;
-        const seq: i64 = @intCast(row.input_ids.len);
-        const labels: i64 = @intCast(row.marker_positions.len);
-        const input_elements = try std.math.mul(usize, try std.math.add(usize, row.input_ids.len, row.marker_positions.len), 2);
+        var seq: usize = 0;
+        var labels: usize = 0;
+        for (indexes) |index| {
+            seq = @max(seq, rows[index].input_ids.len);
+            labels = @max(labels, rows[index].marker_positions.len);
+        }
+        const token_count = try std.math.mul(usize, indexes.len, seq);
+        const marker_count = try std.math.mul(usize, indexes.len, labels);
+        const input_elements = try std.math.mul(usize, try std.math.add(usize, token_count, marker_count), 2);
         const input_bytes = try std.math.mul(usize, input_elements, @sizeOf(i64));
-        var permit = try self.session.admit(.{ .batch = 1, .sequence = row.input_ids.len, .input_bytes = input_bytes, .host_preprocess_bytes = 0 });
+        var permit = try self.session.admit(.{ .batch = indexes.len, .sequence = seq, .input_bytes = input_bytes, .host_preprocess_bytes = input_bytes });
         defer permit.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const ids = try scratch.alloc(i64, token_count);
+        const attention = try scratch.alloc(i64, token_count);
+        const positions = try scratch.alloc(i64, marker_count);
+        const mask = try scratch.alloc(i64, marker_count);
+        @memset(ids, self.tok.specialTokens().pad_id);
+        @memset(attention, 0);
+        @memset(positions, 0);
+        @memset(mask, 0);
+        for (indexes, 0..) |index, physical_row| {
+            const row = rows[index];
+            @memcpy(ids[physical_row * seq ..][0..row.input_ids.len], row.input_ids);
+            @memcpy(attention[physical_row * seq ..][0..row.attention_mask.len], row.attention_mask);
+            @memcpy(positions[physical_row * labels ..][0..row.marker_positions.len], row.marker_positions);
+            @memcpy(mask[physical_row * labels ..][0..row.marker_mask.len], row.marker_mask);
+        }
+        const shape = [_]i64{ @intCast(indexes.len), @intCast(seq) };
+        const marker_shape = [_]i64{ @intCast(indexes.len), @intCast(labels) };
         var inputs: [4]Tensor = undefined;
         var initialized: usize = 0;
         defer for (inputs[0..initialized]) |*input| input.deinit();
-        inputs[0] = try Tensor.initInt64(a, "input_ids", &.{ 1, seq }, row.input_ids);
+        inputs[0] = try Tensor.initInt64(a, "input_ids", &shape, ids);
         initialized += 1;
-        inputs[1] = try Tensor.initInt64(a, "attention_mask", &.{ 1, seq }, row.attention_mask);
+        inputs[1] = try Tensor.initInt64(a, "attention_mask", &shape, attention);
         initialized += 1;
-        inputs[2] = try Tensor.initInt64(a, "decision_marker_positions", &.{ 1, labels }, row.marker_positions);
+        inputs[2] = try Tensor.initInt64(a, "decision_marker_positions", &marker_shape, positions);
         initialized += 1;
-        inputs[3] = try Tensor.initInt64(a, "decision_marker_mask", &.{ 1, labels }, row.marker_mask);
+        inputs[3] = try Tensor.initInt64(a, "decision_marker_mask", &marker_shape, mask);
         initialized += 1;
         return self.lockedSessionRun(&permit, &inputs, a);
     }
@@ -3143,4 +3197,107 @@ test "gliner distributed GPU-hosted helpers mirror pipeline/session state" {
     };
     try std.testing.expect(pipeline.usesDistributedGpuHosted());
     try std.testing.expect(pipeline.usesTensorParallelGpuHosted());
+}
+
+test "decision batching pads distinct rows and scatters split tasks in request order" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const batch: usize = @intCast(inputs[0].shape[0]);
+            const seq: usize = @intCast(inputs[0].shape[1]);
+            const labels: usize = @intCast(inputs[2].shape[1]);
+            const ids = inputs[0].asInt64();
+            const mask = inputs[3].asInt64();
+            if (self.calls == 0) {
+                try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, inputs[0].shape);
+                try std.testing.expectEqualSlices(i64, &.{ 30, 1, 7, 20, 1, 2 }, ids);
+                try std.testing.expectEqualSlices(i64, &.{ 1, 1, 0, 1, 1, 1 }, inputs[1].asInt64());
+                try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 1, 0 }, mask);
+            } else try std.testing.expectEqual(@as(usize, 1), batch);
+            self.calls += 1;
+            const logits = try alloc.alloc(f32, batch * labels);
+            defer alloc.free(logits);
+            for (logits, 0..) |*logit, i| logit.* = if (mask[i] == 0) -1e4 else @floatFromInt(ids[(i / labels) * seq] + @as(i64, @intCast(i % labels)));
+            const outputs = try alloc.alloc(Tensor, 1);
+            errdefer alloc.free(outputs);
+            outputs[0] = try Tensor.initFloat32(alloc, "logits", inputs[2].shape, logits);
+            return outputs;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = backends.Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var probe = Probe{};
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a,
+        \\{"added_tokens":[{"id":7,"content":"[PAD]","special":true}],"model":{"type":"WordPiece","unk_token":"[UNK]","vocab":{"[UNK]":0,"[PAD]":7}}}
+    );
+    const tok = tokenizer.tokenizer();
+    defer tok.deinitTokenizer();
+    var pipeline = GlinerPipeline{ .allocator = a, .session = .{ .ptr = &probe, .vtable = &Probe.vtable }, .tok = tok, .config = .{ .decision_batch_size = 2 } };
+    const two = [_]DecisionLabel{ .{ .name = "no" }, .{ .name = "yes" } };
+    const three = [_]DecisionLabel{ .{ .name = "a" }, .{ .name = "b" }, .{ .name = "c" } };
+    const tasks0 = [_]DecisionTask{ .{ .name = "first", .labels = &two }, .{ .name = "second", .labels = &two } };
+    const tasks1 = [_]DecisionTask{.{ .name = "other", .labels = &three }};
+    const requests = [_]DecisionRequest{ .{ .text = "long", .tasks = &tasks0 }, .{ .text = "short", .tasks = &tasks1 } };
+    var rows = [_]PreparedDecisionRow{
+        .{ .request_index = 0, .input_ids = @constCast(&[_]i64{ 10, 1, 2, 3, 4 }), .attention_mask = @constCast(&[_]i64{ 1, 1, 1, 1, 1 }), .marker_positions = @constCast(&[_]i64{ 0, 1 }), .marker_mask = @constCast(&[_]i64{ 1, 1 }), .task_indexes = @constCast(&[_]usize{0}) },
+        .{ .request_index = 1, .input_ids = @constCast(&[_]i64{ 30, 1 }), .attention_mask = @constCast(&[_]i64{ 1, 1 }), .marker_positions = @constCast(&[_]i64{ 0, 1, 1 }), .marker_mask = @constCast(&[_]i64{ 1, 1, 1 }), .task_indexes = @constCast(&[_]usize{0}) },
+        .{ .request_index = 0, .input_ids = @constCast(&[_]i64{ 20, 1, 2 }), .attention_mask = @constCast(&[_]i64{ 1, 1, 1 }), .marker_positions = @constCast(&[_]i64{ 0, 1 }), .marker_mask = @constCast(&[_]i64{ 1, 1 }), .task_indexes = @constCast(&[_]usize{1}) },
+    };
+    var ranges0 = [_]DecisionTaskRange{ .{ .task_index = 0, .start = 0, .end = 2 }, .{ .task_index = 1, .start = 2, .end = 4 } };
+    var ranges1 = [_]DecisionTaskRange{.{ .task_index = 0, .start = 0, .end = 3 }};
+    var ranges = [_][]DecisionTaskRange{ &ranges0, &ranges1 };
+    const prepared = PreparedDecisionBatch{ .allocator = a, .requests = &requests, .rows = &rows, .task_ranges = &ranges, .logits_len = @constCast(&[_]usize{ 4, 3 }), .prompt_tokens = @constCast(&[_]usize{ 8, 2 }) };
+    const results = try pipeline.decidePrepared(&prepared);
+    defer {
+        for (results) |*row| row.deinit(a);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 11, 20, 21 }, results[0].raw_logits);
+    try std.testing.expectEqualSlices(f32, &.{ 30, 31, 32 }, results[1].raw_logits);
+    try std.testing.expectEqual(@as(usize, 2), results[0].execution_chunks);
+    try std.testing.expectEqual(@as(usize, 1), results[1].execution_chunks);
+}
+
+test "decision text normalization matches Fastino punctuation and Unicode lowercase" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        seen: std.ArrayListUnmanaged([]u8) = .empty,
+        fn append(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const owned = try alloc.dupe(u8, text);
+            errdefer alloc.free(owned);
+            try out.append(alloc, @intCast(self.seen.items.len + 1));
+            try self.seen.append(alloc, owned);
+        }
+    };
+    var probe = Probe{};
+    defer {
+        for (probe.seen.items) |word| a.free(word);
+        probe.seen.deinit(a);
+    }
+    const tok = Tokenizer{ .ptr = &probe, .vtable = &.{ .encode = undefined, .encodeInto = Probe.append, .encodeForModel = undefined, .encodeGeneration = undefined, .decode = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } };
+    const ids = try decisionTextIds(a, tok, "İSTANBUL\u{00a0}ΟΣ");
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 3), ids.len);
+    try std.testing.expectEqualStrings("i\u{0307}stanbul", probe.seen.items[0]);
+    try std.testing.expectEqualStrings("ος", probe.seen.items[1]);
+    try std.testing.expectEqualStrings(".", probe.seen.items[2]);
+    const empty = try decisionTextIds(a, tok, "");
+    defer a.free(empty);
+    try std.testing.expectEqual(@as(usize, 1), empty.len);
+    try std.testing.expectEqualStrings(".", probe.seen.items[3]);
+    const punctuated = try decisionTextIds(a, tok, "Hi!");
+    defer a.free(punctuated);
+    try std.testing.expectEqual(@as(usize, 2), punctuated.len);
+    try std.testing.expectEqualStrings("hi", probe.seen.items[4]);
+    try std.testing.expectEqualStrings("!", probe.seen.items[5]);
 }

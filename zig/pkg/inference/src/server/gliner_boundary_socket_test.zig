@@ -49,6 +49,11 @@ pub const Loopback = struct {
     address: ?Io.net.IpAddress = null,
 
     pub fn init(a: Allocator, node: *Node) !*Loopback {
+        return initWithCapacity(a, node, 2);
+    }
+
+    pub fn initWithCapacity(a: Allocator, node: *Node, capacity: u32) !*Loopback {
+        if (capacity == 0 or capacity > 16) return error.InvalidLoopbackCapacity;
         // Caller-owned listeners need the same exclusive startup precondition
         // as Node.serve. Publish the resource owner before request workers can
         // race its lazy creation; this neither loads a model nor reserves work.
@@ -58,17 +63,19 @@ pub const Loopback = struct {
         self.allocator = a;
         self.budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         const transport_allocator = self.budget.allocator();
-        self.server_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        self.server_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(2 * capacity + 2) });
         errdefer self.server_io.deinit();
-        self.client_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        // Each request owns a request/watchdog pair and may nest a
+        // connect/watchdog pair. Provision both pairs for every client.
+        self.client_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4 * capacity) });
         errdefer self.client_io.deinit();
         self.server = httpx.Server.initWithConfig(transport_allocator, self.server_io.io(), .{
             .host = "127.0.0.1",
             .port = 0,
             .max_body_size = 64 * 1024,
             .max_headers = 32,
-            .max_connections = 2,
-            .max_request_tasks = 2,
+            .max_connections = capacity,
+            .max_request_tasks = capacity,
             .max_h1_inflight_bodies = 1,
             .header_read_timeout_ms = short_timeout_ms,
             .body_read_timeout_ms = short_timeout_ms,
@@ -76,7 +83,7 @@ pub const Loopback = struct {
             .keep_alive_timeout_ms = short_timeout_ms,
             .keep_alive = false,
             .max_requests_per_connection = 1,
-            .request_body_buffer_budget_bytes = 128 * 1024,
+            .request_body_buffer_budget_bytes = capacity * 64 * 1024,
         });
         errdefer self.server.deinit();
         // The ingress deadline is fixed by this test owner, never by request
@@ -95,8 +102,8 @@ pub const Loopback = struct {
             .max_response_size = 1024 * 1024,
             .max_response_headers = 64,
             .keep_alive = false,
-            .pool_max_connections = 1,
-            .pool_max_per_host = 1,
+            .pool_max_connections = capacity,
+            .pool_max_per_host = capacity,
             .cookies_enabled = false,
             .cancel_in_flight_on_shutdown = true,
         });
@@ -182,7 +189,7 @@ pub const Loopback = struct {
         self.allocator.destroy(self);
     }
 
-    fn connect(self: *Loopback) !httpx.Socket {
+    pub fn connect(self: *Loopback) !httpx.Socket {
         // Zig 0.16 Threaded.netConnectIpPosix panics for a non-none native
         // timeout. Use the same structured race as the HTTP client's deadline:
         // cancel and join the loser, closing any late successful connection.

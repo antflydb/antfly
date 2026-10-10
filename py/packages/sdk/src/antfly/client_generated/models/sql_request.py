@@ -24,9 +24,11 @@ class SQLRequest:
 
         Attributes:
             statement (str): A single SQL statement.
-            lake_visibility (SQLRequestLakeVisibility | Unset): Direct read-only statement visibility for writable Iceberg
-                sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not
-                supported with sessions, connections or prepared execution. Default: SQLRequestLakeVisibility.COMMITTED.
+            lake_visibility (SQLRequestLakeVisibility | Unset): Read visibility for writable Iceberg sources. Accepted pins
+                typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared
+                executions inside a transaction retain the first accepted read cut for each table, including across savepoint
+                rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not
+                supported. Default: SQLRequestLakeVisibility.COMMITTED.
             parameters (list[Any] | Unset): Positional JSON parameter values, including null.
             database (str | Unset): Database used to resolve unqualified catalog names.
             namespace (str | Unset): Namespace used to resolve unqualified table names.

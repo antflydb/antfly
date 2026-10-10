@@ -156,11 +156,9 @@ pub fn classificationLogitsProfiled(
     const H: usize = config.hiddenSize();
     const labels = sample.classification_labels;
     if (seq_len == 0 or labels.len == 0) return error.InvalidExtractionInput;
-    // The embedded CUDA local-attention artifact has a fixed 512-score
-    // threadgroup buffer. Keep longer declared contexts on the bounded native
-    // and Metal segment-attention implementations until a regenerated CUDA
-    // kernel removes that physical limit.
-    if (config == .modern_bert and cb.kind() == .cuda and seq_len > 512)
+    // The GLiNER CUDA encoder uses dynamic shared scores and supports up to
+    // 8192 keys; native and Metal retain their declared context bounds.
+    if (config == .modern_bert and cb.kind() == .cuda and seq_len > 8192)
         return error.UnsupportedModernBertCudaSequenceLength;
 
     const attention_mask = try allocator.alloc(i64, seq_len);
@@ -489,7 +487,7 @@ pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
 pub fn sequenceTokenCeiling(config: EncoderConfig, deberta_limit: usize, cuda_backend: bool) usize {
     return switch (config) {
         .deberta => |deberta| @min(@as(usize, deberta.max_position_embeddings), deberta_limit),
-        .modern_bert => |modern| @min(@as(usize, modern.max_position_embeddings), if (cuda_backend) @as(usize, 512) else std.math.maxInt(usize)),
+        .modern_bert => |modern| @min(@as(usize, modern.max_position_embeddings), if (cuda_backend) @as(usize, 8192) else std.math.maxInt(usize)),
     };
 }
 
@@ -525,7 +523,9 @@ test "gliner span v2 preserves DeBERTa 512 ceiling and admits Decide 1B context 
     } };
     try std.testing.expectEqual(@as(usize, 512), sequenceTokenCeiling(deberta, 512, false));
     try std.testing.expectEqual(@as(usize, 7999), sequenceTokenCeiling(modern, 512, false));
-    try std.testing.expectEqual(@as(usize, 512), sequenceTokenCeiling(modern, 512, true));
+    try std.testing.expectEqual(@as(usize, 7999), sequenceTokenCeiling(modern, 512, true));
+    const oversized_modern = EncoderConfig{ .modern_bert = .{ .max_position_embeddings = 8193 } };
+    try std.testing.expectEqual(@as(usize, 8192), sequenceTokenCeiling(oversized_modern, 512, true));
     const bytes = try deviceScratchUpperBound(modern, 7999);
     try std.testing.expect(bytes > 1024 * 1024 * 1024);
     try std.testing.expect(bytes < 2 * 1024 * 1024 * 1024);
