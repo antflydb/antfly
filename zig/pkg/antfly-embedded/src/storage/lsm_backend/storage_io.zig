@@ -572,6 +572,10 @@ pub const Storage = struct {
     pub const VTable = struct {
         /// Physical directory for private build files; null disables filesystem staging.
         private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
+        /// Exact immutable native checkpoint, owned by the returned buffer.
+        /// Providers pin the complete primary/projection generation and expose
+        /// authenticated remote extents; mutable or partial views return null.
+        native_checkpoint_reference_alloc: ?*const fn (*anyopaque, Allocator) anyerror!?[]u8 = null,
         /// Optional contiguous, file-backed view. The caller owns the mapping
         /// and releases its lease with deinit; no provider lifetime is retained.
         map_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
@@ -626,6 +630,11 @@ pub const Storage = struct {
     pub fn privateScratchDirectory(self: Storage, fallback: []const u8) ?[]const u8 {
         if (self.vtable.private_scratch_directory) |directory| return directory(self.ptr);
         return fallback;
+    }
+
+    pub fn nativeCheckpointReferenceAlloc(self: Storage, a: Allocator) !?[]u8 {
+        const reference = self.vtable.native_checkpoint_reference_alloc orelse return null;
+        return reference(self.ptr, a);
     }
 
     pub fn createDirPath(self: Storage, path: []const u8) !void {

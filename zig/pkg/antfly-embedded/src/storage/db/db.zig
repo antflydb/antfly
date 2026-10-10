@@ -2956,6 +2956,9 @@ test "db optional row policy authority preserves scoped secret denial and outage
 }
 
 pub const DB = struct {
+    retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
+    retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
+    native_query_warming: @import("native_query_warming.zig").Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -4807,30 +4810,46 @@ pub const DB = struct {
 
     fn openSourceVectors(self: *DB, create: bool) !void {
         if (self.local_execution.source_vectors.load(.acquire) != null) return;
-        if (self.primary_backend != .lsm or self.physical_root_mode != .filesystem_managed or
+        const external_read = self.open_mode == .query_readonly and
+            self.physical_root_mode == .external_backend and !create;
+        if (self.primary_backend != .lsm or (!external_read and self.physical_root_mode != .filesystem_managed) or
             self.local_execution.replication_write_gate != null or self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_effect_mirror != null)
             return error.VectorStoreRequiresLocalSingleShardTable;
-        const storage = try self.alloc.create(lsm_backend_mod.NativeStorage);
-        errdefer self.alloc.destroy(storage);
-        storage.* = try lsm_backend_mod.NativeStorage.init(self.alloc, .threaded);
-        errdefer storage.deinit();
+        var native: ?*lsm_backend_mod.NativeStorage = null;
+        errdefer if (native) |owned| {
+            owned.deinit();
+            self.alloc.destroy(owned);
+        };
+        const storage = if (external_read)
+            self.primary_lsm_storage orelse return error.VectorStoreRequiresLocalSingleShardTable
+        else owned: {
+            const value = try self.alloc.create(lsm_backend_mod.NativeStorage);
+            value.* = lsm_backend_mod.NativeStorage.init(self.alloc, .threaded) catch |err| {
+                self.alloc.destroy(value);
+                return err;
+            };
+            native = value;
+            break :owned value.storage();
+        };
         const root = try std.fs.path.join(self.alloc, &.{ self.core.path, "source-vectors" });
         defer self.alloc.free(root);
         if (!create) {
             const current = try std.fs.path.join(self.alloc, &.{ root, "CURRENT" });
             defer self.alloc.free(current);
-            _ = storage.storage().fileSize(current) catch |err| switch (err) {
+            _ = storage.fileSize(current) catch |err| switch (err) {
                 error.FileNotFound => return error.MissingVectorPayloadStore,
                 else => return err,
             };
         }
         const source = try self.alloc.create(vector_payload_store_mod.Store);
         errdefer self.alloc.destroy(source);
-        source.* = try vector_payload_store_mod.Store.openManaged(self.alloc, self.core.index_manager.resource_manager, storage.storage(), root, openModeRequiresReadOnlyBackends(self.open_mode));
+        var source_policy = vector_payload_store_mod.Store.OpenPolicy.fromEnvironment();
+        source_policy.inventory_read_only = self.open_mode != .query_readonly;
+        source.* = try vector_payload_store_mod.Store.openManagedWithPolicy(self.alloc, self.core.index_manager.resource_manager, storage, root, openModeRequiresReadOnlyBackends(self.open_mode), source_policy);
         errdefer source.deinit();
-        source.enableBackgroundCollection();
+        if (!external_read) source.enableBackgroundCollection();
         source.ann_reference_root = try std.fs.path.join(source.alloc, &.{ self.core.index_manager.base_path, "vector-blocks" });
-        self.source_vector_storage = storage;
+        self.source_vector_storage = native;
         self.local_execution.source_vectors.store(source, .release);
         if (self.local_execution.table_storage.dense_embeddings == .vector_store) {
             self.core.store.configurePayloadPolicy(source.interface(), false, null);
@@ -5792,6 +5811,7 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.artifact_producer_scheduler.deinit(self.alloc);
@@ -5904,6 +5924,10 @@ pub const DB = struct {
         // state has closed.
         if (self.generation_read_lease) |*lease| lease.deinit();
         self.generation_read_lease = null;
+        if (self.retained_query_lease) |*lease| lease.deinit();
+        self.retained_query_lease = null;
+        if (self.retained_remote_query_lease) |*lease| lease.deinit();
+        self.retained_remote_query_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -19101,7 +19125,7 @@ pub const DB = struct {
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        return try self.snapshotInternal(id, false, .none, null, null, false);
+        return try self.snapshotInternal(id, false, .none, null, null, false, null);
     }
 
     /// Drain durable replay/enrichment effects before a caller freezes writes
@@ -19142,7 +19166,7 @@ pub const DB = struct {
     pub fn snapshotWithMaintenanceDeadline(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false);
+        return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns, null, false, null);
     }
 
     /// Captures the primary store and its validated generated projections as
@@ -19154,7 +19178,7 @@ pub const DB = struct {
     pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        return try self.snapshotInternal(id, true, cancellation, null, null, false);
+        return try self.snapshotInternal(id, true, cancellation, null, null, false, null);
     }
 
     /// Cohort capture verifies the exact durable owner fence and drained
@@ -19163,7 +19187,7 @@ pub const DB = struct {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         if (expected.role != .backup_snapshot) return error.InvalidIntegrityTopologyFence;
-        return try self.snapshotInternal(id, true, cancellation, null, expected, false);
+        return try self.snapshotInternal(id, true, cancellation, null, expected, false, null);
     }
 
     /// Seal an exact common-cut owner generation durably. No corpus copy or
@@ -19176,7 +19200,7 @@ pub const DB = struct {
         const seal = @import("native_backup_seal.zig");
         const name = try seal.nameAlloc(self.alloc, expected);
         defer self.alloc.free(name);
-        _ = try self.snapshotInternal(name, true, cancellation, null, expected, true);
+        _ = try self.snapshotInternal(name, true, cancellation, null, expected, true, null);
         const root = try seal.pathAlloc(self.alloc, self.core.path, expected);
         defer self.alloc.free(root);
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -19310,6 +19334,162 @@ pub const DB = struct {
         try seal.reclaim(self.alloc, io, self.core.path, .{ .cancel = fence }, .none);
     }
 
+    /// A durable generation for cursor pages: no apply/read lease escapes
+    /// capture, and resume never falls back to a fresh live generation.
+    pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+        return self.captureQueryCutInternal(request, cancellation, true);
+    }
+    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+        try request.validate(@import("native_query_cut.zig").nowMs());
+        _ = try request.namespace(self.core.identity_namespace);
+        if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const remaining = request.expires_ms -| @import("native_query_cut.zig").nowMs();
+        const expiry_deadline = monotonicTimeNs() +| remaining * std.time.ns_per_ms;
+        const deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
+        const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
+        const token = control.token();
+        try token.check();
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
+            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+        };
+        var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
+        defer guard.deinit();
+        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+        defer self.alloc.free(root);
+        const existed = try snapshotPathExists(io, root);
+        // A failed new capture must not consume the capacity reserved for
+        // usable cursors. The parent guard excludes readers of this new root.
+        errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
+            try token.check();
+            return switch (err) {
+                error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported, error.BackupSealBackendUnsupported => error.UnsupportedQueryRequest,
+                error.VectorMigrationActive, error.NativeBackupProjectionNotQuiescent, error.NativeBackupRepairStateNotQuiescent => error.IndexRebuilding,
+                error.BackupSealWalBudgetExceeded => error.QueryCandidateBudgetExceeded,
+                else => err,
+            };
+        };
+        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
+            try repository.publish(io, root, request, self.core.identity_namespace, token);
+        };
+    }
+    fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        const cut = @import("native_query_cut.zig");
+        const repository = self.backend_runtime.query_cut_repository orelse return true;
+        const io = self.backend_runtime.filesystemIo() orelse return true;
+        const now = cut.nowMs();
+        const state_path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins/.warming.json", .{self.core.path});
+        defer self.alloc.free(state_path);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const State = struct { request: cut.Request, sequence: u64, complete: bool = false, next_ms: u64 = 0 };
+        var state: ?State = if (@import("native_backup.zig").readFileAlloc(a, io, state_path, 4096)) |bytes|
+            try std.json.parseFromSliceLeaky(State, a, bytes, .{})
+        else |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        const sequence = self.core.nextDerivedSequence();
+        if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
+            state = null;
+        };
+        if (state) |value| if (value.complete and value.next_ms > now and value.sequence == sequence) return true;
+        if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
+            // Keep one private warm cut; it never consumes all foreground cut
+            // capacity. Completed cuts are discarded after publishing hints.
+            if (state) |value| {
+                var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
+                defer guard.deinit();
+                try std.Io.Dir.cwd().deleteTree(io, try cut.pathAlloc(a, self.core.path, value.request.id));
+            }
+            var nonce: [32]u8 = undefined;
+            try io.randomSecure(&nonce);
+            const id = std.fmt.bytesToHex(nonce, .lower);
+            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
+            // The parent directory is created by capture; persist only once
+            // the coherent local generation is sealed.
+            try self.captureQueryCutInternal(state.?.request, cancellation, false);
+            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+        }
+        const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
+        const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        if (completed) {
+            state.?.complete = true;
+            state.?.next_ms = now +| 60000;
+            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
+            defer guard.deinit();
+            try std.Io.Dir.cwd().deleteTree(io, root);
+        }
+        return completed;
+    }
+
+    pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
+        const cut = @import("native_query_cut.zig");
+        try request.validate(cut.nowMs());
+        const origin = try request.namespace(self.core.identity_namespace);
+        const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
+        defer self.alloc.free(cache_id);
+        if (request.create) try self.captureQueryCut(request, cancellation);
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
+        defer self.alloc.free(path);
+        const expiry_deadline = monotonicTimeNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline };
+        var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
+        var guarded = true;
+        defer if (guarded) guard.deinit();
+        if (!try snapshotPathExists(io, path)) if (self.backend_runtime.query_cut_repository) |repository| {
+            if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
+                var lease = opened;
+                errdefer lease.deinit();
+                // The remote manifest is immutable. No local capture or
+                // collection can change it, so opening pages must not hold
+                // the filesystem publication guard across provider I/O.
+                guard.deinit();
+                guarded = false;
+                var readonly = try DB.open(self.alloc, path, .{
+                    .open_mode = .query_readonly,
+                    .physical_root_mode = .external_backend,
+                    .storage = lease.view,
+                    .backend_runtime = self.backend_runtime,
+                    .identity_namespace = origin,
+                });
+                errdefer readonly.close();
+                try control.token().check();
+                readonly.retained_remote_query_lease = lease;
+                return readonly;
+            }
+            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try repository.recover(io, path, request, origin, control.token());
+            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+        };
+        var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
+        guard.deinit();
+        guarded = false;
+        var transferred = false;
+        defer if (!transferred) reader.deinit();
+        try cut.validate(self.alloc, io, path, request, origin, control.token());
+        var readonly = try DB.open(self.alloc, path, .{
+            .open_mode = .query_readonly,
+            .backend_runtime = self.backend_runtime,
+            .identity_namespace = origin,
+            .prefer_existing_identity_namespace = true,
+        });
+        errdefer readonly.close();
+        try control.token().check();
+        readonly.retained_query_lease = reader;
+        transferred = true;
+        return readonly;
+    }
+
     const SnapshotFenceTestHook = struct {
         ptr: *anyopaque,
         after_capture_admission: *const fn (*anyopaque) void,
@@ -19329,6 +19509,14 @@ pub const DB = struct {
         defer job.deinit();
         try self.validateVectorMigrationIdentity(job.value);
         return job.value.phase == .cancelled;
+    }
+
+    fn requireQueryCutStorage(self: *DB) !void {
+        if (self.physical_root_mode != .filesystem_managed or self.primary_backend != .lsm) return error.NativeBackupStorageBackendUnsupported;
+        try self.enforceVectorMigrationConfigurationGate();
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
     }
 
     fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
@@ -19351,9 +19539,11 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
         expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
-        seal_only: bool,
+        backup_seal_only: bool,
+        query_cut: ?@import("native_query_cut.zig").Request,
     ) !u64 {
-        try self.ensurePrimaryOnlySnapshot();
+        const seal_only = backup_seal_only or query_cut != null;
+        if (query_cut == null) try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
@@ -19379,9 +19569,9 @@ pub const DB = struct {
             }
         }
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (seal_only) "backup-pins" else "snapshots" });
+        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (query_cut != null) "query-pins" else if (seal_only) "backup-pins" else "snapshots" });
         defer self.alloc.free(snapshot_parent);
-        var pin_lock: ?@import("native_backup_seal.zig").StoreLock = if (seal_only) try @import("native_backup_seal.zig").StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
+        var pin_lock: ?@import("native_backup_seal.zig").StoreLock = if (backup_seal_only) try @import("native_backup_seal.zig").StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
         defer if (pin_lock) |*held| held.deinit();
         const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
         defer self.alloc.free(snapshot_root);
@@ -19391,10 +19581,11 @@ pub const DB = struct {
             defer self.alloc.free(tombstone);
             if (try snapshotPathExists(io, tombstone)) return error.BackupSealReleased;
             if (try snapshotPathExists(io, snapshot_root)) {
-                _ = try @import("native_backup_seal.zig").readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
+                if (query_cut) |request| try @import("native_query_cut.zig").validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try @import("native_backup_seal.zig").readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
                 return 0;
             }
         } else if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
+        if (query_cut != null) try self.requireQueryCutStorage();
         const staging_root = if (seal_only) blk: {
             // One deterministic unpublished namespace per exact attempt lets
             // restart/retry reclaim abandoned pins without a directory scan.
@@ -19461,7 +19652,7 @@ pub const DB = struct {
         defer capture.release();
         // Migration may have won admission after the optimistic entry check.
         // Its structural mutation uses this same snapshot fence.
-        try self.ensurePrimaryOnlySnapshot();
+        if (query_cut == null) try self.ensurePrimaryOnlySnapshot() else try self.requireQueryCutStorage();
         if (builtin.is_test) {
             if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
         }
@@ -19484,7 +19675,7 @@ pub const DB = struct {
                 target_sequence,
                 .{},
                 cancellation,
-                std.math.maxInt(u64),
+                maintenance_deadline_ns orelse std.math.maxInt(u64),
             ) catch |err| switch (err) {
                 error.Cancelled => return error.Canceled,
                 else => return err,
@@ -19492,8 +19683,27 @@ pub const DB = struct {
             try ensureSnapshotActive(cancellation);
             try self.flushAppliedSequencesForIdle();
 
-            structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
-            if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
+            if (query_cut != null) {
+                try lockAtomicWithCancellation(&self.local_execution.index_structural_mutation_mutex, cancellation);
+                structural = .{
+                    .db = self,
+                    .snapshot_mutation = capture.borrowMutation(),
+                    .operation = "native query cut",
+                    .index_name = "*",
+                    .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
+                    .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
+                };
+                const previous = self.core.index_manager.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+                if (previous & published_dense_catalog_closed != 0) return error.IndexRebuilding;
+                structural.?.catalog_barrier_held = true;
+                while (self.core.index_manager.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) {
+                    try cancellation.check();
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+            } else {
+                structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
+                if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
+            }
             replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
                 io,
                 @as(?types.CancellationToken, cancellation),
@@ -19501,8 +19711,19 @@ pub const DB = struct {
                 error.Cancelled => return error.Canceled,
                 else => return err,
             };
-            try self.lockApplyForPortableRuntime();
-            apply_held = true;
+            if (query_cut != null) {
+                try self.enforcePortableRuntimeGate();
+                while (!self.core.tryLockApplyExclusive()) {
+                    try cancellation.check();
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                apply_held = true;
+                try self.enforcePortableRuntimeGate();
+                try cancellation.check();
+            } else {
+                try self.lockApplyForPortableRuntime();
+                apply_held = true;
+            }
             if (self.currentMaintenanceTargetSequence() == target_sequence) {
                 capture_target_sequence = self.core.nextDerivedSequence();
                 break;
@@ -19515,7 +19736,7 @@ pub const DB = struct {
             structural = null;
         }
 
-        try self.ensurePrimaryOnlySnapshotLocked();
+        if (query_cut == null) try self.ensurePrimaryOnlySnapshotLocked() else try self.requireQueryCutStorage();
         if (expected_topology_fence) |expected| {
             var read = try self.core.store.beginProbeTxn();
             defer read.abort();
@@ -19641,19 +19862,29 @@ pub const DB = struct {
             const seal = @import("native_backup_seal.zig");
             const wal_bytes = try generated_checkpoints.walPrefixBytes();
             if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
-            const primary_root = try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
+            var vector_bytes: u64 = 0;
+            if (query_cut != null) if (self.local_execution.source_vectors.load(.acquire)) |source| {
+                const vector_root = try std.fs.path.join(self.alloc, &.{ staging_root, "source-vectors" });
+                defer self.alloc.free(vector_root);
+                var remaining_wal = seal.wal_budget_bytes - wal_bytes;
+                vector_bytes = try source.sealQuerySnapshot(io, vector_root, &remaining_wal, cancellation);
+            };
+            const primary_root = if (query_cut != null) try self.alloc.dupe(u8, staging_root) else try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
             defer self.alloc.free(primary_root);
             var total: u64 = switch (primary_snapshot) {
                 .lsm => |*checkpoint| try checkpoint.seal(io, primary_root, cancellation),
                 .logical => return error.BackupSealBackendUnsupported,
             };
+            total = std.math.add(u64, total, vector_bytes) catch return error.FileTooBig;
             total = std.math.add(u64, total, try generated_checkpoints.seal(io, staging_root, cancellation, seal.wal_budget_bytes)) catch return error.FileTooBig;
             total = std.math.add(u64, total, try generated_metadata.seal(staging_root, cancellation, 0)) catch return error.FileTooBig;
             // The durable tree has its own links; discard temporary lease
             // trees before its inventory and atomic publication.
             try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
             try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
-            _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
+            if (query_cut) |request| {
+                try @import("native_query_cut.zig").finish(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, cancellation);
+            } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),
                 .source_backend = @tagName(self.primary_backend),
@@ -30390,6 +30621,10 @@ pub const DB = struct {
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
         if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
+        if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
+            self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
+            self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
+            self.native_query_warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
         self.quarantine_recovery.start(.{
             .ptr = self,
             .runtime = self.backend_runtime,

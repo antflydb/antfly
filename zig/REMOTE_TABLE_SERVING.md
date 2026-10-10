@@ -8,6 +8,11 @@ snapshot-bound indexes and materializations, a bounded local cache, and one nati
 query planner across HTTP rows, search, SQL, and PostgreSQL wire delivery. An index
 configuration is desired state; only a verified published generation is query-ready.
 
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md)
+describes proposed source notifications, catalog commits, writable archives, and
+recent-change merging. These extend the serving contracts here; object events
+alone must not establish source commitment or index readiness.
+
 ## Implementation status
 
 The serving path now connects the existing persistent range cache beneath shared

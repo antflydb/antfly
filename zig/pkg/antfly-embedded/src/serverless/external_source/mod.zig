@@ -21,6 +21,7 @@ pub const object_snapshot = @import("object_snapshot.zig");
 pub const iceberg_metadata = @import("iceberg_metadata.zig");
 pub const iceberg_avro = @import("iceberg_avro.zig");
 pub const iceberg_inventory = @import("iceberg_inventory.zig");
+pub const lake_catalog = @import("lake_catalog/mod.zig");
 
 pub const Format = types.Format;
 pub const ColumnChunk = types.ColumnChunk;
@@ -78,6 +79,7 @@ test "serverless external source module compiles" {
     _ = iceberg_metadata;
     _ = iceberg_avro;
     _ = iceberg_inventory;
+    _ = lake_catalog;
     _ = Format;
     _ = ColumnChunk;
     _ = Inventory;

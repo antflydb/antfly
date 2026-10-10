@@ -92,6 +92,7 @@ pub const Table = struct {
         /// Fresh query-definition metadata, allocated for this execution. A
         /// schema/prepared-plan cache must never retain a publication pointer.
         catalog_json: []const u8,
+        object_generation: u64 = 0,
         indexes_json: []const u8,
         schema_json: []const u8 = "",
         desired: [32]u8,

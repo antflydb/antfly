@@ -1318,6 +1318,9 @@ pub const AntflyApiHandler = struct {
     ) !void {
         const metadata_router = metadata_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
+        try public_server.get("/tables/:table_name/sources/managed", httpx.Handler.bind(self, managedSourceStatus));
+        try public_server.post("/tables/:table_name/sources/managed", httpx.Handler.bind(self, configureManagedSources));
+        try public_server.post("/tables/:table_name/lake/reconcile", httpx.Handler.bind(self, reconcileLakeSource));
         const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
         if (include_contextual) {
@@ -5927,6 +5930,7 @@ pub const AntflyApiHandler = struct {
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
         const Input = struct {
+            lake_visibility: enum { committed, accepted } = .committed,
             statement: ?[]const u8 = null,
             parameters: ?[]const std.json.Value = null,
             database: ?[]const u8 = null,
@@ -5987,7 +5991,10 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .lake_visibility = switch (request.lake_visibility) {
+                .committed => .committed,
+                .accepted => .accepted,
+            }, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -6127,7 +6134,7 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
         defer self.releasePublicOperation("globalQuery");
         var cancellation = requestCancellation(ctx);
-        if (isNdjsonContentType(ctx.header("content-type"))) {
+        if (isNdjsonContentType(ctx.header("content-type")) or (@import("composed_query.zig").hasSource(ctx.allocator, body_data) catch false)) {
             var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
                 body_data,
                 authenticated_identity,
@@ -6613,6 +6620,7 @@ pub const AntflyApiHandler = struct {
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
+                    .query_source => .table,
                     .database => .database,
                     .namespace => .namespace,
                     .table => .table,
@@ -6836,6 +6844,22 @@ pub const AntflyApiHandler = struct {
             .physical_name = physical_name,
         } });
         alloc.free(result);
+    }
+
+    pub fn listQuerySources(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.catalogResource(ctx, null);
+    }
+    pub fn getQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, null);
+    }
+    pub fn createQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, .create);
+    }
+    pub fn dropQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, .drop);
     }
 
     pub fn listDatabases(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7705,7 +7729,10 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
-        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+        if (self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
+            error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
+            else => return err,
+        }) |value| {
             var response = value;
             return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
         }
@@ -8388,6 +8415,76 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn managedSourceStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.managedSourcesRequest(ctx, false);
+    }
+    fn configureManagedSources(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.managedSourcesRequest(ctx, true);
+    }
+    fn managedSourcesRequest(self: *AntflyApiHandler, ctx: *httpx.Context, mutate: bool) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        const binding = (try self.resolvePublicTableBinding(ctx, name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(ctx.allocator);
+        const module = @import("managed_sources.zig");
+        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        defer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(bytes);
+        return ctx.response.build();
+    }
+    fn reconcileLakeSource(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        var parsed = std.json.parseFromSlice(struct { table_id: u64 }, ctx.allocator, (try ctx.body()) orelse "", .{}) catch return jsonErrorResponse(ctx, 400, "invalid reconciliation request");
+        defer parsed.deinit();
+        return self.lakeCatalogRequest(ctx, name, .{ .action = .reconcile, .expected_table_id = parsed.value.table_id });
+    }
+
+    pub fn getLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .load });
+    }
+
+    pub fn initializeLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .create, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn commitLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .commit, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn ingestLakeChanges(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .changes, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn maintainLakeTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .maintenance, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn getLakeCommitOutcome(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: metadata_server_openapi.server.GetLakeCommitOutcomeParams) !httpx.Response {
+        const id = (try decodePathParamOrBadRequest(ctx, commit_id)) orelse return ctx.response.build();
+        defer ctx.allocator.free(id);
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .resolve, .commit_id = id, .request_hash = params.request_hash });
+    }
+
+    fn lakeCatalogRequest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, request: @import("lake_catalog_http.zig").Request) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(ctx.allocator);
+        var response = @import("lake_catalog_http.zig").execute(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), request) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+            return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        };
+        defer response.deinit(ctx.allocator);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
+    }
+
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
         return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
             switch (err) {
@@ -8444,7 +8541,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");
         };
-        if (try self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+        if (self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
+            error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
+            else => return err,
+        }) |value| {
             var response = value;
             if (row_policy_proof != null or lookup_opts.opts.fields.len != 0) {
                 response.deinit(self.api_server.alloc);

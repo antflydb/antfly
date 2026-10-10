@@ -5812,6 +5812,7 @@ pub const DataServer = struct {
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    native_query_repository: ?*@import("../api/native_query_repository.zig").Repository = null,
     /// Process-role HTTP transport services are distinct from storage/API
     /// executor lanes and may be shared by every httpx listener in this role.
     http_observer_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
@@ -9569,6 +9570,11 @@ pub const DataServer = struct {
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
+        if (self.native_query_repository) |repository| {
+            if (self.backend_runtime) |runtime| runtime.query_cut_repository = null;
+            repository.deinit();
+            self.alloc.destroy(repository);
+        }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.hot_standby_admin_server = null;
@@ -9626,6 +9632,14 @@ pub const DataServer = struct {
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
         }
         if (self.backend_runtime) |ptr| {
+            if (comptime !linked_storage) if (ptr.query_cut_repository == null and self.api_server_cfg.node_config != null and self.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
+                const Repository = @import("../api/native_query_repository.zig").Repository;
+                const repository = try self.alloc.create(Repository);
+                errdefer self.alloc.destroy(repository);
+                repository.* = try Repository.init(self.alloc, self.api_server_cfg.node_config, self.api_server_cfg.secret_store, self.api_server_cfg.deployment_mode, self.api_server_cfg.native_lake_artifact_base_dir);
+                self.native_query_repository = repository;
+                ptr.query_cut_repository = repository.capability();
+            };
             self.provisioned_storage.attachBackendRuntime(ptr, &self.read_source, &self.write_source);
             if (self.data_raft_apply) |apply_sm| {
                 apply_sm.write_source.backend_runtime = ptr;
@@ -23938,6 +23952,11 @@ pub const DataServer = struct {
                 defer alloc.free(security_json);
                 try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
+                if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
+                    const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
+                    defer alloc.free(retained_setup);
+                    try storage_kernel_context.?.configureNativeQueries(retained_setup);
+                }
             }
         }
 
@@ -24054,7 +24073,7 @@ pub const DataServer = struct {
                                 },
                             },
                         },
-                        .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
+                        .data_apply_storage_context = cfg.storage_kernel_context_handle orelse if (storage_kernel_context) |context| context.handle else null,
                         .native_snapshot_delegate = data_raft_apply.?.nativeSnapshotDelegate(),
                     }, .{}, .{
                         .transition_runtime = null,
@@ -24087,6 +24106,7 @@ pub const DataServer = struct {
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
             .provisioned_storage = provisioned_storage,
             .storage_kernel_context = storage_kernel_context,
+            .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -30886,6 +30906,11 @@ pub fn runFromIterator(
         defer alloc.free(security_json);
         try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
+            const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
+            defer alloc.free(retained_setup);
+            try process_storage_kernel_context.?.configureNativeQueries(retained_setup);
+        };
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
