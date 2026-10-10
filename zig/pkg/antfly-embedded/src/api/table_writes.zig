@@ -127,6 +127,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -1277,6 +1278,13 @@ pub const BoundTableWriteSource = struct {
             transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
             else => return err,
         };
+    }
+
+    pub fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+        try ensurePreDecisionContextActive(context);
+        // The ordinary bound DB is not a hidden restore owner.
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation);
     }
 
     pub fn txnStatusGroupLocal(

@@ -674,6 +674,20 @@ pub const TableWriteSource = struct {
             cancellation: db_mod.types.CancellationToken,
             control: distributed_txn.CommitControl,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        /// Original completion authority, owned through the synchronous call.
+        /// This context has no newly minted pre-decision clock/deadline.
+        txn_resolve_group_local_with_execution: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            txn_id: db_mod.types.TxnId,
+            status: db_mod.types.TxnStatus,
+            commit_version: u64,
+            topology_epoch: u64,
+            sync_level: db_mod.types.SyncLevel,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!?void = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -1213,6 +1227,24 @@ pub const TableWriteSource = struct {
             return try self.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
         };
         return try BoundaryAbi.call("txn_resolve_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation });
+    }
+
+    pub fn txnResolveGroupLocalWithExecution(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
+        if (context.execution_runnable) |borrow| try borrow.checkLifetime();
+        try context.cancellation.check();
+        const callback = self.vtable.txn_resolve_group_local_with_execution orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("txn_resolve_group_local_with_execution", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context });
     }
 
     pub fn txnStatusGroupLocal(
@@ -1855,6 +1887,23 @@ fn consumerTests() type {
                     try token.check();
                     return {};
                 }
+                fn lifetime(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return if (self.stopped) runtime_error_abi.statusFromError(error.DeadlineExceeded) else .ok;
+                }
+                fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime_error_abi.Status {
+                    @panic("callback handoff must not create another CPU grant");
+                }
+                fn controlled(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(raw, context.execution_runnable.?.context);
+                    try std.testing.expect(context.deadline_ns == null and context.deadline_io == null);
+                    try std.testing.expectEqualDeep(self.expected, context.cancellation);
+                    try context.execution_runnable.?.checkLifetime();
+                    try context.cancellation.check();
+                    self.aware_calls += 1;
+                    return {};
+                }
                 fn foreignDispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
                     return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
                 }
@@ -1882,6 +1931,18 @@ fn consumerTests() type {
                 try std.testing.expectError(error.Canceled, source.txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, db_mod.types.CancellationToken.fromAtomic(&canceled)));
                 try std.testing.expectEqual(@as(usize, 1), fake.aware_calls);
                 try std.testing.expectEqual(@as(usize, 1), fake.legacy_calls);
+                fake.stopped = false;
+                const context: distributed_txn.PreDecisionContext = .{
+                    .execution_runnable = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Fake.lifetime, .check_lifetime = Fake.lifetime, .park = Fake.transition, .enter = Fake.transition },
+                    .cancellation = fake.expected,
+                };
+                try std.testing.expectError(error.UnsupportedOperation, source.txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, context));
+                try std.testing.expectEqual(@as(usize, 1), fake.aware_calls);
+                source.vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local_with_execution = Fake.controlled };
+                _ = try source.txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, context);
+                fake.stopped = true;
+                try std.testing.expectError(error.DeadlineExceeded, source.txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", id, .committed, 3, 4, .write, context));
+                try std.testing.expectEqual(@as(usize, 2), fake.aware_calls);
             }
         }
 

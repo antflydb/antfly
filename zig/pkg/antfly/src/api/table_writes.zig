@@ -20206,6 +20206,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
@@ -23686,15 +23687,41 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return txnResolveGroupLocalWithExecution(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .{ .cancellation = cancellation });
+    }
+
+    fn txnResolveGroupLocalWithExecution(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        status: db_mod.types.TxnStatus,
+        commit_version: u64,
+        topology_epoch: u64,
+        sync_level: db_mod.types.SyncLevel,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
+        const cancellation = context.cancellation;
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         // Serialize the final epoch validation with split/merge transition
         // admission. If a transition is already waiting, it wins admission;
         // otherwise this resolve remains ahead of the transition until the
         // durable decision has been applied.
-        var admission = @import("group_admission_wait.zig").completion(cancellation, self.tableActivityIo());
+        var admission = @import("group_admission_wait.zig").preDecision(context, self.tableActivityIo());
         try self.beginGroupOperationControlled(table_name, group_id, &admission);
         defer self.endGroupOperation(table_name, group_id);
+        if (context.restore_staging_scope) |scope| {
+            try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
+                .restore_staging_scope = scope,
+                .restore_staging_plan_id = context.restore_staging_plan_id,
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+            }, context);
+            return {};
+        }
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (self.raft_batcher) |batcher| {
@@ -23726,17 +23753,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocalWithCancellation(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                status,
-                commit_version,
-                topology_epoch,
-                sync_level,
-                cancellation,
-            )) == null) return null;
+            const result = if (context.execution_runnable != null)
+                try owner.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context)
+            else
+                try owner.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation);
+            if (result == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
@@ -25778,6 +25799,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
@@ -27083,6 +27105,23 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_version = commit_version,
             } },
         }, topology_epoch, cancellation);
+    }
+
+    fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
+        // Delegation must preserve the scoped callback, including hidden owner identity.
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            if (topology_epoch != 0) try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            return owner.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context);
+        }
+        return batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .restore_staging_scope = context.restore_staging_scope,
+            .restore_staging_plan_id = context.restore_staging_plan_id,
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        }, topology_epoch, context);
     }
 
     fn txnStatusGroupLocal(

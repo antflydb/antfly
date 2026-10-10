@@ -1646,3 +1646,19 @@ ownership, original-clock deadline expiry and sticky cancellation. These checks
 do not instantiate the physical provisioned source's admission state machine;
 its full integration, complete local completion/capture wait graph and automatic
 default qualification remain open.
+
+Local resolution now has an explicit process-local execution callback at the
+compiled table-write boundary. Local workers and hosted workers that resolve
+to a local route carry the original runnable and completion cancellation to
+that callback without reconstructing a foreground deadline. Provisioned sources
+use it during group admission and forward it to their local owners. Hosted
+control sources retain it through delegation; physical hosted sources keep the
+context on their fenced batch route. Bound ordinary sources check it before
+entering native resolution, retaining the synchronous caller through return.
+
+The private ABI contract rejects incapable resolution callbacks without falling
+back to cancellation-only or unscoped dispatch. Focused coverage checks direct
+and private dispatch and an actual scheduler-owned local participant child.
+Deeper native storage/Raft waits still retain CPU, physical integration remains
+required, and ordinary bound DBs do not serve hidden restore owners. No public
+DTO serialization or new completion owner/deadline is introduced.

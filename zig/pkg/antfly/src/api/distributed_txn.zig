@@ -572,6 +572,7 @@ pub const HostedParticipantWorker = struct {
         var view = self.*;
         var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
         view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
         try resolveGroupWithin(&view, alloc, group_id, table_name, req, .none, try completionDeadline(borrow, maximum));
         try borrow.checkLifetime();
     }
@@ -622,6 +623,7 @@ pub const HostedParticipantWorker = struct {
         var view = self.*;
         var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
         view.execution_wait = wait.boundary();
+        view.pre_decision_context.execution_runnable = borrow;
         try resolveGroupWithin(&view, alloc, group_id, table_name, req, cancellation, deadline);
     }
 
@@ -976,7 +978,18 @@ pub const HostedParticipantWorker = struct {
         defer route.deinit(alloc);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         switch (route) {
-            .local => _ = (try resolveGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, operation_cancellation)) orelse return error.UnknownGroup,
+            .local => {
+                const result = if (self.pre_decision_context.execution_runnable) |borrow|
+                    try self.writes.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, .{
+                        .execution_runnable = borrow,
+                        .cancellation = operation_cancellation,
+                        .restore_staging_scope = req.restore_staging_scope,
+                        .restore_staging_plan_id = req.restore_staging_plan_id,
+                    })
+                else
+                    try resolveGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, operation_cancellation);
+                _ = result orelse return error.UnknownGroup;
+            },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
@@ -1311,8 +1324,15 @@ pub const LocalTableWriteParticipantWorker = struct {
         }
     };
     fn resolveGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, cancellation: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
         var control: CompletionCancellation = .{ .borrow = borrow, .foreground = cancellation };
-        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, .{ .ptr = &control, .check_fn = CompletionCancellation.check });
+        try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
+        _ = (try self.writes.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, .{
+            .execution_runnable = borrow,
+            .cancellation = .{ .ptr = &control, .check_fn = CompletionCancellation.check },
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+        })) orelse return error.UnknownGroup;
     }
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
@@ -7810,6 +7830,16 @@ test "distributed txn independently scheduled local worker preserves call author
         fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, context: PreDecisionContext) !?void {
             return check(raw, context);
         }
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, context: PreDecisionContext) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.child_context, context.execution_runnable.?.context);
+            // Completion authority is not reconstructed from the foreground fence.
+            try std.testing.expect(context.deadline_ns == null and context.deadline_io == null);
+            try context.execution_runnable.?.checkLifetime();
+            try context.cancellation.check();
+            self.calls += 1;
+            return {};
+        }
         fn check(raw: *anyopaque, context: PreDecisionContext) !?void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.child_context, context.execution_runnable.?.context);
@@ -7839,16 +7869,17 @@ test "distributed txn independently scheduled local worker preserves call author
     try child.activate();
     var canceled: std.atomic.Value(bool) = .init(false);
     var fake: Fake = .{ .child_context = child.borrow.context, .expected = .{ .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s, .deadline_io = io_borrow, .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) } };
-    var local: LocalTableWriteParticipantWorker = .{ .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_begin_group_local_with_pre_decision_context = Fake.begin, .txn_prepare_group_local_with_pre_decision_context = Fake.prepare } }, .pre_decision_context = fake.expected };
+    var local: LocalTableWriteParticipantWorker = .{ .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_begin_group_local_with_pre_decision_context = Fake.begin, .txn_prepare_group_local_with_pre_decision_context = Fake.prepare, .txn_resolve_group_local_with_execution = Fake.resolve } }, .pre_decision_context = fake.expected };
     var worker = local.worker();
     worker.execution_runnable = child.borrow;
     try worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} });
     try worker.prepareGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .req = .{} });
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try worker.resolveGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 });
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(local.pre_decision_context.execution_runnable == null);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
 }
 
 test "distributed txn independently scheduled hosted worker rejects stopped coordinator before routing" {
