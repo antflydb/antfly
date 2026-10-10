@@ -47,6 +47,36 @@ export fn antfly_sql_regex_replacement_smoke() u32 {
 export fn antfly_sql_regex_capture_smoke() u32 {
     return runCaptures() catch 0;
 }
+export fn antfly_sql_regex_selection_smoke() u32 {
+    return runSelection() catch 0;
+}
+fn runSelection() !u32 {
+    var memory = std.heap.FixedBufferAllocator.init(&buffer);
+    const backing = memory.allocator();
+    const Case = struct { pattern: []const u8, input: []const u8, options: []const u8, start: usize, captures: usize, matched: ?bool = null, spans: []const regex.Span = &.{}, sqlstate: ?[]const u8 = null };
+    const Witnesses = struct { entries: []const Case };
+    const golden = try std.json.parseFromSlice(Witnesses, backing, @embedFile("testdata/selection-postgres.json"), .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    for (golden.value.entries) |case| {
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var budget: regex.Budget = .{};
+        const flags = try regex.Flags.parse(case.options, false);
+        var program = regex.Program.compile(a, case.pattern, flags.native, .{}, &budget) catch |err| {
+            if (err == error.SqlInvalidRegularExpression and case.sqlstate != null and std.mem.eql(u8, case.sqlstate.?, "2201B")) continue;
+            return err;
+        };
+        defer program.deinit();
+        if (case.sqlstate != null or program.captures != case.captures) return error.WrongAcceptance;
+        var subject = try regex.Subject.init(a, case.input);
+        defer subject.deinit();
+        const spans = try a.alloc(regex.Span, program.captures + 1);
+        if (try program.find(subject, case.start, spans, &budget) != case.matched.? or spans.len != case.spans.len) return error.WrongMatch;
+        for (spans, case.spans) |actual, expected| if (actual.start != expected.start or actual.end != expected.end) return error.WrongSpan;
+    }
+    return @intCast(golden.value.entries.len);
+}
 fn runCaptures() !u32 {
     var memory = std.heap.FixedBufferAllocator.init(&buffer);
     const backing = memory.allocator();

@@ -36,6 +36,18 @@ and deliberate rejections must be distinguished.
 
 ### Native capture-capable regular expressions
 
+The remaining exhaustive contract and public-SQL qualification work is required
+and tracked in [the regex parity design](design/sql-regex-parity.md). Existing
+component counts below do not close that target.
+
+The new bounded selection campaign qualifies 24,575 PostgreSQL 18.6 C/UTF8
+contracts with zero mismatches and an incorrect-witness positive control.
+Thirty-seven minimized witnesses now join the native and WASM regression gates;
+ten new scalar contracts verify the same corrected selection rules through
+SQL binding/execution. Full contract/upstream inventory, PostgreSQL 19, broader
+SQL/collation and durable-expression qualification remain open. These component
+improvements do not change the 899 unresolved original-case dispositions.
+
 SQL now uses the native Zig `antfly_regex.captures` interface in `lib/regex`.
 The vendored C engine and bridge have been removed. The existing byte/FST
 interface is unchanged; SQL retains flag parsing, error translation, bounded

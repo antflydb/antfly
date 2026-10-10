@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
         b.step("test", "Execute independent PostgreSQL contracts in freestanding WASM").dependOn(&run.step);
         return;
     }
+    const probe_module = b.createModule(.{ .root_source_file = b.path("src/parity_probe.zig"), .target = target, .optimize = optimize, .link_libc = false });
+    probe_module.addImport("antfly_sql_regex", module);
+    const probe = b.addExecutable(.{ .name = "sql-regex-parity-probe", .root_module = probe_module });
+    b.step("parity-probe", "Build the offline PostgreSQL regex witness runner").dependOn(&b.addInstallArtifact(probe, .{}).step);
     const tests = b.addTest(.{ .root_module = module });
     b.step("test", "Run SQL regex portability and admission tests").dependOn(&b.addRunArtifact(tests).step);
     b.step("check", "Compile SQL regex portability contracts without executing them").dependOn(&tests.step);

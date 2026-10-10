@@ -9,6 +9,16 @@ import psycopg
 from generate_sql_postgres_reference import postgres
 
 CASES = [
+    ("fixed-bound-inherits-selection", "regexp_substr('aa','(a{1})(a*?)')"),
+    ("equal-bounds-impose-selection", "regexp_substr('aa','(a{1,1})(a*?)')"),
+    ("nullable-greedy-capture", "regexp_substr('','(a*)*?',1,1,'',1)"),
+    ("nullable-lazy-capture", "regexp_substr('','(a*?)*?',1,1,'',1)"),
+    ("fixed-bound-occurrences", "regexp_count('aa','(a{1})(a*?)')"),
+    ("fixed-bound-replacement", "regexp_replace('aa','(a{1})(a*?)','X')"),
+    ("BRE-interior-anchor", "regexp_like('a^b','a^b','b')"),
+    ("complement-newline-membership", r"regexp_like(E'\n\n','\D{2}','n')"),
+    ("empty-capture-position", "regexp_instr('','(a*)*?',1,1,0,'',1)"),
+    ("grouped-assertion-occurrences", "regexp_count('ab','(?:(?<=a))+')"),
     ("operator-match", "'abc' ~ 'a'"),
     ("operator-imatch", "'abc' ~* 'A'"),
     ("operator-not-match", "'abc' !~ 'A'"),
@@ -99,12 +109,17 @@ def generate():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     observed = generate()
     if args.check:
         if json.loads(args.check.read_text()) != observed:
             raise SystemExit("PostgreSQL scalar regex reference mismatch")
         print(f"Verified {len(observed['entries'])} PostgreSQL scalar regex contracts")
+    elif args.output:
+        args.output.write_text(
+            json.dumps(observed, ensure_ascii=False, indent=2) + "\n"
+        )
     else:
         print(json.dumps(observed, ensure_ascii=False, indent=2))
 

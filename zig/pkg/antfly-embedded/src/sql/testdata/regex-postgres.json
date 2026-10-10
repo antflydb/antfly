@@ -3,6 +3,76 @@
   "collation": "C",
   "entries": [
     {
+      "id": "fixed-bound-inherits-selection",
+      "expression": "regexp_substr('aa','(a{1})(a*?)')",
+      "value": "a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "equal-bounds-impose-selection",
+      "expression": "regexp_substr('aa','(a{1,1})(a*?)')",
+      "value": "aa",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "nullable-greedy-capture",
+      "expression": "regexp_substr('','(a*)*?',1,1,'',1)",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "nullable-lazy-capture",
+      "expression": "regexp_substr('','(a*?)*?',1,1,'',1)",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "fixed-bound-occurrences",
+      "expression": "regexp_count('aa','(a{1})(a*?)')",
+      "value": 2,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "fixed-bound-replacement",
+      "expression": "regexp_replace('aa','(a{1})(a*?)','X')",
+      "value": "Xa",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "BRE-interior-anchor",
+      "expression": "regexp_like('a^b','a^b','b')",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "complement-newline-membership",
+      "expression": "regexp_like(E'\\n\\n','\\D{2}','n')",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "empty-capture-position",
+      "expression": "regexp_instr('','(a*)*?',1,1,0,'',1)",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "grouped-assertion-occurrences",
+      "expression": "regexp_count('ab','(?:(?<=a))+')",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
       "id": "operator-match",
       "expression": "'abc' ~ 'a'",
       "value": true,

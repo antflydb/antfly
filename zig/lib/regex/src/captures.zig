@@ -63,7 +63,7 @@ const invalid = error.InvalidPattern;
 const none = std.math.maxInt(u32);
 const Range = struct { first: u32, last: u32 };
 const Tag = enum { empty, literal, any, class, concat, alternate, repeat, capture, start, end, absolute_start, absolute_end, word_start, word_end, word_boundary, not_word_boundary, backref, ahead, not_ahead, behind, not_behind };
-const Node = struct { tag: Tag, left: u32 = 0, right: u32 = 0, value: u32 = 0, minimum: u32 = 0, maximum: u32 = 0, flags: u32 = 0, short: ?bool = null, negated: bool = false, captures: bool = false, backrefs: bool = false, suffix: usize = 0, suffix_count: usize = 0, priority: u32 = none, min_width: usize = 0, max_width: usize = 0 };
+const Node = struct { tag: Tag, left: u32 = 0, right: u32 = 0, value: u32 = 0, minimum: u32 = 0, maximum: u32 = 0, flags: u32 = 0, short: ?bool = null, empty_short: ?bool = null, negated: bool = false, grouped: bool = false, captures: bool = false, backrefs: bool = false, suffix: usize = 0, suffix_count: usize = 0, priority: u32 = none, min_width: usize = 0, max_width: usize = 0 };
 const Op = enum { accept, literal, any, class, split, save_start, save_end, assertion, backref, look, progress, priority_start, priority_end, regular_capture, iteration_start, iteration_end };
 const Instruction = struct { op: Op, next: u32 = 0, other: u32 = 0, node: u32 = 0, value: u32 = 0 };
 
@@ -206,6 +206,15 @@ pub const Program = struct {
         defer parser.preferences.deinit(a);
         const root = try parser.parse();
         for (parser.nodes.items) |*node| setWidth(node, parser.nodes.items);
+        // Empty capture participation is separate from whole-match preference.
+        // Required repetitions of a strictly zero-width child cannot use their
+        // lazy extent attribute to suppress that child's required captures.
+        for (parser.nodes.items) |*node| node.empty_short = switch (node.tag) {
+            .capture => parser.nodes.items[node.left].empty_short,
+            .concat => parser.nodes.items[node.left].empty_short orelse parser.nodes.items[node.right].empty_short,
+            .repeat => if (node.maximum == 0) null else if (node.minimum > 0 and node.max_width == 0) parser.nodes.items[node.left].empty_short else node.short,
+            else => node.short,
+        };
         for (parser.nodes.items) |*node| node.captures = switch (node.tag) {
             .capture => true,
             .concat, .alternate => parser.nodes.items[node.left].captures or parser.nodes.items[node.right].captures,
@@ -230,9 +239,10 @@ pub const Program = struct {
                 prefix.minimum -= 1;
                 if (prefix.maximum != none) prefix.maximum -= 1;
                 prefix.captures = false;
+                if (prefix.maximum == 0) prefix.empty_short = null;
                 setWidth(&prefix, parser.nodes.items);
                 const left = try parser.add(prefix);
-                parser.nodes.items[index] = .{ .tag = .concat, .left = left, .right = node.left, .short = node.short, .captures = true, .min_width = node.min_width, .max_width = node.max_width };
+                parser.nodes.items[index] = .{ .tag = .concat, .left = left, .right = node.left, .short = node.short, .empty_short = node.empty_short, .captures = true, .min_width = node.min_width, .max_width = node.max_width };
             }
         }
         var priorities: std.ArrayList(bool) = .empty;
@@ -424,7 +434,9 @@ const Parser = struct {
         while (true) {
             self.skip();
             if (self.position == self.text.len or self.groupEnd() or (!self.basic() and self.at('|'))) break;
-            try items.append(self.a, try self.piece());
+            const initial = items.items.len == 0;
+            const initial_star = initial or (items.items.len == 1 and self.nodes.items[items.items[0]].tag == .start);
+            try items.append(self.a, try self.piece(initial, initial_star));
         }
         if (items.items.len == 0) return self.add(.{ .tag = .empty });
         var index = items.items.len - 1;
@@ -436,12 +448,14 @@ const Parser = struct {
         }
         return root;
     }
-    fn piece(self: *Parser) anyerror!u32 {
-        const item = try self.atom();
+    fn piece(self: *Parser, initial: bool, initial_star: bool) anyerror!u32 {
+        const item = try self.atom(initial, initial_star);
         self.skip();
+        if (self.basic() and self.nodes.items[item].tag == .start and self.at('*')) return item;
         var minimum: u32 = 0;
         var maximum: u32 = none;
         var quantified = true;
+        var fixed_bound = false;
         if (self.take('*')) {} else if (!self.basic() and self.take('+')) {
             minimum = 1;
         } else if (!self.basic() and self.take('?')) {
@@ -452,19 +466,21 @@ const Parser = struct {
                 self.position += if (self.basic()) @as(usize, 2) else 1;
                 minimum = try self.number();
                 maximum = minimum;
-                if (self.take(',')) maximum = if (self.at('}') or (self.basic() and self.at('\\'))) none else try self.number();
+                if (self.take(',')) maximum = if (self.at('}') or (self.basic() and self.at('\\'))) none else try self.number() else fixed_bound = true;
                 if (self.basic() and !self.take('\\')) return invalid;
                 if (!self.take('}') or minimum > maximum or minimum > 255 or (maximum != none and maximum > 255)) return invalid;
             }
         }
         if (!quantified) return item;
         switch (self.nodes.items[item].tag) {
-            .start, .end, .absolute_start, .absolute_end, .word_start, .word_end, .word_boundary, .not_word_boundary, .ahead, .not_ahead, .behind, .not_behind => return invalid,
+            .start, .end, .absolute_start, .absolute_end, .word_start, .word_end, .word_boundary, .not_word_boundary, .ahead, .not_ahead, .behind, .not_behind => if (!self.nodes.items[item].grouped) return invalid,
             else => {},
         }
         const short = self.advanced() and self.take('?');
         if (self.at('*') or self.bound() or (!self.basic() and (self.at('+') or self.at('?')))) return invalid;
-        return self.add(.{ .tag = .repeat, .left = item, .minimum = minimum, .maximum = maximum, .short = short });
+        // Syntactically fixed {m} and {m}? inherit the atom's preference;
+        // {m,m} and {m,m}? instead impose greedy/lazy selection respectively.
+        return self.add(.{ .tag = .repeat, .left = item, .minimum = minimum, .maximum = maximum, .short = if (maximum == 0) null else if (fixed_bound) self.nodes.items[item].short else short });
     }
     fn number(self: *Parser) !u32 {
         var value: u32 = 0;
@@ -477,12 +493,13 @@ const Parser = struct {
         if (count == 0) return invalid;
         return value;
     }
-    fn atom(self: *Parser) anyerror!u32 {
+    fn atom(self: *Parser, initial: bool, initial_star: bool) anyerror!u32 {
         self.skip();
         if (self.position == self.text.len) return invalid;
         const ch = self.text[self.position];
         if (!self.basic() and ch == '{' and self.bound()) return invalid;
         self.position += 1;
+        if (self.basic() and ((ch == '^' and !initial) or (ch == '$' and self.position != self.text.len and !self.groupEnd()) or (ch == '*' and initial_star))) return self.add(.{ .tag = .literal, .value = ch, .flags = self.flags });
         if (ch == '(' and !self.basic()) return self.group();
         if (ch == '\\') {
             if (self.position == self.text.len) return invalid;
@@ -528,7 +545,10 @@ const Parser = struct {
         const child = try self.expression();
         if (self.basic() and !self.take('\\')) return invalid;
         if (!self.take(')')) return invalid;
-        if (tag == .empty or (tag == .capture and number_value == 0)) return child;
+        if (tag == .empty or (tag == .capture and number_value == 0)) {
+            self.nodes.items[child].grouped = true;
+            return child;
+        }
         if (number_value != 0) {
             self.closed[number_value] = true;
             self.preferences.items[number_value - 1] = self.nodes.items[child].short orelse false;
@@ -575,7 +595,9 @@ const Parser = struct {
             }, @intCast(value))) {
                 try self.classPoint(first, @intCast(value));
             };
-            return self.add(.{ .tag = .class, .left = first, .right = @intCast(self.ranges.items.len), .negated = ch >= 'A' and ch <= 'Z', .flags = self.flags });
+            // PostgreSQL's complemented shorthands retain newline membership;
+            // newline-sensitive exclusion belongs to explicit negated brackets.
+            return self.add(.{ .tag = .class, .left = first, .right = @intCast(self.ranges.items.len), .negated = ch >= 'A' and ch <= 'Z', .flags = self.flags & ~@as(u32, 64) });
         }
         var value: u32 = switch (ch) {
             'B' => '\\',
@@ -1356,7 +1378,10 @@ const Dissection = struct {
                 var pos = start;
                 var count: usize = 0;
                 const child_short = program.nodes[node.left].short orelse false;
-                const empty_once = !(node.short orelse false) and node.maximum > 0 and try self.can(program.entries[node.left], start, start);
+                // Empty capture binding follows the repeated child's preference,
+                // independently of the enclosing repetition's extent preference.
+                const empty_short = program.nodes[node.left].empty_short orelse false;
+                const empty_once = !empty_short and node.maximum > 0 and try self.can(program.entries[node.left], start, start);
                 while (pos < end or count < node.minimum or (count == 0 and empty_once)) {
                     if (count >= node.maximum) return error.InvalidRegexProgram;
                     var selected = false;

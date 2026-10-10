@@ -1,5 +1,9 @@
 # Native SQL regular expressions
 
+The required full-parity target and unfinished qualification work are tracked
+in [the regex parity design](../../../docs/design/sql-regex-parity.md).
+The validation below is a baseline, not the release-completion criterion.
+
 SQL regex functions use the capture-capable native Zig interface in
 `lib/regex/src/captures.zig`, exported as `antfly_regex.captures`. This is
 separate from the byte-oriented matcher and FST automaton: those retain their
@@ -57,3 +61,29 @@ verify PostgreSQL results without any host imports.
 SQL binding, NULLs, overloads, diagnostics and statement/cursor ownership retain
 their separate integration gates. This backend replacement does not award
 additional original corpus-case credit.
+
+## Bounded differential campaigns
+
+Build the offline witness runner here with `zig build parity-probe
+-Doptimize=ReleaseFast`. From the repository root, run:
+
+```sh
+uv run --no-project --with 'psycopg[binary]==3.3.6' python \
+  scripts/check_sql_regex_parity.py --oracle-major 18 \
+  --max-subject 3 --fuzz 5000 --seed 19 \
+  --output /tmp/regex-witness.json --report /tmp/regex-report.json
+```
+
+That qualified 24,575-case C/UTF8 campaign passes against PostgreSQL 18.6.
+Omit the major override to require PostgreSQL 19; use `ANTFLY_PG_BIN` to select
+its installed binaries. There is no fallback or successful missing-oracle skip.
+Use `--suite regressions` for the 37 permanent selection/rejection witnesses.
+The regular native and WASM gates replay those witnesses without PostgreSQL;
+WASM now executes 1,062 component contracts twice.
+
+Artifacts record the exact reference build/binary and campaign bounds. The
+native runner returns the exact witness digest and complete outcome count;
+reports also pin its binary. An incorrect-witness positive control is mandatory.
+Quota refusals are not parity successes. The campaign covers its declared
+selection grammar, not every ARE shape or the complete public SQL surface.
+See the design for remaining upstream, shrinking, collation and activation work.

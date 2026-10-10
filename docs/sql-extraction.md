@@ -5,6 +5,11 @@ The behavioral reference is `combine-pr-141-143-144` at `79644dfa1`.
 This ledger is not a claim that all SQL surfaces are available.
 
 **Status: SQL extraction is in progress, not ready as a complete SQL feature.**
+
+Full native PostgreSQL regex parity is a required remaining workstream, not
+satisfied by the replacement engine's current component witnesses. Its target
+profiles, implementation boundaries and release gates are tracked in
+[the regex parity design](design/sql-regex-parity.md).
 The implementation now includes scalar and aggregate execution, joins and CTEs,
 native catalog DDL, durable READ COMMITTED sessions/savepoints, and public SQL
 interfaces. It does not yet reproduce the mega branch's complete SQL behavior.

@@ -1177,6 +1177,41 @@ test "PostgreSQL ARE independently generated spans preserve captures flags and C
     }
 }
 
+test "PostgreSQL ARE differential witnesses preserve fixed bounds nullable captures BRE context and grouped assertions" {
+    const Case = struct { id: []const u8, pattern: []const u8, input: []const u8, options: []const u8, captures: usize, start: usize, matched: ?bool = null, spans: []const Span = &.{}, sqlstate: ?[]const u8 = null };
+    const Golden = struct { format: u32, profile: struct { postgres_major: u32, encoding: []const u8, collation: []const u8 }, entries: []const Case };
+    const a = std.testing.allocator;
+    const golden = try std.json.parseFromSlice(Golden, a, @embedFile("testdata/selection-postgres.json"), .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(u32, 2), golden.value.format);
+    try std.testing.expect(golden.value.profile.postgres_major >= 18);
+    try std.testing.expectEqualStrings("UTF8", golden.value.profile.encoding);
+    try std.testing.expectEqualStrings("C", golden.value.profile.collation);
+    for (golden.value.entries) |case| {
+        errdefer std.debug.print("PostgreSQL selection witness {s}: {s}\n", .{ case.id, case.pattern });
+        var budget: Budget = .{};
+        const flags = try Flags.parse(case.options, false);
+        var program = Program.compile(a, case.pattern, flags.native, .{}, &budget) catch |err| {
+            if (err != error.SqlInvalidRegularExpression) return err;
+            try std.testing.expectEqualStrings("2201B", case.sqlstate orelse return error.UnexpectedCompileRejection);
+            continue;
+        };
+        defer program.deinit();
+        try std.testing.expect(case.sqlstate == null);
+        try std.testing.expectEqual(case.captures, program.captures);
+        var subject = try Subject.init(a, case.input);
+        defer subject.deinit();
+        const spans = try a.alloc(Span, program.captures + 1);
+        defer a.free(spans);
+        try std.testing.expectEqual(case.matched.?, try program.find(subject, case.start, spans, &budget));
+        try std.testing.expectEqual(case.spans.len, spans.len);
+        for (spans, case.spans) |actual, expected| {
+            try std.testing.expectEqual(expected.start, actual.start);
+            try std.testing.expectEqual(expected.end, actual.end);
+        }
+    }
+}
+
 test "PostgreSQL ARE shares immutable patterns across independent Io workers" {
     if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;

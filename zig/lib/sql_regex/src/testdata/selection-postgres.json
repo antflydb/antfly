@@ -1,0 +1,608 @@
+{
+  "format": 2,
+  "profile": {
+    "postgres_major": 18,
+    "server_version_num": 180006,
+    "server_build": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.3.34.2), 64-bit",
+    "server_binary_sha256": "5621ee8db83b53e586147ef43d4c00b8bfe1ecca7046d09153a112d7bc5f170e",
+    "encoding": "UTF8",
+    "collation": "C",
+    "statement_timeout": "2s"
+  },
+  "campaign": {
+    "grammar": "regressions-v1",
+    "suite": "regressions",
+    "case_count": 37
+  },
+  "entries": [
+    {
+      "pattern": "(a{1})(a*?)",
+      "input": "aa",
+      "captures": 2,
+      "options": "",
+      "start": 0,
+      "id": "72b2d99aa05f5cbd174498fe",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 0
+        },
+        {
+          "end": 1,
+          "start": 0
+        },
+        {
+          "end": 1,
+          "start": 1
+        }
+      ]
+    },
+    {
+      "pattern": "(a{1}?)(a*?)",
+      "input": "aa",
+      "captures": 2,
+      "options": "",
+      "start": 0,
+      "id": "725272c3ccdd742d47613ad6",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 0
+        },
+        {
+          "end": 1,
+          "start": 0
+        },
+        {
+          "end": 1,
+          "start": 1
+        }
+      ]
+    },
+    {
+      "pattern": "(a{1,1})(a*?)",
+      "input": "aa",
+      "captures": 2,
+      "options": "",
+      "start": 0,
+      "id": "c7467d344b1a9bbb9dee0400",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": 1,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "start": 1
+        }
+      ]
+    },
+    {
+      "pattern": "(a*)*?",
+      "input": "",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "d8444b7dc675e9f52e8f8d5b",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(a*?)*?",
+      "input": "",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "a90894a4abdde5054ffc435f",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        }
+      ]
+    },
+    {
+      "pattern": "(a*)??",
+      "input": "",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "fd74e4bf794e69082f93fb47",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(a*?)??",
+      "input": "",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "9b306a2bbd80250424f2bba9",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        }
+      ]
+    },
+    {
+      "pattern": "(a*){1}?",
+      "input": "aa",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "5932e0130a1af87be4b424f8",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(a*?){1}",
+      "input": "aa",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "bce24d0592e7457358d129f6",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(a*){2}?",
+      "input": "aa",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "3d959b9036431c48feed59e7",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "start": 2
+        }
+      ]
+    },
+    {
+      "pattern": "(a*){0,2}?",
+      "input": "",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "72e531a34c2e742f4aeb40c3",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(a*?){0})(a*)",
+      "input": "aa",
+      "captures": 2,
+      "options": "",
+      "start": 0,
+      "id": "014e634af36b074bcfecdf7b",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        },
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(a+?){0})(a*)",
+      "input": "aa",
+      "captures": 2,
+      "options": "",
+      "start": 0,
+      "id": "41c5b57cb9396f49aed95337",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        },
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "a^b",
+      "input": "a^b",
+      "captures": 0,
+      "options": "b",
+      "start": 0,
+      "id": "37e8cf99fa3c73c70d43d344",
+      "matched": true,
+      "spans": [
+        {
+          "end": 3,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "a$b",
+      "input": "a$b",
+      "captures": 0,
+      "options": "b",
+      "start": 0,
+      "id": "cca349abc6be674f6b1a9ba8",
+      "matched": true,
+      "spans": [
+        {
+          "end": 3,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "^*",
+      "input": "*",
+      "captures": 0,
+      "options": "b",
+      "start": 0,
+      "id": "559228738698aaf5a5b94579",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "^*",
+      "input": "*",
+      "captures": 0,
+      "options": "e",
+      "start": 0,
+      "id": "7561b0841e8c6f0dc1f4bf45",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "\\(a*\\)",
+      "input": "aa",
+      "captures": 1,
+      "options": "b",
+      "start": 0,
+      "id": "9eb508d7fadcc22d6f25c0a3",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        },
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(?!a)){2}",
+      "input": "b",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "fa54abdbbed53fe9cd394721",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(?<=a))+",
+      "input": "ab",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "2772bca54375e9d874671da2",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 1
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(?:((?!.))){1,1}?)?",
+      "input": "",
+      "captures": 1,
+      "options": "n",
+      "start": 0,
+      "id": "9239e3b29ef13d2601680ee2",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": 0,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(?:((?:(?<!\\w)){0,2}?))*?",
+      "input": "b",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "6946781ae78a41dbda0d56fe",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        }
+      ]
+    },
+    {
+      "pattern": "(?:(?:(?!(?:[^a])(?:\\D)))(?:(?:()){0,2}?)){0,2}",
+      "input": "a",
+      "captures": 1,
+      "options": "",
+      "start": 0,
+      "id": "4af395615f65221bad4d954c",
+      "matched": true,
+      "spans": [
+        {
+          "end": 0,
+          "start": 0
+        },
+        {
+          "end": -1,
+          "start": -1
+        }
+      ]
+    },
+    {
+      "pattern": "(?:\\D){2}",
+      "input": "\n\n",
+      "captures": 0,
+      "options": "n",
+      "start": 0,
+      "id": "f09e57ccda3bfbfae59329d4",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "\\W+",
+      "input": "\n雪",
+      "captures": 0,
+      "options": "n",
+      "start": 0,
+      "id": "d7ed9e6d16e98a39d20cddd9",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "[\\D]+",
+      "input": "\n雪",
+      "captures": 0,
+      "options": "n",
+      "start": 0,
+      "id": "c6504b06a46173ab3e79dfbb",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "[^\\d]+",
+      "input": "\n雪",
+      "captures": 0,
+      "options": "n",
+      "start": 0,
+      "id": "ca7283429b5658f6f2581a96",
+      "matched": true,
+      "spans": [
+        {
+          "end": 2,
+          "start": 1
+        }
+      ]
+    },
+    {
+      "pattern": "[^\\D]+",
+      "input": "1\n2",
+      "captures": 0,
+      "options": "n",
+      "start": 0,
+      "id": "f50baf03aff642c8c9a748c8",
+      "matched": true,
+      "spans": [
+        {
+          "end": 1,
+          "start": 0
+        }
+      ]
+    },
+    {
+      "pattern": "(",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "f685f0993346a45ad9fd78ae",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": ")",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "ae6256025e117988f03ae682",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "[",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "72f11881f7ed5b5bbd474de9",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "a{256}",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "a0876fbc814be4008ad61ed6",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "(?z)a",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "0636cde7693a0ab6c5e59fde",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "a**",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "c84cbe7860652b3dbbc69f31",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "^*",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "600324f26c2f170904314162",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "(?=a)*",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "9eedcdc7cf7e8301741f01e0",
+      "sqlstate": "2201B"
+    },
+    {
+      "pattern": "a{1}{2}",
+      "input": "aaa",
+      "captures": 0,
+      "options": "",
+      "start": 0,
+      "id": "ee0141b53708be2b489ea2cf",
+      "sqlstate": "2201B"
+    }
+  ]
+}
