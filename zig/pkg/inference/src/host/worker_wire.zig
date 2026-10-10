@@ -36,6 +36,7 @@ pub const Event = struct {
 };
 
 pub const WarmModel = struct {
+    cuda_precision: ?[]const u8 = null,
     kind: []const u8,
     name: []const u8,
     backend: ?[]const u8,
@@ -70,6 +71,7 @@ pub const Create = struct {
         const models = try arena.alloc(WarmModel, context.preload_len);
         const source = if (context.preload_ptr) |ptr| ptr[0..context.preload_len] else &.{};
         for (source, models) |model, *out| out.* = .{
+            .cuda_precision = model.cuda_precision.slice(),
             .kind = model.kind.slice(),
             .name = model.name.slice(),
             .backend = model.backend.slice(),
@@ -103,6 +105,7 @@ pub const Create = struct {
         if (self.protocol_version != version or self.bridge_version != bridge.abi_version) return error.UnsupportedVersion;
         const models = try arena.alloc(bridge.WarmModel, self.preload.len);
         for (self.preload, models) |model, *target| target.* = .{
+            .cuda_precision = .init(model.cuda_precision),
             .kind = .init(model.kind),
             .name = .init(model.name),
             .backend = .init(model.backend),

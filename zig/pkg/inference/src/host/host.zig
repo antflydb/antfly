@@ -699,6 +699,7 @@ fn convertWarmModels(
                 out[i] = .{
                     .kind = parseWarmModelKind(model.kind.slice()) orelse return error.InvalidArguments,
                     .name = model.name.slice(),
+                    .cuda_precision = if (model.cuda_precision.slice()) |value| std.meta.stringToEnum(@typeInfo(@FieldType(inference.server.WarmModel, "cuda_precision")).optional.child, value) orelse return error.InvalidArguments else null,
                     .backend = inference.backends.BackendType.parseOptional(model.backend.slice()) catch
                         return error.InvalidArguments,
                     .format = model.format.slice(),
@@ -735,6 +736,19 @@ test "standalone preload bridge preserves A4B residency controls" {
     try std.testing.expectEqual(@as(usize, 1), resolved.items.len);
     try std.testing.expectEqual(inference.ops.A4bResidencyMode.streamed, resolved.items[0].residency_mode.?);
     try std.testing.expectEqual(@as(?u32, 4096), resolved.items[0].memory_budget_mb);
+
+    var decision_model = inference_bridge.WarmModel{
+        .kind = .init("extractor"),
+        .name = .init("fastino/GLiNER2.5-Decide-1B"),
+        .backend = .init("cuda"),
+        .cuda_precision = .init("fp32"),
+    };
+    context.preload_ptr = @ptrCast(&decision_model);
+    var decision = try convertWarmModels(std.testing.allocator, &context);
+    defer decision.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.fp32, decision.items[0].cuda_precision.?);
+    decision_model.cuda_precision = .init("int4");
+    try std.testing.expectError(error.InvalidArguments, convertWarmModels(std.testing.allocator, &context));
 }
 
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {

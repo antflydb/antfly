@@ -50,9 +50,8 @@ pub const Limits = struct {
     /// length by construction: peak per-call device/host memory scales with
     /// this constant group size, never with the document's total window
     /// count. 1 reproduces the original strictly-serial behavior. Only
-    /// windows for a schema with no classification, records, or JointIE task
-    /// are grouped (see the batchable check in executeChecked); those task
-    /// families keep the original one-window-per-call path unchanged.
+    /// JointIE windows remain serial. Classification windows are grouped on
+    /// CUDA; other backends preserve their qualified classification shapes.
     window_batch_size: usize = 4,
 };
 pub const Options = struct {
@@ -212,6 +211,19 @@ const Window = struct {
 /// whether this Window becomes responsible for `result`'s lifetime (the
 /// unbatched path, one Window per WindowResult) or not (the batched path,
 /// where the caller retains one shared WindowResult per group instead).
+fn classificationRow(logits: []const f32, batch: usize, width: usize, index: usize) ![]const f32 {
+    const size = std.math.mul(usize, batch, width) catch return error.InvalidBoundaryScorerOutput;
+    if (index >= batch or width == 0 or logits.len != size) return error.InvalidBoundaryScorerOutput;
+    return logits[index * width ..][0..width];
+}
+
+test "boundary window classification selects the correct padded batch row" {
+    const logits = [_]f32{ 9, -2, 0, -3, 8, 0 };
+    try std.testing.expectEqualSlices(f32, &.{ -3, 8, 0 }, try classificationRow(&logits, 2, 3, 1));
+    try std.testing.expectError(error.InvalidBoundaryScorerOutput, classificationRow(&logits, 2, 2, 1));
+    try std.testing.expectError(error.InvalidBoundaryScorerOutput, classificationRow(&logits, 2, 3, 2));
+}
+
 fn collectWindow(a: Allocator, result: pipeline.WindowResult, index: usize, prepared: *const processor.PreparedBatch, item: *const wire.Item, owns_result: bool) !Window {
     if (index >= result.outputs.samples.len or index >= result.joint_candidates.len or index >= prepared.samples.len) return error.InvalidExtractionOutput;
     const sample = result.outputs.samples[index];
@@ -221,10 +233,11 @@ fn collectWindow(a: Allocator, result: pipeline.WindowResult, index: usize, prep
         const values = try a.alloc(f64, classification.task.labels.len);
         @memset(values, std.math.nan(f64));
         const scores = result.classification_scores orelse return error.InvalidBoundaryScorerOutput;
+        const batch_logits = try classificationRow(scores.logits, prepared.samples.len, prepared.classification_width, index);
         for (prepared.samples[index].classification_labels, 0..) |label, li| {
             if (label.schema_index != task_index) continue;
-            if (label.label_index >= values.len or li >= scores.logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
-            values[label.label_index] = scores.logits[li];
+            if (label.label_index >= values.len or li >= batch_logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
+            values[label.label_index] = batch_logits[li];
         }
         for (values) |value| if (!std.math.isFinite(value)) return error.InvalidBoundaryPipelineRouting;
         row.* = values;
@@ -647,15 +660,11 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     var batch_results = std.ArrayListUnmanaged(pipeline.WindowResult).empty;
     defer for (batch_results.items) |*br| br.deinit();
 
-    // Only ordinary entities/relations/legacy-structures windows are grouped
-    // into one forward pass (pipeline.runScoredWindows and
-    // request_device.runWindowsWithOutputAllocator already accept a
-    // multi-sample PreparedBatch): classification and JointIE keep the
-    // original one-window-per-call path, since their scoring/candidate
-    // shapes have not been measured or reviewed batched (see
-    // Limits.window_batch_size's doc comment and GLINER25.md's
-    // long-document throughput section).
-    const batchable = item.compiled.schema.classifications.len == 0 and item.compiled.schema.joint_ie == null;
+    // CUDA classification uses the shared padded label dimension; collectWindow
+    // selects each row before the existing global-logit merge. JointIE remains
+    // serial until its candidate ownership is qualified for batched windows.
+    const batchable = item.compiled.schema.joint_ie == null and
+        (item.compiled.schema.classifications.len == 0 or cb.kind() == .cuda);
 
     var start: usize = 0;
     while (start < document.windows.len) {

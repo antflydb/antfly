@@ -11394,6 +11394,44 @@ test "clip byte-level bpe honors split pretokenizer array merges and end suffix"
     try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0 }, encoded.attention_mask);
 }
 
+test "NFC byte-level BPE preserves added tokens and canonical composition exclusions" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"BPE","vocab":{"à":1,"¤":2,"¡":3,"¼":4,"Ã":5,"©":6,"Ġ":7,"<é>":20},"merges":[]},
+        \\ "normalizer":{"type":"NFC"},
+        \\ "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"use_regex":true},
+        \\ "added_tokens":[{"id":20,"content":"<é>","special":true,"normalized":false}]}
+    );
+    defer tok.deinitSelf();
+    const text = "e\u{0301}<e\u{0301}>\u{095c}";
+    // é is C3 A9; U+095C normalizes to U+0921 U+093C (E0 A4 A1 E0 A4 BC).
+    const expected = [_]i32{ 5, 6, 20, 1, 2, 3, 1, 2, 4 };
+    const raw = try tok.encode(a, text);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(i32, &expected, raw);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(a);
+    try tok.encodeInto(a, text, &ids);
+    try std.testing.expectEqualSlices(i32, &expected, ids.items);
+    var model = try tok.tokenizer().encodeForModel(a, text, expected.len);
+    defer model.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, model.ids);
+    var generation = try tok.tokenizer().encodeForGenerationConfigured(a, text, expected.len, false);
+    defer generation.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, generation.ids);
+
+    // Force parallel eligibility by size. Normalization must still happen
+    // before byte-level regex segmentation, including combining sequences.
+    const count = HfTokenizer.parallel_bpe_min_bytes / 4 + 1;
+    const large = try a.alloc(u8, count * 4);
+    defer a.free(large);
+    for (0..count) |i| @memcpy(large[i * 4 ..][0..4], "e\u{0301} ");
+    ids.clearRetainingCapacity();
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, a, large, &ids, 4);
+    try std.testing.expectEqual(count * 3, ids.items.len);
+    for (0..count) |i| try std.testing.expectEqualSlices(i32, &.{ 5, 6, 7 }, ids.items[i * 3 ..][0..3]);
+}
+
 test "sequence normalizer applies lowercase before byte-level bpe" {
     const allocator = std.testing.allocator;
 

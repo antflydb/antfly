@@ -880,6 +880,10 @@ fn encoderLayer(
         total,
         H,
         if (resident_slots) modernBertLinearSlot(layer_idx, .qkv) else null,
+        if (!config.rope_interleaved and packed_row == null and row_segments == null and branches == null)
+            .{ .sequence = seq_len, .heads = num_heads, .theta = rope_theta }
+        else
+            null,
         fusion_positions,
         rope_theta,
         &name_buf,
@@ -1023,6 +1027,12 @@ const QkvProjection = struct {
     rotated: bool = false,
 };
 
+const QkvRope = struct {
+    sequence: usize,
+    heads: usize,
+    theta: f32,
+};
+
 fn projectQkv(
     cb: *const ComputeBackend,
     config: Config,
@@ -1031,6 +1041,7 @@ fn projectQkv(
     rows: usize,
     hidden_size: usize,
     slot: ?usize,
+    rope: ?QkvRope,
     fusion_positions: ?CT,
     rope_theta: f32,
     name_buf: *[256]u8,
@@ -1048,6 +1059,12 @@ fn projectQkv(
             slot,
         );
         defer cb.free(qkv);
+        if (rope) |rotation| {
+            if (rotation.sequence == 0 or rotation.heads == 0 or rows % rotation.sequence != 0 or hidden_size % rotation.heads != 0) return error.InvalidShape;
+            if (try cb.splitQkvRope(qkv, rows / rotation.sequence, rotation.sequence, rotation.heads, hidden_size / rotation.heads, rotation.theta)) |parts| {
+                return .{ .q = parts.first, .k = parts.second, .v = parts.third, .rotated = true };
+            }
+        }
         if (fusion_positions) |positions| {
             if (try cb.packedQkvRope(qkv, positions, hidden_size, hidden_size / config.num_attention_heads, rope_theta)) |fused|
                 return .{ .q = fused.first, .k = fused.second, .v = fused.third, .rotated = true };

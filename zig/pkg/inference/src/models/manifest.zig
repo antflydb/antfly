@@ -525,6 +525,15 @@ pub const ModelManifest = struct {
         return false;
     }
 
+    /// Declared routing only; boundary requests still require exact live-artifact
+    /// qualification before any learned operation.
+    pub fn isGlinerDecisionModel(self: *const ModelManifest) bool {
+        if (self.gliner_architecture != .boundary and
+            !(self.gliner_architecture == .span and self.gliner_span_declared)) return false;
+        for (self.capabilities) |cap| if (std.mem.eql(u8, cap, "typed_decisions")) return true;
+        return false;
+    }
+
     /// Architecture recognition and runtime qualification are separate. Every
     /// serving entry point must check this before choosing a legacy GLiNER path.
     pub fn hasSupportedGlinerRuntime(self: *const ModelManifest) bool {
@@ -1501,9 +1510,8 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(at_bytes);
         try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
     }
-    // Decide's small tokenizer config declares [L] and [SEP_STRUCT] IDs.
-    // Discovery needs these IDs to validate the explicit head without
-    // materializing the multi-megabyte tokenizer.json on every request.
+    // Small tokenizer metadata may declare marker IDs. Ettin lists strings
+    // only, so discovery falls back to tokenizer.json when IDs are missing.
     if (manifest.gliner_classification_head == .label_marker_mlp) {
         if (try catalog.readOptional("tokenizer_config.json")) |tokenizer_config_bytes| {
             defer allocator.free(tokenizer_config_bytes);
@@ -1615,6 +1623,17 @@ fn isListingCandidateRejection(err: anyerror) bool {
 fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     if (manifest.gliner_model_type.len > 0) return;
     if (!std.mem.eql(u8, manifest.config_model_arch, "extractor") and !hasGlinerPathHint(catalog.model_dir_path)) return;
+
+    // Ettin Decide declares its span architecture and label-marker head, but
+    // publishes its marker IDs only in tokenizer.json. Discovery must not
+    // require the legacy special_tokens_map sidecar; full loading still
+    // validates every required marker and the consumed weight layout.
+    if (manifest.gliner_span_declared and manifest.gliner_classification_head == .label_marker_mlp and
+        std.mem.eql(u8, manifest.config_model_arch, "extractor"))
+    {
+        manifest.gliner_model_type = try allocator.dupe(u8, "gliner2");
+        return;
+    }
 
     if (try catalog.readOptional("special_tokens_map.json")) |tokens_bytes| {
         defer allocator.free(tokens_bytes);
@@ -4501,8 +4520,50 @@ test "Decide listing reads small marker sidecar for declared classification head
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);
     try std.testing.expectEqual(@as(i32, 128007), listing.gliner_token_l);
     try std.testing.expectEqual(@as(i32, 128001), listing.gliner_token_sep_struct);
+    // Ettin's tokenizer_config lists token strings without numeric IDs.
+    // Listing then validates the marker IDs from tokenizer.json.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"additional_special_tokens\":[\"[L]\",\"[SEP_STRUCT]\"]}" });
+    try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(a, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":128007,\"content\":\"[L]\"},{\"id\":128001,\"content\":\"[SEP_STRUCT]\"}]}" });
+    var without_ids = try loadListingFromDir(a, path);
+    defer without_ids.deinit();
+    try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, without_ids.gliner_classification_head);
+    try std.testing.expectEqual(@as(i32, 128007), without_ids.gliner_token_l);
+    try std.testing.expectError(error.InvalidModelManifest, loadFromDir(a, path));
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "[]" });
     try std.testing.expectError(error.InvalidTokenizerConfig, loadListingFromDir(a, path));
+}
+
+test "Decide listing accepts explicit span head without legacy marker sidecars" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"extractor","architecture":"span","config_version":3,"architecture_version":1,"architectures":["SpanExtractor"],"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm"}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data =
+        \\{"type":"extractor","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"],"gliner_classification_head":"label_marker_mlp"}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
+        \\{"additional_special_tokens":["[L]","[SEP_STRUCT]"]}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(a, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[]}" });
+    try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(a, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":128007,\"content\":\"[L]\"},{\"id\":128001,\"content\":\"[SEP_STRUCT]\"}]}" });
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expect(listing.isGlinerDecisionModel());
+    try std.testing.expectEqualStrings("gliner2", listing.gliner_model_type);
+    try std.testing.expectEqual(@as(i32, 128007), listing.gliner_token_l);
+    try std.testing.expectError(error.InvalidModelManifest, loadFromDir(a, path));
+
+    // A head declaration alone cannot turn an unrelated extractor into GLiNER.
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(a, path));
 }
 
 test "GLiNER Decide listing falls back to tokenizer JSON marker IDs" {

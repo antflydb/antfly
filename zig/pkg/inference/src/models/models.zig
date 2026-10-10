@@ -35,6 +35,7 @@ pub const clap = @import("clap.zig");
 pub const manifest = @import("manifest.zig");
 pub const compatibility = @import("compatibility.zig");
 pub const gliner_boundary = @import("gliner_boundary.zig");
+pub const gliner_encoder = @import("gliner_encoder.zig");
 pub const gliner_boundary_artifact = @import("gliner_boundary_artifact.zig");
 pub const gliner_boundary_bundle = @import("gliner_boundary_bundle.zig");
 
@@ -54,6 +55,7 @@ test {
     _ = manifest;
     _ = compatibility;
     _ = gliner_boundary;
+    _ = gliner_encoder;
     _ = gliner_boundary_artifact;
     _ = gliner_boundary_bundle;
 }

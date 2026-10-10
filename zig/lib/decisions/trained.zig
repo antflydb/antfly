@@ -17,6 +17,7 @@
 const std = @import("std");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
+pub const LongDocument = @import("windowing.zig").Options;
 
 pub const Kind = enum { choice, score, noul };
 pub const Question = struct {
@@ -32,6 +33,7 @@ pub const Request = struct {
     model_identity: ?[]const u8 = null,
     state: []const u8,
     questions: []Question,
+    long_document: LongDocument = .{},
     embedding_options: ?@import("embedding.zig").Options = null,
 };
 
@@ -75,7 +77,11 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
     };
     // The request owns parsed strings through the caller's request arena.
     const root = try object(parsed.value);
-    try onlyKeys(root, &.{ "model", "model_identity", "state", "questions", "embedding_options" });
+    try onlyKeys(root, &.{ "model", "model_identity", "state", "questions", "embedding_options", "long_document" });
+    const long_document = if (root.get("long_document")) |raw|
+        try @import("windowing.zig").parse(raw)
+    else
+        LongDocument{};
     const model = try nonempty(root.get("model") orelse return error.InvalidDecideRequest);
     const model_identity: ?[]const u8 = if (root.get("model_identity")) |value| blk: {
         const identity = try nonempty(value);
@@ -143,7 +149,7 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
         }
         question.* = .{ .name = name, .kind = kind, .instructions = instructions, .labels = labels, .descriptions = descriptions, .examples = examples };
     }
-    return .{ .model = model, .model_identity = model_identity, .state = state, .questions = out, .embedding_options = if (root.get("embedding_options")) |v| try @import("embedding.zig").Options.parse(v) else null };
+    return .{ .model = model, .model_identity = model_identity, .state = state, .questions = out, .long_document = long_document, .embedding_options = if (root.get("embedding_options")) |v| try @import("embedding.zig").Options.parse(v) else null };
 }
 
 fn put(a: Allocator, map: *std.json.ObjectMap, key: []const u8, value: Value) !void {
@@ -171,6 +177,7 @@ pub const ExtractionValue = struct { value: Value, schema_bytes: usize };
 /// all generated nesting is fixed and parseValue still enforces schema/text limits.
 pub fn extractionValue(a: Allocator, request: Request, contract: ExecutionContract) !ExtractionValue {
     const classifications = contract.usesClassifications();
+    if (!classifications and request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
     var root: std.json.ObjectMap = .empty;
     try put(a, &root, "schema_version", .{ .integer = 2 });
     try put(a, &root, "model", string(request.model));
@@ -209,6 +216,14 @@ pub fn extractionValue(a: Allocator, request: Request, contract: ExecutionContra
     if (classifications) {
         var options: std.json.ObjectMap = .empty;
         try put(a, &options, "include_confidence", .{ .bool = true });
+        if (request.long_document.mode == .window) {
+            var windows: std.json.ObjectMap = .empty;
+            try put(a, &windows, "mode", string("window"));
+            try put(a, &windows, "window_words", .{ .integer = @intCast(request.long_document.window_words) });
+            try put(a, &windows, "overlap_words", .{ .integer = @intCast(request.long_document.overlap_words) });
+            try put(a, &windows, "max_windows", .{ .integer = @intCast(request.long_document.max_windows) });
+            try put(a, &options, "long_document", .{ .object = windows });
+        }
         try put(a, &root, "options", .{ .object = options });
     }
     return .{
@@ -224,6 +239,27 @@ fn number(v: Value) !f64 {
         .number_string => std.fmt.parseFloat(f64, v.number_string) catch return error.InvalidDecideOutput,
         else => error.InvalidDecideOutput,
     };
+}
+
+test "typed decide windowing preserves extraction geometry and rejects invalid options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = "{\"model\":\"multi-decide\",\"state\":\"hello\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"Relevant?\"}},\"long_document\":";
+    const request = try parse(a, prefix ++ "{\"mode\":\"window\",\"window_words\":64,\"overlap_words\":8,\"max_windows\":4}}");
+    const input = try extractionInput(a, request, .boundary);
+    const json = try std.json.parseFromSlice(Value, a, input.json, .{});
+    const windows = json.value.object.get("options").?.object.get("long_document").?;
+    try std.testing.expectEqualDeep(request.long_document, try @import("windowing.zig").parse(windows));
+    try std.testing.expectError(error.UnsupportedDecisionWindowing, extractionInput(a, request, .laya));
+    for ([_][]const u8{
+        "null",                                                     "{\"mode\":\"window\",\"window_words\":32,\"overlap_words\":32}",
+        "{\"mode\":\"window\",\"max_windows\":129}",                "{\"mode\":\"reject\",\"window_words\":64}",
+        "{\"mode\":\"window\",\"record_identity\":\"occurrence\"}",
+    }) |invalid| {
+        const bytes = try std.fmt.allocPrint(a, "{s}{s}}}", .{ prefix, invalid });
+        try std.testing.expectError(error.InvalidDecideRequest, parse(a, bytes));
+    }
 }
 
 fn tokenCount(v: Value) !Value {

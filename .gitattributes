@@ -5,3 +5,9 @@ zig/pkg/antfly/antfarm/assets/*.js whitespace=-trailing-space
 
 # PDF fixtures are binary test assets; xref entries contain required padding.
 *.pdf binary
+
+# GLiNER family captures and CUDA artifacts are generated qualification data.
+zig/pkg/inference/testdata/gliner25/family/evidence/** linguist-generated=true
+zig/pkg/inference/testdata/gliner25/family/*/oracle_fp32.jsonl linguist-generated=true
+zig/pkg/inference/testdata/gliner25/family/*/capacity_oracle_fp32.jsonl linguist-generated=true
+zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.ptx linguist-generated=true

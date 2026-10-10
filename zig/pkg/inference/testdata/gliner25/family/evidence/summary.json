@@ -1,0 +1,1816 @@
+{
+  "format_version": 1,
+  "qualification": false,
+  "scope": "curated_diagnostic_results",
+  "note": "Recorded aggregates preserve passing and rejected candidates. Full historical reports are external run artifacts; retained replay captures and benchmark samples remain pinned by manifest.json. These results do not grant release qualification.",
+  "campaigns": [
+    {
+      "campaign": "fastino_multi_bf16_eager_quality",
+      "source_report_sha256": "f2361f3d143baa613b3f9e902f8cf22c59262e026d75b2dae50a8729982c6dea",
+      "qualification": false,
+      "quality_passed": false,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "bf16",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "mixed_tasks",
+          "passed": false,
+          "error": "reference selected label changed"
+        },
+        {
+          "id": "unicode_offsets",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "entity_attributes",
+          "passed": false,
+          "error": "reference output cardinality changed"
+        },
+        {
+          "id": "legacy_structure",
+          "passed": false,
+          "error": "reference selected label changed"
+        },
+        {
+          "id": "record_natural",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "record_latent",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "record_anchorless",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "enum_field",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "constrained_classification",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "joint_ie",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        }
+      ]
+    },
+    {
+      "campaign": "fastino_multi_bf16_flash_quality",
+      "source_report_sha256": "859420e5a00c06d83627c8633e170173ba49bac36e4dc8cd2c4267fc7e38c23d",
+      "qualification": false,
+      "all_cases_passed": false,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0",
+          "flashdeberta": "0.0.8",
+          "triton": "3.8.0"
+        },
+        "dtype": "bf16",
+        "attention": "flashdeberta",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "mixed_tasks",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "unicode_offsets",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "entity_attributes",
+          "passed": false,
+          "error": "reference output cardinality changed"
+        },
+        {
+          "id": "legacy_structure",
+          "passed": false,
+          "error": "reference selected label changed"
+        },
+        {
+          "id": "record_natural",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "record_latent",
+          "passed": false,
+          "error": "reference output cardinality changed"
+        },
+        {
+          "id": "record_anchorless",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "enum_field",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "constrained_classification",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "joint_ie",
+          "passed": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "campaign": "fastino_multi_fp16_eager_quality",
+      "source_report_sha256": "2bd64c709633dbbc10b913b652033ef000756d978b49a1b0ee5cc06fe0cf157f",
+      "qualification": false,
+      "quality_passed": false,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp16",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "mixed_tasks",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "unicode_offsets",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "entity_attributes",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "legacy_structure",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "record_natural",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        },
+        {
+          "id": "record_latent",
+          "passed": false,
+          "error": "reference output cardinality changed"
+        },
+        {
+          "id": "record_anchorless",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "enum_field",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "constrained_classification",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "joint_ie",
+          "passed": false,
+          "error": "reference confidence outside FP32 tolerance"
+        }
+      ]
+    },
+    {
+      "campaign": "fastino_multi_fp16_flash_quality",
+      "source_report_sha256": "b69b36d78e204f9b2d4784a9dc4b1a614a8ddb45b557a59adf37f5e412c0af90",
+      "qualification": false,
+      "all_cases_passed": false,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0",
+          "flashdeberta": "0.0.8",
+          "triton": "3.8.0"
+        },
+        "dtype": "fp16",
+        "attention": "flashdeberta",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "mixed_tasks",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "unicode_offsets",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "entity_attributes",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "legacy_structure",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "record_natural",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "record_latent",
+          "passed": false,
+          "error": "reference output cardinality changed"
+        },
+        {
+          "id": "record_anchorless",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "enum_field",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "constrained_classification",
+          "passed": true,
+          "error": null
+        },
+        {
+          "id": "joint_ie",
+          "passed": true,
+          "error": null
+        }
+      ]
+    },
+    {
+      "campaign": "l4_multi_fp16_exact_exp",
+      "source_report_sha256": "ac9d66b15324cdb60093c8455c46ae2093f1e6251913873ab226f03c945fd583",
+      "model_id": "fastino/gliner2.5-multi-v1",
+      "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+      "backend": "cuda",
+      "precision": "fp16",
+      "attention_only": false,
+      "qualification": false,
+      "status": "complete",
+      "expected_cases": 10,
+      "native_binary_sha256": "b97ec53328094e4523cf838dde1b79ffcf3865e5c1337b3446a04aa5642941fa",
+      "scope": "fixture_accuracy_only",
+      "cases": [
+        {
+          "id": "mixed_tasks",
+          "max_confidence_error": 0.0010785460472106934
+        },
+        {
+          "id": "unicode_offsets",
+          "max_confidence_error": 0.0003235340118408203
+        },
+        {
+          "id": "entity_attributes",
+          "max_confidence_error": 0.00046432018280029297
+        },
+        {
+          "id": "legacy_structure",
+          "max_confidence_error": 5.5849552154541016e-05
+        },
+        {
+          "id": "record_natural",
+          "max_confidence_error": 0.001355290412902832
+        },
+        {
+          "id": "record_latent",
+          "max_confidence_error": 0.0015638470649719238
+        },
+        {
+          "id": "record_anchorless",
+          "max_confidence_error": 0
+        },
+        {
+          "id": "enum_field",
+          "max_confidence_error": 1.0728836059570312e-06
+        },
+        {
+          "id": "constrained_classification",
+          "max_confidence_error": 0.00016740416710692152
+        },
+        {
+          "id": "joint_ie",
+          "max_confidence_error": 0.0011868406437861578
+        }
+      ]
+    },
+    {
+      "campaign": "l4_multi_fp16_public_classification_rejected",
+      "source_report_sha256": "00dddb43b67cf53f599d4a0cb4dc5b3f38001ad913f12e8fb4c1e671e2c57260",
+      "status": "complete",
+      "qualification": false,
+      "scope": "public_test_classification_parity",
+      "model": "fastino/gliner2.5-multi-v1",
+      "precision": "fp16",
+      "native_binary_sha256": "b97ec53328094e4523cf838dde1b79ffcf3865e5c1337b3446a04aa5642941fa",
+      "measured_slices_passed": false,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp32",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "fixture_sha256": "cd6c82baa7abc492d13567c070b70340fdaa6171324d83a84f74332b6d00b4d0",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "fr-FR",
+          "fixture_sha256": "a2946593786bd9ff9a7e7dc24c5b6948f35ff3ac3ccfd1f419f5d15afc0f9d99",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "de-DE",
+          "fixture_sha256": "1d82450576ec2eb02f8549458f3d9a87b0c612523ba547e7ea85ae9fd4ae1f0e",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "es-ES",
+          "fixture_sha256": "b17273e6131e8f3abf4635065f656f7bc070b60fcc848207e468f74ca8076acc",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "ar-SA",
+          "fixture_sha256": "8439342e086db5a61bea22abbbce822613fa697a7949dc912be0cc945d693742",
+          "documents": 200,
+          "matched": 198,
+          "agreement": 0.99,
+          "passed": false
+        },
+        {
+          "locale": "hi-IN",
+          "fixture_sha256": "8b46cf3af7436a4d5b6d263ed74061d4d7ec7c542e5a99cce6c80fec7b56c2da",
+          "documents": 200,
+          "matched": 196,
+          "agreement": 0.98,
+          "passed": false
+        },
+        {
+          "locale": "ja-JP",
+          "fixture_sha256": "9796fe8311a34679df547cc7e98ca9303b43855d88a1c94718f5e2472fbc58c5",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "zh-CN",
+          "fixture_sha256": "28f56554a9521e2ee4dc5c32a601efdf13ff806149eb5c1a648bc7bd79dc777e",
+          "documents": 200,
+          "matched": 198,
+          "agreement": 0.99,
+          "passed": false
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "3300ebbb2625f2509af3442b12973fae80daa064ffb34a1d556858c297be3ea0"
+      }
+    },
+    {
+      "campaign": "l4_multi_decide_fp16_compact_fixtures",
+      "source_report_sha256": "a5509071d1b1394a961b954f1b929542354181387ec3da120e31faf2e6172b2a",
+      "model_id": "fastino/GLiNER2.5-multi-Decide",
+      "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+      "backend": "cuda",
+      "precision": "fp16",
+      "attention_only": false,
+      "qualification": false,
+      "status": "complete",
+      "expected_cases": 18,
+      "native_binary_sha256": "9f70a8c2e620aef814fda682f3988e2aa7f9b8130b829ef338a273823d0c245d",
+      "scope": "fixture_accuracy_only",
+      "cases": [
+        {
+          "id": "support_intent",
+          "max_confidence_error": 1.1622905731201172e-05
+        },
+        {
+          "id": "travel",
+          "max_confidence_error": 6.431341171264648e-05
+        },
+        {
+          "id": "hotel_multi_task",
+          "max_confidence_error": 0.0008712708950042725
+        },
+        {
+          "id": "passage_question",
+          "max_confidence_error": 2.014636993408203e-05
+        },
+        {
+          "id": "described_labels",
+          "max_confidence_error": 1.710653305053711e-05
+        },
+        {
+          "id": "ordinal",
+          "max_confidence_error": 0.00011295080184936523
+        },
+        {
+          "id": "book_genre",
+          "max_confidence_error": 0.00014922022819519043
+        },
+        {
+          "id": "sentiment_multi",
+          "max_confidence_error": 0.0005123615264892578
+        },
+        {
+          "id": "distinct_multilingual",
+          "max_confidence_error": 0.0004936456680297852
+        },
+        {
+          "id": "ragged_descriptions",
+          "max_confidence_error": 0.00012743473052978516
+        },
+        {
+          "id": "tokens_128_batch_1",
+          "max_confidence_error": 3.814697265625e-06
+        },
+        {
+          "id": "tokens_128_batch_8",
+          "max_confidence_error": 0.000164031982421875
+        },
+        {
+          "id": "tokens_512_batch_1",
+          "max_confidence_error": 4.076957702636719e-05
+        },
+        {
+          "id": "tokens_512_batch_8",
+          "max_confidence_error": 0.0003674030303955078
+        },
+        {
+          "id": "tokens_2048_batch_1",
+          "max_confidence_error": 0.0006176233291625977
+        },
+        {
+          "id": "tokens_2048_batch_8",
+          "max_confidence_error": 0.0006181597709655762
+        },
+        {
+          "id": "tokens_128_batch_32",
+          "max_confidence_error": 0.00044590234756469727
+        },
+        {
+          "id": "tokens_128_batch_64",
+          "max_confidence_error": 0.0004457235336303711
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "762db8d1ddfe58077140abde05356a871e3643851845d3c07f774fcbe35f9108",
+        "uncompressed_size_bytes": 234429
+      }
+    },
+    {
+      "campaign": "l4_multi_decide_fp16_bias_epilogue_rejected",
+      "source_report_sha256": "39416549fdd368cfced66fd123c0a85003f5d39fd6ba763f95dd2a86064de6b9",
+      "status": "complete",
+      "qualification": false,
+      "scope": "public_test_classification_parity",
+      "model": "fastino/GLiNER2.5-multi-Decide",
+      "precision": "fp16",
+      "native_binary_sha256": "1c3c1b7bdbc07b29f6d08ab350cb16d6fb75812adbc80375f4cc7ef295eea922",
+      "measured_slices_passed": false,
+      "disposition": "rejected: Arabic slice below 99.5%; FP16 bias epilogue removed from dispatch",
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-multi-Decide",
+        "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp32",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "fixture_sha256": "cd6c82baa7abc492d13567c070b70340fdaa6171324d83a84f74332b6d00b4d0",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "fr-FR",
+          "fixture_sha256": "a2946593786bd9ff9a7e7dc24c5b6948f35ff3ac3ccfd1f419f5d15afc0f9d99",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "de-DE",
+          "fixture_sha256": "1d82450576ec2eb02f8549458f3d9a87b0c612523ba547e7ea85ae9fd4ae1f0e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "es-ES",
+          "fixture_sha256": "b17273e6131e8f3abf4635065f656f7bc070b60fcc848207e468f74ca8076acc",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "ar-SA",
+          "fixture_sha256": "8439342e086db5a61bea22abbbce822613fa697a7949dc912be0cc945d693742",
+          "documents": 200,
+          "matched": 198,
+          "agreement": 0.99,
+          "passed": false
+        },
+        {
+          "locale": "hi-IN",
+          "fixture_sha256": "8b46cf3af7436a4d5b6d263ed74061d4d7ec7c542e5a99cce6c80fec7b56c2da",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "ja-JP",
+          "fixture_sha256": "9796fe8311a34679df547cc7e98ca9303b43855d88a1c94718f5e2472fbc58c5",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "zh-CN",
+          "fixture_sha256": "28f56554a9521e2ee4dc5c32a601efdf13ff806149eb5c1a648bc7bd79dc777e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "dcdbede960fbbcb550cd3d1040b981ab36cd58312bc10a0e50079256726debfa",
+        "uncompressed_size_bytes": 9538979
+      }
+    },
+    {
+      "campaign": "l4_decide_1b_fp16_nfc_short_fixtures",
+      "source_report_sha256": "0012b97254502d8afc9835d4f70ee6694f30209204f976ec4a53df8a1a1256c5",
+      "model_id": "fastino/GLiNER2.5-Decide-1B",
+      "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+      "backend": "cuda",
+      "precision": "fp16",
+      "attention_only": false,
+      "qualification": false,
+      "status": "complete",
+      "expected_cases": 10,
+      "native_binary_sha256": "b0633cb3a7d38e99dfd4065562f7ca417c2702cf9124228f047793de18181994",
+      "cases": [
+        {
+          "id": "support_intent",
+          "max_confidence_error": 2.0265579223632812e-05
+        },
+        {
+          "id": "travel",
+          "max_confidence_error": 0.00014525651931762695
+        },
+        {
+          "id": "hotel_multi_task",
+          "max_confidence_error": 0.00035440921783447266
+        },
+        {
+          "id": "passage_question",
+          "max_confidence_error": 2.9802322387695312e-06
+        },
+        {
+          "id": "described_labels",
+          "max_confidence_error": 2.664327621459961e-05
+        },
+        {
+          "id": "ordinal",
+          "max_confidence_error": 4.0084123611450195e-06
+        },
+        {
+          "id": "book_genre",
+          "max_confidence_error": 0.0001353621482849121
+        },
+        {
+          "id": "sentiment_multi",
+          "max_confidence_error": 9.715557098388672e-05
+        },
+        {
+          "id": "distinct_multilingual",
+          "max_confidence_error": 0.00030416250228881836
+        },
+        {
+          "id": "ragged_descriptions",
+          "max_confidence_error": 6.496906280517578e-05
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "5369c91c1443575ed4abb7435397f3e83d33635e7181b79f93a17c8040be4ef8",
+        "uncompressed_size_bytes": 16339
+      }
+    },
+    {
+      "campaign": "l4_decide_1b_fp16_nfc_capacity_fixtures",
+      "source_report_sha256": "7f0c646a3c5908693abfef3292e7d18268f26f2b51858a26119ee4bb353c6a87",
+      "model_id": "fastino/GLiNER2.5-Decide-1B",
+      "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+      "backend": "cuda",
+      "precision": "fp16",
+      "attention_only": false,
+      "qualification": false,
+      "status": "complete",
+      "expected_cases": 10,
+      "native_binary_sha256": "b0633cb3a7d38e99dfd4065562f7ca417c2702cf9124228f047793de18181994",
+      "cases": [
+        {
+          "id": "tokens_128_batch_1",
+          "max_confidence_error": 0.0
+        },
+        {
+          "id": "tokens_128_batch_8",
+          "max_confidence_error": 0.00017827749252319336
+        },
+        {
+          "id": "tokens_512_batch_1",
+          "max_confidence_error": 9.5367431640625e-07
+        },
+        {
+          "id": "tokens_512_batch_8",
+          "max_confidence_error": 0.000202178955078125
+        },
+        {
+          "id": "tokens_2048_batch_1",
+          "max_confidence_error": 3.5762786865234375e-07
+        },
+        {
+          "id": "tokens_2048_batch_8",
+          "max_confidence_error": 0.0008289813995361328
+        },
+        {
+          "id": "tokens_128_batch_32",
+          "max_confidence_error": 0.0004749894142150879
+        },
+        {
+          "id": "tokens_128_batch_64",
+          "max_confidence_error": 0.0007613301277160645
+        },
+        {
+          "id": "tokens_4096_batch_1",
+          "max_confidence_error": 6.80685043334961e-05
+        },
+        {
+          "id": "tokens_7999_batch_1",
+          "max_confidence_error": 2.3543834686279297e-05
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "78ca4acccf8152850b4af913167fb6680d71a962c8174348070a612f62dd9dff",
+        "uncompressed_size_bytes": 283602
+      }
+    },
+    {
+      "campaign": "l4_decide_1b_fp16_nfc_public_gold_intents",
+      "source_report_sha256": "12642847db229912075b927c2f0a509a32976cc6b7e93c1bac5fc7803eb9e9b1",
+      "qualification": false,
+      "scope": "massive_public_test_gold_intent_accuracy",
+      "model": "fastino/GLiNER2.5-Decide-1B",
+      "precision": "fp16",
+      "native_binary_sha256": "b0633cb3a7d38e99dfd4065562f7ca417c2702cf9124228f047793de18181994",
+      "note": "Preselected public test subset; training-data independence is not established.",
+      "documents": 1600,
+      "native_accuracy": 0.401875,
+      "fastino_accuracy": 0.401875,
+      "status": "complete",
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-Decide-1B",
+        "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp32",
+        "weight_dtype": "fp32",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "documents": 200,
+          "native_correct": 134,
+          "native_accuracy": 0.67,
+          "fastino_correct": 134,
+          "fastino_accuracy": 0.67
+        },
+        {
+          "locale": "fr-FR",
+          "documents": 200,
+          "native_correct": 112,
+          "native_accuracy": 0.56,
+          "fastino_correct": 112,
+          "fastino_accuracy": 0.56
+        },
+        {
+          "locale": "de-DE",
+          "documents": 200,
+          "native_correct": 86,
+          "native_accuracy": 0.43,
+          "fastino_correct": 86,
+          "fastino_accuracy": 0.43
+        },
+        {
+          "locale": "es-ES",
+          "documents": 200,
+          "native_correct": 104,
+          "native_accuracy": 0.52,
+          "fastino_correct": 104,
+          "fastino_accuracy": 0.52
+        },
+        {
+          "locale": "ar-SA",
+          "documents": 200,
+          "native_correct": 26,
+          "native_accuracy": 0.13,
+          "fastino_correct": 26,
+          "fastino_accuracy": 0.13
+        },
+        {
+          "locale": "hi-IN",
+          "documents": 200,
+          "native_correct": 14,
+          "native_accuracy": 0.07,
+          "fastino_correct": 14,
+          "fastino_accuracy": 0.07
+        },
+        {
+          "locale": "ja-JP",
+          "documents": 200,
+          "native_correct": 91,
+          "native_accuracy": 0.455,
+          "fastino_correct": 91,
+          "fastino_accuracy": 0.455
+        },
+        {
+          "locale": "zh-CN",
+          "documents": 200,
+          "native_correct": 76,
+          "native_accuracy": 0.38,
+          "fastino_correct": 76,
+          "fastino_accuracy": 0.38
+        }
+      ]
+    },
+    {
+      "campaign": "l4_fastino_multi_decide_flash_fp16_weights_fixtures",
+      "source_report_sha256": "700548a869baa71a6e3c98d39015d2cf8e865e94020c785fbb54e5ebfeb2edd9",
+      "status": "complete",
+      "qualification": false,
+      "scope": "fastino_short_and_capacity_fixture_quality",
+      "measured_cases_passed": true,
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-multi-Decide",
+        "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0",
+          "flashdeberta": "0.0.8",
+          "triton": "3.8.0"
+        },
+        "dtype": "fp16",
+        "weight_dtype": "fp16",
+        "attention": "flashdeberta",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "support_intent",
+          "passed": true
+        },
+        {
+          "id": "travel",
+          "passed": true
+        },
+        {
+          "id": "hotel_multi_task",
+          "passed": true
+        },
+        {
+          "id": "passage_question",
+          "passed": true
+        },
+        {
+          "id": "described_labels",
+          "passed": true
+        },
+        {
+          "id": "ordinal",
+          "passed": true
+        },
+        {
+          "id": "book_genre",
+          "passed": true
+        },
+        {
+          "id": "sentiment_multi",
+          "passed": true
+        },
+        {
+          "id": "distinct_multilingual",
+          "passed": true
+        },
+        {
+          "id": "ragged_descriptions",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_512_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_512_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_2048_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_2048_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_32",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_64",
+          "passed": true
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "40aee7ed5b6aab6b4fbfca48669c19efaf0e1a46f393ac22fcaff17008462455",
+        "uncompressed_size_bytes": 352499
+      }
+    },
+    {
+      "campaign": "l4_fastino_multi_decide_flash_fp16_weights_public_classification",
+      "source_report_sha256": "825d2ecec60a9891581d052878e4def60badf12647462c697fd79fec44a44518",
+      "status": "complete",
+      "qualification": false,
+      "scope": "fastino_public_holdout_profile_quality",
+      "model": "fastino/GLiNER2.5-multi-Decide",
+      "measured_slices_passed": true,
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-multi-Decide",
+        "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0",
+          "flashdeberta": "0.0.8",
+          "triton": "3.8.0"
+        },
+        "dtype": "fp16",
+        "weight_dtype": "fp16",
+        "attention": "flashdeberta",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "fr-FR",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "de-DE",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "es-ES",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "ar-SA",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "hi-IN",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "ja-JP",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "zh-CN",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "5182b94bc6842717b1e7f6fd922184939e579b49f755ae49c7bb0d6ef353d45f",
+        "uncompressed_size_bytes": 10823698
+      }
+    },
+    {
+      "campaign": "l4_fastino_decide_1b_sdpa_fp16_weights_fixtures",
+      "source_report_sha256": "fa4b0b78ed4f6bcdfc2a49a8368b4e1a327319b8dcf65339e6399a0172cbbfa4",
+      "status": "complete",
+      "qualification": false,
+      "scope": "fastino_short_and_capacity_fixture_quality",
+      "measured_cases_passed": true,
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-Decide-1B",
+        "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp16",
+        "weight_dtype": "fp16",
+        "attention": "sdpa",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "cases": [
+        {
+          "id": "support_intent",
+          "passed": true
+        },
+        {
+          "id": "travel",
+          "passed": true
+        },
+        {
+          "id": "hotel_multi_task",
+          "passed": true
+        },
+        {
+          "id": "passage_question",
+          "passed": true
+        },
+        {
+          "id": "described_labels",
+          "passed": true
+        },
+        {
+          "id": "ordinal",
+          "passed": true
+        },
+        {
+          "id": "book_genre",
+          "passed": true
+        },
+        {
+          "id": "sentiment_multi",
+          "passed": true
+        },
+        {
+          "id": "distinct_multilingual",
+          "passed": true
+        },
+        {
+          "id": "ragged_descriptions",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_512_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_512_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_2048_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_2048_batch_8",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_32",
+          "passed": true
+        },
+        {
+          "id": "tokens_128_batch_64",
+          "passed": true
+        },
+        {
+          "id": "tokens_4096_batch_1",
+          "passed": true
+        },
+        {
+          "id": "tokens_7999_batch_1",
+          "passed": true
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "6846c968e0ec800c1686e61dd8b3ddf1c71eed0de07a513854af9807d9d7efa8",
+        "uncompressed_size_bytes": 459804
+      }
+    },
+    {
+      "campaign": "l4_fastino_decide_1b_sdpa_fp16_weights_public_classification",
+      "source_report_sha256": "33ced520dd5022a862363dcf70c252c1ccee8d6c8967553029ac725546bd9f60",
+      "status": "complete",
+      "qualification": false,
+      "scope": "fastino_public_holdout_profile_quality",
+      "model": "fastino/GLiNER2.5-Decide-1B",
+      "measured_slices_passed": true,
+      "reference": {
+        "model_id": "fastino/GLiNER2.5-Decide-1B",
+        "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp16",
+        "weight_dtype": "fp16",
+        "attention": "sdpa",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "fr-FR",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "de-DE",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "es-ES",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "ar-SA",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "hi-IN",
+          "documents": 200,
+          "matched": 199,
+          "agreement": 0.995,
+          "passed": true
+        },
+        {
+          "locale": "ja-JP",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        },
+        {
+          "locale": "zh-CN",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "8205acaaa4997e90563756f49545369b3d815b22d8a7877336397c8f90cf306b",
+        "uncompressed_size_bytes": 10084832
+      }
+    },
+    {
+      "campaign": "l4_multi_fp32_entities_original_text",
+      "source_report_sha256": "e7606c5f7a2a8b469d8d5f528a43ab73efe794368f4263d86cd6c03323e0edb2",
+      "status": "complete",
+      "qualification": false,
+      "scope": "public_test_entities_parity",
+      "model": "fastino/gliner2.5-multi-v1",
+      "precision": "fp32",
+      "native_binary_sha256": "b97ec53328094e4523cf838dde1b79ffcf3865e5c1337b3446a04aa5642941fa",
+      "measured_slices_passed": true,
+      "source_span_policy": "original_text",
+      "disposition": "Re-evaluated under the approved original-text span policy. Only predictions containing Fastino's appended terminal period are excluded; strict results and every excluded prediction remain recorded. No release qualification is granted.",
+      "reference_prediction_counts": {
+        "entities": 947,
+        "attributes": 0,
+        "relations": 0,
+        "records": 0
+      },
+      "strict_slices_passed": true,
+      "excluded_reference_predictions": 1,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp32",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "fixture_sha256": "cd6c82baa7abc492d13567c070b70340fdaa6171324d83a84f74332b6d00b4d0",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 183,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "fr-FR",
+          "fixture_sha256": "a2946593786bd9ff9a7e7dc24c5b6948f35ff3ac3ccfd1f419f5d15afc0f9d99",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 166,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "de-DE",
+          "fixture_sha256": "1d82450576ec2eb02f8549458f3d9a87b0c612523ba547e7ea85ae9fd4ae1f0e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 179,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "es-ES",
+          "fixture_sha256": "b17273e6131e8f3abf4635065f656f7bc070b60fcc848207e468f74ca8076acc",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 199,
+            "agreement": 0.995,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 175,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 1
+        },
+        {
+          "locale": "ar-SA",
+          "fixture_sha256": "8439342e086db5a61bea22abbbce822613fa697a7949dc912be0cc945d693742",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 140,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "hi-IN",
+          "fixture_sha256": "8b46cf3af7436a4d5b6d263ed74061d4d7ec7c542e5a99cce6c80fec7b56c2da",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 24,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "ja-JP",
+          "fixture_sha256": "9796fe8311a34679df547cc7e98ca9303b43855d88a1c94718f5e2472fbc58c5",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 53,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "zh-CN",
+          "fixture_sha256": "28f56554a9521e2ee4dc5c32a601efdf13ff806149eb5c1a648bc7bd79dc777e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 27,
+            "attributes": 0,
+            "relations": 0,
+            "records": 0
+          },
+          "excluded_reference_predictions": 0
+        }
+      ],
+      "source_capture": {
+        "uncompressed_sha256": "aaf5856841876fd0e7c2a6cd7526e78aec3637a04903ade95da884309973d01a",
+        "uncompressed_size_bytes": 2930621,
+        "encoding": "gzip"
+      },
+      "comparison_sources": {
+        "recheck_family_holdout.py": "f9af1fd7737590cc5a6fbd65f4dedafc8172107b1412ca531242f435c9c37e10",
+        "check_family_holdout.py": "94878f8894ef4a0d70272a55159d758bf8d33a0e38694cabff84cebf11f6fe61",
+        "check_family_decisions.py": "78052a643d6119ea6b457213287160e0ec78d9b75e7c8cccb9e56a0b6ab52275",
+        "source_span_policy.py": "6fc87a0771ca18786de3a1a2caa88d2b8f59effca1afb68965863d9e68afb7e9"
+      },
+      "source_strict_report_sha256": "d3dcf6251205595f743aed526743faf1dd697f67e847f824440f88ded5503c73"
+    },
+    {
+      "campaign": "l4_multi_fp32_structured_original_text",
+      "source_report_sha256": "8db6128ba5e32c9947551b9835a6854393094ee8fa55f10b2db9382de93e4657",
+      "status": "complete",
+      "qualification": false,
+      "scope": "public_test_structured_parity",
+      "model": "fastino/gliner2.5-multi-v1",
+      "precision": "fp32",
+      "native_binary_sha256": "9f70a8c2e620aef814fda682f3988e2aa7f9b8130b829ef338a273823d0c245d",
+      "reference_prediction_counts": {
+        "entities": 1670,
+        "attributes": 1670,
+        "relations": 575,
+        "records": 867
+      },
+      "all_heads_exercised": true,
+      "measured_slices_passed": true,
+      "source_span_policy": "original_text",
+      "disposition": "Re-evaluated under the approved original-text span policy. Only predictions containing Fastino's appended terminal period are excluded; strict results and every excluded prediction remain recorded. No release qualification is granted.",
+      "strict_slices_passed": false,
+      "excluded_reference_predictions": 4,
+      "reference": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "packages": {
+          "gliner2": "2.0.0",
+          "torch": "2.14.0",
+          "transformers": "5.17.0",
+          "tokenizers": "0.23.2",
+          "safetensors": "0.8.0"
+        },
+        "dtype": "fp32",
+        "weight_dtype": "fp32",
+        "attention": "eager",
+        "device": "NVIDIA L4",
+        "cuda": "13.0",
+        "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+        "timing_boundary": "public_batch_api_loaded_model"
+      },
+      "slices": [
+        {
+          "locale": "en-US",
+          "fixture_sha256": "cd6c82baa7abc492d13567c070b70340fdaa6171324d83a84f74332b6d00b4d0",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 343,
+            "attributes": 343,
+            "relations": 143,
+            "records": 179
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "fr-FR",
+          "fixture_sha256": "a2946593786bd9ff9a7e7dc24c5b6948f35ff3ac3ccfd1f419f5d15afc0f9d99",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 198,
+            "agreement": 0.99,
+            "passed": false
+          },
+          "reference_prediction_counts": {
+            "entities": 299,
+            "attributes": 299,
+            "relations": 116,
+            "records": 175
+          },
+          "excluded_reference_predictions": 3
+        },
+        {
+          "locale": "de-DE",
+          "fixture_sha256": "1d82450576ec2eb02f8549458f3d9a87b0c612523ba547e7ea85ae9fd4ae1f0e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 318,
+            "attributes": 318,
+            "relations": 109,
+            "records": 173
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "es-ES",
+          "fixture_sha256": "b17273e6131e8f3abf4635065f656f7bc070b60fcc848207e468f74ca8076acc",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 199,
+            "agreement": 0.995,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 297,
+            "attributes": 297,
+            "relations": 113,
+            "records": 158
+          },
+          "excluded_reference_predictions": 1
+        },
+        {
+          "locale": "ar-SA",
+          "fixture_sha256": "8439342e086db5a61bea22abbbce822613fa697a7949dc912be0cc945d693742",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 249,
+            "attributes": 249,
+            "relations": 90,
+            "records": 111
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "hi-IN",
+          "fixture_sha256": "8b46cf3af7436a4d5b6d263ed74061d4d7ec7c542e5a99cce6c80fec7b56c2da",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 35,
+            "attributes": 35,
+            "relations": 0,
+            "records": 22
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "ja-JP",
+          "fixture_sha256": "9796fe8311a34679df547cc7e98ca9303b43855d88a1c94718f5e2472fbc58c5",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 92,
+            "attributes": 92,
+            "relations": 3,
+            "records": 3
+          },
+          "excluded_reference_predictions": 0
+        },
+        {
+          "locale": "zh-CN",
+          "fixture_sha256": "28f56554a9521e2ee4dc5c32a601efdf13ff806149eb5c1a648bc7bd79dc777e",
+          "documents": 200,
+          "matched": 200,
+          "agreement": 1.0,
+          "passed": true,
+          "strict_comparison": {
+            "documents": 200,
+            "matched": 200,
+            "agreement": 1.0,
+            "passed": true
+          },
+          "reference_prediction_counts": {
+            "entities": 37,
+            "attributes": 37,
+            "relations": 1,
+            "records": 46
+          },
+          "excluded_reference_predictions": 0
+        }
+      ],
+      "source_capture": {
+        "encoding": "gzip",
+        "uncompressed_sha256": "a587a43d42256a9f4da26b90b7447a36fb2e1d9c0b64674987ce201c9fd45f96",
+        "uncompressed_size_bytes": 7033320
+      },
+      "comparison_sources": {
+        "recheck_family_holdout.py": "f9af1fd7737590cc5a6fbd65f4dedafc8172107b1412ca531242f435c9c37e10",
+        "check_family_holdout.py": "94878f8894ef4a0d70272a55159d758bf8d33a0e38694cabff84cebf11f6fe61",
+        "check_family_decisions.py": "78052a643d6119ea6b457213287160e0ec78d9b75e7c8cccb9e56a0b6ab52275",
+        "source_span_policy.py": "6fc87a0771ca18786de3a1a2caa88d2b8f59effca1afb68965863d9e68afb7e9"
+      },
+      "source_bounds_discrepancies": [
+        {
+          "locale": "fr-FR",
+          "source_id": "4112"
+        },
+        {
+          "locale": "fr-FR",
+          "source_id": "3253"
+        },
+        {
+          "locale": "es-ES",
+          "source_id": "9519"
+        }
+      ],
+      "source_strict_report_sha256": "327cafdc10537b3323ff614b9ac248de1e362036fa34b122befa06e5e2314cd1"
+    },
+    {
+      "campaign": "l4_multi_decide_fp32_http_concurrency",
+      "source_report_sha256": "91af1fc9db719c01798237a763b8065710ccf259f6764a6c51aabc18bff4bfe1",
+      "status": "complete",
+      "qualification": false,
+      "scope": "real_loopback_http_correctness_and_admission_cleanup",
+      "model": "multi_decide",
+      "precision": "fp32",
+      "concurrency": [
+        1,
+        4,
+        16
+      ],
+      "distinct_requests": 16,
+      "serial_response_identity": true,
+      "admission_leases_released": true,
+      "leaks": 0,
+      "test": "GLiNER family CUDA typed decisions through concurrent HTTP sockets",
+      "note": "Debug test build, cold FP32 preload excluded from socket deadline; no serving performance claim.",
+      "source_capture": {
+        "sha256": "7c671d4831ac1246d4f18b318663def363620a087a9f210766d2459003c1ec77"
+      }
+    },
+    {
+      "campaign": "l4_multi_decide_fp32_http_queue_cancellation",
+      "source_report_sha256": "2b26751f50265a307ab52f0487782c079f53696433d30ac7dfbb7ab7d761050c",
+      "status": "complete",
+      "qualification": false,
+      "scope": "real_loopback_http_correctness_admission_and_queued_cancellation",
+      "model": "fastino/GLiNER2.5-multi-Decide",
+      "precision": "fp32",
+      "concurrency": [
+        1,
+        4,
+        16
+      ],
+      "distinct_requests": 16,
+      "serial_response_identity": true,
+      "admission_leases_released": true,
+      "queued_disconnect_drained": true,
+      "queued_device_admission_unchanged": true,
+      "queued_kernel_launches": 0,
+      "retry_response_identity": true,
+      "leaks": 0,
+      "native_binary_sha256": "ad337e3330025e7126eb6401874953a6c2cc81ee014d770d9194343df271b8ee",
+      "note": "Isolated debug model-backed test. Cold preload excluded from socket deadlines. No serving performance claim.",
+      "source_capture": {
+        "sha256": "972bf9056d670d0f6ab49e862f227a0d3c2df311b5f1908b57d9eccbf352f969"
+      }
+    },
+    {
+      "campaign": "l4_multi_decide_fp32_managed_windows",
+      "source_report_sha256": "d9478c43ca188b295ec3baf03a23a9c83561cc9febbf9b8d48592af3256cdf6f",
+      "status": "complete",
+      "qualification": false,
+      "scope": "managed_window_batching_and_cancellation_correctness",
+      "model": "fastino/GLiNER2.5-multi-Decide",
+      "precision": "fp32",
+      "window_counts": [
+        0,
+        2,
+        8,
+        32
+      ],
+      "distinct_documents": 2,
+      "window_batch_sizes": [
+        1,
+        4
+      ],
+      "exact_window_counts": true,
+      "serial_batch_confidence_tolerance": 0.0005,
+      "cancel_before_execution": true,
+      "cancel_during_execution": true,
+      "retry_response_identity": true,
+      "leaks": 0,
+      "native_binary_sha256": "d10ba1c204333805f64874b7f3ecdff127c93aec76fec3795f12bb36a7314913",
+      "note": "Debug model-backed CUDA test; no serving or window performance claim.",
+      "source_capture": {
+        "sha256": "0062a91ed884d0e421d6e31defcc68e8bcfe83c475616734e3eb5cf1f3d8551c"
+      }
+    }
+  ]
+}

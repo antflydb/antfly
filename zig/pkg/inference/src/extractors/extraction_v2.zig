@@ -257,6 +257,21 @@ fn note(options: ParseOptions, index: ?usize, stage: []const u8) void {
     if (options.failure) |failure| failure.* = .{ .input_index = index, .stage = stage };
 }
 
+/// Extraction geometry; typed decisions lower matching bounds into this contract.
+pub fn parseLongDocument(raw: Value) !LongDocument {
+    const config = try asObject(raw);
+    try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
+    var result = LongDocument{};
+    result.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
+    result.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
+    result.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
+    result.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
+    result.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
+    if (result.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;
+    if (result.mode == .window and result.overlap_words >= result.window_words) return error.InvalidExtractionOptions;
+    return result;
+}
+
 pub fn parseOptions(value: Value) !Options {
     const object = try asObject(value);
     try keys(object, &.{ "threshold", "word_splitter", "flat_ner", "overlap", "offset_unit", "include_confidence", "include_spans", "long_document", "decoder", "joint_ie", "reader", "resolver" });
@@ -277,15 +292,7 @@ pub fn parseOptions(value: Value) !Options {
         options.overlap = policy;
     }
     if (object.get("long_document")) |raw| {
-        const config = try asObject(raw);
-        try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
-        options.long_document.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
-        options.long_document.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
-        options.long_document.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
-        options.long_document.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
-        options.long_document.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
-        if (options.long_document.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;
-        if (options.long_document.mode == .window and options.long_document.overlap_words >= options.long_document.window_words) return error.InvalidExtractionOptions;
+        options.long_document = try parseLongDocument(raw);
     }
     if (object.get("decoder")) |raw| {
         const config = try asObject(raw);

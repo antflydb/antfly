@@ -5,6 +5,7 @@ pub const types = @import("types.zig");
 
 pub const ChoiceDecisionQuestion = types.ChoiceDecisionQuestion;
 pub const DecideAnswer = types.DecideAnswer;
+pub const DecideLongDocument = types.DecideLongDocument;
 pub const DecideQuestion = types.DecideQuestion;
 pub const DecideRequest = types.DecideRequest;
 pub const DecideResponse = types.DecideResponse;

@@ -27,7 +27,7 @@ const Case = struct {
     input_ids: []const i64,
     logits: []const []const f64,
 };
-const Report = struct { id: []const u8, tokens: usize, median_ms: f64, p95_ms: f64, max_logit_error: f64, logits: [][]f64, samples_ms: []f64 };
+const Report = struct { id: []const u8, tokens: usize, median_ms: f64, p95_ms: f64, core_median_ms: f64, max_logit_error: f64, logits: [][]f64, samples_ms: []f64, core_samples_ms: []f64 };
 
 pub fn main(init: std.process.Init) !void {
     const a = inference.platform.allocator.processAllocator(std.heap.smp_allocator);
@@ -39,9 +39,14 @@ pub fn main(init: std.process.Init) !void {
     var warmups: usize = 3;
     var reps: usize = 20;
     var tolerance: f64 = 0.05;
+    var worker = false;
     while (args.next()) |key| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, key, "--model-dir")) path = value else if (std.mem.eql(u8, key, "--capture")) capture = value else if (std.mem.eql(u8, key, "--backend")) backend = value else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--tolerance")) tolerance = try std.fmt.parseFloat(f64, value) else return error.InvalidArgument;
+        if (std.mem.eql(u8, key, "--model-dir")) path = value else if (std.mem.eql(u8, key, "--capture")) capture = value else if (std.mem.eql(u8, key, "--backend")) backend = value else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--tolerance")) tolerance = try std.fmt.parseFloat(f64, value) else if (std.mem.eql(u8, key, "--worker")) worker = switch (try std.fmt.parseInt(u8, value, 10)) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidArgument,
+        } else return error.InvalidArgument;
     }
     if (reps < 3 or reps > 1000 or warmups > 100 or !std.math.isFinite(tolerance) or tolerance <= 0) return error.InvalidArgument;
     const bytes = try inference.util.c_file.readFile(a, capture orelse return error.MissingArgument);
@@ -50,9 +55,10 @@ pub fn main(init: std.process.Init) !void {
     defer cases.deinit();
     const directory = path orelse return error.MissingArgument;
     const start_load = inference.platform.time.monotonicNs();
-    const session = if (std.mem.eql(u8, backend, "metal")) try factory.createMetalSession(a, directory) else if (std.mem.eql(u8, backend, "native")) try factory.createNativeSession(a, directory) else return error.InvalidBackend;
+    const session = if (std.mem.eql(u8, backend, "metal")) try factory.createMetalSession(a, directory) else if (std.mem.eql(u8, backend, "native")) try factory.createNativeSession(a, directory) else if (std.mem.eql(u8, backend, "cuda")) try factory.createCudaSession(a, directory) else return error.InvalidBackend;
     defer session.close();
     if (std.mem.eql(u8, backend, "metal") and session.backend() != .metal) return error.InvalidBackend;
+    if (std.mem.eql(u8, backend, "cuda") and session.backend() != .cuda) return error.InvalidBackend;
     const config = try factory.getGlinerSpanConfig(session);
     if (config != .modern_bert) return error.InvalidModel;
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
@@ -62,51 +68,77 @@ pub fn main(init: std.process.Init) !void {
     const tok = try inference.hf_tokenizer.HfTokenizer.loadFromBytes(a, tok_bytes);
     defer tok.tokenizer().deinitTokenizer();
     const load_ms = @as(f64, @floatFromInt(inference.platform.time.monotonicNs() - start_load)) / std.time.ns_per_ms;
-    const watchdog = if (std.mem.eql(u8, backend, "metal")) try inference.HardCancellationWatchdog.create(a) else null;
+    const watchdog = if (std.mem.eql(u8, backend, "metal") or std.mem.eql(u8, backend, "cuda")) try inference.HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(init.io);
+    if (worker) {
+        const ready = try std.json.Stringify.valueAlloc(a, .{
+            .event = "ready",
+            .backend = backend,
+            .build_mode = @tagName(@import("builtin").mode),
+            .model_dir = directory,
+            .capture = capture.?,
+            .cases = cases.value.len,
+            .load_ms = load_ms,
+            .tolerance = tolerance,
+            .qualification = false,
+            .timing_boundary = "prepared_cpu_input_upload+encoder+classifier+completed_cpu_readback",
+            .cuda_stats = factory.getCudaRuntimeStats(session),
+        }, .{});
+        defer a.free(ready);
+        try std.Io.File.stdout().writeStreamingAll(init.io, ready);
+        try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        var buffer: [4096]u8 = undefined;
+        var stdin = std.Io.File.stdin().readerStreaming(init.io, &buffer);
+        const Command = struct { request_id: u32, op: enum { validate, run, stop }, case_index: usize = 0 };
+        var commands: usize = 0;
+        while (try stdin.interface.takeDelimiter('\n')) |line| {
+            if (line.len > 2048 or commands >= 65536) return error.BenchmarkCommandLimitExceeded;
+            commands += 1;
+            const command = try std.json.parseFromSlice(Command, a, line, .{});
+            defer command.deinit();
+            if (command.value.op == .stop) return;
+            if (command.value.case_index >= cases.value.len) return error.InvalidCase;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const invocation = try invoke(arena.allocator(), session, tok, config, watchdog, cases.value[command.value.case_index], tolerance);
+            const response = try std.json.Stringify.valueAlloc(arena.allocator(), .{
+                .request_id = command.value.request_id,
+                .id = cases.value[command.value.case_index].id,
+                .tokens = cases.value[command.value.case_index].input_ids.len,
+                .elapsed_ms = invocation.elapsed_ms,
+                .core_ms = invocation.core_ms,
+                .max_logit_error = invocation.max_logit_error,
+                .logits = invocation.logits,
+                .cuda_stats = factory.getCudaRuntimeStats(session),
+            }, .{});
+            try std.Io.File.stdout().writeStreamingAll(init.io, response);
+            try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        }
+        return error.BenchmarkProtocolEndedWithoutStop;
+    }
     var report_arena = std.heap.ArenaAllocator.init(a);
     defer report_arena.deinit();
     const out = report_arena.allocator();
     const reports = try out.alloc(Report, cases.value.len);
     for (cases.value, reports) |case, *report| {
         const samples = try out.alloc(f64, reps);
+        const core_samples = try out.alloc(f64, reps);
         var max_error: f64 = 0;
         var last_rows: [][]f64 = &.{};
         for (0..1 + warmups + reps) |iteration| {
             var request_arena = std.heap.ArenaAllocator.init(a);
             defer request_arena.deinit();
             const ra = request_arena.allocator();
-            const control = inference.InferenceExecutionControl{
-                .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
-                .deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s,
-            };
-            const start = inference.platform.time.monotonicNs();
-            var compiled = try schema.compile(ra, case.schema_json, .{});
-            defer compiled.deinit();
-            var prepared = try processor.prepare(ra, tok.tokenizer(), &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 7999, .max_batch_tokens = 7999 });
-            defer prepared.deinit();
-            if (prepared.samples.len != 1) return error.InvalidCase;
-            const counts = try ra.alloc(usize, compiled.schema.classifications.len);
-            for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
-            var managed = try factory.getManagedComputeBackend(session, ra, null, control);
-            defer managed.deinit();
-            const rows = try executor.classificationLogits(&managed.backend, ra, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
-            const elapsed = @as(f64, @floatFromInt(inference.platform.time.monotonicNs() - start)) / std.time.ns_per_ms;
-            if (!std.mem.eql(i64, prepared.input_ids, case.input_ids) or rows.len != case.logits.len) return error.PreprocessingMismatch;
-            for (rows, case.logits) |got, expected| {
-                if (got.len != expected.len) return error.LogitShapeMismatch;
-                for (got, expected) |actual, want| {
-                    if (!std.math.isFinite(actual)) return error.NonFiniteLogit;
-                    const delta = @abs(actual - want);
-                    max_error = @max(max_error, delta);
-                    if (delta > tolerance) {
-                        std.debug.print("{s}: logit error {d} exceeds {d}\n", .{ case.id, delta, tolerance });
-                        return error.LogitMismatch;
-                    }
-                }
+            const invocation = try invoke(ra, session, tok, config, watchdog, case, tolerance);
+            const elapsed = invocation.elapsed_ms;
+            const core_elapsed = invocation.core_ms;
+            const rows = invocation.logits;
+            max_error = @max(max_error, invocation.max_logit_error);
+            if (iteration > warmups) {
+                samples[iteration - warmups - 1] = elapsed;
+                core_samples[iteration - warmups - 1] = core_elapsed;
             }
-            if (iteration > warmups) samples[iteration - warmups - 1] = elapsed;
             if (iteration == warmups + reps) {
                 last_rows = try out.alloc([]f64, rows.len);
                 for (rows, last_rows) |row, *saved| saved.* = try out.dupe(f64, row);
@@ -118,11 +150,56 @@ pub fn main(init: std.process.Init) !void {
                 return x < y;
             }
         }.less);
-        report.* = .{ .id = case.id, .tokens = case.input_ids.len, .median_ms = if (reps % 2 == 0) (sorted[reps / 2 - 1] + sorted[reps / 2]) / 2 else sorted[reps / 2], .p95_ms = sorted[@min(reps - 1, (reps * 95 + 99) / 100 - 1)], .max_logit_error = max_error, .logits = last_rows, .samples_ms = samples };
+        const core_sorted = try out.dupe(f64, core_samples);
+        std.mem.sort(f64, core_sorted, {}, struct {
+            fn less(_: void, x: f64, y: f64) bool {
+                return x < y;
+            }
+        }.less);
+        report.* = .{ .id = case.id, .tokens = case.input_ids.len, .median_ms = if (reps % 2 == 0) (sorted[reps / 2 - 1] + sorted[reps / 2]) / 2 else sorted[reps / 2], .p95_ms = sorted[@min(reps - 1, (reps * 95 + 99) / 100 - 1)], .core_median_ms = if (reps % 2 == 0) (core_sorted[reps / 2 - 1] + core_sorted[reps / 2]) / 2 else core_sorted[reps / 2], .max_logit_error = max_error, .logits = last_rows, .samples_ms = samples, .core_samples_ms = core_samples };
         std.debug.print("{s} {s}: {d:.3} ms, error {d:.6}\n", .{ backend, case.id, report.median_ms, max_error });
     }
-    const result = try std.json.Stringify.valueAlloc(a, .{ .scope = "offline loaded pipeline: schema compile, tokenization, encoder, classifier and completed readback; excludes HTTP, model load, and output presentation", .backend = backend, .model_dir = directory, .load_ms = load_ms, .warmups = warmups, .reps = reps, .validation_preflights = 1, .tolerance = tolerance, .reports = reports }, .{});
+    const result = try std.json.Stringify.valueAlloc(a, .{ .scope = "offline loaded pipeline: schema compile, tokenization, encoder, classifier and completed readback; excludes HTTP, model load, and output presentation", .core_scope = "prepared encoder, classifier and completed CPU readback; excludes schema compilation and tokenization", .build_mode = @tagName(@import("builtin").mode), .backend = backend, .model_dir = directory, .load_ms = load_ms, .warmups = warmups, .reps = reps, .validation_preflights = 1, .tolerance = tolerance, .reports = reports, .cuda_stats = factory.getCudaRuntimeStats(session) }, .{});
     defer a.free(result);
     try std.Io.File.stdout().writeStreamingAll(init.io, result);
     try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+}
+
+const Invocation = struct { elapsed_ms: f64, core_ms: f64, max_logit_error: f64, logits: [][]f64 };
+
+fn invoke(ra: std.mem.Allocator, session: anytype, tok: anytype, config: anytype, watchdog: anytype, case: Case, tolerance: f64) !Invocation {
+    var max_error: f64 = 0;
+    const control = inference.InferenceExecutionControl{
+        .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
+        .deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s,
+    };
+    const start = inference.platform.time.monotonicNs();
+    var compiled = try schema.compile(ra, case.schema_json, .{});
+    defer compiled.deinit();
+    var prepared = try processor.prepare(ra, tok.tokenizer(), &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 7999, .max_batch_tokens = 7999 });
+    defer prepared.deinit();
+    if (prepared.samples.len != 1) return error.InvalidCase;
+    const counts = try ra.alloc(usize, compiled.schema.classifications.len);
+    for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+    const core_start = inference.platform.time.monotonicNs();
+    var managed = try factory.getManagedComputeBackend(session, ra, null, control);
+    defer managed.deinit();
+    const rows = try executor.classificationLogits(&managed.backend, ra, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
+    const end = inference.platform.time.monotonicNs();
+    const elapsed = @as(f64, @floatFromInt(end - start)) / std.time.ns_per_ms;
+    const core_elapsed = @as(f64, @floatFromInt(end - core_start)) / std.time.ns_per_ms;
+    if (!std.mem.eql(i64, prepared.input_ids, case.input_ids) or rows.len != case.logits.len) return error.PreprocessingMismatch;
+    for (rows, case.logits) |got, expected| {
+        if (got.len != expected.len) return error.LogitShapeMismatch;
+        for (got, expected) |actual, want| {
+            if (!std.math.isFinite(actual) or !std.math.isFinite(want)) return error.NonFiniteLogit;
+            const delta = @abs(actual - want);
+            max_error = @max(max_error, delta);
+            if (delta > tolerance) {
+                std.debug.print("{s}: logit error {d} exceeds {d}\n", .{ case.id, delta, tolerance });
+                return error.LogitMismatch;
+            }
+        }
+    }
+    return .{ .elapsed_ms = elapsed, .core_ms = core_elapsed, .max_logit_error = max_error, .logits = rows };
 }

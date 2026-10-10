@@ -4723,6 +4723,7 @@ pub fn runFromIterator(
                 .backend = inference_bridge.OptionalString.init(model.backend),
                 .format = inference_bridge.OptionalString.init(model.format),
                 .quantization = inference_bridge.OptionalString.init(model.quantization),
+                .cuda_precision = inference_bridge.OptionalString.init(if (model.cuda_precision) |value| @tagName(value) else null),
                 .residency_mode = switch (model.residency_mode orelse .auto) {
                     .auto => .auto,
                     .resident => .resident,

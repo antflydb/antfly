@@ -779,6 +779,8 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_decide_long_document import InferenceDecideLongDocument
+from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
@@ -852,6 +854,7 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
+from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -2232,6 +2235,8 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDecideLongDocument",
+    "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
@@ -2305,6 +2310,7 @@ __all__ = (
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
+    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",

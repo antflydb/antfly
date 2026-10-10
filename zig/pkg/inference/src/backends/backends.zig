@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
@@ -254,6 +255,9 @@ pub const SessionManager = struct {
     /// Load-time A4B policy. It is copied into the created session and is
     /// never consulted as mutable process-global state during inference.
     a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
+    gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
+    /// Per-manager qualification override, absent from production builds.
+    test_allow_unqualified_gliner_cuda_precision: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     /// Provider preference for the external ONNX Runtime backend. Automatic is
     /// resolved before admission; candidate SessionManagers then carry only
     /// the resolved CPU/CUDA value through construction.
@@ -371,7 +375,9 @@ pub const SessionManager = struct {
         // reaching the log but never the API response.
         var first_err: ?anyerror = null;
 
+        if (self.gliner_cuda_precision != null and self.a4b_inference_request != null) return error.IncompatibleCudaLoadPolicies;
         for (effective_backends) |backend| {
+            if (self.gliner_cuda_precision != null and backend != .cuda) continue;
             if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
                 std.log.err(
                     "qualified CUDA A4B model {s} rejected CPU fallback after GPU admission failure",
@@ -465,13 +471,19 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
-                        self.allocator,
-                        model_path,
-                        self.kernel_jit,
-                        self.kernel_jit_load_context,
-                        self.a4b_inference_request,
-                    ) catch |err| {
+                    (if (self.gliner_cuda_precision) |precision|
+                        (if (if (builtin.is_test) self.test_allow_unqualified_gliner_cuda_precision else false)
+                            session_factory.createCudaSessionWithGlinerPrecisionForTest(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision)
+                        else
+                            session_factory.createCudaSessionWithGlinerPrecision(self.allocator, model_path, self.kernel_jit, self.kernel_jit_load_context, precision))
+                    else
+                        session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
+                            self.allocator,
+                            model_path,
+                            self.kernel_jit,
+                            self.kernel_jit_load_context,
+                            self.a4b_inference_request,
+                        )) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
                         first_err = first_err orelse err;
