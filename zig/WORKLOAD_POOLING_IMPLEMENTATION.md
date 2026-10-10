@@ -2025,3 +2025,26 @@ allocation/zeroing and collision probing, source-location lookup across readers,
 other legacy iterator callers, selective planning, native reader construction,
 copy/publication and metadata work still need bounded quanta and fair CPU/cleanup
 ownership. Linux qualification remains unavailable after Docker recovery failed.
+
+
+### Cumulative HA boundary compatibility
+
+The cumulative native integration snapshot exposed two HA maintenance compile
+errors that the control-only checks did not instantiate: cache transition
+admission passed a `SourceStateMutex` wrapper to the atomic mutex helper, and
+the compiled owner fixture called a nonexistent `close` method. Admission now
+uses the wrapper's actual owned or shared atomic mutex, and the owner fixture
+uses the owning `deinit` method. The wrapper regression checks original
+cancellation, deadline and scheduler-close errors before acquisition, after
+acquisition and under contention, preserving another holder's lock and using
+the shared mutex even when the unused owned mutex is held. The focused HA
+admission suite passes 15 selected checks (12 default-runner and 3 local-runner).
+
+These fixes require independent archive/API/DB verification. The live cumulative
+snapshot also failed its provisioned-owner text-statistics assertion (expected
+four documents, observed three); the existing physical binary reproduces it.
+The fixture now prints the exact statistics on that failure without relaxing
+the assertion. Its indexing/synchronization cause remains unresolved. The live
+and queued validation snapshots retain their original source and HEAD. Full
+runtime resource, performance, cleanup/fairness and automatic-default gates
+remain open; Linux validation remains unavailable after Docker recovery failed.

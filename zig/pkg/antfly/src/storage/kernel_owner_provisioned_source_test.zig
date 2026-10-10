@@ -1335,6 +1335,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     switch (text_stats) {
         .fields => |fields| {
             try std.testing.expectEqual(@as(usize, 1), fields.fields.len);
+            if (fields.fields[0].global_doc_count != 4) {
+                std.debug.print("compiled owner text statistics after bulk finish and full-index synchronization: {s}\n", .{text_stats_response.json});
+            }
             try std.testing.expectEqual(@as(u32, 4), fields.fields[0].global_doc_count);
             try std.testing.expectEqual(@as(u32, 1), fields.fields[0].term_doc_freqs[0].doc_freq);
         },

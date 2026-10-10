@@ -1234,7 +1234,7 @@ test "HA seed maintenance lifetime crosses the compiled owner boundary and remai
     try context.ensure();
     defer context.deinit();
     var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 7001, .identity_range_id = 7001, .schema_json = .fromSlice("{}") });
-    defer owner.close();
+    defer owner.deinit();
     const Check = struct {
         calls: usize = 0,
         cause: ?anyerror,

@@ -7249,7 +7249,7 @@ pub const ProvisionedTableWriteSource = struct {
             errdefer if (first) |cache| cache.unlockOpenMutex();
             if (second) |cache| try original.lockIo(cache.openMutexIo(), &cache.open_mutex, lifetime);
             errdefer if (second) |cache| cache.unlockOpenMutex();
-            try original.lockAtomic(owner.tableActivityIo(), &owner.local_db_mutex, lifetime);
+            try owner.local_db_mutex.lockWithLifetime(owner.tableActivityIo(), lifetime);
             errdefer owner.local_db_mutex.unlock();
             if (first) |cache| try original.lockAtomic(cache.openMutexIo(), &cache.entry_lifecycle_mutex, lifetime);
             errdefer if (first) |cache| cache.entry_lifecycle_mutex.unlock();
@@ -32204,6 +32204,10 @@ const SourceStateMutex = struct {
         return self.shared orelse &self.owned;
     }
 
+    fn lockWithLifetime(self: *SourceStateMutex, io: std.Io, lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        try @import("antfly_local_sources").common_seed_snapshot_lifetime.lockAtomic(io, self.atomicMutex(), lifetime);
+    }
+
     fn tryLock(self: *SourceStateMutex) bool {
         return self.atomicMutex().tryLock();
     }
@@ -36610,6 +36614,52 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
             }
             try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+        }
+
+        test "HA seed maintenance lifetime locks the actual owned or shared source state" {
+            const runtime = @import("antfly_runtime_abi");
+            const Check = struct {
+                calls: usize = 0,
+                fail_after: usize,
+                cause: anyerror,
+                fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    if (self.calls >= self.fail_after) return runtime.error_abi.statusFromError(self.cause);
+                    return .ok;
+                }
+            };
+            inline for (.{ false, true }) |shared| {
+                var backing: std.atomic.Mutex = .unlocked;
+                var state: SourceStateMutex = .{};
+                if (shared) state.bind(&backing);
+                // A bound wrapper must use the process's shared mutex even
+                // when its unused owned mutex is unavailable.
+                if (shared) try std.testing.expect(state.owned.tryLock());
+                defer if (shared) state.owned.unlock();
+                for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+                    for (1..3) |fail_after| {
+                        var check: Check = .{ .fail_after = fail_after, .cause = cause };
+                        const original: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+                        try std.testing.expectError(cause, state.lockWithLifetime(std.testing.io, &original));
+                        try std.testing.expect(state.tryLock());
+                        state.unlock();
+                    }
+                    try std.testing.expect(state.tryLock());
+                    var check: Check = .{ .fail_after = 3, .cause = cause };
+                    const original: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+                    try std.testing.expectError(cause, state.lockWithLifetime(std.testing.io, &original));
+                    try std.testing.expect(!state.tryLock());
+                    state.unlock();
+                }
+                var check: Check = .{ .fail_after = std.math.maxInt(usize), .cause = error.Canceled };
+                const original: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+                try state.lockWithLifetime(std.testing.io, &original);
+                try std.testing.expect(!state.tryLock());
+                state.unlock();
+                try std.testing.expect(state.tryLock());
+                state.unlock();
+            }
         }
 
         test "HA seed maintenance lifetime keeps the original token through actual source and typed foreign callbacks" {
