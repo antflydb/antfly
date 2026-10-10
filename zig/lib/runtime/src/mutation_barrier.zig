@@ -105,6 +105,15 @@ pub const MutationBarrier = struct {
     pub fn acquireExclusiveControlled(self: *@This(), io: std.Io, controls: anytype) !ExclusiveLease {
         try controls.checkpoint();
         if (shared_barrier == self) return error.InvalidArgument;
+        return self.acquireExclusiveRootControlled(io, controls);
+    }
+
+    /// A fresh operation owns no mutation lease of its own. Another Io
+    /// operation on the same OS thread may own a legacy shared lease; its
+    /// thread-local marker is not this capture's nesting authority. Callers
+    /// must preserve the root identity and all controls through acquisition.
+    pub fn acquireExclusiveRootControlled(self: *@This(), io: std.Io, controls: anytype) !ExclusiveLease {
+        try controls.checkpoint();
         _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
         defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
         while (!self.reader_gate.tryLock()) try waitControlled(io, controls);
