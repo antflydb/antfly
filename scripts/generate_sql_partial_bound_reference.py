@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verify partial-index constant bounds against disposable PostgreSQL."""
 
@@ -10,7 +22,10 @@ from pathlib import Path
 
 from generate_sql_postgres_reference import postgres
 
-FIXTURE = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_partial_bound_reference.json"
+FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_partial_bound_reference.json"
+)
 
 
 def cases():
@@ -79,7 +94,9 @@ def main():
         for case in cases():
             entry = dict(case)
             try:
-                entry["expected"] = db.execute(f"SELECT ({case['sql']})::text").fetchone()[0]
+                entry["expected"] = db.execute(
+                    f"SELECT ({case['sql']})::text"
+                ).fetchone()[0]
             except psycopg.Error as error:
                 entry["error"] = error.sqlstate
             output["entries"].append(entry)
@@ -88,7 +105,9 @@ def main():
     else:
         if output != json.loads(FIXTURE.read_text()):
             raise ValueError("PostgreSQL partial-index constant-bound oracle drift")
-        print(f"Verified {len(output['entries'])} PostgreSQL partial-index constant bounds")
+        print(
+            f"Verified {len(output['entries'])} PostgreSQL partial-index constant bounds"
+        )
 
 
 if __name__ == "__main__":

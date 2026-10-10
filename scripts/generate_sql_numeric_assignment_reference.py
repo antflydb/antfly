@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verify NUMERIC assignment/default/generated ordering against PostgreSQL."""
 
@@ -10,16 +22,30 @@ from pathlib import Path
 
 from generate_sql_postgres_reference import postgres
 
-FIXTURE = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_assignment_reference.json"
+FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_assignment_reference.json"
+)
 
 
 def cases():
     return [
         {"use_default": True},
-        *({"input": value} for value in (
-            None, "1.244", "12.345", "-12.345", "0.001", "99.995",
-            "99.994", "NaN", "Infinity", "-Infinity",
-        )),
+        *(
+            {"input": value}
+            for value in (
+                None,
+                "1.244",
+                "12.345",
+                "-12.345",
+                "0.001",
+                "99.995",
+                "99.994",
+                "NaN",
+                "Infinity",
+                "-Infinity",
+            )
+        ),
     ]
 
 
@@ -44,9 +70,16 @@ def main():
         for case in cases():
             entry = dict(case)
             try:
-                statement = "INSERT INTO numeric_assignment DEFAULT VALUES" if case.get("use_default") else "INSERT INTO numeric_assignment(base) VALUES (%s::numeric)"
+                statement = (
+                    "INSERT INTO numeric_assignment DEFAULT VALUES"
+                    if case.get("use_default")
+                    else "INSERT INTO numeric_assignment(base) VALUES (%s::numeric)"
+                )
                 params = None if case.get("use_default") else (case["input"],)
-                cursor = db.execute(statement + " RETURNING base::text, narrow::text, total::text", params)
+                cursor = db.execute(
+                    statement + " RETURNING base::text, narrow::text, total::text",
+                    params,
+                )
                 entry["expected"] = list(cursor.fetchone())
             except psycopg.Error as error:
                 entry["error"] = error.sqlstate
