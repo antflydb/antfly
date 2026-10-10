@@ -390,6 +390,30 @@ remains unadvertised. Remaining work includes capability/adoption and migration
 coordination, full restore/replay fault qualification, generated-name admission
 and unchanged original SQL lifecycle/DML qualification.
 
+Coordinator preparation now contains a bounded activation/adoption/upgrade
+state machine. An occupancy upgrade creates a new generation and retires the
+old seal with its original coverage; it never relabels a relation-only root.
+The worker validates prepared migrations against the observed cut, waits on
+receipt fences between intents, and resolves ambiguous appends from durable
+work. Native publication preparation requests the coverage-specific floor;
+standby publication, guarded mutations and activation downgrade checks use
+that same floor. Adoption and publication proofs both bind exact incarnation,
+member count and membership fingerprint to proposal admission before append.
+A newer admitted decoder may satisfy an older fixed-format proof without
+changing its wire version.
+
+The native store gate passes 41 tests, including lower-capability adoption
+rejection with unchanged source clock, job and standalone revision. Debug and
+ReleaseFast control gates pass 18 worker and 5 command tests; these include migration
+receipt/leader/uncertainty faults, version/truncation checks and exact-membership
+admission. Service coordinator validation is running. The latest service-level
+proof-binding changes require a fresh
+coordinator run after the already-running older input completes. The coordinator
+selects automatic occupancy adoption only once this binary advertises protocol
+34; the advertised version deliberately remains 33 pending complete native
+restore/replay and distributed capability qualification. This is not yet
+production activation or original-case disposition credit.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining

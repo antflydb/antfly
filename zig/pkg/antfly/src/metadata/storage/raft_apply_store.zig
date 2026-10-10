@@ -190,6 +190,47 @@ fn publishLiveRelationRootWithCoverageForTest(store: *RaftApplyStore, a: std.mem
     return ready;
 }
 
+test "system catalog relation namespace transaction occupancy adoption rejects lower durable capability without effects" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/occupancy-adoption", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const identity = "11111111111111111111111111111111".*;
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+    var proof: topology_protocol.Activation = .{ .version = topology_protocol.relation_mutation_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) };
+    const activated = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(activated);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activated });
+    proof.version = topology_protocol.constraint_occupancy_version;
+    const adopt = try (relation_control.Command{ .adopt = proof }).encodeAlloc(a);
+    defer a.free(adopt);
+    const revision = try store.standaloneRevision();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = adopt }));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), try relation_reconciliation.readSourceRevision(&read, group));
+    }
+    proof.version = topology_protocol.relation_reconciliation_version;
+    const legacy = try (relation_control.Command{ .adopt = proof }).encodeAlloc(a);
+    defer a.free(legacy);
+    try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = legacy });
+    const observed = try store.relationReconciliationWork(group);
+    try std.testing.expectEqual(@as(u64, 1), observed.epoch.?.revision);
+    const next = try relation_reconciliation.State.initWithCoverage(group, try relation_reconciliation.nextJobId(null), observed.epoch.?, .constraint_names);
+    const start = try (relation_control.Command{ .start = .{ .next = next } }).encodeAlloc(a);
+    defer a.free(start);
+    const prior_revision = try store.standaloneRevision();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = start }));
+    try std.testing.expectEqual(prior_revision, try store.standaloneRevision());
+    try std.testing.expect(std.meta.eql(observed, try store.relationReconciliationWork(group)));
+}
+
 test "system catalog relation namespace transaction occupancy follows native writes checkpoint and restart" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -10869,14 +10910,14 @@ pub const RaftApplyStore = struct {
             return error.MetadataHAChunkSequenceGap;
     }
 
-    fn standbyRelationActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64) !topology_protocol.Activation {
+    fn standbyRelationActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, required: u16) !topology_protocol.Activation {
         var buf: [160]u8 = undefined;
         const raw = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
         if (raw.len > 1024) return error.InvalidCatalogRecord;
         var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
         defer parsed.deinit();
         const activation = parsed.value;
-        if (activation.version < topology_protocol.relation_publication_version) return error.TableTopologyProtocolUpgradeRequired;
+        if (activation.version < @max(required, topology_protocol.relation_publication_version)) return error.TableTopologyProtocolUpgradeRequired;
         if (activation.version > topology_protocol.current_version or activation.member_count == 0 or
             std.mem.allEqual(u8, &activation.membership_fingerprint, 0)) return error.InvalidCatalogRecord;
         const identity_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
@@ -10953,7 +10994,7 @@ pub const RaftApplyStore = struct {
             if (before_live == null or !root.eql(before_live.?.generation) or std.mem.order(u8, &root.job_id, &live.generation.job_id) != .lt)
                 return error.InvalidCatalogRecord;
         } else if (before_live != null) return error.InvalidCatalogRecord;
-        const activation = try self.standbyRelationActivationTxn(&read, state.group_id);
+        const activation = try self.standbyRelationActivationTxn(&read, state.group_id, relation_control.publicationVersion(state.coverage));
         const proof = try self.requireRelationPublicationProof(state, platform_time.monotonicNs());
         if (!std.meta.eql(proof.root, observed.root) or proof.applied_index != observed.applied_index) return error.CatalogPublicationProofPending;
         return .{ .proof = proof, .activation = activation };
@@ -11025,7 +11066,7 @@ pub const RaftApplyStore = struct {
         if (!current_timeline or frame.index != pending.next or record.lsn <= pending.last_lsn) return error.MetadataHAChunkSequenceGap;
         if (publication) |verified| {
             if (!try verified.proof.matchesTxn(&txn)) return error.CatalogPublicationProofPending;
-            if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+            if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id, relation_control.publicationVersion(verified.proof.state.coverage))))
                 return error.TableTopologyProtocolUpgradeRequired;
         }
         try txn.put(&metadataChunkKey(frame.index), record.payload);
@@ -11099,7 +11140,7 @@ pub const RaftApplyStore = struct {
                         !live.epoch.eql(try relationSourceEpochTxn(&txn, descriptor.group_id)) or
                         try durableAppliedIndexTxn(&txn, descriptor.group_id) != verified.proof.applied_index or
                         !try relationWriterEnabledTxn(&txn, descriptor.group_id)) return error.InvalidCatalogRecord;
-                    if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+                    if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id, relation_control.publicationVersion(verified.proof.state.coverage))))
                         return error.TableTopologyProtocolUpgradeRequired;
                 }
             }
@@ -20012,7 +20053,14 @@ pub const RaftApplyStore = struct {
                     if (std.meta.eql(current.value.incarnation, activation.incarnation) and current.value.version > activation.version) return;
                 }
                 if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0 and activation.version < topology_protocol.relation_reconciliation_version) return;
-                if (try stagingGet(txn, try relation_reconciliation.liveKey(&key_buf, group_id)) != null and activation.version < topology_protocol.relation_publication_version) return;
+                if (try stagingGet(txn, try relation_reconciliation.liveKey(&key_buf, group_id))) |live_bytes| {
+                    const live = try relation_reconciliation.LiveRoot.decode(live_bytes);
+                    if (activation.version < relation_control.publicationVersion(live.coverage)) return;
+                }
+                if (try stagingGet(txn, try relation_reconciliation.jobKey(&key_buf, group_id))) |job_bytes| {
+                    const state = try relation_reconciliation.State.decode(job_bytes);
+                    if (state.coverage == .constraint_names and activation.version < topology_protocol.constraint_occupancy_version) return;
+                }
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
@@ -22413,11 +22461,12 @@ pub const RaftApplyStore = struct {
     ) !void {
         try guard.validate();
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
-        const activation = try self.standbyRelationActivationTxn(txn, group_id);
+        const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.relation_mutation_version);
         if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
         const epoch = try relationSourceEpochTxn(txn, group_id);
         if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
         var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
+        if (activation.version < relation_control.publicationVersion(live.root.coverage)) return error.TableTopologyProtocolUpgradeRequired;
         if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
         const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
         const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
