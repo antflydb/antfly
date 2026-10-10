@@ -8,4 +8,5 @@ test {
     _ = @import("common/maintenance_scheduler.zig");
     _ = @import("storage/db/graph_cleanup_owner.zig");
     _ = @import("storage/db/quarantine_recovery.zig");
+    _ = @import("storage/db/native_query_warming.zig");
 }

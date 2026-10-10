@@ -1060,3 +1060,20 @@ retained bytes including capsule metadata, and retires both before restoring
 the coordinator. The actual hosted-table-read fixture remains subject to the
 cumulative independently compiled consumer gate. This fixture correction does
 not qualify default pooling or the wider overload/performance matrix.
+
+
+### Native checkpoint warming shutdown
+
+The native warming owner introduced by main now publishes one shared physical
+join event. The first stop caller permanently fences admission, detaches the
+registration and cancels/joins it outside the lifecycle lock. Every later stop
+caller waits for the same event; detachment never authorizes freeing the DB
+while a warming turn still borrows it. Empty owners publish the join immediately.
+
+A physical recurring fixture holds the warming turn open through two stop
+callers, verifies neither returns early, takes the lifecycle lock from the
+retiring callback, observes the original cancellation token, and verifies the
+registration's active accounting retires after both callers join. Existing
+warming cadence/retry checks run in the same focused maintenance gate. Actual
+DB shutdown and archive integration remain cumulative gates; warming still
+requires CPU-stage adoption and finite provider work before default qualification.
