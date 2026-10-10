@@ -796,7 +796,7 @@ pub const Config = struct {
                         else => return error.InvalidConfig,
                     };
                     defer policy.deinit();
-                    policy.value.validate() catch return error.InvalidConfig;
+                    policy.value.validateManagedCleanupCapacity() catch return error.InvalidConfig;
                     runnable_policy = policy.value;
                 }
             }
@@ -4086,12 +4086,19 @@ test "config runnable scheduler validates canonical opt-in policy" {
     var disabled = try Config.parseFromSlice(alloc, "{\"admission\":{\"runnable\":null}}");
     defer disabled.deinit();
     try std.testing.expect(disabled.admission.runnable == null);
+    var defaults = try Config.parseFromSlice(alloc,
+        \\{"admission":{"runnable":{}}}
+    );
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 8), defaults.admission.runnable.?.slots);
+    try std.testing.expectEqual(@as(usize, 0), defaults.admission.runnable.?.cleanup_slots);
     var enabled = try Config.parseFromSlice(alloc,
-        \\{"admission":{"runnable":{"slots":3,"control_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}
+        \\{"admission":{"runnable":{"slots":3,"control_slots":1,"cleanup_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}
     );
     defer enabled.deinit();
     const policy = enabled.admission.runnable.?;
     try std.testing.expectEqual(@as(usize, 3), policy.slots);
+    try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
     try std.testing.expectEqual(@as(u32, 8), policy.checkpoint_budget);
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .admission = .{ .runnable = policy } }, .{});
     defer alloc.free(body);
@@ -4099,6 +4106,20 @@ test "config runnable scheduler validates canonical opt-in policy" {
     defer reopened.deinit();
     try std.testing.expectEqualDeep(policy, reopened.admission.runnable.?);
     for ([_][]const u8{
+        \\{"admission":{"runnable":{"slots":2}}}
+        ,
+        \\{"admission":{"runnable":{"slots":3,"control_slots":2}}}
+        ,
+        \\{"admission":{"runnable":{"cleanup_slots":2}}}
+        ,
+        \\{"admission":{"runnable":{"cleanup_slots":-1}}}
+        ,
+        \\{"admission":{"runnable":{"slots":3,"control_slots":2,"cleanup_slots":1}}}
+        ,
+        \\{"admission":{"runnable":{"max_operations":2}}}
+        ,
+        \\{"admission":{"runnable":{"max_operations":3}}}
+        ,
         \\{"admission":{"runnable":{"slots":1}}}
         ,
         \\{"admission":{"runnable":{"control_slots":8}}}

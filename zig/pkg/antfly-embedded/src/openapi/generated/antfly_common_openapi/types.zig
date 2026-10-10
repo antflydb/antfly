@@ -2324,11 +2324,15 @@ pub const QueryAdmissionWaiting = struct {
 };
 
 pub const RunnableSchedulingConfigValue = struct {
+    /// Total CPU slots including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves.
     slots: ?i64 = null,
-    /// Reserved within slots; must be smaller than slots.
+    /// Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
     control_slots: ?i64 = null,
-    /// Query, write, inference and background slot-service weights. Only read integration is currently enabled.
+    /// Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
+    cleanup_slots: ?i64 = null,
+    /// Query, write, inference and background slot-service weights.
     weights: ?[]const i64 = null,
+    /// Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
     max_operations: ?i64 = null,
     /// Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
     max_bytes: ?u64 = null,
@@ -2343,6 +2347,7 @@ pub const RunnableSchedulingConfigValue = struct {
     pub const openApiFieldMetadata = .{
         .{ "slots", "slots", true },
         .{ "control_slots", "control_slots", true },
+        .{ "cleanup_slots", "cleanup_slots", true },
         .{ "weights", "weights", true },
         .{ "max_operations", "max_operations", true },
         .{ "max_bytes", "max_bytes", true },
@@ -2369,6 +2374,10 @@ pub const RunnableSchedulingConfigValue = struct {
         }
         if (self.control_slots) |value| {
             try jw.objectField("control_slots");
+            try jw.write(value);
+        }
+        if (self.cleanup_slots) |value| {
+            try jw.objectField("cleanup_slots");
             try jw.write(value);
         }
         if (self.weights) |value| {
@@ -2407,7 +2416,7 @@ pub const RunnableSchedulingConfigValue = struct {
     }
 };
 
-/// Opt-in fixed runnable scheduling for SQL reads. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+/// Opt-in fixed runnable scheduling across execution classes. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
 pub const RunnableSchedulingConfig = ?RunnableSchedulingConfigValue;
 
 pub const S3ExternalIoConfig = struct {

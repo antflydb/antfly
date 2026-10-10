@@ -40,6 +40,14 @@ pub const Config = struct {
         return self.slots - self.control_slots - self.cleanup_slots;
     }
 
+    /// Managed startup needs independent ordinary, health and cleanup capacity.
+    /// Keep generic scheduler validation separate for standalone consumers.
+    pub fn validateManagedCleanupCapacity(self: Config) !void {
+        try self.validate();
+        if (self.max_operations < 4 or (self.cleanup_slots == 0 and self.ordinarySlots() < 2))
+            return error.ManagerCleanupCapacityUnavailable;
+    }
+
     pub fn validate(self: Config) !void {
         if (self.slots < 2 or self.slots > 65535 or self.control_slots == 0 or self.control_slots >= self.slots or
             self.cleanup_slots > 1 or self.cleanup_slots >= self.slots - self.control_slots or
@@ -135,8 +143,9 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (self.closed) return error.SchedulerClosed;
+        try self.config.validateManagedCleanupCapacity();
         if (self.config.cleanup_slots != 0) return;
-        if (self.entries != null or self.config.ordinarySlots() <= 1)
+        if (self.entries != null)
             return error.ManagerCleanupCapacityUnavailable;
         self.config.cleanup_slots = 1;
     }
@@ -2732,4 +2741,32 @@ test "runnable scheduler child observes original parent worker IO cancellation w
     child.finish();
     parent.finish();
     try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler managed cleanup capacity rejects insufficient metadata without changing native policy" {
+    for ([_]usize{ 2, 3 }) |operations| {
+        for ([_]usize{ 0, 1 }) |cleanup| {
+            var owner = try Scheduler.init(.{ .slots = 3, .cleanup_slots = cleanup, .max_operations = operations });
+            defer owner.close();
+            const before = owner.policyAndStats();
+            try std.testing.expectError(error.ManagerCleanupCapacityUnavailable, owner.ensureCleanupCpuBeforePublication());
+            try std.testing.expectEqualDeep(before, owner.policyAndStats());
+        }
+    }
+    var standalone = try Scheduler.init(.{ .slots = 2, .max_operations = 2 });
+    defer standalone.close();
+    try std.testing.expectError(error.ManagerCleanupCapacityUnavailable, standalone.ensureCleanupCpuBeforePublication());
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&standalone, .{ .io = std.testing.io, .retained_bytes = 1 }, .query);
+    try std.testing.expectEqual(@as(usize, 1), standalone.stats().runnable_slots);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), standalone.stats().operations);
+    var managed = try Scheduler.init(.{ .slots = 3, .max_operations = 4 });
+    defer managed.close();
+    try managed.ensureCleanupCpuBeforePublication();
+    const policy = managed.policyAndStats().config;
+    try std.testing.expectEqual(@as(usize, 3), policy.slots);
+    try std.testing.expectEqual(@as(usize, 1), policy.ordinarySlots());
+    try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
 }

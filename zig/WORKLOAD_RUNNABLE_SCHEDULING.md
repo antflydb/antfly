@@ -49,6 +49,16 @@ finite. Control slots are reserved within the total slot envelope and are not
 lent to ordinary work. Identifying protected controls remains an authenticated,
 grammar-verified responsibility of the adapter, not a label clients can select.
 
+Managed server startup establishes a dedicated cleanup CPU slot within `slots`,
+independent of `control_slots`. Set `cleanup_slots` to one explicitly, or leave
+it at zero for startup to reserve one before publishing work. The public policy
+requires at least three total slots and four operation entries, and the combined
+CPU reserves must leave at least one ordinary slot. Startup also checks that the
+control metadata budget can hold its actual cleanup owners. It never expands the
+configured total or changes an active policy. Generic native scheduler consumers
+can retain the zero-cleanup shared-control policy. These rules apply to explicit
+opt-in scheduling; automatic deployment defaults still require qualification.
+
 Control also has protected outstanding metadata: `control_bytes` is reserved
 inside `max_bytes`, and up to four entries (at most half `max_operations`) are
 reserved inside the operation bound. Filling ordinary outstanding limits cannot

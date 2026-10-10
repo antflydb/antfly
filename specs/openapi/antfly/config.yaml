@@ -1056,18 +1056,25 @@ components:
       type: object
       nullable: true
       additionalProperties: false
-      description: Opt-in fixed runnable scheduling for SQL reads. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+      description: Opt-in fixed runnable scheduling across execution classes. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
       properties:
         slots:
           type: integer
-          minimum: 2
+          minimum: 3
           maximum: 65535
           default: 8
+          description: Total CPU slots including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves.
         control_slots:
           type: integer
           minimum: 1
           default: 1
-          description: Reserved within slots; must be smaller than slots.
+          description: Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
+        cleanup_slots:
+          type: integer
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
         weights:
           type: array
           minItems: 4
@@ -1077,11 +1084,12 @@ components:
             minimum: 1
             maximum: 65535
           default: [4, 2, 1, 1]
-          description: Query, write, inference and background slot-service weights. Only read integration is currently enabled.
+          description: Query, write, inference and background slot-service weights.
         max_operations:
           type: integer
-          minimum: 2
+          minimum: 4
           default: 128
+          description: Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
         max_bytes:
           type: integer
           format: uint64

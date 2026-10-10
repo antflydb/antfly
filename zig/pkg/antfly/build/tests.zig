@@ -157,6 +157,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-text-statistics-controls-test", "Verify trusted statistics controls retain original authority and deadline")
         .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);
+    const runnable_config_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runnable_config_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_imports.configure(b, runnable_config_mod, true, true);
+    const runnable_config_tests = b.addTest(.{
+        .root_module = runnable_config_mod,
+        .filters = &.{"config runnable scheduler"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-config-test", "Verify public runnable policy parsing and managed cleanup capacity")
+        .dependOn(&b.addRunArtifact(runnable_config_tests).step);
     const text_statistics_storage_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "text stats use postings when segment source is omitted", "statistics ownership survives every allocation failure", "statistics frequency result retires", "statistics background labels retire", "db statistics controlled primary hydration", "statistics primary hydration adapter" },
