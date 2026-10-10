@@ -6943,6 +6943,24 @@ pub const DB = struct {
         }
     }
 
+    /// Synchronous native mutation admission using the caller's original
+    /// lifetime and CPU owner. Controls are not serialized or used to cancel
+    /// an already durable write. Post-commit visibility has its own token.
+    pub fn batchWithAdmissionControls(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken) anyerror!void {
+        try controls.lifetime.check();
+        const opts: BatchExecutionOptions = .{
+            .admission_controls = controls,
+            .visibility_cancellation = visibility_cancellation,
+        };
+        if (benchMetricsEnabled()) {
+            var profile: BatchProfile = .{};
+            try self.batchInternal(req, &profile, opts);
+            logBatchProfile(req, profile);
+        } else {
+            try self.batchInternal(req, null, opts);
+        }
+    }
+
     pub fn batchWithVisibilityCancellation(self: *DB, req: types.BatchRequest, cancellation: types.CancellationToken) anyerror!void {
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
@@ -58830,6 +58848,64 @@ test "db split modeled sim workloads stay green" {
     const alloc = std.testing.allocator;
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-default", 0xA17F_E301, 8);
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-reopen-heavy", 0xA17F_E302, 10);
+}
+
+test "db controlled mutation admission rejects before effects and releases service fences" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-controlled-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const State = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Timeout,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return self.cause;
+        }
+        fn unexpectedWait(_: *anyopaque) !void {
+            return error.UnexpectedUncontendedAdmissionWait;
+        }
+    };
+    var state: State = .{};
+    const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{
+        .lifetime = .{ .context = &state, .check_fn = State.check },
+        .execution_wait = .{ .ptr = &state, .begin = State.unexpectedWait, .end = State.unexpectedWait },
+    };
+    try db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "accepted", .value = "{}" }} }, controls, .none);
+    const checkpoints = state.checks;
+    // Entry, snapshot acquisition and exclusive apply acquisition all retain
+    // the same borrowed authority, including revalidation after acquisition.
+    try std.testing.expect(checkpoints >= 5);
+    const accepted = (try db.get(alloc, "accepted")).?;
+    defer alloc.free(accepted);
+    try std.testing.expectEqualStrings("{}", accepted);
+    for ([_]anyerror{ error.Timeout, error.Canceled, error.SchedulerClosed }) |cause| {
+        for (1..checkpoints + 1) |fail_at| {
+            state = .{ .fail_at = fail_at, .cause = cause };
+            try std.testing.expectError(cause, db.batchWithAdmissionControls(
+                .{ .writes = &.{.{ .key = "rejected", .value = "{}" }} },
+                controls,
+                .none,
+            ));
+            const rejected = try db.get(alloc, "rejected");
+            defer if (rejected) |value| alloc.free(value);
+            try std.testing.expect(rejected == null);
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            capture.release();
+        }
+    }
+    state = .{};
+    try db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "rejected", .value = "{}" }} }, controls, .none);
+    const recovered = (try db.get(alloc, "rejected")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{}", recovered);
 }
 
 test "db batch get match_all search and index registry" {

@@ -1376,3 +1376,26 @@ needs adoption across production writers and other service fences. CPU yielding
 inside lock-holding query work remains unqualified until the complete lock/wait
 dependency graph permits resumption and control progress; these tests do not
 prove the broader runtime resource/performance/default gates.
+
+Native batch admission now has a synchronous original-owner contract through
+`DB.batchWithAdmissionControls`. It checks the caller at entry and carries the
+same lifetime and optional CPU wait boundary into snapshot mutation admission
+and exclusive apply acquisition. Portable-runtime gates still run before and
+after apply acquisition. An existing mutation lease is explicitly retained,
+including capture-owned helper borrows, rather than reentering reader admission
+behind a queued capture. Admission controls stop at those pre-decision fences;
+primary durability, mandatory retirement and post-commit visibility retain their
+existing distinct contracts.
+
+Focused snapshot tests use a real scheduler with one ordinary CPU slot, exercise
+both mutation/capture wait directions, preserve operation/byte ownership and
+exactly-once lease release, and reject expired/canceled/closed nested retains.
+Native focused snapshot/lock and text regressions passed 57 tests within the
+3 GiB compiler bound. A separate `antfly-mutation-service-admission-test`
+exercises the actual DB batch entry, every observed admission checkpoint,
+absence of rejected documents, release of both service fences and successful
+reuse. That production test and full storage integration are queued and have
+not yet qualified this wiring. Serving/ABI write callers still need to transport
+this original-owner contract; other writer/maintenance/catalog waits and the
+full lock dependency graph remain unfinished. These changes do not enable CPU
+yielding inside pinned query work or automatic pooling defaults.

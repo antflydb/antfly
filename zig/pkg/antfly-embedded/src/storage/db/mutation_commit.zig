@@ -780,7 +780,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
+            var snapshot_mutation = if (opts.admission_controls) |controls|
+                try self.core.snapshot_admission.acquireMutationControlledIo(
+                    self.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                    controls,
+                    opts.snapshot_mutation,
+                )
+            else if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
             std.debug.assert(snapshot_mutation.admission == self.core.snapshot_admission);
             if (builtin.is_test) {
@@ -796,7 +802,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.admission_controls) |controls| {
+                try self.enforcePortableRuntimeGate();
+                try self.core.apply_mutex.lockExclusiveControlledIo(
+                    self.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                    controls,
+                );
+                self.enforcePortableRuntimeGate() catch |err| {
+                    self.core.unlockApply();
+                    return err;
+                };
+            } else {
+                try self.lockApplyForPortableRuntime();
+            }
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (self.local_execution.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;

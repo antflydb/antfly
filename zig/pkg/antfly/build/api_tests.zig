@@ -2365,6 +2365,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-transaction-capture-budget-test", "Require original transaction routing controls and capture cleanup")
         .dependOn(&transaction_capture_run.step);
 
+    const mutation_service_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/mutation_service_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, mutation_service_admission_root, true, true);
+    mutation_service_admission_root.addImport("antfly_source_root", mutation_service_admission_root);
+    const mutation_service_admission_tests = b.addTest(.{
+        .name = "mutation-service-admission-tests",
+        .root_module = mutation_service_admission_root,
+        .filters = &.{"db controlled mutation admission"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-mutation-service-admission-test", "Verify original mutation admission rejects before effects and releases real DB fences")
+        .dependOn(&b.addRunArtifact(mutation_service_admission_tests).step);
+
     const controlled_service_lock_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/controlled_service_lock_test_root.zig"),
         .target = target,
@@ -2375,7 +2391,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const controlled_service_lock_tests = b.addTest(.{
         .name = "controlled-service-lock-tests",
         .root_module = controlled_service_lock_root,
-        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock" },
+        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock", "snapshot admission" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
