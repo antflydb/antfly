@@ -1247,7 +1247,7 @@ test "HA seed maintenance lifetime crosses the compiled owner boundary and remai
             return .ok;
         }
     };
-    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.SchedulerFull, error.RunnableWaitTimeout, error.ExecutionWaitUnsupported }) |cause| {
         var check: Check = .{ .cause = cause };
         const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
         try std.testing.expectError(cause, owner.prepareHotStandbySeedSnapshotWithLifetime("docs", std.math.maxInt(u64), &lifetime));

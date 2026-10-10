@@ -30,6 +30,14 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
+    .{ .status = .scheduler_full, .err = error.SchedulerFull },
+    .{ .status = .runnable_wait_timeout, .err = error.RunnableWaitTimeout },
+    .{ .status = .execution_wait_unsupported, .err = error.ExecutionWaitUnsupported },
+    .{ .status = .invalid_runnable_demand, .err = error.InvalidRunnableDemand },
+    .{ .status = .invalid_runnable_policy, .err = error.InvalidRunnablePolicy },
+    .{ .status = .invalid_runnable_transition, .err = error.InvalidRunnableTransition },
+    .{ .status = .manager_cleanup_capacity_unavailable, .err = error.ManagerCleanupCapacityUnavailable },
     .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
     .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
@@ -1030,5 +1038,31 @@ test "committed visibility outcomes survive the storage owner boundary" {
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(err, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+}
+
+test "runnable failures survive status-only storage and local query boundaries" {
+    // Maintenance uses status-only calls, while reads attach an envelope.
+    // Both must return the original admission cause to their owner.
+    const failures = [_]anyerror{
+        error.SchedulerClosed,
+        error.SchedulerFull,
+        error.RunnableWaitTimeout,
+        error.ExecutionWaitUnsupported,
+        error.InvalidRunnableDemand,
+        error.InvalidRunnablePolicy,
+        error.InvalidRunnableTransition,
+        error.ManagerCleanupCapacityUnavailable,
+    };
+    for (failures, 0..) |err, index| {
+        const status = statusFromError(err);
+        try std.testing.expectEqual(@as(u32, 0x10000) + @as(u32, @intCast(index)), @backingInt(status));
+        try std.testing.expectError(err, statusToError(status));
+        for ([_]abi.FailureBoundary{ .storage_owner, .local_query }) |boundary| {
+            const failure = failureFromError(err, boundary, abi.abi_version, 1);
+            try validateFailureEnvelope(status, &failure, abi.abi_version);
+            try std.testing.expectError(err, statusToError(failure.status));
+            try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+        }
     }
 }

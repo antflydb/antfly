@@ -902,3 +902,22 @@ records. Treating that as EOF prematurely discarded healthy encrypted frames.
 The HTTP/2 reader adapter now uses `readSliceShort`, whose zero result represents
 actual end of stream while buffered progress is consumed before returning.
 The regression also checks true truncated frame payloads are rejected and freed.
+
+### Runnable failure identities at the compiled storage boundary
+
+The cumulative physical HA seed test exposed `SchedulerClosed` being converted
+into `StorageKernelFailure` by the status-only storage owner maintenance call.
+The runtime failure registry now declares the runnable admission and transition
+errors explicitly. Failure ABI 62 assigns these unpublished pooling identities
+an append-only range beginning at `0x10000`, preserving every existing main
+status value. Both status-only calls and storage/local-query failure envelopes
+retain the exact scheduler cause. The physical HA seed fixture also checks
+queue pressure, runnable wait timeout and unsupported execution wait, with a
+successful retry through the same owner after each rejection.
+
+Native and pinned Nix glibc Zig Linux registry checks cover every registered
+identity, inverse mapping, envelope validation, and the released main status
+fingerprint. These focused checks do not prove the separately compiled HA seed
+fixture has passed; that fixture remains part of cumulative integration. Holder
+CPU loans and mandatory reentry still need implementation before background
+callbacks may safely share the node CPU budget.
