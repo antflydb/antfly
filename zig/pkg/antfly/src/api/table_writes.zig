@@ -10521,6 +10521,43 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn beginGroupOperationControlledLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, controls: *@import("group_admission_wait.zig").Budget) !void {
+        const io = self.tableActivityIo();
+        try controls.checkpoint();
+        while (self.retiring_replica_groups.contains(group_id)) {
+            try @import("group_admission_wait.zig").wait(io, &self.table_activity_mutex, &self.table_activity_ready, controls);
+        }
+        self.activityEntryLocked(table_name, group_id).operation_waiters += 1;
+        errdefer self.cancelGroupOperationWaiterLocked(table_name, group_id);
+        while (true) {
+            try controls.checkpoint();
+            if (self.retiring_replica_groups.contains(group_id)) {
+                try @import("group_admission_wait.zig").wait(io, &self.table_activity_mutex, &self.table_activity_ready, controls);
+                continue;
+            }
+            if (self.findTableActivityLocked(table_name, null)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.structural_active or entry.restore_preparations > 0 or entry.read_request_active > 0 or entry.status_request_active > 0) {
+                    try @import("group_admission_wait.zig").wait(io, &self.table_activity_mutex, &self.table_activity_ready, controls);
+                    continue;
+                }
+            }
+            if (self.findTableActivityLocked(table_name, group_id)) |index| {
+                const entry = self.active_table_activities.items[index];
+                if (entry.operation_active or entry.transition_waiters > 0 or entry.generation_preparation_active) {
+                    try @import("group_admission_wait.zig").wait(io, &self.table_activity_mutex, &self.table_activity_ready, controls);
+                    continue;
+                }
+            }
+            const entry = self.activityEntryLocked(table_name, group_id);
+            std.debug.assert(entry.operation_waiters > 0);
+            entry.operation_waiters -= 1;
+            entry.operation_active = true;
+            entry.operation_allows_reads = false;
+            return;
+        }
+    }
+
     fn cancelGroupOperationWaiterLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.tableActivityIo();
         const index = self.findTableActivityLocked(table_name, group_id) orelse unreachable;
@@ -10897,6 +10934,18 @@ pub const ProvisionedTableWriteSource = struct {
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.beginGroupOperationLocked(table_name, group_id);
+    }
+
+    fn beginGroupOperationControlled(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64, controls: *@import("group_admission_wait.zig").Budget) !void {
+        const io = self.tableActivityIo();
+        try controls.checkpoint();
+        if (!controls.controls.context.requiresAwareCallback()) {
+            self.beginGroupOperation(table_name, group_id);
+            return;
+        }
+        while (!self.table_activity_mutex.tryLock()) try controls.waitForProgress();
+        defer self.table_activity_mutex.unlock(io);
+        try self.beginGroupOperationControlledLocked(table_name, group_id, controls);
     }
 
     pub fn testingMarkTableRequestActive(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -23386,7 +23435,8 @@ pub const ProvisionedTableWriteSource = struct {
         // admission window. Otherwise a split can publish after validation
         // but before this transaction becomes visible to the pending-txn
         // transition fence.
-        self.beginGroupOperation(table_name, group_id);
+        var admission = @import("group_admission_wait.zig").preDecision(context, self.tableActivityIo());
+        try self.beginGroupOperationControlled(table_name, group_id, &admission);
         defer self.endGroupOperation(table_name, group_id);
         try ensurePreDecisionContextActive(context);
         if (context.restore_staging_scope) |scope| {
@@ -23507,7 +23557,8 @@ pub const ProvisionedTableWriteSource = struct {
             guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
         }
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
-        self.beginGroupOperation(table_name, group_id);
+        var admission = @import("group_admission_wait.zig").preDecision(context, self.tableActivityIo());
+        try self.beginGroupOperationControlled(table_name, group_id, &admission);
         defer self.endGroupOperation(table_name, group_id);
         try ensurePreDecisionContextActive(context);
         if (req.restore_staging_scope != null) {
@@ -23641,7 +23692,8 @@ pub const ProvisionedTableWriteSource = struct {
         // admission. If a transition is already waiting, it wins admission;
         // otherwise this resolve remains ahead of the transition until the
         // durable decision has been applied.
-        self.beginGroupOperation(table_name, group_id);
+        var admission = @import("group_admission_wait.zig").completion(cancellation, self.tableActivityIo());
+        try self.beginGroupOperationControlled(table_name, group_id, &admission);
         defer self.endGroupOperation(table_name, group_id);
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);

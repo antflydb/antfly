@@ -2349,6 +2349,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = participant_fanout_control_root,
         .filters = &.{
             "distributed txn independently scheduled",
+            "group admission wait",
             "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback",
             "distributed txn retries an ambiguous coordinator decision under the same id",
             "distributed txn propagates one absolute deadline through ambiguous decision recovery",

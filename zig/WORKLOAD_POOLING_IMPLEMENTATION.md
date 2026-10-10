@@ -1630,3 +1630,19 @@ compatibility. Contract coverage uses both direct and private ABI dispatch,
 including expiry during the callback, rejection before a subsequent call and
 atomic cancellation. This closes an authority loss, but does not release CPU
 across the internal storage, Raft, catalog or group-admission waits.
+
+Provisioned local BEGIN and PREPARE now retain their original budget through
+group-operation admission, including retirement, structural/read/status owners
+and transition/candidate preparation fences. Controlled condition waits poll
+with owner Io, release CPU using the original captured class when available,
+and release the activity mutex before mandatory CPU resumption. Rejection returns
+with that mutex held so registered waiter accounting is removed under the same
+lock. Resolution admission checks its supplied completion cancellation token
+through the same bounded physical waits; it does not yet transport a runnable
+borrow for CPU release. Unscoped callers retain notification-driven legacy waits.
+
+Focused helper coverage verifies unlocked CPU reentry, rejection cleanup lock
+ownership, original-clock deadline expiry and sticky cancellation. These checks
+do not instantiate the physical provisioned source's admission state machine;
+its full integration, complete local completion/capture wait graph and automatic
+default qualification remain open.
