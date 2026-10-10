@@ -2823,6 +2823,11 @@ const PointResultLifetime = enum {
         first_owned: usize,
         value: []const u8,
     ) ![]const u8 {
+        return self.retainWithAdmission(backend, allocator, held, first_owned, value, null);
+    }
+
+    fn retainWithAdmission(self: PointResultLifetime, backend: anytype, allocator: Allocator, held: *PointResultValues, first_owned: usize, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+        if (control) |budget| try budget.checkpoint();
         if (self == .snapshot_pinned) return value;
         const address = @intFromPtr(value.ptr);
         if (!(builtin.is_test and test_duplicate_owned_point_results)) {
@@ -2832,11 +2837,12 @@ const PointResultLifetime = enum {
         }
         const candidates = if (builtin.is_test and test_duplicate_owned_point_results) held.items[held.items.len..] else held.items[first_owned..];
         for (candidates) |owned| {
+            if (control) |budget| try budget.checkpoint();
             const base = @intFromPtr(owned.ptr);
             if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
         }
-        if (!(builtin.is_test and test_duplicate_owned_point_results)) return copyPointValue(backend, allocator, held, value);
-        const owned = try allocator.dupe(u8, value);
+        if (!(builtin.is_test and test_duplicate_owned_point_results)) return copyPointValueWithAdmission(backend, allocator, held, value, control);
+        const owned = try copyPointPromotionRows(allocator, value, control);
         errdefer allocator.free(owned);
         try held.append(allocator, owned);
         recordPointValueCopy(backend);
@@ -2947,7 +2953,7 @@ fn readManySortedPointFromSnapshotWithScratch(
             },
             else => return err,
         };
-        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retainWithAdmission(backend, allocator, held_values, first_owned, value, control);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -3109,7 +3115,7 @@ fn readManySortedByRunFromSnapshotWithScratch(
             },
             else => return err,
         };
-        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retain(backend, allocator, held_values, first_owned, value);
+        values[i] = try PointResultLifetime.forBlockPins(held_blocks).retainWithAdmission(backend, allocator, held_values, first_owned, value, control);
         result.hits += 1;
     }
     try batch_indexes.transferBlocks(backend.allocator, block_handles);
@@ -6026,9 +6032,9 @@ fn directoryUnresolvedKeys(
     return if (first_resolved != null) unresolved.items else keys;
 }
 
-fn retainSourcePointValue(backend: anytype, allocator: Allocator, held: *PointResultValues, namespace: backend_types.Namespace, value: []const u8) ![]const u8 {
+fn retainSourcePointValueWithAdmission(backend: anytype, allocator: Allocator, held: *PointResultValues, namespace: backend_types.Namespace, value: []const u8, control: ?read_admission.Port) ![]const u8 {
     if (!namespace.own_source_point_results) return value;
-    return PointResultLifetime.transaction_owned.retain(backend, allocator, held, held.items.len, value);
+    return PointResultLifetime.transaction_owned.retainWithAdmission(backend, allocator, held, held.items.len, value, control);
 }
 
 fn getFromSnapshotRuns(
@@ -6048,12 +6054,14 @@ fn getFromSnapshotRuns(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) ![]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (mutable.findIndex(namespace, key)) |idx| {
         const entry = mutable.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
         read_hint.* = null;
         backend.recordMutableHit();
-        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
     }
     for (immutable_memtables) |state| {
         if (state.findIndex(namespace, key)) |idx| {
@@ -6061,7 +6069,7 @@ fn getFromSnapshotRuns(
             if (entry.tombstone) return error.NotFound;
             read_hint.* = null;
             backend.recordMutableHit();
-            return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+            return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
         }
     }
     var candidate_group_index = if (last_l0_group_index.*) |hinted_index|
@@ -6579,7 +6587,11 @@ const AsyncPointResultPins = struct {
 // buffer; oversized values keep their exact-size allocation. Every buffer is
 // registered with the caller before use and survives pool eviction/errors.
 fn copyPointValue(backend: anytype, allocator: Allocator, held: *PointResultValues, value: []const u8) ![]const u8 {
-    const copied = try held.copies.copy(allocator, held, value);
+    return copyPointValueWithAdmission(backend, allocator, held, value, null);
+}
+
+fn copyPointValueWithAdmission(backend: anytype, allocator: Allocator, held: *PointResultValues, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+    const copied = try held.copies.copyWithAdmission(allocator, held, value, control);
     recordPointValueCopy(backend);
     return copied;
 }
@@ -6592,12 +6604,17 @@ const AsyncPointResultCopies = struct {
     next_capacity: usize = 256,
 
     fn copy(self: *@This(), allocator: Allocator, held: *PointResultValues, value: []const u8) ![]const u8 {
+        return self.copyWithAdmission(allocator, held, value, null);
+    }
+
+    fn copyWithAdmission(self: *@This(), allocator: Allocator, held: *PointResultValues, value: []const u8, control: ?read_admission.Port) ![]const u8 {
+        if (control) |budget| try budget.checkpoint();
         if (value.len == 0) return "";
         // Keep the small buffer across larger results. A mixed-size batch
         // cannot strand a nearly empty slab for every large value.
         if (value.len > max_packed_value_bytes) {
             try held.ensureUnusedCapacity(allocator, 1);
-            const owned = try allocator.dupe(u8, value);
+            const owned = try copyPointPromotionRows(allocator, value, control);
             held.appendAssumeCapacity(owned);
             return owned;
         }
@@ -6616,7 +6633,8 @@ const AsyncPointResultCopies = struct {
             self.next_capacity = @min(max_buffer_bytes, owned.len *| 2);
         }
         const result = self.buffer[self.used..][0..value.len];
-        @memcpy(result, value);
+        try copyPointResultBytes(result, value, control);
+        if (control) |budget| try budget.checkpoint();
         self.used += value.len;
         return result;
     }
@@ -7147,13 +7165,13 @@ fn retainAsyncPointEntry(
     // A single-point caller may keep a key hint. Batch slots never consume
     // hints and retain only values, independent of cache/decoder lifetimes.
     const value = if (read_hint) |hint| blk: {
-        const owned = try copyTableEntry(value_allocator, positioned.entry);
+        const owned = try copyTableEntryWithAdmission(value_allocator, positioned.entry, read.control);
         errdefer value_allocator.free(owned.bytes);
         try held_values.append(value_allocator, owned.bytes);
         hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = owned.entry.key, .entry_index = positioned.index };
         break :blk owned.entry.value;
-    } else if (read.result_copies) |copies| try copies.copy(value_allocator, held_values, positioned.entry.value) else blk: {
-        const owned = try value_allocator.dupe(u8, positioned.entry.value);
+    } else if (read.result_copies) |copies| try copies.copyWithAdmission(value_allocator, held_values, positioned.entry.value, read.control) else blk: {
+        const owned = try copyPointPromotionRows(value_allocator, positioned.entry.value, read.control);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
         break :blk owned;
@@ -7559,7 +7577,7 @@ fn fillBatchAsyncPointSlot(
                 result.misses += 1;
             } else {
                 values[i] = if (namespace.own_source_point_results or lifetime == .transaction_owned) owned: {
-                    const value = try copies.copy(allocator, held_values, present.value);
+                    const value = try copies.copyWithAdmission(allocator, held_values, present.value, shared.control);
                     recordPointValueCopy(backend);
                     break :owned value;
                 } else present.value;
@@ -7738,7 +7756,7 @@ fn getFromRunIndices(
                 const entry = state.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 read_hint.* = null;
-                return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+                return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
             }
             continue;
         }
@@ -7751,7 +7769,7 @@ fn getFromRunIndices(
                         const entry = state.entryAt(idx);
                         if (entry.tombstone) return error.NotFound;
                         read_hint.* = null;
-                        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+                        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
                     }
                     continue;
                 }
@@ -7816,7 +7834,7 @@ fn getFromRunIndices(
             .key = entry.key,
             .entry_index = entry_index,
         };
-        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
+        return try retainSourcePointValueWithAdmission(backend, value_allocator, held_values, namespace, entry.value, control);
     }
     return null;
 }
@@ -8345,15 +8363,24 @@ fn copyPointPromotionRows(allocator: Allocator, rows: []const u8, control: ?read
     if (control) |budget| try budget.checkpoint();
     const owned = try allocator.alloc(u8, rows.len);
     errdefer allocator.free(owned);
-    var cursor: usize = 0;
-    while (cursor < rows.len) {
-        if (control) |budget| try budget.checkpoint();
-        const end = cursor + @min(rows.len - cursor, 64 * 1024);
-        @memcpy(owned[cursor..end], rows[cursor..end]);
-        cursor = end;
-    }
+    try copyPointResultBytes(owned, rows, control);
     if (control) |budget| try budget.checkpoint();
     return owned;
+}
+
+fn copyPointResultBytes(dst: []u8, src: []const u8, control: ?read_admission.Port) !void {
+    std.debug.assert(dst.len == src.len);
+    if (control == null) {
+        @memcpy(dst, src);
+        return;
+    }
+    var cursor: usize = 0;
+    while (cursor < src.len) {
+        try control.?.checkpoint();
+        const end = cursor + @min(src.len - cursor, 64 * 1024);
+        @memcpy(dst[cursor..end], src[cursor..end]);
+        cursor = end;
+    }
 }
 
 fn findExactEntryInCachedPrefixWithScratch(
@@ -8398,12 +8425,12 @@ fn findExactEntryInCachedPrefixWithScratchWithAdmission(
     if (control) |budget| try budget.checkpoint();
     if (lifetime == .transaction_owned) {
         var entry = found.entry;
-        entry.value = if (entry.tombstone) "" else try copyPointValue(backend, value_allocator, held_values, entry.value);
+        entry.value = if (entry.tombstone) "" else try copyPointValueWithAdmission(backend, value_allocator, held_values, entry.value, control);
         entry.key = key;
         entry.namespace_name = namespace.name;
         return .{ .entry_index = found.index, .entry = entry };
     }
-    const owned = try copyTableEntry(value_allocator, found.entry);
+    const owned = try copyTableEntryWithAdmission(value_allocator, found.entry, control);
     errdefer value_allocator.free(owned.bytes);
     try held_values.append(value_allocator, owned.bytes);
     recordPointValueCopy(backend);
@@ -8705,17 +8732,26 @@ const OwnedTableEntry = struct {
 // Point-result ownership needs the selected row, never a duplicate of the
 // entire decoded block. Large rows can still transfer this compact buffer.
 fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTableEntry {
+    return copyTableEntryWithAdmission(allocator, entry, null);
+}
+
+fn copyTableEntryWithAdmission(allocator: Allocator, entry: lsm_table_file.Entry, control: ?read_admission.Port) !OwnedTableEntry {
+    if (control) |budget| try budget.checkpoint();
     const namespace_len = if (entry.namespace_name) |name| name.len else 0;
-    const bytes = try allocator.alloc(u8, namespace_len + entry.key.len + entry.value.len);
+    const prefix_len = std.math.add(usize, namespace_len, entry.key.len) catch return error.OutOfMemory;
+    const total_len = std.math.add(usize, prefix_len, entry.value.len) catch return error.OutOfMemory;
+    const bytes = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(bytes);
     var copied = entry;
     if (entry.namespace_name) |name| {
-        @memcpy(bytes[0..namespace_len], name);
+        try copyPointResultBytes(bytes[0..namespace_len], name, control);
         copied.namespace_name = bytes[0..namespace_len];
     }
     copied.key = bytes[namespace_len..][0..entry.key.len];
-    @memcpy(@constCast(copied.key), entry.key);
-    copied.value = bytes[namespace_len + entry.key.len ..];
-    @memcpy(@constCast(copied.value), entry.value);
+    try copyPointResultBytes(@constCast(copied.key), entry.key, control);
+    copied.value = bytes[prefix_len..];
+    try copyPointResultBytes(@constCast(copied.value), entry.value, control);
+    if (control) |budget| try budget.checkpoint();
     return .{ .entry = copied, .bytes = bytes };
 }
 
@@ -9335,7 +9371,7 @@ fn getFromRunWithLocalIndexWithAdmission(
         return loaded.entry.value;
     }
 
-    return try copyPointValue(backend, value_allocator, held_values, loaded.entry.value);
+    return try copyPointValueWithAdmission(backend, value_allocator, held_values, loaded.entry.value, control);
 }
 
 fn runMayContainWithFilter(backend: anytype, run: *Run, namespace: backend_types.Namespace, key: []const u8) !bool {
@@ -13751,4 +13787,95 @@ pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: us
     try std.testing.expectEqual(child.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
     try std.testing.expectEqual(child.snapshot().memory.peak_bytes, parent.snapshot().memory.peak_bytes);
     try std.testing.expect(parent.snapshot().memory.peak_bytes < @as(u64, window.len) * 2);
+}
+
+pub fn qualifyControlledPointResultCopies(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    const seed = try held.copies.copy(a, &held, "seed");
+    const previous_buffer = held.copies.buffer;
+    const previous_used = held.copies.used;
+    const previous_count = held.items.len;
+    const large: [192 * 1024]u8 = @splat('v');
+    const key: [128 * 1024]u8 = @splat('k');
+    const name: [65 * 1024]u8 = @splat('n');
+    if (fixture == 3) {
+        const entry: lsm_table_file.Entry = .{ .namespace_name = &name, .key = &key, .value = &large };
+        const owned = copyTableEntryWithAdmission(a, entry, control) catch |err| {
+            const retry = try copyTableEntry(a, entry);
+            defer a.free(retry.bytes);
+            try std.testing.expectEqualSlices(u8, &name, retry.entry.namespace_name.?);
+            try std.testing.expectEqualSlices(u8, &key, retry.entry.key);
+            try std.testing.expectEqualSlices(u8, &large, retry.entry.value);
+            try std.testing.expectEqualStrings("seed", seed);
+            return err;
+        };
+        defer a.free(owned.bytes);
+        try std.testing.expectEqualSlices(u8, &name, owned.entry.namespace_name.?);
+        try std.testing.expectEqualSlices(u8, &key, owned.entry.key);
+        try std.testing.expectEqualSlices(u8, &large, owned.entry.value);
+    } else {
+        const value = large[0..switch (fixture) {
+            0 => @as(usize, 32),
+            1 => 512,
+            else => large.len,
+        }];
+        const copied = held.copies.copyWithAdmission(a, &held, value, control) catch |err| {
+            try std.testing.expectEqualStrings("seed", seed);
+            if (held.copies.buffer.ptr == previous_buffer.ptr) try std.testing.expectEqual(previous_used, held.copies.used) else try std.testing.expectEqual(@as(usize, 0), held.copies.used);
+            if (fixture == 2) try std.testing.expectEqual(previous_count, held.items.len);
+            const retry = try held.copies.copy(a, &held, value);
+            try std.testing.expectEqualSlices(u8, value, retry);
+            try std.testing.expectEqualStrings("seed", seed);
+            return err;
+        };
+        try std.testing.expectEqualSlices(u8, value, copied);
+    }
+    try std.testing.expectEqualStrings("seed", seed);
+}
+
+pub fn qualifyControlledOwnedPointBatch(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    const persisted = fixture % 2 == 1;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-owned-point-copy", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = if (persisted) 1 else 1024 * 1024, .table_block_compression = .none, .max_concurrent_point_block_reads = if (fixture >= 2) 1 else 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    const large: [192 * 1024]u8 = @splat('v');
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("a:small", "seed");
+        try write.put("b:large", &large);
+        try write.commit();
+    }
+    const runs = try a.alloc(Run, backend.runs.count());
+    defer a.free(runs);
+    for (runs, 0..) |*run, i| run.* = backend.runs.at(i).*;
+    if (persisted) try std.testing.expect(runs.len > 0) else try std.testing.expectEqual(@as(usize, 0), runs.len);
+    const groups = try buildL0RunGroups(a, runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, runs);
+    defer a.free(levels);
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    var values: [4]?[]const u8 = @splat(null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const result = try readManySortedPointFromSnapshotWithScratch(&backend, &backend.mutable, &.{}, runs, groups, levels, a, null, &held, .{ .name = "docs", .own_source_point_results = true }, &.{ "a:small", "b:large", "b:large", "z:missing" }, &values, false, scratch.allocator(), control);
+    try std.testing.expectEqual(@as(usize, 3), result.hits);
+    try std.testing.expectEqual(@as(usize, 1), result.misses);
+    cache.invalidatePrefix("/controlled-owned-point-copy");
+    try std.testing.expectEqualStrings("seed", values[0].?);
+    try std.testing.expectEqualSlices(u8, &large, values[1].?);
+    try std.testing.expectEqualSlices(u8, &large, values[2].?);
+    try std.testing.expect(values[3] == null);
 }
