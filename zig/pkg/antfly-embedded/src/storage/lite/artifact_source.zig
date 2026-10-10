@@ -263,7 +263,7 @@ pub const Registry = struct {
             .marker_path = marker_path,
             .marker = marker,
         };
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visit, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
@@ -389,6 +389,11 @@ const State = struct {
     }
 
     fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.cache.?.visitRange(offset, length, context, visitor);
+    }
+
+    fn visitUncached(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.reader.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
     }

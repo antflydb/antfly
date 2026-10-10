@@ -553,18 +553,28 @@ pub const StreamingWriter = struct {
     }
     /// Only indexed chunks with the same physical value type may be copied.
     pub fn copyChunk(self: *StreamingWriter, reader: *const TypedDocValuesReader, index: u32, delta: i64) !void {
-        var info = reader.chunkInfo(index) orelse return error.InvalidData;
-        if (reader.value_type != self.value_type) return error.InvalidData;
-        info.first = std.math.cast(u32, (std.math.add(i64, info.first, delta) catch return error.InvalidData)) orelse return error.InvalidData;
-        info.last = std.math.cast(u32, (std.math.add(i64, info.last, delta) catch return error.InvalidData)) orelse return error.InvalidData;
-        info.base = std.math.cast(u32, (std.math.add(i64, info.base, delta) catch return error.InvalidData)) orelse return error.InvalidData;
-        if (self.last_doc) |last| if (info.first <= last) return error.InvalidData;
+        return self.copyChunks(reader, index, 1, delta);
+    }
+
+    /// Copy one contiguous payload traversal while retaining each descriptor.
+    pub fn copyChunks(self: *StreamingWriter, reader: *const TypedDocValuesReader, first: u32, count: u32, delta: i64) !void {
+        if (count == 0 or first > reader.num_chunks or count > reader.num_chunks - first) return error.InvalidData;
+        var previous = self.last_doc;
+        for (first..first + count) |index| {
+            if (!self.canCopyChunk(reader, @intCast(index), delta)) return error.InvalidData;
+            const info = reader.chunkInfo(@intCast(index)).?;
+            const shifted: u32 = @intCast(@as(i64, info.first) + delta);
+            if (previous) |last| if (shifted <= last) return error.InvalidData;
+            previous = @intCast(@as(i64, info.last) + delta);
+        }
         try self.flush();
         if (self.start == null) {
             self.start = self.sink.len();
             try self.sink.appendSlice(&.{ @backingInt(self.value_type) | 0xe0, 0, 0, 0, 0 });
         }
-        const extent = try reader.chunkRange(index);
+        const begin = (try reader.chunkRange(first)).start;
+        const end = (try reader.chunkRange(first + count - 1)).end;
+        const output = self.sink.len() - self.start.?;
         const Copy = struct {
             fn consume(raw: *anyopaque, _: u64, bytes: []const u8) !void {
                 const sink: *@import("../segment.zig").SegmentSink = @ptrCast(@alignCast(raw));
@@ -573,12 +583,18 @@ pub const StreamingWriter = struct {
         };
         const Source = @import("../segment_source.zig");
         const view = if (reader.range) |range| range.view else try Source.View.init(.{ .contiguous = reader.data }, 0, reader.data.len);
-        try view.visitRange(extent.start, extent.end - extent.start, self.sink, Copy.consume);
-        info.end = self.sink.len() - self.start.?;
-        try self.appendDirectory(info);
-        self.largest_decoded_chunk = @max(self.largest_decoded_chunk, info.decoded);
-        self.last_doc = info.last;
-        self.copied_chunks += 1;
+        try view.visitRange(begin, end - begin, self.sink, Copy.consume);
+        for (first..first + count) |index| {
+            var info = reader.chunkInfo(@intCast(index)).?;
+            info.end = output + info.end - begin;
+            info.first = @intCast(@as(i64, info.first) + delta);
+            info.last = @intCast(@as(i64, info.last) + delta);
+            info.base = @intCast(@as(i64, info.base) + delta);
+            try self.appendDirectory(info);
+            self.largest_decoded_chunk = @max(self.largest_decoded_chunk, info.decoded);
+            self.last_doc = info.last;
+        }
+        self.copied_chunks += count;
     }
     pub fn finish(self: *StreamingWriter) !bool {
         try self.flush();
@@ -607,7 +623,7 @@ pub fn concatenateStreams(alloc: Allocator, sink: *@import("../segment.zig").Seg
         defer scoped.deinit();
         if (scoped.reader.value_type != value_type) return error.InvalidData;
         if (scoped.reader.indexed) {
-            for (0..scoped.reader.num_chunks) |i| try writer.copyChunk(&scoped.reader, @intCast(i), 0);
+            if (scoped.reader.num_chunks != 0) try writer.copyChunks(&scoped.reader, 0, scoped.reader.num_chunks, 0);
         } else {
             var cursor = TypedDocValuesReader.Cursor.init(&scoped.reader);
             defer cursor.deinit();
@@ -2679,13 +2695,14 @@ test "typed compressed copy borrows provider spans and propagates visitor failur
     const a = std.testing.allocator;
     var input = TypedDocValuesWriter.init(a, .u64_val, 4);
     defer input.deinit();
-    for (0..4) |doc| try input.add(@intCast(doc), .{ .u64_val = doc + 10 });
+    for (0..16) |doc| try input.add(@intCast(doc), .{ .u64_val = doc + 10 });
     const bytes = try input.build();
     defer a.free(bytes);
     const Backend = struct {
         bytes: []const u8,
         copied_bytes: usize = 0,
         visited_bytes: usize = 0,
+        visits: usize = 0,
         fail: bool = false,
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2695,6 +2712,7 @@ test "typed compressed copy borrows provider spans and propagates visitor failur
         fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.fail) return error.TestIoFailure;
+            self.visits += 1;
             self.visited_bytes += @intCast(length);
             try consume(context, 0, self.bytes[@intCast(offset)..][0..@intCast(length)]);
         }
@@ -2705,20 +2723,23 @@ test "typed compressed copy borrows provider spans and propagates visitor failur
     const view = try sources.View.init(.{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } }, 0, bytes.len);
     var reader = try RangeTypedDocValuesReader.init(a, view, 1024, 1024);
     defer reader.deinit();
-    const extent = try reader.reader.chunkRange(0);
+    const extent = .{ .start = (try reader.reader.chunkRange(0)).start, .end = (try reader.reader.chunkRange(reader.reader.num_chunks - 1)).end };
     backend.copied_bytes = 0;
     var output = @import("../segment.zig").MemorySegmentSink.init(a);
     defer output.deinit();
     var sink = output.sink();
     var writer = StreamingWriter.init(a, &sink, .u64_val);
     defer writer.deinit();
-    try writer.copyChunk(&reader.reader, 0, 0);
+    try writer.copyChunks(&reader.reader, 0, reader.reader.num_chunks, 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.visits);
     try std.testing.expectEqual(@as(usize, 0), backend.copied_bytes);
     try std.testing.expectEqual(extent.end - extent.start, backend.visited_bytes);
     try std.testing.expect(try writer.finish());
     var result = try TypedDocValuesReader.init(a, output.out.items);
     defer result.deinit();
     try std.testing.expectEqual(@as(?u64, 13), try result.getU64(3));
+    try std.testing.expectEqual(@as(?u64, 25), try result.getU64(15));
+    try std.testing.expectEqual(reader.reader.num_chunks, writer.copied_chunks);
     var failed_output = @import("../segment.zig").MemorySegmentSink.init(a);
     defer failed_output.deinit();
     var failed_sink = failed_output.sink();

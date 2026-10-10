@@ -5006,7 +5006,8 @@ fn writeMergeTypedDocValuesSections(
             var cursor = typed_dv.TypedDocValuesReader.Cursor.init(dv);
             defer cursor.deinit();
             if (dv.indexed) {
-                for (0..dv.num_chunks) |chunk_index| {
+                var chunk_index: u32 = 0;
+                while (chunk_index < dv.num_chunks) : (chunk_index += 1) {
                     const info = dv.chunkInfo(@intCast(chunk_index)).?;
                     if (info.last >= reader.doc_count) return error.InvalidSegment;
                     const below = input.deletedBefore(info.first);
@@ -5014,7 +5015,14 @@ fn writeMergeTypedDocValuesSections(
                     if (through - below == @as(u64, info.last) - info.first + 1) continue;
                     const delta = @as(i64, merged_doc_base) - @as(i64, @intCast(below));
                     if (through == below and writer.canCopyChunk(dv, @intCast(chunk_index), delta)) {
-                        try writer.copyChunk(dv, @intCast(chunk_index), delta);
+                        var end = chunk_index + 1;
+                        while (end < dv.num_chunks) : (end += 1) {
+                            const next = dv.chunkInfo(end).?;
+                            if (next.last >= reader.doc_count) return error.InvalidSegment;
+                            if (input.deletedBefore(next.first) != below or input.deletedBefore(next.last + 1) != below or !writer.canCopyChunk(dv, end, delta)) break;
+                        }
+                        try writer.copyChunks(dv, chunk_index, end - chunk_index, delta);
+                        chunk_index = end - 1;
                         continue;
                     }
                     const chunk = try cursor.chunkAt(@intCast(chunk_index));
@@ -5139,14 +5147,22 @@ fn writeMergeTypedDocValuesSectionsInOrder(
                 const width = @as(usize, info.last) - info.first + 1;
                 const delta = @as(i64, @intCast(base)) - @as(i64, info.first);
                 if (info.first == first_ref.doc_id and try span_cursor.proves(base, selected, width) and writer.canCopyChunk(reader, chunk_index, delta)) {
-                    try writer.copyChunk(reader, chunk_index, delta);
+                    var end = chunk_index + 1;
+                    var total_width = width;
+                    while (end < reader.num_chunks) : (end += 1) {
+                        const next = reader.chunkInfo(end).?;
+                        const next_width = @as(usize, next.last) - info.first + 1;
+                        if (!try span_cursor.proves(base, selected, next_width) or !writer.canCopyChunk(reader, end, delta)) break;
+                        total_width = next_width;
+                    }
+                    try writer.copyChunks(reader, chunk_index, end - chunk_index, delta);
                     if (scans[first_ref.input_idx].cursor) |*cursor| {
                         cursor.entries = null;
                         cursor.chunk = null;
-                        cursor.next_chunk = chunk_index + 1;
+                        cursor.next_chunk = end;
                         scans[first_ref.input_idx].current = null;
                     }
-                    base += width;
+                    base += total_width;
                     continue;
                 }
             }
@@ -11426,4 +11442,86 @@ test "monotonic typed selections seek across deleted chunks" {
     try std.testing.expectEqualSlices(u8, &value, actual);
     std.debug.print("MONOTONIC_TYPED_GAP source_chunks={d} selected={d} prefix={d} tail={d} decoded={d}\n", .{ column.num_chunks, records.len, prefix, tail, decoded });
     try std.testing.expectEqual(@as(usize, 1), decoded);
+}
+
+test "borrowed typed ranges preserve native logical cache and coalesce cold reads" {
+    const a = std.testing.allocator;
+    const native = @import("storage/lite/native.zig");
+    const sources = @import("segment_source.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/borrow-hot.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const payload = try a.alloc(u8, integrity.page_size + 4);
+    defer a.free(payload);
+    @memset(payload[0..integrity.page_size], 'v');
+    std.mem.writeInt(u32, payload[integrity.page_size..][0..4], Crc32.hash(payload[0..integrity.page_size]), .big);
+    try file.putIndexCatalogRecord("/segment", payload);
+    const checkpoint = file.activeCheckpoint();
+    var value = try file.openIndexValue(a, "/segment", checkpoint);
+    defer value.deinit(a);
+    file.page_cache_enabled.store(false, .monotonic);
+    const Backend = struct {
+        file: *native.NativeFile,
+        value: native.NativeFile.IndexValue,
+        checkpoint: native.CheckpointSlot,
+        cache: ?sources.ConcurrentBlockCache = null,
+        fn rawRead(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.file.readIndexValueInto(self.value, offset, out, self.checkpoint);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cache.?.readInto(offset, out);
+        }
+        fn auth(raw: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cache.?.readAuthenticated(offset, length, within, out, expected);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, consume);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .file = &file, .value = value, .checkpoint = checkpoint };
+    const raw = sources.Source{ .ranges = .{ .ptr = &backend, .length = payload.len, .read_into = Backend.rawRead, .visit_range = Backend.visit, .close = Backend.close } };
+    backend.cache = try sources.ConcurrentBlockCache.init(a, raw, 160 * 1024);
+    defer backend.cache.?.deinit();
+    const facade = backend.cache.?.borrowedSource();
+    const directory = integrity.Directory{ .offset = integrity.page_size, .length = 4, .checksum = Crc32.hash(payload[integrity.page_size..]) };
+    const paged = try integrity.PagedSource.init(a, facade, directory);
+    defer paged.deinit();
+    const view = try sources.View.init(paged.source(), 0, integrity.page_size);
+    var buffer: [64]u8 = undefined;
+    try view.readInto(0, &buffer);
+    const Consumer = struct {
+        fn consume(_: *anyopaque, _: u64, span: []const u8) !void {
+            for (span) |byte| try std.testing.expectEqual(@as(u8, 'v'), byte);
+        }
+    };
+    var context: u8 = 0;
+    var reads = file.test_backing_read_calls.load(.monotonic);
+    for (0..256) |i| try view.readInto(i * buffer.len, &buffer);
+    const buffered = file.test_backing_read_calls.load(.monotonic) - reads;
+    reads = file.test_backing_read_calls.load(.monotonic);
+    for (0..256) |i| try view.visitRange(i * buffer.len, buffer.len, &context, Consumer.consume);
+    const borrowed = file.test_backing_read_calls.load(.monotonic) - reads;
+    reads = file.test_backing_read_calls.load(.monotonic);
+    try view.visitRange(0, 256 * buffer.len, &context, Consumer.consume);
+    const coalesced = file.test_backing_read_calls.load(.monotonic) - reads;
+    std.debug.print("FRESH_HOT_CACHE buffered_backing_calls={d} borrowed_backing_calls={d} coalesced_backing_calls={d}\n", .{ buffered, borrowed, coalesced });
+    try std.testing.expectEqual(@as(u64, 0), borrowed);
+    try std.testing.expectEqual(buffered, borrowed);
+    // Cold native traversal measures API calls, with its page cache disabled.
+    reads = file.test_backing_read_calls.load(.monotonic);
+    for (0..256) |i| try raw.visitRange(i * buffer.len, buffer.len, &context, Consumer.consume);
+    const cold_individual = file.test_backing_read_calls.load(.monotonic) - reads;
+    reads = file.test_backing_read_calls.load(.monotonic);
+    try raw.visitRange(0, 256 * buffer.len, &context, Consumer.consume);
+    const cold_group = file.test_backing_read_calls.load(.monotonic) - reads;
+    std.debug.print("COLD_NATIVE individual_calls={d} grouped_calls={d}\n", .{ cold_individual, cold_group });
+    try std.testing.expect(cold_group < cold_individual);
 }

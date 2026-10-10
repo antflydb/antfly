@@ -243,7 +243,7 @@ pub const PagedSource = struct {
             }
             const index: usize = @intCast(absolute / page_size);
             const within: usize = @intCast(absolute % page_size);
-            const take: usize = @intCast(@min(@min(length - position, page_size - within), self.directory.offset - absolute));
+            var take: usize = @intCast(@min(@min(length - position, page_size - within), self.directory.offset - absolute));
             const state = self.validations[index].load(.acquire);
             if (state == 2) return error.CrcMismatch;
             if (self.original == .contiguous) {
@@ -252,6 +252,13 @@ pub const PagedSource = struct {
                 try self.readPage(index, 0, &.{});
                 try self.original.visitRange(absolute, take, &forward, Forward.visit);
             } else if (state == 1 and self.original.ranges.visit_range != null) {
+                // Verified adjacent pages share one native cursor traversal.
+                // Stop before an unknown or failed page; neither may be exposed.
+                const limit = @min(length - position, self.directory.offset - absolute);
+                var next = index + 1;
+                while (take < limit and next < self.validations.len and self.validations[next].load(.acquire) == 1) : (next += 1) {
+                    take += @intCast(@min(limit - take, page_size));
+                }
                 try self.original.visitRange(absolute, take, &forward, Forward.visit);
             } else {
                 // Cold range providers authenticate before exposing any bytes.
@@ -363,6 +370,7 @@ test "segment borrowed spans authenticate cold pages and borrow verified ranges"
     const Backend = struct {
         bytes: []const u8,
         reads: usize = 0,
+        visits: usize = 0,
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.reads += 1;
@@ -370,6 +378,7 @@ test "segment borrowed spans authenticate cold pages and borrow verified ranges"
         }
         fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.visits += 1;
             try consume(context, 0, self.bytes[@intCast(offset)..][0..@intCast(length)]);
         }
         fn close(_: *anyopaque) void {}
@@ -385,11 +394,13 @@ test "segment borrowed spans authenticate cold pages and borrow verified ranges"
         try std.testing.expectEqual(view.length, consumer.used);
         if (source == .contiguous) try std.testing.expectEqual(view.length, consumer.borrowed);
         backend.reads = 0;
+        backend.visits = 0;
         consumer.used = 0;
         consumer.borrowed = 0;
         try view.visitRange(0, view.length, &consumer, Consumer.consume);
         try std.testing.expectEqual(@as(usize, 0), backend.reads);
         try std.testing.expectEqual(view.length, consumer.borrowed);
+        if (source == .ranges) try std.testing.expectEqual(@as(usize, 1), backend.visits);
     }
     bytes[11] ^= 1;
     const corrupt = try PagedSource.init(a, .{ .contiguous = bytes }, directory);
