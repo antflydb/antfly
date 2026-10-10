@@ -3339,6 +3339,10 @@ pub const ResourceManager = struct {
             if (self.memory.budget.hard_limit_bytes != 0 and memory_next > self.memory.budget.hard_limit_bytes) self.memory.hard_limit_rejections +|= 1;
             return error.ResourceBudgetExceeded;
         }
+        // Construction already charged the parent for credit. Only metadata
+        // growth needs new capacity; admit it before publishing either owner.
+        // Failure leaves the reservation and observer unchanged.
+        if (added > credit) try self.reserveParentLocked(added - credit);
         source.used_bytes -= credit;
         target.used_bytes = target_next;
         target.peak_bytes = @max(target.peak_bytes, target_next);
@@ -7032,6 +7036,49 @@ test "resource manager adopts construction credit without a second host charge" 
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
+}
+
+pub fn qualifyParentConstructionCredit() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    for ([_]Slice{ .lsm_read_working_set, .lsm_block_table_cache }) |source| {
+        for ([_]u64{ 128, 136, 140 }) |parent_limit| {
+            var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
+            defer parent.deinit(a);
+            var child = ResourceManager.init(.{ .identity_allocator = a });
+            defer child.deinit(a);
+            try child.installMemoryParent(parent.memoryParentPort());
+            var credit = try child.reserveWithoutReclaim(source, 128);
+            defer credit.release();
+            var retained: u64 = 0;
+            defer child.observeUsage(.lsm_block_table_cache, &retained, 0);
+            if (parent_limit == 128) {
+                try std.testing.expectError(error.ResourceBudgetExceeded, child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
+                try std.testing.expectEqual(@as(u64, 128), credit.bytes);
+                try std.testing.expectEqual(@as(u64, 0), retained);
+                try std.testing.expectEqual(@as(u64, 128), child.snapshot().memory.used_bytes);
+                try std.testing.expectEqual(@as(usize, 0), child.observer_identities.count());
+                // An exact-credit handoff needs no new parent capacity.
+                try child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 128);
+            } else {
+                try child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
+            }
+            try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(retained, parent.snapshot().memory.peak_bytes);
+            try std.testing.expectEqual(retained, child.snapshot().memory.used_bytes);
+            credit.release();
+            try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
+            try child.adjustUsage(.lsm_block_table_cache, &retained, 0);
+            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.accounting_errors);
+            try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.accounting_errors);
+        }
+    }
+}
+
+test "resource manager construction credit preserves hierarchical parent capacity" {
+    try qualifyParentConstructionCredit();
 }
 
 test "resource manager adopts construction credit only within both destination limits" {

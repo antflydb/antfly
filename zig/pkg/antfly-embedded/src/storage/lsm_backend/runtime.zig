@@ -8275,8 +8275,8 @@ const DecodedPointBlock = union(enum) { prefix_records: []const u8, raw_rows: []
 
 fn promoteCachedPointBlock(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prepared: ?DecodedPointBlock) !void {
     const cache = backend.options.cache orelse return;
-    if (!(cache.tryBeginLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen()) catch return)) return;
-    defer cache.finishLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen());
+    var claim = (cache.tryBeginLoadClaim(path, run_id, generation, .run_table_block, offset, window.physicalLen(), null) catch return) orelse return;
+    defer claim.transferToCache();
     if (cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen())) |retained| {
         var winner = retained;
         winner.release();

@@ -1153,6 +1153,47 @@ pub const Cache = struct {
     }
 
     /// Optional work never waits for a loader or the pending-map mutex.
+    /// Its independent key and charge survive a stopped caller. Cleanup is an
+    /// infallible transfer into fixed cache storage, as for mandatory loads.
+    pub fn tryBeginLoadClaim(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind, block_offset: u64, block_len: u32, control: ?read_admission.Port) !?LoadClaim {
+        if (control) |budget| try budget.checkpoint();
+        const key_bytes = std.math.mul(usize, path.len, 2) catch return error.ResourceBudgetExceeded;
+        const borrowed_key = makeKey(path, run_id, generation, kind, block_offset, block_len);
+        const shard = self.shardForKey(borrowed_key);
+        const slot = blk: {
+            if (!shard.pending_sync.tryLock()) return null;
+            defer shard.pending_sync.unlock();
+            self.drainLoadCleanupLocked(shard);
+            if (shard.pending_loads.getPtrAdapted(borrowed_key, KeyContext{}) != null or shard.pending_loads.count() == pending_capacity) return null;
+            for (&shard.load_cleanup) |*candidate| {
+                if (candidate.state.load(.acquire) == .free) {
+                    candidate.state.store(.reserved, .release);
+                    break :blk candidate;
+                }
+            }
+            return null;
+        };
+        var transferred = false;
+        defer if (!transferred) slot.state.store(.pending, .release);
+        // Never wait for accounting while holding the pending-map lock.
+        try self.admitLoadKeyBytes(slot, key_bytes, control);
+        slot.identity = 0;
+        const key = try copyKey(self.allocator, borrowed_key);
+        slot.key = key;
+        if (control) |budget| try budget.checkpoint();
+        if (!shard.pending_sync.tryLock()) return null;
+        defer shard.pending_sync.unlock();
+        // Another loader may have won while we admitted the owned key.
+        if (shard.pending_loads.getPtrAdapted(key, KeyContext{}) != null or shard.pending_loads.count() == pending_capacity) return null;
+        try self.publishPendingLoadLocked(shard, key);
+        const identity = shard.pending_loads.getPtrAdapted(key, KeyContext{}).?.identity;
+        slot.identity = identity;
+        transferred = true;
+        // Publication commits ownership; no fallible checkpoint may follow.
+        return .{ .cache = self, .key = key, .identity = identity, .cleanup = slot };
+    }
+
+    /// Legacy optional registration; callers must finish its borrowed key.
     pub fn tryBeginLoadWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind, block_offset: u64, block_len: u32) !bool {
         const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
         const shard = self.shardForKey(key);
@@ -2235,6 +2276,93 @@ else
 
         fn broadcast(_: *@This()) void {}
     };
+
+/// Owns exactly one loader registration and its independent cleanup key.
+/// The cache/allocator must outlive this token and all physical loader work.
+/// Retire or transfer the token before destroying its owning completion task.
+pub fn qualifyOptionalLoadClaim(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var child = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try child.installMemoryParent(parent.memoryParentPort());
+    var cache = Cache.init(a, 1024);
+    defer cache.deinit();
+    cache.attachResourceManager(&child);
+    const path = try a.dupe(u8, "optional-promotion-owned-path");
+    defer a.free(path);
+    const key = makeKey(path, 1, 1, .run_table_block, 8, 32);
+    const shard = cache.shardForKey(key);
+    // Optional acquisition cannot spend a loader/pending-lock wait.
+    shard.pending_sync.lock();
+    const busy = cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, control);
+    shard.pending_sync.unlock();
+    try std.testing.expect((try busy) == null);
+    var claim = (try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, control)) orelse return error.TestUnexpectedResult;
+    defer claim.transferToCache();
+    try std.testing.expect((try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, control)) == null);
+    const bytes: u64 = path.len * 2;
+    try std.testing.expectEqual(bytes, child.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(bytes, parent.snapshot().memory.used_bytes);
+    // Destruction of the request's path cannot invalidate the cleanup key.
+    @memset(path, 'x');
+    // Cleanup must complete its ownership transfer even while both ledgers
+    // and the pending lock are unavailable and the caller has stopped.
+    shard.pending_sync.lock();
+    std.debug.assert(child.mutex.tryLock());
+    std.debug.assert(parent.mutex.tryLock());
+    claim.transferToCache();
+    claim.transferToCache();
+    parent.mutex.unlock();
+    child.mutex.unlock();
+    shard.pending_sync.unlock();
+    try std.testing.expect(claim.isFinished());
+    var next = (try cache.tryBeginLoadClaim("optional-promotion-owned-path", 1, 1, .run_table_block, 8, 32, control)) orelse return error.TestUnexpectedResult;
+    defer next.transferToCache();
+    try std.testing.expectEqual(bytes, child.snapshot().memory.used_bytes);
+    next.transferToCache();
+    try cache.drainLoadCleanupWithAdmission(control);
+    try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+pub fn qualifyOptionalLoadClaimAllocation() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    for (0..2) |failed_copy| {
+        var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer parent.deinit(a);
+        var child = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer child.deinit(a);
+        try child.installMemoryParent(parent.memoryParentPort());
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var cache = Cache.init(failing.allocator(), 1024);
+        defer cache.deinit();
+        cache.attachResourceManager(&child);
+        failing.fail_index = failing.alloc_index + failed_copy;
+        const path = "optional-promotion-allocation";
+        try std.testing.expectError(error.OutOfMemory, cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, null));
+        failing.fail_index = std.math.maxInt(usize);
+        const shard = cache.shardForKey(makeKey(path, 1, 1, .run_table_block, 8, 32));
+        try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+        // Both failures keep admitted key bytes owned until an independent
+        // pass; the next load must recover that slot and the exact charge.
+        try std.testing.expectEqual(@as(u64, path.len * 2), child.snapshot().memory.used_bytes);
+        var claim = (try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, null)) orelse return error.TestUnexpectedResult;
+        defer claim.transferToCache();
+        try std.testing.expectEqual(@as(u64, path.len * 2), parent.snapshot().memory.used_bytes);
+        claim.transferToCache();
+        shard.pending_sync.lock();
+        cache.drainLoadCleanupLocked(shard);
+        shard.pending_sync.unlock();
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+    }
+}
 
 /// Owns exactly one loader registration and its independent cleanup key.
 /// The cache/allocator must outlive this token and all physical loader work.

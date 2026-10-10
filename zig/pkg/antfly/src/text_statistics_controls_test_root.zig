@@ -1527,3 +1527,47 @@ test "text statistics trusted controls prefix and large Snappy decode checkpoint
 test "text statistics trusted controls decision transport uses current Antfly protocol and retires original parent" {
     try sources.functions_runtime.qualifyRemoteTransportRetirement();
 }
+
+test "text statistics trusted controls promotion construction credit respects shared parent capacity" {
+    try sources.storage_resource_manager.qualifyParentConstructionCredit();
+    try sources.storage_lsm_backend_cache.qualifyOptionalLoadClaimAllocation();
+}
+
+test "text statistics trusted controls optional promotion claims own cleanup without pending lock waits" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 8, 16, 32 }) |stop_at| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var canceled = std.atomic.Value(bool).init(false);
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+            try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+            var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+            const admission = sources.common_read_admission;
+            var adapter = admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            const result = sources.storage_lsm_backend_cache.qualifyOptionalLoadClaim(admission.Port.init(&payload));
+            if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+            try std.testing.expectEqual(phase, execution.entry.?.class);
+            try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
+}
