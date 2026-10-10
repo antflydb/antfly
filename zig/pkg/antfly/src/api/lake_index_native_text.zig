@@ -331,6 +331,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var summaries: std.ArrayList(?statistics.Ref) = .empty;
         var input_bytes: usize = 0;
+        const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
+        @memset(file_manifests, null);
+        var global_statistics: ?statistics.Ref = if (seed) |old| old.term_statistics else null;
+        // Retain each old file contribution until its replacement is complete.
+        // A checkpoint's DF root therefore describes exactly its manifests.
+        if (seed) |old| for (old.file_groups) |group| {
+            if (plan.by_id.get(group.file.id)) |index| {
+                file_manifests[index] = try publishFileManifest(a, ca, store, group, cancellation);
+            } else {
+                global_statistics = try updateStatistics(a, store, provider, group, null, global_statistics, cancellation);
+            }
+        };
         for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
             group.* = .{ .file = file, .segments = &.{} };
             if (!changed) {
@@ -341,6 +353,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
                 try summaries.appendSlice(ca, group.summaries);
                 try segments.appendSlice(ca, group.segments);
+                file_manifests[file_ordinal] = try publishFileManifest(a, ca, store, group.*, cancellation);
                 continue;
             }
             const first_segment = segments.items.len;
@@ -395,55 +408,68 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
+            file_manifests[file_ordinal] = try publishFileManifest(a, ca, store, group.*, cancellation);
+            global_statistics = try updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation);
+            // This non-serving checkpoint has internally consistent file/DF
+            // roots, including retained old files awaiting replacement.
+            if (provider.progress != null) {
+                var checkpoint_arena = std.heap.ArenaAllocator.init(a);
+                defer checkpoint_arena.deinit();
+                const manifests = try presentManifests(checkpoint_arena.allocator(), file_manifests);
+                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
+                try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
+            }
         }
-        // Global DF touches only changed file contributions. The spill manager
-        // bounds disk independently of the sort's 4 MiB resident working set.
-        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-        defer spill_manager.deinit();
-        var stats_builder = statistics.Builder.init(a, &spill_manager);
-        defer stats_builder.deinit();
-        var stats_reads: u64 = 512 * 1024 * 1024;
-        var stats_writes: u64 = 512 * 1024 * 1024;
-        const scope = store.upload_scope.?;
-        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
-        if (seed) |old| for (old.file_groups) |group| {
-            const current = plan.by_id.get(group.file.id);
-            if (current != null and !plan.changed[current.?]) continue;
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, -1);
-        };
-        for (groups, plan.changed) |group, changed| if (changed) {
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, 1);
-        };
-        const global_statistics = try stats_builder.finish(stats_pages.store(), if (seed) |old| old.term_statistics else null);
         var root: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
-        // Publish one immutable manifest per file. Large corpora do not put
-        // every native segment reference (twice) into the root artifact.
-        const manifests = try ca.alloc(artifacts.ChunkRef, groups.len);
-        for (groups, manifests) |group, *manifest| {
-            try cancellation.check();
-            const page = try std.json.Stringify.valueAlloc(a, group, .{});
-            defer a.free(page);
-            if (page.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-            var page_upload = store.*;
-            page_upload.allocator = ca;
-            const ref = try page_upload.putWithCancellation(page, cancellation);
-            manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-        }
-        root.manifests = manifests;
+        root.manifests = try presentManifests(ca, file_manifests);
         root.file_groups = &.{};
         root.segments = &.{};
-        try root.validate();
-        const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
-        if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-        var upload = store.*;
-        upload.allocator = ca;
-        const uploaded = try upload.putWithCancellation(bytes, cancellation);
-        const owned = try std.json.Stringify.valueAlloc(ca, Declared{ .name = want.name, .binding = binding, .artifact = .{ .name = want.name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len } }, .{});
-        try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
+        try declarations.append(out, try publishRoot(a, out, store, want.name, root, cancellation));
     }
     return declarations.toOwnedSlice(out);
+}
+fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {
+    var refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+    for (slots) |slot| if (slot) |ref| try refs.append(a, ref);
+    return refs.toOwnedSlice(a);
+}
+fn updateStatistics(a: A, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, old: ?FileGroup, next: ?FileGroup, previous: ?statistics.Ref, cancellation: Cancellation) !?statistics.Ref {
+    var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+    defer manager.deinit();
+    var builder = statistics.Builder.init(a, &manager);
+    defer builder.deinit();
+    var reads: u64 = 512 * 1024 * 1024;
+    var writes: u64 = 512 * 1024 * 1024;
+    const scope = store.upload_scope.?;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    if (old) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, -1);
+    if (next) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, 1);
+    return builder.finish(pages.store(), previous);
+}
+fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
+    const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
+    defer a.free(bytes);
+    if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+    var upload = store.*;
+    upload.allocator = out;
+    const ref = try upload.putWithCancellation(bytes, cancellation);
+    return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+}
+fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, root: Root, cancellation: Cancellation) !Declared {
+    try root.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(bytes);
+    if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+    var upload = store.*;
+    upload.allocator = a;
+    var ref = try upload.putWithCancellation(bytes, cancellation);
+    defer ref.deinit(a);
+    const declaration: Declared = .{ .name = name, .binding = root.binding, .artifact = .{ .name = name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len } };
+    const encoded = try std.json.Stringify.valueAlloc(a, declaration, .{});
+    defer a.free(encoded);
+    return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
 }
 fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool) !void {
     try cancellation.check();

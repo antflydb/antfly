@@ -160,6 +160,8 @@ pub const State = struct {
     generation: u64 = 0,
     pending: ?Attempt = null,
     published: ?Publication = null,
+    /// Partial roots are resumable build inputs, never a serving publication.
+    checkpoint: ?Publication = null,
     failure: ?Failure = null,
     pub fn validate(self: State) !void {
         if (self.version != 1) return error.InvalidLakeIndexCatalog;
@@ -172,6 +174,12 @@ pub const State = struct {
             try publication.validate();
             if (publication.namespace != null and !std.meta.eql(publication.namespace, self.namespace)) return error.InvalidLakeIndexCatalog;
             if (publication.generation > self.generation or (self.pending != null and publication.generation >= self.pending.?.generation)) return error.InvalidLakeIndexCatalog;
+        }
+        if (self.checkpoint) |saved| {
+            try saved.validate();
+            if (!std.meta.eql(saved.namespace, self.namespace) or saved.generation > self.generation) return error.InvalidLakeIndexCatalog;
+            if (self.pending) |attempt| if (!std.meta.eql(saved.signature, attempt.signature)) return error.InvalidLakeIndexCatalog;
+            if (self.published) |ready| if (saved.generation <= ready.generation) return error.InvalidLakeIndexCatalog;
         }
         if (self.failure) |failure| {
             if (failure.generation != self.generation or failure.reason.len == 0 or failure.reason.len > 512 or std.mem.allEqual(u8, &failure.desired, 0)) return error.InvalidLakeIndexCatalog;
@@ -188,6 +196,21 @@ pub const State = struct {
         next.generation = std.math.add(u64, self.generation, 1) catch return error.LakeIndexGenerationExhausted;
         next.pending = .{ .reader_protocol = native_reader_protocol, .generation = next.generation, .token = token, .signature = signature, .started_at_ms = now_ms, .lease_expires_at_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidLakeIndexCatalog };
         next.failure = null;
+        if (next.checkpoint) |saved| if (!std.meta.eql(saved.signature, signature)) {
+            next.checkpoint = null;
+        };
+        try next.validate();
+        return next;
+    }
+    pub fn saveCheckpoint(self: State, saved: Publication, now_ms: u64) !State {
+        try self.validate();
+        const attempt = self.pending orelse return error.LakeIndexPublicationFenceChanged;
+        if (!std.meta.eql(saved.namespace, self.namespace) or !std.meta.eql(saved.signature, attempt.signature) or
+            saved.generation != attempt.generation or !std.mem.eql(u8, &saved.token, &attempt.token) or
+            now_ms < attempt.started_at_ms or now_ms >= attempt.lease_expires_at_ms or saved.published_at_ms != now_ms or
+            saved.reader_protocol != attempt.reader_protocol or !try locatorEqual(std.heap.page_allocator, saved.store_locator, attempt.store_locator)) return error.LakeIndexPublicationFenceChanged;
+        var next = self;
+        next.checkpoint = saved;
         try next.validate();
         return next;
     }
@@ -200,6 +223,7 @@ pub const State = struct {
         var next = self;
         next.pending = null;
         next.published = publication;
+        next.checkpoint = null;
         next.failure = null;
         try next.validate();
         return next;
@@ -321,12 +345,21 @@ pub fn transitionAllowed(a: A, before: anytype, after: anytype) !bool {
     if (replacement.generation == previous.generation +| 1 and replacement.generation > previous.generation) {
         if (replacement.pending) |attempt| {
             return std.mem.eql(u8, &attempt.signature.desired, &desiredFingerprint(after)) and
-                replacement.failure == null and try publicationEqual(a, previous.published, replacement.published);
+                replacement.failure == null and try publicationEqual(a, previous.published, replacement.published) and
+                (if (replacement.checkpoint) |saved| std.meta.eql(saved.signature, attempt.signature) and try publicationEqual(a, previous.checkpoint, saved) else true);
         }
-        return replacement.published == null and replacement.failure == null;
+        return replacement.published == null and replacement.failure == null and replacement.checkpoint == null;
     }
     if (replacement.generation != previous.generation) return false;
     const attempt = previous.pending orelse return false;
+    if (!try publicationEqual(a, previous.checkpoint, replacement.checkpoint)) {
+        if (replacement.checkpoint) |saved| {
+            if (replacement.pending == null or saved.generation != attempt.generation or !std.mem.eql(u8, &saved.token, &attempt.token) or
+                !std.meta.eql(saved.signature, attempt.signature) or saved.published_at_ms < attempt.started_at_ms or
+                saved.published_at_ms >= attempt.lease_expires_at_ms or saved.reader_protocol != attempt.reader_protocol or
+                !try locatorEqual(a, saved.store_locator, attempt.store_locator)) return false;
+        } else if (replacement.pending != null or replacement.failure != null) return false;
+    }
     if (replacement.pending) |renewed| {
         return renewed.generation == attempt.generation and std.mem.eql(u8, &renewed.token, &attempt.token) and
             renewed.reader_protocol == attempt.reader_protocol and try locatorEqual(a, renewed.store_locator, attempt.store_locator) and

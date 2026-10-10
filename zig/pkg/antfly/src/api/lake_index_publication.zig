@@ -81,7 +81,34 @@ pub fn beginWithLocator(a: A, io: std.Io, table: records.TableRecord, source: *s
 pub fn build(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock) ![]u8 {
     return buildWithLease(a, artifact_store, table, source, store_identity, context, cancellation, clock, null);
 }
-pub const Lease = struct { ptr: *anyopaque, snapshot: *const fn (*anyopaque, A) anyerror!local.common_topology_records.TableRecord };
+pub const Lease = struct {
+    ptr: *anyopaque,
+    snapshot: *const fn (*anyopaque, A) anyerror!local.common_topology_records.TableRecord,
+    save_checkpoint: ?*const fn (*anyopaque, catalog.Publication) anyerror!void = null,
+};
+const BuildProgress = struct {
+    a: A,
+    store: *stores.ArtifactStore,
+    cancellation: Cancellation,
+    clock: Clock,
+    lease: Lease,
+    saved: catalog.Publication,
+    declarations: std.ArrayList(local.serverless_segment_sidecar_manifest.DeclaredArtifact) = .empty,
+    fn save(raw: *anyopaque, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.cancellation.check();
+        // Deep ownership survives each bounded builder/file arena.
+        const bytes = try std.json.Stringify.valueAlloc(self.a, declaration, .{});
+        const owned = try std.json.parseFromSliceLeaky(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.a, bytes, .{ .allocate = .alloc_always });
+        const slot = for (self.declarations.items, 0..) |old, index| {
+            if (std.mem.eql(u8, old.name, owned.name)) break index;
+        } else null;
+        if (slot) |index| self.declarations.items[index] = owned else try self.declarations.append(self.a, owned);
+        self.saved.directory = try @import("lake_index_directory.zig").publish(self.a, self.store, self.declarations.items, self.cancellation);
+        self.saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
+        try self.lease.save_checkpoint.?(self.lease.ptr, self.saved);
+    }
+};
 pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease) ![]u8 {
     return buildWithLeaseAndEmbedding(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, null, null);
 }
@@ -128,7 +155,7 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
             std.mem.eql(u8, &published.signature.store, &signature.store)) published.declarations else &.{}
     else
         &.{};
-    const candidates: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = if (current.value.published) |published|
+    const published_candidates: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = if (current.value.published) |published|
         if (reusable_directory and std.meta.eql(published.namespace, current.value.namespace) and std.mem.eql(u8, &published.signature.credentials, &signature.credentials) and std.mem.eql(u8, &published.signature.store, &signature.store)) published.declarations else &.{}
     else
         &.{};
@@ -137,6 +164,25 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     var native_arena = std.heap.ArenaAllocator.init(a);
     defer native_arena.deinit();
     const na = native_arena.allocator();
+    var candidate_list: std.ArrayList(local.serverless_segment_sidecar_manifest.DeclaredArtifact) = .empty;
+    if (current.value.checkpoint) |*saved| {
+        if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) {
+            try @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, saved, cancellation, null);
+            try candidate_list.appendSlice(na, saved.declarations);
+        }
+    }
+    for (published_candidates) |declaration| {
+        const present = for (candidate_list.items) |saved| {
+            if (std.mem.eql(u8, declaration.name, saved.name)) break true;
+        } else false;
+        if (!present) try candidate_list.append(na, declaration);
+    }
+    const candidates = candidate_list.items;
+    var progress: BuildProgress = .{ .a = na, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    if (lease) |owner| if (owner.save_checkpoint != null) {
+        if (current.value.checkpoint) |saved| try progress.declarations.appendSlice(na, saved.declarations);
+        provider.progress = .{ .ptr = &progress, .save = BuildProgress.save };
+    };
     const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const contributions_api = @import("lake_index_contributions.zig");
     var contribution_index: contributions_api.Index = undefined;
@@ -183,8 +229,11 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     defer manifest.deinit(a);
     const native = try @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index);
     const native_declarations = native.declarations;
+    for (native_declarations) |declaration| try provider.checkpoint(declaration);
     const ordered = try @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates);
+    for (ordered) |declaration| try provider.checkpoint(declaration);
     const text = try @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
+    for (text) |declaration| try provider.checkpoint(declaration);
     const sparse = try @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
     const dense = try @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
     const declarations = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len + dense.len);

@@ -54,8 +54,8 @@ metadata. “Cold” here means empty application disk cache after publication, 
 an uninitialized machine or a brand-new source. Record this distinction with
 results. Peak RSS is the Antfly process high-water mark, not all pod processes.
 
-Reserve $20 for each of at most two attempts, including failed/disconnected
-attempts, and $25 conservatively for prior work: $65 planned reservations inside
+Reserve $20 for each of at most four attempts, including failed/disconnected
+attempts, and $25 conservatively for prior work: $105 planned reservations inside
 the approved $150 incremental ceiling. One pod's maximum 3,400-second lifetime
 bounds compute; no persistent volume, service or new cluster is created. The
 current undiscounted resource calculation is about $0.56 per attempt, with a $10
@@ -92,8 +92,46 @@ contributions for resumable construction, and publish only after complete
 coverage and source/lease validation. Bound local disk independently of archive
 size and expose progress and the exhausted resource in failures. Raising the
 spill limit alone does not establish archive scalability. Repeat construction
-and the query matrix after this work; the two configured run allowances have
-been consumed.
+and the query matrix after this work. The two initial allowances were consumed;
+the user requested the bounded-construction follow-up and further benchmarks.
+A reviewed extension records two additional attempts in the same ledger without
+changing spend limits or resetting prior reservations.
+
+## Bounded, resumable construction
+
+Replay now admits at most one source file into its existing 1 GiB local spill
+budget. Advancing to another file releases the prior run. Whole-source consumers
+stream ordinarily; a single file exceeding replay admission uses the ordinary
+streaming path. Replay is an optimization, while completed index contributions
+are the durable recovery unit. Physical references, schema/null contracts,
+delete handling and cancellation remain attached to the pinned source.
+
+Fused metadata builders sort and publish each changed file before resetting
+its local runs. A partially built ordered root carries zero fingerprints for
+unfinished files, so retry cannot mistake missing rows for completed coverage.
+Text construction updates document-frequency statistics per file with bounded
+spill and page I/O, instead of reducing summaries for the entire archive in one
+job. Its checkpoint contains a consistent statistics root and file manifests;
+old contributions remain referenced until replacement completes.
+
+The catalog stores a separate, non-serving checkpoint directory. Each complete
+file commits through the renewing full-definition CAS. Ambiguous checkpoint
+replies terminate the attempt; recovery rereads authority under a fresh lease
+and reuses completed contributions. Source, definition, credentials, storage or
+incarnation changes invalidate reuse. Only complete construction passes the
+existing final source/lease checks and publishes a queryable generation.
+
+Both vacuum traversal paths mark checkpoint roots. The collection cutoff also
+protects the checkpoint's upload generation and later attempts. Replacement,
+successful publication and DROP release checkpoint ownership through metadata.
+These protections prevent vacuum from deleting an interrupted build's reusable
+inputs without exposing its partial rows to query readers.
+
+Memory, spill, file-count and per-file page I/O admission remain enforced. A
+single pathological file can still exceed an index builder's limits; this change
+removes archive-wide accumulation and does not establish a bound for arbitrary
+file sizes. Full-archive construction and query performance must be measured on
+the optimized binary before deployment readiness is claimed.
 
 ## Current/history correctness gate
 

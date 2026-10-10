@@ -78,9 +78,10 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
     const build_alloc = working.allocator();
     var handle = store.artifactStore();
-    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |build_error| {
+    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |build_error| {
         heartbeat.cancel(io);
         heartbeat_active = false;
+        if (lease.terminal_error) |err| return err;
         const failure_time = clock.now_ms(clock.ptr) catch return build_error;
         var admitted = try catalog.parse(a, lease.record.lake_index_catalog_json);
         defer admitted.deinit();
@@ -149,6 +150,26 @@ const Renewal = struct {
         record.lake_index_catalog_json = try a.dupe(u8, record.lake_index_catalog_json);
         return record;
     }
+    fn saveCheckpoint(raw: *anyopaque, saved: catalog.Publication) !void {
+        const self: *Renewal = @ptrCast(@alignCast(raw));
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.terminal_error) |err| return err;
+        var state = try catalog.parse(self.a, self.record.lake_index_catalog_json);
+        defer state.deinit();
+        const bytes = try catalog.encode(self.a, try state.value.saveCheckpoint(saved, saved.published_at_ms));
+        errdefer self.a.free(bytes);
+        var replacement = self.record;
+        replacement.lake_index_catalog_json = bytes;
+        self.authority.replace(self.authority.ptr, self.record, replacement) catch |err| {
+            self.terminal_error = err;
+            self.failed.store(true, .release);
+            return err;
+        };
+        if (self.owned) |old| self.a.free(old);
+        self.owned = bytes;
+        self.record = replacement;
+    }
     // Provider cancellation callbacks must remain free of metadata I/O.
     fn check(raw: *anyopaque) !void {
         const self: *Renewal = @ptrCast(@alignCast(raw));
@@ -208,6 +229,8 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer a.free(data);
     var put = try client.putObject("antfly", "part.parquet", data, .{});
     put.deinit(a);
+    var second = try client.putObject("antfly", "part2.parquet", data, .{});
+    second.deinit(a);
     const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\"}},\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
@@ -226,6 +249,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         now: u64 = 100,
         commits: usize = 0,
         lose_reply: bool = true,
+        cancel_checkpoint: bool = false,
         fn replace(raw: *anyopaque, expected: local.common_topology_records.TableRecord, replacement: local.common_topology_records.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!std.mem.eql(u8, expected.lake_index_catalog_json, self.table.lake_index_catalog_json)) return error.TableGenerationChanged;
@@ -236,6 +260,14 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             self.table = replacement;
             self.table.lake_index_catalog_json = bytes;
             self.commits += 1;
+            if (self.cancel_checkpoint) {
+                var saved = try catalog.parse(std.testing.allocator, bytes);
+                defer saved.deinit();
+                if (saved.value.checkpoint != null) {
+                    self.cancel_checkpoint = false;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+            }
             if (self.lose_reply) {
                 self.lose_reply = false;
                 return error.MetadataMutationOutcomeUnknown;
@@ -257,13 +289,14 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expectEqual(@as(usize, 1), mock.commits);
     mock.now = 110;
     try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expectEqual(@as(usize, 3), mock.commits);
+    const committed_build = mock.commits;
+    try std.testing.expect(committed_build > 3);
     var published = try catalog.parse(a, mock.table.lake_index_catalog_json);
     defer published.deinit();
     try std.testing.expectEqual(@as(u64, 2), published.value.published.?.generation);
     try std.testing.expect(published.value.pending == null);
     try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expectEqual(@as(usize, 3), mock.commits);
+    try std.testing.expectEqual(committed_build, mock.commits);
     const selection = @import("lake_index_selection.zig");
     var query_table: local.sql_catalog.Table = .{
         .id = mock.table.table_id,
@@ -279,15 +312,46 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     query_table.external_indexes.?.desired = @splat(9);
     try std.testing.expect((try selection.select(a, query_table, &source, &store, .{}, .automatic)) == null);
     try std.testing.expectError(error.ExternalLakeIndexDefinitionChanged, selection.select(a, query_table, &source, &store, .{}, .required));
+    // A new definition forces construction. Lose the reply to the first
+    // complete file checkpoint, then reopen authority under another attempt.
+    mock.table.indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true}}";
+    mock.cancel_checkpoint = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+    var partial = try catalog.parse(a, mock.table.lake_index_catalog_json);
+    defer partial.deinit();
+    try std.testing.expect(partial.value.checkpoint != null);
+    try std.testing.expectEqual(@as(u64, 2), partial.value.published.?.generation);
+    const resumed_artifacts = store.artifactStore();
+    try @import("lake_index_directory.zig").hydrateLazy(partial.arena.allocator(), resumed_artifacts, &partial.value.checkpoint.?, .none, null);
+    const first_text = partial.value.checkpoint.?.declarations[0];
+    const partial_root = try @import("lake_index_native_text.zig").loadRoot(partial.arena.allocator(), resumed_artifacts, first_text.artifact, .none, null);
+    try std.testing.expectEqual(@as(usize, 1), partial_root.file_groups.len);
+    mock.now += 10;
+    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+    var resumed = try catalog.parse(a, mock.table.lake_index_catalog_json);
+    defer resumed.deinit();
+    try std.testing.expect(resumed.value.checkpoint == null);
+    try std.testing.expectEqual(@as(u64, 4), resumed.value.published.?.generation);
+    try @import("lake_index_directory.zig").hydrateLazy(resumed.arena.allocator(), resumed_artifacts, &resumed.value.published.?, .none, null);
+    const resumed_root = try @import("lake_index_native_text.zig").loadRoot(resumed.arena.allocator(), resumed_artifacts, resumed.value.published.?.declarations[0].artifact, .none, null);
+    try std.testing.expectEqual(@as(usize, 2), resumed_root.file_groups.len);
+    try std.testing.expectEqualStrings(partial_root.file_groups[0].segments[0].artifact_id, resumed_root.file_groups[0].segments[0].artifact_id);
+    var resumed_writer = try @import("lake_index_native_text.zig").loadWriter(a, resumed_artifacts, resumed_root, .none, null, null);
+    defer resumed_writer.deinit();
+    const resumed_snapshot = resumed_writer.acquireSnapshot();
+    defer resumed_snapshot.release();
+    const hits = try resumed_snapshot.search(a, "body", &.{"index"}, 10);
+    defer a.free(hits.hits);
+    try std.testing.expectEqual(@as(u32, 2), hits.total_count);
     // Simulate restoring historical metadata after its derived directory was
     // retired. Matching source/schema signatures must still rebuild storage.
     var artifacts = store.artifactStore();
-    try artifacts.delete(published.value.published.?.directory.?.artifact_id);
+    try artifacts.delete(resumed.value.published.?.directory.?.artifact_id);
     try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expectEqual(@as(usize, 5), mock.commits);
+    try std.testing.expect(mock.commits > committed_build);
     var recovered = try catalog.parse(a, mock.table.lake_index_catalog_json);
     defer recovered.deinit();
-    try std.testing.expectEqual(@as(u64, 3), recovered.value.published.?.generation);
+    try std.testing.expectEqual(@as(u64, 5), recovered.value.published.?.generation);
     try std.testing.expectEqual(published.value.namespace, recovered.value.namespace);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
     // A complete older directory is still a refresh obligation after a
@@ -298,11 +362,11 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     mock.owned = historical;
     mock.table.lake_index_catalog_json = historical;
     try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expectEqual(@as(usize, 7), mock.commits);
+    try std.testing.expect(mock.commits > committed_build);
     var upgraded = try catalog.parse(a, mock.table.lake_index_catalog_json);
     defer upgraded.deinit();
     try std.testing.expectEqual(catalog.native_reader_protocol, upgraded.value.published.?.reader_protocol);
-    try std.testing.expectEqual(@as(u64, 4), upgraded.value.published.?.generation);
+    try std.testing.expectEqual(@as(u64, 6), upgraded.value.published.?.generation);
     // A text format refresh must also rebuild when the reader protocol and
     // every source/definition signature are current and the directory exists.
     var old_text = upgraded.value.published.?;
@@ -325,10 +389,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     mock.owned = old_catalog;
     mock.table.lake_index_catalog_json = old_catalog;
     try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-    try std.testing.expectEqual(@as(usize, 9), mock.commits);
+    try std.testing.expect(mock.commits > committed_build);
     var refreshed = try catalog.parse(a, mock.table.lake_index_catalog_json);
     defer refreshed.deinit();
-    try std.testing.expectEqual(@as(u64, 5), refreshed.value.published.?.generation);
+    try std.testing.expectEqual(@as(u64, 7), refreshed.value.published.?.generation);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, refreshed.value.published.?, .none));
 }
 

@@ -653,7 +653,15 @@ archive-wide replay capture inheriting SQL’s 1 GiB spill limit; the runtime
 error does not identify the exact limit site. The second pod and 78 derived
 objects were deleted. No search latency was measured in either attempt.
 
-The next engine step is bounded file/cohort replay with release and resumable
-publication, followed by another qualification run. Both configured attempts
-are consumed; the ledger retains $65 in conservative allowances, including
-prior work. Reconcile charges and review a new run plan before further attempts.
+The follow-up now bounds replay and metadata sorts by file, updates text
+statistics by file, and saves complete file contributions in a separate
+non-serving catalog checkpoint. Retries use a fresh lease and retain completed
+work; both vacuum paths protect checkpoint roots. The local replay optimization
+falls back to streaming for an oversized file. Per-file index admission remains
+enforced. Optimized archive construction and query benchmarks are being rerun.
+
+The original two attempts consumed $65 in conservative allowances including
+prior work. The reviewed follow-up permits two more attempts, up to $105 of
+allowances within the unchanged $150 ceiling. `--extend-run-limit` records this
+extension in the existing ledger; it cannot reset failed reservations or change
+spend limits.

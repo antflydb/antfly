@@ -117,7 +117,7 @@ def plan(config, inventory):
     }
 
 
-def reserve(ledger_path, config, run_id):
+def reserve(ledger_path, config, run_id, *, extend_run_limit=False):
     """Serialize attempts; never refund failed work or overwrite an existing budget."""
     b = config["budget"]
     with os.fdopen(os.open(ledger_path, os.O_RDWR | os.O_CREAT, 0o600), "r+") as file:
@@ -133,6 +133,24 @@ def reserve(ledger_path, config, run_id):
                 "runs": [],
             }
         )
+        previous = ledger["budget"]
+        if extend_run_limit and previous != b:
+            unchanged = {k: v for k, v in previous.items() if k != "max_runs"} == {
+                k: v for k, v in b.items() if k != "max_runs"
+            }
+            if not unchanged or b["max_runs"] <= previous["max_runs"]:
+                raise ValueError(
+                    "Run-limit extension must preserve the approved budget"
+                )
+            ledger.setdefault("run_limit_extensions", []).append(
+                {
+                    "from": previous["max_runs"],
+                    "to": b["max_runs"],
+                    "at_unix": time.time(),
+                    "prior_runs": len(ledger["runs"]),
+                }
+            )
+            ledger["budget"] = b
         if ledger["project"] != config["project"] or ledger["budget"] != b:
             raise ValueError("Existing ledger budget differs")
         if len(ledger["runs"]) >= b["max_runs"]:
@@ -257,6 +275,11 @@ def main():
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--extend-run-limit",
+        action="store_true",
+        help="Record an explicitly reviewed retry extension without changing spend limits or prior reservations",
+    )
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     inventory = json.loads(args.inventory.read_text())
@@ -317,7 +340,7 @@ def main():
 
     verify_inventory(inventory)
     args.output.mkdir(parents=True, exist_ok=False)
-    reserve(args.ledger, config, run_id)
+    reserve(args.ledger, config, run_id, extend_run_limit=args.extend_run_limit)
     (args.output / "plan.json").write_text(
         json.dumps(
             {

@@ -109,6 +109,7 @@ class ArchiveQualificationTest(unittest.TestCase):
     def test_failed_or_interrupted_reservations_exhaust_retry_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"
+            self.config["budget"]["max_runs"] = 2
             archive.reserve(ledger, self.config, "failed")
             archive.reserve(ledger, self.config, "interrupted")
             with self.assertRaisesRegex(ValueError, "Run limit exhausted"):
@@ -122,6 +123,27 @@ class ArchiveQualificationTest(unittest.TestCase):
             self.config["budget"]["prior_work_reserved_usd"] = 0
             with self.assertRaisesRegex(ValueError, "ledger budget differs"):
                 archive.reserve(ledger, self.config, "second")
+
+    def test_reviewed_retry_extension_preserves_spend_and_failed_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            self.config["budget"]["max_runs"] = 2
+            archive.reserve(ledger, self.config, "failed")
+            archive.reserve(ledger, self.config, "interrupted")
+            self.config["budget"]["max_runs"] = 4
+            with self.assertRaisesRegex(ValueError, "budget differs"):
+                archive.reserve(ledger, self.config, "implicit-extension")
+            archive.reserve(
+                ledger, self.config, "reviewed-retry", extend_run_limit=True
+            )
+            recorded = json.loads(ledger.read_text())
+            self.assertEqual(len(recorded["runs"]), 3)
+            self.assertEqual(recorded["run_limit_extensions"][0]["prior_runs"], 2)
+            self.config["budget"]["ceiling_usd"] = 149
+            with self.assertRaisesRegex(ValueError, "preserve the approved budget"):
+                archive.reserve(
+                    ledger, self.config, "changed-budget", extend_run_limit=True
+                )
 
 
 if __name__ == "__main__":
