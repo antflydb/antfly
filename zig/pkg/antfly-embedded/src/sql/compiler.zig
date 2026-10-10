@@ -1928,7 +1928,10 @@ const Parser = struct {
         for (unnamed.items) |entry| {
             const constraint = &constraints.items[entry.index];
             switch (constraint.*) {
-                .add_unique => |*unique| unique.name = try self.generatedConstraintName(table.table, if (unique.primary) &.{} else unique.columns, if (unique.primary) "pkey" else "key", constraints.items),
+                .add_unique => |*unique| {
+                    unique.name = try self.generatedConstraintName(table.table, if (unique.primary) &.{} else unique.columns, if (unique.primary) "pkey" else "key", constraints.items);
+                    unique.generated_name = true;
+                },
                 .add_foreign_key => |*fk| fk.name = try self.generatedConstraintName(table.table, fk.columns, "fkey", constraints.items),
                 .add_check => |*check| check.name = try self.generatedConstraintName(table.table, if (entry.column) |column| &.{column} else &.{}, "check", constraints.items),
                 else => unreachable,
@@ -3280,6 +3283,7 @@ test "compiler unnamed constraints use table and column names without declaratio
     var second = try compile(std.testing.allocator, "CREATE TABLE p2 (id TEXT PRIMARY KEY)", .{});
     defer second.deinit();
     try std.testing.expectEqualStrings("p1_pkey", first.statement.create_table.constraints[0].add_unique.name);
+    try std.testing.expect(first.statement.create_table.constraints[0].add_unique.generated_name);
     try std.testing.expectEqualStrings("p2_pkey", second.statement.create_table.constraints[0].add_unique.name);
     var child = try compile(std.testing.allocator, "CREATE TABLE child (id TEXT PRIMARY KEY, p TEXT REFERENCES p1(id), n BIGINT CHECK (n > 0), UNIQUE (n), UNIQUE (n), CONSTRAINT child_n_key CHECK (n < 100))", .{});
     defer child.deinit();
@@ -3290,6 +3294,9 @@ test "compiler unnamed constraints use table and column names without declaratio
     try std.testing.expectEqualStrings("child_n_key1", constraints[3].add_unique.name);
     try std.testing.expectEqualStrings("child_n_key2", constraints[4].add_unique.name);
     try std.testing.expectEqualStrings("child_n_key", constraints[5].add_check.name);
+    var explicit = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT CONSTRAINT exact_name PRIMARY KEY)", .{});
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.statement.create_table.constraints[0].add_unique.generated_name);
 }
 
 test "compiler generated constraint names clip long UTF-8 identifiers at codepoint boundaries" {

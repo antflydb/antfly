@@ -30,8 +30,9 @@ pub const Coordinator = struct {
     /// Caller serializes this lane with catalog mutations and excludes HA
     /// owners. One durable intent at most per round; scans are bounded by the
     /// storage owner and every apply rechecks the observed source/root cut.
-    pub fn step(self: *Coordinator, store: anytype, alloc: std.mem.Allocator, group: u64, identity: incarnation.MetadataClusterIncarnation, node_id: u64, now_ns: u64) !void {
-        if (now_ns < self.next_round_at_ns) return;
+    /// true means exactly one control intent was successfully applied.
+    pub fn step(self: *Coordinator, store: anytype, alloc: std.mem.Allocator, group: u64, identity: incarnation.MetadataClusterIncarnation, node_id: u64, now_ns: u64) !bool {
+        if (now_ns < self.next_round_at_ns) return false;
         self.next_round_at_ns = now_ns +| worker.round_interval_ns;
         try store.expireRelationPublicationProofs(now_ns);
         const activation: protocol.Activation = .{
@@ -45,7 +46,7 @@ pub const Coordinator = struct {
             const bytes = try std.json.Stringify.valueAlloc(alloc, activation, .{});
             defer alloc.free(bytes);
             try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
-            return;
+            return true;
         }
         const work = try store.relationReconciliationWork(group);
         const command: control.Command = blk: {
@@ -59,7 +60,7 @@ pub const Coordinator = struct {
                     if (state.epoch.eql(work.epoch.?) and state.phase == .ready and state.failure == .none and
                         (work.root == null or !work.root.?.eql(r.Generation.of(&state))))
                     {
-                        const proof = (try store.stepRelationPublicationProof(state, now_ns)) orelse return;
+                        const proof = (try store.stepRelationPublicationProof(state, now_ns)) orelse return false;
                         var publication_activation = activation;
                         publication_activation.version = protocol.relation_publication_version;
                         break :blk .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = publication_activation } };
@@ -67,11 +68,12 @@ pub const Coordinator = struct {
                 }
             }
             try store.cancelRelationPublicationProof(group);
-            break :blk (try worker.nextIntent(work, group, self.prefer_gc)) orelse return;
+            break :blk (try worker.nextIntent(work, group, self.prefer_gc)) orelse return false;
         };
         const bytes = try command.encodeAlloc(alloc);
         defer alloc.free(bytes);
         try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
         self.prefer_gc = command != .garbage;
+        return true;
     }
 };

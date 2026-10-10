@@ -76,6 +76,46 @@ def exercise_ddl(conn):
     admit(f"DROP INDEX {index}", simple=True)
     admit(f"CREATE INDEX {index} ON {parent}(n)")
 
+    # Generated backing indexes must avoid existing namespace objects and
+    # explicit names later in the declaration. Exercise the FK plan path too.
+    collision = prefix + "_collision"
+    for suffix in ("_pkey", "_pkey1"):
+        admit(f"CREATE INDEX {collision + suffix} ON {parent}(n)")
+    admit(
+        f"CREATE TABLE {collision} (id TEXT PRIMARY KEY, p TEXT REFERENCES {parent}(id), "
+        f"n BIGINT, CONSTRAINT {collision}_pkey2 UNIQUE(n))"
+    )
+    visible(collision)
+    conn.execute(f"INSERT INTO {collision} (id, p, n) VALUES ('c', 'p', 1)")
+    conn.execute(f"SELECT id FROM {collision}").fetchone()
+    conn.execute(f"DELETE FROM {collision} WHERE id = 'c'")
+    admit(f"CREATE TABLE IF NOT EXISTS {collision} (id TEXT PRIMARY KEY)")
+    try:
+        admit(f"CREATE INDEX {collision}_pkey3 ON {parent}(n)")
+    except psycopg.Error as exc:
+        assert exc.sqlstate == "42P07", exc
+    else:
+        raise AssertionError("generated primary-key index name was not reserved")
+    # Clipping two distinct table identifiers can yield the same default name.
+    long_prefix = prefix + "x" * (60 - len(prefix))
+    for ending in ("aaa", "bbb"):
+        long_table = long_prefix + ending
+        admit(f"CREATE TABLE {long_table} (id TEXT PRIMARY KEY)", simple=True)
+        visible(long_table)
+        conn.execute(f"INSERT INTO {long_table} (id) VALUES ('c')")
+
+    explicit = prefix + "_explicit"
+    try:
+        admit(
+            f"CREATE TABLE IF NOT EXISTS {explicit} (id TEXT CONSTRAINT {collision}_pkey PRIMARY KEY)"
+        )
+    except psycopg.Error as exc:
+        assert exc.sqlstate == "42P07", exc
+    else:
+        raise AssertionError("explicit index-name conflict was silently accepted")
+    admit(f"CREATE TABLE {explicit} (id TEXT PRIMARY KEY)")
+    visible(explicit)
+
     for columns in (10, 20, 30, 40, 50, 128, 256, 10):
         print(f"psycopg standalone DDL: {columns} columns", flush=True)
         child = prefix + "_child_" + str(columns) + "_" + uuid.uuid4().hex[:6]

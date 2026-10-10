@@ -31,8 +31,14 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     const alloc = allocators.scratch;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
+    var generated_names: std.ArrayList([]const u8) = .empty;
+    defer generated_names.deinit(alloc);
+    if (statement == .create_table) for (statement.create_table.constraints) |constraint| {
+        if (constraint == .add_unique and constraint.add_unique.generated_name)
+            try generated_names.append(alloc, constraint.add_unique.name);
+    };
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names.items } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },

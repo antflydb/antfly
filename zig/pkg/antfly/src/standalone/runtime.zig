@@ -3470,13 +3470,19 @@ const LocalStandaloneMetadata = struct {
         const store = self.lifecycle_store orelse return;
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock();
-        self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs()) catch |err| switch (err) {
-            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => {},
+        const before = try store.standaloneRevision();
+        const applied = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs()) catch |err| switch (err) {
+            error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => false,
             else => return err,
         };
-        // Control intents advance the same durable catalog revision as public
-        // mutations, but change no table-manager projection.
-        self.durable_revision = try store.standaloneRevision();
+        const after = try store.standaloneRevision();
+        // Only certify an already current projection when this exact control
+        // intent was the sole write. A failed refresh (revision zero), an
+        // independent writer, or an uncertain apply must remain detectable by
+        // the next catalog reader. No full projection scan on control rounds.
+        if (self.durable_revision != 0 and self.durable_revision == before and
+            applied and before != std.math.maxInt(u64) and after == before + 1)
+            self.durable_revision = after;
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
@@ -12168,8 +12174,11 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
     defer alloc.free(drop_json);
     // Use two external parent owners as well, so native publication exercises
     // independent source/parent roles and receipts beyond the first range.
+    // Backing-index names belong to the namespace, not to each physical table.
+    const parent_schema = try std.mem.replaceOwned(u8, alloc, drop_json, "\"name\":\"pk\"", "\"name\":\"other_nodes_pk\"");
+    defer alloc.free(parent_schema);
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "other_nodes", .{
-        .schema_json = @constCast(drop_json),
+        .schema_json = parent_schema,
         .indexes_json = @constCast("{}"),
         .num_shards = 2,
     });
@@ -12392,6 +12401,21 @@ fn exerciseNativeTruncatePublishedOwners(alloc: std.mem.Allocator, metadata: *Lo
     try nativeTruncateRequestStatus(alloc, server, "/tables/other_nodes/batch", "{\"inserts\":{\"parent-row\":{\"id\":1,\"parent_id\":1}},\"sync_level\":\"full_index\"}", 201);
     try nativeTruncateRequestStatus(alloc, server, "/tables/nodes/batch", "{\"inserts\":{\"new-child\":{\"id\":4,\"parent_id\":1}},\"sync_level\":\"full_index\"}", 201);
     try nativeTruncateRequestStatus(alloc, server, "/tables/other_nodes/batch", "{\"deletes\":[\"parent-row\"]}", 409);
+    // This fixture drives the control loop explicitly. Settle its current
+    // relation cut before SQL chooses a namespace-wide automatic index name.
+    var published = false;
+    for (0..128) |_| {
+        metadata.relation_reconciliation.next_round_at_ns = 0;
+        try metadata.reconcileRelations();
+        const work = try metadata.lifecycle_store.?.relationReconciliationWork(group_ids.main_metadata_group_id);
+        if (work.current) |state| if (work.root) |root| {
+            if (work.epoch != null and state.epoch.eql(work.epoch.?) and root.eql(@import("antfly_local_sources").system_catalog_relation_reconciliation.Generation.of(&state))) {
+                published = true;
+                break;
+            }
+        };
+    }
+    try std.testing.expect(published);
     try nativeTruncateRequestStatus(alloc, server, "/sql", "{\"statement\":\"CREATE TABLE docs (id BIGINT PRIMARY KEY, graph_target TEXT)\"}", 200);
     _ = try reconcileStandaloneInitialFkVisible(metadata, data, alloc);
     try nativeTruncateRequestStatus(alloc, server, "/tables/docs/indexes/links", "{\"name\":\"links\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"cites\",\"field\":\"graph_target\"}]}", 201);
@@ -14837,6 +14861,20 @@ test "system catalog standalone relation coordinator publishes changed schemas a
     const new_schema = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"new_idx\",\"keys\":[{\"column\":\"id\"}]}]}";
     const table: antfly.metadata.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = old_schema, .indexes_json = "{}" };
     try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const committed_revision = try store.standaloneRevision();
+    // A committed mutation whose cache refresh exhausts memory must remain
+    // invalid through another failed control round, then recover on retry.
+    {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        metadata.alloc = failing.allocator();
+        defer metadata.alloc = alloc;
+        try std.testing.expectError(error.OutOfMemory, metadata.reloadLifecycleProjectionLocked());
+        try std.testing.expectEqual(@as(u64, 0), metadata.durable_revision);
+        try metadata.reconcileRelations();
+        try std.testing.expectEqual(@as(u64, 0), metadata.durable_revision);
+        try std.testing.expectEqual(committed_revision, try store.standaloneRevision());
+        try std.testing.expect(metadata.findTableByNameLocked("physical") == null);
+    }
     metadata.coordinated_lifecycle_allowed = false;
     try metadata.reconcileRelations();
     try std.testing.expect(!try store.relationSourceTrackingActive(group));
@@ -14856,6 +14894,12 @@ test "system catalog standalone relation coordinator publishes changed schemas a
             };
         }
         try std.testing.expect(progressed);
+        if (iteration == 0) try std.testing.expectEqual(@as(u64, 0), metadata.durable_revision);
+        // A public reader recovers the invalid projection; control progression
+        // must not certify it merely because publication itself succeeded.
+        var snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
+        defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &snapshot);
+        try std.testing.expectEqualStrings(if (iteration == 0) old_schema else new_schema, metadata.findTableByNameLocked("physical").?.schema_json);
         const resolved = try store.resolveSystemCatalogIdentities(alloc, group, .{ .relations = &targets });
         defer resolved.deinit(alloc);
         try std.testing.expect(resolved.relations[iteration] != null);

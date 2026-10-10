@@ -487,7 +487,15 @@ pub const MutationOutcome = enum {
 };
 
 pub const Ddl = union(enum) {
-    create_table: struct { name: ast.Name, schema_json: []const u8, if_not_exists: bool, tablespace: ?[]const u8 = null },
+    create_table: struct {
+        name: ast.Name,
+        schema_json: []const u8,
+        if_not_exists: bool,
+        tablespace: ?[]const u8 = null,
+        /// Only compiler-generated backing index names may be disambiguated.
+        /// Explicit SQL names remain exact catalog declarations.
+        generated_constraint_names: []const []const u8 = &.{},
+    },
     drop_table: ast.DropTable,
     catalog_ddl: ast.CatalogDdl,
     policy_ddl: ast.PolicyDdl,
