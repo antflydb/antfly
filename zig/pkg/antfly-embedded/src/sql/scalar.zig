@@ -2387,6 +2387,24 @@ const Binder = struct {
                         _ = try self.infer(arg, depth + 1);
                     },
                 }
+                if (function == .nullif) {
+                    const left = try self.infer(call.args[0], depth + 1);
+                    const right = try self.infer(call.args[1], depth + 1);
+                    if (numeric(left.kind) and numeric(right.kind)) {
+                        // NULLIF returns the equality operator's first operand,
+                        // rather than the CASE/COALESCE common result domain.
+                        merged = left;
+                        const left_floating = left.kind == .number and (left.element_type == null or builtin_cast.floating(left.element_type.?));
+                        const right_floating = right.kind == .number and (right.element_type == null or builtin_cast.floating(right.element_type.?));
+                        if (!left_floating and right_floating) {
+                            merged.kind = .number;
+                            merged.element_type = .float64;
+                        } else if (left.kind == .integer and right.element_type == .numeric) {
+                            merged.kind = .number;
+                            merged.element_type = .numeric;
+                        }
+                    }
+                }
                 // These constructs select their own result type before an
                 // enclosing expression can supply a coercion context.
                 if (merged.kind == null) switch (function) {
@@ -2733,7 +2751,11 @@ const Binder = struct {
                         .jsonb_set => if (i == 1) .text else null,
                         .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
                         .array_to_string => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .text,
-                        .@"$array_quantified" => if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                        // Known probes retain their declared domain. Forcing
+                        // NUMERIC into real[]'s element type changes equality;
+                        // only an unknown probe adopts the array domain.
+                        .@"$array_quantified" => if (i == 0 and actual.kind != null) null else if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                        .nullif => if (actual.kind != null) null else kind.element_type,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
                         else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
@@ -3530,9 +3552,30 @@ const Evaluator = struct {
                         break :blk .{};
                     },
                     .nullif => {
-                        const left = try self.runDatum(call.args[0], depth + 1);
-                        const right = try self.runDatum(call.args[1], depth + 1);
-                        break :blk if (left.sql_null or (!right.sql_null and (try self.compareValues(left, right)) == .eq)) .{} else left;
+                        var left = try self.runDatum(call.args[0], depth + 1);
+                        if (instruction.type.kind == .number) {
+                            const target = instruction.type.element_type orelse .float64;
+                            if ((target == .numeric and left.numeric == null) or
+                                (builtin_cast.floating(target) and (left.numeric != null or left.value == .integer)))
+                                left = try self.castDatumBuiltin(left, self.program.instructions[call.args[0]].type.element_type, target);
+                        }
+                        var right = try self.runDatum(call.args[1], depth + 1);
+                        // Mixed NUMERIC/floating equality uses float8, while
+                        // an already floating first operand keeps its width.
+                        if (!right.sql_null and instruction.type.kind == .number) {
+                            const target = instruction.type.element_type orelse .float64;
+                            if (target == .numeric and right.numeric == null)
+                                right = try self.castDatumBuiltin(right, self.program.instructions[call.args[1]].type.element_type, .numeric)
+                            else if (builtin_cast.floating(target) and (right.numeric != null or right.value == .integer))
+                                right = try self.castDatumBuiltin(right, self.program.instructions[call.args[1]].type.element_type, .float64);
+                        }
+                        if (left.sql_null) break :blk .{};
+                        if (right.sql_null) break :blk left;
+                        const order = if (left.value == .float and right.value == .float) floating: {
+                            var work = self.workBudget();
+                            break :floating try arrays.compareElement(.float64, left, right, &work);
+                        } else try self.compareValues(left, right);
+                        break :blk if (order == .eq) .{} else left;
                     },
                     .greatest, .least => {
                         var best: Datum = .{};

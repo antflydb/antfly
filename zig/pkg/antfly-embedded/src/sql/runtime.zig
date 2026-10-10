@@ -1844,6 +1844,109 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
     };
 }
 
+test "SQL mixed numeric comparisons preserve prepared ANY ALL probe domains" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, parameter: Json, expected: []const Json };
+    const cases = [_]Case{
+        .{ .sql = "SELECT $1 = ANY(ARRAY[1.1::real]),$1 <> ALL(ARRAY[1.1::real]),$1 = ANY(ARRAY[1.1::double precision])", .parameter = .{ .string = "1.1" }, .expected = &.{ .{ .bool = false }, .{ .bool = true }, .{ .bool = true } } },
+        .{ .sql = "SELECT $1 = ANY(ARRAY[0::real]),$1 <> ALL(ARRAY[0::real])", .parameter = .{ .string = "1e100" }, .expected = &.{ .{ .bool = false }, .{ .bool = true } } },
+        .{ .sql = "SELECT $1 = ANY(ARRAY[1.1::real,NULL]),$1 <> ALL(ARRAY[1.1::real,NULL])", .parameter = .{ .string = "1.1" }, .expected = &.{ .null, .null } },
+        .{ .sql = "SELECT $1 = ANY(ARRAY[]::real[]),$1 <> ALL(ARRAY[]::real[])", .parameter = .null, .expected = &.{ .{ .bool = false }, .{ .bool = true } } },
+        .{ .sql = "SELECT $1 = ANY(NULL::real[]),$1 <> ALL(NULL::real[])", .parameter = .{ .string = "1.1" }, .expected = &.{ .null, .null } },
+        .{ .sql = "SELECT 1.1 = ANY(ARRAY[1.1::real]),1.1 <> ALL(ARRAY[1.1::real]),$1::text", .parameter = .{ .string = "1.1" }, .expected = &.{ .{ .bool = false }, .{ .bool = true }, .{ .string = "1.1" } } },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var backend = fixture.iface();
+        backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }};
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{case.parameter}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        for (result.output.rows[0], case.expected) |actual, expected| {
+            try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+            switch (expected) {
+                .bool => |value| try std.testing.expectEqual(value, actual.bool),
+                .string => |value| try std.testing.expectEqualStrings(value, actual.string),
+                .null => {},
+                else => unreachable,
+            }
+        }
+    }
+}
+
+test "SQL mixed numeric comparisons preserve NULLIF equality and return domains" {
+    const a = std.testing.allocator;
+    const Kind = @import("array_value.zig").ElementType;
+    const cases = [_]struct { expression: []const u8, kind: Kind, text: ?[]const u8 }{
+        .{ .expression = "NULLIF(1.1::real,1.1::numeric)", .kind = .float32, .text = "1.1" },
+        .{ .expression = "NULLIF(1.1::numeric,1.1::real)", .kind = .float64, .text = "1.1" },
+        .{ .expression = "NULLIF(1::real,1::numeric)", .kind = .float32, .text = null },
+        .{ .expression = "NULLIF(1::numeric,1::real)", .kind = .float64, .text = null },
+        .{ .expression = "NULLIF(1::int4,2::int8)", .kind = .int32, .text = "1" },
+        .{ .expression = "NULLIF(1::int2,2::int8)", .kind = .int16, .text = "1" },
+        .{ .expression = "NULLIF(1::int4,2::real)", .kind = .float64, .text = "1" },
+        .{ .expression = "NULLIF(1::real,2::int4)", .kind = .float32, .text = "1" },
+        .{ .expression = "NULLIF('9007199254740993'::int8,'9007199254740992'::double precision)", .kind = .float64, .text = null },
+        .{ .expression = "NULLIF('9007199254740992'::double precision,'9007199254740993'::int8)", .kind = .float64, .text = null },
+        .{ .expression = "NULLIF(1::int4,2::numeric)", .kind = .numeric, .text = "1" },
+        .{ .expression = "NULLIF(1.20::numeric,2::int4)", .kind = .numeric, .text = "1.20" },
+        .{ .expression = "NULLIF('9007199254740993.1200'::numeric,2::int8)", .kind = .numeric, .text = "9007199254740993.1200" },
+        .{ .expression = "NULLIF(NULL::numeric,1::real)", .kind = .float64, .text = null },
+        .{ .expression = "NULLIF(1.1::real,NULL::numeric)", .kind = .float32, .text = "1.1" },
+        .{ .expression = "NULLIF('NaN'::numeric,'NaN'::real)", .kind = .float64, .text = null },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        const sql = try std.fmt.allocPrint(a, "SELECT {s},({s})::text", .{ case.expression, case.expression });
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(?Kind, case.kind), result.output.columns[0].element_type);
+        const actual = result.output.rows[0][1];
+        if (case.text) |text| {
+            try std.testing.expectEqual(std.meta.Tag(Json).string, std.meta.activeTag(actual));
+            try std.testing.expectEqualStrings(text, actual.string);
+        } else try std.testing.expectEqual(std.meta.Tag(Json).null, std.meta.activeTag(actual));
+    }
+    var overflow = try compiler.compile(a, "SELECT NULLIF(NULL::real,1e1000::numeric)", .{});
+    defer overflow.deinit();
+    var overflow_fixture: TestBackend = .{ .row_count = 0 };
+    try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, overflow_fixture.iface(), &overflow, &.{}, .{}));
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var backend = fixture.iface();
+    backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }};
+    var compiled = try compiler.compile(a, "SELECT NULLIF($1,1.1::real),NULLIF(1.1::real,$1)", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{.{ .string = "1.1" }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(?Kind, .float64), result.output.columns[0].element_type);
+    try std.testing.expectEqual(@as(?Kind, .float32), result.output.columns[1].element_type);
+    try std.testing.expectEqual(@as(f64, 1.1), result.output.rows[0][0].float);
+    try std.testing.expectEqual(@as(f64, @as(f32, 1.1)), result.output.rows[0][1].float);
+}
+
+test "SQL mixed numeric comparisons unwind prepared allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fixture: TestBackend = .{ .row_count = 0 };
+            var backend = fixture.iface();
+            backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }};
+            var result = try execute(a, backend, compiled, &.{.{ .string = "1.1" }}, .{});
+            defer result.deinit();
+            try std.testing.expect(!result.output.rows[0][0].bool);
+            try std.testing.expect(result.output.rows[0][1] != .null);
+            try std.testing.expect(result.output.rows[0][2] != .null);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT $1 = ANY(ARRAY[1.1::real]),NULLIF($1,1.1::real),NULLIF(1.1::real,$1)", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
+}
+
 test "SQL floating text consumers preserve declared width exponents and signed zero" {
     const a = std.testing.allocator;
     for ([_]struct { sql: []const u8, expected: []const u8 }{
