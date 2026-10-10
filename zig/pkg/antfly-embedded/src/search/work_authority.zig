@@ -8,6 +8,10 @@ pub const Authority = struct {
     context: *const anyopaque,
     check_fn: *const fn (*const anyopaque) anyerror!void,
 
+    pub fn checkpoint(self: Authority) !void {
+        try self.check();
+    }
+
     pub fn check(self: Authority) !void {
         try self.check_fn(self.context);
     }

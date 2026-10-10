@@ -588,10 +588,15 @@ pub fn execute(
 /// Exact snapshot count with at most one segment's filter bitmap in memory.
 /// Callers must separately prove that no primary visibility/residual check is owed.
 pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    return countMatchesWithAuthority(alloc, snap, query, null);
+}
+
+pub fn countMatchesWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, authority: ?WorkAuthority) !u32 {
+    if (authority) |owner| try owner.check();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
+    return std.math.cast(u32, try query_mod.countFilterWithAuthority(alloc, snap, filter, authority)) orelse error.CountOverflow;
 }
 
 pub fn executeCountCandidates(
@@ -599,16 +604,22 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
+    return executeCountCandidatesWithAuthority(alloc, snap, query, null);
+}
+
+pub fn executeCountCandidatesWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery, authority: ?WorkAuthority) !SearchResult {
+    if (authority) |owner| try owner.check();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
     const filter = try searchQueryToFilterArena(arena.allocator(), query);
-    const doc_ids = try snap.executeFilter(alloc, filter);
+    const doc_ids = try query_mod.executeFilterWithAuthority(alloc, snap, filter, authority);
     defer alloc.free(doc_ids);
 
     var hits = try alloc.alloc(ScoredHit, doc_ids.len);
     errdefer alloc.free(hits);
     for (doc_ids, 0..) |doc_id, i| {
+        if (i % 64 == 0) if (authority) |owner| try owner.check();
         hits[i] = .{
             .doc_id = doc_id,
             .score = 0,
@@ -617,6 +628,7 @@ pub fn executeCountCandidates(
         };
     }
 
+    if (authority) |owner| try owner.check();
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(doc_ids.len) };
 }
 
@@ -6350,5 +6362,46 @@ test "native text search propagates lifetime authority through snapshot scoring 
     for (legacy.hits, controlled.hits) |expected, actual| {
         try std.testing.expectEqual(expected.doc_id, actual.doc_id);
         try std.testing.expectEqual(expected.score, actual.score);
+    }
+}
+
+test "native text count authority covers exact and candidate count entry points" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("one");
+    const snapshot = writer.snapshot();
+    const query: SearchQuery = .{ .term = .{ .field = "title", .term = "hello" } };
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const authority: WorkAuthority = .{ .context = &state, .check_fn = State.check };
+    try std.testing.expectEqual(@as(u32, 1), try countMatchesWithAuthority(a, snapshot, query, authority));
+    const exact_checks = state.calls;
+    state = .{};
+    var candidates = try executeCountCandidatesWithAuthority(a, snapshot, query, authority);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u32, 1), candidates.total_hits);
+    const candidate_checks = state.calls;
+    for (1..exact_checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, countMatchesWithAuthority(a, snapshot, query, authority));
+    }
+    for (1..candidate_checks + 1) |fail_at| {
+        state = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.SchedulerClosed, executeCountCandidatesWithAuthority(a, snapshot, query, authority));
     }
 }

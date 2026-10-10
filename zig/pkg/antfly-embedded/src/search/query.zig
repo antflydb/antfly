@@ -37,6 +37,7 @@ const levenshtein = @import("levenshtein.zig");
 const regex_mod = @import("regex.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
+const WorkAuthority = @import("work_authority.zig").Authority;
 const read_admission = @import("../common/read_admission.zig");
 const synonyms_mod = @import("../section/synonyms.zig");
 
@@ -105,6 +106,32 @@ pub const Filter = union(enum) {
         };
     }
 
+    /// Borrow lifetime controls only for this invocation. These callbacks never
+    /// suspend: callers may retain analysis/index locks while evaluating filters.
+    pub fn executeWithOffsetAndAuthority(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        if (authority == null) return self.executeWithOffset(alloc, seg, doc_offset);
+        try authority.?.check();
+        seg.beginAccess();
+        defer seg.endAccess();
+        var result = switch (self) {
+            .term => |term| try term.executeWithAuthority(alloc, seg, authority),
+            .bool_filter => |filter| try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority),
+            .match_all => blk: {
+                var bm = roaring.RoaringBitmap.init(alloc);
+                errdefer bm.deinit();
+                for (0..seg.reader.doc_count) |doc| {
+                    if (doc % 64 == 0) try authority.?.check();
+                    try bm.add(@intCast(doc));
+                }
+                break :blk bm;
+            },
+            else => try self.executeWithOffset(alloc, seg, doc_offset),
+        };
+        errdefer result.deinit();
+        try authority.?.check();
+        return result;
+    }
+
     fn matchNone(alloc: Allocator) roaring.RoaringBitmap {
         return roaring.RoaringBitmap.init(alloc);
     }
@@ -131,6 +158,14 @@ pub const TermFilter = struct {
     }
 
     pub fn executeWithAdmission(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, control: ?read_admission.Port) FilterError!roaring.RoaringBitmap {
+        return self.executeControlled(alloc, seg, control);
+    }
+
+    pub fn executeWithAuthority(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeControlled(alloc, seg, authority);
+    }
+
+    fn executeControlled(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, control: anytype) FilterError!roaring.RoaringBitmap {
         if (control) |budget| try budget.checkpoint();
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -186,7 +221,7 @@ pub const TermFilter = struct {
 
 /// Keep the ordinary bitmap path for uncontrolled callers. Controlled
 /// scans decode bounded postings chunks and checkpoint between groups of hits.
-fn postingsBitmapWithAdmission(alloc: Allocator, postings: inverted.TermPostings, control: ?read_admission.Port) !roaring.RoaringBitmap {
+fn postingsBitmapWithAdmission(alloc: Allocator, postings: inverted.TermPostings, control: anytype) !roaring.RoaringBitmap {
     const budget = control orelse return postings.docBitmap(alloc);
     var bitmap = roaring.RoaringBitmap.init(alloc);
     errdefer bitmap.deinit();
@@ -225,12 +260,17 @@ pub const BoolFilter = struct {
     }
 
     pub fn executeWithOffset(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return self.executeWithOffsetAndAuthority(alloc, seg, doc_offset, null);
+    }
+
+    pub fn executeWithOffsetAndAuthority(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         var result: ?roaring.RoaringBitmap = null;
         errdefer if (result) |*r| r.deinit();
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -243,7 +283,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, authority);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -261,7 +301,8 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -276,6 +317,7 @@ fn executeShouldClauses(
     min_should_match: u32,
     seg: *const index_mod.SegmentEntry,
     doc_offset: u32,
+    authority: ?WorkAuthority,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
         return roaring.RoaringBitmap.init(alloc);
@@ -285,7 +327,8 @@ fn executeShouldClauses(
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         for (should) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = try clause.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -296,11 +339,15 @@ fn executeShouldClauses(
     defer counts.deinit(alloc);
 
     for (should) |clause| {
-        var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+        if (authority) |owner| try owner.check();
+        var clause_bm = try clause.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
+        var collected: usize = 0;
         while (iter.next()) |doc_id| {
+            if (collected % 64 == 0) if (authority) |owner| try owner.check();
+            collected += 1;
             const entry = try counts.getOrPut(alloc, doc_id);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
@@ -310,7 +357,10 @@ fn executeShouldClauses(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
     var iter = counts.iterator();
+    var collected: usize = 0;
     while (iter.next()) |entry| {
+        if (collected % 64 == 0) if (authority) |owner| try owner.check();
+        collected += 1;
         if (entry.value_ptr.* >= min_should_match) {
             try result.add(entry.key_ptr.*);
         }
@@ -1844,18 +1894,28 @@ pub fn executeFilter(
 
 /// Borrow controls only for this synchronous scan; never mutate shared readers.
 pub fn executeFilterWithAdmission(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, control: ?read_admission.Port) ![]u32 {
+    return executeFilterControlled(alloc, snap, filter, control, null);
+}
+
+pub fn executeFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, authority: ?WorkAuthority) ![]u32 {
+    return executeFilterControlled(alloc, snap, filter, null, authority);
+}
+
+fn executeFilterControlled(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, control: ?read_admission.Port, authority: ?WorkAuthority) ![]u32 {
     if (control) |budget| try budget.checkpoint();
+    if (authority) |owner| try owner.check();
     var all_ids = std.ArrayListUnmanaged(u32).empty;
     defer all_ids.deinit(alloc);
 
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
+        if (authority) |owner| try owner.check();
         if (control) |budget| try budget.checkpoint();
         var bm = if (filter == .term and control != null) blk: {
             seg.beginAccess();
             defer seg.endAccess();
             break :blk try filter.term.executeWithAdmission(alloc, seg, control);
-        } else try filter.executeWithOffset(alloc, seg, doc_offset);
+        } else try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         if (control) |budget| budget.checkpoint() catch |err| {
             bm.deinit();
             return err;
@@ -1874,6 +1934,7 @@ pub fn executeFilterWithAdmission(alloc: Allocator, snap: *const index_mod.Index
         var collected: usize = 0;
         while (iter.next()) |doc_id| {
             if (collected % 64 == 0) if (control) |budget| try budget.checkpoint();
+            if (collected % 64 == 0) if (authority) |owner| try owner.check();
             collected += 1;
             try all_ids.append(alloc, doc_id + doc_offset);
         }
@@ -1882,6 +1943,7 @@ pub fn executeFilterWithAdmission(alloc: Allocator, snap: *const index_mod.Index
     }
 
     if (control) |budget| try budget.checkpoint();
+    if (authority) |owner| try owner.check();
     return try alloc.dupe(u32, all_ids.items);
 }
 
@@ -1964,9 +2026,15 @@ pub fn countFilter(
     snap: *const index_mod.IndexSnapshot,
     filter: Filter,
 ) !usize {
+    return countFilterWithAuthority(alloc, snap, filter, null);
+}
+
+pub fn countFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, authority: ?WorkAuthority) !usize {
+    if (authority) |owner| try owner.check();
     var total: usize = 0;
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
+        if (authority) |owner| try owner.check();
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
         if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
             seg.shared.lockDeletionShared();
@@ -1977,7 +2045,7 @@ pub fn countFilter(
                 continue;
             }
         }
-        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
+        var bm = try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer bm.deinit();
 
         {
@@ -1989,6 +2057,7 @@ pub fn countFilter(
         doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
     }
+    if (authority) |owner| try owner.check();
     return total;
 }
 
@@ -3897,4 +3966,63 @@ test "controlled term filter checkpoints preserve exact results and retire parti
     const retry = try executeFilterWithAdmission(alloc, snap, filter, port);
     defer alloc.free(retry);
     try testing.expectEqualSlices(u32, expected, retry);
+}
+
+test "controlled count filters retain exact Boolean and live document semantics on rejection" {
+    const a = testing.allocator;
+    const docs: [193]TestTermDocument = @splat(.{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} });
+    const bytes = try buildTestSegmentWithTerms(a, &docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("17");
+    const snapshot = writer.snapshot();
+    const alpha: Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const missing: Filter = .{ .term = .{ .field = "body", .term = "missing" } };
+    const compound: Filter = .{ .bool_filter = .{
+        .must = &.{.{ .bool_filter = .{ .must = &.{alpha}, .should = &.{}, .must_not = &.{} } }},
+        .should = &.{ alpha, alpha },
+        .min_should_match = 2,
+        .must_not = &.{missing},
+    } };
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        cause: anyerror = error.Canceled,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return self.cause;
+        }
+    };
+    for ([_]Filter{ alpha, compound, .{ .match_all = {} } }) |filter| {
+        const expected = try executeFilter(a, snapshot, filter);
+        defer a.free(expected);
+        var state: State = .{};
+        const authority: WorkAuthority = .{ .context = &state, .check_fn = State.check };
+        const actual = try executeFilterWithAuthority(a, snapshot, filter, authority);
+        defer a.free(actual);
+        try testing.expectEqualSlices(u32, expected, actual);
+        const candidate_checks = state.calls;
+        state = .{};
+        try testing.expectEqual(expected.len, try countFilterWithAuthority(a, snapshot, filter, authority));
+        const count_checks = state.calls;
+        try testing.expect(count_checks > 6);
+        for ([_]anyerror{ error.Canceled, error.Timeout, error.SchedulerClosed }) |cause| {
+            for (1..count_checks + 1) |fail_at| {
+                state = .{ .fail_at = fail_at, .cause = cause };
+                try testing.expectError(cause, countFilterWithAuthority(a, snapshot, filter, authority));
+                try testing.expectEqual(fail_at, state.calls);
+            }
+            for (1..candidate_checks + 1) |fail_at| {
+                state = .{ .fail_at = fail_at, .cause = cause };
+                try testing.expectError(cause, executeFilterWithAuthority(a, snapshot, filter, authority));
+                try testing.expectEqual(fail_at, state.calls);
+            }
+        }
+        state = .{};
+        try testing.expectEqual(expected.len, try countFilterWithAuthority(a, snapshot, filter, authority));
+    }
 }

@@ -2375,7 +2375,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const text_scoring_authority_tests = b.addTest(.{
         .name = "text-scoring-authority-tests",
         .root_module = text_scoring_authority_root,
-        .filters = &.{ "controlled WAND scoring", "native text lifetime", "native text search propagates lifetime", "scorer", "single-term", "WAND", "shared top-k" },
+        .filters = &.{ "controlled WAND scoring", "native text lifetime", "native text search propagates lifetime", "controlled count filters", "native text count authority", "controlled term filter checkpoints", "scorer", "single-term", "WAND", "shared top-k" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-text-scoring-authority-test", "Verify original lifetime failures retire native scoring state")

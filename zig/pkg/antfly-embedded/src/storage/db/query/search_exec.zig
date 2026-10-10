@@ -11848,7 +11848,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        const total = try search_mod.countMatchesWithAuthority(alloc, snapshot, search_query, @import("../../query_controls.zig").nativeTextAuthority(&effective_req));
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -12063,7 +12063,7 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+            try search_mod.executeCountCandidatesWithAuthority(alloc, snapshot, search_query, @import("../../query_controls.zig").nativeTextAuthority(&effective_req))
         else
             try search_mod.execute(alloc, snapshot, .{
                 .authority = @import("../../query_controls.zig").nativeTextAuthority(&effective_req),

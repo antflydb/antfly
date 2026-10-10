@@ -1330,3 +1330,15 @@ expiration during unscored block pruning. This is focused correctness evidence.
 It does not qualify CPU fairness under locks, arbitrary postings decoder work,
 phrase/count/sort/aggregation/vector paths, background execution, runtime resource
 limits, performance or automatic defaults. Those remain completion requirements.
+
+Both production count-only entry points now retain the same non-suspending
+original lifetime authority: exact snapshot counts and materialized candidate
+counts. Term postings (including synonym expansion), recursive Boolean clauses,
+minimum-should-match accumulation, match-all construction and candidate copying
+poll during their loops. Multi-segment offsets and deletion masks retain their
+existing semantics. Focused tests compare legacy/controlled membership and
+counts, exercise nested Boolean filters across deleted documents, and inject
+lifetime failures at every observed checkpoint to check partial retirement.
+Specialized leaf filters, bulk bitmap operations, positional verification,
+provider/decoder work and lock-safe CPU yielding still need bounded-work coverage;
+checks surrounding these operations do not prove bounded execution within them.
