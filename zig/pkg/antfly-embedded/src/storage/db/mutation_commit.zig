@@ -181,12 +181,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
         pub fn acquireReplicationMutationShared(self: anytype) ?MutationBarrier.SharedLease {
             const barrier = self.replicationMutationBarrier() orelse return null;
+            if (@import("mutation_admission.zig").receiverMutationRoot(self)) |root| {
+                std.debug.assert(root.barrier == barrier);
+                return root.borrow();
+            }
             return barrier.acquireShared();
         }
 
         pub fn batchContext(self: anytype) BatchExecutionContext {
             const resources = self.core.batchExecutionResources();
             return .{
+                .mutation_root = @import("mutation_admission.zig").receiverMutationRoot(self),
                 .alloc = self.alloc,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -218,6 +223,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .replication_async_metadata_mirror = self.local_execution.replication_async_metadata_mirror,
                 .replication_write_gate = self.local_execution.replication_write_gate,
             };
+        }
+
+        pub fn batchContextWithMutationRoot(self: anytype, root: ?*MutationBarrier.RootSharedLease) BatchExecutionContext {
+            var ctx = batchContext(self);
+            ctx.mutation_root = root orelse ctx.mutation_root;
+            return ctx;
         }
 
         pub fn batchInternalPrepared(
@@ -259,7 +270,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 mutation_admission.retainedLeaseControls(opts.admission_controls)
             else
                 opts.admission_controls;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationShared(self, initial_controls);
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
@@ -2387,7 +2398,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
-                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
+                var record = try prepareDirectChangeRecord(&batchContextWithMutationRoot(self, opts.mutation_root), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
                 defer change_journal_mod.deinitRecord(self.alloc, &record);
                 const payload = try change_journal_mod.encodeRecord(self.alloc, record);
                 errdefer self.alloc.free(payload);
@@ -2869,7 +2880,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var deferred_replication_gates = ReplicationDeferredCommitGates{};
             defer deferred_replication_gates.releaseTransition();
             if (!opts.bypass_replication_write_gate) {
-                var replication_ctx = self.batchContext();
+                var replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&replication_ctx));
                 if (transaction_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
@@ -2948,7 +2959,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             }
             if (!opts.bypass_replication_write_gate) {
-                const replication_ctx = self.batchContext();
+                const replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 try deferred_replication_gates.waitForDurabilityAndAuthority(replication_ctx.replication_write_gate);
                 if (opts.transaction_resolution != null or durable_replication_batch_payload != null or durable_replication_replay_payload != null) {
                     // The outbox is cleared only after every appended record has
@@ -2981,7 +2992,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
             }
             if (append_derived_replay) {
-                var pressure_ctx = self.batchContext();
+                var pressure_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 const backlog_pressure_start_ns = monotonicTimeNs();
                 try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
                 try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);

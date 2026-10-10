@@ -613,6 +613,8 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,
@@ -979,6 +981,8 @@ pub const RelationalPriorMembership = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Borrowed at a stable address; all nested work joins before root release.
+    mutation_root: ?*MutationBarrier.RootSharedLease = null,
     /// Borrowed only during pre-decision snapshot/apply acquisition. This
     /// authority never cancels mandatory retirement after primary durability.
     admission_controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = null,

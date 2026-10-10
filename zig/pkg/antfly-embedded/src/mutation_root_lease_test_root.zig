@@ -136,3 +136,117 @@ test "mutation root lease respects writer intent and original expiry across C1 p
     fresh.finish();
     try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
 }
+
+test "mutation root lease explicit nested admission bypasses writer gate and joins cross worker" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    var barrier: Barrier = .{};
+    const Controls = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?Boundary {
+            return null;
+        }
+    };
+    var controls: Controls = .{};
+    var root = try barrier.acquireSharedRootControlled(std.testing.io, &controls);
+    var held = true;
+    defer if (held) root.release();
+    const Owner = struct {
+        barrier: *Barrier,
+        mutation_root: ?*Barrier.RootSharedLease,
+        core: struct { apply_mutex: Apply = .{} } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    var owner: Owner = .{ .barrier = &barrier, .mutation_root = &root };
+    try std.testing.expect(barrier.reader_gate.tryLock());
+    var gate_held = true;
+    defer if (gate_held) barrier.reader_gate.unlock();
+    var first = (try admission.acquireReplicationMutationShared(&owner, null)).?;
+    var first_held = true;
+    defer if (first_held) first.release();
+    var second = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+    var second_held = true;
+    defer if (second_held) second.release();
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    try std.testing.expectEqual(@as(usize, 2), root.borrowers.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+    const worker = try std.Thread.spawn(.{}, Barrier.SharedLease.release, .{&second});
+    worker.join();
+    second_held = false;
+    try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    // Root cannot retire until the remaining synchronous consumer joins.
+    barrier.reader_gate.unlock();
+    gate_held = false;
+    try std.testing.expect(barrier.tryAcquireExclusive() == null);
+    // Release before the root, without allowing the deferred borrow to linger.
+    first.release();
+    first_held = false;
+    root.release();
+    held = false;
+    var capture = barrier.tryAcquireExclusive() orelse return error.LeakedMutationRoot;
+    capture.release();
+}
+
+test "mutation root lease explicit nested admission preserves rejection and rolls back borrow" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    const Controls = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?Boundary {
+            return null;
+        }
+    };
+    var controls: Controls = .{};
+    var barrier: Barrier = .{};
+    var root = try barrier.acquireSharedRootControlled(std.testing.io, &controls);
+    defer root.release();
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: Apply = .{} } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    var owner: Owner = .{ .barrier = &barrier };
+    const Lifetime = struct {
+        calls: usize = 0,
+        reject_at: usize,
+        failure: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls >= self.reject_at) return self.failure;
+        }
+        fn forbiddenWait(_: *anyopaque) !void {
+            @panic("nested borrowing cannot park CPU");
+        }
+    };
+    var old = root.borrow();
+    defer old.release();
+    try std.testing.expect(barrier.reader_gate.tryLock());
+    defer barrier.reader_gate.unlock();
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.Forbidden }) |failure| {
+        for ([_]usize{ 1, 2 }) |reject_at| {
+            var original: Lifetime = .{ .reject_at = reject_at, .failure = failure };
+            const acquisition: Apply.Acquisition = .{
+                .lifetime = .{ .context = &original, .check_fn = Lifetime.check },
+                .execution_wait = .{ .ptr = &original, .begin = Lifetime.forbiddenWait, .end = Lifetime.forbiddenWait },
+            };
+            try std.testing.expectError(failure, admission.acquireReplicationMutationSharedScoped(&owner, acquisition, &root));
+            try std.testing.expectEqual(reject_at, original.calls);
+            try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+        }
+    }
+    var other: Barrier = .{};
+    owner.barrier = &other;
+    try std.testing.expectError(error.InvalidArgument, admission.acquireReplicationMutationSharedScoped(&owner, null, &root));
+    owner.barrier = &barrier;
+    var healthy = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+    healthy.release();
+    try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+}

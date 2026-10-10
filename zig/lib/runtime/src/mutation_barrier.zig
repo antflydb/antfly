@@ -42,8 +42,16 @@ pub const MutationBarrier = struct {
     pub const SharedLease = struct {
         barrier: *MutationBarrier,
         nested: bool = false,
+        root: ?*RootSharedLease = null,
 
         pub fn release(self: *@This()) void {
+            if (self.root) |root| {
+                std.debug.assert(root.barrier == self.barrier);
+                const previous = root.borrowers.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 0);
+                self.* = undefined;
+                return;
+            }
             std.debug.assert(shared_barrier == self.barrier);
             std.debug.assert(shared_depth > 0);
             shared_depth -= 1;
@@ -61,7 +69,25 @@ pub const MutationBarrier = struct {
     /// physically join before release; they must not reacquire behind a writer.
     pub const RootSharedLease = struct {
         barrier: *MutationBarrier,
+        borrowers: std.atomic.Value(usize) = .init(0),
+
+        /// The root must stay at a stable address until every borrower has
+        /// physically joined and released. Borrowing never enters reader_gate.
+        pub fn borrow(self: *@This()) SharedLease {
+            _ = self.borrowers.fetchAdd(1, .acq_rel);
+            return .{ .barrier = self.barrier, .nested = true, .root = self };
+        }
+
+        pub fn borrowControlled(self: *@This(), controls: anytype) !SharedLease {
+            try controls.checkpoint();
+            var lease = self.borrow();
+            errdefer lease.release();
+            try controls.checkpoint();
+            return lease;
+        }
+
         pub fn release(self: *@This()) void {
+            std.debug.assert(self.borrowers.load(.acquire) == 0);
             self.barrier.unlockShared();
             self.* = undefined;
         }

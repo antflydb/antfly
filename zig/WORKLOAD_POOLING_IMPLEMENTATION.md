@@ -2521,3 +2521,36 @@ accepted work retains its separate completion authority. No production outer
 lease is switched until that complete graph is wired and physically verified.
 `retainedLeaseControls` still prohibits CPU transfer inside unconverted holders;
 this work does not enable defaults or qualify whole-holder CPU lending.
+
+
+### Explicit enclosing mutation borrows
+
+`RootSharedLease` now lends `SharedLease` consumers an explicit root pointer.
+Borrow acquisition increments an atomic count without entering the writer gate
+or changing legacy thread-local nesting. Controlled borrowing checks the original
+non-yielding lifetime before and after acquisition; post-acquisition rejection
+rolls back only that borrow. Borrow release can run on another worker. The root
+must remain at a stable address until every borrower physically joins and
+releases; root release asserts that the count is zero.
+
+`BatchExecutionOptions`, `BatchExecutionContext` and synchronous recovery
+`Context`/`Execution` carry the borrowed root. Prepared batch admission and its
+replication/change-record/pressure contexts preserve an explicitly supplied
+scope. Receiver-based nested mutation helpers and context-based DB helpers
+borrow it when present. Controlled admission rejects a root belonging to another
+barrier. No root pointer is installed on the shared resident DB.
+
+Four consumer fixtures exercise the preceding two root checks plus borrowing
+under a held writer gate with cross-worker release, and entry/post-grant
+Canceled/DeadlineExceeded/SchedulerClosed/Forbidden rejection with an existing
+borrow retained. These are primitive/admission checks; they do not execute the
+full DB batch or recovery receiver. The cumulative consumer suite must validate
+those implementations separately.
+
+Production callers still use legacy outer leases. Specialized batch dispatch,
+transaction/resolution entry, nested materialization and post-commit cleanup
+must propagate enclosing scope completely before replacing those outer leases.
+The dedicated recovery receiver cannot replace ordinary DB batch callbacks,
+which retain resident completion behavior. Mandatory completion authority and
+release before remote durability waits remain requirements. CPU transfer inside
+retained service holders and pooling defaults remain disabled/unqualified.

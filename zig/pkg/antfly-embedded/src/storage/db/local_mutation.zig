@@ -755,6 +755,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const vectorIndexConsumesChunkKey = materialization.vectorIndexConsumesChunkKey;
         pub const waitForCachedBool = commit.waitForCachedBool;
         pub const Execution = struct {
+            mutation_root: ?*execution_resources.MutationBarrier.RootSharedLease = null,
             local_execution: *LocalExecutionState,
             rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
             rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
@@ -901,6 +902,7 @@ pub fn ImplementationFor(comptime D: type) type {
             }
         };
         pub const Context = struct {
+            mutation_root: ?*execution_resources.MutationBarrier.RootSharedLease = null,
             local_execution: *LocalExecutionState,
             alloc: Allocator,
             runtime_alloc: Allocator,
@@ -923,6 +925,7 @@ pub fn ImplementationFor(comptime D: type) type {
 
             pub fn borrow(db: anytype) @This() {
                 return .{
+                    .mutation_root = @import("mutation_admission.zig").receiverMutationRoot(db),
                     .local_execution = db.local_execution,
                     .alloc = db.alloc,
                     .runtime_alloc = db.runtime_alloc,
@@ -950,6 +953,7 @@ pub fn ImplementationFor(comptime D: type) type {
             /// Its scratch allocations are released before returning to the driver.
             pub fn mutation(self: *const @This()) Execution {
                 return .{
+                    .mutation_root = self.mutation_root,
                     .local_execution = self.local_execution,
                     .alloc = self.alloc,
                     .runtime_alloc = self.runtime_alloc,

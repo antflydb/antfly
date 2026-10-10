@@ -23,7 +23,36 @@ pub fn lockApply(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !void 
 /// Pass the same original admission through the process-wide mutation/capture
 /// gate before acquiring snapshot/apply service fences. No new owner or time.
 pub fn acquireReplicationMutationShared(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease {
-    const barrier = owner.replicationMutationBarrier() orelse return null;
+    return acquireReplicationMutationSharedScoped(owner, controls, receiverMutationRoot(owner));
+}
+
+/// Explicit enclosing ownership belongs to an invocation, never to shared DB
+/// state or an OS thread. Legacy callers keep their existing nesting behavior.
+pub fn receiverMutationRoot(owner: anytype) ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease {
+    if (@hasField(@TypeOf(owner.*), "mutation_root")) return owner.mutation_root;
+    return null;
+}
+
+pub fn acquireReplicationMutationSharedScoped(
+    owner: anytype,
+    controls: ?lock.ApplyRwLock.Acquisition,
+    root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
+) !?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease {
+    const barrier = owner.replicationMutationBarrier() orelse {
+        if (root != null) return error.InvalidArgument;
+        return null;
+    };
+    if (root) |enclosing| {
+        if (enclosing.barrier != barrier) return error.InvalidArgument;
+        const Check = struct {
+            original: ?lock.ApplyRwLock.Acquisition,
+            pub fn checkpoint(self: *@This()) !void {
+                try checkLifetime(self.original);
+            }
+        };
+        var check: Check = .{ .original = controls };
+        return try enclosing.borrowControlled(&check);
+    }
     if (controls) |original| {
         const Adapter = struct {
             original: lock.ApplyRwLock.Acquisition,
