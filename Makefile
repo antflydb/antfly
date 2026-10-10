@@ -381,7 +381,7 @@ sdk-lint: ## Run SDK linter
 	(cd ./go/pkg/sdk && $(GO) vet ./...)
 
 # Explicit SQL extraction audits; intentionally outside default build/test gates.
-.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check sql-catalog-lifecycle-oracle-check
 sql-parity-inventory-check:
 	python3 scripts/check_sql_parity_inventory.py
 
@@ -390,3 +390,6 @@ sql-parity-evidence-check:
 
 sql-parity-release-check:
 	python3 scripts/check_sql_parity_inventory.py --release
+
+sql-catalog-lifecycle-oracle-check:
+	uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_sql_catalog_lifecycle.py
