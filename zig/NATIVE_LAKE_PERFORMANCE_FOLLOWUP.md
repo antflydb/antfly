@@ -1511,11 +1511,20 @@ bounded generation-specific scalar cache and current-authority checks remain in
 use. Request-owned raw branch envelopes are shared read-only across lanes and
 released with the query lease.
 
+Main's numeric-predicate fast path uses the same constrained scoring policy as
+bitmap predicates and candidate producers. Streaming lowering and segment
+binding share that single constraint flag, including boosted distributed leaves.
+Filtered WAND uses the selected distributed term frequencies alongside its
+matching document count and average length for both planning and scoring.
+Differential tests use unequal local/global frequencies and compare exact scores
+across numeric includes/exclusions, repeated match tokens and signed boosts.
+
 ### Qualification
 
-With Zig 0.17.0, Debug qualification passed 49 focused tests (one optimized-only
-benchmark skipped), all 243 lake integration tests and the production server
-build. ReleaseFast passed all 50 focused tests, including the collector
+With Zig 0.17.0 after merging origin/main at `083142678c`, Debug qualification
+passed 50 focused tests (one optimized-only benchmark skipped), all 313 lake
+integration tests and the production server build. ReleaseFast passed all 51
+focused tests, including the collector
 benchmark. All 16 page-tree tests also passed independently, including generic
 legacy encoding, integrity, snapshot retention, allocation failure and recovery.
 Final qualification reported no failures or allocator leaks. Zig formatting,

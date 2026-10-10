@@ -2398,13 +2398,15 @@ fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEnt
 }
 
 /// Query-wide statistics and segment planning are shared with unfiltered WAND.
-fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapshot, field: []const u8, terms: []const SimpleTextTerm, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32) !void {
+fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapshot, field: []const u8, terms: []const SimpleTextTerm, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32, scoring_stats: ?distributed_stats_mod.TextFieldStats) !void {
     const names = try alloc.alloc([]const u8, terms.len);
     defer alloc.free(names);
     const frequencies = try alloc.alloc(u32, terms.len);
     defer alloc.free(frequencies);
     for (terms, names) |term, *name| name.* = term.term;
-    try snap.termDocFreqs(alloc, field, names, frequencies);
+    if (scoring_stats) |stats| {
+        for (names, frequencies) |name, *frequency| frequency.* = stats.termDocFreq(name) orelse return error.InvalidArgument;
+    } else try snap.termDocFreqs(alloc, field, names, frequencies);
     const bound_table = try snap.bm25BoundTable(avg_dl, request.bm25_config);
     const plans = try snap.planTextSegments(alloc, field, names, frequencies, doc_count, avg_dl, request.bm25_config);
     defer alloc.free(plans);
@@ -2559,7 +2561,7 @@ fn executeSimpleTextBoolWithProducers(
         break;
     };
     if (filtered_wand) {
-        try collectFilteredWandQuery(alloc, snap, text_field, should_terms.items, request, &collector, scoring_doc_count, avg_dl);
+        try collectFilteredWandQuery(alloc, snap, text_field, should_terms.items, request, &collector, scoring_doc_count, avg_dl, scoring_stats);
     } else {
         if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
         var doc_offset: u32 = 0;
@@ -3177,7 +3179,6 @@ const LoweredText = struct {
         a: Allocator,
         stats: *StreamingBoolStats,
         constrained: bool,
-        bitmap: bool,
         fn node(self: *@This(), value: LoweredText) !*const LoweredText {
             const result = try self.a.create(LoweredText);
             result.* = value;
@@ -3261,7 +3262,7 @@ const LoweredText = struct {
                 .match_none => return self.node(.{}),
                 .match_all => return self.node(.{ .kind = .all }),
                 .doc_num => |d| return self.node(.{ .kind = if (d.bitmap != null) .bitmap else .none, .bitmap = d.bitmap, .boost = d.boost }),
-                .term => |t| return self.node(.{ .kind = .term, .term = t, .legacy_norm = self.stats.overrides.len == 0 and self.bitmap and t.boost != 1 }),
+                .term => |t| return self.node(.{ .kind = .term, .term = t, .legacy_norm = self.constrained and t.boost != 1 }),
                 .bool_query => |b| {
                     if (try self.simple(b)) |result| return result;
                     return self.node(.{ .kind = .boolean, .must = try self.children(b.must), .should = try self.children(b.should), .must_not = try self.children(b.must_not), .boost = b.boost, .minimum = if (b.should.len == 0) 0 else if (b.min_should == 0 and b.must.len == 0 and !b.pure_should_optional) 1 else b.min_should, .baseline = if (b.must.len == 0 and (b.should.len == 0 or b.pure_should_optional)) (if (b.pure_should_optional) @as(f32, 0) else @as(f32, 1)) else null });
@@ -3271,7 +3272,7 @@ const LoweredText = struct {
                     const names = try self.a.alloc([]const u8, tokens.len);
                     for (tokens, names) |token, *name| name.* = token.term;
                     const override = matchingFieldStats(self.stats.overrides, m.field, names);
-                    const legacy = self.stats.overrides.len == 0 and self.bitmap and m.boost != 1;
+                    const legacy = self.constrained and m.boost != 1;
                     var unique: std.ArrayListUnmanaged(*const LoweredText) = .empty;
                     for (tokens, 0..) |token, i| {
                         var duplicate = false;
@@ -3307,7 +3308,6 @@ const StreamingBoolBuilder = struct {
     config: inverted.BM25Config,
     stats: *StreamingBoolStats,
     constrained: bool,
-    bitmap_constraints: bool,
     planning: bool = false,
     compute_bounds: bool = true,
     summaries_only: bool = false,
@@ -3623,7 +3623,7 @@ const StreamingBoolBuilder = struct {
             },
             .term => |tq| {
                 value.boost = tq.boost;
-                value.legacy_norm = self.stats.overrides.len == 0 and self.bitmap_constraints and tq.boost != 1;
+                value.legacy_norm = self.constrained and tq.boost != 1;
                 const local = try self.stats.get(tq.field, tq.term);
                 const override = if (self.force_local_stats) null else self.stats_override orelse matchingFieldStats(self.stats.overrides, tq.field, &.{tq.term});
                 const frequency_hint = if (override) |global| global.termDocFreq(tq.term).? else local.frequency;
@@ -3673,7 +3673,7 @@ const StreamingBoolBuilder = struct {
                 self.force_local_stats = self.stats_override == null;
                 defer self.stats_override = previous_override;
                 defer self.force_local_stats = previous_local;
-                const legacy = self.stats.overrides.len == 0 and self.bitmap_constraints and mq.boost != 1;
+                const legacy = self.constrained and mq.boost != 1;
                 var unique: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty;
                 for (tokens, 0..) |token, i| {
                     var duplicate = false;
@@ -3751,7 +3751,7 @@ const StreamingBoolPrepared = struct {
         self.locked = .{ .backing = self.budget.allocator() };
         self.arena = std.heap.ArenaAllocator.init(self.locked.allocator());
         const segment = &cache.snap.segments[plan.segment_idx];
-        self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .bitmap_constraints = cache.request.filter_doc_bitmap != null or cache.request.exclude_doc_bitmap != null, .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
+        self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
         segment.beginAccess();
         defer segment.endAccess();
         self.prepare(cache.bq) catch |err| {
@@ -3947,7 +3947,7 @@ const StreamingBoolPlanning = struct {
             if (segment.reader.doc_count == 0) continue;
             _ = arena.reset(.free_all);
             var diagnostics: SearchDiagnostics = .{};
-            var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = self.cache.snap, .segment = segment, .offset = plan.doc_offset, .config = self.cache.request.bm25_config, .stats = self.cache.stats, .constrained = requestHasDocNumConstraints(self.cache.request) or self.cache.producers.present(), .bitmap_constraints = self.cache.request.filter_doc_bitmap != null or self.cache.request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .diagnostics = &diagnostics };
+            var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = self.cache.snap, .segment = segment, .offset = plan.doc_offset, .config = self.cache.request.bm25_config, .stats = self.cache.stats, .constrained = requestHasDocNumConstraints(self.cache.request) or self.cache.producers.present(), .planning = true, .summaries_only = true, .diagnostics = &diagnostics };
             defer builder.deinit();
             segment.beginAccess();
             defer segment.endAccess();
@@ -4001,7 +4001,7 @@ fn planStreamingBoolSegmentsCached(a: Allocator, scratch: *std.heap.ArenaAllocat
             segment.beginAccess();
             defer segment.endAccess();
             _ = scratch.reset(.retain_capacity);
-            var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .diagnostics = request.diagnostics };
+            var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .diagnostics = request.diagnostics };
             defer builder.deinit();
             upper = try (try builder.buildRequest(bq)).segmentBound();
         }
@@ -4043,7 +4043,7 @@ fn scoreStreamingBoolRange(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, 
     return scoreStreamingBoolRangeCached(snap, bq, request, stats, producers, work, arena, collector, shared, if (shared) |owner| owner.prepared else null);
 }
 fn exactStreamingBoolBound(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
-    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .exact_summaries = true };
+    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .exact_summaries = true };
     defer refinement.deinit();
     return (try refinement.buildRequest(bq)).segmentBound();
 }
@@ -4080,7 +4080,7 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
     _ = arena.reset(.retain_capacity);
     var lease = if (cache) |prepared| try prepared.get(plan) else null;
     defer if (lease) |*selected| selected.release();
-    var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .diagnostics = request.diagnostics };
+    var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .diagnostics = request.diagnostics };
     defer builder.deinit();
     const root = if (lease) |selected| try builder.instantiate(selected.owner.root) else try builder.buildRequest(bq);
     if (request.diagnostics) |diagnostics| {
@@ -4313,7 +4313,7 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snap, .count = snap.scoringDocCount(), .overrides = request.distributed_text_stats };
     try stats.collect(.{ .bool_query = bq });
     try stats.load();
-    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null };
+    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present() };
     stats.lowered = try lowerer.lower(.{ .bool_query = bq });
     var io: ?std.Io = null;
     for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) {
@@ -8204,6 +8204,13 @@ test "streaming boolean nested mixed fields match all hit reference" {
             constrained.exclude_doc_nums = if (exclude) selected_ids.items else &.{};
             var expected = try executeBoolAllHit(a, writer.snapshot(), bq, constrained);
             defer expected.deinit();
+            var numeric = (try executeStreamingTextBool(a, writer.snapshot(), bq, constrained, .{})).?;
+            defer numeric.deinit();
+            try std.testing.expectEqual(expected.hits.len, numeric.hits.len);
+            for (expected.hits, numeric.hits) |left, right| {
+                try std.testing.expectEqual(left.doc_id, right.doc_id);
+                try std.testing.expectEqual(left.score, right.score);
+            }
             constrained.filter_doc_nums = &.{};
             constrained.filter_doc_nums_positive = false;
             constrained.exclude_doc_nums = &.{};
@@ -8269,7 +8276,7 @@ test "streaming boolean native segment scratch and shared readers remain bounded
         var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
         try stats.collect(.{ .bool_query = bq });
         try stats.load();
-        var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+        var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
         defer builder.deinit();
         _ = try builder.buildRequest(bq);
         try std.testing.expectEqual(@as(u32, 1), builder.readers.count());
@@ -8309,7 +8316,7 @@ test "streaming boolean minimum should pivot and mixed field block bounds" {
     var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
     try stats.collect(.{ .bool_query = pivot });
     try stats.load();
-    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
     defer builder.deinit();
     const root = try builder.build(.{ .bool_query = pivot });
     try std.testing.expectEqual(@as(u32, 1999), (try root.seek(0)).?.doc);
@@ -8318,7 +8325,7 @@ test "streaming boolean minimum should pivot and mixed field block bounds" {
     const ranked: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "ranked" } } } };
     try stats.collect(.{ .bool_query = ranked });
     try stats.load();
-    var ranked_builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    var ranked_builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
     defer ranked_builder.deinit();
     const ranked_root = try ranked_builder.build(.{ .bool_query = ranked });
     const first_score = (try ranked_root.seek(0)).?.score;
@@ -8875,7 +8882,7 @@ test "streaming boolean phrase block ceilings prune positions and retain stacked
     var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = 8192 };
     try stats.collect(.{ .bool_query = bq });
     try stats.load();
-    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
     defer builder.deinit();
     const root = try builder.buildRequest(bq);
     _ = try root.approximate(0);
@@ -9069,7 +9076,7 @@ test "streaming boolean single large segment shares bounded ranges and live cuto
         defer lease.release();
         var clones = std.heap.ArenaAllocator.init(a);
         defer clones.deinit();
-        var builder: StreamingBoolBuilder = .{ .a = clones.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+        var builder: StreamingBoolBuilder = .{ .a = clones.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
         defer builder.deinit();
         const root = try builder.instantiate(lease.owner.root);
         for (builder.nodes.items) |node| if (node.term) |term| {
@@ -9217,7 +9224,7 @@ test "streaming boolean parallel metadata planning tightens phrase ceilings and 
     sources[0].fail = true;
     try std.testing.expectError(error.TestReadFailed, cache.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) }));
     sources[0].fail = false;
-    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
     defer builder.deinit();
     const root = try builder.instantiate(held.owner.root);
     try std.testing.expect(try root.seek(0) != null);
@@ -9245,7 +9252,7 @@ test "streaming boolean parallel metadata planning tightens phrase ceilings and 
             defer lease.release();
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
-            var clone: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = &snap.segments[0], .offset = 0, .config = .{}, .stats = context, .constrained = false, .bitmap_constraints = false };
+            var clone: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = &snap.segments[0], .offset = 0, .config = .{}, .stats = context, .constrained = false };
             defer clone.deinit();
             const node = try clone.instantiate(lease.owner.root);
             try std.testing.expect(try node.seek(32) != null);
@@ -9353,7 +9360,7 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
     for (legacy_plans) |plan| try scoreStreamingBoolSegment(writer.snapshot(), bq, request, &stats, .{}, plan, &legacy_scratch, &legacy_collector, null);
     const legacy_hits = try legacy_collector.finish();
     defer a.free(legacy_hits);
-    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false, .bitmap = false };
+    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false };
     stats.lowered = try lowerer.lower(request.query);
     try std.testing.expectEqual(@as(usize, 1), stats.analyses.items.len);
     try std.testing.expectEqual(@as(usize, 4), stats.lowered.?.should.len);
@@ -9386,7 +9393,7 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
             var context: StreamingBoolStats = .{ .a = arena.allocator(), .snap = snap, .count = 20 };
             try context.collect(query);
             try context.load();
-            var lowering: LoweredText.Lowerer = .{ .a = context.a, .stats = &context, .constrained = true, .bitmap = true };
+            var lowering: LoweredText.Lowerer = .{ .a = context.a, .stats = &context, .constrained = true };
             _ = try lowering.lower(query);
         }
     };
@@ -9439,7 +9446,7 @@ test "streaming boolean term candidates avoid inventory plans and exact bounds r
     var stats: StreamingBoolStats = .{ .a = arena.allocator(), .snap = snapshot, .count = 10000 };
     try stats.collect(request.query);
     try stats.load();
-    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false, .bitmap = false };
+    var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false };
     stats.lowered = try lowerer.lower(request.query);
     const plans = try planStreamingBoolSegments(a, &scratch, snapshot, bq, request, &stats, .{});
     defer a.free(plans);
@@ -9465,4 +9472,34 @@ test "streaming boolean term candidates avoid inventory plans and exact bounds r
     try std.testing.expectEqual(@as(u64, 1), cache.bound_reuses.load(.monotonic));
     provider.revoked = true;
     try std.testing.expectError(error.Canceled, cache.exactBound(plans[0], scratch.allocator()));
+}
+
+test "streaming boolean numeric predicates preserve boosted distributed leaf scores" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "first", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 7, .norm = 5 }} },
+        .{ .id = "second", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 11, .norm = 20 }} },
+        .{ .id = "third", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 19, .norm = 40 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const globals = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 27, .global_total_field_len = 1080, .term_doc_freqs = &.{.{ .term = "hello", .doc_freq = 9 }} }};
+    for ([_]f32{ 0, 1, 0.25, -0.75 }) |boost| for ([_]SearchQuery{
+        .{ .term = .{ .field = "title", .term = "hello", .boost = boost } },
+        .{ .match = .{ .field = "title", .text = "hello hello", .boost = boost } },
+    }) |query| for ([_]bool{ false, true }) |distributed| for ([_]bool{ false, true }) |exclude| {
+        var request: SearchRequest = .{ .query = query, .k = 1, .include_stored = false, .filter_doc_nums = if (exclude) &.{} else &.{2}, .filter_doc_nums_positive = !exclude, .exclude_doc_nums = if (exclude) &.{ 0, 1 } else &.{}, .distributed_text_stats = if (distributed) &globals else &.{} };
+        var reference = try execute(a, writer.snapshot(), request);
+        defer reference.deinit();
+        const bq: BoolQuery = .{ .should = &.{query} };
+        request.query = .{ .bool_query = bq };
+        var streaming = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
+        defer streaming.deinit();
+        try std.testing.expectEqual(@as(usize, 1), reference.hits.len);
+        try std.testing.expectEqual(reference.hits.len, streaming.hits.len);
+        try std.testing.expectEqual(reference.hits[0].doc_id, streaming.hits[0].doc_id);
+        try std.testing.expectEqual(reference.hits[0].score, streaming.hits[0].score);
+    };
 }
