@@ -160,10 +160,21 @@ source tree against retired URIs before reaching the vendor. Unknown content typ
 fail closed. Real qualification covers branch creation/root retention and v2
 pagination, including the provider's actual detached-reference and content syntax.
 
-Nessie's GC tooling can provide a future bounded historical live set, but its
-standard CLI alone does not integrate Antfly's leases or irreversible writer
-fence. Introducing a shorter history cutoff requires equivalent protection for
-external readers and native historical pins.
+Nessie may opt into `nessie_history_retention_ms` (minimum ten minutes).
+The gateway persists an immutable policy witness and a monotone history floor
+under vacuum admission. Every branch/tag head remains a complete protected root,
+including unchanged heads whose last commit predates the floor. Recent committed
+roots, external reader leases and Antfly native pins remain protected. Older
+history is excluded only after these protections have been applied.
+
+Enabling this policy requires leased Iceberg REST reads. Native hash-addressed
+content/history reads are denied; native reference discovery and configuration
+remain available. Every gateway instance must enforce this persisted policy and
+vendor access must remain private. Restart cannot silently disable or alter it.
+Retired-file resurrection is still rejected for writes and reference mutations.
+This bounds **table-file reachability**, not the vendor's physical commit database:
+Nessie persistence-store/history database compaction remains provider administration.
+The default remains complete historical retention.
 
 See [Nessie REST API](https://projectnessie.org/develop/rest/) and
 [Nessie management](https://projectnessie.org/guides/management/).
@@ -202,6 +213,35 @@ fixtures use that same clock. This does not qualify production clock skew, cloud
 IAM or real GCS deletion. Shared-file/delete-file combinations, larger catalogs,
 production deployment and full-archive performance need additional qualification.
 Unsupported mutations and exceeded inventory/metadata bounds fail closed. Retain
-all Nessie commit-history roots until an equally protected provider history
-retention integration is configured. Table creation never automatically provisions
+all Nessie commit-history roots unless the enforced leased-read retention policy
+is configured. Table creation never automatically provisions
 the external catalog, gateway, private network or provider identities.
+
+
+## Incremental planning
+
+A vacuum job retains its admission epoch while planning yields. Conditional,
+bounded radix pages persist file marks, completed manifests and completed roots;
+recovery never treats a partially traversed manifest as completed. Each turn adds
+at most `planning_files_per_turn` new marks (default 4,096), completes at most
+`planning_roots_per_turn` roots (128), and consumes one object inventory page
+(`inventory_page_size`, 256; maximum 1,000). S3 version/delete-marker cursors and
+GCS generation/page-token cursors persist before the next turn. No physical
+deletions begin until marking and inventory selection have both completed.
+Deletion receipts remain bounded and independently resumable.
+
+The planner still bounds individual metadata/manifest reads and replays root
+enumeration when resuming; a very large individual manifest may require repeated
+reads. Full-archive performance and real GCS generation deletion need qualification.
+Budget exhaustion keeps the job fenced for recovery; it never authorizes a partial
+live set. Empty native Iceberg snapshots have metadata-derived identities and
+remain valid reader roots even before their first data publication.
+
+
+October 2026 extension qualification additionally covers durable incremental marks
+and provider inventory continuation, shorter Nessie retention with real deletion
+after an external lease closes, managed PostgreSQL snapshot/update/teardown, and
+real GCS/Pub/Sub resource lifecycle in `antfly-dev-01`. Managed GCS uses isolated
+temporary resources and verifies notification delivery and owned cleanup; this does
+not qualify the vacuum controller's GCS generation-deletion path. Live native
+cursor recovery covers finalized split/merge and process restart on shared S3.

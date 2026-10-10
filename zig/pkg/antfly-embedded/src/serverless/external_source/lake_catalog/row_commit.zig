@@ -66,6 +66,7 @@ pub fn schema(a: A, metadata: V) !V {
     for ((try m.get(metadata, "schemas")).array.items) |s| if (try m.int(try m.get(s, "schema-id")) == id) return s;
     return error.InvalidLakeMetadata;
 }
+pub const stable_key = @import("stable_key.zig");
 const Rows = struct { data: []const V, keys: []const V, key_schema: V, ids: V };
 fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
     if (batch.batch_id.len == 0 or batch.batch_id.len > 256 or batch.source.len == 0 or batch.source.len > 256 or batch.epoch.len == 0 or batch.epoch.len > 256 or batch.checkpoint.len == 0 or batch.checkpoint.len > 1024 or batch.key_fields.len == 0 or batch.key_fields.len > 32 or batch.changes.len == 0 or batch.changes.len > parquet.max_rows) return error.InvalidLakeChangeBatch;
@@ -79,7 +80,7 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
         var found = false;
         for ((try m.get(s, "fields")).array.items) |f| if (std.mem.eql(u8, try m.str(try m.get(f, "name")), name)) {
             const kind = try m.str(try m.get(f, "type"));
-            if (std.mem.eql(u8, kind, "float") or std.mem.eql(u8, kind, "double")) return error.InvalidLakeChangeBatch;
+            _ = kind;
             try append(&fields, f);
             try append(&ids, try m.get(f, "id"));
             found = true;
@@ -99,14 +100,26 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
         if (change.row != .object) return error.InvalidLakeRow;
         var key = object(a);
         var tuple = array(a);
-        for (batch.key_fields) |name| {
-            const v = change.row.object.get(name) orelse return error.InvalidLakeRow;
+        for (batch.key_fields, 0..) |name, key_index| {
+            var v = change.row.object.get(name) orelse return error.InvalidLakeRow;
+            const kind = try m.str(try m.get(fields.array.items[key_index], "type"));
+            if (std.mem.eql(u8, kind, "float") or std.mem.eql(u8, kind, "double")) {
+                var number: f64 = switch (v) {
+                    .integer => @floatFromInt(v.integer),
+                    .float => v.float,
+                    else => return error.InvalidLakeRow,
+                };
+                if (std.mem.eql(u8, kind, "float")) number = @as(f64, @floatCast(@as(f32, @floatCast(number))));
+                if (!std.math.isFinite(number)) return error.InvalidLakeRow;
+                v = .{ .float = number };
+                change.row.object.getPtr(name).?.* = v;
+            }
             if (v == .null) return error.InvalidLakeRow;
             try put(a, &key, name, v);
             try append(&tuple, v);
         }
         if (change.op == .delete and change.row.object.count() != batch.key_fields.len) return error.InvalidLakeRow;
-        const encoded_key = try std.json.Stringify.valueAlloc(a, tuple, .{});
+        const encoded_key = try stable_key.identity(a, batch.key_fields, change.row, &.{});
         try seen.put(encoded_key, index);
         try append(&keys, key);
     }
@@ -114,7 +127,7 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
     for (batch.changes, keys.array.items, 0..) |change, key, index| {
         var tuple = array(a);
         for (batch.key_fields) |name| try append(&tuple, key.object.get(name).?);
-        const encoded_key = try std.json.Stringify.valueAlloc(a, tuple, .{});
+        const encoded_key = try stable_key.identity(a, batch.key_fields, change.row, &.{});
         if (seen.get(encoded_key).? != index) continue;
         try append(&unique_keys, key);
         if (change.op == .upsert) try append(&data, change.row);
@@ -139,9 +152,10 @@ pub fn validate(a: A, metadata_json: []const u8, batch: Batch, context: types.Co
     const root = try m.parse(scratch, metadata_json);
     _ = try normalize(scratch, try schema(scratch, root), batch, context);
 }
+
 pub fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]const u8 {
     try files.context.ensureActive();
-    const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ files.prefix, relative });
+    const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", relative });
     var client = files.client;
     var result = client.putObject(files.bucket, key, bytes, .{ .if_none_match = true, .cancellation = types.contextCancellation(&files.context) }) catch |err| switch (err) {
         error.PreconditionFailed, error.ObjectAlreadyExists => {
@@ -157,7 +171,7 @@ pub fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]co
 }
 fn recordOwnership(a: A, files: Files, relative: []const u8, bytes: []const u8, etag: ?[]const u8) ![]const u8 {
     const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, files.uri, "/"), relative });
-    const key = try std.fmt.allocPrint(a, "{s}/.antfly-owned/{s}.json", .{ files.prefix, types.digestHex(uri) });
+    const key = try std.fmt.allocPrint(a, "{s}{s}.antfly-owned/{s}.json", .{ files.prefix, if (files.prefix.len == 0) "" else "/", types.digestHex(uri) });
     const marker = try std.json.Stringify.valueAlloc(a, .{ .uri = uri, .sha256 = &types.digestHex(bytes), .etag = etag, .owner = "antfly-native-lake-v1" }, .{});
     var client = files.client;
     var stored = client.putObject(files.bucket, key, marker, .{ .if_none_match = true, .cancellation = types.contextCancellation(&files.context) }) catch |err| switch (err) {
@@ -180,7 +194,7 @@ pub fn readLimited(a: A, files: Files, uri: []const u8, max_bytes: usize) ![]con
     if (!std.mem.startsWith(u8, uri, root)) return error.LakeArtifactOutsideTable;
     const relative = uri[root.len..];
     if (std.mem.indexOf(u8, relative, "..") != null) return error.LakeArtifactOutsideTable;
-    const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ files.prefix, relative });
+    const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", relative });
     var client = files.client;
     var result = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context), .max_response_bytes = max_bytes });
     defer result.deinit(client.allocator);

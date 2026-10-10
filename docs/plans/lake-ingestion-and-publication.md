@@ -649,3 +649,26 @@ classes and SQL modes. The immutable HN cohorts currently documented are not a
 rolling-year production service. Aggregation/hierarchy/graph/analysis/stateful
 composition and broader SQL acceptance must retain the same visibility and cursor
 fences; do not replace exact archive semantics with a bounded candidate sample.
+
+
+## Managed adapter reconciliation and qualification
+
+The operator package `py/packages/lake-maintenance` now provides persisted source
+definitions, conditional authority revisions, an unresolved operation journal,
+provider ownership witnesses, progress/status, teardown and a bounded supervisor.
+PostgreSQL native configuration uses table-incarnation and source-definition CAS;
+its exported snapshot-to-stream cutover remains owned by the distributed executor.
+S3 uses owned SQS queues plus an enforced notification-configuration writer policy.
+GCS uses owned Pub/Sub topics/subscriptions and attributed bucket notifications.
+Provider events are wakeups: native catalog/source reconciliation and durable
+handoff precede acknowledgement; periodic polling repairs lost events.
+
+The journal records references rather than credentials and never uses SQLite.
+Unknown provider outcomes retain the exact intent across restart. Removed resources
+must satisfy their ownership witness; existing operator resources cannot be adopted.
+PostgreSQL teardown removes native configuration before taking the same advisory
+cutover lock and deleting inactive physical resources. Standalone has no CDC
+executor and rejects PostgreSQL managed setup.
+
+See [operator setup](../../py/packages/lake-maintenance/README.md) for the CLI,
+endpoints, cloud configuration contracts and real-provider qualification scope.

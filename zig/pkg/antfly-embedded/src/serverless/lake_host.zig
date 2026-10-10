@@ -46,12 +46,15 @@ pub const OpenOptions = struct {
     pub fn resolveCatalog(self: OpenOptions, alloc: std.mem.Allocator, source: binding.Binding, opened: stores.OpenedObjectStore, context: catalog.types.Context) !catalog.types.Table {
         const config = source.catalog orelse return error.InvalidLakeCatalog;
         try config.validate();
+        // Host policy may bind immutable metadata for either catalog kind.
+        // Consulting it first prevents managed catalogs from silently reopening
+        // the current pointer instead of a transaction's retained cut.
+        if (self.catalog_resolver) |resolver| return resolver.load_fn(resolver.ptr, alloc, source, context);
         if (config.type == .managed) {
             const managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = source.source_uri, .context = context };
             return managed.load(alloc);
         }
-        const resolver = self.catalog_resolver orelse return error.LakeCatalogConnectionRequired;
-        return resolver.load_fn(resolver.ptr, alloc, source, context);
+        return error.LakeCatalogConnectionRequired;
     }
 };
 

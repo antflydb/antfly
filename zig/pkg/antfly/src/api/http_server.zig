@@ -6002,6 +6002,10 @@ pub const ApiHttpServer = struct {
         }
         var store = try @import("lake_index_store.zig").Store.openRetainedNative(a, config, self.cfg.secret_store, binding.locator, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
+        if (!config.lake_indexes.artifact_gc.dry_run) {
+            var sql_artifacts = store.artifactStore();
+            _ = try @import("lake_sql_retained_cut.zig").collectBounded(&sql_artifacts, item.table_id, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), cancel);
+        }
         var collector: @import("lake_index_gc.zig").Collector = .{
             .a = a,
             .table = item.table_id,

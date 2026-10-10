@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Complete retained native generations over the configured artifact provider.
 //! Transfer uses bounded authenticated chunks, then one immutable manifest.
 //! Restored filesystem trees are disposable caches of that durable authority.
@@ -266,7 +279,10 @@ pub const Repository = struct {
             error.FileNotFound => return null,
             else => return err,
         };
-        const cached = std.json.parseFromSliceLeaky(CachedFile, a, bytes, .{}) catch return null;
+        return checkedExtent(a, bytes, expected_domain, expires, source, complete, needed_until);
+    }
+    fn checkedExtent(a: A, bytes: []const u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool, needed_until: u64) !?[]const Ref {
+        const cached = std.json.parseFromSliceLeaky(CachedFile, a, bytes, .{ .allocate = .alloc_always }) catch return null;
         if (!std.mem.eql(u8, &cached.domain, &expected_domain) or cached.expires_ms != expires or cached.source.inode != source.inode or cached.source.size != source.size or cached.source.mtime_ns != source.mtime_ns or !std.mem.eql(u8, cached.source.path, source.path)) return null;
         var size: u64 = 0;
         for (cached.chunks) |ref| {
@@ -278,6 +294,45 @@ pub const Repository = struct {
         }
         if (size > source.size or (complete and size != source.size)) return null;
         return cached.chunks;
+    }
+    fn checkpointKey(self: *Repository, a: A, namespace: Namespace, expires: u64, digest: [32]u8) ![]u8 {
+        // Use the generation inventory so the existing owner registry and
+        // expiry collector reclaim references after their chunk horizon.
+        return std.fmt.allocPrint(a, "{s}{s}native-query-generations/{d}/{d}/{d}/{d:0>20}/extent-{s}.json", .{ self.store.opened.prefix, if (self.store.opened.prefix.len == 0) "" else "/", namespace.table_id, namespace.shard_id, namespace.range_id, expires, std.fmt.bytesToHex(&digest, .lower) });
+    }
+    fn checkpointExtent(self: *Repository, a: A, namespace: Namespace, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, needed_until: u64, cancellation: Cancellation) !?[]const Ref {
+        const bridge: TokenBridge = .{ .token = cancellation };
+        for ([_]u64{ expires, expires +| cache_window_ms, expires -| cache_window_ms }) |epoch| {
+            try cancellation.check();
+            var object = self.store.opened.client.getObject(self.store.opened.bucket, try self.checkpointKey(a, namespace, epoch, digest), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
+                try cancellation.check();
+                switch (err) {
+                    error.ObjectNotFound, error.NotFound, error.FileNotFound, error.NoSuchKey => continue,
+                    else => return err,
+                }
+            };
+            defer object.deinit(self.store.opened.client.allocator);
+            if (try checkedExtent(a, object.body, expected_domain, epoch, source, true, needed_until)) |refs| return refs;
+        }
+        return null;
+    }
+    fn publishCheckpoint(self: *Repository, a: A, namespace: Namespace, expires: u64, digest: [32]u8, bytes: []const u8, cancellation: Cancellation) !void {
+        const bridge: TokenBridge = .{ .token = cancellation };
+        const location = try self.checkpointKey(a, namespace, expires, digest);
+        var result = self.store.opened.client.putObject(self.store.opened.bucket, location, bytes, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+            try cancellation.check();
+            switch (err) {
+                error.PreconditionFailed, error.ConditionalCheckFailed => {
+                    var previous = try self.store.opened.client.getObject(self.store.opened.bucket, location, .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() });
+                    defer previous.deinit(self.store.opened.client.allocator);
+                    if (!std.mem.eql(u8, previous.body, bytes)) return error.CatalogGenerationChanged;
+                    return;
+                },
+                else => return err,
+            }
+        };
+        result.deinit(self.store.opened.client.allocator);
+        try cancellation.check();
     }
     fn cachedExtent(a: A, io: std.Io, parent: []const u8, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool, needed_until: u64) !?[]const Ref {
         // Warming uses a longer private cut than an ordinary public cursor.
@@ -367,6 +422,14 @@ pub const Repository = struct {
                 try files.append(a, .{ .path = file.path, .size = file.size, .chunks = cached });
                 continue;
             }
+            // Local hints are disposable. A completed remote checkpoint can
+            // prove extent coverage after hint loss without uploading it again.
+            if (try self.checkpointExtent(a, namespace, digest, generation_domain, chunk_expiry, file, request.expires_ms, cancellation)) |cached| {
+                try files.append(a, .{ .path = file.path, .size = file.size, .chunks = cached });
+                const cached_bytes = try std.json.Stringify.valueAlloc(a, CachedFile{ .domain = generation_domain, .expires_ms = chunk_expiry, .source = file, .chunks = cached }, .{});
+                _ = try local.storage_db_native_backup.writeFileDurable(io, cache_path, cached_bytes);
+                continue;
+            }
             var attempt: [16]u8 = undefined;
             std.mem.writeInt(u64, attempt[0..8], chunk_expiry, .big);
             @memcpy(attempt[8..16], digest[0..8]);
@@ -398,6 +461,7 @@ pub const Repository = struct {
             const refs = try chunks.toOwnedSlice(a);
             try files.append(a, .{ .path = file.path, .size = file.size, .chunks = refs });
             const cache_bytes = try std.json.Stringify.valueAlloc(a, CachedFile{ .domain = generation_domain, .expires_ms = chunk_expiry, .source = file, .chunks = refs }, .{});
+            try self.publishCheckpoint(a, namespace, chunk_expiry, digest, cache_bytes, cancellation);
             // Reuse is optional; failure to persist a hint cannot weaken the
             // immutable remote generation commit that follows.
             _ = try local.storage_db_native_backup.writeFileDurable(io, cache_path, cache_bytes);
@@ -487,6 +551,26 @@ pub const Repository = struct {
         }
         try cut.finish(a, io, staging, request, namespace, manifest.sequence, cancellation);
         try cut.validate(a, io, staging, request, namespace, cancellation);
+        // Recovery creates new inode/mtime identities. Rebind the authenticated
+        // remote references to those sealed local files before publication so
+        // the replacement owner's first capture does not re-upload them.
+        const restored_bytes = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fmt.allocPrint(a, "{s}/query-cut.json", .{staging}), max_manifest_bytes);
+        const restored = try std.json.parseFromSliceLeaky(cut.Manifest, a, restored_bytes, .{});
+        for (restored.files) |file| {
+            const remote = for (manifest.files) |candidate| {
+                if (std.mem.eql(u8, candidate.path, file.path) and candidate.size == file.size) break candidate;
+            } else return error.CatalogGenerationChanged;
+            if (remote.chunks.len == 0) continue;
+            const scope = (try artifacts.uploadScopeFromArtifactId(remote.chunks[0].artifact_id)) orelse return error.CatalogGenerationChanged;
+            const horizon = scope.fencingToken();
+            const encoded = try std.json.Stringify.valueAlloc(a, CachedFile{ .domain = expected_domain, .expires_ms = horizon, .source = file, .chunks = remote.chunks }, .{});
+            const proof = try std.json.Stringify.valueAlloc(a, .{ .domain = expected_domain, .source = file }, .{});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(proof, &digest, .{});
+            // Every chunk was verified during recovery; this proof is published
+            // only after the replacement seal has passed validation.
+            try self.publishCheckpoint(a, namespace, horizon, digest, encoded, cancellation);
+        }
         try std.Io.Dir.rename(.cwd(), staging, .cwd(), root, io);
         if (std.fs.path.dirname(root)) |parent| try fs.syncDirPortable(io, parent);
     }
@@ -543,6 +627,8 @@ test "external lake native repository reuses immutable extents and collects expi
     try cut.finish(a, io, first_root, first, namespace, 1, .none);
     try cut.finish(a, io, second_root, second, namespace, 1, .none);
     try repository.capability().publish(io, first_root, first, namespace, .none);
+    // Reboot/loss of all local hints must reuse the durable checkpoint.
+    try std.Io.Dir.cwd().deleteTree(io, try std.fmt.allocPrint(scratch, "{s}/.chunk-cache", .{directory.path()}));
     try repository.capability().publish(io, second_root, second, namespace, .none);
     // Local commit evidence is private cache metadata, never snapshot data.
     try std.testing.expect(try repository.localCommit(scratch, io, first_root, first, namespace));
@@ -556,6 +642,15 @@ test "external lake native repository reuses immutable extents and collects expi
     try repository.capability().recover(io, recovered, first, namespace, .none);
     const recovered_bytes = try local.storage_db_native_backup.readFileAlloc(scratch, io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{recovered}), 1024);
     try std.testing.expectEqualStrings("original immutable extent", recovered_bytes);
+    const replacement_id: [64]u8 = @splat('c');
+    const replacement: cut.Request = .{ .id = &replacement_id, .table_id = 7, .expires_ms = expires, .create = true };
+    const replacement_root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), replacement_id });
+    try fs.createDirPathPortable(io, replacement_root);
+    try std.Io.Dir.hardLink(.cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{recovered}), .cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{replacement_root}), io, .{});
+    try cut.finish(a, io, replacement_root, replacement, namespace, 1, .none);
+    try std.testing.expect(try Repository.publishLimited(&repository, io, replacement_root, replacement, namespace, .none, 0));
+    const replacement_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, replacement, namespace, .none), replacement, namespace);
+    try std.testing.expectEqualStrings(first_manifest.files[0].chunks[0].artifact_id, replacement_manifest.files[0].chunks[0].artifact_id);
     // A virtual reader needs only the manifest, never a recovered directory.
     const virtual_root = try std.fmt.allocPrint(scratch, "{s}/virtual", .{directory.path()});
     var remote = (try repository.capability().openRead(io, virtual_root, first, namespace, .none)).?;

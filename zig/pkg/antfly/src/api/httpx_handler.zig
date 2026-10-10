@@ -1318,6 +1318,9 @@ pub const AntflyApiHandler = struct {
     ) !void {
         const metadata_router = metadata_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try metadata_router.register(public_server);
+        try public_server.get("/tables/:table_name/sources/managed", httpx.Handler.bind(self, managedSourceStatus));
+        try public_server.post("/tables/:table_name/sources/managed", httpx.Handler.bind(self, configureManagedSources));
+        try public_server.post("/tables/:table_name/lake/reconcile", httpx.Handler.bind(self, reconcileLakeSource));
         const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
         if (include_contextual) {
@@ -5928,7 +5931,6 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
-        if (request.lake_visibility == .accepted and mode != .statement) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "accepted lake visibility requires a direct read-only statement" });
         const statement = request.statement orelse "";
         if (mode == .prepare and statement.len > @import("sql_prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
         if (mode == .statement or mode == .prepare) {
@@ -8389,6 +8391,33 @@ pub const AntflyApiHandler = struct {
         }
         try stream.writer.?.close();
         return ctx.response.build();
+    }
+
+    fn managedSourceStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.managedSourcesRequest(ctx, false);
+    }
+    fn configureManagedSources(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.managedSourcesRequest(ctx, true);
+    }
+    fn managedSourcesRequest(self: *AntflyApiHandler, ctx: *httpx.Context, mutate: bool) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        const binding = (try self.resolvePublicTableBinding(ctx, name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(ctx.allocator);
+        const module = @import("managed_sources.zig");
+        const bytes = (if (mutate) module.configure(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), (try ctx.body()) orelse "") else module.status(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity))) catch |err| return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        defer ctx.allocator.free(bytes);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(bytes);
+        return ctx.response.build();
+    }
+    fn reconcileLakeSource(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid path parameter");
+        var parsed = std.json.parseFromSlice(struct { table_id: u64 }, ctx.allocator, (try ctx.body()) orelse "", .{}) catch return jsonErrorResponse(ctx, 400, "invalid reconciliation request");
+        defer parsed.deinit();
+        return self.lakeCatalogRequest(ctx, name, .{ .action = .reconcile, .expected_table_id = parsed.value.table_id });
     }
 
     pub fn getLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

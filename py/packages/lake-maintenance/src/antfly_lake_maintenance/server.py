@@ -195,6 +195,8 @@ class Handler(BaseHTTPRequestHandler):
                     if route.path.endswith("/credentials") or "/views" in route.path:
                         raise PermissionError
             if self.command in ("GET", "HEAD"):
+                if native:
+                    controller.allow_native_read(upstream_path)
                 if (
                     not native
                     and self.command == "GET"

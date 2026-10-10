@@ -28,7 +28,7 @@ pub const grace_ns = 30 * std.time.ns_per_s;
 pub fn namespace(a: A, prefix: []const u8, binding: local.serverless_external_source_catalog_binding.Binding, uuid: []const u8) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ binding.source_uri, uuid }, .{});
     defer a.free(identity);
-    return std.fmt.allocPrint(a, "{s}/lake-readers/{s}", .{ prefix, catalog.types.digestHex(identity) });
+    return std.fmt.allocPrint(a, "{s}{s}lake-readers/{s}", .{ prefix, if (prefix.len == 0) "" else "/", catalog.types.digestHex(identity) });
 }
 pub const Store = struct {
     client: objectstore.Client,

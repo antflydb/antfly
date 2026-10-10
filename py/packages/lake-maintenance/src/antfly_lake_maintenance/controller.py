@@ -13,12 +13,25 @@ from pyiceberg.table.update import TableRequirement, TableUpdate, update_table_m
 from pyiceberg.table.metadata import TableMetadataUtil
 
 from .provider import Provider, Reachability
+from .planning import DurableReachability, PlanningPending
 from .store import Conflict, Unavailable, digest, encode
 
 
 class Controller:
     def __init__(self, config, store, *, now_ns=time.time_ns):
         self.config, self.store, self.now_ns = config, store, now_ns
+        for field, default, ceiling in (
+            ("planning_files_per_turn", 4096, 100_000),
+            ("planning_roots_per_turn", 128, 10_000),
+            ("inventory_page_size", 256, 1000),
+            ("max_metadata_roots", 100_000, 10_000_000),
+            ("max_metadata_bytes", 256 * 1024 * 1024, 1024 * 1024 * 1024),
+        ):
+            value = config.get(field, default)
+            if type(value) is not int or not 1 <= value <= ceiling:
+                raise ValueError(
+                    f"{field} must be a positive integer at most {ceiling}"
+                )
         self.provider = Provider(config, store)
         if config["provider"] not in ("nessie", "polaris"):
             raise ValueError("unknown provider")
@@ -57,6 +70,37 @@ class Controller:
         self.store.require_versioned_deletion(config["warehouse_uri"])
         self.store.probe_authority(config["authority_uri"])
         self.store.immutable(self.key("binding.json"), encode(identity))
+        retention = config.get("nessie_history_retention_ms")
+        policy_uri = self.key("nessie-history-policy.json")
+        prior_policy = self.store.get(policy_uri)
+        if retention is not None:
+            if (
+                config["provider"] != "nessie"
+                or type(retention) is not int
+                or retention < 600_000
+            ):
+                raise ValueError(
+                    "Nessie history retention must be at least ten minutes"
+                )
+            self.store.immutable(
+                policy_uri,
+                encode(
+                    {
+                        "protocol": 1,
+                        "retention_ms": retention,
+                        "historical_native_reads": False,
+                    }
+                ),
+            )
+        elif prior_policy is not None:
+            raise Conflict("cannot disable an already enforced Nessie history policy")
+
+    def allow_native_read(self, path):
+        # History shortening requires leased REST reads. Hash-addressed native
+        # content/history reads would bypass retirement and cannot be exposed.
+        if self.store.get(self.key("nessie-history-policy.json")) is not None:
+            if urlsplit(path).path not in ("/trees", "/config"):
+                raise PermissionError("retained history requires leased REST reads")
 
     def key(self, path):
         return self.config["authority_uri"] + path
@@ -551,6 +595,11 @@ class Controller:
                 plan = self._plan(job, registry, base)
                 plan["admission_epoch"] = admission["epoch"]
                 self.store.immutable(plan_uri, encode(plan))
+            except PlanningPending:
+                # The same admission epoch protects partial marks and the
+                # inventory continuation. Restart resumes instead of releasing
+                # writers into a partially planned deletion set.
+                return {**base, "state": "running"}
             except Exception:
                 if self.store.get(plan_uri) is None:
                     self._release_job(
@@ -673,7 +722,34 @@ class Controller:
             or current["metadata-location"] != job["expected_metadata_location"]
         ):
             raise Conflict("stale maintenance table incarnation or metadata")
-        graph = self.graph()
+        admission = self.state()["vacuum"]
+        if admission is None or admission["phase"] != "planning":
+            raise Conflict("planning admission changed")
+        planning_root = self.key(
+            f"jobs/{admission['id']}/planning/{admission['epoch']}/"
+        )
+        graph = DurableReachability(
+            self.provider,
+            self.config["warehouse_uri"],
+            prefix=planning_root,
+            max_files=self.config.get("planning_files_per_turn", 4096),
+            max_bytes=self.config.get("max_metadata_bytes", 256 * 1024 * 1024),
+        )
+        history_floor = None
+        if self.config.get("nessie_history_retention_ms") is not None:
+            proposed_floor = (
+                self.now_ns() // 1_000_000 - self.config["nessie_history_retention_ms"]
+            )
+
+            def advance_floor(state):
+                if state["vacuum"] != admission:
+                    raise Conflict("history retention admission changed")
+                state["nessie_history_floor_ms"] = max(
+                    proposed_floor, state.get("nessie_history_floor_ms", 0)
+                )
+                return state["nessie_history_floor_ms"]
+
+            history_floor = self.store.mutate(self.key("HEAD.json"), advance_floor)
         graph.history(current["metadata-location"])
         native_history = {key: list(value) for key, value in graph.snapshots.items()}
         protected = set(map(str, job["protected_snapshots"]))
@@ -713,20 +789,23 @@ class Controller:
             if str(value["snapshot-id"]) not in protected
         ]
         # All roots across the provider, including other tables sharing files.
-        seen_roots = set()
-        for root in self.provider.all_metadata():
-            if root in seen_roots:
-                continue
-            seen_roots.add(root)
-            if len(seen_roots) > self.config.get("max_files", 100_000):
-                raise Unavailable("provider root budget exceeded")
+        new_roots = 0
+        for root in self.provider.all_metadata(history_floor_ms=history_floor):
+            completed = root in graph.completed_roots
+            if not completed:
+                if new_roots >= self.config.get("planning_roots_per_turn", 128):
+                    raise PlanningPending()
+                new_roots += 1
             if (
                 root == current["metadata-location"]
                 and self.config["provider"] == "polaris"
             ):
-                graph.mark(root, snapshots=protected)
+                if not completed:
+                    graph.mark(root, snapshots=protected)
             else:
-                root_metadata = graph.mark(root)
+                root_metadata = (
+                    graph.read_metadata(root) if completed else graph.mark(root)
+                )
                 # Another native table can retain a historical snapshot whose
                 # files happen to live under this table's prefix. Protect that
                 # registry too; current vendor roots alone are insufficient.
@@ -755,6 +834,7 @@ class Controller:
                         ]:
                             graph.add(pin_root)
                             graph.mark_snapshot(snapshot)
+            graph.completed_roots.add(root)
         for identifier in protected:
             for root, snapshot in graph.snapshots[identifier]:
                 graph.add(root)
@@ -769,18 +849,45 @@ class Controller:
         graph.check_uri(prefix)
         if prefix == self.config["warehouse_uri"]:
             raise Unavailable("cannot vacuum an entire warehouse as one table")
-        selected, count, retained = [], 0, 0
-        for obj in self.store.inventory(prefix, all_versions=True):
-            count += 1
-            if count > self.config.get("max_files", 100_000):
-                raise Unavailable("table inventory budget exceeded")
+        inventory_uri = planning_root + "inventory.json"
+        saved_inventory = self.store.get(inventory_uri)
+        progress = (
+            json.loads(saved_inventory[0])
+            if saved_inventory
+            else {"cursor": None, "objects": [], "retained": 0, "complete": False}
+        )
+        selected, retained = list(progress["objects"]), progress["retained"]
+        objects, following = (
+            ([], None)
+            if progress["complete"]
+            else self.store.inventory_page(
+                prefix,
+                progress["cursor"],
+                limit=self.config.get("inventory_page_size", 256),
+            )
+        )
+        for obj in objects:
             if obj.uri in graph.files or obj.modified_ms >= before:
                 retained += 1
             elif len(selected) < policy["max_deleted"]:
                 selected.append(asdict(obj))
+        progress = {
+            "cursor": following,
+            "objects": selected,
+            "retained": retained,
+            "complete": following is None,
+        }
+        self.store.put(
+            inventory_uri,
+            encode(progress),
+            version=saved_inventory[1] if saved_inventory else None,
+            absent=saved_inventory is None,
+        )
+        if not progress["complete"]:
+            raise PlanningPending()
         # Nessie retains all content history: do not expire snapshots whose
         # history remains publicly addressable through native catalog refs.
-        if self.config["provider"] == "nessie":
+        if self.config["provider"] == "nessie" and history_floor is None:
             remove = []
         retired = [
             identifier

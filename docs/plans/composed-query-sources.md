@@ -135,15 +135,35 @@ Reads authorize the saved name and every leaf. Definitions permit literal union
 or overlay leaves only, preventing recursion. Drop/recreate changes the source ID
 and invalidates previous cursors; definitions do not freeze table contents.
 
-Direct HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default
-remains `"committed"`. A statement pins one committed source and one immutable WAL
-suffix per writable lake table, reusing it across aliases and joins. Typed upserts
-and deletes resolve before SQL filtering, aggregation, ordering and limits. Integer,
-string and boolean stable keys are supported. Accepted visibility is not enabled
-for connection/session/prepared or transactional modes, or timestamp/numeric keys.
-Existing SQL scan and memory budgets still apply.
+HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default remains
+`"committed"`. Idle statements and prepared execution outside a transaction take
+one statement cut. Inside an HTTP SQL session transaction, the first accepted
+read persists its visibility mode and binds each writable lake table once.
+Later statements and prepared execution inherit that mode and reuse the cut.
+Repeated aliases share the same inventory and copied WAL suffix. Typed upserts
+and deletes resolve before filtering, aggregation, ordering and limits.
 
-The intended extension to accepted SQL visibility uses a transaction-pinned
+Cuts store the exact metadata location **and bytes**, table UUID, Antfly table ID,
+schema/object generations, accepted WAL watermark and final pending images in an
+immutable artifact. The durable transaction contains its authenticated capability.
+Reopening checks the current external UUID without replacing the saved metadata;
+publication and WAL reclamation therefore cannot change previously accepted rows.
+Savepoint rollback preserves the base cut. A missing/expired artifact or changed
+incarnation fails explicitly. Retention is currently a fixed one-hour horizon,
+with conservative pin expiry rather than immediate release on transaction end.
+Serializable accepted external reads and pgwire accepted-mode selection remain
+unsupported. SQL scan/memory limits still apply.
+
+Stable overlay keys include finite numeric values and timestamps. Numeric keys
+preserve integer precision and normalize integral floats and negative zero.
+Iceberg physical timestamps use microseconds; logical RFC3339 strings normalize
+to UTC so equivalent offsets compare identically. JSON source overlays declare
+`key_types: ["number", "timestamp"]` alongside their key fields when needed.
+Full-text union/overlay sorting and RRF remain supported. Cross-source graph,
+aggregation, join and hierarchy operators still need a visibility-aware execution
+stage; they are rejected instead of merging independently filtered leaf results.
+
+The remaining extension to accepted SQL visibility uses a transaction-pinned
 read contract. A transaction binds each writable lake table's incarnation,
 committed snapshot and accepted WAL watermark on its first read of that table.
 Subsequent statements, including prepared execution, reuse those cuts and add
@@ -486,3 +506,23 @@ global ordering and declared ranking behavior. Then qualify cold/restart latency
 selective indexed filters, backlog bounds and resource usage against archive-scale
 HN data on remote storage. Small protocol fixtures do not establish full archive
 performance or a production deployment.
+
+
+### Remote checkpoint references and replacement owners
+
+Completed remote extent proofs survive loss of local chunk hints. They retain
+exact table/shard/range, file seal, checksum, credential scope and retention
+horizon. Recovery verifies every chunk and rebinds those references to the newly
+sealed replacement files; a subsequent capture can reuse them with zero upload
+budget. Adjacent warming epochs are probed within a bounded horizon. References
+expire with their generation inventory, so reuse cannot outlive reader protection.
+
+This reduces transfer for already published/recovered extents. New data still
+requires an initial upload. The live distributed qualification resumes an original HTTP cursor after finalized
+split, finalized merge and all data-owner restarts using a shared S3 repository.
+Fresh capture after a split needs another physical-generation identity boundary:
+split children can preserve their parent's document identity namespace while
+holding different files. A repository key must distinguish those physical groups
+without changing stored document IDs or duplicating original-cover results.
+Current cover validation rejects that ambiguous fresh capture. Direct remote-native
+checkpoint adoption and fresh post-split capture remain separate work.

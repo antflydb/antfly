@@ -14,7 +14,7 @@ from pyiceberg.manifest import read_manifest_list
 from pyiceberg.table.metadata import TableMetadataUtil
 from pyiceberg.table.update import RemoveSnapshotsUpdate, SetPropertiesUpdate
 
-from .store import Conflict, Unavailable, encode
+from .store import Conflict, Unavailable, digest, encode
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -150,16 +150,46 @@ class Provider:
             {"requirements": requirements, "updates": updates},
         )
 
-    def all_metadata(self):
+    def all_metadata(self, *, history_floor_ms=None):
         if self.config["provider"] == "nessie":
             # NONE cutoff: preserve every historical content state on every
             # branch and tag. A branch's REST table view hides these roots.
             refs = self._pages("/trees", "references", native=True)
             for ref in refs:
                 reference = quote(ref["name"] + "@" + ref["hash"], safe="")
+                if history_floor_ms is not None:
+                    # An unchanged table's last Put can predate the cutoff.
+                    # Protect every branch/tag's complete head contents first.
+                    for entry in self._pages(
+                        f"/trees/{reference}/entries?content=true",
+                        "entries",
+                        native=True,
+                    ):
+                        content = entry.get("content") or {}
+                        if content.get("type") == "ICEBERG_TABLE":
+                            yield content["metadataLocation"]
+                        elif content.get("type") != "NAMESPACE":
+                            raise Unavailable("unsupported Nessie head content")
                 for entry in self._pages(
                     f"/trees/{reference}/history?fetch=ALL", "logEntries", native=True
                 ):
+                    if history_floor_ms is not None:
+                        from datetime import datetime
+
+                        timestamp = entry.get("commitMeta", {}).get("commitTime")
+                        if timestamp is None:
+                            raise Unavailable(
+                                "Nessie commit lacks a retention timestamp"
+                            )
+                        instant = datetime.fromisoformat(
+                            timestamp.replace("Z", "+00:00")
+                        )
+                        if instant.tzinfo is None:
+                            raise Unavailable("Nessie timestamp lacks timezone")
+                        # Commit clocks need not be strictly ordered: continue
+                        # scanning rather than assuming an early stop is safe.
+                        if int(instant.timestamp() * 1000) < history_floor_ms:
+                            continue
                     for operation in entry.get("operations", []):
                         content = operation.get("content", {})
                         if content.get("type") == "ICEBERG_TABLE":
@@ -300,15 +330,16 @@ class Reachability:
                 self.mark_snapshot(snapshot)
 
     def mark_snapshot(self, snapshot):
+        if snapshot.get("antfly-empty-metadata"):
+            self.add(snapshot["antfly-empty-metadata"])
+            self.live_snapshots.add(snapshot["manifest-list"])
+            return
         self.live_snapshots.add(snapshot["manifest-list"])
         uri = snapshot.get("manifest-list")
         if not uri:
             raise Unavailable("snapshot lacks a manifest list")
         self.add(uri)
-        source = self.provider.io.new_input(uri)
-        self.bytes += len(source)
-        if self.bytes > self.max_bytes:
-            raise Unavailable("manifest traversal byte budget exceeded")
+        source = self.manifest_input(uri)
         from pyiceberg.avro.file import AvroFile
         from pyiceberg.manifest import (
             MANIFEST_ENTRY_SCHEMAS,
@@ -324,11 +355,7 @@ class Reachability:
             self.add(manifest.manifest_path)
             if manifest.manifest_path in self.marked_manifests:
                 continue
-            self.marked_manifests.add(manifest.manifest_path)
-            source = self.provider.io.new_input(manifest.manifest_path)
-            self.bytes += len(source)
-            if self.bytes > self.max_bytes:
-                raise Unavailable("manifest traversal byte budget exceeded")
+            source = self.manifest_input(manifest.manifest_path)
             with AvroFile(
                 source,
                 MANIFEST_ENTRY_SCHEMAS[DEFAULT_READ_VERSION],
@@ -342,6 +369,16 @@ class Reachability:
                 for entry in reader:
                     if entry.status != ManifestEntryStatus.DELETED:
                         self.add(entry.data_file.file_path)
+            # Only completed traversal is reusable. A budget/cancellation or
+            # missing object must never publish a partial manifest as marked.
+            self.marked_manifests.add(manifest.manifest_path)
+
+    def manifest_input(self, uri):
+        source = self.provider.io.new_input(uri)
+        self.bytes += len(source)
+        if self.bytes > self.max_bytes:
+            raise Unavailable("manifest traversal byte budget exceeded")
+        return source
 
     def history(self, uri):
         """Index snapshot IDs in bounded metadata history for native reader pins."""
@@ -354,6 +391,23 @@ class Reachability:
             if len(visited) > self.max_files:
                 raise Unavailable("metadata history budget exceeded")
             metadata = self.read_metadata(root)
+            if (
+                not metadata.get("snapshots")
+                and metadata.get("current-snapshot-id", -1) == -1
+            ):
+                raw = self.provider.store.get(root)
+                if raw is None:
+                    raise Unavailable("empty snapshot metadata disappeared")
+                identifier = "empty:" + metadata["table-uuid"] + ":" + digest(raw[0])
+                self.snapshots.setdefault(identifier, []).append(
+                    (
+                        root,
+                        {
+                            "antfly-empty-metadata": root,
+                            "manifest-list": "empty-metadata:" + root,
+                        },
+                    )
+                )
             for snapshot in metadata.get("snapshots", []):
                 self.snapshots.setdefault(str(snapshot["snapshot-id"]), []).append(
                     (root, snapshot)

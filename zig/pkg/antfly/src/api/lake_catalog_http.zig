@@ -22,12 +22,13 @@ const configured = @import("../serverless/configured_object_store_support.zig");
 const server_api = @import("http_server.zig");
 const operation = local.api_operation;
 const A = std.mem.Allocator;
-pub const Action = enum { load, create, commit, resolve, changes, maintenance };
+pub const Action = enum { load, create, commit, resolve, changes, maintenance, reconcile };
 pub const Request = struct {
     action: Action,
     body: []const u8 = "",
     commit_id: []const u8 = "",
     request_hash: []const u8 = "",
+    expected_table_id: ?u64 = null,
 };
 pub const Response = struct {
     status: u16,
@@ -37,7 +38,7 @@ pub const Response = struct {
     }
 };
 pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, expected_id: ?u64, identity: ?server_api.AuthenticatedIdentity, context: operation.RequestContext, request: Request) !Response {
-    const mutation = request.action == .create or request.action == .commit or request.action == .changes or request.action == .maintenance;
+    const mutation = request.action == .create or request.action == .commit or request.action == .changes or request.action == .maintenance or request.action == .reconcile;
     if (identity) |value| {
         if (!server_api.permissionsAllow(value.permissions, .table, physical, if (mutation) .admin else .read)) return error.Forbidden;
         // Catalog writes are table-wide file commits, not row-policy mutations.
@@ -47,11 +48,19 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     defer server.source.freeAdminSnapshot(&snapshot);
     const table = @import("tables.zig").findTableByName(&snapshot, physical) orelse return error.TableNotFound;
     if (expected_id) |id| if (id != table.table_id) return error.TableGenerationChanged;
+    if (request.expected_table_id) |id| if (id != table.table_id) return error.TableGenerationChanged;
     var source = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidLakeCatalog;
     defer source.deinit(a);
-    if (source.binding.catalog == null) return error.InvalidLakeCatalog;
     const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     const lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
+    if (request.action == .reconcile and source.binding.catalog == null) {
+        try server.prepareLakeCache();
+        var serving = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .external_base_source = source }, options.lakeOptions(), .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(context.cancellation.ptr, context.cancellation.is_cancelled_fn) }, &server.lake_read_cache);
+        defer serving.deinit();
+        try server.notifyLakeCommit(physical);
+        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "reconciled", .table_id = table.table_id, .metadata_location = source.binding.source_uri, .snapshot_id = serving.inventory.snapshot_id, .searchable = false }, .{}) };
+    }
+    if (source.binding.catalog == null) return error.InvalidLakeCatalog;
     if (request.action == .maintenance) {
         const maintenance = @import("lake_maintenance.zig");
         const result = try maintenance.execute(a, server, table.*, source.binding, options, lake_context, context, request.body);
@@ -62,6 +71,12 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
         const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
         return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
+    }
+    if (request.action == .reconcile) {
+        var result = try configured.executeLakeCatalogAlloc(a, source.binding, options, lake_context, .load);
+        defer result.deinit(a);
+        try server.notifyLakeCommit(physical);
+        return encode(a, result, "reconciled", "", "");
     }
     if (!mutation) {
         const call: configured.CatalogOperation = if (request.action == .load) .load else .{ .resolve = .{ .id = request.commit_id, .hash = request.request_hash } };

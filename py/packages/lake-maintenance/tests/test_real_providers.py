@@ -182,6 +182,95 @@ def test_real_rows_vacuum_replay_and_restart(deployed):
     assert reopened.run_job(request_hash, body) == result
 
 
+def test_real_incremental_planning_keeps_admission_and_recovers_marks(deployed):
+    controller, gateway, base, namespace = deployed
+    controller.config["planning_files_per_turn"] = 8
+    controller.config["inventory_page_size"] = 2
+    with catalog(base) as cat:
+        current = table(cat, namespace, controller)
+        current.append(pa.table({"id": pa.array([1], type=pa.int64())}))
+        for number in range(8):
+            controller.store.put(
+                current.location().rstrip("/")
+                + f"/data/incremental-orphan-{number}.parquet",
+                b"orphan",
+            )
+    request_hash, body = job(controller, namespace)
+    first = controller.run_job(request_hash, body)
+    assert first["state"] == "running"
+    admission = controller.state()["vacuum"]
+    assert admission["phase"] == "planning"
+    assert (
+        controller.store.get(controller.key(f"jobs/{request_hash}/plan.json")) is None
+    )
+    reopened = Controller(
+        controller.config, Store(IO_PROPERTIES), now_ns=controller.now_ns
+    )
+    gateway.controller = reopened
+    assert reopened.state()["vacuum"]["epoch"] == admission["epoch"]
+    for _ in range(1024):
+        result = reopened.run_job(request_hash, body)
+        if result["state"] == "complete":
+            break
+    else:
+        pytest.fail("incremental planner did not converge")
+    assert result["deleted_objects"] == 8
+    with catalog(base) as cat:
+        assert cat.load_table((*namespace, "items")).scan().to_arrow()[
+            "id"
+        ].to_pylist() == [1]
+
+
+@pytest.mark.skipif(
+    os.environ.get("ANTFLY_REAL_NESSIE_RETENTION") != "1",
+    reason="requires a dedicated fresh Nessie catalog: retention cannot coexist with later conservative-history runs",
+)
+def test_real_nessie_retention_preserves_heads_and_protects_reader(deployed):
+    controller, gateway, base, namespace = deployed
+    if controller.config["provider"] != "nessie":
+        pytest.skip("Nessie-specific retention")
+    controller.config["nessie_history_retention_ms"] = 600_000
+    controller = Controller(
+        controller.config, controller.store, now_ns=controller.now_ns
+    )
+    gateway.controller = controller
+    with catalog(base) as cat:
+        current = table(cat, namespace, controller)
+        current.append(pa.table({"id": pa.array([1], type=pa.int64())}))
+    reader = catalog(base)
+    old = reader.load_table((*namespace, "items"))
+    old_files = [task.file.file_path for task in old.scan().plan_files()]
+    try:
+        with catalog(base) as cat:
+            changed = cat.load_table((*namespace, "items"))
+            changed.overwrite(pa.table({"id": pa.array([2], type=pa.int64())}))
+        request_hash, body = job(controller, namespace)
+        run_to_completion(controller, request_hash, body)
+        assert old.scan().to_arrow()["id"].to_pylist() == [1]
+        denied = requests.get(
+            base + "/nessie/trees/main/history?fetch=ALL",
+            headers={"Authorization": "Bearer " + TOKENS["writer"]},
+            timeout=10,
+        )
+        assert denied.status_code == 403
+    finally:
+        reader.close()
+    request_hash, body = job(controller, namespace)
+    result = run_to_completion(controller, request_hash, body)
+    assert result["deleted_objects"] >= len(old_files)
+    assert all(controller.store.get(uri) is None for uri in old_files)
+    with catalog(base) as cat:
+        assert cat.load_table((*namespace, "items")).scan().to_arrow()[
+            "id"
+        ].to_pylist() == [2]
+    restarted = Controller(
+        controller.config, Store(IO_PROPERTIES), now_ns=controller.now_ns
+    )
+    assert restarted.state()["nessie_history_floor_ms"] > 0
+    with pytest.raises(PermissionError):
+        restarted.allow_native_read("/trees/main/history")
+
+
 def test_real_writer_fence_and_pinned_reader(deployed):
     controller, gateway, base, namespace = deployed
     with catalog(base) as cat:

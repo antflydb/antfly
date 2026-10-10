@@ -21,22 +21,40 @@ const catalog = local.sql_catalog;
 const ingestion = @import("../serverless/lake_ingestion.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
+const stable_key = local.serverless_external_source_mod.lake_catalog.row_commit.stable_key;
 
 pub const Cut = struct {
     pending: ingestion.Pending,
+    kinds: []const stable_key.Kind = &.{},
     changed: std.StringHashMapUnmanaged(void) = .empty,
     pub fn init(a: A, pending: ingestion.Pending) !Cut {
-        var result: Cut = .{ .pending = pending };
-        for (pending.changes) |change| try result.changed.put(a, try identity(a, pending.key_fields, change.row), {});
+        return initKinds(a, pending, &.{});
+    }
+    pub fn initForTable(a: A, pending: ingestion.Pending, table: catalog.Table) !Cut {
+        const kinds = try a.alloc(stable_key.Kind, pending.key_fields.len);
+        for (pending.key_fields, kinds) |key, *kind| kind.* = switch ((try table.column(key)).type) {
+            .datetime => .timestamp,
+            .number => .number,
+            .integer, .string, .uuid, .boolean => .scalar,
+            else => return error.UnsupportedSqlExecution,
+        };
+        // Native Iceberg WAL timestamps are microseconds; SQL exposes the
+        // same canonical UTC representation as the committed Parquet reader.
+        for (pending.changes) |change| for (table.columns) |column| {
+            if (column.type == .datetime) if (change.row.object.getPtr(column.name)) |value| {
+                if (value.* != .null) value.* = try stable_key.normalize(a, value.*, .timestamp);
+            };
+        };
+        return initKinds(a, pending, kinds);
+    }
+    fn initKinds(a: A, pending: ingestion.Pending, kinds: []const stable_key.Kind) !Cut {
+        var result: Cut = .{ .pending = pending, .kinds = kinds };
+        for (pending.changes) |change| try result.changed.put(a, try identity(a, pending.key_fields, change.row, kinds), {});
         return result;
     }
 };
-fn identity(a: A, keys: []const []const u8, row: V) ![]const u8 {
-    if (row != .object) return error.InvalidWal;
-    const values = try a.alloc(V, keys.len);
-    defer a.free(values);
-    for (keys, values) |key, *value| value.* = row.object.get(key) orelse return error.InvalidWal;
-    return std.json.Stringify.valueAlloc(a, values, .{});
+fn identity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
+    return local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, kinds);
 }
 pub fn physicalRequest(a: A, request: catalog.Scan, cut: Cut) !catalog.Scan {
     // Ordered/physical selections cannot be translated to the new logical cut.
@@ -93,7 +111,7 @@ const Cursor = struct {
             self.base_done = page.after == null;
             for (page.rows) |row| {
                 try self.context.ensureActive();
-                const key = try identity(scratch, self.cut.pending.key_fields, row.value);
+                const key = try identity(scratch, self.cut.pending.key_fields, row.value, self.cut.kinds);
                 if (self.cut.changed.contains(key)) continue;
                 if (!try matchesTyped(scratch, self.table, row, self.request.conditions)) continue;
                 try rows.append(scratch, try project(scratch, self.table, row, self.request.fields));
@@ -104,7 +122,7 @@ const Cursor = struct {
             const change = self.cut.pending.changes[self.change_at];
             self.change_at += 1;
             if (change.op == .delete) continue;
-            const key = try identity(scratch, self.cut.pending.key_fields, change.row);
+            const key = try identity(scratch, self.cut.pending.key_fields, change.row, self.cut.kinds);
             const row: catalog.Row = .{ .id = try std.fmt.allocPrint(scratch, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(key)}), .version = self.cut.pending.lsn, .value = change.row };
             if (try matchesTyped(scratch, self.table, row, self.request.conditions)) try rows.append(scratch, try project(scratch, self.table, row, self.request.fields));
         };
@@ -166,8 +184,8 @@ test "lake SQL typed WAL visibility suppresses replaced matches before filtering
     const newer = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1,\"amount\":20}", .{});
     const deleted = try std.json.parseFromSliceLeaky(V, a, "{\"id\":2}", .{});
     const cut = try Cut.init(a, .{ .lsn = 3, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .upsert, .row = newer }, .{ .op = .delete, .row = deleted } } });
-    try std.testing.expect(cut.changed.contains(try identity(a, &.{"id"}, old)));
-    try std.testing.expect(cut.changed.contains(try identity(a, &.{"id"}, deleted)));
+    try std.testing.expect(cut.changed.contains(try identity(a, &.{"id"}, old, &.{})));
+    try std.testing.expect(cut.changed.contains(try identity(a, &.{"id"}, deleted, &.{})));
     const condition = [_]catalog.Condition{.{ .column = "amount", .op = .eq, .value = .{ .integer = 10 } }};
     try std.testing.expect(try matches(.{ .id = "old", .version = 0, .value = old }, &condition));
     try std.testing.expect(!try matches(.{ .id = "new", .version = 3, .value = newer }, &condition));
@@ -226,4 +244,17 @@ test "lake SQL overlay cursor keeps filtered short pages alive and applies final
         if (pages > 10) return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 2), total);
+}
+
+test "lake SQL accepted timestamp keys match canonical committed rows and numeric aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "/id", .type = .number }, .{ .name = "time", .path = "/time", .type = .datetime } } };
+    const instant = local.datetime.parseRfc3339ToSignedNs("2026-10-09T15:00:00Z").?;
+    const encoded = try std.fmt.allocPrint(a, "{{\"id\":7.0,\"time\":{d}}}", .{@divExact(instant, std.time.ns_per_us)});
+    const pending = try std.json.parseFromSliceLeaky(V, a, encoded, .{});
+    const cut = try Cut.initForTable(a, .{ .lsn = 9, .key_fields = &.{ "id", "time" }, .changes = &.{.{ .op = .delete, .row = pending }} }, table);
+    const committed = try std.json.parseFromSliceLeaky(V, a, "{\"id\":7,\"time\":\"2026-10-09T08:00:00-07:00\"}", .{});
+    try std.testing.expect(cut.changed.contains(try identity(a, cut.pending.key_fields, committed, cut.kinds)));
 }

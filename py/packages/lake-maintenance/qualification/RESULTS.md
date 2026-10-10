@@ -47,3 +47,50 @@ and SDK changes in the shared workspace were preserved.
 
 Production IAM/network enforcement, broader shared-data/delete-file combinations,
 larger catalogs and archive-scale performance remain additional qualifications.
+
+## Extended implementation qualification — 2026-10-09
+
+The earlier results above describe the previous implementation. The following
+qualification covers durable accepted SQL cuts, managed adapters, checkpoint
+reuse and incremental vacuum planning added subsequently:
+
+* The native binary builds with **46/46 successful steps**. The full lake API
+  suite passes **136 API + 124 local tests**, with no skips, failures or leaks
+  (**48/48 steps**). Validation used an isolated checkout to preserve concurrent
+  SQL and SDK edits in the shared workspace.
+* Focused accepted SQL tests pass: a durable session reuses the same metadata
+  snapshot and WAL images after publication and queue collection; an aggregate
+  and self-join remain unchanged, while a fresh accepted read sees the added row.
+* Focused remote recovery tests pass: removing local chunk hints does not force
+  another upload, and a recovered replacement with new file seals can reuse its
+  verified remote checkpoint chunks without transferring them again.
+* A real four-process native cluster passes the original public-cursor test
+  across finalized split, finalized merge and restart of all data owners, using
+  an S3 snapshot repository. This tests an original pre-split cursor; **fresh
+  ordered snapshot capture after splitting still needs distinct physical
+  generation identities for ranges that preserve a shared document namespace**.
+* A real PostgreSQL 18 logical replication fixture passes managed provisioning,
+  initial copy, subsequent update and owned physical slot/publication teardown
+  against a distributed native cluster.
+* A real GCS fixture in `antfly-dev-01` passes owned bucket notification,
+  Pub/Sub topic/subscription and publisher IAM setup, event receipt,
+  acknowledgement and teardown. Temporary cloud resources were removed. Its
+  native handoff is a test double; native catalog reconciliation is validated
+  independently. This is not an end-to-end cloud search qualification.
+* The final local provider suite passes **22 tests**, with eight skips for
+  unavailable native HTTP or provider-specific cases. A separate opt-in Nessie
+  retention test passes: a leased old reader survives retirement, and its
+  expired data files are actually deleted after the lease is released. The
+  shortened-history test uses an isolated catalog because it intentionally
+  removes files that conservative-history fixtures require.
+* The local authority, managed source, incremental planning and retention suites
+  pass **25 tests**. Python lint/format and staged whitespace checks pass.
+
+Real AWS/SQS provisioning, archive-scale throughput and cloud-provider vacuum
+performance remain unqualified. Incremental marking retains bounded metadata
+and persists reachability across turns, but oversized individual manifests may
+require replay rather than resuming at a byte offset. Nessie retention shortens
+file reachability under the enforced gateway contract; it does not compact the
+vendor's commit database. Cross-source graph/global aggregation execution,
+pgwire accepted selection and serializable accepted external SQL remain outside
+the supported query coverage described in the design documents.

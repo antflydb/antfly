@@ -30,12 +30,23 @@ const Context = catalog.types.Context;
 const Attempt = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64 };
 pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
-    return configured.openNativeArtifactObjectStoreAlloc(a, options.node_config orelse return error.NativeArtifactStorageRequired, options.secret_store, false);
+    const config = options.node_config orelse return error.NativeArtifactStorageRequired;
+    if (config.storage.artifacts.connection == null) {
+        if (config.deployment_mode != .standalone and config.deployment_mode != .embedded) return error.NativeArtifactStorageRequired;
+        const base = config.storage.local_base_dir orelse
+            (if (config.storage.lite_path) |path| std.fs.path.dirname(path) orelse "." else return error.NativeArtifactStorageRequired);
+        const root = try std.fs.path.join(a, &.{ base, "artifacts" });
+        defer a.free(root);
+        const uri = try std.fmt.allocPrint(a, "file://{s}", .{root});
+        defer a.free(uri);
+        return local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(a, uri, "native-lake-indexes", .{ .ensure_bucket = true });
+    }
+    return configured.openNativeArtifactObjectStoreAlloc(a, config, options.secret_store, false);
 }
 pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ .source = binding.source_uri, .catalog = binding.catalog }, .{});
     defer a.free(identity);
-    return std.fmt.allocPrint(a, "{s}/lake-ingestion/{d}/{d}/{s}", .{ base, options.catalog_table_id, options.catalog_generation, catalog.types.digestHex(identity) });
+    return std.fmt.allocPrint(a, "{s}{s}lake-ingestion/{d}/{d}/{s}", .{ base, if (base.len == 0) "" else "/", options.catalog_table_id, options.catalog_generation, catalog.types.digestHex(identity) });
 }
 pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
@@ -132,7 +143,8 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         var files = try configured.openBindingObjectStoreAlloc(a, binding, source_options);
         defer files.deinit();
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-        const built = try catalog.row_commit.prepare(scratch, current.table, .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = binding.source_uri, .context = context }, parsed.value, record.lsn, timestamp);
+        const files_uri = if (files.fs_client != null) try std.fmt.allocPrint(scratch, "object://{s}/{s}", .{ files.bucket, files.prefix }) else binding.source_uri;
+        const built = try catalog.row_commit.prepare(scratch, current.table, .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = files_uri, .context = context }, parsed.value, record.lsn, timestamp);
         attempt = .{ .id = try std.fmt.allocPrint(scratch, "wal-{d}-{s}", .{ record.lsn, catalog.types.digestHex(current.table.metadata_location) }), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
         const bytes = try std.json.Stringify.valueAlloc(scratch, attempt, .{});
         var stored = client.putObject(opened.bucket, intent_key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
@@ -182,7 +194,7 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
         for (batch.changes) |change| {
             var values: std.ArrayList(V) = .empty;
             for (keys) |field| try values.append(a, change.row.object.get(field) orelse return error.InvalidWal);
-            const identity = try std.json.Stringify.valueAlloc(a, values.items, .{});
+            const identity = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, change.row, &.{});
             const entry = try latest.getOrPut(a, identity);
             if (entry.found_existing) changes.items[entry.value_ptr.*] = change else {
                 if (changes.items.len == 65536) return error.LakeOverlayTooLarge;

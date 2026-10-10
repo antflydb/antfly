@@ -14,6 +14,18 @@
 // limitations.
 
 const std = @import("std");
+
+test "lake SQL admission retains physical float key precision in its WAL payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const commit = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.row_commit;
+    const batch = try std.json.parseFromSliceLeaky(commit.Batch, a, "{\"batch_id\":\"precision\",\"source\":\"hook\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"id\":16777216}},{\"op\":\"delete\",\"row\":{\"id\":16777217}}]}", .{});
+    try commit.validate(a, "{\"current-schema-id\":0,\"schemas\":[{\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"float\",\"required\":true}]}]}", batch, .{});
+    for (batch.changes) |change| try std.testing.expectEqual(@as(f64, 16777216), change.row.object.get("id").?.float);
+    const payload = try std.json.Stringify.valueAlloc(a, batch, .{});
+    try std.testing.expect(std.mem.indexOf(u8, payload, "16777217") == null);
+}
 const server_mod = @import("http_server.zig");
 const Adapter = @import("sql_execution.zig").Adapter;
 const domain = @import("antfly_local_sources").system_catalog_domain;
@@ -71,6 +83,93 @@ const Fixture = struct {
         self.native_closed += 1;
     }
 };
+
+test "lake SQL accepted transaction retains WAL images after publication and prepares executions against that cut" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const table_manager = @import("../metadata/table_manager.zig");
+    const metadata_api = @import("../metadata/api.zig");
+    const lake_api = @import("lake_catalog_http.zig");
+    const Source = struct {
+        fixture: Fixture,
+        table: [1]table_manager.TableRecord,
+        fn snapshot(raw: *anyopaque, context: operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return Fixture.catalog(&self.fixture, alloc, context, call);
+        }
+        fn replace(raw: *anyopaque, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!table_manager.tableDefinitionsEqual(self.table[0], expected)) return error.TableGenerationChanged;
+            const owned = try std.testing.allocator.dupe(u8, replacement.schema_json);
+            std.testing.allocator.free(self.table[0].schema_json);
+            self.table[0].schema_json = owned;
+            self.fixture.lake_schema = owned;
+        }
+    };
+    var directory = try local.common_test_directory.TestDirectory.init("sql-pinned-accepted");
+    defer directory.cleanup();
+    const config_json = try std.json.Stringify.valueAlloc(a, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } }, .connections = .{ .artifacts = .{ .kind = "external_io", .capabilities = .{"storage.primary"}, .external_io = .{ .protocol = "filesystem", .root = directory.path() } } } }, .{});
+    defer a.free(config_json);
+    var config = try local.common_config.Config.parseFromSlice(a, config_json);
+    defer config.deinit();
+    const uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()});
+    defer a.free(uri);
+    var schema = try std.json.parseFromSlice(std.json.Value, a, Fixture.native_schema, .{});
+    defer schema.deinit();
+    const base_bytes = try std.json.Stringify.valueAlloc(a, .{ .kind = "external", .format = "iceberg", .uri = uri, .table_id = "events", .schema_fingerprint = "auto", .write_policy = "iceberg_writer", .catalog = .{ .type = "managed" } }, .{});
+    defer a.free(base_bytes);
+    var base = try std.json.parseFromSlice(std.json.Value, a, base_bytes, .{});
+    defer base.deinit();
+    try schema.value.object.put(schema.arena.allocator(), "base_source", base.value);
+    const schema_json = try std.json.Stringify.valueAlloc(a, schema.value, .{});
+    var source: Source = .{ .fixture = .{ .lake_schema = schema_json }, .table = .{.{ .table_id = 7, .name = "events", .schema_json = schema_json, .indexes_json = "{}" }} };
+    defer a.free(source.table[0].schema_json);
+    var backend = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var server = server_mod.ApiHttpServer.init(a, .{ .node_config = &config, .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
+    defer server.deinit();
+    var initial = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .create, .body = "{\"commit_id\":\"create\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"amount\",\"type\":\"long\",\"required\":true}]}}" });
+    defer initial.deinit(a);
+    var accepted = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":1}}]}" });
+    defer accepted.deinit(a);
+    const transaction = try server.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, server.localSessionNodeId(), null);
+    const id = std.fmt.bytesToHex(transaction.txn_id, .lower);
+    var identity: ?server_mod.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .lake_visibility = .accepted };
+    var compiled = try local.sql_compiler.compile(a, "SELECT SUM(amount) FROM events", .{});
+    defer compiled.deinit();
+    var first = try adapter.execute(a, &compiled, &.{}, .{}, null);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("1", first.output.rows[0][0].string);
+    var next = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"second\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":2}}]}" });
+    defer next.deinit(a);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, source.table[0].schema_json)).?;
+    defer binding.deinit(a);
+    try std.testing.expect(try @import("../serverless/lake_ingestion.zig").drain(a, binding.binding, .{ .node_config = &config, .catalog_table_id = 7 }, .{ .io = std.testing.io }));
+    // New request and recompiled/prepared statement reuse the durable cut.
+    // The current catalog now contains both rows, unlike the initial empty
+    // snapshot plus the single copied WAL image held by this transaction.
+    var resumed: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id };
+    var again = try resumed.execute(a, &compiled, &.{}, .{}, null);
+    defer again.deinit();
+    try std.testing.expectEqualStrings("1", again.output.rows[0][0].string);
+    var joined = try local.sql_compiler.compile(a, "SELECT SUM(e.amount) FROM events e JOIN events f ON e.amount = f.amount", .{});
+    defer joined.deinit();
+    var joined_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id };
+    var joined_result = try joined_adapter.execute(a, &joined, &.{}, .{}, null);
+    defer joined_result.deinit();
+    try std.testing.expectEqualStrings("1", joined_result.output.rows[0][0].string);
+    var fresh: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .lake_visibility = .accepted };
+    var latest = try fresh.execute(a, &compiled, &.{}, .{}, null);
+    defer latest.deinit();
+    try std.testing.expectEqualStrings("3", latest.output.rows[0][0].string);
+}
 
 test "lake SQL API binds external catalog sources for aggregates joins public rows and read-only rejection" {
     const alloc = std.testing.allocator;

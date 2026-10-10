@@ -108,12 +108,13 @@ conflict; prepared jobs retain their original epoch through recovery.
 
 Traversal defaults to 100,000 objects/roots and 256 MiB of metadata; a plan selects
 at most 4,096 object-version deletions and deletes 64 per turn (configurable). Exceeding a bound
-fails closed. Planning holds catalog admission and is not a demonstrated
-full-archive incremental marker. Unsupported mutations (merge/transplant,
+fails closed. Planning holds catalog admission and persists its marks and provider inventory
+cursor across bounded turns. Full-archive latency is not yet qualified. Unsupported mutations (merge/transplant,
 registration, table purge, views and multi-table transactions) fail closed. A
 candidate whose filesystem/GCS generation changed is preserved and the job stays
 fenced for reconciliation. Current real-provider qualification covers S3 versioned
-storage; GCS code requires separate real-cloud qualification.
+storage; GCS vacuum deletion requires separate real-cloud qualification. Managed
+GCS notification provisioning and event delivery are real-cloud qualified below.
 
 ## Reproduce qualification
 
@@ -149,3 +150,62 @@ privileged local driver. After removing that override, recreate the networks. Th
 probe checks both private IP addresses and vendor DNS names. Provider tests use official Nessie 0.109.0, Polaris
 1.7.0 and RustFS 1.0.0-alpha.81. Retention tests inject a controller clock 21 minutes
 ahead; real provider/storage operations are performed without waiting ten minutes.
+
+
+## Managed source operator
+
+Install with `uv sync --extra managed`. `antfly-managed-source --config sources.json
+--source NAME ACTION` supports `define`, `reconcile`, `poll`, `status`, `remove`
+and `run`. Define once, then supervise with `run --interval 10`; each bounded turn
+revalidates provider ownership and native configuration before observing progress
+or consuming notifications. SIGTERM stops between bounded provider operations.
+Failures preserve the exact unresolved operation intent and use bounded backoff.
+Status records the error class without provider messages or credentials.
+
+Configuration contains `authority_uri`, `antfly_endpoint`, optional `runtime`
+connection/header settings, and a `sources` map. Each definition names `kind`,
+`table`, and immutable `table_id`. PostgreSQL additionally uses `postgres_table`,
+`dsn_ref: "${secret:PG_DSN}"`, and an optional `key_template` (default `id`). S3
+uses `bucket`, `prefix`, `account_id`, plus the operator's
+`notification_writer_arn`; GCS uses `bucket`, `prefix`, and `project`.
+Credentials resolve only at runtime. The conditional object-store authority owns
+intent, revisions, resources and notification checkpoints; this is not SQLite.
+Definitions are immutable and do not adopt operator-owned resources.
+
+PostgreSQL provisioning marks its parent publication with a stable ownership
+witness. Native distributed CDC owns authority-specific exported-cutover slots
+and publications. Teardown first removes its exact native entry using an
+incarnation/hash CAS, then uses the native cutover advisory lock and ownership
+witness to remove inactive owned physical resources. The managed database role
+must privately own this resource namespace. Standalone native mode has no CDC
+executor and rejects managed PostgreSQL configuration. Real qualification covers
+initial snapshot, update ingestion and teardown against PostgreSQL 18.
+
+S3 provisioning requires an enforced exclusive bucket-notification configuration
+writer, because AWS provides no notification CAS. The operator verifies its role
+and the bucket's deny policy, preserves unrelated notifications, creates a tagged
+SQS queue and restricted delivery policy, and removes only owned resources.
+GCS uses labeled Pub/Sub resources and notification ownership attributes,
+reconciles publisher IAM with etags, and tears down matching resources only.
+Notification consumers reconcile the durable catalog and persist the handoff
+before acknowledgement; empty queues still trigger periodic reconciliation.
+Native endpoints are `GET/POST /db/v1/tables/{name}/sources/managed` and
+`POST /db/v1/tables/{name}/lake/reconcile`, with administrator authorization and
+an explicit table-incarnation fence. Index publication remains asynchronous.
+Real GCS/Pub/Sub qualification covers provisioning, ownership reconciliation,
+notification delivery and teardown in `antfly-dev-01` with temporary resources.
+S3/SQS provisioning currently has SDK contract tests; real AWS qualification
+remains outstanding.
+
+Nessie shorter retention is opt-in through `nessie_history_retention_ms` (at least
+600000). It irreversibly switches external reads to leased Iceberg REST access;
+native historical content/history endpoints are denied. Branch/tag heads and
+active readers remain protected. This controls file reachability, not physical
+Nessie commit-database truncation. All gateway instances must share the authority
+and enforce the policy before enabling it.
+
+Shortened Nessie retention qualification uses a dedicated fresh catalog:
+`ANTFLY_REAL_CATALOGS=1 ANTFLY_REAL_NESSIE_RETENTION=1 uv run pytest -q
+ tests/test_real_providers.py -k nessie_retention`. Do not subsequently run the
+conservative-history suite against that catalog: expired historical table files
+are deliberately gone. Reset the disposable Nessie fixture between these runs.

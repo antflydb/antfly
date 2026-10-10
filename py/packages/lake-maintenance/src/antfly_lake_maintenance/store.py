@@ -292,6 +292,73 @@ class Store:
                         int(item["LastModified"].timestamp() * 1000),
                     )
 
+    def inventory_page(self, prefix, cursor=None, *, limit=256):
+        """One exact-version page; the opaque cursor belongs to the caller's epoch."""
+        if not prefix.endswith("/") or not 1 <= limit <= 1000:
+            raise ValueError("invalid inventory page")
+        scheme, bucket, key = self._parts(prefix)
+        if scheme == "s3":
+            result = self.s3.list_object_versions(
+                Bucket=bucket, Prefix=key, MaxKeys=limit, **(cursor or {})
+            )
+            entries = [
+                Object(
+                    f"s3://{bucket}/{item['Key']}",
+                    encode(
+                        {"etag": item.get("ETag"), "version_id": item["VersionId"]}
+                    ).decode(),
+                    item.get("Size", 0),
+                    int(item["LastModified"].timestamp() * 1000),
+                )
+                for item in result.get("Versions", []) + result.get("DeleteMarkers", [])
+            ]
+            following = (
+                {
+                    "KeyMarker": result["NextKeyMarker"],
+                    "VersionIdMarker": result["NextVersionIdMarker"],
+                }
+                if result.get("IsTruncated")
+                else None
+            )
+            return entries, following
+        if scheme == "gs":
+            iterator = self.gcs.list_blobs(
+                bucket,
+                prefix=key,
+                versions=True,
+                page_token=cursor,
+                page_size=limit,
+                max_results=limit,
+                timeout=20,
+                retry=None,
+            )
+            page = next(iterator.pages, ())
+            entries = [
+                Object(
+                    f"gs://{bucket}/{blob.name}",
+                    str(blob.generation),
+                    blob.size or 0,
+                    int(blob.updated.timestamp() * 1000),
+                )
+                for blob in page
+            ]
+            return entries, iterator.next_page_token
+        # Local qualification uses a deterministic path cursor. Cloud inventory
+        # uses provider continuation tokens rather than rescanning old pages.
+        from itertools import islice
+
+        entries = list(
+            islice(
+                (
+                    item
+                    for item in self.inventory(prefix, all_versions=True)
+                    if cursor is None or item.uri > cursor
+                ),
+                limit + 1,
+            )
+        )
+        return entries[:limit], entries[limit - 1].uri if len(entries) > limit else None
+
     def _s3_version(self, bucket, item):
         head = self.s3.head_object(Bucket=bucket, Key=item["Key"], IfMatch=item["ETag"])
         if head["ETag"] != item["ETag"]:

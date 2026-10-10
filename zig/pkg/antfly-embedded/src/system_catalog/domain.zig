@@ -1322,8 +1322,8 @@ pub fn validateQuerySource(a: std.mem.Allocator, bytes: []const u8) !void {
             for (items.array.items[0..i]) |prior| if (std.mem.eql(u8, name, try sourceLeaf(prior))) return error.InvalidCatalogMutation;
         }
     } else if (value.object.get("overlay")) |spec| {
-        if (spec != .object or spec.object.count() < 3 or spec.object.count() > 4) return error.InvalidCatalogMutation;
-        for (spec.object.keys()) |key| if (!std.mem.eql(u8, key, "base") and !std.mem.eql(u8, key, "changes") and !std.mem.eql(u8, key, "key") and !std.mem.eql(u8, key, "tombstone_field")) return error.InvalidCatalogMutation;
+        if (spec != .object or spec.object.count() < 3 or spec.object.count() > 5) return error.InvalidCatalogMutation;
+        for (spec.object.keys()) |key| if (!std.mem.eql(u8, key, "base") and !std.mem.eql(u8, key, "changes") and !std.mem.eql(u8, key, "key") and !std.mem.eql(u8, key, "tombstone_field") and !std.mem.eql(u8, key, "key_types")) return error.InvalidCatalogMutation;
         const base = try sourceLeaf(spec.object.get("base") orelse return error.InvalidCatalogMutation);
         const changes = try sourceLeaf(spec.object.get("changes") orelse return error.InvalidCatalogMutation);
         if (std.mem.eql(u8, base, changes)) return error.InvalidCatalogMutation;
@@ -1332,6 +1332,10 @@ pub fn validateQuerySource(a: std.mem.Allocator, bytes: []const u8) !void {
         for (keys.array.items, 0..) |key, i| {
             try sourceField(key);
             for (keys.array.items[0..i]) |prior| if (std.mem.eql(u8, prior.string, key.string)) return error.InvalidCatalogMutation;
+        }
+        if (spec.object.get("key_types")) |types| {
+            if (types != .array or types.array.items.len != keys.array.items.len) return error.InvalidCatalogMutation;
+            for (types.array.items) |kind| if (kind != .string or (!std.mem.eql(u8, kind.string, "scalar") and !std.mem.eql(u8, kind.string, "number") and !std.mem.eql(u8, kind.string, "timestamp"))) return error.InvalidCatalogMutation;
         }
         if (spec.object.get("tombstone_field")) |field| try sourceField(field);
     } else return error.InvalidCatalogMutation;

@@ -32,6 +32,7 @@ pub fn hasSource(a: A, body: []const u8) !bool {
     defer parsed.deinit();
     return parsed.value == .object and parsed.value.object.contains("source");
 }
+const KeyKind = local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.Kind;
 const Hit = struct { value: V, table: []const u8, id: []const u8, score: f64, keys: []const V };
 const Order = struct { field: []const u8, desc: bool = false };
 fn compareValue(l: V, r: V) std.math.Order {
@@ -48,14 +49,11 @@ fn less(orders: []const Order, l: Hit, r: Hit) bool {
     if (table_order != .eq) return table_order == .lt;
     return std.mem.lessThan(u8, l.id, r.id);
 }
-fn rowIdentity(a: A, keys: []const []const u8, row: V) ![]const u8 {
-    if (row != .object) return error.UnsupportedQueryRequest;
-    const values = try a.alloc(V, keys.len);
-    for (keys, values) |key, *value| {
-        value.* = row.object.get(key) orelse return error.UnsupportedQueryRequest;
-        if (value.* != .integer and value.* != .string and value.* != .bool) return error.UnsupportedQueryRequest;
-    }
-    return std.json.Stringify.valueAlloc(a, values, .{});
+fn rowIdentity(a: A, keys: []const []const u8, row: V, kinds: []const KeyKind) ![]const u8 {
+    return local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, kinds) catch |err| switch (err) {
+        error.InvalidLakeKey => error.UnsupportedQueryRequest,
+        else => err,
+    };
 }
 fn integer(value: V) !usize {
     return switch (value) {
@@ -77,11 +75,12 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
     if (source != .object or source.object.count() != 1) return error.UnsupportedQueryRequest;
     const overlay = source.object.get("overlay");
     var overlay_keys: []const []const u8 = &.{};
+    var overlay_kinds: []const KeyKind = &.{};
     var tombstone_field: []const u8 = "deleted";
     const union_value = source.object.get("union") orelse overlay_source: {
         const spec = overlay orelse return error.UnsupportedQueryRequest;
-        if (spec != .object or spec.object.count() < 3 or spec.object.count() > 4) return error.InvalidQueryRequest;
-        for (spec.object.keys()) |field| if (!std.mem.eql(u8, field, "base") and !std.mem.eql(u8, field, "changes") and !std.mem.eql(u8, field, "key") and !std.mem.eql(u8, field, "tombstone_field")) return error.InvalidQueryRequest;
+        if (spec != .object or spec.object.count() < 3 or spec.object.count() > 5) return error.InvalidQueryRequest;
+        for (spec.object.keys()) |field| if (!std.mem.eql(u8, field, "base") and !std.mem.eql(u8, field, "changes") and !std.mem.eql(u8, field, "key") and !std.mem.eql(u8, field, "tombstone_field") and !std.mem.eql(u8, field, "key_types")) return error.InvalidQueryRequest;
         const keys = spec.object.get("key") orelse return error.InvalidQueryRequest;
         if (keys != .array or keys.array.items.len == 0 or keys.array.items.len > 8) return error.InvalidQueryRequest;
         const names = try scratch.alloc([]const u8, keys.array.items.len);
@@ -91,6 +90,15 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
             name.* = key.string;
         }
         overlay_keys = names;
+        if (spec.object.get("key_types")) |types| {
+            if (types != .array or types.array.items.len != names.len) return error.InvalidQueryRequest;
+            const kinds = try scratch.alloc(KeyKind, names.len);
+            for (types.array.items, kinds) |value, *kind| {
+                if (value != .string) return error.InvalidQueryRequest;
+                kind.* = std.meta.stringToEnum(KeyKind, value.string) orelse return error.InvalidQueryRequest;
+            }
+            overlay_kinds = kinds;
+        }
         if (spec.object.get("tombstone_field")) |field| {
             if (field != .string or field.string.len == 0 or std.mem.indexOfAny(u8, field.string, "/.~") != null) return error.InvalidQueryRequest;
             tombstone_field = field.string;
@@ -152,7 +160,7 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
         try fields.append(scratch, .{ .string = tombstone_field });
         try root.object.put(scratch, "fields", .{ .array = fields.toManaged(scratch) });
     }
-    return executeStreams(a, scratch, root, union_value.array.items, overlay_keys, tombstone_field, requested_fields, orders.items, rrf, overlay != null, limit, offset, count, cursor, expression_bytes, executor, budget);
+    return executeStreams(a, scratch, root, union_value.array.items, overlay_keys, overlay_kinds, tombstone_field, requested_fields, orders.items, rrf, overlay != null, limit, offset, count, cursor, expression_bytes, executor, budget);
 }
 
 const batch_size = 128;
@@ -300,20 +308,21 @@ fn scoreValue(value: V) f64 {
         else => std.math.nan(f64),
     };
 }
-fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, root: V, response_a: A, executor: Executor) !void {
+fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, kinds: []const KeyKind, root: V, response_a: A, executor: Executor) !void {
     if (base.hits.len == 0) return;
     const pa = base.arena.allocator();
     var clauses: std.ArrayList(V) = .empty;
     var identities: std.StringHashMapUnmanaged(usize) = .empty;
     for (base.hits, 0..) |hit, i| {
         const row = hit.value.object.get("_source") orelse return error.UnsupportedQueryRequest;
-        const identity = try rowIdentity(pa, keys, row);
+        const identity = try rowIdentity(pa, keys, row, kinds);
         const unique = try identities.getOrPut(pa, identity);
         if (unique.found_existing) return error.InvalidQueryRequest;
         unique.value_ptr.* = i;
         var terms: std.ArrayList(V) = .empty;
-        for (keys) |key| {
-            const encoded = try std.json.Stringify.valueAlloc(pa, .{ .term = .{ .path = try std.fmt.allocPrint(pa, "/{s}", .{key}), .value = row.object.get(key).? } }, .{});
+        for (keys, 0..) |key, index| {
+            const key_value = try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.normalize(pa, row.object.get(key).?, if (kinds.len == 0) .scalar else kinds[index]);
+            const encoded = try std.json.Stringify.valueAlloc(pa, .{ .term = .{ .path = try std.fmt.allocPrint(pa, "/{s}", .{key}), .value = key_value } }, .{});
             try terms.append(pa, try std.json.parseFromSliceLeaky(V, pa, encoded, .{}));
         }
         try clauses.append(pa, try std.json.parseFromSliceLeaky(V, pa, try std.json.Stringify.valueAlloc(pa, .{ .conjuncts = terms.items }, .{}), .{}));
@@ -339,7 +348,7 @@ fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, ro
     if (total == .object) if (total.object.get("relation")) |relation| if (relation != .string or (!std.mem.eql(u8, relation.string, "exact") and !std.mem.eql(u8, relation.string, "eq"))) return error.QueryCandidateBudgetExceeded;
     if (items.len != total_count or items.len > base.hits.len) return error.QueryCandidateBudgetExceeded;
     for (items) |hit| {
-        const key = try rowIdentity(pa, keys, hit.object.get("_source").?);
+        const key = try rowIdentity(pa, keys, hit.object.get("_source").?, kinds);
         const i = identities.get(key) orelse return error.InvalidQueryRequest;
         if (base.hidden[i]) return error.InvalidQueryRequest;
         base.hidden[i] = true;
@@ -354,7 +363,7 @@ fn maskTombstones(stream: *Stream, field: []const u8) !void {
         }
     }
 }
-fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []const u8, tombstone: []const u8, fields: ?V, orders: []const Order, rrf: bool, overlay: bool, limit: usize, offset: usize, count: bool, cursor: ?V, expression: []const u8, executor: Executor, budget: *local.sql_memory_budget) !Response {
+fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []const u8, kinds: []const KeyKind, tombstone: []const u8, fields: ?V, orders: []const Order, rrf: bool, overlay: bool, limit: usize, offset: usize, count: bool, cursor: ?V, expression: []const u8, executor: Executor, budget: *local.sql_memory_budget) !Response {
     if (count and !overlay) {
         var total: usize = 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -417,7 +426,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         };
     }
     if (overlay) {
-        maskBatch(&streams[0], &streams[1], keys, root, a, executor) catch |err| {
+        maskBatch(&streams[0], &streams[1], keys, kinds, root, a, executor) catch |err| {
             if (streams[0].failed) |response| {
                 streams[0].failed = null;
                 return response;
@@ -464,7 +473,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
                         return err;
                     };
                     if (overlay) {
-                        if (i == 0) maskBatch(stream, &streams[1], keys, root, a, executor) catch |err| {
+                        if (i == 0) maskBatch(stream, &streams[1], keys, kinds, root, a, executor) catch |err| {
                             if (stream.failed) |response| {
                                 stream.failed = null;
                                 return response;
@@ -734,4 +743,16 @@ test "external lake archive overlay streams past five thousand masked candidates
     try std.testing.expectEqualStrings("exact", total.object.get("relation").?.string);
     fixture.cancel_after = fixture.checks + 20;
     try std.testing.expectError(error.Cancelled, execute(a, body, fixture.executor()));
+}
+
+test "external lake overlay identities canonicalize numeric and explicit timestamp keys without rounding large integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try std.json.parseFromSliceLeaky(V, a, "{\"id\":7,\"time\":\"2026-10-09T08:00:00-07:00\"}", .{});
+    const right = try std.json.parseFromSliceLeaky(V, a, "{\"id\":7.0,\"time\":\"2026-10-09T15:00:00Z\"}", .{});
+    try std.testing.expectEqualStrings(try rowIdentity(a, &.{ "id", "time" }, left, &.{ .number, .timestamp }), try rowIdentity(a, &.{ "id", "time" }, right, &.{ .number, .timestamp }));
+    const precise = try std.json.parseFromSliceLeaky(V, a, "{\"id\":9007199254740993}", .{});
+    const rounded = try std.json.parseFromSliceLeaky(V, a, "{\"id\":9007199254740992}", .{});
+    try std.testing.expect(!std.mem.eql(u8, try rowIdentity(a, &.{"id"}, precise, &.{.number}), try rowIdentity(a, &.{"id"}, rounded, &.{.number})));
 }

@@ -1610,7 +1610,7 @@ components:
           type: string
           enum: [committed, accepted]
           default: committed
-          description: Direct read-only statement visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not supported with sessions, connections or prepared execution.
+          description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
         statement:
           type: string
           minLength: 1

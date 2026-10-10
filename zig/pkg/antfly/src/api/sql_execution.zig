@@ -139,6 +139,7 @@ pub const Adapter = struct {
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
+    accepted_lake_repeatable: bool = false,
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     range_reads: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     dynamic_snapshot: ?*@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null,
@@ -176,7 +177,11 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
-        if (self.lake_visibility == .accepted and (compiled.statement != .select or self.session_id != null or self.connection_id != null or guarded_backend != null)) return error.UnsupportedSqlExecution;
+        if (self.lake_visibility == .accepted and guarded_backend != null) return error.UnsupportedSqlExecution;
+        const previous_visibility = self.lake_visibility;
+        const previous_context = self.context;
+        defer self.lake_visibility = previous_visibility;
+        defer self.context = previous_context;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
         const previous_provider = self.decision_provider;
@@ -226,6 +231,7 @@ pub const Adapter = struct {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
+            if (inherited.?.metadata.accepted_lake_reads) self.lake_visibility = .accepted;
             if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return zig017_failure: {
                 zig017_return_error = error.SqlConnectionNotFound;
                 break :zig017_failure error.SqlConnectionNotFound;
@@ -411,6 +417,7 @@ pub const Adapter = struct {
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
+                self.accepted_lake_repeatable = self.lake_visibility == .accepted and transaction.isolation != .serializable;
                 self.staged = &staged;
                 self.inserting = switch (compiled.statement) {
                     .insert => |insert| insert.conflict == null,
@@ -421,6 +428,7 @@ pub const Adapter = struct {
                 };
                 defer {
                     self.active_transaction = null;
+                    self.accepted_lake_repeatable = false;
                     self.staged = null;
                     self.range_reads = null;
                     self.ranges_staged = false;
@@ -970,7 +978,7 @@ pub const Adapter = struct {
 
     fn checkLakeRead(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         // External snapshots cannot provide native serializable range proofs.
-        if (self.range_reads != null or self.dynamic_snapshot != null) return error.UnsupportedSqlExecution;
+        if ((self.range_reads != null and !self.accepted_lake_repeatable) or self.dynamic_snapshot != null) return error.UnsupportedSqlExecution;
         if (try self.rowPolicyProof(alloc, table)) |proof| {
             if (self.policy_proofs == null) alloc.free(proof);
             return error.RowPolicyUnsupported;
@@ -1021,6 +1029,47 @@ pub const Adapter = struct {
         };
     }
 
+    fn loadSqlLakeCut(self: *Adapter, a: std.mem.Allocator, table: catalog.Table) !?@import("lake_sql_retained_cut.zig").Descriptor {
+        const id = self.active_transaction orelse return null;
+        var held = (try self.server.txn_sessions.getLakeCut(self.server.alloc, id, table.physical_name)) orelse return null;
+        defer held.deinit(self.server.alloc);
+        if (held.version != table.id or held.document_json == null) return error.CatalogGenerationChanged;
+        const token = try std.json.parseFromSliceLeaky([]const u8, a, held.document_json.?, .{ .allocate = .alloc_always });
+        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        defer store.deinit();
+        var artifacts = store.artifactStore();
+        const cut = try @import("lake_sql_retained_cut.zig").load(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+        var normalized = try self.context.platformDeadline();
+        const time = @import("antfly_platform").time;
+        const wall_now = time.realtimeNs() / std.time.ns_per_ms;
+        if (wall_now >= cut.expires_ms) return error.CatalogGenerationChanged;
+        const expiry_deadline = time.monotonicNs() +| (cut.expires_ms - wall_now) * std.time.ns_per_ms;
+        normalized.deadline_ns = @min(normalized.deadline_ns orelse expiry_deadline, expiry_deadline);
+        self.context = normalized;
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .load);
+        defer current.deinit(a);
+        const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(a, current.table.metadata_json);
+        const metadata = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata;
+        if (!std.mem.eql(u8, try metadata.str(try metadata.get(root, "table-uuid")), cut.table_uuid)) return error.CatalogGenerationChanged;
+        return cut;
+    }
+    fn saveSqlLakeCut(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, cut: @import("lake_sql_retained_cut.zig").Descriptor, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {
+        const id = self.active_transaction orelse return error.SqlTransactionNotActive;
+        var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, table.external_base_source.?.binding, options);
+        defer opened.deinit();
+        const pins = @import("../serverless/lake_snapshot_pins.zig");
+        const pin: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try pins.namespace(a, opened.prefix, table.external_base_source.?.binding, cut.table_uuid), .context = context };
+        const now = @import("antfly_platform").time.realtimeNs();
+        if (cut.expires_ms <= now / std.time.ns_per_ms) return error.CatalogGenerationChanged;
+        _ = try pin.acquireFor(a, cut.snapshot_id, now, (cut.expires_ms - now / std.time.ns_per_ms) * std.time.ns_per_ms);
+        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        defer store.deinit();
+        var artifacts = store.artifactStore();
+        const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), self.server.embedding_provider_runtime.io, cut, self.context.cancellation);
+        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
+    }
+
     fn fillLakeStatement(self: *Adapter, alloc: std.mem.Allocator, owner: *LakeStatement, requests: []const catalog.StatementScan) !catalog.StatementRead {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -1035,31 +1084,55 @@ pub const Adapter = struct {
                 const source = try alloc.create(@import("antfly_local_sources").serverless_query_lake_serving.ServingSource);
                 errdefer alloc.destroy(source);
                 const schema: @import("antfly_local_sources").storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
+                var retained: ?@import("lake_sql_retained_cut.zig").Descriptor = null;
+                if (self.lake_visibility == .accepted and self.active_transaction != null) {
+                    if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
+                    retained = try self.loadSqlLakeCut(owner.overlay_arena.?.allocator(), request.table);
+                }
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else null, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
                 source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
                 errdefer source.deinit();
-                try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
-                if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
+                try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                if (retained) |cut| {
+                    if (!std.mem.eql(u8, source.inventory.snapshot_id, cut.snapshot_id)) return error.CatalogGenerationChanged;
+                    const oa = owner.overlay_arena.?.allocator();
+                    const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
+                    overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, cut.pending, request.table);
+                    if (cut.pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                } else if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
                     const binding = schema.external_base_source.?.binding;
                     const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
                     var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(alloc, binding, lake_options, context, .load);
                     defer current.deinit(alloc);
-                    const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(oa, current.table.metadata_json);
+                    const pinned_metadata = source.catalog_metadata orelse return error.InvalidLakeMetadata;
+                    const metadata_uri = pinned_metadata.metadata_location;
+                    const source_metadata = pinned_metadata.metadata_json;
+                    const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(oa, source_metadata);
+                    const current_root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(oa, current.table.metadata_json);
+                    const uuid = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.str(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.get(root, "table-uuid"));
+                    if (!std.mem.eql(u8, uuid, try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.str(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.get(current_root, "table-uuid")))) return error.CatalogGenerationChanged;
                     const cut = try @import("lake_search_overlay.zig").snapshotCoverage(root, source.inventory.snapshot_id);
                     const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
-                    for (pending.key_fields) |key| {
-                        const kind = (try request.table.column(key)).type;
-                        if (kind != .integer and kind != .string and kind != .boolean) return error.UnsupportedSqlExecution;
-                    }
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
-                    overlay.* = try @import("lake_sql_overlay.zig").Cut.init(oa, pending);
-                    if (pending.changes.len != 0) {
-                        try @import("lake_search_overlay.zig").requireNativeAncestry(root, source.inventory.snapshot_id);
-                        try owner.overlays.put(alloc, request.table.id, overlay);
-                    }
+                    if (pending.changes.len != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
+                    // Persist the unmodified physical WAL before SQL converts
+                    // timestamp values to its logical representation.
+                    if (self.active_transaction != null) try self.saveSqlLakeCut(oa, request.table, .{
+                        .table_id = request.table.id,
+                        .schema_version = request.table.schema_version,
+                        .object_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0,
+                        .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| @import("lake_sql_retained_cut.zig").ttl_ms,
+                        .metadata_location = metadata_uri,
+                        .metadata_json = source_metadata,
+                        .table_uuid = uuid,
+                        .snapshot_id = source.inventory.snapshot_id,
+                        .pending = pending,
+                    }, lake_options, context);
+                    overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, pending, request.table);
+                    if (pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 }
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
