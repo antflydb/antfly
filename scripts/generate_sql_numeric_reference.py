@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Generate/verify the exact NUMERIC kernel oracle; no float intermediates."""
 
@@ -201,16 +213,36 @@ def cases():
             result.append({"op": op, "left": left, "right": right})
     result.append({"op": "remainder", "left": "1e131071", "right": "12345"})
     roots = [
-        "0", "0.00", "1", "2", "4", "9", "10000", "1e-20",
-        "1.2345678901234567890123456789", "9007199254740993",
+        "0",
+        "0.00",
+        "1",
+        "2",
+        "4",
+        "9",
+        "10000",
+        "1e-20",
+        "1.2345678901234567890123456789",
+        "9007199254740993",
         "99999999999999999999999999999999999999",
-        "NaN", "Infinity", "-Infinity", "-1", "-0.0000",
-        "0.00000000000000000000000000000000000001", "1e-16383",
-        "9999", "10001", "99999999", "100000001",
-        "2.25", "0.0025", "123456789.123456789",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "-1",
+        "-0.0000",
+        "0.00000000000000000000000000000000000001",
+        "1e-16383",
+        "9999",
+        "10001",
+        "99999999",
+        "100000001",
+        "2.25",
+        "0.0025",
+        "123456789.123456789",
         "1.00000000000000100000000000000025",
         "1.00000000000000099999999999999999",
-        "1.00000000000000100000000000000026", "1e1000", "1e-1000",
+        "1.00000000000000100000000000000026",
+        "1e1000",
+        "1e-1000",
     ]
     root_rng = random.Random(20261011)
     roots.extend(
@@ -325,7 +357,12 @@ def main():
             output["entries"].append(entry)
     if args.generate:
         print('{\n  "reference": "PostgreSQL exact NUMERIC kernel",\n  "entries": [')
-        print(",\n".join("    " + json.dumps(entry, separators=(",", ":")) for entry in output["entries"]))
+        print(
+            ",\n".join(
+                "    " + json.dumps(entry, separators=(",", ":"))
+                for entry in output["entries"]
+            )
+        )
         print("  ]\n}")
     else:
         if output != json.loads(FIXTURE.read_text()):

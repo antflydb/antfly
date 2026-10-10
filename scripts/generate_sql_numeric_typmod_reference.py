@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verify NUMERIC type-modifier values and wire descriptors with PostgreSQL."""
 
@@ -10,7 +22,10 @@ from pathlib import Path
 
 from generate_sql_postgres_reference import postgres
 
-FIXTURE = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_typmod_reference.json"
+FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_numeric_typmod_reference.json"
+)
 
 
 def cases():
@@ -97,7 +112,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate", action="store_true")
     args = parser.parse_args()
-    output = {"reference": "PostgreSQL 18 NUMERIC type modifiers", "entries": [], "queries": []}
+    output = {
+        "reference": "PostgreSQL 18 NUMERIC type modifiers",
+        "entries": [],
+        "queries": [],
+    }
     with postgres() as db:
         for sql in cases():
             entry = {"sql": sql}
@@ -106,7 +125,9 @@ def main():
                 entry["oid"] = cursor.pgresult.ftype(0)
                 entry["typmod"] = cursor.pgresult.fmod(0)
                 entry["expected"] = db.execute(f"SELECT ({sql})::text").fetchone()[0]
-                prepared = db.pgconn.prepare(b"numeric_modifier_oracle", f"SELECT ({sql})".encode())
+                prepared = db.pgconn.prepare(
+                    b"numeric_modifier_oracle", f"SELECT ({sql})".encode()
+                )
                 if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
                     raise ValueError(prepared.error_message.decode())
                 descriptor = db.pgconn.describe_prepared(b"numeric_modifier_oracle")
@@ -125,14 +146,18 @@ def main():
             descriptor = db.pgconn.describe_prepared(b"numeric_modifier_oracle")
             if descriptor.status != psycopg.pq.ExecStatus.COMMAND_OK:
                 raise ValueError(descriptor.error_message.decode())
-            output["queries"].append({"sql": sql, "oid": descriptor.ftype(0), "modifier": descriptor.fmod(0)})
+            output["queries"].append(
+                {"sql": sql, "oid": descriptor.ftype(0), "modifier": descriptor.fmod(0)}
+            )
             db.execute("DEALLOCATE numeric_modifier_oracle")
     if args.generate:
         print(json.dumps(output, indent=2))
     else:
         if output != json.loads(FIXTURE.read_text()):
             raise ValueError("PostgreSQL NUMERIC type-modifier oracle drift")
-        print(f"Verified {len(output['entries'])} PostgreSQL NUMERIC type modifiers and {len(output['queries'])} query descriptors")
+        print(
+            f"Verified {len(output['entries'])} PostgreSQL NUMERIC type modifiers and {len(output['queries'])} query descriptors"
+        )
 
 
 if __name__ == "__main__":
