@@ -109,6 +109,51 @@ pub const Source = union(enum) {
         }
     }
 
+    /// Visit bounded immutable spans. Consumers must discard private output on
+    /// any error; providers may fail after delivering a prefix. Never retain slices.
+    pub fn visitRange(self: Source, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > self.len() or length > self.len() - offset) return error.EndOfStream;
+        if (length == 0) return;
+        const Checked = struct {
+            context: *anyopaque,
+            consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+            length: u64,
+            position: u64 = 0,
+            fn visit(raw: *anyopaque, relative: u64, bytes: []const u8) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                if (relative != state.position or bytes.len == 0 or bytes.len > state.length - state.position) return error.InvalidData;
+                var used: usize = 0;
+                while (used < bytes.len) {
+                    const take = @min(bytes.len - used, 64 * 1024);
+                    try state.consume(state.context, state.position, bytes[used..][0..take]);
+                    used += take;
+                    state.position += take;
+                }
+            }
+        };
+        var checked = Checked{ .context = context, .consume = consume, .length = length };
+        if (self == .contiguous) {
+            try Checked.visit(&checked, 0, self.contiguous[@intCast(offset)..][0..@intCast(length)]);
+        } else if (self.ranges.visit_range) |visit| {
+            try visit(self.ranges.ptr, offset, length, &checked, Checked.visit);
+        } else {
+            try self.visitBuffered(offset, length, &checked, Checked.visit);
+        }
+        if (checked.position != length) return error.EndOfStream;
+    }
+
+    // Keep exceptional staging off the borrowed fast path's stack frame.
+    noinline fn visitBuffered(self: Source, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        var buffer: [64 * 1024]u8 = undefined;
+        var position: u64 = 0;
+        while (position < length) {
+            const take: usize = @intCast(@min(buffer.len, length - position));
+            try self.readInto(offset + position, buffer[0..take]);
+            try consume(context, position, buffer[0..take]);
+            position += take;
+        }
+    }
+
     pub fn prefetch(self: Source, offset: u64, length: u64) void {
         if (offset > self.len() or length > self.len() - offset or length == 0) return;
         if (self == .ranges) if (self.ranges.prefetch) |hint| hint(self.ranges.ptr, offset, length);
@@ -235,6 +280,7 @@ pub const BlockCache = struct {
         offset: u64 = 0,
         valid_len: usize = 0,
         age: u64 = 0,
+        pins: usize = 0,
     };
     allocator: std.mem.Allocator,
     source: Source,
@@ -371,10 +417,12 @@ pub const ConcurrentBlockCache = struct {
         defer self.fill_mutex.unlock();
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
-        const bytes = self.cache.retainedBytes() + self.fill.len;
+        var bytes: usize = self.fill.len;
         self.bufferAllocator().free(self.fill);
         self.fill = &.{};
         for (&self.cache.slots) |*slot| {
+            if (slot.pins != 0) continue;
+            bytes += slot.bytes.len;
             self.bufferAllocator().free(slot.bytes);
             slot.* = .{};
         }
@@ -382,8 +430,74 @@ pub const ConcurrentBlockCache = struct {
     }
 
     pub fn borrowedSource(self: *ConcurrentBlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .read_authenticated = authenticatedAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .visit_range = visitAdapter, .checksum = checksumAdapter, .read_authenticated = authenticatedAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
     }
+    // Called under mutex. A leased slab is immutable until its callback ends.
+    fn victim(self: *ConcurrentBlockCache, offset: u64) ?*BlockCache.Slot {
+        var oldest: ?*BlockCache.Slot = null;
+        for (&self.cache.slots) |*slot| {
+            if (slot.pins != 0) continue;
+            if (slot.valid_len != 0 and slot.offset == offset) return slot;
+            if (oldest == null or slot.age < oldest.?.age) oldest = slot;
+        }
+        return oldest;
+    }
+
+    fn visitAdapter(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(raw));
+        return self.visitRange(offset, length, context, consume);
+    }
+
+    pub fn visitRange(self: *ConcurrentBlockCache, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > self.cache.source.len() or length > self.cache.source.len() - offset) return error.EndOfStream;
+        var position: u64 = 0;
+        while (position < length) {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            var lease: ?*BlockCache.Slot = null;
+            var end = offset + length;
+            const absolute = offset + position;
+            for (&self.cache.slots) |*slot| {
+                if (slot.valid_len == 0) continue;
+                if (absolute >= slot.offset and absolute - slot.offset < slot.valid_len) {
+                    lease = slot;
+                    break;
+                }
+                if (slot.offset > absolute) end = @min(end, slot.offset);
+            }
+            if (lease) |slot| {
+                slot.pins += 1;
+                self.cache.clock +%= 1;
+                slot.age = self.cache.clock;
+                const within: usize = @intCast(absolute - slot.offset);
+                const take: usize = @intCast(@min(length - position, slot.valid_len - within));
+                const bytes = slot.bytes[within..][0..take];
+                self.mutex.unlock();
+                // Neither cache lock is held across user code, including errors
+                // and reentrant reads. Reclamation skips this pinned slab.
+                const result = consume(context, position, bytes);
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                slot.pins -= 1;
+                self.mutex.unlock();
+                try result;
+                position += take;
+            } else {
+                self.mutex.unlock();
+                const Forward = struct {
+                    context: *anyopaque,
+                    consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+                    base: u64,
+                    fn visit(ptr: *anyopaque, relative: u64, bytes: []const u8) !void {
+                        const value: *@This() = @ptrCast(@alignCast(ptr));
+                        return value.consume(value.context, value.base + relative, bytes);
+                    }
+                };
+                var forward = Forward{ .context = context, .consume = consume, .base = position };
+                try self.cache.source.visitRange(absolute, end - absolute, &forward, Forward.visit);
+                position += end - absolute;
+            }
+        }
+    }
+
     fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
         self.cache.source.prefetch(offset, length);
@@ -483,19 +597,12 @@ pub const ConcurrentBlockCache = struct {
     fn publishFill(self: *ConcurrentBlockCache, offset: u64, length: usize) !void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        var oldest = &self.cache.slots[0];
-        for (&self.cache.slots) |*slot| if (slot.age < oldest.age) {
-            oldest = slot;
-        };
-        for (&self.cache.slots) |*slot| if (slot.valid_len != 0 and slot.offset == offset) {
-            if (slot.valid_len >= length) {
-                self.cache.clock +%= 1;
-                slot.age = self.cache.clock;
-                return;
-            }
-            oldest = slot;
-            break;
-        };
+        const oldest = self.victim(offset) orelse return;
+        if (oldest.valid_len != 0 and oldest.offset == offset and oldest.valid_len >= length) {
+            self.cache.clock +%= 1;
+            oldest.age = self.cache.clock;
+            return;
+        }
         if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
             if (self.budget == null or !self.budget.?.budget_denied) return err;
             return;
@@ -556,13 +663,9 @@ pub const ConcurrentBlockCache = struct {
         try self.cache.source.readInto(offset, self.fill[0..length]);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        var oldest = &self.cache.slots[0];
-        for (&self.cache.slots) |*slot| if (slot.age < oldest.age) {
-            oldest = slot;
-        };
-        for (&self.cache.slots) |*slot| if (slot.valid_len != 0 and slot.offset == offset) {
-            oldest = slot;
-            break;
+        const oldest = self.victim(offset) orelse {
+            @memcpy(out, self.fill[within..][0..out.len]);
+            return;
         };
         if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
             if (self.budget == null or !self.budget.?.budget_denied) return err;
@@ -615,6 +718,11 @@ pub const View = struct {
         return .{ .source = source, .offset = offset, .length = length };
     }
 
+    pub fn visitRange(self: View, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > self.length or length > self.length - offset) return error.EndOfStream;
+        try self.source.visitRange(self.offset + offset, length, context, consume);
+    }
+
     pub fn readInto(self: View, offset: u64, out: []u8) !void {
         if (offset > self.length or out.len > self.length - offset) return error.EndOfStream;
         try self.source.readInto(self.offset + offset, out);
@@ -629,3 +737,103 @@ pub const SharedOwner = struct {
     retain: *const fn (*anyopaque) void,
     release: *const fn (*anyopaque) void,
 };
+
+test "range visitors preserve borrowing bound spans and reject malformed providers" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 160 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'v');
+    const Backend = struct {
+        bytes: []const u8,
+        mode: enum { normal, gap, short, failure } = .normal,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .short) return;
+            if (self.mode == .failure) return error.TestIoFailure;
+            try consume(context, if (self.mode == .gap) 1 else 0, self.bytes[@intCast(offset)..][0..@intCast(length)]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Consumer = struct {
+        bytes: []const u8,
+        borrowed: bool,
+        used: usize = 0,
+        max_span: usize = 0,
+        fn consume(raw: *anyopaque, relative: u64, span: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.used, relative);
+            try std.testing.expectEqualSlices(u8, self.bytes[self.used..][0..span.len], span);
+            if (self.borrowed) try std.testing.expectEqual(@intFromPtr(self.bytes.ptr) + self.used, @intFromPtr(span.ptr));
+            self.used += span.len;
+            self.max_span = @max(self.max_span, span.len);
+        }
+    };
+    var backend = Backend{ .bytes = bytes };
+    const source = Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } };
+    const view = try View.init(source, 7, bytes.len - 14);
+    var consumer = Consumer{ .bytes = bytes[7 .. bytes.len - 7], .borrowed = true };
+    try view.visitRange(0, view.length, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 0), backend.reads);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), consumer.max_span);
+    try std.testing.expectEqual(view.length, consumer.used);
+    for ([_]Backend{ .{ .bytes = bytes, .mode = .gap }, .{ .bytes = bytes, .mode = .short }, .{ .bytes = bytes, .mode = .failure } }, 0..) |state, i| {
+        backend = state;
+        consumer.used = 0;
+        const failure = [_]anyerror{ error.InvalidData, error.EndOfStream, error.TestIoFailure };
+        try std.testing.expectError(failure[i], view.visitRange(0, view.length, &consumer, Consumer.consume));
+        try std.testing.expectEqual(@as(usize, 0), consumer.used);
+    }
+    backend.mode = .normal;
+    var fallback = source;
+    fallback.ranges.visit_range = null;
+    consumer.borrowed = false;
+    consumer.used = 0;
+    try (try View.init(fallback, 7, bytes.len - 14)).visitRange(0, view.length, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 3), backend.reads);
+    try std.testing.expectError(error.EndOfStream, view.visitRange(view.length, 1, &consumer, Consumer.consume));
+}
+
+test "cache leases survive reentrant fills pressure and callback errors" {
+    const a = std.testing.allocator;
+    var data: [512]u8 = undefined;
+    for (&data, 0..) |*byte, i| byte.* = @truncate(i);
+    var cache = try ConcurrentBlockCache.init(a, .{ .contiguous = &data }, 80);
+    defer cache.deinit();
+    var warm: [16]u8 = undefined;
+    try cache.readInto(0, &warm);
+    const Consumer = struct {
+        cache: *ConcurrentBlockCache,
+        original: []const u8,
+        fail: bool = false,
+        fn visit(raw: *anyopaque, _: u64, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualSlices(u8, self.original, bytes);
+            // Recursively lease every resident slot, forcing the all-pinned
+            // read fallback without holding either lock across callbacks.
+            if (self.original[0] < 48) {
+                const offset: u64 = @as(u64, self.original[0]) + 16;
+                var next: [16]u8 = undefined;
+                try self.cache.readInto(offset, &next);
+                var child = @This(){ .cache = self.cache, .original = &next };
+                try self.cache.visitRange(offset, 16, &child, visit);
+            } else {
+                var scratch: [16]u8 = undefined;
+                try self.cache.readInto(64, &scratch);
+            }
+            _ = ConcurrentBlockCache.reclaim(self.cache, 0);
+            try std.testing.expectEqualSlices(u8, self.original, bytes);
+            if (self.fail) return error.TestVisitorFailure;
+        }
+    };
+    var consumer = Consumer{ .cache = &cache, .original = &warm, .fail = true };
+    try std.testing.expectError(error.TestVisitorFailure, cache.visitRange(0, 16, &consumer, Consumer.visit));
+    for (cache.cache.slots) |slot| try std.testing.expectEqual(@as(usize, 0), slot.pins);
+    _ = ConcurrentBlockCache.reclaim(&cache, 0);
+    try std.testing.expectEqual(@as(usize, 0), cache.retainedBytes());
+}

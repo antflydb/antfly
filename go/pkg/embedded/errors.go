@@ -38,8 +38,8 @@ const (
 	// Unsupported means the operation requires a platform or filesystem
 	// capability that is unavailable. Retrying unchanged will not succeed.
 	Unsupported ErrorCode = 8
-	// Stalled reports that a bounded drain such as RunUntilIdle detected a
-	// managed index making no forward progress and gave up.
+	// Stalled reports stalled derived work or a failed derived worker. Inspect
+	// pending-work diagnostics and repair or reopen the database.
 	Stalled ErrorCode = 9
 	// Cancelled means the caller stopped the operation by returning false
 	// from its progress or streaming callback (see Inference.Pull and
@@ -73,7 +73,7 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	Busy:            "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
 	OutcomeUnknown:  "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
 	Unsupported:     "the operation requires a capability that is not supported by this platform or filesystem",
-	Stalled:         "a bounded drain made no forward progress for its configured stall window and gave up",
+	Stalled:         "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
 	Cancelled:       "the caller cancelled the operation",
 	Internal:        "an internal error occurred",
 }
