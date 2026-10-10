@@ -268,6 +268,11 @@ pub const ReadScope = struct {
             else => return err,
         };
     }
+    /// True only when the backend implements direct batch delivery.
+    pub fn supportsDirectBatchInto(self: *const @This()) bool {
+        return self.vtable.get_many_sorted_into != null;
+    }
+
     /// Slices belong to caller buffers, independently of reset or close.
     /// Output buffers must not overlap each other or the input keys.
     /// Contents may be partially written on errors; result slots are cleared.

@@ -2781,6 +2781,7 @@ pub const Txn = struct {
         parent: *Txn,
         scratch: read_scratch,
         batch_scratch: read_scratch,
+        native_batch: native.DocumentBatchReadState = .{},
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.scratch.allocator(), key);
@@ -2844,7 +2845,7 @@ pub const Txn = struct {
                 i = end;
             }
             if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointWithScratch(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count]);
+            try (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], &self.native_batch);
             for (loaded[0..count], positions[0..count]) |value, position| {
                 var end = position + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
@@ -2862,11 +2863,13 @@ pub const Txn = struct {
         pub fn reset(self: *@This()) void {
             self.scratch.reset();
             self.batch_scratch.reset();
+            self.native_batch.reset();
         }
 
         pub fn close(self: *@This()) void {
             self.scratch.deinit();
             self.batch_scratch.deinit();
+            self.native_batch.deinit();
             self.* = undefined;
         }
     };
@@ -2875,7 +2878,7 @@ pub const Txn = struct {
     /// Erased adapters retain the parent automatically. Scope results are
     /// owned copies, so subsequent pending mutations cannot invalidate them.
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
-        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024) };
+        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024), .native_batch = .{ .allocator = allocator } };
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -5897,4 +5900,71 @@ test "lite budget allocator accounts concurrent allocation resize and cleanup" {
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expect(budget.peak > 0);
     try std.testing.expect(budget.alloc_calls >= 4 * 1024);
+}
+
+test "lite scoped native batch state reuses all working allocations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "batch-scratch-perf.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var store = try Store.createWithOptions(file_budget.allocator(), path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var requested: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, &requested, 0..) |*doc, *key, *node, *request, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        request.* = key;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var scope = try txn.openReadScope(budget.allocator());
+    defer scope.close();
+    var slots: [512][8]u8 = undefined;
+    var buffers: [512][]u8 = undefined;
+    for (&slots, &buffers) |*slot, *buffer| buffer.* = slot;
+    var values: [512]?[]const u8 = undefined;
+    const direct = @hasDecl(@TypeOf(scope), "getManySortedInto");
+    if (direct) try scope.getManySortedInto(&requested, &buffers, &values) else try scope.getManySorted(&requested, &values);
+    scope.reset();
+    for (0..4) |_| {
+        try scope.getManySortedInto(&requested, &buffers, &values);
+        scope.reset();
+    }
+    const alloc_before = budget.alloc_calls;
+    const file_alloc_before = file_budget.alloc_calls;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..2000) |_| {
+        if (direct) try scope.getManySortedInto(&requested, &buffers, &values) else try scope.getManySorted(&requested, &values);
+        for (values) |value| try std.testing.expectEqualSlices(u8, &score, value.?);
+        scope.reset();
+    }
+    const batch_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    const batch_allocs = budget.alloc_calls - alloc_before;
+    const retained = budget.live;
+    try std.testing.expectEqual(alloc_before, budget.alloc_calls);
+    try std.testing.expectEqual(file_alloc_before, file_budget.alloc_calls);
+    std.debug.print("REVIEW_TOTAL file_allocations={d} scope_allocations={d} batches=2000\n", .{ file_budget.alloc_calls - file_alloc_before, batch_allocs });
+    var columns: [512]?f64 = undefined;
+    const graph_started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var retained_entries: usize = 0;
+    for (0..500) |_| {
+        var query = try store.beginRead();
+        defer query.abort();
+        _ = try @import("../../graph/score_read.zig").populate(a, &query, &.{""}, &nodes, &.{&columns});
+        for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+        retained_entries += query.snapshot_reads.count();
+    }
+    const graph_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - graph_started;
+    std.debug.print("LITE_BATCH_SCRATCH_TIMING keys=512 batches=2000 direct={any} batch_ns={d} scratch_allocations={d} retained_bytes={d} graph_queries=500 graph_ns={d} graph_retained_entries={d}\n", .{ direct, batch_ns, batch_allocs, retained, graph_ns, retained_entries });
 }

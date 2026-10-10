@@ -100,7 +100,7 @@ pub fn populate(
         if (scope) |*active| active.close();
     };
     const direct = comptime if (scoped) @hasDecl(Scope, "getManySortedInto") else false;
-    const use_buffers = direct and scope != null;
+    const use_buffers = direct and scope != null and (if (comptime scoped and @hasDecl(Scope, "supportsDirectBatchInto")) scope.?.supportsDirectBatchInto() else true);
     const score_buffers: [][8]u8 = if (use_buffers) try alloc.alloc([8]u8, batch_capacity) else &.{};
     defer if (use_buffers) alloc.free(score_buffers);
     const output_buffers: [][]u8 = if (use_buffers) try alloc.alloc([]u8, batch_capacity) else &.{};
@@ -138,10 +138,10 @@ pub fn populate(
         @memset(read_values[0..len], null);
         if (scoped and scope != null) {
             if (direct) {
-                scope.?.getManySortedInto(read_keys[0..len], output_buffers[0..len], read_values[0..len]) catch |err| switch (err) {
+                if (use_buffers) scope.?.getManySortedInto(read_keys[0..len], output_buffers[0..len], read_values[0..len]) catch |err| switch (@as(anyerror, err)) {
                     error.BufferTooSmall => return error.InvalidGraphMetricScore,
                     else => return err,
-                };
+                } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
             } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
         } else try txn.getManySorted(read_keys[0..len], read_values[0..len]);
         for (read_values[0..len], 0..) |maybe_raw, i| {
@@ -340,4 +340,66 @@ test "graph metric physical score reads preserve probe-only and legacy scope fal
     var legacy = Legacy{};
     _ = try populate(std.testing.allocator, &legacy, &.{"p/"}, &.{ "b", "a" }, &.{&scores});
     try std.testing.expectEqualSlices(?f64, &.{ 4, 4 }, &scores);
+}
+
+test "graph metric physical score reads respect erased direct capability" {
+    const erased = @import("../storage/backend_erased.zig");
+    const Borrowed = struct {
+        raw: [8]u8 = @bitCast(@as(f64, 7)),
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return &self.raw;
+        }
+        pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+            for (values) |*value| value.* = &self.raw;
+        }
+        pub fn reset(_: *@This()) void {}
+        pub fn close(_: *@This()) void {}
+    };
+    const Txn = struct {
+        pub fn openReadScope(_: *@This(), a: std.mem.Allocator) !erased.ReadScope {
+            return erased.readScopeFrom(a, Borrowed{});
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var txn = Txn{};
+    var scope = try txn.openReadScope(std.testing.allocator);
+    defer scope.close();
+    try std.testing.expect(!scope.supportsDirectBatchInto());
+    var columns: [2]?f64 = undefined;
+    _ = try populate(std.testing.allocator, &txn, &.{"p/"}, &.{ "a", "b" }, &.{&columns});
+    try std.testing.expectEqualSlices(?f64, &.{ 7, 7 }, &columns);
+    // Presence of the method is insufficient: a copying adapter may expose it.
+    const DirectOffTxn = struct {
+        const Scope = struct {
+            borrowed: Borrowed = .{},
+            pub fn supportsDirectBatchInto(_: *const @This()) bool {
+                return false;
+            }
+            pub fn getManySorted(self: *@This(), keys_: []const []const u8, values: []?[]const u8) !void {
+                return self.borrowed.getManySorted(keys_, values);
+            }
+            pub fn getManySortedInto(_: *@This(), _: []const []const u8, _: []const []u8, _: []?[]const u8) !void {
+                return error.TestUnexpectedResult;
+            }
+            pub fn reset(_: *@This()) void {}
+            pub fn close(_: *@This()) void {}
+        };
+        pub fn openReadScope(_: *@This(), _: std.mem.Allocator) !Scope {
+            return .{};
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var direct_off = DirectOffTxn{};
+    _ = try populate(std.testing.allocator, &direct_off, &.{"p/"}, &.{ "a", "b" }, &.{&columns});
+    try std.testing.expectEqualSlices(?f64, &.{ 7, 7 }, &columns);
+    // The public portable API still copies into caller buffers when requested.
+    var slots: [2][8]u8 = undefined;
+    var copied: [2]?[]const u8 = undefined;
+    try scope.getManySortedInto(&.{ "a", "b" }, &.{ &slots[0], &slots[1] }, &copied);
+    try scope.reset();
+    for (copied, &slots) |value, *slot| try std.testing.expectEqual(slot.ptr, value.?.ptr);
 }
