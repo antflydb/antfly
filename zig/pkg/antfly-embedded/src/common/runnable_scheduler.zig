@@ -42,7 +42,7 @@ pub const Config = struct {
 
     /// Managed startup needs independent ordinary, health and cleanup capacity.
     /// Keep generic scheduler validation separate for standalone consumers.
-    pub fn validateManagedCleanupCapacity(self: Config) !void {
+    pub noinline fn validateManagedCleanupCapacity(self: Config) !void {
         try self.validate();
         if (self.max_operations < 4 or (self.cleanup_slots == 0 and self.ordinarySlots() < 2))
             return error.ManagerCleanupCapacityUnavailable;
