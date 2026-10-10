@@ -1077,3 +1077,22 @@ registration's active accounting retires after both callers join. Existing
 warming cadence/retry checks run in the same focused maintenance gate. Actual
 DB shutdown and archive integration remain cumulative gates; warming still
 requires CPU-stage adoption and finite provider work before default qualification.
+
+
+### Original native warming pass deadline
+
+A production warming turn now borrows one Pass created before callback entry,
+with a ten-second monotonic deadline and the owner's original cancellation.
+State preparation and capture consume that budget. Capture uses the earlier
+of its own request/expiry limit and the pass deadline; repository warming no
+longer starts a new ten-second budget after capture. Stage fences reject expired
+publication work, and the outer callback fence preserves DeadlineExceeded when
+boolean provider cancellation reports Canceled or a provider swallows expiry.
+
+The focused fixture exercises expiry after preparation, provider cancellation,
+swallowed expiry, successful publication, and rejection before callback entry.
+Physical callback shutdown and previous fanout regressions remain in the same
+gate. This does not prove that every filesystem syscall or provider can be
+physically interrupted; actual DB capture/archive integration remains pending.
+Warming still uses legacy CPU scheduling until its capture/publication holder
+graph adopts mandatory reentry and bounded CPU stages. Defaults stay unqualified.

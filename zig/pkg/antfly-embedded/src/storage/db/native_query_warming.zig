@@ -5,6 +5,36 @@
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+/// One original callback budget, borrowed through the physical turn. Provider
+/// cancellation is boolean; the outer fence restores the exact lifetime cause.
+pub const Pass = struct {
+    pub const budget_ns = 10 * std.time.ns_per_s;
+    parent: Cancellation,
+    deadline_ns: u64,
+    now_ns: *const fn () u64 = @import("antfly_platform").time.monotonicNs,
+    pub fn check(self: *const Pass) !void {
+        try self.parent.check();
+        if (self.now_ns() >= self.deadline_ns) return error.DeadlineExceeded;
+    }
+    fn cancelled(raw: *const anyopaque) bool {
+        const self: *const Pass = @ptrCast(@alignCast(raw));
+        self.check() catch return true;
+        return false;
+    }
+    pub fn token(self: *const Pass) Cancellation {
+        return .{ .ptr = self, .is_cancelled_fn = cancelled };
+    }
+    fn run(self: *const Pass, ptr: *anyopaque, turn: *const fn (*anyopaque, *const Pass) anyerror!bool) !bool {
+        try self.check();
+        const complete = turn(ptr, self) catch |err| {
+            try self.check();
+            return err;
+        };
+        try self.check();
+        return complete;
+    }
+};
+
 pub const Owner = struct {
     port: Port = undefined,
     mutex: std.atomic.Mutex = .unlocked,
@@ -13,7 +43,7 @@ pub const Owner = struct {
     stop_started: bool = false,
     joined: std.Io.Event = .unset,
     failures: u32 = 0,
-    pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, turn: *const fn (*anyopaque, Cancellation) anyerror!bool };
+    pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, turn: *const fn (*anyopaque, *const Pass) anyerror!bool };
     fn lock(self: *Owner) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
@@ -57,7 +87,8 @@ pub const Owner = struct {
     }
     fn step(self: *Owner) ?u64 {
         if (self.stopping.load(.acquire)) return null;
-        const complete = self.port.turn(self.port.ptr, .{ .ptr = self, .is_cancelled_fn = cancelled }) catch |err| {
+        const pass: Pass = .{ .parent = .{ .ptr = self, .is_cancelled_fn = cancelled }, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| Pass.budget_ns };
+        const complete = pass.run(self.port.ptr, self.port.turn) catch |err| {
             if (self.stopping.load(.acquire)) return null;
             self.failures +|= 1;
             if (self.failures == 1 or self.failures % 16 == 0) std.log.warn("native checkpoint warming deferred: {}", .{err});
@@ -73,7 +104,8 @@ test "external lake native warming bounds retry turns and honors close cancellat
         calls: usize = 0,
         complete: bool = false,
         fail: bool = false,
-        fn turn(raw: *anyopaque, cancellation: Cancellation) !bool {
+        fn turn(raw: *anyopaque, pass: *const Pass) !bool {
+            const cancellation = pass.token();
             const self: *@This() = @ptrCast(@alignCast(raw));
             try cancellation.check();
             self.calls += 1;
@@ -113,7 +145,8 @@ test "maintenance runtime native warming concurrent shutdown retains physical ca
         second_done: std.Io.Event = .unset,
         unlocked: std.atomic.Value(bool) = .init(false),
         canceled: std.atomic.Value(bool) = .init(false),
-        fn turn(ptr: *anyopaque, cancellation: Cancellation) !bool {
+        fn turn(ptr: *anyopaque, pass: *const Pass) !bool {
+            const cancellation = pass.token();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.set(self.io);
             self.release.waitUncancelable(self.io);
@@ -173,4 +206,54 @@ test "maintenance runtime native warming concurrent shutdown retains physical ca
     try std.testing.expect(f.canceled.load(.acquire));
     try std.testing.expect(owner.registration == null);
     try std.testing.expectEqual(@as(usize, 0), (try backend.ptr().maintenanceScheduler()).snapshot().active);
+}
+
+test "external lake native warming retains one original pass deadline through provider cancellation" {
+    const F = struct {
+        var now: u64 = 0;
+        calls: usize = 0,
+        publish: usize = 0,
+        expire: bool = false,
+        swallow: bool = false,
+        fn clock() u64 {
+            return now;
+        }
+        fn turn(raw: *anyopaque, pass: *const Pass) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try pass.check();
+            now = 9;
+            try pass.token().check();
+            if (self.expire) now = 10;
+            if (self.swallow) return true;
+            // A provider sees boolean cancellation, but this cannot replace
+            // the pass's original deadline cause or authorize publication.
+            try pass.token().check();
+            try pass.check();
+            self.publish += 1;
+            return true;
+        }
+    };
+    var canceled = std.atomic.Value(bool).init(false);
+    for ([_]bool{ false, true }) |swallow| {
+        F.now = 0;
+        var f: F = .{ .expire = true, .swallow = swallow };
+        const pass: Pass = .{ .parent = Cancellation.fromAtomic(&canceled), .deadline_ns = 10, .now_ns = F.clock };
+        try std.testing.expectError(error.DeadlineExceeded, pass.run(&f, F.turn));
+        try std.testing.expectEqual(@as(usize, 1), f.calls);
+        try std.testing.expectEqual(@as(usize, 0), f.publish);
+        try std.testing.expectEqual(@as(u64, 10), pass.deadline_ns);
+    }
+    F.now = 0;
+    var f: F = .{};
+    const pass: Pass = .{ .parent = Cancellation.fromAtomic(&canceled), .deadline_ns = 10, .now_ns = F.clock };
+    try std.testing.expect(try pass.run(&f, F.turn));
+    try std.testing.expectEqual(@as(usize, 1), f.publish);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, pass.run(&f, F.turn));
+    try std.testing.expectEqual(@as(usize, 1), f.calls);
+    canceled.store(false, .release);
+    F.now = 10;
+    try std.testing.expectError(error.DeadlineExceeded, pass.run(&f, F.turn));
+    try std.testing.expectEqual(@as(usize, 1), f.calls);
 }

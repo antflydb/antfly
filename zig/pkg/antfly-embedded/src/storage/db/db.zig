@@ -19368,13 +19368,17 @@ pub const DB = struct {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+        return self.captureQueryCutInternalWithDeadline(request, cancellation, publish, null);
+    }
+    fn captureQueryCutInternalWithDeadline(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool, original_deadline: ?u64) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const remaining = request.expires_ms -| @import("native_query_cut.zig").nowMs();
         const expiry_deadline = monotonicTimeNs() +| remaining * std.time.ns_per_ms;
-        const deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
+        const request_deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
+        const deadline = @min(original_deadline orelse request_deadline, request_deadline);
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
@@ -19404,7 +19408,9 @@ pub const DB = struct {
             try repository.publish(io, root, request, self.core.identity_namespace, token);
         };
     }
-    fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+    fn warmNativeCheckpoint(raw: *anyopaque, pass: *const @import("native_query_warming.zig").Pass) !bool {
+        try pass.check();
+        const cancellation = pass.token();
         const self: *DB = @ptrCast(@alignCast(raw));
         const cut = @import("native_query_cut.zig");
         const repository = self.backend_runtime.query_cut_repository orelse return true;
@@ -19422,6 +19428,7 @@ pub const DB = struct {
             error.FileNotFound => null,
             else => return err,
         };
+        try pass.check();
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
@@ -19441,12 +19448,16 @@ pub const DB = struct {
             state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
-            try self.captureQueryCutInternal(state.?.request, cancellation, false);
+            try pass.check();
+            try self.captureQueryCutInternalWithDeadline(state.?.request, cancellation, false, pass.deadline_ns);
+            try pass.check();
             _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
         }
+        try pass.check();
         const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
-        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = pass.deadline_ns };
         const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        try pass.check();
         if (completed) {
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
