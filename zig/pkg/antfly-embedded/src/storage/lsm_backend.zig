@@ -7464,7 +7464,8 @@ pub const Backend = struct {
                         if (self.run_block_cache.items.len == 0) return false;
                         if (control) |budget| {
                             _ = try self.evictOldestLocalBlockWithAdmission(budget);
-                            _ = try manager.drainPayloadRetirementWithAdmission(budget);
+                            _ = try manager.drainForegroundPayloadRetirementWithAdmission(budget);
+                            if (manager.cleanup_consumer_bound.load(.acquire)) return false;
                             try manager.drainConstructionCleanupWithAdmission(budget);
                         } else _ = self.evictOldestLocalBlock();
                         continue;

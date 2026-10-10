@@ -3157,10 +3157,21 @@ pub const ResourceManager = struct {
         return retired;
     }
 
+    /// Pooled foreground work publishes retirement; only the joined consumer
+    /// performs allocator callbacks. Standalone managers retain synchronous
+    /// collection under the caller's original admission.
+    pub fn drainForegroundPayloadRetirementWithAdmission(self: *ResourceManager, control: read_admission.Port) !usize {
+        if (self.cleanup_consumer_bound.load(.acquire)) {
+            try control.checkpoint();
+            return 0;
+        }
+        return self.drainPayloadRetirementWithAdmission(control);
+    }
+
     /// Reserve an independent retirement owner before reserving decoder bytes.
     /// Saturation refuses construction before allocation or physical work.
     pub fn reserveConstructionWithAdmission(self: *ResourceManager, slice: Slice, bytes: u64, control: read_admission.Port) !ConstructionCredit {
-        _ = try self.drainPayloadRetirementWithAdmission(control);
+        _ = try self.drainForegroundPayloadRetirementWithAdmission(control);
         // Visit all completed slots before electing a free one. Returning at
         // the first free slot would indefinitely strand later retirement debt
         // under a steady stream of low-concurrency reads.
@@ -8092,5 +8103,56 @@ pub fn qualifyLegacyReclaimerAdoption(control: read_admission.Port, fixture: usi
     }
     manager.deinit(a);
     live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+pub fn qualifyBoundConsumerConstruction(control: read_admission.Port, deny: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    const Physical = struct {
+        retirement: PayloadRetirement = .{},
+        credit: ?Reservation = null,
+        destroyed: *usize,
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed.* += 1;
+            std.testing.allocator.destroy(self);
+        }
+    };
+    var parent = ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var destroyed: usize = 0;
+    var construction = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(Physical), control);
+    defer construction.retire();
+    const physical = try a.create(Physical);
+    var published = false;
+    defer if (!published) a.destroy(physical);
+    physical.* = .{ .destroyed = &destroyed };
+    try manager.registerPayloadRetirementWithAdmission(&physical.retirement, &physical.credit, &construction, physical, Physical.destroy, control);
+    published = true;
+    try manager.bindCleanupConsumer();
+    defer manager.unbindCleanupConsumer();
+    physical.retirement.publish();
+    const before = manager.snapshot().memory.used_bytes;
+    if (deny) parent.memory.budget.hard_limit_bytes = before;
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainForegroundPayloadRetirementWithAdmission(control));
+    const result = manager.reserveConstructionWithAdmission(.lsm_read_working_set, 16, control);
+    if (deny) {
+        try std.testing.expectError(error.ResourceBudgetExceeded, result);
+    } else {
+        var extra = try result;
+        extra.retire();
+    }
+    try std.testing.expectEqual(@as(usize, 0), destroyed);
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    try std.testing.expect(manager.cleanupPending());
+    // Only the independent consumer API can perform physical destruction.
+    try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+    try std.testing.expectEqual(@as(usize, 1), destroyed);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
 }

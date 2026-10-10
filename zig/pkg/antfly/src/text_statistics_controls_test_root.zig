@@ -2120,7 +2120,9 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
         try std.testing.expect(manager.cleanupPending());
         var health: native.Execution = .{};
         defer health.finish();
-        try health.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 19, .allow_wait = false }, .control);
+        // The consumer may reacquire between the observed park and this
+        // request. One original bounded admission must still make progress.
+        try health.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = until, .retained_bytes = 19, .allow_wait = true }, .control);
         try health.checkpoint();
         health.finish();
         parent.mutex.unlock();
@@ -2506,5 +2508,35 @@ test "text statistics trusted controls cleanup startup adopts warm registry and 
         live = false;
         try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
+
+test "text statistics trusted controls bound cleanup dispatch keeps foreground construction out of physical destruction" {
+    const admission = sources.common_read_admission;
+    const Budget = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for ([_]bool{ false, true }) |deny| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .retained_bytes = 23 }, phase);
+            var budget = Budget{ .execution = &execution };
+            var adapter = admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            try sources.storage_resource_manager.qualifyBoundConsumerConstruction(admission.Port.init(&payload), deny);
+            try std.testing.expectEqual(phase, try execution.retainedClass());
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
     }
 }
