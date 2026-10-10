@@ -361,8 +361,8 @@ same-named table-qualified membership through source verification, publication,
 membership-only deletion and replay; a separate retired-generation test covers
 GC and replay after retirement intent removal. The complete lifecycle also
 passes allocation-failure injection. The Debug reconciliation gate passes all
-69 tests; the optimized gate passed 68 tests before the final unchanged-replay
-regression was added, and its updated run is in progress. This does not activate production
+69 tests in both Debug and ReleaseFast, including the unchanged-replay
+regression and allocation-failure sweep. This does not activate production
 occupancy, generated-name admission, or change original-case dispositions.
 
 The mounted native campaign must adopt source tracking through the actual
