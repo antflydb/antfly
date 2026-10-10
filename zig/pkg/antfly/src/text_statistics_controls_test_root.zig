@@ -2540,3 +2540,86 @@ test "text statistics trusted controls bound cleanup dispatch keeps foreground c
         }
     }
 }
+
+const CleanupStartupFailure = enum { parent, header, worker, cleanup_capacity };
+
+noinline fn qualifyWarmCleanupStartupFailure(failure: CleanupStartupFailure) !void {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    const Callback = struct {
+        fn reclaim(_: *anyopaque, _: u64) u64 {
+            return 0;
+        }
+    };
+    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+    defer scheduler.close();
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer parent.deinit(std.testing.allocator);
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var live = true;
+    defer if (live) manager.deinit(std.testing.allocator);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var context: u8 = 0;
+    var ids: [65]u64 = @splat(0);
+    defer if (live) for (ids) |id| if (id != 0) manager.unregisterReclaimer(id);
+    for (&ids) |*id| id.* = try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim);
+    const cell = manager.reclaimers.items[0];
+    const buffer = manager.reclaimers.items.ptr;
+    // Separate a registry-header failure from accounting-map allocation.
+    var prime = try manager.reserveWithoutReclaim(.lsm_read_working_set, 8);
+    prime.release();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    if (failure == .header) manager.identity_allocator = failing.allocator();
+    if (failure == .parent) parent.memory.budget.hard_limit_bytes = 1;
+    var roots: [2]native.Execution = @splat(.{});
+    defer for (&roots) |*root| root.finish();
+    if (failure == .cleanup_capacity) for (&roots) |*root| {
+        try root.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = 23, .allow_wait = false });
+        try root.park(.resource_blocked);
+    };
+    var available = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer available.deinit();
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    const result = Cleanup.create(std.testing.allocator, if (failure == .worker) unavailable.io() else available.io(), &manager, &scheduler);
+    manager.identity_allocator = std.testing.allocator;
+    switch (failure) {
+        .parent => try std.testing.expectError(error.ResourceBudgetExceeded, result),
+        .header => try std.testing.expectError(error.OutOfMemory, result),
+        .worker => try std.testing.expectError(error.ConcurrencyUnavailable, result),
+        .cleanup_capacity => try std.testing.expectError(error.ResourceTemporarilyUnavailable, result),
+    }
+    try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+    try std.testing.expect(cell == manager.reclaimers.items[0]);
+    try std.testing.expect(buffer == manager.reclaimers.items.ptr);
+    try std.testing.expectEqual(ids[0], cell.identity);
+    const retained = manager.snapshot().memory.used_bytes;
+    try std.testing.expectEqual(failure == .header or failure == .worker, retained > 0);
+    try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
+    if (failure == .header) try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, if (failure == .cleanup_capacity) 2 else 0), scheduler.stats().operations);
+    for (&roots) |*root| root.finish();
+    parent.memory.budget.hard_limit_bytes = 0;
+    const worker = try Cleanup.create(std.testing.allocator, available.io(), &manager, &scheduler);
+    defer worker.deinit();
+    const admitted = manager.snapshot().memory.used_bytes;
+    try std.testing.expect(admitted > 0);
+    if (failure == .worker) try std.testing.expectEqual(retained, admitted) else try std.testing.expect(admitted > retained);
+    try std.testing.expectEqual(admitted, parent.snapshot().memory.used_bytes);
+    try std.testing.expect(cell == manager.reclaimers.items[0]);
+    try std.testing.expect(buffer == manager.reclaimers.items.ptr);
+    worker.join();
+    for (&ids) |*id| {
+        manager.unregisterReclaimer(id.*);
+        id.* = 0;
+    }
+    manager.deinit(std.testing.allocator);
+    live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "text statistics trusted controls warm cleanup startup failures retain physical credit and allow later publication" {
+    for ([_]CleanupStartupFailure{ .parent, .header, .worker, .cleanup_capacity }) |failure| try qualifyWarmCleanupStartupFailure(failure);
+}
