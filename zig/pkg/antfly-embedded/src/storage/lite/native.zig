@@ -1984,7 +1984,17 @@ const PageCache = struct {
             return @sizeOf(IndexView) + self.frame.raw.?.len + self.frame.offsets.capacity * @sizeOf(u16);
         }
     };
-    const CachedPage = struct { bytes: []u8, credit: u8, metadata: bool, index: ?*IndexView = null };
+    /// Immutable encoded bytes, owned jointly by residency and active readers.
+    /// Retired pinned pages remain charged until the last reader releases them.
+    const RawView = struct {
+        bytes: []u8,
+        references: usize = 1,
+
+        fn size(self: *const RawView) usize {
+            return @sizeOf(RawView) + self.bytes.len;
+        }
+    };
+    const CachedPage = struct { bytes: []u8, credit: u8, metadata: bool, index: ?*IndexView = null, raw_view: ?*RawView = null };
     mutex: std.atomic.Mutex = .unlocked,
     pages: std.AutoArrayHashMapUnmanaged(u64, CachedPage) = .empty,
     clock_hand: usize = 0,
@@ -2018,6 +2028,54 @@ const PageCache = struct {
         return true;
     }
 
+    fn acquireRaw(self: *PageCache, allocator: Allocator, page_id: u64, size: usize) ?*RawView {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const before_bytes = self.total_bytes;
+        defer if (self.total_bytes != before_bytes) self.refreshPageResourceUsageLocked();
+        if (self.clearPagesForHardPressureLocked(allocator)) return null;
+        const cached = self.pages.getPtr(page_id) orelse return null;
+        if (cached.bytes.len != size or cached.index != null) return null;
+        if (cached.raw_view) |view| {
+            cached.credit = if (cached.metadata) 3 else 2;
+            view.references += 1;
+            return view;
+        }
+        const extra = @sizeOf(RawView);
+        if (extra > self.limit_bytes or size > self.limit_bytes - extra) return null;
+        const view = allocator.create(RawView) catch return null;
+        var promoted = false;
+        defer if (!promoted) allocator.destroy(view);
+        self.evictPagesToExceptLocked(allocator, self.limit_bytes - extra, page_id);
+        if (self.total_bytes > self.limit_bytes - extra) return null;
+        const resident = self.pages.getPtr(page_id).?;
+        view.* = .{ .bytes = resident.bytes, .references = 2 };
+        resident.raw_view = view;
+        resident.credit = if (resident.metadata) 3 else 2;
+        self.total_bytes += extra;
+        promoted = true;
+        self.refreshPageResourceUsageLocked();
+        _ = self.clearPagesForHardPressureLocked(allocator);
+        return view;
+    }
+
+    fn releaseRaw(self: *PageCache, allocator: Allocator, view: *RawView) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const before_bytes = self.total_bytes;
+        self.releaseRawLocked(allocator, view);
+        if (self.total_bytes != before_bytes) self.refreshPageResourceUsageLocked();
+    }
+
+    fn releaseRawLocked(self: *PageCache, allocator: Allocator, view: *RawView) void {
+        std.debug.assert(view.references > 0);
+        view.references -= 1;
+        if (view.references != 0) return;
+        self.total_bytes -= view.size();
+        allocator.free(view.bytes);
+        allocator.destroy(view);
+    }
+
     fn acquireIndex(self: *PageCache, allocator: Allocator, page_id: u64) !?*IndexView {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -2030,6 +2088,7 @@ const PageCache = struct {
             view.references += 1;
             return view;
         }
+        if (cached.raw_view != null) return null;
         const payload = try decodePagePayload(cached.bytes, .document_index);
         const view = allocator.create(IndexView) catch return null;
         view.* = .{ .frame = .{} };
@@ -2080,6 +2139,8 @@ const PageCache = struct {
     fn freePageLocked(self: *PageCache, allocator: Allocator, page: CachedPage) void {
         if (page.index) |view| {
             self.releaseIndexLocked(allocator, view);
+        } else if (page.raw_view) |view| {
+            self.releaseRawLocked(allocator, view);
         } else {
             self.total_bytes -= page.bytes.len;
             allocator.free(page.bytes);
@@ -2549,6 +2610,8 @@ pub const NativeFile = struct {
     test_backing_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_backing_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_cache_borrowed_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_cache_copy_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
     test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -5652,6 +5715,7 @@ pub const NativeFile = struct {
     /// Admit requested pages according to policy, never speculative neighbors.
     const ValuePageReader = struct {
         bytes: [64 * 1024]u8 = undefined,
+        lease: ?*PageCache.RawView = null,
         first: u64 = 0,
         count: usize = 0,
         admitted: u16 = 0,
@@ -5659,6 +5723,13 @@ pub const NativeFile = struct {
         chain_run: usize = 0,
         /// Cold artifact export keeps navigation hot without admitting payloads.
         cache_payload: bool = true,
+
+        fn deinit(self: *@This(), file: *NativeFile) void {
+            if (self.lease) |lease| file.page_cache.releaseRaw(file.allocator, lease);
+            self.lease = null;
+            self.count = 0;
+            self.admitted = 0;
+        }
 
         fn requested(self: *@This(), file: *NativeFile, index: usize) []const u8 {
             const size: usize = file.header.page_size;
@@ -5679,11 +5750,21 @@ pub const NativeFile = struct {
             if (builtin.is_test) _ = file.test_page_reads.fetchAdd(1, .monotonic);
             const size: usize = file.header.page_size;
             if (page >= self.first and page - self.first < self.count)
-                return self.requested(file, @intCast(page - self.first));
-            self.count = 0;
-            self.admitted = 0;
+                return if (self.lease) |lease| lease.bytes else self.requested(file, @intCast(page - self.first));
+            self.deinit(file);
             const use_cache = file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0;
+            if (use_cache) {
+                if (file.page_cache.acquireRaw(file.allocator, page, size)) |lease| {
+                    self.lease = lease;
+                    self.first = page;
+                    self.count = 1;
+                    self.admitted = 1;
+                    if (builtin.is_test) _ = file.test_value_cache_borrowed_bytes.fetchAdd(size, .monotonic);
+                    return lease.bytes;
+                }
+            }
             if (use_cache and file.page_cache.copyInto(page, self.bytes[0..size])) {
+                if (builtin.is_test) _ = file.test_value_cache_copy_bytes.fetchAdd(size, .monotonic);
                 self.first = page;
                 self.count = 1;
                 self.admitted = 1;
@@ -5755,6 +5836,7 @@ pub const NativeFile = struct {
         fn initWithCacheIntent(file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool) !ValueChunkCursor {
             if (len == 0) return error.InvalidNativeValueChain;
             var cursor = ValueChunkCursor{ .file = file, .checkpoint = checkpoint, .pending = null, .chain_page = root, .remaining = len, .value_length = len, .reader = .{ .cache_payload = cache_payload } };
+            errdefer cursor.deinit();
             const raw = try cursor.reader.read(file, checkpoint, root, 1);
             if (raw[4] == @backingInt(PageKind.value_extent)) {
                 const node = try decodeExtentNode(try decodePagePayload(raw, .value_extent), len);
@@ -5801,6 +5883,7 @@ pub const NativeFile = struct {
         }
 
         pub fn deinit(self: *ValueChunkCursor) void {
+            self.reader.deinit(self.file);
             self.frames.deinit(self.file.allocator);
         }
 
@@ -6939,6 +7022,7 @@ pub const NativeFile = struct {
 
     fn readExtentRange(self: *NativeFile, ref: ExtentRef, checkpoint: CheckpointSlot, start: usize, out: []u8) !void {
         var reader = ValuePageReader{};
+        defer reader.deinit(self);
         return self.readExtentRangeBuffered(ref, checkpoint, start, out, &reader, 1);
     }
 
@@ -7299,6 +7383,7 @@ pub const NativeFile = struct {
         }
 
         var reader = ValuePageReader{};
+        defer reader.deinit(self);
         const range_end = range_start + range_len;
         var value_offset: usize = 0;
         var written: usize = 0;
@@ -13930,6 +14015,7 @@ test "lite value windows cache requested pages and retain warm extent metadata" 
         const root = (try decodeDocumentEntry(raw)).external_value_root_page;
         file.page_cache_enabled.store(true, .monotonic);
         var reader = NativeFile.ValuePageReader{};
+        defer reader.deinit(&file);
         _ = try reader.read(&file, checkpoint, root, 16);
         try std.testing.expectEqual(!metadata_only, file.page_cache.pages.contains(root));
         try std.testing.expect(!file.page_cache.pages.contains(root + 1));
@@ -15819,4 +15905,194 @@ test "lite native immutable value traversal needs no heap scratch for ordinary e
     }
     try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
     std.debug.print("LITE_CURSOR_TRAVERSAL bytes=1048576 traversals=24 heap_allocations={d}\n", .{budget.alloc_calls});
+}
+
+test "lite raw value leases retain replacement bytes and account retired pins" {
+    const a = std.testing.allocator;
+    var cache = PageCache{};
+    defer cache.deinit(a);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    cache.attachResourceManager(&manager);
+    cache.put(a, 1, "original");
+    const old = cache.acquireRaw(a, 1, 8).?;
+    defer cache.releaseRaw(a, old);
+    const same = cache.acquireRaw(a, 1, 8).?;
+    try std.testing.expectEqual(old, same);
+    cache.releaseRaw(a, same);
+    cache.put(a, 1, "replaced");
+    const newer = cache.acquireRaw(a, 1, 8).?;
+    try std.testing.expect(newer != old);
+    try std.testing.expectEqualStrings("original", old.bytes);
+    try std.testing.expectEqualStrings("replaced", newer.bytes);
+    cache.clear(a);
+    try std.testing.expectEqual(old.size() + newer.size(), cache.total_bytes);
+    try std.testing.expectEqual(cache.total_bytes, manager.sliceStats(.lite_native_page_cache).used_bytes);
+    cache.releaseRaw(a, newer);
+    cache.limit_bytes = old.size();
+    cache.put(a, 2, "pressure");
+    try std.testing.expect(!cache.pages.contains(2));
+    try std.testing.expectEqualStrings("original", old.bytes);
+    try std.testing.expectEqual(old.size(), cache.total_bytes);
+}
+
+test "lite raw value leases fall back without promotion allocation or headroom" {
+    const a = std.testing.allocator;
+    var cache = PageCache{};
+    defer cache.deinit(a);
+    cache.put(a, 1, "original");
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?*PageCache.RawView, null), cache.acquireRaw(failing.allocator(), 1, 8));
+    try std.testing.expect(failing.has_induced_failure);
+    var out: [8]u8 = undefined;
+    try std.testing.expect(cache.copyInto(1, &out));
+    try std.testing.expectEqualStrings("original", &out);
+    cache.limit_bytes = 8;
+    try std.testing.expectEqual(@as(?*PageCache.RawView, null), cache.acquireRaw(a, 1, 8));
+    try std.testing.expectEqual(@as(usize, 8), cache.total_bytes);
+}
+
+test "lite warm value ranges borrow pages without copies or allocations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "warm-value-lease.aflite");
+    defer a.free(path);
+    var counter = std.testing.FailingAllocator.init(a, .{});
+    var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const value = try a.alloc(u8, 1024 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    try file.putIndexCatalogRecord("wal", value);
+    for (0..2) |_| {
+        const got = (try file.getIndexCatalogRecordRangeAlloc(a, "wal", 8192, 16)).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(value[8192..][0..16], got);
+    }
+    const borrowed = file.test_value_cache_borrowed_bytes.load(.monotonic);
+    const copied = file.test_value_cache_copy_bytes.load(.monotonic);
+    const reads = file.test_value_read_calls.load(.monotonic);
+    const allocations = counter.alloc_index;
+    counter.fail_index = counter.alloc_index;
+    for (0..100) |_| {
+        const got = (try file.getIndexCatalogRecordRangeAlloc(a, "wal", 8192, 16)).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(value[8192..][0..16], got);
+    }
+    try std.testing.expect(!counter.has_induced_failure);
+    try std.testing.expectEqual(allocations, counter.alloc_index);
+    try std.testing.expectEqual(reads, file.test_value_read_calls.load(.monotonic));
+    try std.testing.expectEqual(copied, file.test_value_cache_copy_bytes.load(.monotonic));
+    const bytes = file.test_value_cache_borrowed_bytes.load(.monotonic) - borrowed;
+    try std.testing.expect(bytes > 100 * 16);
+    std.debug.print("LITE_VALUE_LEASE ranges=100 returned_bytes=1600 borrowed_page_bytes={d} copied_page_bytes=0 backing_reads=0 allocations=0\n", .{bytes});
+}
+
+test "lite value cursor initialization errors release borrowed pages" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "value-lease-error.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("key", "value");
+    const checkpoint = file.activeCheckpoint();
+    const root = checkpoint.document_index_root_page;
+    file.page_cache.clear(a);
+    var scratch: [65536]u8 = undefined;
+    _ = try file.readPageInto(root, checkpoint, &scratch);
+    try std.testing.expectError(error.UnexpectedNativePageKind, NativeFile.ValueChunkCursor.initAtCheckpoint(&file, root, 5, checkpoint));
+    try std.testing.expectEqual(@as(usize, 1), file.page_cache.pages.get(root).?.raw_view.?.references);
+    file.page_cache.clear(a);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+}
+
+test "lite raw value leases retire under shared hard pressure" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 8192, .hard_limit_bytes = 16384 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var cache = PageCache{};
+    defer cache.deinit(a);
+    cache.attachResourceManager(&manager);
+    cache.put(a, 1, "original");
+    const view = cache.acquireRaw(a, 1, 8).?;
+    var external: u64 = 0;
+    manager.observeUsage(.lite_native_page_cache, &external, 32768);
+    defer manager.observeUsage(.lite_native_page_cache, &external, 0);
+    try std.testing.expectEqual(@as(?*PageCache.RawView, null), cache.acquireRaw(a, 1, 8));
+    try std.testing.expectEqual(@as(u32, 0), cache.pages.count());
+    try std.testing.expectEqual(view.size(), cache.total_bytes);
+    try std.testing.expectEqualStrings("original", view.bytes);
+    try std.testing.expectEqual(view.size() + external, manager.sliceStats(.lite_native_page_cache).used_bytes);
+    cache.releaseRaw(a, view);
+    try std.testing.expectEqual(external, manager.sliceStats(.lite_native_page_cache).used_bytes);
+}
+
+test "lite borrowed value callbacks allow reentrant eviction and release on failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "value-lease-callback.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    var bytes: [8192]u8 = @splat('v');
+    try file.putIndexCatalogRecord("value", &bytes);
+    const checkpoint = file.activeCheckpoint();
+    var value = try file.openIndexValue(a, "value", checkpoint);
+    defer value.deinit(a);
+    var warm: [16]u8 = undefined;
+    try file.readIndexValueInto(value, 0, &warm, checkpoint);
+    const Probe = struct {
+        file: *NativeFile,
+        value: NativeFile.IndexValue,
+        checkpoint: CheckpointSlot,
+        fn visit(raw: *anyopaque, _: u64, chunk: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The outer callback must own a lease while residency disappears.
+            self.file.page_cache.clear(self.file.allocator);
+            try std.testing.expect(self.file.page_cache.total_bytes > 0);
+            var nested: [16]u8 = undefined;
+            try self.file.readIndexValueInto(self.value, 0, &nested, self.checkpoint);
+            for (chunk) |byte| try std.testing.expectEqual(@as(u8, 'v'), byte);
+            self.file.page_cache.clear(self.file.allocator);
+            return error.CallbackStopped;
+        }
+    };
+    var probe = Probe{ .file = &file, .value = value, .checkpoint = checkpoint };
+    try std.testing.expectError(error.CallbackStopped, file.visitIndexValue(value, 0, 16, checkpoint, &probe, Probe.visit));
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+}
+
+test "lite raw value leases survive concurrent replacement and eviction" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var cache = PageCache{};
+    defer cache.deinit(a);
+    cache.put(a, 1, "original");
+    const pinned = cache.acquireRaw(a, 1, 8).?;
+    defer cache.releaseRaw(a, pinned);
+    const Runner = struct {
+        fn run(c: *PageCache, failed: *std.atomic.Value(bool)) void {
+            for (0..200) |_| {
+                c.put(std.testing.allocator, 1, "replaced");
+                if (c.acquireRaw(std.testing.allocator, 1, 8)) |view| {
+                    if (!std.mem.eql(u8, view.bytes, "replaced")) failed.store(true, .monotonic);
+                    c.releaseRaw(std.testing.allocator, view);
+                }
+                c.clear(std.testing.allocator);
+            }
+        }
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &cache, &failed });
+    for (0..200) |_| {
+        if (!std.mem.eql(u8, "original", pinned.bytes)) failed.store(true, .monotonic);
+        cache.clear(a);
+    }
+    thread.join();
+    try std.testing.expect(!failed.load(.monotonic));
+    try std.testing.expectEqualStrings("original", pinned.bytes);
 }

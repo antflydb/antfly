@@ -1025,6 +1025,7 @@ fn workerMain(worker: *Worker) void {
                 (runtime.truncates_in_flight == 0 and runtime.computeMinPersistedLocked() > runtime.last_claimed_truncate_sequence))
             {
                 const sequence = worker.applied_sequence;
+                const needs_persistence = sequence > worker.persisted_sequence;
                 const cleanup_delay = runtime.truncate_retry_not_before_ns -| platform_time.monotonicNs();
                 if (worker.applied_sequence <= worker.persisted_sequence and cleanup_delay > 0) {
                     worker.next_delay_ms = delayMilliseconds(cleanup_delay);
@@ -1032,7 +1033,10 @@ fn workerMain(worker: *Worker) void {
                     return;
                 }
                 runtime.mutex.unlock(io);
-                const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
+                const persisted = (if (needs_persistence)
+                    persistIdleAppliedSequence(runtime, worker, sequence, io)
+                else
+                    cleanupIdleAppliedSequence(runtime, io)) catch |err| {
                     if (err == error.WorkerStopping) return;
                     if (catch_up_policy.isRecoverableAdmissionError(err)) {
                         scheduleRecoverableCatchUpRetry(worker, err);
@@ -1287,6 +1291,11 @@ fn workerMain(worker: *Worker) void {
         worker.recoverable_retry_backoff.reset();
         worker.retry_not_before_ns = 0;
     }
+}
+
+fn cleanupIdleAppliedSequence(runtime: *DerivedRuntime, io: Io) !bool {
+    try attemptPendingTruncate(runtime, io);
+    return true;
 }
 
 fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !bool {
@@ -2921,4 +2930,82 @@ test "issue1015 foreground visibility cleanup preserves runtime backoff" {
     }
     std.debug.print("FRESH_FOREGROUND_BACKOFF requests=20 truncate_calls={d} claim={d} complete={d}\n", .{ probe.calls, runtime.last_claimed_truncate_sequence, runtime.last_truncated_sequence });
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
+
+test "issue1015 durable idle cleanup skips persistence" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        persist_calls: usize = 0,
+        truncate_calls: usize = 0,
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.persist_calls += 1;
+            return true;
+        }
+        fn truncate(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.truncate_calls += 1;
+            if (self.truncate_calls < 4) return error.WouldBlock;
+        }
+    };
+    var probe = Probe{};
+    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const worker = try a.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try a.dupe(u8, "durable"), .kind = .{ .name = "durable", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1 };
+    try runtime.workers.append(a, worker);
+    // Simulate dispatches after each shared cleanup deadline expires.
+    for (0..4) |dispatch| {
+        runtime.truncate_retry_not_before_ns = 0;
+        workerMain(worker);
+        if (dispatch < 3) {
+            runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            workerMain(worker);
+            try std.testing.expectEqual(dispatch + 1, probe.truncate_calls);
+        }
+    }
+    try runtime.failIfUnhealthy();
+    try std.testing.expectEqual(@as(usize, 4), probe.truncate_calls);
+    try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
+    std.debug.print("LITE_IDLE_CLEANUP durable_sequence=1 dispatches=4 persist_calls={d} truncate_calls={d}\n", .{ probe.persist_calls, probe.truncate_calls });
+    try std.testing.expectEqual(@as(usize, 0), probe.persist_calls);
+}
+
+test "issue1015 idle cleanup persists a new watermark once" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        persist_calls: usize = 0,
+        truncate_calls: usize = 0,
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.persist_calls += 1;
+            return true;
+        }
+        fn truncate(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.truncate_calls += 1;
+            if (self.truncate_calls < 4) return error.WouldBlock;
+        }
+    };
+    var probe = Probe{};
+    var runtime = try DerivedRuntime.init(a, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const worker = try a.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try a.dupe(u8, "durable"), .kind = .{ .name = "durable", .kind = .graph }, .applied_sequence = 1, .persisted_sequence = 0, .target_sequence = 1 };
+    try runtime.workers.append(a, worker);
+    // Simulate dispatches after each shared cleanup deadline expires.
+    for (0..4) |dispatch| {
+        runtime.truncate_retry_not_before_ns = 0;
+        workerMain(worker);
+        if (dispatch < 3) {
+            runtime.truncate_retry_not_before_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+            workerMain(worker);
+            try std.testing.expectEqual(dispatch + 1, probe.truncate_calls);
+        }
+    }
+    try runtime.failIfUnhealthy();
+    try std.testing.expectEqual(@as(usize, 4), probe.truncate_calls);
+    try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
+    std.debug.print("LITE_IDLE_CLEANUP durable_sequence=1 dispatches=4 persist_calls={d} truncate_calls={d}\n", .{ probe.persist_calls, probe.truncate_calls });
+    try std.testing.expectEqual(@as(usize, 1), probe.persist_calls);
 }

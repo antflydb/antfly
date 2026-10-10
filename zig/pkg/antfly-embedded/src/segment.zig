@@ -1259,6 +1259,19 @@ pub const SegmentReader = struct {
     pub fn typedMergeWorkingSetBytes(self: *const SegmentReader) !u64 {
         var total: u64 = 0;
         for (self.fields) |field| {
+            if (self.native) |native| {
+                if (native.range.findSection(field.name, .typed_doc_values)) |section| {
+                    if (section.typed_navigation) |navigation| {
+                        if (navigation.reader.largest_decoded_chunk) |largest| {
+                            // Admission validated this immutable directory and its
+                            // exact summary. Legacy directories still use the scan.
+                            total = try std.math.add(u64, total, try std.math.mul(u64, navigation.offsets.len, 2));
+                            total = try std.math.add(u64, total, try std.math.mul(u64, largest, 3));
+                            continue;
+                        }
+                    }
+                }
+            }
             const view = (try self.sectionView(field.name, .typed_doc_values)) orelse continue;
             if (view.length < 5) return error.InvalidData;
             var header: [5]u8 = undefined;
@@ -11703,4 +11716,55 @@ test "segment.shared typed navigation authenticates legacy sections before admis
     // Legacy artifacts authenticate the complete section, not individual pages.
     legacy[@intCast(offset + 14)] ^= 1;
     try std.testing.expectError(error.CrcMismatch, SegmentReader.initSource(a, .{ .contiguous = legacy }));
+}
+
+test "segment.typed merge estimate reuses validated indexed navigation" {
+    const a = std.testing.allocator;
+    var sink = MemorySegmentSink.init(a);
+    defer sink.deinit();
+    var column_sink = sink.sink();
+    var values = typed_dv.StreamingWriter.init(a, &column_sink, .u64_val);
+    defer values.deinit();
+    for (0..50_000) |doc| try values.add(@intCast(doc), .{ .u64_val = doc });
+    try std.testing.expect(try values.finish());
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..50_000) |_| try writer.addUnstoredDoc();
+    try writer.addSection(try writer.addField("value"), .typed_doc_values, sink.out.items);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const Backend = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .bytes = bytes };
+    const input = SegmentSource{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .close = Backend.close } };
+    var reader = try SegmentReader.initSource(a, input);
+    defer reader.deinit();
+
+    const Counter = struct {
+        source: SegmentSource,
+        reads: usize = 0,
+        read_bytes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, bytes_out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            self.read_bytes += bytes_out.len;
+            try self.source.readInto(offset, bytes_out);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var counter = Counter{ .source = reader.native.?.range.source };
+    reader.native.?.range.source = .{ .ranges = .{ .ptr = &counter, .length = counter.source.len(), .read_into = Counter.read, .close = Counter.close } };
+    const navigation = reader.native.?.range.findSection("value", .typed_doc_values).?.typed_navigation.?;
+    const estimate = try reader.typedMergeWorkingSetBytes();
+    std.debug.print("LITE_TYPED_ESTIMATE chunks={d} logical_range_reads={d} read_bytes={d} estimate={d}\n", .{ navigation.reader.num_chunks, counter.reads, counter.read_bytes, estimate });
+    try std.testing.expectEqual(@as(usize, 0), counter.reads);
+    try std.testing.expectEqual(@as(u64, 40012), estimate);
 }
