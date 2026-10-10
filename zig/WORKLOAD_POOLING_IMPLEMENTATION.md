@@ -2108,3 +2108,33 @@ callback retires capacity and denies later work. Failure observations release
 and join all threads rather than leaving a hung test. This verifies the actual
 maintenance owner, but still does not qualify shared CPU admission for all
 background work or broader API/DB/resource/performance/default contracts.
+
+
+### Bounded source locator construction probes
+
+Deferred source reachability locator construction now admits one hash bucket
+probe per maintenance work step. A collision keeps the row, reader and next
+probe position in the locator until insertion or full-identity duplicate
+validation completes. The locator remains pending even if its final reader
+and row have been consumed while a probe chain remains. The existing marking
+loop charges and checks the original lifetime between probes. Newest-first
+reader traversal, full digest/dimension comparison and immutable subset
+leases retain their existing semantics. Workspace accounting includes the
+additional inline probe state and no new allocation is introduced.
+
+The actual source/memory-primary suite passed 88 native checks (87 custom
+runner checks plus one default runner check), with zero failures and leaks.
+The new fixture builds 32 real source identities in the same 64-bucket hash
+slot, observes individual collision probe progress, and checks full identities
+against pinned reader contents. Actual collection rejects original Canceled,
+DeadlineExceeded and SchedulerClosed after exactly one charged probe, joins
+the scanner, discards the unpublished mark, releases its source mutex, and
+keeps all primary values readable. Subsequent collection completes and those
+values remain readable. Four ownership audit checks passed.
+
+This closes the unbounded collision chain inside deferred locator construction.
+Synchronous legacy construction, allocation/zeroing, per-item lookup probes
+and traversal across readers still require separate bounded-work adoption.
+Shared background CPU admission, complete holder/cleanup adoption, full
+archive/API/DB integration, runtime resource/performance and automatic default
+qualification remain incomplete.

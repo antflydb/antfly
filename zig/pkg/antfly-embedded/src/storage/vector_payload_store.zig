@@ -7719,3 +7719,136 @@ test "source vector payloads live verification charges sparse searches and rejec
     defer alloc.free(restored);
     try std.testing.expectEqualSlices(u8, artifact, restored);
 }
+
+test "source vector payloads locator collision probes yield and preserve original rejection and full identity" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-locator-probes", false);
+    defer source.deinit();
+    source.bitmap_marking = true;
+    source.bitmap_locator = true;
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var references: [32]payload.Reference = undefined;
+    var selected: usize = 0;
+    var selected_keys: [32][]u8 = undefined;
+    defer for (selected_keys[0..selected]) |key| alloc.free(key);
+    var attempt: usize = 0;
+    while (selected < references.len) : (attempt += 1) {
+        try std.testing.expect(attempt < 65536);
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{attempt}), "model");
+        defer alloc.free(key);
+        const reference = try payload.Reference.forArtifact(key, artifact);
+        // 32 unique rows require 64 locator buckets.
+        if (std.mem.readInt(u64, reference.digest[0..8], .little) & 63 != 0) continue;
+        try store.put(key, artifact);
+        selected_keys[selected] = try alloc.dupe(u8, key);
+        references[selected] = reference;
+        selected += 1;
+    }
+    try source.checkpoint();
+    var indexed = LiveSet.init(alloc);
+    defer indexed.deinit();
+    try indexed.enableBitmapsDeferred(&source.opened, true);
+    try std.testing.expectEqual(@as(usize, 64), indexed.locator.?.slots.len);
+    var turns: usize = 0;
+    while (try indexed.advanceLocator()) : (turns += 1) {
+        try std.testing.expect(turns < 2048);
+        if (indexed.locator.?.probe) |probe| {
+            const position = probe.position;
+            try std.testing.expect(indexed.locatorPending());
+            try std.testing.expect(try indexed.advanceLocator());
+            turns += 1;
+            if (indexed.locator.?.probe) |next| try std.testing.expectEqual((position + 1) & 63, next.position);
+        }
+    }
+    // The old row-sized quantum took only 32 turns despite this long chain.
+    try std.testing.expect(turns >= 32 * 33 / 2);
+    for (references) |reference| try indexed.put(reference.digest, reference.dims);
+    try std.testing.expectEqual(@as(u32, 32), indexed.count());
+    var newest_reader: ?usize = null;
+    var order_pos = source.opened.reader_order.len;
+    while (order_pos != 0 and newest_reader == null) {
+        order_pos -= 1;
+        const reader_index = source.opened.reader_order[order_pos];
+        const reader = source.opened.readers[reader_index];
+        for (0..reader.count) |row| {
+            if (std.mem.eql(u8, reader.sourceIdentityAt(row).key, &references[0].digest)) {
+                newest_reader = reader_index;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(newest_reader != null);
+    var newest_found = false;
+    for (indexed.locator.?.slots) |slot| {
+        if (slot == 0) continue;
+        const reader_index: usize = @intCast((slot >> 32) - 1);
+        const row: usize = @as(u32, @truncate(slot));
+        if (std.mem.eql(u8, source.opened.readers[reader_index].sourceIdentityAt(row).key, &references[0].digest)) {
+            try std.testing.expectEqual(newest_reader.?, reader_index);
+            newest_found = true;
+        }
+    }
+    try std.testing.expect(newest_found);
+    const Check = struct {
+        source: *Store,
+        position: usize,
+        rejection: anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            if (self.source.marking) |mark| if (mark.live.locator.?.probe) |probe| {
+                if (probe.position != self.position) return runtime.error_abi.statusFromError(self.rejection);
+            } else return runtime.error_abi.statusFromError(self.rejection);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |rejection| {
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+        turns = 0;
+        while (source.marking.?.live.locator.?.probe == null) : (turns += 1) {
+            try std.testing.expect(turns < 64);
+            try source.advanceMarkingSnapshot();
+        }
+        var check: Check = .{ .source = &source, .position = source.marking.?.live.locator.?.probe.?.position, .rejection = rejection };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        const before = source.statsSnapshot().collection_mark_rows;
+        source.mark_step_rows = 8;
+        try std.testing.expectError(rejection, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expectEqual(before + 1, source.statsSnapshot().collection_mark_rows);
+        try std.testing.expect(source.marking == null);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        source.mark_step_rows = 1;
+        for (selected_keys) |key| {
+            const restored = try store.get(alloc, key);
+            defer alloc.free(restored);
+            try std.testing.expectEqualSlices(u8, artifact, restored);
+        }
+    }
+    source.mark_step_rows = 4096;
+    turns = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1)
+        try std.testing.expect(turns < 256);
+    for (selected_keys) |key| {
+        const restored = try store.get(alloc, key);
+        defer alloc.free(restored);
+        try std.testing.expectEqualSlices(u8, artifact, restored);
+    }
+}

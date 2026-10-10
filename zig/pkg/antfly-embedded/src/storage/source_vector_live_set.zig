@@ -42,6 +42,7 @@ pub const LiveSet = struct {
         slots: []u64,
         remaining_readers: usize,
         remaining_rows: usize = 0,
+        probe: ?struct { reader: usize, row: usize, position: usize } = null,
 
         fn capacity(source: *const native.Opened) !usize {
             var rows: usize = 0;
@@ -67,31 +68,37 @@ pub const LiveSet = struct {
             return self;
         }
         fn pending(self: *const Locator) bool {
-            return self.remaining_readers != 0 or self.remaining_rows != 0;
+            return self.remaining_readers != 0 or self.remaining_rows != 0 or self.probe != null;
         }
-        /// One row (or empty reader) per turn lets the existing mark budget
-        /// yield during construction. Once complete, this table is immutable.
+        /// One hash bucket (or empty reader) per turn. Collision chains keep
+        /// the current row pinned until its insertion or duplicate check ends.
         fn advance(self: *Locator, source: *const native.Opened) !bool {
-            if (self.remaining_rows == 0) {
-                if (self.remaining_readers == 0) return false;
-                self.remaining_readers -= 1;
-                self.remaining_rows = source.readers[source.reader_order[self.remaining_readers]].count;
-                if (self.remaining_rows == 0) return true;
-            }
-            self.remaining_rows -= 1;
-            const reader_index = source.reader_order[self.remaining_readers];
-            const identity = source.readers[reader_index].sourceIdentityAt(self.remaining_rows);
-            if (!identity.vector or identity.key.len != 32) return error.InvalidVectorReference;
-            var position = bucket(identity.key[0..32].*, self.slots.len - 1);
-            while (self.slots[position] != 0) : (position = (position + 1) & (self.slots.len - 1)) {
-                const at = address(self.slots[position]);
-                const old = source.readers[at.reader].sourceIdentityAt(at.row);
-                if (std.mem.eql(u8, identity.key, old.key)) {
-                    if (identity.dims != old.dims) return error.VectorReferenceIdentityMismatch;
-                    return true;
+            if (self.probe == null) {
+                if (self.remaining_rows == 0) {
+                    if (self.remaining_readers == 0) return false;
+                    self.remaining_readers -= 1;
+                    self.remaining_rows = source.readers[source.reader_order[self.remaining_readers]].count;
+                    if (self.remaining_rows == 0) return true;
                 }
+                self.remaining_rows -= 1;
+                const reader_index = source.reader_order[self.remaining_readers];
+                const identity = source.readers[reader_index].sourceIdentityAt(self.remaining_rows);
+                if (!identity.vector or identity.key.len != 32) return error.InvalidVectorReference;
+                self.probe = .{ .reader = reader_index, .row = self.remaining_rows, .position = bucket(identity.key[0..32].*, self.slots.len - 1) };
             }
-            self.slots[position] = ((@as(u64, reader_index) + 1) << 32) | @as(u64, @intCast(self.remaining_rows));
+            const probe = self.probe.?;
+            if (self.slots[probe.position] == 0) {
+                self.slots[probe.position] = ((@as(u64, probe.reader) + 1) << 32) | @as(u64, @intCast(probe.row));
+                self.probe = null;
+                return true;
+            }
+            const identity = source.readers[probe.reader].sourceIdentityAt(probe.row);
+            const at = address(self.slots[probe.position]);
+            const old = source.readers[at.reader].sourceIdentityAt(at.row);
+            if (std.mem.eql(u8, identity.key, old.key)) {
+                if (identity.dims != old.dims) return error.VectorReferenceIdentityMismatch;
+                self.probe = null;
+            } else self.probe.?.position = (probe.position + 1) & (self.slots.len - 1);
             return true;
         }
         fn get(self: *const Locator, source: *const native.Opened, digest: Digest) ?Address {
