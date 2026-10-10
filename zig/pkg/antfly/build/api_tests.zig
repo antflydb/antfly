@@ -2346,7 +2346,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const local_commit_control_tests = b.addTest(.{
         .name = "local-commit-control-tests",
         .root_module = local_commit_control_root,
-        .filters = &.{ "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries" },
+        .filters = &.{ "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries", "bound batch controls retain original owner through native snapshot admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const local_commit_control_run = addFilteredTestRunArtifact(b, local_commit_control_tests);
@@ -2391,7 +2391,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const controlled_service_lock_tests = b.addTest(.{
         .name = "controlled-service-lock-tests",
         .root_module = controlled_service_lock_root,
-        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock", "snapshot admission" },
+        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock", "snapshot admission", "mutation admission controls" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")

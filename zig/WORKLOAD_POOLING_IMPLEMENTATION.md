@@ -1399,3 +1399,25 @@ not yet qualified this wiring. Serving/ABI write callers still need to transport
 this original-owner contract; other writer/maintenance/catalog waits and the
 full lock dependency graph remain unfinished. These changes do not enable CPU
 yielding inside pinned query work or automatic pooling defaults.
+
+Bound one-table, predicate-free commit batches now pass the existing commit
+team borrow and original pre-decision context into native mutation admission.
+The same-process `TableWriteSource` control callback retains that team until the
+synchronous batch returns; no new callback capability or serialized authority
+is introduced. The shared admission adapter checks lifetime without CPU yielding,
+uses the supplied pre-decision clock directly, and parks/resumes the original
+borrow at contended snapshot/apply waits. Resumption captures the current class
+instead of assuming the parent class. Post-durability visibility keeps its own
+cancellation token. The pre-decision error remains distinct for proven
+pre-proposal expiry.
+
+Focused adapter tests cover unrelated service/original clock domains, sticky
+expiry/cancellation, missing borrowed lifetime support, original cancellation
+while parked, failed CPU resumption, captured-class restoration and service-fence
+retirement. Together with snapshot/lock/text regressions, 59 native tests passed
+within the 3 GiB compiler bound. The physical bound-source regression is included
+in `antfly-local-commit-control-test` and queued with the cumulative storage/ABI
+run; it has not yet qualified production wiring. Guarded and explicit transaction
+admission, provisioned/Raft writer paths, durable completion waits and the remaining
+lock dependency graph still need adoption. Lock-held query CPU yielding and
+automatic defaults remain unqualified.

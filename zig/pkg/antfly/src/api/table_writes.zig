@@ -43753,6 +43753,89 @@ fn implementationTests() type {
             try std.testing.expect(try db.lookup(alloc, "doc:budget", .{}) == null);
         }
 
+        test "bound batch controls retain original owner through native snapshot admission" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-batch-admission");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            var source = BoundTableWriteSource.init("docs", &db);
+            const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
+            const Capture = @TypeOf(db.core.snapshot_admission.*).CaptureLease;
+            const State = struct {
+                capture: *Capture,
+                canceled: *std.atomic.Value(bool),
+                scenario: usize,
+                parks: usize = 0,
+                resumes: usize = 0,
+                lifetimes: usize = 0,
+                checkpoints: usize = 0,
+                fn lifetime(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.lifetimes += 1;
+                    return .ok;
+                }
+                fn checkpoint(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.checkpoints += 1;
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
+                }
+                fn current(_: *anyopaque, output: *c_int) callconv(.c) runtime_error_abi.Status {
+                    output.* = @backingInt(runnable_abi.Class.write);
+                    return .ok;
+                }
+                fn resize(_: *anyopaque, slots: usize) callconv(.c) runtime_error_abi.Status {
+                    return if (slots == 1) .ok else runtime_error_abi.statusFromError(error.InvalidRunnableDemand);
+                }
+                fn park(raw: *anyopaque, phase: c_int) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (phase != @backingInt(runnable_abi.Wait.resource)) return runtime_error_abi.statusFromError(error.InvalidArgument);
+                    self.parks += 1;
+                    self.capture.release();
+                    if (self.scenario == 2) self.canceled.store(true, .release);
+                    return .ok;
+                }
+                fn enter(raw: *anyopaque, phase: c_int) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (phase != @backingInt(runnable_abi.Class.write)) return runtime_error_abi.statusFromError(error.InvalidArgument);
+                    self.resumes += 1;
+                    return if (self.scenario == 1) runtime_error_abi.statusFromError(error.SchedulerClosed) else .ok;
+                }
+            };
+            const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:admission", .value = "{}" }} }};
+            // Failures first so absence of a published document is observable.
+            for ([_]usize{ 1, 2, 0 }) |scenario| {
+                var capture = db.core.snapshot_admission.acquireCapture();
+                defer capture.release();
+                var canceled = std.atomic.Value(bool).init(false);
+                var state: State = .{ .capture = &capture, .canceled = &canceled, .scenario = scenario };
+                var team: runnable_abi.Team = .{
+                    .borrow = .{ .context = &state, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.query), .checkpoint = State.checkpoint, .park = State.park, .enter = State.enter, .resize_team = State.resize, .check_lifetime = State.lifetime, .current_class = State.current },
+                    .maximum_slots = 1,
+                    .allocator = alloc,
+                };
+                const control: distributed_txn.CommitControl = .{ .team = &team, .pre_decision = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) } };
+                if (scenario == 0) {
+                    const outcome = (try source.source().commitBatchWithControl(alloc, &tables, .write, .none, control)).?;
+                    try std.testing.expect(outcome == .committed);
+                    var row = (try db.lookup(alloc, "doc:admission", .{})).?;
+                    defer row.deinit(alloc);
+                } else {
+                    try std.testing.expectError(if (scenario == 1) error.SchedulerClosed else error.Canceled, source.source().commitBatchWithControl(alloc, &tables, .write, .none, control));
+                    try std.testing.expect(try db.lookup(alloc, "doc:admission", .{}) == null);
+                }
+                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                try std.testing.expectEqual(state.parks, state.resumes);
+                try std.testing.expect(state.lifetimes > 1);
+                try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
+                try std.testing.expect(team.state == .joined);
+                var next_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+                next_capture.release();
+                try std.testing.expect(db.core.tryLockApplyExclusive());
+                db.core.unlockApply();
+            }
+        }
+
         test "bound table write source applies batch writes" {
             const alloc = std.testing.allocator;
             var path_tmp = try TestDirectory.init("antfly-api-table-batch");

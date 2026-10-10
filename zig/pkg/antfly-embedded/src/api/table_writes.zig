@@ -68,16 +68,7 @@ pub fn repairNativeRestoreProjectionsUntilCompleteWithIo(
 }
 
 pub const TableWriteSource = table_write_source.TableWriteSource;
-pub fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !void {
-    try context.cancellation.check();
-    if (context.deadline_ns) |deadline_ns| {
-        // This check is deliberately adjacent to mutation admission. Keep its
-        // error distinct from generic storage and transport deadlines so only
-        // this proven pre-proposal outcome may authorize replica failover.
-        const now_ns = (table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
-        if (now_ns >= deadline_ns) return error.PreDecisionDeadlineExceeded;
-    }
-}
+pub const ensurePreDecisionContextActive = @import("mutation_admission_controls.zig").checkPreDecision;
 
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
@@ -728,7 +719,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{});
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{}, null);
     }
 
     fn commitBatchWithPreDecisionContext(
@@ -738,6 +729,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
         pre_decision: distributed_txn.PreDecisionContext,
+        borrow: ?runnable_abi.Borrowed,
     ) !?distributed_txn.CommitOutcome {
         try ensurePreDecisionContextActive(pre_decision);
         if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
@@ -755,7 +747,11 @@ pub const BoundTableWriteSource = struct {
             };
             try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
             try ensurePreDecisionContextActive(pre_decision);
-            db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
+            // Keep this stack-owned budget alive through the synchronous DB
+            // call. Post-durability visibility retains its independent token.
+            const admission = @import("mutation_admission_controls.zig");
+            var budget = admission.init(pre_decision, borrow, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+            db.batchWithAdmissionControls(req, admission.acquisition(&budget), cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
             };
@@ -802,7 +798,7 @@ pub const BoundTableWriteSource = struct {
         // Validate the original execution fences before contacting storage.
         try team.reserve(0);
         defer team.finish();
-        return commitBatchWithCancellation(ptr, alloc, tables, sync_level, cancellation);
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{}, team.borrow);
     }
 
     fn commitTransactionWithIdAndExecution(
@@ -830,7 +826,7 @@ pub const BoundTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         if (control.team) |team| try team.reserve(0);
         defer if (control.team) |team| team.finish();
-        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, control.pre_decision);
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, control.pre_decision, if (control.team) |team| team.borrow else null);
     }
 
     fn commitTransactionWithIdAndControl(
