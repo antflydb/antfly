@@ -54,8 +54,8 @@ metadata. “Cold” here means empty application disk cache after publication, 
 an uninitialized machine or a brand-new source. Record this distinction with
 results. Peak RSS is the Antfly process high-water mark, not all pod processes.
 
-Reserve $20 for each of at most four attempts, including failed/disconnected
-attempts, and $25 conservatively for prior work: $105 planned reservations inside
+Reserve $20 for each of at most six attempts, including failed/disconnected
+attempts, and $25 conservatively for prior work: $145 planned reservations inside
 the approved $150 incremental ceiling. One pod's maximum 3,400-second lifetime
 bounds compute; no persistent volume, service or new cluster is created. The
 current undiscounted resource calculation is about $0.56 per attempt, with a $10
@@ -86,16 +86,21 @@ manager’s 1 GiB limit; the error does not identify the exact limit site. Neith
 attempt reached SQL count or search benchmarks. Both pods and their uniquely
 scoped derived artifacts were deleted, preserving source objects.
 
-Replace whole-archive replay with bounded file/cohort windows shared across
-index consumers. Release a window after its consumers finish, persist completed
-contributions for resumable construction, and publish only after complete
-coverage and source/lease validation. Bound local disk independently of archive
-size and expose progress and the exhausted resource in failures. Raising the
-spill limit alone does not establish archive scalability. Repeat construction
-and the query matrix after this work. The two initial allowances were consumed;
+The bounded construction below replaces whole-archive replay and reduction
+with per-file work and durable, non-serving checkpoints. Spill limits remain
+enforced. The optimized archive run must still prove complete construction and
+the query matrix; raising a spill limit alone would not establish archive
+scalability. The two initial allowances were consumed;
 the user requested the bounded-construction follow-up and further benchmarks.
-A reviewed extension records two additional attempts in the same ledger without
-changing spend limits or resetting prior reservations.
+Retry extensions are recorded in the same ledger without changing spend limits
+or resetting prior reservations. The first extension admitted a full-archive
+rerun and a separately labelled 142,577-row raw-file search diagnostic. The
+archive rerun failed after 841.6 seconds with `SqlProgramLimitExceeded`, at
+267.5 MiB peak RSS. A constrained-capacity regression reproduced the predicate
+builder exhausting a shared 64-file spill manager; predicate runs are now
+capped at four. Two further retry allowances fit the unchanged $150 ceiling.
+Runtime admission diagnostics distinguish file capacity from spill bytes;
+the shared error alone does not establish the exact cloud failure site.
 
 ## Bounded, resumable construction
 

@@ -31,7 +31,7 @@
     "ceiling_usd": 150,
     "prior_work_reserved_usd": 25,
     "reservation_per_run_usd": 20,
-    "max_runs": 4,
+    "max_runs": 6,
     "cpu_hour_usd": 0.0445,
     "memory_gib_hour_usd": 0.0049225,
     "disk_gib_hour_usd": 0.0001389,

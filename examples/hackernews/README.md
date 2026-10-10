@@ -661,7 +661,8 @@ falls back to streaming for an oversized file. Per-file index admission remains
 enforced. Optimized archive construction and query benchmarks are being rerun.
 
 The original two attempts consumed $65 in conservative allowances including
-prior work. The reviewed follow-up permits two more attempts, up to $105 of
-allowances within the unchanged $150 ceiling. `--extend-run-limit` records this
+prior work. The follow-up now permits four additional attempts, up to $145 of
+allowances within the unchanged $150 ceiling. One is a separately labelled
+142,577-row raw-file search diagnostic; full-archive gates remain unchanged. `--extend-run-limit` records this
 extension in the existing ledger; it cannot reset failed reservations or change
 spend limits.

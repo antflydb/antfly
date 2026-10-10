@@ -55,6 +55,7 @@ pub const Manager = struct {
     directory_name: [43]u8 = undefined,
     sequence: u64 = 0,
     files: usize = 0,
+    peak_files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
     fn lock(self: *Manager) void {
@@ -102,6 +103,11 @@ pub const Manager = struct {
         if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+    }
+    pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .peak_files = self.peak_files, .peak_bytes = self.peak_bytes, .max_bytes = self.max_bytes };
     }
     fn releaseBytes(self: *Manager, bytes: u64) void {
         self.lock();
@@ -166,6 +172,7 @@ pub const Manager = struct {
         errdefer file.close(self.io);
         try self.dir.?.deleteFile(self.io, text);
         self.files += 1;
+        self.peak_files = @max(self.peak_files, self.files);
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {

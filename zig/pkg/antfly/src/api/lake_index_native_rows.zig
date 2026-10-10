@@ -322,7 +322,13 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = try ca.dupe(bool, entry.delta.keep);
                 if (slot < keep.len) keep[slot] = false;
                 const delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
-                const ref = try ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta);
+                const ref = ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) catch |err| {
+                    if (err == error.SqlProgramLimitExceeded) {
+                        const admission = manager.admissionStats();
+                        std.log.warn("native ordered lake admission exhausted file_index={d} total_files={d} peak_spill_files={d} peak_spill_bytes={d} spill_byte_limit={d}", .{ file_index, needed.len, admission.peak_files, admission.peak_bytes, admission.max_bytes });
+                    }
+                    return err;
+                };
                 entry.published = ref;
                 try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
                 // Only the latest root directory is needed for the next file.

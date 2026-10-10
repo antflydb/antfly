@@ -50,7 +50,12 @@
     "prior_work_reserved_usd": 25,
     "first_attempt_reserved_usd": 20,
     "second_attempt_reserved_usd": 20,
-    "note": "Reservations are conservative allowances, not measured cloud billing."
+    "note": "Reservations are conservative allowances, not measured cloud billing.",
+    "third_attempt_reserved_usd": 20,
+    "fourth_diagnostic_reserved_usd": 20,
+    "total_reserved_usd": 105,
+    "max_planned_reserved_usd": 145,
+    "max_attempts": 6
   },
   "rerun": {
     "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
@@ -71,10 +76,47 @@
     "derived_bytes_deleted": 144166
   },
   "next_blocker": {
-    "shape": "Archive-wide replay capture inherits a 1 GiB SQL spill limit before native index construction.",
-    "diagnosis": "Static build-path diagnosis consistent with SqlProgramLimitExceeded; the runtime failure does not identify the exact limit site.",
-    "replay_path": "zig/pkg/antfly/src/api/lake_index_build_replay.zig",
-    "spill_path": "zig/pkg/antfly-embedded/src/sql/spill.zig",
-    "required_work": "Bound replay lifetime to file/cohort windows, release each completed window, and checkpoint resumable publication; requalify construction and queries."
+    "shape": "Complete optimized archive construction and search qualification after the predicate spill-capacity fix.",
+    "diagnosis": "Per-file temporary data is released, but the bounded archive attempt encountered another shared SqlProgramLimitExceeded; exact runtime admission site remains unconfirmed.",
+    "required_work": "Use admission diagnostics on the fixed-binary rerun; retain resource bounds and completed checkpoints; measure throughput and search latency before deployment."
+  },
+  "bounded_construction": {
+    "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
+    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast",
+    "shape": "Per-file replay, metadata sorts, text DF reduction and durable non-serving checkpoints; renewed full-definition CAS and vacuum protection.",
+    "lake_regressions_passed": 83,
+    "replay_checkpoint_and_multi_file_recovery": "passed",
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "SqlProgramLimitExceeded",
+    "table_registration_ms": 24110.98,
+    "elapsed_since_build_start_seconds": 841.58,
+    "build_peak_rss_bytes": 280494080,
+    "observed_ordered_root_rows": 142577,
+    "observed_completed_files_per_root": 1,
+    "total_source_files": 334,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 8486,
+    "derived_bytes_deleted": 202020853
+  },
+  "predicate_capacity_fix": {
+    "shape": "Limit predicate sort runs to four within the fused ordered builders shared 64-file manager; record synchronized spill file/byte admission diagnostics.",
+    "regression": "55 sibling files plus 5000 distinct predicate blocks, with repeated merges, sorted values and zero retained spill bytes.",
+    "before": "SqlProgramLimitExceeded",
+    "after": "passed",
+    "cloud_failure_attribution": "The constrained-capacity regression demonstrates a remaining risk; the previous cloud error does not identify its exact limit site.",
+    "optimized_archive_rerun": "pending"
+  },
+  "search_diagnostic": {
+    "scope": "One unchanged raw BigQuery Parquet file, separately generation-fenced and copied server-side; does not qualify full-archive latency.",
+    "rows": 142577,
+    "bytes": 61797036,
+    "source_original_preserved": true,
+    "status": "running",
+    "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
+    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec"
   }
 }
