@@ -1436,11 +1436,11 @@ pub const Adapter = struct {
         return result;
     }
 
-    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         return mutateInternal(ptr, alloc, table, input, false);
     }
 
-    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         return mutateInternal(ptr, alloc, table, input, true);
     }
 

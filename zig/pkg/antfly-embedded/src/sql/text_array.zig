@@ -55,7 +55,9 @@ fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_tex
             .numeric => {
                 const numeric = @import("numeric_value.zig");
                 var context: numeric.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = byte_limit };
-                defer work.remaining = context.remaining;
+                // Numeric work only decreases the initial usize budget. The
+                // context uses u64 on every target, including wasm32.
+                defer work.remaining = @intCast(context.remaining);
                 try numeric.write(&context, cell.numeric.?.*, writer);
             },
         }

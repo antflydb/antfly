@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const platform_atomic = @import("antfly_platform").atomic;
 const analysis_mod = @import("analysis.zig");
 const index_mod = @import("../index.zig");
 const scorer_mod = @import("scorer.zig");
@@ -3714,8 +3715,8 @@ const StreamingBoolPreparedCache = struct {
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     clock: u64 = 0,
-    preparations: std.atomic.Value(u64) = .init(0),
-    reuses: std.atomic.Value(u64) = .init(0),
+    preparations: platform_atomic.Value(u64) = .init(0),
+    reuses: platform_atomic.Value(u64) = .init(0),
     fn deinit(self: *@This()) void {
         for (&self.slots) |*slot| {
             std.debug.assert(slot.users == 0 and !slot.building);
@@ -3783,8 +3784,8 @@ const StreamingBoolPlanning = struct {
     cache: *StreamingBoolPreparedCache,
     plans: []index_mod.IndexSnapshot.TextSegmentPlan,
     next: std.atomic.Value(usize) = .init(0),
-    loads: std.atomic.Value(u64) = .init(0),
-    hits: std.atomic.Value(u64) = .init(0),
+    loads: platform_atomic.Value(u64) = .init(0),
+    hits: platform_atomic.Value(u64) = .init(0),
     fn run(self: *@This()) anyerror!void {
         var budget: StreamingBoolPrepared.Budget = .{ .backing = std.heap.page_allocator, .limit = self.cache.entry_bytes };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
@@ -4042,7 +4043,7 @@ const StreamingBoolParallel = struct {
     exclude: ?Adapter = null,
     mutex: std.Io.Mutex = .init,
     cutoff_valid: std.atomic.Value(bool) = .init(false),
-    cutoff: std.atomic.Value(u64) = .init(0),
+    cutoff: platform_atomic.Value(u64) = .init(0),
     fn lock(self: *@This()) !void {
         try self.mutex.lock(self.io);
     }

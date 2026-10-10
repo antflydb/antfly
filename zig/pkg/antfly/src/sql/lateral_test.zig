@@ -25,7 +25,7 @@ const Backend = struct {
     fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedBackendCall;
     }
-    fn mutate(_: *anyopaque, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: A, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.UnexpectedBackendCall;
     }
     fn checkpoint(_: *anyopaque) !void {}

@@ -48,7 +48,7 @@ pub fn admitText(a: std.mem.Allocator, text: []const u8, budget: *Budget) !void 
 }
 
 pub const Budget = struct {
-    remaining: usize = 1_048_576,
+    remaining: usize = @import("resource_limits.zig").default_memory_bytes,
     /// Optional shared row/program work and cancellation identity. Local JSON
     /// admission remains independently bounded, without restarting its owner.
     shared: ?*@import("numeric_value.zig").Context = null,
