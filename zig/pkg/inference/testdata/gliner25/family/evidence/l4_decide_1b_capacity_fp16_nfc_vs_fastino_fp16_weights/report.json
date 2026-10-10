@@ -1,0 +1,415 @@
+{
+  "model": {
+    "model_id": "fastino/GLiNER2.5-Decide-1B",
+    "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+    "files": {
+      "config.json": {
+        "size_bytes": 464,
+        "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 2160,
+        "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d"
+      },
+      "model.safetensors": {
+        "size_bytes": 4755208228,
+        "sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3"
+      },
+      "tokenizer.json": {
+        "size_bytes": 3585055,
+        "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 559,
+        "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3"
+      }
+    },
+    "architecture": "span",
+    "tasks": [
+      "classification",
+      "typed_decisions"
+    ]
+  },
+  "qualification": false,
+  "scope": "loaded_classification_fixtures",
+  "native_binary_sha256": "b0633cb3a7d38e99dfd4065562f7ca417c2702cf9124228f047793de18181994",
+  "cases_sha256": "54858eb7c50693d6a8b78609e66dca19bb499bdb5578901303d2967e0af78c76",
+  "oracle_sha256": "4ff5e60e47745f7e3328a25cceb2e0801843bae5e773982d3feb65177cba9dfb",
+  "precision": "fp16",
+  "attention_only": false,
+  "reference_dtype": "fp16",
+  "reference_weight_dtype": "fp16",
+  "attention": "sdpa",
+  "pairs": 30,
+  "tail_samples": 200,
+  "warmup": 5,
+  "cells": [
+    {
+      "id": "tokens_128_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 0.0,
+      "native_ns": {
+        "min": 11977539.0,
+        "median": 12067618.0,
+        "mean": 12070002.95,
+        "p95": 12159168.9,
+        "max": 12349244.0,
+        "cv": 0.00421445569810919
+      },
+      "python_ns": {
+        "min": 27494658.0,
+        "median": 29187825.0,
+        "mean": 29377380.19,
+        "p95": 30767666.9,
+        "max": 37593002.0,
+        "cv": 0.039706660042710104
+      },
+      "native_over_python": {
+        "lower_95": 0.40658677947305283,
+        "median": 0.4140841860905904,
+        "upper_95": 0.4169951364360081,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_128_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.00017827749252319336,
+      "native_ns": {
+        "min": 52403630.0,
+        "median": 55272661.5,
+        "mean": 55232825.215,
+        "p95": 56513415.45,
+        "max": 57446116.0,
+        "cv": 0.015617356937860538
+      },
+      "python_ns": {
+        "min": 56840350.0,
+        "median": 60580769.5,
+        "mean": 60560475.605,
+        "p95": 62618489.0,
+        "max": 63464276.0,
+        "cv": 0.021111167544939448
+      },
+      "native_over_python": {
+        "lower_95": 0.9098289688630606,
+        "median": 0.9143203029901326,
+        "upper_95": 0.9181220952659209,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_512_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 9.5367431640625e-07,
+      "native_ns": {
+        "min": 29958837.0,
+        "median": 31519345.0,
+        "mean": 31597438.27,
+        "p95": 33047559.8,
+        "max": 34117417.0,
+        "cv": 0.027116738581975483
+      },
+      "python_ns": {
+        "min": 31769067.0,
+        "median": 34427810.0,
+        "mean": 34363728.555,
+        "p95": 36125215.05,
+        "max": 36803583.0,
+        "cv": 0.0335455141558088
+      },
+      "native_over_python": {
+        "lower_95": 0.896970720993644,
+        "median": 0.9173248830288601,
+        "upper_95": 0.9323307863926044,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_512_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.000202178955078125,
+      "native_ns": {
+        "min": 265206795.0,
+        "median": 271907135.5,
+        "mean": 271893921.01,
+        "p95": 275161101.45,
+        "max": 276987936.0,
+        "cv": 0.008203561468464772
+      },
+      "python_ns": {
+        "min": 278333073.0,
+        "median": 282054067.0,
+        "mean": 282164169.77,
+        "p95": 285124286.55,
+        "max": 287777142.0,
+        "cv": 0.006159910794050664
+      },
+      "native_over_python": {
+        "lower_95": 0.9598743039769999,
+        "median": 0.9618268143102962,
+        "upper_95": 0.9639623700739923,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_2048_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 3.5762786865234375e-07,
+      "native_ns": {
+        "min": 142794303.0,
+        "median": 146748712.0,
+        "mean": 146774157.545,
+        "p95": 149443939.35,
+        "max": 150716660.0,
+        "cv": 0.010882487568385151
+      },
+      "python_ns": {
+        "min": 142960809.0,
+        "median": 146103135.0,
+        "mean": 146125801.995,
+        "p95": 148417520.05,
+        "max": 150454053.0,
+        "cv": 0.009878394584551019
+      },
+      "native_over_python": {
+        "lower_95": 1.0005437868954352,
+        "median": 1.0040947863084186,
+        "upper_95": 1.009375822055634,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_2048_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.0008289813995361328,
+      "native_ns": {
+        "min": 1515587111.0,
+        "median": 1532079067.0,
+        "mean": 1531981669.07,
+        "p95": 1539637277.8500001,
+        "max": 1543754260.0,
+        "cv": 0.003105718453638322
+      },
+      "python_ns": {
+        "min": 1430271077.0,
+        "median": 1438168369.0,
+        "mean": 1438231890.915,
+        "p95": 1443399087.5500002,
+        "max": 1451380004.0,
+        "cv": 0.002389742649810629
+      },
+      "native_over_python": {
+        "lower_95": 1.0642108148051526,
+        "median": 1.0655986286701153,
+        "upper_95": 1.0664132092653669,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_128_batch_32",
+      "batch_size": 32,
+      "max_confidence_error": 0.0004749894142150879,
+      "native_ns": {
+        "min": 254625694.0,
+        "median": 265359492.0,
+        "mean": 265133339.96,
+        "p95": 271348018.25,
+        "max": 275534461.0,
+        "cv": 0.015819715934194723
+      },
+      "python_ns": {
+        "min": 279727175.0,
+        "median": 283809227.5,
+        "mean": 284906586.325,
+        "p95": 289254544.65,
+        "max": 449415178.0,
+        "cv": 0.04240588238578067
+      },
+      "native_over_python": {
+        "lower_95": 0.9243838522476361,
+        "median": 0.9286434918534325,
+        "upper_95": 0.9326335861465894,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_128_batch_64",
+      "batch_size": 64,
+      "max_confidence_error": 0.0007613301277160645,
+      "native_ns": {
+        "min": 647585056.0,
+        "median": 653129880.0,
+        "mean": 654180316.295,
+        "p95": 662473595.8,
+        "max": 664686749.0,
+        "cv": 0.0059346457113791835
+      },
+      "python_ns": {
+        "min": 621187478.0,
+        "median": 630102412.0,
+        "mean": 631785729.21,
+        "p95": 635783753.9499999,
+        "max": 791005758.0,
+        "cv": 0.024720380837172953
+      },
+      "native_over_python": {
+        "lower_95": 1.0344065962581277,
+        "median": 1.035500829118946,
+        "upper_95": 1.037275162574499,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_4096_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 6.80685043334961e-05,
+      "native_ns": {
+        "min": 368400747.0,
+        "median": 371178818.5,
+        "mean": 371291614.995,
+        "p95": 372868721.55,
+        "max": 373359830.0,
+        "cv": 0.002544177739168518
+      },
+      "python_ns": {
+        "min": 376712061.0,
+        "median": 382034166.0,
+        "mean": 381809574.8,
+        "p95": 385518185.0,
+        "max": 388505315.0,
+        "cv": 0.006719657791101378
+      },
+      "native_over_python": {
+        "lower_95": 0.9674746119594207,
+        "median": 0.9725392337286681,
+        "upper_95": 0.9761384479562653,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_7999_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 2.3543834686279297e-05,
+      "native_ns": {
+        "min": 1064411721.0,
+        "median": 1073465772.5,
+        "mean": 1073951116.245,
+        "p95": 1081180761.5,
+        "max": 1084030905.0,
+        "cv": 0.004125212424491426
+      },
+      "python_ns": {
+        "min": 1129816369.0,
+        "median": 1142149832.5,
+        "mean": 1142092583.59,
+        "p95": 1148092628.3999999,
+        "max": 1149872466.0,
+        "cv": 0.0034274484174626405
+      },
+      "native_over_python": {
+        "lower_95": 0.9384518019003276,
+        "median": 0.9403043720217723,
+        "upper_95": 0.9435274445284797,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    }
+  ],
+  "python": {
+    "event": "ready",
+    "arm": "fastino_cuda",
+    "model_id": "fastino/GLiNER2.5-Decide-1B",
+    "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+    "model_files": {
+      "config.json": {
+        "size_bytes": 464,
+        "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 2160,
+        "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d"
+      },
+      "model.safetensors": {
+        "size_bytes": 4755208228,
+        "sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3"
+      },
+      "tokenizer.json": {
+        "size_bytes": 3585055,
+        "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 559,
+        "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3"
+      }
+    },
+    "packages": {
+      "gliner2": "2.0.0",
+      "torch": "2.14.0",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2",
+      "safetensors": "0.8.0"
+    },
+    "dtype": "fp16",
+    "weight_dtype": "fp16",
+    "attention": "sdpa",
+    "device": "NVIDIA L4",
+    "cuda": "13.0",
+    "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+    "timing_boundary": "public_batch_api_loaded_model",
+    "qualification": false
+  },
+  "native": {
+    "event": "ready",
+    "backend": "cuda",
+    "precision": "fp16",
+    "build_mode": "fast",
+    "max_position_embeddings": 7999,
+    "timing_boundary": "public_batch_api_loaded_model",
+    "qualification": false
+  },
+  "aggregate_speedup": {
+    "geomean": 1.122703176854652,
+    "lower_95": 1.120432985007486,
+    "upper_95": 1.126178844086357,
+    "estimator": "equal_weight_cells_median_paired_log_speedup"
+  },
+  "measured_cells_passed": true,
+  "peak_worker_rss_bytes": 10115858432,
+  "status": "complete",
+  "raw_capture": {
+    "path": "raw.jsonl.gz",
+    "encoding": "gzip",
+    "uncompressed_sha256": "a931962049476f9efe773c63be652c690f1d4d7420bfdba7f02868d7e7b153a5",
+    "uncompressed_size_bytes": 1016696
+  }
+}

@@ -23,9 +23,10 @@ const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
-// Raster embedding requests now enforce asset pins and output dimensions.
-// Older hosts ignore these fields, so mixed runtime versions must fail closed.
-pub const abi_version: u32 = 28;
+// The merged ABI includes both CUDA preload precision and raster embedding
+// asset pins/output dimensions. Each parent independently used version 28
+// for a different layout, so neither can interoperate with this runtime.
+pub const abi_version: u32 = 29;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -69,6 +70,7 @@ pub const A4bResidencyMode = enum(u8) {
 };
 
 pub const WarmModel = extern struct {
+    cuda_precision: OptionalString = .{},
     kind: String,
     name: String,
     backend: OptionalString = .{},

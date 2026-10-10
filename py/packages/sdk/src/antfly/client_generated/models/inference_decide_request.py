@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.choice_decision_question import ChoiceDecisionQuestion
     from ..models.decision_input import DecisionInput
     from ..models.embedding_decision_options import EmbeddingDecisionOptions
+    from ..models.inference_decide_long_document import InferenceDecideLongDocument
     from ..models.multi_choice_decision_question import MultiChoiceDecisionQuestion
     from ..models.predicate_decision_question import PredicateDecisionQuestion
     from ..models.score_decision_question import ScoreDecisionQuestion
@@ -32,6 +33,8 @@ class InferenceDecideRequest:
             model_identity (str | Unset): Pin the exact EmbeddingGemma 2 assets and embedding recipe.
             input_ (str | Unset):
             inputs (list[DecisionInput] | Unset):
+            long_document (InferenceDecideLongDocument | Unset): Explicit windowing for qualified boundary decision models.
+                Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
             embedding_options (EmbeddingDecisionOptions | Unset): Request-wide embedding geometry defaults. Acceptance
                 thresholds and calibration belong to individual questions.
     """
@@ -43,6 +46,7 @@ class InferenceDecideRequest:
     model_identity: str | Unset = UNSET
     input_: str | Unset = UNSET
     inputs: list[DecisionInput] | Unset = UNSET
+    long_document: InferenceDecideLongDocument | Unset = UNSET
     embedding_options: EmbeddingDecisionOptions | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +81,10 @@ class InferenceDecideRequest:
                 inputs_item = inputs_item_data.to_dict()
                 inputs.append(inputs_item)
 
+        long_document: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.long_document, Unset):
+            long_document = self.long_document.to_dict()
+
         embedding_options: dict[str, Any] | Unset = UNSET
         if not isinstance(self.embedding_options, Unset):
             embedding_options = self.embedding_options.to_dict()
@@ -95,6 +103,8 @@ class InferenceDecideRequest:
             field_dict["input"] = input_
         if inputs is not UNSET:
             field_dict["inputs"] = inputs
+        if long_document is not UNSET:
+            field_dict["long_document"] = long_document
         if embedding_options is not UNSET:
             field_dict["embedding_options"] = embedding_options
 
@@ -105,6 +115,7 @@ class InferenceDecideRequest:
         from ..models.choice_decision_question import ChoiceDecisionQuestion
         from ..models.decision_input import DecisionInput
         from ..models.embedding_decision_options import EmbeddingDecisionOptions
+        from ..models.inference_decide_long_document import InferenceDecideLongDocument
         from ..models.multi_choice_decision_question import MultiChoiceDecisionQuestion
         from ..models.predicate_decision_question import PredicateDecisionQuestion
         from ..models.score_decision_question import ScoreDecisionQuestion
@@ -168,6 +179,13 @@ class InferenceDecideRequest:
 
                 inputs.append(inputs_item)
 
+        _long_document = d.pop("long_document", UNSET)
+        long_document: InferenceDecideLongDocument | Unset
+        if isinstance(_long_document, Unset):
+            long_document = UNSET
+        else:
+            long_document = InferenceDecideLongDocument.from_dict(_long_document)
+
         _embedding_options = d.pop("embedding_options", UNSET)
         embedding_options: EmbeddingDecisionOptions | Unset
         if isinstance(_embedding_options, Unset):
@@ -181,6 +199,7 @@ class InferenceDecideRequest:
             model_identity=model_identity,
             input_=input_,
             inputs=inputs,
+            long_document=long_document,
             embedding_options=embedding_options,
         )
 

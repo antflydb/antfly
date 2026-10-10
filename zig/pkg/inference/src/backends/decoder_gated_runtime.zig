@@ -1576,6 +1576,36 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     capture_pre_norm_hidden: bool,
     phase: contracts.DecoderRuntimeDecodePhase,
 ) !?BackendOwnedGreedyTokenResult {
+    return tryBackendOwnedTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        capture_final_hidden,
+        capture_pre_norm_hidden,
+        phase,
+        .greedy_argmax,
+        null,
+    );
+}
+
+fn tryBackendOwnedTokenResultPhaseHidden(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    capture_final_hidden: bool,
+    capture_pre_norm_hidden: bool,
+    phase: contracts.DecoderRuntimeDecodePhase,
+    mode: contracts.DecoderRuntimeDecodeMode,
+    sampling: ?contracts.DecoderRuntimeSamplingRequest,
+) !?BackendOwnedGreedyTokenResult {
     const trace = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
     if (gatedFamilyCompareRequested()) {
         if (trace) std.debug.print("decoder-runtime-admission: miss reason=compare\n", .{});
@@ -1665,7 +1695,8 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
             .gemma4_a4b_shared_kv
         else
             .gemma4_gated_ple_shared_kv,
-        .mode = .greedy_argmax,
+        .mode = mode,
+        .sampling = sampling,
         .phase = phase,
         .configured_layer_count = configured_layer_count,
         .layer_count = layer_count,
@@ -1802,6 +1833,162 @@ fn tryBackendOwnedSampledToken(
         sampling,
         token_history,
     );
+}
+
+fn residentSampleRequest(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) ops.DecoderRuntimeSampleResidentLogitsRequest {
+    return .{
+        .linear_slot = finalLmHeadSlot(configured_layer_count),
+        .hidden_size = gpt_config.hidden_size,
+        .out_dim = gpt_config.vocab_size,
+        .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
+        .temperature = sampling.temperature,
+        .top_k = if (sampling.top_k > 0) @intCast(sampling.top_k) else 0,
+        .top_p = sampling.top_p,
+        .min_p = sampling.min_p,
+        .repetition_penalty = sampling.repetition_penalty,
+        .frequency_penalty = sampling.frequency_penalty,
+        .presence_penalty = sampling.presence_penalty,
+        .token_history = token_history,
+    };
+}
+
+const ResidentSampledFramePolicy = struct {
+    active_frame_enabled: bool,
+    direct_family_enabled: bool,
+    direct_model_decode_enabled: bool,
+    active_paged_block_enabled: bool,
+    compare_disabled: bool,
+    reference_decode_disabled: bool,
+};
+
+fn residentSampledFramePolicyAllows(policy: ResidentSampledFramePolicy) bool {
+    return policy.active_frame_enabled and
+        policy.direct_family_enabled and
+        policy.direct_model_decode_enabled and
+        policy.active_paged_block_enabled and
+        policy.compare_disabled and
+        policy.reference_decode_disabled;
+}
+
+fn residentSampledFramePolicySupported(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+) bool {
+    if (!residentSampledFramePolicyAllows(.{
+        .active_frame_enabled = !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_DECODE_FRAME"),
+        .direct_family_enabled = !disableDirectGatedFamilyRequested(),
+        .direct_model_decode_enabled = !gpt_config.hasPle() or !disableGemma4DirectDecodeRequested(),
+        .active_paged_block_enabled = !disableActivePagedGatedBlockForDecodeRequested(),
+        .compare_disabled = !gatedFamilyCompareRequested(),
+        .reference_decode_disabled = !referenceGatedFamilyDecodeRequested(),
+    })) return false;
+    if (preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers)) != gpt_config.num_hidden_layers) return false;
+    if (!gpt_config.hasPle() and !gpt_config.usesMoe()) return false;
+    return gpt_config.num_hidden_layers <= 256;
+}
+
+fn residentSampledNucleusContractSupported(sampling: model_runtime.SamplingConfig) bool {
+    return sampling.temperature > 0.0 and
+        sampling.top_k <= 0 and
+        sampling.top_p > 0.0 and
+        sampling.top_p < 1.0 and
+        sampling.min_p <= 0.0 and
+        sampling.repetition_penalty == 1.0 and
+        sampling.frequency_penalty == 0.0 and
+        sampling.presence_penalty == 0.0;
+}
+
+/// True only when the existing fused decode frame and resident-logits sampler
+/// can honor the complete request. This is intentionally side-effect free
+/// with respect to model/KV state and must be called before frame submission.
+pub fn residentSampledTokenSupported(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) bool {
+    if (!residentSampledTokenStaticSupported(gpt_config, configured_layer_count, sampling)) return false;
+    const request = residentSampleRequest(
+        gpt_config,
+        configured_layer_count,
+        sampling,
+        token_history,
+    );
+    return cb.decoderRuntimeResidentLogitsSamplingSupported(&request);
+}
+
+fn residentSampledTokenStaticSupported(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    sampling: model_runtime.SamplingConfig,
+) bool {
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
+    if (!residentSampledFramePolicySupported(gpt_config, configured_layer_count)) return false;
+    if (!sampledBackendSupportsTokenConstraints(gpt_config)) return false;
+    if (!residentSampledNucleusContractSupported(sampling)) return false;
+    return true;
+}
+
+/// Static continuation check for an already-armed sampled pipeline. Unlike
+/// residentSampledTokenSupported, this never asks the backend to reserve or
+/// rebind storage while a submitted frame may still be executing.
+pub fn residentSampledTokenPipelineContinuationSupported(
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    sampling: model_runtime.SamplingConfig,
+) bool {
+    return residentSampledTokenStaticSupported(gpt_config, configured_layer_count, sampling);
+}
+
+/// Run exactly one fused model frame and sample the logits left by that
+/// frame's LM-head tail. Null is returned only for a preflight rejection.
+/// Once the frame has run, a missing sample is a committed error and must not
+/// be recovered by replaying the model forward at the same KV position.
+pub fn forwardResidentSampledToken(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) !?i64 {
+    if (decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode) return null;
+    if (!residentSampledTokenSupported(cb, gpt_config, configured_layer_count, sampling, token_history)) return null;
+
+    const result = (try tryBackendOwnedTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .full,
+        .sampled_nucleus,
+        .{
+            .temperature = sampling.temperature,
+            .top_k = if (sampling.top_k > 0) @intCast(sampling.top_k) else 0,
+            .top_p = sampling.top_p,
+            .min_p = sampling.min_p,
+            .repetition_penalty = sampling.repetition_penalty,
+            .frequency_penalty = sampling.frequency_penalty,
+            .presence_penalty = sampling.presence_penalty,
+            .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
+            .token_history = token_history,
+        },
+    )) orelse return error.ResidentSamplingFrameFailed;
+    return result.token_id;
 }
 
 fn tryBackendOwnedGreedyToken(
@@ -5759,6 +5946,92 @@ pub fn forwardGreedyTokenPipelinedStep(
     return result.token_id;
 }
 
+pub fn forwardSampledTokenPipelinedArm(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) !bool {
+    // The graph runtime performs the complete backend capability check and
+    // fixed-capacity scratch reservation before entering this function. Keep
+    // arm itself static so it cannot introduce a second reservation boundary.
+    if (!residentSampledTokenStaticSupported(gpt_config, configured_layer_count, sampling)) return false;
+    if (decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode) return false;
+    const result = try tryBackendOwnedTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        token_id,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .submit_only,
+        .sampled_nucleus,
+        .{
+            .temperature = sampling.temperature,
+            .top_k = if (sampling.top_k > 0) @intCast(sampling.top_k) else 0,
+            .top_p = sampling.top_p,
+            .min_p = sampling.min_p,
+            .repetition_penalty = sampling.repetition_penalty,
+            .frequency_penalty = sampling.frequency_penalty,
+            .presence_penalty = sampling.presence_penalty,
+            .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
+            .token_history = token_history,
+        },
+    );
+    return result != null;
+}
+
+pub fn forwardSampledTokenPipelinedStep(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+    sampling: model_runtime.SamplingConfig,
+    token_history: []const i64,
+) !?i64 {
+    // Arm already performed the backend capability check and full-capacity
+    // reservation. Keep step admission static so it cannot resize shared
+    // sampler buffers while the submitted frame is executing.
+    if (!residentSampledTokenStaticSupported(gpt_config, configured_layer_count, sampling)) return null;
+    if (decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode) return null;
+    const result = (try tryBackendOwnedTokenResultPhaseHidden(
+        cb,
+        allocator,
+        gpt_config,
+        configured_layer_count,
+        -1,
+        seq_len,
+        decode_context,
+        false,
+        false,
+        .step,
+        .sampled_nucleus,
+        .{
+            .temperature = sampling.temperature,
+            .top_k = if (sampling.top_k > 0) @intCast(sampling.top_k) else 0,
+            .top_p = sampling.top_p,
+            .min_p = sampling.min_p,
+            .repetition_penalty = sampling.repetition_penalty,
+            .frequency_penalty = sampling.frequency_penalty,
+            .presence_penalty = sampling.presence_penalty,
+            .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
+            .token_history = token_history,
+        },
+    )) orelse return null;
+    if (result.token_id < 0) return error.InvalidModelOutput;
+    return result.token_id;
+}
+
 pub fn decoderRuntimePipelinedControl(
     cb: *const ops.ComputeBackend,
     phase: contracts.DecoderRuntimeDecodePhase,
@@ -6881,6 +7154,67 @@ test "sampled gated runtime defers configs with suppressed tokens" {
     config.suppress_token_ids[0] = 42;
     config.suppress_token_ids_len = 1;
     try std.testing.expect(!sampledBackendSupportsTokenConstraints(config));
+}
+
+test "resident sampled decode rejects disabled frame and direct policies before submission" {
+    const enabled = ResidentSampledFramePolicy{
+        .active_frame_enabled = true,
+        .direct_family_enabled = true,
+        .direct_model_decode_enabled = true,
+        .active_paged_block_enabled = true,
+        .compare_disabled = true,
+        .reference_decode_disabled = true,
+    };
+    try std.testing.expect(residentSampledFramePolicyAllows(enabled));
+
+    var disabled = enabled;
+    disabled.active_frame_enabled = false;
+    try std.testing.expect(!residentSampledFramePolicyAllows(disabled));
+
+    disabled = enabled;
+    disabled.direct_family_enabled = false;
+    try std.testing.expect(!residentSampledFramePolicyAllows(disabled));
+
+    disabled = enabled;
+    disabled.direct_model_decode_enabled = false;
+    try std.testing.expect(!residentSampledFramePolicyAllows(disabled));
+}
+
+test "resident sampled decode rejects sampling outside exact nucleus contract before submission" {
+    const matched = model_runtime.SamplingConfig{
+        .temperature = 0.8,
+        .top_k = 0,
+        .top_p = 0.95,
+        .min_p = 0.0,
+        .repetition_penalty = 1.0,
+        .frequency_penalty = 0.0,
+        .presence_penalty = 0.0,
+    };
+    try std.testing.expect(residentSampledNucleusContractSupported(matched));
+
+    var unsupported = matched;
+    unsupported.top_k = 64;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
+
+    unsupported = matched;
+    unsupported.top_p = 1.0;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
+
+    unsupported = matched;
+    unsupported.min_p = 0.05;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
+
+    unsupported = matched;
+    unsupported.repetition_penalty = 1.1;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
+
+    unsupported = matched;
+    unsupported.frequency_penalty = 0.2;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
+
+    unsupported = matched;
+    unsupported.presence_penalty = 0.2;
+    try std.testing.expect(!residentSampledNucleusContractSupported(unsupported));
 }
 
 test "Gemma4 MTP verify-tail frame defaults off" {
