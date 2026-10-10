@@ -2507,8 +2507,10 @@ rejection rollback. Legacy `SharedLease` callers and nesting are unchanged.
 Two focused fixtures cover same-thread distinct operations at C1/H1, cross-worker
 physical release, genuine legacy nesting after that release, root/byte ownership
 through caller retirement, and the original deadline across CPU parking while
-a reader and the writer gate remain held. The gate also retains existing barrier
-regressions. These checks qualify the primitive only, not production adoption.
+a reader and the writer gate remain held. The two fixtures also exercise legacy
+nesting and capture exclusion; runtime-library tests are not independently
+discovered through this consumer root and are not counted. These checks qualify
+the primitive only, not production adoption.
 
 The migration must next propagate explicit enclosing root scope through
 `BatchExecutionContext`, `BatchExecutionOptions`, synchronous mutation/recovery

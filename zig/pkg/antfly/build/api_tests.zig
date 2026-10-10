@@ -2580,7 +2580,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const mutation_root_lease_tests = b.addTest(.{
         .name = "mutation-root-lease-tests",
         .root_module = mutation_root_lease_root,
-        .filters = &.{ "mutation root lease", "storage.hot_standby mutation barrier" },
+        .filters = &.{"mutation root lease"},
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-mutation-root-lease-test", "Verify independent mutation root leases preserve original C1 ownership and writer priority")
