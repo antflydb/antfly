@@ -1844,6 +1844,98 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
     };
 }
 
+test "SQL numeric selectors coerce arguments to their common domain" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, json: []const u8 }{
+        .{ .sql = "SELECT to_jsonb(coalesce(NULL::real,1.123456789::numeric))", .json = "1.1234568" },
+        .{ .sql = "SELECT to_jsonb(coalesce(1.123456789::numeric,NULL::real))", .json = "1.1234568" },
+        .{ .sql = "SELECT to_jsonb(greatest(1.1::real,1.1::numeric))", .json = "1.1" },
+        .{ .sql = "SELECT to_jsonb(least(1.1::numeric,1.1::real))", .json = "1.1" },
+        .{ .sql = "SELECT to_jsonb(greatest(NULL::real,1.123456789::numeric))", .json = "1.1234568" },
+        .{ .sql = "SELECT to_jsonb(least(NULL::double precision,1.123456789::numeric))", .json = "1.123456789" },
+        .{ .sql = "SELECT to_jsonb(coalesce(NULL::numeric,9007199254740993::bigint))", .json = "9007199254740993" },
+        .{ .sql = "SELECT to_jsonb(greatest('NaN'::real,1::numeric))", .json = "\"NaN\"" },
+        .{ .sql = "SELECT to_jsonb(least('NaN'::numeric,1::real))", .json = "1" },
+        .{ .sql = "SELECT to_jsonb(greatest('-Infinity'::real,'Infinity'::numeric))", .json = "\"Infinity\"" },
+        .{ .sql = "SELECT to_jsonb(least('-Infinity'::numeric,'Infinity'::real))", .json = "\"-Infinity\"" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const actual = try std.json.Stringify.valueAlloc(a, result.output.rows[0][0], .{});
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(case.json, actual);
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var backend = fixture.iface();
+    backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }};
+    var compiled = try compiler.compile(a, "SELECT coalesce(NULL::real,$1),greatest(1::real,$1),least(2::real,$1)", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{.{ .string = "1.123456789" }}, .{});
+    defer result.deinit();
+    for (result.output.columns, result.output.rows[0]) |column, cell| {
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float32), column.element_type);
+        try std.testing.expectEqual(@as(f64, @as(f32, 1.123456789)), cell.float);
+    }
+}
+
+test "SQL floating numeric conversions respect lazy branch demand" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT CASE WHEN true THEN 1::real ELSE 1e1000 END",
+        "SELECT CASE WHEN false THEN 1e1000 ELSE 1::real END",
+        "SELECT CASE WHEN true THEN 1::double precision ELSE 1e1000 END",
+        "SELECT CASE WHEN true THEN 1::real ELSE (1e1000::numeric)::real END",
+        "SELECT COALESCE(1::real,1e1000)",
+        "SELECT COALESCE(1::double precision,1e1000)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(f64, 1), result.output.rows[0][0].float);
+    }
+    for ([_][]const u8{
+        "SELECT CASE WHEN false THEN 1::real ELSE 1e1000 END",
+        "SELECT CASE WHEN true THEN 1e1000 ELSE 1::double precision END",
+        "SELECT COALESCE(NULL::real,1e1000)",
+        "SELECT GREATEST(1::real,1e1000)",
+        "SELECT LEAST(1::double precision,1e1000)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var backend = fixture.iface();
+    backend.parameter_descriptor_hints = &.{.{ .kind = .integer, .element_type = .int32 }};
+    var compiled = try compiler.compile(a, "SELECT COALESCE(1::real,1e1000),$1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{.{ .integer = 0 }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(f64, 1), result.output.rows[0][0].float);
+}
+
+test "SQL numeric selectors unwind lazy conversion allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fixture: TestBackend = .{ .row_count = 0 };
+            var backend = fixture.iface();
+            backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }};
+            var result = try execute(a, backend, compiled, &.{.{ .string = "1.123456789" }}, .{});
+            defer result.deinit();
+            for (result.output.rows[0]) |cell| try std.testing.expectEqual(@as(f64, @as(f32, 1.123456789)), cell.float);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT coalesce($1,1::real,1e1000),greatest($1,1::real),least($1,2::real),CASE WHEN true THEN coalesce($1,1::real) ELSE 1e1000 END", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
+}
+
 test "SQL mixed numeric comparisons preserve prepared ANY ALL probe domains" {
     const a = std.testing.allocator;
     const Case = struct { sql: []const u8, parameter: Json, expected: []const Json };

@@ -2535,11 +2535,18 @@ const Binder = struct {
             var work: arrays.Budget = .{};
             const value = try numericTextLeaky(self.alloc, expression.literal.numeric, &work);
             var evaluator: Evaluator = .{ .program = undefined, .alloc = self.alloc, .cells = &.{}, .parameters = &.{}, .limits = .{} };
-            const converted = try evaluator.castDatumBuiltin(value, .numeric, array_element.?);
-            instruction.type = .{ .kind = .number, .element_type = array_element, .nullable = false };
-            instruction.operation = .{ .literal = converted.value };
-            try self.instructions.append(self.alloc, instruction);
-            return @intCast(self.instructions.items.len - 1);
+            const converted: ?Datum = evaluator.castDatumBuiltin(value, .numeric, array_element.?) catch |err| blk: {
+                // A typed conversion failure belongs to execution demand,
+                // not an unused CASE/COALESCE arm. Keep its runtime cast.
+                if (std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) break :blk null;
+                return err;
+            };
+            if (converted) |datum| {
+                instruction.type = .{ .kind = .number, .element_type = array_element, .nullable = false };
+                instruction.operation = .{ .literal = datum.value };
+                try self.instructions.append(self.alloc, instruction);
+                return @intCast(self.instructions.items.len - 1);
+            }
         }
         instruction.operation = switch (expression.*) {
             .literal => |value| if (value == .parameter) blk: {
@@ -2678,6 +2685,18 @@ const Binder = struct {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
                         out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
+                if (numeric(kind.kind) and (function == .coalesce or function == .greatest or function == .least)) {
+                    // Common-type selectors coerce every argument in both
+                    // ordinary and prepared queries. The cast remains inside
+                    // COALESCE's demand boundary, preserving short-circuiting.
+                    const target = try parameterElementType(kind);
+                    for (call.args, args) |arg, *out| {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = kind.kind.?, .element_type = target, .coercion = .function } };
+                        out.* = try self.compileArrayContext(coercion, kind.kind, target, depth + 1);
                     }
                     break :blk .{ .call = .{ .function = function, .args = args } };
                 }
@@ -3582,7 +3601,15 @@ const Evaluator = struct {
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            if (best.sql_null or (try self.compareValues(datum, best)) == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
+                            if (best.sql_null) {
+                                best = datum;
+                                continue;
+                            }
+                            const order = if (datum.value == .float and best.value == .float) floating: {
+                                var work = self.workBudget();
+                                break :floating try arrays.compareElement(.float64, datum, best, &work);
+                            } else try self.compareValues(datum, best);
+                            if (order == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
                         }
                         break :blk best;
                     },
