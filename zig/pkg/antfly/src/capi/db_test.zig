@@ -1597,8 +1597,9 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT ON CONSTRAINT pk DO NOTHING RETURNING id", .count = 0 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL),('also_skipped',1,NULL) ON CONFLICT DO NOTHING RETURNING id", .count = 0 },
-        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT (id) DO UPDATE SET id=3 RETURNING id", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET id=3 RETURNING id", .count = 1 },
     }) |case| {
         var compiled = try sql.compiler.compile(alloc, case.statement, .{});
         defer compiled.deinit();
@@ -1628,7 +1629,7 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "rows" }, .read_write);
     const row = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":4,\"parent\":null}", .{});
     var mutation: antfly.capi_dependencies.sql_catalog.Mutation = .{ .key = "racer", .row = row, .expected_version = 0 };
-    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{}, &.{}, &.{mutation});
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, .{ .constraint_name = "pk" }, &.{mutation});
     try std.testing.expect(owners[0].key == null);
     mutation.conflict_guard = owners[0].guard;
     var winner = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('winner',4,NULL)", .{});
@@ -1637,6 +1638,52 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     defer won.deinit();
     try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
     try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
+}
+
+test "capi SQL named composite conflicts select one immediate generation and survive reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-composite");
+    defer directory.cleanup();
+    const sql = @import("antfly_local_sources").capi_sql;
+    for (0..2) |phase| {
+        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 701, .shard_id = 702 } });
+        defer database.close();
+        if (phase == 0) try database.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"Selected Pair","columns":["tenant","id"]},{"name":"equivalent_deferred","columns":["id","tenant"],"deferrable":true},{"name":"n_key","columns":["n"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"tenant":{"type":"integer"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+        if (phase == 0) {
+            var seed = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('original',7,1,10),('other',8,2,20)", .{});
+            defer seed.deinit();
+            var seeded = try sql.runtime.execute(alloc, adapter.backend(), &seed, &.{}, .{});
+            defer seeded.deinit();
+        }
+        const statement = if (phase == 0)
+            "INSERT INTO rows(_id,tenant,id,n) VALUES('proposed',7,1,20) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO UPDATE SET n=rows.n+excluded.n RETURNING _id,tenant,id,n"
+        else
+            "INSERT INTO rows(_id,tenant,id,n) VALUES('proposed',7,1,5) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO UPDATE SET n=rows.n+excluded.n RETURNING _id,tenant,id,n";
+        var compiled = try sql.compiler.compile(alloc, statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+        try std.testing.expectEqualStrings("original", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
+        try std.testing.expectEqualStrings(if (phase == 0) "30" else "35", result.output.rows[0][3].string);
+        try std.testing.expect(try database.lookup(alloc, "proposed", .{}) == null);
+        var original = (try database.lookup(alloc, "original", .{})).?;
+        defer original.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, original.json, if (phase == 0) "\"n\":30" else "\"n\":35") != null);
+        var rejected = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('invalid',9,3,20) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO NOTHING", .{});
+        defer rejected.deinit();
+        try std.testing.expectError(error.UniqueConstraintViolation, sql.runtime.execute(alloc, adapter.backend(), &rejected, &.{}, .{}));
+        try std.testing.expect(try database.lookup(alloc, "invalid", .{}) == null);
+        var deferred = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('deferred',9,3,40) ON CONFLICT ON CONSTRAINT equivalent_deferred DO NOTHING", .{});
+        defer deferred.deinit();
+        try std.testing.expectError(error.DeferrableConflictArbiter, sql.runtime.execute(alloc, adapter.backend(), &deferred, &.{}, .{}));
+        try std.testing.expect(try database.lookup(alloc, "deferred", .{}) == null);
+    }
 }
 
 test "capi SQL native expression partial unique claims reject collisions and arbitrate targetless inserts" {
@@ -1701,6 +1748,59 @@ test "capi SQL local integrity refuses partial ownership instead of inventing co
     try std.testing.expect(try database.lookup(alloc, "k", .{}) == null);
 }
 
+fn sqlFkRecoveryStatement(handle: ?*anyopaque, statement: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+    defer alloc.free(request);
+    var response: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice(request), &response);
+    defer freeRawBuffer(response.ptr, response.len);
+    if (status != .ok) std.debug.print("FK recovery SQL failure {s}: {s}\n", .{ statement, if (response.ptr) |ptr| ptr[0..response.len] else "" });
+    try std.testing.expectEqual(capi.ErrorCode.ok, status);
+}
+
+test "capi SQL FK publication recovers lost owner replies at every phase" {
+    const alloc = std.testing.allocator;
+    const fk = @import("antfly_local_sources").capi_sql_fk;
+    defer fk.interruptAfterPhaseForTest(null);
+    for (0..4) |operation| for (1..6) |phase| {
+        std.debug.print("FK recovery operation={d} phase={d}\n", .{ operation, phase });
+        var directory = try TestDirectory.init("capi-sql-fk-recovery");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(alloc, directory.path(), "database");
+        defer alloc.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer if (handle != null) antfly_db_close(handle);
+        try sqlFkRecoveryStatement(handle, "CREATE TABLE parents(n BIGINT PRIMARY KEY)");
+        try sqlFkRecoveryStatement(handle, "INSERT INTO parents(_id,n) VALUES ('p',1)");
+        if (operation != 0) {
+            try sqlFkRecoveryStatement(handle, if (operation == 1) "CREATE TABLE children(n BIGINT)" else "CREATE TABLE children(n BIGINT,CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n))");
+            try sqlFkRecoveryStatement(handle, "INSERT INTO children(_id,n) VALUES ('c',1)");
+        }
+        fk.interruptAfterPhaseForTest(@intCast(phase));
+        try sqlFkRecoveryStatement(handle, switch (operation) {
+            0 => "CREATE TABLE children(n BIGINT,CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n))",
+            1 => "ALTER TABLE children ADD CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n)",
+            2 => "ALTER TABLE children DROP CONSTRAINT fk",
+            3 => "DROP TABLE children",
+            else => unreachable,
+        });
+        antfly_db_close(handle);
+        handle = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+        if (operation == 0 or operation == 1) {
+            try sqlFkRecoveryStatement(handle, "INSERT INTO children(_id,n) VALUES ('c2',1)");
+            try sqlFkRecoveryStatement(handle, "DROP TABLE children");
+        }
+        try sqlFkRecoveryStatement(handle, "DELETE FROM parents");
+    };
+}
+
 test "capi SQL RETURNING uses native defaults generated values and versioned preimages" {
     var directory = try TestDirectory.init("capi-sql-returning");
     defer directory.cleanup();
@@ -1753,6 +1853,120 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     try std.testing.expectEqual(@as(usize, 32), first.len);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expectEqualStrings("5", generated_rows[0].array.items[1].string);
+}
+
+test "capi SQL array mutations retain native cells and returning provenance" {
+    var directory = try TestDirectory.init("capi-sql-array-mutations");
+    defer directory.cleanup();
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, directory.path(), "sql");
+    defer a.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
+    const Case = struct { sql: []const u8, parameters: []const std.json.Value = &.{}, lower: ?i64 = null, first: ?[]const u8 = null, whole_null: bool = false };
+    for ([_]Case{
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) VALUES ('a','[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],1) RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "UPDATE \"default\" SET n=2 WHERE _id='a' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) SELECT 'b',a,j,n FROM \"default\" WHERE _id='a' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "UPDATE \"default\" SET a='[3:4]={9223372036854775807,NULL}' WHERE _id='b' RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "DELETE FROM \"default\" WHERE _id='b' RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "UPDATE \"default\" SET a=ARRAY[1::smallint,NULL] WHERE _id='a' RETURNING a,j", .lower = 1, .first = "1" },
+        .{ .sql = "UPDATE \"default\" SET a=$1 WHERE _id='a' RETURNING a,j", .parameters = &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) SELECT 'p','[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) SELECT 'q',$1,ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .parameters = &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) SELECT 'r',ARRAY[1::smallint,NULL],ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .lower = 1, .first = "1" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) VALUES ('a',ARRAY[0],ARRAY[NULL::jsonb],9) ON CONFLICT (_id) DO UPDATE SET n=excluded.n RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,a,j,n) VALUES ('a','[3:4]={9223372036854775807,NULL}',ARRAY['null'::jsonb,NULL],9) ON CONFLICT (_id) DO UPDATE SET a=excluded.a,j=excluded.j WHERE \"default\".a='[-1:1]={9007199254740993,NULL,2}'::bigint[] RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "INSERT INTO \"default\" (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a='[-1:1]={9007199254740993,NULL,2}' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO \"default\" (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=ARRAY[1::smallint,NULL] RETURNING a,j", .lower = 1, .first = "1" },
+        .{ .sql = "INSERT INTO \"default\" (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=$1 RETURNING a,j", .parameters = &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "UPDATE \"default\" SET a=NULL WHERE _id='a' RETURNING a,j", .whole_null = true },
+        .{ .sql = "SELECT a,j FROM \"default\" WHERE _id='a'", .whole_null = true },
+    }) |case| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql, .parameters = case.parameters }, .{});
+        defer a.free(request);
+        var out: capi.Buffer = .{};
+        defer freeRawBuffer(out.ptr, out.len);
+        // Exercise the same C-ABI request implementation without erasing the
+        // native error return trace behind the public diagnostic envelope.
+        try executeEmbeddedSql(asHandle(handle).?, "default", request, &out);
+        const response = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer response.deinit();
+        const rows = response.value.object.get("rows").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        const values = rows[0].array.items;
+        if (case.whole_null) {
+            try std.testing.expect(values[0] == .null);
+        } else {
+            try std.testing.expectEqual(case.lower.?, values[0].object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+            try std.testing.expectEqualStrings(case.first.?, values[0].object.get("values").?.array.items[0].string);
+            try std.testing.expect(values[0].object.get("sql_nulls").?.array.items[1].bool);
+        }
+        const json = values[1].object;
+        try std.testing.expect(json.get("values").?.array.items[0] == .null);
+        try std.testing.expect(!json.get("sql_nulls").?.array.items[0].bool);
+        try std.testing.expect(json.get("sql_nulls").?.array.items[1].bool);
+    }
+    for ([_]struct { sql: []const u8, state: []const u8, code: capi.ErrorCode = .invalid_argument }{
+        .{ .sql = "UPDATE \"default\" SET a=ARRAY[] WHERE _id='a'", .state = "42P18" },
+        .{ .sql = "UPDATE \"default\" SET a=ARRAY['1'] WHERE _id='a'", .state = "42804" },
+        .{ .sql = "UPDATE \"default\" SET a='{1,2}'::text WHERE _id='a'", .state = "42804" },
+        .{ .sql = "INSERT INTO \"default\" (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM \"default\" WHERE _id='q') RETURNING a,j", .state = "0A000", .code = .unsupported },
+        .{ .sql = "INSERT INTO \"default\" (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=coalesce((SELECT a FROM \"default\" WHERE _id='q'),excluded.a) RETURNING a,j", .state = "0A000", .code = .unsupported },
+    }) |case| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql }, .{});
+        defer a.free(request);
+        var out: capi.Buffer = .{};
+        defer freeRawBuffer(out.ptr, out.len);
+        try std.testing.expectEqual(case.code, antfly_db_sql_json(handle, .fromSlice(request), &out));
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+    }
+}
+
+test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-typed");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    var inserted = try sql.compiler.compile(alloc,
+        \\INSERT INTO rows(_id,body,payload) VALUES ('a','alpha',NULL),('b','alpha',CAST('null' AS JSONB)),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB))
+    , .{});
+    defer inserted.deinit();
+    var mutation = try sql.runtime.execute(alloc, adapter.backend(), &inserted, &.{}, .{});
+    defer mutation.deinit();
+    try database.runUntilIdle();
+    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM rows ORDER BY _id", .{});
+    defer scanned.deinit();
+    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{});
+    defer baseline.deinit();
+    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
+    defer searched.deinit();
+    var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{});
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
+    const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
+    defer alloc.free(expected);
+    const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expect(hits.output.rows[0][2].bool);
+    try std.testing.expect(!hits.output.rows[1][2].bool);
+    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+    try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {
@@ -3870,7 +4084,8 @@ test "capi relational expression errors preserve public status semantics" {
     const expression_errors = antfly.capi_dependencies.relational_expression_errors;
     inline for (@typeInfo(expression_errors.Error).error_set.error_names.?) |field| {
         const err = @field(expression_errors.Error, field);
-        try std.testing.expectEqual(if (expression_errors.isInvalidInput(err)) capi.ErrorCode.invalid_argument else capi.ErrorCode.intent_conflict, capi.mapError(err));
+        const expected: capi.ErrorCode = if (err == error.SqlFeatureNotSupported) .unsupported else if (expression_errors.isInvalidInput(err)) .invalid_argument else .intent_conflict;
+        try std.testing.expectEqual(expected, capi.mapError(err));
     }
 }
 
@@ -4479,4 +4694,38 @@ test "capi fact edge cleanup releases the owned array exactly once" {
     const edges = try alloc.alloc(graph_mod.Edge, 1);
     edges[0] = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
     graphFreeEdges(alloc, edges);
+}
+
+test "capi SQL DROP INDEX retains catalog lookup and explicit table ownership" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-drop-index-merge");
+    defer directory.cleanup();
+    const path = try tempTestPath(a, directory.path(), "sql");
+    defer a.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
+    for ([_][]const u8{
+        "CREATE INDEX merge_idx ON \"default\" (id)",
+        "DROP INDEX merge_idx",
+        "CREATE INDEX merge_idx ON \"default\" (id)",
+        "DROP INDEX merge_idx ON \"default\"",
+        "DROP INDEX IF EXISTS missing_merge_idx",
+    }, 0..) |sql, index| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = sql }, .{});
+        defer a.free(request);
+        var out: capi.Buffer = .{};
+        defer freeRawBuffer(out.ptr, out.len);
+        try executeEmbeddedSql(asHandle(handle).?, "default", request, &out);
+        const bytes = (try asHandle(handle).?.db.getSchemaJson(a)).?;
+        defer a.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const indexes = parsed.value.object.get("relational_indexes").?.array.items;
+        try std.testing.expectEqual(@as(usize, if (index == 0 or index == 2) 1 else 0), indexes.len);
+    }
 }

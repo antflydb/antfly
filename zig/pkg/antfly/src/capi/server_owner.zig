@@ -1435,6 +1435,35 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     if (context) |value| value.release();
 }
 
+pub fn metadataApplyStoreRelationPublication(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataRelationPublicationRequest,
+    out_result: *kernel_owner_abi.MetadataRelationPublicationResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    if (request.operation != .step and request.expected_state.len != 0) return .invalid_argument;
+    switch (request.operation) {
+        .step => {
+            const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+            if (request.expected_state.len != r.State.encoded_len or request.expected_state.ptr == null) return .invalid_argument;
+            const state = r.State.decode(request.expected_state.slice()) catch return .invalid_argument;
+            if (state.group_id != request.group_id) return .invalid_argument;
+            const proof = handle.store.stepRelationPublicationProof(state, request.now_ns) catch |err| return storageOwnerStatusFromError(err);
+            if (proof) |value| {
+                const root = if (value.root) |generation| generation.encode() catch |err| return storageOwnerStatusFromError(err) else @as([30]u8, @splat(0));
+                out_result.* = .{ .ready = 1, .has_root = @intFromBool(value.root != null), .applied_index = value.applied_index, .root = root };
+            }
+        },
+        .cancel => handle.store.cancelRelationPublicationProof(request.group_id) catch |err| return storageOwnerStatusFromError(err),
+        .close => handle.store.closeRelationPublicationProof(request.group_id),
+        .expire => handle.store.expireRelationPublicationProofs(request.now_ns) catch |err| return storageOwnerStatusFromError(err),
+        _ => return .invalid_argument,
+    }
+    return .ok;
+}
+
 pub fn metadataApplyStoreApplyBatch(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataApplyBatchRequest,
@@ -1820,6 +1849,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_query_definition => |input| {
                     const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_source_tracking => {
+                    const value = handle.store.relationSourceTrackingActive(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_reconciliation_work => {
+                    const value = handle.store.relationReconciliationWork(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .topology_activation => {

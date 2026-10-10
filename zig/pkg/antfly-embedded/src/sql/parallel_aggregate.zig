@@ -56,7 +56,7 @@ const Work = struct {
 };
 fn compatible(program: @import("scalar.zig").Program) bool {
     for (program.instructions) |instruction| switch (instruction.operation) {
-        .column, .literal, .parameter, .unary => {},
+        .column, .literal, .parameter, .unary, .cast => {},
         .binary => |binary| switch (binary.op) {
             .add, .subtract, .multiply, .divide, .modulo, .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {},
             else => return false,
@@ -68,7 +68,7 @@ fn compatible(program: @import("scalar.zig").Program) bool {
 pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *operators.Grouped, scan: *runtime.Context.ScanState, table: catalog.Table, request: catalog.Scan) !bool {
     const io = context.backend.execution_io orelse return false;
     if (context.limits.retained_bytes < 1024 * 1024) return false;
-    for (bound.specs) |spec| if (spec.distinct or !(spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer))) return false;
+    for (bound.specs) |spec| if (!operators.exactMergeable(spec)) return false;
     if (bound.input.predicate) |program| if (!compatible(program)) return false;
     for (bound.input.projections) |program| if (program) |value| if (!compatible(value)) return false;
     var allocator: scheduling.LockedAllocator = .{ .backing = context.alloc };

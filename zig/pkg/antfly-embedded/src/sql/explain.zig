@@ -56,6 +56,7 @@ fn boundDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, func
     try scalarDecisionFunctions(alloc, bound.scalars, functions);
     if (bound.aggregate) |aggregate| {
         try scalarDecisionFunctions(alloc, aggregate.input, functions);
+        for (aggregate.ordered) |plan| if (plan.direct) |*program| try decisionFunctions(alloc, program, functions);
         for (aggregate.outputs) |*program| try decisionFunctions(alloc, program, functions);
         for (aggregate.orders) |*program| try decisionFunctions(alloc, program, functions);
         if (aggregate.having) |*program| try decisionFunctions(alloc, program, functions);
@@ -124,7 +125,17 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
     return switch (node.operation) {
         .singleton => .{ .node_type = "Values" },
         .literal_rows => .{ .node_type = "Values" },
+        .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
+        .outer_ref => .{ .node_type = "Outer Reference" },
+        .apply => |apply| blk: {
+            const source: Plan = .{ .node_type = if (apply.demand != null) "Masked Apply" else "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
+            var functions: std.ArrayList([]const u8) = .empty;
+            if (apply.condition) |*program| try decisionFunctions(alloc, program, &functions);
+            if (apply.demand) |*program| try decisionFunctions(alloc, program, &functions);
+            if (functions.items.len == 0) break :blk source;
+            break :blk .{ .node_type = "DecisionEval", .functions = functions.items, .plans = try alloc.dupe(Plan, &.{source}) };
+        },
         .materialized_ref => |producer| .{ .node_type = "Materialized Reference", .plans = try alloc.dupe(Plan, &.{try relationPlan(alloc, bound, producer, verbose, depth + 1, remaining)}) },
         .scan => |scan| blk: {
             if (scan.index >= bound.scans.len) return error.InvalidSqlBackendResponse;
@@ -142,8 +153,8 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         },
         .join => |join| blk: {
             const source: Plan = .{
-                .node_type = if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
-                .join_kind = @tagName(join.kind),
+                .node_type = if (join.membership != null) "Null-aware Membership" else if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
+                .join_kind = if (join.membership != null) "membership" else @tagName(join.kind),
                 .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, join.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, join.right, verbose, depth + 1, remaining) }),
             };
             var functions: std.ArrayList([]const u8) = .empty;

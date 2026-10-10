@@ -97,7 +97,7 @@ build-docs:
 release-scripting-test:
 	scripts/release/test.sh
 
-generate: graph-identifier-generate build-docs tidy
+generate: graph-identifier-generate build-docs tidy zig-source-catalog-generate
 	$(MAKE) zig-openapi-generate
 	@for mod in $(GO_MODULES); do \
 		echo "==> Generating in $$mod"; \
@@ -133,6 +133,10 @@ zig-test:
 
 zig-unit-test:
 	$(ZIG_MAKE) unit-test ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"
+
+.PHONY: zig-source-catalog-generate
+zig-source-catalog-generate:
+	$(ZIG_MAKE) source-catalog-generate
 
 zig-generate:
 	$(ZIG_MAKE) generate

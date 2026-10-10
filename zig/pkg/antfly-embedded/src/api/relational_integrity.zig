@@ -174,6 +174,24 @@ pub const Plan = struct {
         return self.bindConflictExpressions(alloc, columns, &.{}, arbiter_predicate);
     }
 
+    /// A named constraint identifies one exact generation. Never widen it to
+    /// all constraints with the same columns, or to an access-index name.
+    pub fn bindNamedConflict(self: *const Plan, alloc: Allocator, name: []const u8) ![]const usize {
+        for (self.uniques, 0..) |unique, index| {
+            if (!std.mem.eql(u8, unique.definition.name, name)) continue;
+            if (unique.definition.deferrable) return error.DeferrableConflictArbiter;
+            return alloc.dupe(usize, &.{index});
+        }
+        const declaration = self.view.validator().?.schema;
+        if (declaration.checks) |values| for (values.value) |value| {
+            if (std.mem.eql(u8, value.name, name)) return error.WrongConflictConstraintKind;
+        };
+        if (declaration.foreign_keys) |values| for (values.value) |value| {
+            if (std.mem.eql(u8, value.name, name)) return error.WrongConflictConstraintKind;
+        };
+        return error.SqlConstraintNotFound;
+    }
+
     pub fn bindConflictExpressions(self: *const Plan, alloc: Allocator, columns: []const []const u8, expressions: []const native.RelationalIndexKey, arbiter_predicate: []const native.UniquePredicate) ![]const usize {
         const target_count = columns.len + expressions.len;
         if (target_count > 32) return error.InvalidIntegrityDefinition;

@@ -576,7 +576,10 @@ pub const Reader = struct {
             for (self.fields) |field| {
                 const current_ordinal = self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, field).?;
                 const source_ordinal = source.physicalLayout().ordinalForName(source.tableSchema().relational_columns, field) orelse continue;
-                if (self.active.tableSchema().relational_columns[current_ordinal].column_type != source.tableSchema().relational_columns[source_ordinal].column_type)
+                const current_column = self.active.tableSchema().relational_columns[current_ordinal];
+                const source_column = source.tableSchema().relational_columns[source_ordinal];
+                if (current_column.column_type != source_column.column_type or current_column.sql_element_type != source_column.sql_element_type or
+                    !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(current_column.numeric_modifier, source_column.numeric_modifier))
                     return error.RelationalIndexColumnTypeMismatch;
             }
             const source_conditions = try alloc.alloc(predicates.Source, self.conditions.len);
@@ -632,6 +635,49 @@ pub const Reader = struct {
         errdefer page.deinit();
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         return page;
+    }
+
+    /// Hydrate an exact primary identity using this reader's visibility cut
+    /// and cached source-layout projection. Ranked queries must retain native
+    /// SQL-null provenance rather than round-tripping through public JSON.
+    pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        if (self.index != null) return error.InvalidRelationalRowsRequest;
+        if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const key = try internal.relationalRowKeyAlloc(temporary, document);
+        if (std.mem.order(u8, key, self.lower) == .lt or std.mem.order(u8, key, self.upper) != .lt) return null;
+        const raw = self.read.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const row = try self.rowView(raw);
+        if (self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
+            ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns)) return null;
+        var predicate_scratch = std.ArrayList(u8).empty;
+        for (self.source_conditions) |condition| {
+            if (!(try condition.evaluate(temporary, &predicate_scratch, row)).matches()) return null;
+        }
+        if (self.row_filter) |filter| if (!try filter.matches(filter.context, temporary, document, row)) return null;
+        const projected = try row.projectSqlTypedAlloc(alloc, self.selected.?);
+        if (try typedSize(projected.value, 0) +| projected.sql_nulls.len +| document.len > 16 * 1024 * 1024)
+            return error.RelationalRowResultTooLarge;
+        const digest: ?[32]u8 = if (self.include_primary_digest) blk: {
+            var result: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(raw, &result, .{});
+            break :blk result;
+        } else null;
+        return .{
+            .key = try alloc.dupe(u8, document),
+            .json = "",
+            .typed = projected.value,
+            .sql_nulls = projected.sql_nulls,
+            .version = row.writeTimestampNs(),
+            .schema_version = row.table_schema.version,
+            .semantic_hash = row.semanticHash(),
+            .expected_content_digest = digest,
+        };
     }
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {

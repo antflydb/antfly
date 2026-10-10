@@ -34,6 +34,7 @@ test {
     _ = @import("api/lake_vector_enrichment.zig");
     _ = @import("api/lake_expiring_objects.zig");
     _ = @import("api/lake_vector_enrichment_test.zig");
+    _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
     _ = @import("api/lake_index_store.zig");
@@ -49,6 +50,7 @@ test {
     _ = @import("api/lake_index_refinements_test.zig");
     _ = @import("api/lake_index_sql_rows.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_search_filter.zig");
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");

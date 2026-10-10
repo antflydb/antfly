@@ -19,14 +19,43 @@ pub const Scalar = union(enum) {
     column: []const u8,
     unary: struct { op: Unary, operand: *const Scalar },
     binary: struct { op: Binary, left: *const Scalar, right: *const Scalar },
-    call: struct { name: []const u8, args: []const *const Scalar, star: bool = false, distinct: bool = false, filter: ?*const Scalar = null, window: ?Window = null, subquery: ?*const Select = null },
-    cast: struct { operand: *const Scalar, type: ColumnType },
+    call: struct {
+        name: []const u8,
+        args: []const *const Scalar,
+        star: bool = false,
+        distinct: bool = false,
+        filter: ?*const Scalar = null,
+        window: ?Window = null,
+        subquery: ?*const Select = null,
+        /// Ordered inputs are the last within_group.orders.len arguments. Keeping
+        /// expressions in args makes ordinary dependency, authorization and
+        /// parameter visitors see every input without a second hidden tree.
+        /// Earlier arguments belong to the grouped direct-argument domain.
+        within_group: ?*const WithinGroup = null,
+    },
+    cast: struct {
+        operand: *const Scalar,
+        type: ColumnType,
+        element_type: ?@import("array_value.zig").ElementType = null,
+        numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+        /// Coercion origin controls binding diagnostics, not execution identity.
+        coercion: enum { explicit, function } = .explicit,
+        pub fn withOperand(self: @This(), operand: *const Scalar) @This() {
+            var result = self;
+            result.operand = operand;
+            return result;
+        }
+    },
     case_when: struct { branches: []const Branch, otherwise: ?*const Scalar = null },
     in_list: struct { operand: *const Scalar, values: []const *const Scalar, negated: bool = false },
 
-    pub const Unary = enum { positive, negative, not, is_null, is_not_null, is_true, is_not_true, is_false, is_not_false };
+    pub const Unary = enum { positive, negative, not, is_null, is_not_null, is_true, is_not_true, is_false, is_not_false, is_unknown, is_not_unknown };
     pub const Binary = enum { add, subtract, multiply, divide, modulo, concat, eq, neq, lt, lte, gt, gte, @"and", @"or", is_distinct, is_not_distinct, like, ilike, json_get, json_text };
     pub const Branch = struct { condition: *const Scalar, value: *const Scalar };
+    pub const Ordering = struct { descending: bool = false, nulls_first: ?bool = null };
+    /// Cold metadata is indirect: ordinary scalar nodes must not retain a
+    /// slice/optional discriminator for a rarely used aggregate clause.
+    pub const WithinGroup = struct { orders: []const Ordering };
 };
 
 pub const Name = struct {
@@ -40,6 +69,9 @@ pub const Value = union(enum) {
     boolean: bool,
     integer: i64,
     number: f64,
+    /// Exact SQL numeric spelling, owned by the compiled statement. Decimal,
+    /// scientific and oversized integer literals never cross floating point.
+    numeric: []const u8,
     string: []const u8,
     /// One-based positional parameter. Binding never mutates the compiled IR.
     parameter: u32,
@@ -56,7 +88,17 @@ pub const Predicate = union(enum) {
     negation: *const Predicate,
 };
 
-pub const Projection = struct { field: []const u8 = "", alias: ?[]const u8 = null, expression: ?*const Scalar = null };
+pub const Projection = struct {
+    field: []const u8 = "",
+    alias: ?[]const u8 = null,
+    expression: ?*const Scalar = null,
+    /// SELECT wildcard, expanded against the pinned visible source layout.
+    /// field is empty for * or the source qualifier for qualifier.*.
+    wildcard: bool = false,
+    /// Transient wildcard-expansion ordinal in the caller's pinned layout.
+    /// Consumed during lowering, never resolved by a user-visible column name.
+    bound_column: ?usize = null,
+};
 pub const Order = struct {
     field: []const u8 = "",
     expression: ?*const Scalar = null,
@@ -86,16 +128,49 @@ pub const Select = struct {
     ctes: []const Cte = &.{},
     /// Empty means all visible columns. count_all is mutually exclusive.
     columns: []const Projection = &.{},
+    /// Compiler-owned row-assignment boundary. Wildcards are checked only
+    /// after expansion against the pinned source layout, before any capture.
+    required_output_columns: ?usize = null,
     count_all: bool = false,
     count_alias: ?[]const u8 = null,
     predicate: ?*const Predicate = null,
     group_by: []const *const Scalar = &.{},
     having: ?*const Scalar = null,
     order_by: []const Order = &.{},
+    // Internal binding-domain marker: lowered window orders must not expand
+    // output aliases a second time when entering their virtual-table binder.
+    order_aliases_expanded: bool = false,
     limit: ?Value = null,
     offset: ?Value = null,
+    /// Compiler-only scalar-query demand, applied after validating the user's
+    /// LIMIT and after the child's ordering/OFFSET/grouping semantics.
+    scalar_cardinality_limit: bool = false,
+    /// A compiler-owned transparent selection frame already carries the
+    /// enclosing query's outer bindings; do not append them a second time.
+    selection_staged: bool = false,
+    /// Internal sorted prefix includes OFFSET rows for post-sort projection.
+    /// The enclosing consumer applies OFFSET only after those values exist.
+    selection_prefix: bool = false,
+    /// Compiler-only ordinal forwarding; its width is not a user projection
+    /// or a physical storage-field request. Retained-memory limits still apply.
+    internal_projection: bool = false,
+    /// Compiler-owned grouping/window input; output reads live above it.
+    phase_inputs: bool = false,
+    /// Bound outer-frame columns are invocation constants, not grouping keys.
+    /// In particular they survive a global aggregate's empty input.
+    invocation_constants: []const []const u8 = &.{},
+
+    pub fn capRows(self: Select, requested: usize) usize {
+        return if (self.scalar_cardinality_limit) @min(requested, 2) else requested;
+    }
 };
 pub const NamedWindow = struct { name: []const u8, window: Window };
+
+pub const PhaseScope = struct {
+    /// Forwarded source identities; null denotes a hidden computed result.
+    columns: []const ?[]const u8,
+    grouped: bool,
+};
 pub const SetKind = enum { @"union", intersect, except };
 pub const Cte = struct {
     pub const Materialization = enum { automatic, materialized, not_materialized };
@@ -105,13 +180,47 @@ pub const Cte = struct {
     recursive: bool = false,
     materialization: Materialization = .automatic,
 };
+pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
-    table: struct { name: Name, alias: ?[]const u8 = null, mutation_target: bool = false, mutation_document: bool = false, mutation_presence: bool = false },
-    derived: struct { query: *const Select, alias: []const u8, columns: []const []const u8 = &.{}, hidden: bool = false },
-    join: struct { kind: JoinKind, left: *const Relation, right: *const Relation, condition: ?*const Scalar = null },
+    table: struct {
+        name: Name,
+        search: ?*const Search = null,
+        alias: ?[]const u8 = null,
+        mutation_target: bool = false,
+        mutation_document: bool = false,
+        mutation_presence: bool = false,
+        /// Compiler-owned RETURNING input, never a physical table scan.
+        prepared_rows: bool = false,
+    },
+    derived: struct {
+        query: *const Select,
+        alias: []const u8,
+        columns: []const []const u8 = &.{},
+        hidden: bool = false,
+        lateral: bool = false,
+        /// Internal selection boundary, not a user-visible derived scope.
+        preserve_scope: bool = false,
+        /// Typed aggregate/window boundary retaining its lexical source names.
+        phase_scope: ?*const PhaseScope = null,
+    },
+    join: struct {
+        kind: JoinKind,
+        left: *const Relation,
+        right: *const Relation,
+        condition: ?*const Scalar = null,
+        /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
+        /// is not opened or evaluated for an undemanded row.
+        demand: ?*const Scalar = null,
+        /// Compiler-owned row assignment: zero rows produce SQL NULL cells;
+        /// a second row is an error before any output from this producer.
+        single_row: bool = false,
+        /// Compiler-owned NULL-aware membership, not a SQL join condition.
+        membership: ?struct { probes: []const *const Scalar, correlations: usize, alias: []const u8 } = null,
+    },
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    alias: ?[]const u8 = null,
     conflict: ?Conflict = null,
     returning: ?[]const Projection = null,
     table: Name,
@@ -134,6 +243,7 @@ pub const Insert = struct {
 };
 pub const Conflict = struct {
     columns: []const []const u8,
+    constraint_name: ?[]const u8 = null,
     expressions: []const *const Scalar = &.{},
     /// Optional predicate used to infer partial unique arbiters. It is distinct
     /// from the DO UPDATE predicate, which runs only after an arbiter conflict.
@@ -169,12 +279,25 @@ pub const Merge = struct {
         };
     };
 };
-pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json };
-pub const Column = struct { name: []const u8, type: ColumnType, nullable: bool = true, default_value: ?Value = null };
+/// Array element identity belongs to the accompanying binding descriptor;
+/// an array is never represented as a JSON column or an unknown NULL type.
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
+pub const Column = struct {
+    name: []const u8,
+    type: ColumnType,
+    /// Exact declared builtin identity, including an array's element width.
+    /// Declared array dimensions are not PostgreSQL type identity and are not
+    /// retained here. Durable schema admission must not infer this from rows.
+    element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+    nullable: bool = true,
+    default_expression: ?*const Scalar = null,
+    generated_expression: ?*const Scalar = null,
+};
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table },
+    kind: enum { database, namespace, tablespace, table, index },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -185,6 +308,10 @@ pub const CatalogDdl = struct {
     truncate_tables: []const Name = &.{},
     restart_identity: bool = false,
     cascade: bool = false,
+    /// Index names are namespace relations, not names of their owning table.
+    index_table: ?Name = null,
+    index_targets: []const Name = &.{},
+    concurrently: bool = false,
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
@@ -206,7 +333,7 @@ pub const SchemaChange = union(enum) {
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,
-    set_default: struct { column: []const u8, value: Value },
+    set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
 };
 pub const PolicyDdl = struct {

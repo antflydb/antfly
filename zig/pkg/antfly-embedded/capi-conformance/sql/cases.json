@@ -80,5 +80,445 @@
   {
     "statement": "SELECT n FROM missing_table",
     "sqlstate": "42P01"
+  },
+  {
+    "statement": "CREATE TABLE threads (id TEXT, project_id TEXT, archived BOOLEAN, recency_at_ms BIGINT, preview TEXT)"
+  },
+  {
+    "statement": "INSERT INTO threads (_id,id,project_id,archived,recency_at_ms,preview) VALUES ('t1','t1','p1',FALSE,20,'shown'),('t2','t2','p2',FALSE,30,''),('t3','t3','p1',TRUE,40,'hidden')"
+  },
+  {
+    "statement": "CREATE INDEX threads_by_recency ON threads (archived, recency_at_ms DESC, id DESC)"
+  },
+  {
+    "statement": "CREATE INDEX IF NOT EXISTS threads_by_recency ON threads (id)"
+  },
+  {
+    "statement": "CREATE INDEX visible_threads ON threads (recency_at_ms DESC) WHERE preview <> ''"
+  },
+  {
+    "statement": "CREATE UNIQUE INDEX threads_identity ON threads (id)"
+  },
+  {
+    "statement": "SELECT id FROM threads WHERE NOT archived ORDER BY recency_at_ms DESC,id DESC LIMIT 1",
+    "rows": [
+      [
+        "t2"
+      ]
+    ]
+  },
+  {
+    "statement": "DROP INDEX threads_by_recency"
+  },
+  {
+    "statement": "DROP INDEX IF EXISTS threads_by_recency"
+  },
+  {
+    "statement": "DROP INDEX visible_threads ON threads"
+  },
+  {
+    "statement": "DROP INDEX threads_identity"
+  },
+  {
+    "statement": "DROP INDEX threads_identity",
+    "sqlstate": "42704"
+  },
+  {
+    "statement": "INSERT INTO history_items (_id,thread_id,body,payload) VALUES ('h1','t1','alpha memory',CAST('null' AS JSONB)),('h2','t2','alpha history',NULL),('h3','t3','alpha archived',NULL),('h4','t1','unrelated',CAST('{\"amount\":9007199254740993.0,\"fraction\":0.123456789012345678901}' AS JSONB))"
+  },
+  {
+    "statement": "SELECT _id,payload IS NULL FROM antfly_search('history_items','body:alpha') ORDER BY _id",
+    "rows": [
+      [
+        "h1",
+        false
+      ],
+      [
+        "h2",
+        true
+      ],
+      [
+        "h3",
+        true
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT payload ->> 'amount' AS amount,payload ->> 'fraction' AS fraction FROM antfly_search('history_items','body:unrelated')",
+    "rows": [
+      [
+        "9007199254740993.0",
+        "0.123456789012345678901"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT s._id,t.id,s.score > 0 AS ranked FROM antfly_search('history_items',$1,50) AS s JOIN threads t ON t.id=s.thread_id WHERE t.project_id=$2 AND NOT t.archived ORDER BY s.score DESC,s._id LIMIT 20",
+    "parameters": [
+      "{\"full_text_search\": {\"match\": {\"field\": \"body\", \"text\": \"alpha\"}}, \"indexes\": [\"full_text_index_v0\"], \"filter_query\": {\"term\": {\"thread_id\": \"t1\"}}}",
+      "p1"
+    ],
+    "rows": [
+      [
+        "h1",
+        "t1",
+        true
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT _id FROM antfly_search('history_items','body:alpha',limit => 50) ORDER BY _id",
+    "rows": [
+      [
+        "h1"
+      ],
+      [
+        "h2"
+      ],
+      [
+        "h3"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT _id FROM antfly_search('history_items',$1,$2) ORDER BY score DESC,_id LIMIT 1",
+    "parameters": [
+      "{\"full_text_search\": {\"match\": {\"field\": \"body\", \"text\": \"alpha\"}}}",
+      50
+    ],
+    "rows": [
+      [
+        "h1"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT _id FROM antfly_search('history_items',$1)",
+    "parameters": [
+      "{broken"
+    ],
+    "sqlstate": "22023"
+  },
+  {
+    "statement": "SELECT _id FROM antfly_search('history_items','alpha',0)",
+    "sqlstate": "22023"
+  },
+  {
+    "statement": "SELECT s._id,t.id FROM antfly_search('search_vectors',$1,10) s JOIN threads t ON t.id=s.thread_id WHERE NOT t.archived ORDER BY s.score DESC,s._id LIMIT 1",
+    "parameters": [
+      "{\"embeddings\": {\"dv\": [1.0, 0.0]}, \"indexes\": [\"dv\"]}"
+    ],
+    "rows": [
+      [
+        "v1",
+        "t1"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT _id FROM antfly_search('search_vectors',$1,10) ORDER BY score DESC,_id LIMIT 1",
+    "parameters": [
+      "{\"embeddings\": {\"sv\": {\"indices\": [7, 42], \"values\": [1.5, 0.5]}}, \"indexes\": [\"sv\"]}"
+    ],
+    "rows": [
+      [
+        "v1"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT s._id,t.id FROM antfly_search('search_vectors',$1,10) s JOIN threads t ON t.id=s.thread_id WHERE t.project_id='p1' ORDER BY s.score DESC LIMIT 1",
+    "parameters": [
+      "{\"full_text_search\": {\"match\": {\"field\": \"body\", \"text\": \"alpha\"}}, \"embeddings\": {\"dv\": [1.0, 0.0]}, \"indexes\": [\"dv\"], \"merge_config\": {\"strategy\": \"rrf\"}}"
+    ],
+    "rows": [
+      [
+        "v1",
+        "t1"
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE TABLE fk_parent (id BIGINT)"
+  },
+  {
+    "statement": "CREATE UNIQUE INDEX fk_selected ON fk_parent (id)"
+  },
+  {
+    "statement": "CREATE UNIQUE INDEX fk_redundant ON fk_parent (id)"
+  },
+  {
+    "statement": "CREATE TABLE fk_child (pid BIGINT REFERENCES fk_parent(id))"
+  },
+  {
+    "statement": "INSERT INTO fk_parent (_id,id) VALUES ('p',1)"
+  },
+  {
+    "statement": "INSERT INTO fk_child (_id,pid) VALUES ('c',1)"
+  },
+  {
+    "statement": "DROP INDEX fk_redundant"
+  },
+  {
+    "statement": "DROP INDEX fk_selected",
+    "sqlstate": "2BP01"
+  },
+  {
+    "statement": "INSERT INTO fk_child (_id,pid) VALUES ('bad',2)",
+    "sqlstate": "23503"
+  },
+  {
+    "statement": "CREATE TABLE validate_checked (n BIGINT)"
+  },
+  {
+    "statement": "INSERT INTO validate_checked (_id,n) VALUES ('a',-1)"
+  },
+  {
+    "statement": "ALTER TABLE validate_checked ADD CONSTRAINT positive CHECK (n > 0)"
+  },
+  {
+    "statement": "UPDATE validate_checked SET n=1 WHERE _id='a'"
+  },
+  {
+    "statement": "ALTER TABLE validate_checked VALIDATE CONSTRAINT positive"
+  },
+  {
+    "statement": "INSERT INTO validate_checked (_id,n) VALUES ('bad',-1)",
+    "sqlstate": "23514"
+  },
+  {
+    "statement": "CREATE TABLE search_ranks (id TEXT, rank DOUBLE PRECISION)"
+  },
+  {
+    "statement": "INSERT INTO search_ranks (_id,id,rank) VALUES ('h1','h1',0),('h4','h4',0)"
+  },
+  {
+    "statement": "UPDATE search_ranks SET rank=s.score FROM antfly_search('history_items',$1) s WHERE search_ranks.id=s._id",
+    "parameters": [
+      "body:alpha"
+    ]
+  },
+  {
+    "statement": "SELECT id,rank > 0 FROM search_ranks ORDER BY id",
+    "rows": [
+      [
+        "h1",
+        true
+      ],
+      [
+        "h4",
+        false
+      ]
+    ]
+  },
+  {
+    "statement": "UPDATE search_ranks SET rank=s.score FROM antfly_search('history_items',$1) s WHERE search_ranks.id=s._id",
+    "parameters": [
+      "body:unrelated"
+    ]
+  },
+  {
+    "statement": "SELECT id,rank > 0 FROM search_ranks ORDER BY id",
+    "rows": [
+      [
+        "h1",
+        true
+      ],
+      [
+        "h4",
+        true
+      ]
+    ]
+  },
+  {
+    "statement": "DELETE FROM search_ranks USING antfly_search('history_items',$1) s WHERE search_ranks.id=s._id",
+    "parameters": [
+      "body:alpha"
+    ]
+  },
+  {
+    "statement": "SELECT id FROM search_ranks",
+    "rows": [
+      [
+        "h4"
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE TABLE repair_unique(n BIGINT)"
+  },
+  {
+    "statement": "INSERT INTO repair_unique(_id,n) VALUES ('a',1),('b',1)"
+  },
+  {
+    "statement": "CREATE UNIQUE INDEX repair_key ON repair_unique(n)"
+  },
+  {
+    "statement": "UPDATE repair_unique SET n=2 WHERE _id='b'"
+  },
+  {
+    "statement": "ALTER TABLE repair_unique VALIDATE CONSTRAINT repair_key"
+  },
+  {
+    "statement": "INSERT INTO repair_unique(_id,n) VALUES ('bad',1)",
+    "sqlstate": "23505"
+  },
+  {
+    "statement": "CREATE TABLE publication_parent(n BIGINT PRIMARY KEY)"
+  },
+  {
+    "statement": "CREATE TABLE publication_child(n BIGINT)"
+  },
+  {
+    "statement": "INSERT INTO publication_parent(_id,n) VALUES ('p',1)"
+  },
+  {
+    "statement": "INSERT INTO publication_child(_id,n) VALUES ('c',1)"
+  },
+  {
+    "statement": "ALTER TABLE publication_child ADD CONSTRAINT fk FOREIGN KEY(n) REFERENCES publication_parent(n)"
+  },
+  {
+    "statement": "INSERT INTO publication_child(_id,n) VALUES ('bad',2)",
+    "sqlstate": "23503"
+  },
+  {
+    "statement": "ALTER TABLE publication_child DROP CONSTRAINT fk"
+  },
+  {
+    "statement": "DELETE FROM publication_parent"
+  },
+  {
+    "statement": "INSERT INTO publication_parent(_id,n) VALUES ('p',1)"
+  },
+  {
+    "statement": "ALTER TABLE publication_child ADD CONSTRAINT fk FOREIGN KEY(n) REFERENCES publication_parent(n)"
+  },
+  {
+    "statement": "DROP TABLE publication_child"
+  },
+  {
+    "statement": "DELETE FROM publication_parent"
+  },
+  {
+    "statement": "CREATE TABLE publication_child(n BIGINT,CONSTRAINT fk FOREIGN KEY(n) REFERENCES publication_parent(n))"
+  },
+  {
+    "statement": "INSERT INTO publication_parent(_id,n) VALUES ('p',1)"
+  },
+  {
+    "statement": "INSERT INTO publication_child(_id,n) VALUES ('c',1)"
+  },
+  {
+    "statement": "DROP TABLE publication_child"
+  },
+  {
+    "statement": "DELETE FROM publication_parent"
+  },
+  {
+    "statement": "SELECT COUNT(*) FROM publication_parent",
+    "rows": [
+      [
+        "0"
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE TABLE partial_parent(a BIGINT,b BIGINT,PRIMARY KEY(a,b))"
+  },
+  {
+    "statement": "INSERT INTO partial_parent(_id,a,b) VALUES ('p',1,10),('q',2,20)"
+  },
+  {
+    "statement": "CREATE INDEX partial_by_a ON partial_parent(a)"
+  },
+  {
+    "statement": "CREATE INDEX partial_by_b ON partial_parent(b)"
+  },
+  {
+    "statement": "CREATE TABLE partial_child(a BIGINT,b BIGINT,CONSTRAINT fk FOREIGN KEY(a,b) REFERENCES partial_parent(a,b) MATCH PARTIAL ON DELETE CASCADE)"
+  },
+  {
+    "statement": "INSERT INTO partial_child(_id,a,b) VALUES ('c',1,NULL)"
+  },
+  {
+    "statement": "INSERT INTO partial_child(_id,a,b) VALUES ('bad',3,NULL)",
+    "sqlstate": "23503"
+  },
+  {
+    "statement": "SELECT a FROM partial_child",
+    "rows": [
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "DELETE FROM partial_parent WHERE _id='p'"
+  },
+  {
+    "statement": "SELECT COUNT(*) FROM partial_child",
+    "rows": [
+      [
+        "0"
+      ]
+    ]
+  },
+  {
+    "statement": "DROP TABLE partial_child"
+  },
+  {
+    "statement": "DROP TABLE partial_parent"
+  },
+  {
+    "statement": "CREATE TABLE boolean_partial (n BIGINT, archived BOOLEAN)"
+  },
+  {
+    "statement": "INSERT INTO boolean_partial(_id,n,archived) VALUES ('false',1,false),('true',2,true),('null',3,NULL)"
+  },
+  {
+    "statement": "CREATE INDEX boolean_visible ON boolean_partial(n DESC) WHERE NOT archived"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived = false ORDER BY n DESC",
+    "rows": [
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "UPDATE boolean_partial SET archived=false WHERE _id='true'"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived = false ORDER BY n DESC",
+    "rows": [
+      [
+        "2"
+      ],
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE INDEX boolean_not_true ON boolean_partial(n DESC) WHERE archived IS NOT TRUE"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived IS NOT TRUE ORDER BY n DESC",
+    "rows": [
+      [
+        "3"
+      ],
+      [
+        "2"
+      ],
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "DROP TABLE boolean_partial"
   }
 ]

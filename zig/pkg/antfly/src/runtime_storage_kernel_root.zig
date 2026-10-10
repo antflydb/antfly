@@ -111,6 +111,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageContextMaintenanceRun, "antfly_storage_context_maintenance_run");
     exportInternal(&storage_kernel_exports.metadataApplyStoreOpen, "antfly_metadata_apply_store_open");
     exportInternal(&storage_kernel_exports.metadataApplyStoreClose, "antfly_metadata_apply_store_close");
+    exportInternal(&storage_kernel_exports.metadataApplyStoreRelationPublication, "antfly_metadata_apply_store_relation_publication");
     exportInternal(&storage_kernel_exports.metadataApplyStoreApplyBatch, "antfly_metadata_apply_store_apply_batch");
     exportInternal(&storage_kernel_exports.metadataApplyStoreBuildSnapshot, "antfly_metadata_apply_store_build_snapshot");
     exportInternal(&storage_kernel_exports.metadataApplyStoreInstallSnapshot, "antfly_metadata_apply_store_install_snapshot");

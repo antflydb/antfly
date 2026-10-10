@@ -548,7 +548,7 @@ const Owner = struct {
                 const last = pieces[pieces.len - 1];
                 offset = last.offset + last.ref.byte_len;
                 // Legacy v1 artifacts can be large; keep speculative bytes bounded.
-                if (piece.ref.byte_len > block_bytes) continue;
+                if (piece.ref.byte_len > pack_bytes) continue;
                 // Most native chunks share a page: do not spawn a worker for
                 // every small decoder read of an already consumed page.
                 var duplicate = false;
@@ -714,6 +714,20 @@ const Owner = struct {
         }
         try capability.check();
     }
+    fn completePack(self: *const @This(), start: usize, pack: Ref) bool {
+        if (pack.byte_len > pack_bytes or pack.byte_len > self.directory.bytes - start) return false;
+        var position = start;
+        while (position < start + pack.byte_len) {
+            const metadata = containing(self.directory.metadata, position);
+            const block = if (metadata == null) containing(self.directory.blocks, position) else null;
+            const piece = if (metadata) |i| self.directory.metadata[i] else if (block) |i| self.directory.blocks[i] else return false;
+            const owner = piece.pack orelse return false;
+            if (piece.offset != position or piece.pack_offset != position - start or piece.ref.byte_len > start + pack.byte_len - position or
+                owner.byte_len != pack.byte_len or !std.mem.eql(u8, owner.artifact_id, pack.artifact_id) or !std.mem.eql(u8, owner.checksum, pack.checksum)) return false;
+            position += @intCast(piece.ref.byte_len);
+        }
+        return position == start + pack.byte_len;
+    }
 };
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     const owner = try a.create(Owner);
@@ -821,6 +835,99 @@ pub fn loadQueryScoped(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     return data;
 }
 
+test "external lake cold ranked highlights survive restart with no provider bytes" {
+    const a = std.testing.allocator;
+    const Cache = local.serverless_query_lake_serving_cache.Cache;
+    const types = local.storage_db_types;
+    const search = local.storage_db_query_search_exec;
+    const encoded = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, &.{
+        .{ .key = "one", .value = "{\"body\":\"alpha beta alpha\",\"label\":\"first\"}" },
+        .{ .key = "two", .value = "{\"body\":\"alpha gamma\",\"label\":\"second\"}" },
+        .{ .key = "three", .value = "{\"body\":\"beta gamma\",\"label\":\"third\"}" },
+    }, .{}, null)).?;
+    defer a.free(encoded);
+    var directory = try local.common_test_directory.TestDirectory.init("highlight-restart");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    const ref = try publish(a, a, &store, encoded, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const root = try std.fs.path.join(a, &.{ directory.path(), "cache" });
+    defer a.free(root);
+    // The second process has neither decoded navigation nor RAM payloads.
+    // Deny the provider, not merely its counters: a cache miss must fail.
+    const Denied = struct {
+        fn get(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+            return error.TestRemoteUnavailable;
+        }
+        fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+            return error.TestRemoteUnavailable;
+        }
+        fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+            return error.TestRemoteUnavailable;
+        }
+    };
+    var denied = store.vtable.*;
+    denied.get_alloc = Denied.get;
+    denied.get_alloc_with_cancellation = null;
+    denied.stat = Denied.stat;
+    denied.stat_with_cancellation = null;
+    denied.get_range_alloc = Denied.range;
+    denied.get_range_alloc_with_cancellation = null;
+    var first_score: f32 = 0;
+    for (0..2) |process| {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io_impl.io(), root, .{}, .{});
+        if (process == 1) store.vtable = &denied;
+        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(5), .context = .{ .io = io_impl.io() } };
+        const data = try load(a, .{ .store = store, .cache = cached, .context = cached.context, .cancellation = .none }, ref);
+        var writer = try local.index.IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, data);
+        const snapshot = writer.snapshot();
+        const result = try snapshot.search(a, "body", &.{"alpha"}, 1);
+        defer a.free(result.hits);
+        try std.testing.expectEqual(@as(u64, 2), result.total_count);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        if (process == 0) first_score = result.hits[0].score else try std.testing.expectEqual(first_score, result.hits[0].score);
+        const stored = (try snapshot.storedDocDecompressed(a, result.hits[0].doc_id)).?;
+        defer a.free(stored.data);
+        var hits = [_]types.SearchHit{.{ .id = try a.dupe(u8, stored.id) }};
+        defer hits[0].deinit(a);
+        // Use the same typed source projection and highlighter as delivery;
+        // no Parquet source is available to hide an accidental fallback.
+        hits[0].source_value = .{ .object = .empty };
+        var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
+        defer hydrator.deinit();
+        try hydrator.append(a, snapshot, result.hits[0].doc_id, stored.id, &.{ "label", "body" }, &hits[0].source_value.?);
+        try std.testing.expectEqual(@as(usize, 1), hydrator.blocks.decode_count);
+        try search.attachHighlightsWithIndexQueries(a, .{ .fields = &.{"body"} }, &.{.{
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .text_analysis = .{},
+            .runtime_schema = null,
+        }}, &hits, null);
+        try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+        try std.testing.expect(hits[0].highlights[0].fragments.len != 0);
+        const stats = cache.snapshot();
+        if (process == 0) {
+            try std.testing.expect(stats.provider_reads > 0);
+            try std.testing.expect(stats.provider_bytes > 0);
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), stats.provider_reads);
+            try std.testing.expectEqual(@as(u64, 0), stats.provider_bytes);
+            try std.testing.expect(stats.disk_hits > 0);
+            try std.testing.expect(cache.persistentStats().?.entries > 0);
+        }
+        // Implicit shutdown drains accepted writes before the fresh process.
+    }
+}
+
 test "external lake native text seeks a common term without reading its position corpus" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -880,10 +987,10 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     defer fs.deinit();
     var store = fs.artifactStore();
     store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
-    const bytes = try a.alloc(u8, block_bytes * 6);
+    const bytes = try a.alloc(u8, block_bytes * 20);
     defer a.free(bytes);
     // Distinct block identities prevent cache deduplication hiding fan-out.
-    for (0..6) |i| @memset(bytes[i * block_bytes ..][0..block_bytes], @intCast(i));
+    for (0..20) |i| @memset(bytes[i * block_bytes ..][0..block_bytes], @intCast(i));
     const ref = try publish(a, a, &store, bytes, .none);
     defer a.free(ref.artifact_id);
     defer a.free(ref.checksum);
@@ -904,7 +1011,7 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     for (&query.pending) |*slot| if (slot.*) |*task| {
         while (!task.isComplete()) std.atomic.spinLoopHint();
     };
-    source.prefetch(block_bytes * 4, block_bytes);
+    source.prefetch(block_bytes * 16, block_bytes);
     query.drain(false);
     try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
     var sample: [1]u8 = undefined;
@@ -964,10 +1071,10 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     vtable.get_range_alloc = Denied.range;
     vtable.get_range_alloc_with_cancellation = null;
     capability.store.vtable = &vtable;
-    source.prefetch(block_bytes * 5, block_bytes);
+    source.prefetch(block_bytes * 19, block_bytes);
     query.drain(false);
-    try std.testing.expectError(error.TestRemoteUnavailable, source.readInto(block_bytes * 5, &sample));
-    source.prefetch(block_bytes * 5, block_bytes);
+    try std.testing.expectError(error.TestRemoteUnavailable, source.readInto(block_bytes * 19, &sample));
+    source.prefetch(block_bytes * 19, block_bytes);
     source.quiesceReadContext();
     try std.testing.expectError(error.Canceled, source.readInto(0, &sample));
     source.close();
@@ -1063,6 +1170,36 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     Observed.corrupt = true;
     defer Observed.corrupt = false;
     try std.testing.expectError(error.ArtifactIntegrityMismatch, owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, 0, &sample));
+    Observed.corrupt = false;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const cache_root = try std.fs.path.join(a, &.{ directory.path(), "range-cache" });
+    defer a.free(cache_root);
+    {
+        var restart_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer restart_cache.deinit();
+        try restart_cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
+        const cached: artifacts.CachedRead = .{ .cache = &restart_cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
+        Observed.reads = 0;
+        try owner.read(.{ .store = observed, .cache = cached, .context = cached.context, .cancellation = .none }, 0, output);
+        try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+        try owner.read(.{ .store = observed, .cache = cached, .context = cached.context, .cancellation = .none }, block_bytes * 2 + 17, &sample);
+        try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+    }
+    {
+        var restart_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer restart_cache.deinit();
+        try restart_cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
+        const cached: artifacts.CachedRead = .{ .cache = &restart_cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
+        Observed.reads = 0;
+        Observed.transferred = 0;
+        try owner.read(.{ .store = observed, .cache = cached, .context = cached.context, .cancellation = .none }, block_bytes * 2 + 17, &sample);
+        try std.testing.expectEqual(bytes[block_bytes * 2 + 17], sample[0]);
+        try std.testing.expectEqual(@as(usize, 0), Observed.reads);
+        try std.testing.expectEqual(@as(usize, 0), Observed.transferred);
+        try std.testing.expect(restart_cache.snapshot().disk_hits > 0);
+        try std.testing.expectError(error.DeadlineExceeded, owner.read(.{ .store = observed, .cache = cached, .context = .{ .deadline_ns = 0 }, .cancellation = .none }, 0, &sample));
+    }
     var invalid = owner.directory.blocks[0];
     invalid.pack_offset = pack_bytes;
     const malformed: Directory = .{ .bytes = block_bytes, .metadata = &.{}, .blocks = &.{invalid}, .terms = &.{} };

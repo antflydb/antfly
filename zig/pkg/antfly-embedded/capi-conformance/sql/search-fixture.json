@@ -1,0 +1,101 @@
+{
+  "table": "search_vectors",
+  "schema": {
+    "version": 1,
+    "default_type": "doc",
+    "document_schemas": {
+      "doc": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    }
+  },
+  "indexes": [
+    {
+      "name": "dv",
+      "kind": "dense_vector",
+      "config_json": "{\"field\": \"embedding\", \"dims\": 2, \"metric\": \"l2_squared\", \"external\": true}"
+    },
+    {
+      "name": "sv",
+      "kind": "sparse_vector",
+      "config_json": "{\"field\": \"sparse_embedding\", \"external\": true}"
+    }
+  ],
+  "batch": {
+    "inserts": {
+      "v1": {
+        "thread_id": "t1",
+        "body": "alpha memory",
+        "_embeddings": {
+          "dv": [
+            1.0,
+            0.0
+          ],
+          "sv": {
+            "indices": [
+              7,
+              42
+            ],
+            "values": [
+              1.5,
+              0.5
+            ]
+          }
+        }
+      },
+      "v2": {
+        "thread_id": "t2",
+        "body": "beta history",
+        "_embeddings": {
+          "dv": [
+            0.0,
+            1.0
+          ],
+          "sv": {
+            "indices": [
+              42
+            ],
+            "values": [
+              0.5
+            ]
+          }
+        }
+      }
+    },
+    "sync_level": "write"
+  },
+  "history": {
+    "version": 1,
+    "default_type": "doc",
+    "document_schemas": {
+      "doc": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "thread_id": {
+              "type": "string"
+            },
+            "body": {
+              "type": "string"
+            },
+            "payload": {
+              "type": "object",
+              "nullable": true
+            }
+          }
+        }
+      }
+    }
+  }
+}

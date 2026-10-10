@@ -837,6 +837,9 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
         if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
             guard.entry_error = capi.mapError(err);
         };
+        if (!pinned and guard.entry_error == null) @import("sql_ddl.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
         return guard;
     }
     const effective_access = if (lock_handle.embedded_path != null) HandleAccess.exclusive else access;
@@ -856,6 +859,10 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
     const guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = effective_access };
     if (lock_handle.embedded_path != null) {
         @import("sql_commit.zig").recover(lock_handle) catch {
+            guard.leave();
+            return null;
+        };
+        @import("sql_ddl.zig").recover(lock_handle) catch {
             guard.leave();
             return null;
         };
@@ -2227,7 +2234,7 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
 
 pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     const alloc = std.heap.c_allocator;
-    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true });
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
     errdefer db.close();
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
@@ -2533,6 +2540,7 @@ pub fn openLiteHandleAllocWithRuntime(
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
         .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
+        .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -2628,6 +2636,7 @@ pub fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = !lite,
+        .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -5263,6 +5272,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     }
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
+    try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit }) catch |err| {
         if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {

@@ -22277,6 +22277,17 @@ pub const DB = struct {
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !?u64 {
         if (self.core.schema) |current_schema| {
             if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            // A new epoch cannot reinterpret retained rows or index keys under
+            // a different SQL domain. Explicit typed conversion belongs to the
+            // staged rewrite path, not ordinary metadata publication.
+            if (current_schema.storage_mode == .relational) for (current_schema.relational_columns) |previous| {
+                for (next_schema.relational_columns) |next| {
+                    if (std.mem.eql(u8, previous.path, next.path) and
+                        (previous.sql_element_type != next.sql_element_type or
+                            !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(previous.numeric_modifier, next.numeric_modifier)))
+                        return error.InvalidSchemaUpdateRequest;
+                }
+            };
             // Attaching/detaching an external base must never hide or resurrect
             // native rows under the same identity. Create a new table instead.
             if ((current_schema.external_base_source == null) != (next_schema.external_base_source == null)) return error.InvalidSchemaUpdateRequest;
@@ -22357,7 +22368,13 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        return self.setSchemaJsonMode(alloc, schema_json, null);
+        return self.setSchemaJsonMode(alloc, schema_json, null, null);
+    }
+
+    /// SQL schema changes pin the version used by the pure DDL translator.
+    /// The prepared schema epoch is checked again at atomic publication.
+    pub fn compareAndSetSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8, expected_version: u32) !void {
+        return self.setSchemaJsonMode(alloc, schema_json, null, expected_version);
     }
 
     pub const PublishedChildSchema = struct {
@@ -22780,10 +22797,10 @@ pub const DB = struct {
         // old→new catalog comparison; the apply-locked check below still
         // closes the race with another entry.
         if (!publication.native and try self.orderedMutationAlreadyApplied(publication.ordered_receipt)) return;
-        return self.setSchemaJsonMode(alloc, schema_json, publication);
+        return self.setSchemaJsonMode(alloc, schema_json, publication, null);
     }
 
-    fn setSchemaJsonMode(self: *DB, alloc: Allocator, schema_json: []const u8, publication: ?PublishedChildSchema) !void {
+    fn setSchemaJsonMode(self: *DB, alloc: Allocator, schema_json: []const u8, publication: ?PublishedChildSchema, expected_version: ?u32) !void {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -22871,6 +22888,8 @@ pub const DB = struct {
         }
         var prepared_schema = if (publication != null)
             try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count])
+        else if (expected_version) |expected|
+            try self.core.prepareSchemaMetadataAtVersion(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count], expected)
         else
             try self.core.prepareSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count]);
         defer prepared_schema.deinit();
@@ -29182,6 +29201,9 @@ pub const DB = struct {
         cancellation: types.CancellationToken = .none,
         max_windows_per_index: usize = 0,
         deadline_ns: ?u64 = null,
+        /// Explicit idle calls drain all relational work. A borrowed writer
+        /// advances one fair page and returns its remaining debt to its owner.
+        drain_relational_indexes: bool = true,
         /// Run the foreground enrichment catch-up pass to full completion
         /// instead of bounding it at the request-visibility default
         /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
@@ -30425,6 +30447,51 @@ pub const DB = struct {
         return collected or validated;
     }
 
+    /// Foreground idle maintenance uses the same bounded, fair pages
+    /// as the native worker. A clean sweep, rather than one no-work slice,
+    /// proves that every current index has been considered.
+    pub fn runRelationalIndexMaintenanceUntilIdle(self: *DB, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const sweep = &self.local_execution.relational_index_maintenance_sweep;
+        sweep.request();
+        var last_progress = platform_time.monotonicNs();
+        while (sweep.isPending()) {
+            try ensureSnapshotActive(cancellation);
+            const now = platform_time.monotonicNs();
+            if (deadline_ns) |deadline| if (now >= deadline) return error.DeadlineExceeded;
+            if (self.run_until_idle_no_progress_timeout_ns != 0 and now -| last_progress >= self.run_until_idle_no_progress_timeout_ns) return error.RunUntilIdleNoProgress;
+            if (try self.runRelationalIndexMaintenancePass()) {
+                last_progress = platform_time.monotonicNs();
+            } else if (sweep.isPending()) {
+                const io = self.backend_runtime.io() orelse return error.UnsupportedOperation;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    }
+
+    /// Admission depends only on these index identities. Do not spend its
+    /// deadline on unrelated builds, CHECK validation, or index reclamation.
+    /// Each round gives every required building index one bounded page.
+    pub fn ensureRelationalIndexesReady(self: *DB, names: []const []const u8, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        while (true) {
+            try ensureSnapshotActive(cancellation);
+            var pending = false;
+            for (names) |name| {
+                switch ((try self.relationalIndexBuildStatus(name)).state) {
+                    .ready => continue,
+                    .failed => return error.RelationalIndexNotReady,
+                    .building => {},
+                }
+                if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                try ensureSnapshotActive(cancellation);
+                try self.buildRelationalIndexStep(name, .{});
+                pending = true;
+            }
+            if (!pending) return;
+        }
+    }
+
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
         const started = self.independentMaintenanceNowNs();
         // Artifact repair can keep the shared worker on its active cadence;
@@ -30639,6 +30706,12 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
         try self.drainScheduledTextMerges();
         try self.runArtifactRepairMetadataMaintenanceUntilIdle();
+        if (options.drain_relational_indexes) {
+            try self.runRelationalIndexMaintenanceUntilIdle(options.cancellation, options.deadline_ns);
+        } else {
+            try ensureSnapshotActive(options.cancellation);
+            _ = try self.runRelationalIndexMaintenancePass();
+        }
         // Preserve the ordinary bounded maintenance pass at the lifecycle
         // boundary: besides posting repair it advances tree-link repair,
         // posting checkpoints, and quiescent vector-block publication.
@@ -31105,6 +31178,14 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
     ) !void {
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
+    }
+
+    /// A Lite background turn borrows the file's writer lease. Return pending
+    /// relational debt after one page so its caller can release that lease
+    /// before another turn; explicit runUntilIdle still proves full coverage.
+    pub fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
+        try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
+        return self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -38184,6 +38265,19 @@ pub const DB = struct {
     pub const QueryReadLease = struct {
         db: *DB,
         row_policy_lease: row_policy_gate_mod.Gate.Lease,
+
+        /// Capture a primary typed reader under this lease's existing apply
+        /// fence. Do not recursively acquire the fence behind a queued writer.
+        pub fn relationalRows(self: *const QueryReadLease, alloc: Allocator, fields: []const []const u8, schema_version: u32) !RelationalRows.Reader {
+            var view = self.db.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
+            var reader = try RelationalRows.Reader.open(alloc, self.db.core.store, view, null, .{
+                .fields = fields,
+                .expected_schema_version = schema_version,
+            }, currentTimeNs());
+            reader.row_policy_lease = self.row_policy_lease.clone();
+            return reader;
+        }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
             const db = self.db;
@@ -64085,6 +64179,46 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
     try std.testing.expectEqual(@as(u64, 0), stats.dirty_ranges_read);
     try std.testing.expect(db.relational_column_maintenance.ranges_merged.load(.monotonic) >= 3);
     try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > 0);
+}
+
+test "relational index system NUMERIC cold column projections preserve precision scale and logical hashes" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.initFast("numeric-columns");
+    defer directory.cleanup();
+    const backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var writes: [32]types.BatchWrite = undefined;
+    const documents = [_][]const u8{
+        "{\"n\":123456789012345678901234567890.00001}",
+        "{\"n\":1.2000}",
+        "{\"n\":\"NaN\"}",
+        "{\"n\":null}",
+    };
+    for (&writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = documents[i % documents.len] };
+    try db.batch(.{ .writes = &writes });
+    const options: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .include_content_hashes = true };
+    var before = try db.scan(alloc, "", "", options);
+    defer before.deinit(alloc);
+    try drainTestRelationalMaintenance(&db);
+    db.close();
+    db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    var stats: types.ColumnarScanStats = .{};
+    var projected_options = options;
+    projected_options.columnar_stats = &stats;
+    var after = try db.scan(alloc, "", "", projected_options);
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, writes.len), after.documents.len);
+    try std.testing.expectEqualDeep(before.documents, after.documents);
+    try std.testing.expectEqualDeep(before.hashes, after.hashes);
+    try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
 }
 
 test "relational columnar clean coalescing preserves typed cells without primary reads" {

@@ -19,6 +19,10 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const Value = std.json.Value;
 
+test {
+    _ = @import("schema_expression.zig");
+}
+
 fn value(alloc: std.mem.Allocator, input: anytype) !Value {
     return std.json.parseFromSliceLeaky(Value, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
 }
@@ -45,6 +49,82 @@ fn constraintExists(schema: Value, name: []const u8) bool {
     return false;
 }
 
+fn indexOwned(unique: Value) bool {
+    if (unique != .object) return false;
+    const origin = unique.object.get("origin") orelse return false;
+    return origin == .string and std.mem.eql(u8, origin.string, "index");
+}
+
+fn indexOwnershipNamespaces(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try value(a, .{ .storage_mode = "relational", .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{
+        .type = "object",
+        .properties = .{ .id = .{ .type = "integer" }, .email = .{ .type = "keyword" }, .tenant_id = .{ .type = "keyword" }, .status = .{ .type = "keyword" } },
+        .additionalProperties = false,
+    } } } });
+    const compiler = @import("compiler.zig");
+    for ([_][]const u8{
+        "ALTER TABLE items ADD CONSTRAINT named_id UNIQUE (id)",
+        "CREATE UNIQUE INDEX email_key ON items (email)",
+        "CREATE UNIQUE INDEX partial_email ON items (email) WHERE status='active'",
+        "CREATE UNIQUE INDEX folded_email ON items (lower(email))",
+        "CREATE UNIQUE INDEX tenant_folded_email ON items (tenant_id,lower(email))",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    for (schema.object.getPtr("relational_indexes").?.array.items) |*index| {
+        // Descriptions are editable display metadata, not ownership evidence.
+        try index.object.put(a, "description", .{ .string = "edited by operator" });
+        const name = index.object.get("name").?.string;
+        const uniques = schema.object.get("unique_constraints").?.array.items;
+        try std.testing.expect(indexOwned(uniques[named(uniques, name, "name").?]));
+        for ([_][]const u8{ "DROP", "VALIDATE" }) |action| {
+            const before = try std.json.Stringify.valueAlloc(a, schema, .{});
+            var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "ALTER TABLE items {s} CONSTRAINT {s}", .{ action, name }), .{});
+            defer compiled.deinit();
+            try std.testing.expectError(error.SqlConstraintNotFound, apply(a, &schema, compiled.statement.catalog_ddl));
+            try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+        }
+    }
+    // The namespace publisher consumes the same canonical definitions as
+    // storage, not a second SQL-name interpretation or display-label parser.
+    var cut = try @import("../system_catalog/relation_names.zig").TableCut.init(allocator, .{
+        .namespace_id = 2,
+        .table_id = 7,
+        .name = "items",
+        .schema_json = try std.json.Stringify.valueAlloc(a, schema, .{}),
+    });
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 6), cut.claims.len);
+    for (cut.claims) |claim| {
+        const expected: @import("../system_catalog/relation_names.zig").Kind = if (std.mem.eql(u8, claim.key.name, "items")) .table else if (std.mem.eql(u8, claim.key.name, "named_id")) .constraint_index else .index;
+        try std.testing.expectEqual(expected, claim.owner.kind);
+    }
+    for ([_][]const u8{ "email_key", "partial_email", "folded_email", "tenant_folded_email" }) |name| {
+        // This is the table-bound schema transition. PostgreSQL's unqualified
+        // DROP INDEX additionally needs namespace/catalog owner resolution.
+        try std.testing.expect(try apply(a, &schema, .{ .kind = .table, .action = .alter_schema, .name = .{ .table = "items" }, .schema_change = .{ .drop_index = name } }));
+        try std.testing.expect(named(schema.object.get("unique_constraints").?.array.items, name, "name") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), schema.object.get("unique_constraints").?.array.items.len);
+    // A spoofed legacy display label must not manufacture a paired owner.
+    var ordinary = try compiler.compile(a, "CREATE INDEX display_only ON items (id)", .{});
+    defer ordinary.deinit();
+    try std.testing.expect(try apply(a, &schema, ordinary.statement.catalog_ddl));
+    try schema.object.getPtr("relational_indexes").?.array.items[0].object.put(a, "description", .{ .string = "SQL UNIQUE INDEX" });
+    try std.testing.expect(try apply(a, &schema, .{ .kind = .table, .action = .alter_schema, .name = .{ .table = "items" }, .schema_change = .{ .drop_index = "display_only" } }));
+    try std.testing.expectEqualStrings("named_id", schema.object.get("unique_constraints").?.array.items[0].object.get("name").?.string);
+}
+
+test "SQL unique index ownership is independent of named constraint and display namespaces" {
+    try indexOwnershipNamespaces(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, indexOwnershipNamespaces, .{});
+}
+
 fn hasPrimary(schema: Value) bool {
     const constraints = schema.object.get("unique_constraints") orelse return false;
     if (constraints != .array) return false;
@@ -65,8 +145,9 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
     if (document.* != .object) return error.InvalidSqlBackendResponse;
     const row = document.object.getPtr("schema") orelse return error.InvalidSqlBackendResponse;
     if (row.* != .object) return error.InvalidSqlBackendResponse;
-    const properties = row.object.getPtr("properties") orelse return error.InvalidSqlBackendResponse;
-    if (properties.* != .object) return error.InvalidSqlBackendResponse;
+    // Adding required can relocate row slots, but not this nested map's data.
+    const properties = row.object.get("properties") orelse return error.InvalidSqlBackendResponse;
+    if (properties != .object) return error.InvalidSqlBackendResponse;
     if (columns.len == 0) return error.InvalidSqlSyntax;
     // Validate the entire key before changing either the column shape or its
     // uniqueness declaration. A failed composite key cannot leave a prefix
@@ -91,6 +172,21 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
 }
 
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    var staging = std.heap.ArenaAllocator.init(alloc);
+    defer staging.deinit();
+    var candidate = try value(staging.allocator(), schema.*);
+    const changed = try applyCandidate(staging.allocator(), &candidate, ddl);
+    // Candidate allocations, including failed binding scratch, are never
+    // retained by the caller. Successful result storage belongs to its schema
+    // arena, as do the other JSON schema-builder operations in this module.
+    if (changed) schema.* = try value(alloc, candidate);
+    return changed;
+}
+
+/// In-place builder for an already unpublished schema, allowing CREATE's
+/// constraint batch to avoid cloning the entire schema for every constraint.
+pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    if (ddl.kind == .index and ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
     switch (change) {
@@ -98,17 +194,9 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             for ([_][]const u8{ "unique_constraints", "checks", "foreign_keys" }) |key| {
                 const constraints = try list(schema, alloc, key);
                 if (named(constraints.items, constraint_name, "name")) |position| {
+                    if (std.mem.eql(u8, key, "unique_constraints") and indexOwned(constraints.items[position])) return error.SqlConstraintNotFound;
                     if (change == .drop_constraint) {
                         _ = constraints.orderedRemove(position);
-                        if (std.mem.eql(u8, key, "unique_constraints")) {
-                            const indexes = try list(schema, alloc, "relational_indexes");
-                            if (named(indexes.items, constraint_name, "name")) |index| {
-                                const description = indexes.items[index].object.get("description");
-                                if (description) |text| if (text == .string and std.mem.eql(u8, text.string, "SQL UNIQUE INDEX")) {
-                                    _ = indexes.orderedRemove(index);
-                                };
-                            }
-                        }
                     }
                     return true;
                 }
@@ -150,12 +238,12 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                 const nulls: []const u8 = if (key.nulls_first orelse key.descending) "first" else "last";
                 if (key.expression) |expression| {
                     const lowered = try @import("schema_expression.zig").lowerTyped(alloc, schema.*, expression, null);
-                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
+                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.element_type == .numeric) "numeric" else if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 } else try keys.append(alloc, try value(alloc, .{ .column = key.field, .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 try columns.append(alloc, key.field);
             }
-            // The description marks ownership of the paired uniqueness rule;
-            // native catalog validation and the entire update share one CAS.
+            // Explicit unique-owner provenance, not the display description,
+            // links this index to its rule. Both publish in one schema CAS.
             const predicates = if (index.predicate) |predicate| try @import("schema_expression.zig").lowerIndexPredicate(alloc, schema.*, predicate) else &.{};
             try indexes.append(try value(alloc, .{ .name = index.name, .keys = keys.items, .include_columns = index.include_columns, .where = predicates, .description = if (index.unique) "SQL UNIQUE INDEX" else "SQL INDEX" }));
             if (index.unique) {
@@ -165,9 +253,9 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                     if (key.expression != null) break true;
                 } else false;
                 try constraints.append(if (has_expression)
-                    try value(alloc, .{ .name = index.name, .keys = keys.items, .where = predicates })
+                    try value(alloc, .{ .name = index.name, .origin = "index", .keys = keys.items, .where = predicates })
                 else
-                    try value(alloc, .{ .name = index.name, .columns = columns.items, .where = predicates }));
+                    try value(alloc, .{ .name = index.name, .origin = "index", .columns = columns.items, .where = predicates }));
             }
         },
         .drop_index => |index_name| {
@@ -176,14 +264,11 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                 if (ddl.conditional) return false;
                 return error.SqlIndexNotFound;
             };
-            const description = indexes.items[position].object.get("description");
-            const owned_unique = if (description) |d| d == .string and std.mem.eql(u8, d.string, "SQL UNIQUE INDEX") else false;
             _ = indexes.orderedRemove(position);
-            if (owned_unique) {
-                const constraints = try list(schema, alloc, "unique_constraints");
-                const unique_position = named(constraints.items, index_name, "name") orelse return error.InvalidSqlBackendResponse;
+            const constraints = try list(schema, alloc, "unique_constraints");
+            if (named(constraints.items, index_name, "name")) |unique_position| if (indexOwned(constraints.items[unique_position])) {
                 _ = constraints.orderedRemove(unique_position);
-            }
+            };
         },
         else => {
             const default_type = schema.object.get("default_type") orelse return error.InvalidSqlBackendResponse;
@@ -200,20 +285,32 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             if (std.mem.eql(u8, column_name, "_id")) return error.UnsupportedSqlShape;
             if (change == .add_column) {
                 if (properties.object.contains(column_name)) return error.DuplicateSqlColumn;
-                const single = try @import("ddl_runtime.zig").createSchemaAlloc(alloc, .{ .table = ddl.name, .columns = &.{change.add_column} });
-                const generated = try std.json.parseFromSliceLeaky(Value, alloc, single, .{ .parse_numbers = false });
-                const definition = generated.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
-                try properties.object.put(alloc, try alloc.dupe(u8, column_name), definition.object.get("properties").?.object.get(column_name).?);
+                const column = change.add_column;
+                if (column.default_expression != null and column.generated_expression != null) return error.InvalidSqlSyntax;
+                try properties.object.put(alloc, try alloc.dupe(u8, column_name), try @import("ddl_runtime.zig").columnProperty(alloc, column, column.nullable));
                 if (!change.add_column.nullable) {
                     const required = try list(row, alloc, "required");
                     try required.append(.{ .string = try alloc.dupe(u8, column_name) });
                 }
-                if (change.add_column.default_value != null) {
+                if (column.default_expression) |expression| {
                     const defaults = try list(schema, alloc, "column_defaults");
-                    try defaults.append(generated.object.get("column_defaults").?.array.items[0]);
+                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, false);
+                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
+                }
+                if (column.generated_expression) |expression| {
+                    const generated = try list(schema, alloc, "generated_columns");
+                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, true);
+                    try generated.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
                 }
             } else {
                 const property = properties.object.get(column_name) orelse return error.UndefinedColumn;
+                if (schema.object.getPtr("generated_columns")) |generated| {
+                    if (generated.* != .array) return error.InvalidSqlBackendResponse;
+                    if (named(generated.array.items, column_name, "column")) |i| {
+                        if (change != .drop_column) return error.InvalidSqlSyntax;
+                        _ = generated.array.orderedRemove(i);
+                    }
+                }
                 if (change == .drop_column) {
                     _ = properties.object.swapRemove(column_name);
                     if (row.object.getPtr("required")) |required| {
@@ -223,22 +320,52 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                         };
                     }
                 }
-                const defaults = try list(schema, alloc, "column_defaults");
-                if (named(defaults.items, column_name, "column")) |i| _ = defaults.orderedRemove(i);
+                var replacement: ?Value = null;
                 if (change == .set_default) {
-                    const type_name = property.object.get("type").?.string;
-                    const format = property.object.get("format") orelse .null;
-                    const column_type: ast.ColumnType = if (format == .string and std.mem.eql(u8, format.string, "uuid") and
-                        (std.mem.eql(u8, type_name, "keyword") or std.mem.eql(u8, type_name, "string") or std.mem.eql(u8, type_name, "text")))
-                        .uuid
-                    else if (std.mem.eql(u8, type_name, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, type_name) orelse return error.UnsupportedSqlShape;
-                    const literal = try @import("describe.zig").bindLiteral(alloc, change.set_default.value, column_type);
-                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } }));
+                    const column = try @import("schema_columns.zig").column(column_name, property);
+                    const element = column.element_type;
+                    const column_type = column.type;
+                    const expression = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, change.set_default.expression, .{ .name = column_name, .type = column_type, .element_type = element }, false);
+                    replacement = try value(alloc, .{ .column = column_name, .expression = expression });
                 }
+                const defaults = try list(schema, alloc, "column_defaults");
+                if (replacement != null) try defaults.ensureUnusedCapacity(1);
+                if (named(defaults.items, column_name, "column")) |i| _ = defaults.orderedRemove(i);
+                if (replacement) |entry| defaults.appendAssumeCapacity(entry);
             }
         },
     }
     return true;
+}
+
+fn primaryKeyGrowth(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try value(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{
+        .type = "object",
+        .properties = .{ .id = .{ .type = "integer", .nullable = true }, .tenant = .{ .type = "keyword" } },
+        .additionalProperties = false,
+    } } } });
+    try std.testing.expect(try apply(a, &schema, .{
+        .kind = .table,
+        .action = .alter_schema,
+        .name = .{ .table = "items" },
+        .schema_change = .{ .add_unique = .{ .name = "items_pk", .columns = &.{ "tenant", "id" }, .primary = true } },
+    }));
+    const row = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
+    const required = row.object.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), required.len);
+    for ([_][]const u8{ "tenant", "id" }, required) |column, entry| {
+        try std.testing.expectEqualStrings(column, entry.string);
+        try std.testing.expect(!row.object.get("properties").?.object.get(column).?.object.get("nullable").?.bool);
+    }
+    try std.testing.expect(hasPrimary(schema));
+}
+
+test "primary key schema lowering retains column ownership across row map growth" {
+    try primaryKeyGrowth(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, primaryKeyGrowth, .{});
 }
 
 test "primary key schema lowering rejects deferred timing and empty keys" {

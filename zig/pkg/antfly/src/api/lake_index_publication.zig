@@ -235,7 +235,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     defer fs_artifacts.deinit();
     var artifact_store = fs_artifacts.artifactStore();
     const store_identity: catalog.Digest = @splat(4);
-    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
+    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
     const pending_bytes = try begin(a, std.testing.io, table, &source, store_identity, .{}, 100, 20);
     defer a.free(pending_bytes);
     var pending = table;
@@ -274,6 +274,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         var text_arena = std.heap.ArenaAllocator.init(a);
         defer text_arena.deinit();
         const root = try native_text.loadRoot(text_arena.allocator(), artifact_store, declaration.artifact, .none, null);
+        try std.testing.expect(root.stored_projection);
         try std.testing.expectEqualStrings("body", root.binding.column_bindings[0]);
         var writer = try native_text.loadWriter(a, artifact_store, root, .none, null, null);
         defer writer.deinit();
@@ -282,6 +283,11 @@ test "external lake native publication builds scoped text artifacts and fences e
         const results = try snapshot.search(a, "body", &.{"first"}, 10);
         defer a.free(results.hits);
         try std.testing.expectEqual(@as(u32, 1), results.total_count);
+        const stored = (try snapshot.storedDocDecompressed(a, results.hits[0].doc_id)).?;
+        defer a.free(stored.data);
+        var parsed_source = try std.json.parseFromSlice(std.json.Value, a, stored.data, .{});
+        defer parsed_source.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, parsed_source.value.object.get("body").?.string, "first") != null);
         var cache_io = std.Io.Threaded.init(a, .{});
         defer cache_io.deinit();
         var cache = local.serverless_query_lake_serving_cache.Cache.init(a);

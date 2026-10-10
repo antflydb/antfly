@@ -6586,7 +6586,7 @@ fn freeHighlightRequest(alloc: std.mem.Allocator, value: db_mod.types.HighlightR
     if (value.fields.len > 0) alloc.free(value.fields);
 }
 
-fn highlightsJsonValue(
+pub fn highlightsJsonValue(
     alloc: std.mem.Allocator,
     items: []const db_mod.types.HighlightedField,
 ) !?std.json.ArrayHashMap([]const metadata_openapi.HighlightFragment) {

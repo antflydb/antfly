@@ -32,6 +32,12 @@ const TableRecord = @import("../common/topology_records.zig").TableRecord;
 const RangeRecord = @import("../common/topology_records.zig").RangeRecord;
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
+/// Select repair planning as the mutation closure grows. Native preparation
+/// still validates and locks each participant's exact failed checkpoint.
+pub const RepairAdmission = struct {
+    ptr: *anyopaque,
+    eligible: *const fn (*anyopaque, Allocator, []const u8, u32) anyerror!bool,
+};
 var preparation_diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
 
 /// ScanOptions has a platform-monotonic deadline but no borrowed clock. Move
@@ -247,7 +253,9 @@ const Builder = struct {
     partial_rechecks: std.ArrayList(FinalPartial) = .empty,
     prepared_bytes: usize = 0,
     control: RequestContext = .{},
-    repair_table: ?[]const u8 = null,
+    repair_tables: []const []const u8 = &.{},
+    repair_admission: ?RepairAdmission = null,
+    discovered_repairs: std.StringHashMapUnmanaged(bool) = .empty,
     statement: bool = false,
     constraint_timing: []const native.ConstraintTiming = &.{},
     previous: []const contract.TableCommitRequest = &.{},
@@ -265,7 +273,16 @@ const Builder = struct {
     }
 
     fn repairing(self: *const Builder, name: []const u8) bool {
-        return if (self.repair_table) |target| std.mem.eql(u8, target, name) else false;
+        for (self.repair_tables) |target| if (std.mem.eql(u8, target, name)) return true;
+        return self.discovered_repairs.get(name) orelse false;
+    }
+
+    fn admitRepair(self: *Builder, table: *Loaded) !void {
+        const admission = self.repair_admission orelse return;
+        if (self.repairing(table.name) or self.discovered_repairs.contains(table.name)) return;
+        try self.control.ensureActive();
+        const eligible = try admission.eligible(admission.ptr, self.alloc, table.name, table.view.version());
+        try self.discovered_repairs.put(self.alloc, table.name, eligible);
     }
 
     fn lookup(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions) !?reads.LookupResponse {
@@ -568,6 +585,9 @@ const Builder = struct {
     }
 
     fn enqueue(self: *Builder, item: *Work) !void {
+        // Read-only FK parents and reference observations keep ordinary
+        // coverage checks. Only scheduled primary mutations admit repairs.
+        try self.admitRepair(item.table);
         // Prior expansions may still be traversed by a cyclic cascade. Their
         // storage lives in the request arena; only invalidate the cache here.
         item.expansion = null;
@@ -748,7 +768,11 @@ const Builder = struct {
                 // statement overlay may already contain this transaction's
                 // writes; native preparation validates it before any writes.
                 .compare_claim => {},
-                .release, .repair_release => {
+                .release, .repair_release => |owner| {
+                    if (command.operation == .repair_release) {
+                        const current = state.claim orelse continue;
+                        if (!std.mem.eql(u8, current.parent_table, owner.parent_table) or !std.mem.eql(u8, current.parent_key, owner.parent_key)) continue;
+                    }
                     if (validate and state.references.items.len != 0) return error.ForeignKeyReferenced;
                     state.claim = null;
                 },
@@ -953,19 +977,7 @@ const Builder = struct {
             const generation = (table.catalog.find(.foreign_key, definition.name) orelse return error.PreparedGenerationChanged).generation;
             if (retirement) |selection| if (!selection.includes(generation)) continue;
             const parent = try self.load(definition.parent_table);
-            const target = target: {
-                for (parent.uniques) |unique| {
-                    if (unique.keys.len != 0 or unique.where.len != 0 or unique.deferrable) continue;
-                    if (unique.columns.len != definition.parent_columns.len) continue;
-                    var same = true;
-                    for (unique.columns, definition.parent_columns) |left, right| if (!std.mem.eql(u8, left, right)) {
-                        same = false;
-                        break;
-                    };
-                    if (same) break :target unique;
-                }
-                return error.ForeignKeyTargetNotUnique;
-            };
+            const target = try @import("../schema/relational_foreign_key_target.zig").resolveUnique(parent.uniques, definition.parent_columns);
             var statement_definition = definition;
             if (self.statement) statement_definition.timing = if (native.ConstraintTiming.isDeferred(self.constraint_timing, generation, definition.deferrable, definition.timing)) .deferred else .immediate;
             // A deferred MATCH FULL mixed-null value is an outstanding
@@ -1025,29 +1037,29 @@ pub fn prepare(alloc: Allocator, source: reads.TableReadSource, metadata: []cons
 }
 
 pub fn prepareControlled(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext) !Prepared {
-    return prepareMode(alloc, source, metadata, requests, request_control, null);
+    return prepareMode(alloc, source, metadata, requests, request_control, &.{});
 }
 
-fn prepareMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8) !Prepared {
-    return prepareModeInternal(alloc, source, metadata, requests, request_control, repair_table, false, &.{}, false);
+fn prepareMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8) !Prepared {
+    return prepareModeInternal(alloc, source, metadata, requests, request_control, repair_tables, false, &.{}, false);
 }
 
-fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool) !Prepared {
-    return prepareModeWithTiming(alloc, source, metadata, requests, request_control, repair_table, statement, previous, validate_statement, &.{});
+fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool) !Prepared {
+    return prepareModeWithTiming(alloc, source, metadata, requests, request_control, repair_tables, statement, previous, validate_statement, &.{});
 }
 
-fn prepareModeRouted(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool) !Prepared {
-    return prepareModeRoutedWithTiming(alloc, source, metadata, ranges, requests, request_control, repair_table, statement, previous, validate_statement, &.{});
+fn prepareModeRouted(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool) !Prepared {
+    return prepareModeRoutedWithTiming(alloc, source, metadata, ranges, requests, request_control, repair_tables, statement, previous, validate_statement, &.{}, null);
 }
 
-fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming) !Prepared {
-    return prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, requests, request_control, repair_table, statement, previous, validate_statement, modes);
+fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming) !Prepared {
+    return prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, requests, request_control, repair_tables, statement, previous, validate_statement, modes, null);
 }
 
-fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_table: ?[]const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming) !Prepared {
+fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_table = repair_table, .statement = statement, .previous = previous, .constraint_timing = modes };
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
@@ -1070,7 +1082,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
         defer declaration.deinit(builder.alloc);
-        if (declaration.unique_constraints == null and declaration.foreign_keys == null and (repair_table == null or declaration.checks == null)) continue;
+        if (declaration.unique_constraints == null and declaration.foreign_keys == null and ((repair_tables.len == 0 and repair_admission == null) or declaration.checks == null)) continue;
         if (request.transforms.len != 0) return error.UnsupportedOperation;
         const table = try builder.load(request.table_name);
         if (request.relational_integrity_generation_set) |expected| {
@@ -1172,6 +1184,7 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
     for (builder.partial_rechecks.items) |pending| {
         var dependency = pending.dependency;
         dependency.after = pending.child.after;
+        dependency.repair = builder.repairing(pending.child.table.name);
         const child_index = try builder.outputIndex(pending.child.table.name, pending.child.table.view.version());
         try builder.appendPredicate(child_index, pending.child.key, pending.child.observed_version, pending.child.observed_digest);
         try builder.appendPartial(dependency);
@@ -1195,19 +1208,48 @@ pub fn prepareSessionStatement(alloc: Allocator, source: reads.TableReadSource, 
 }
 
 pub fn prepareSessionStatementWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, statement: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming) !Prepared {
-    var before = try prepareModeWithTiming(alloc, source, metadata, previous, control, null, true, &.{}, false, modes);
+    return prepareSessionStatementMode(alloc, source, metadata, ranges, previous, statement, control, modes, &.{}, null);
+}
+
+pub fn prepareSessionRepairs(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, statements: []const contract.TableCommitRequest, repair_tables: []const []const u8, control: RequestContext) !Prepared {
+    const all = try std.mem.concat(alloc, contract.TableCommitRequest, &.{ previous, statements });
+    defer alloc.free(all);
+    try validateRepairTargets(alloc, metadata, all, repair_tables);
+    return prepareSessionStatementMode(alloc, source, metadata, ranges, previous, statements, control, &.{}, repair_tables, null);
+}
+
+/// Preserve repair admission for previously staged mutations while admitting
+/// newly discovered cascade targets during this statement's expansion.
+pub fn prepareSessionStatementWithRepairAdmission(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, statement: []const contract.TableCommitRequest, admission: RepairAdmission, control: RequestContext) !Prepared {
+    var repairs: std.ArrayList([]const u8) = .empty;
+    defer repairs.deinit(alloc);
+    for (previous) |request| {
+        if (request.writes.len == 0 and request.deletes.len == 0) continue;
+        const version = request.relational_schema_version orelse request.schema_version orelse return error.PreparedGenerationChanged;
+        if (try admission.eligible(admission.ptr, alloc, request.table_name, version)) try repairs.append(alloc, request.table_name);
+    }
+    return prepareSessionStatementMode(alloc, source, metadata, ranges, previous, statement, control, &.{}, repairs.items, admission);
+}
+
+fn prepareSessionStatementMode(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, previous: []const contract.TableCommitRequest, statement: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming, repair_tables: []const []const u8, repair_admission: ?RepairAdmission) !Prepared {
+    var before = try prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, previous, control, repair_tables, true, &.{}, false, modes, repair_admission);
     defer before.deinit();
-    var result = try prepareModeWithTiming(alloc, source, metadata, statement, control, null, true, before.tables, true, modes);
+    var result = try prepareModeRoutedWithTiming(alloc, source, metadata, &.{}, statement, control, repair_tables, true, before.tables, true, modes, repair_admission);
     errdefer result.deinit();
     const names = try alloc.alloc([]const u8, result.tables.len);
     defer alloc.free(names);
-    for (result.tables, names) |table, *name| name.* = table.table_name;
-    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, names, control);
+    var count: usize = 0;
+    for (result.tables) |table| {
+        if (table.relational_repair) continue;
+        names[count] = table.table_name;
+        count += 1;
+    }
+    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, names[0..count], control);
     return result;
 }
 
 pub fn validateConstraintTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, control: RequestContext, modes: []const native.ConstraintTiming) !Prepared {
-    return prepareModeWithTiming(alloc, source, metadata, requests, control, null, true, &.{}, true, modes);
+    return prepareModeWithTiming(alloc, source, metadata, requests, control, &.{}, true, &.{}, true, modes);
 }
 
 pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, names: []const []const u8, deferred: bool, control: RequestContext) ![]const native.ConstraintTiming {
@@ -1229,9 +1271,14 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         // Namespace names need enumeration, but native authority reads and
         // compiled tuple plans are required only for matching declarations.
         var matches = false;
+        var named_uniques: std.StringHashMapUnmanaged(void) = .empty;
+        defer named_uniques.deinit(scratch.allocator());
         for (names) |name| {
             if (declaration.unique_constraints) |uniques| for (uniques.value) |unique| {
-                if (std.mem.eql(u8, name, unique.name)) matches = true;
+                if ((unique.origin orelse .constraint) != .index and std.mem.eql(u8, name, unique.name)) {
+                    matches = true;
+                    try named_uniques.put(scratch.allocator(), unique.name, {});
+                }
             };
             if (declaration.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign| {
                 if (std.mem.eql(u8, name, foreign.name)) matches = true;
@@ -1240,7 +1287,7 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!matches) continue;
         const table = try builder.load(record.name);
         for (names, 0..) |name, i| {
-            for (table.uniques) |unique| if (std.mem.eql(u8, name, unique.name)) {
+            for (table.uniques) |unique| if (named_uniques.contains(name) and std.mem.eql(u8, name, unique.name)) {
                 if (deferred and !unique.deferrable) return error.ConstraintNotDeferrable;
                 found[i] = true;
                 if (modes.items.len >= 4096) return error.TransactionTooLarge;
@@ -1258,6 +1305,27 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
     return modes.toOwnedSlice(alloc);
 }
 
+test "distributed txn constraint timing excludes index ownership without native reads" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedNativeRead;
+        }
+    };
+    var fake: Fake = .{};
+    const source: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"access_key","origin":"index","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = declaration }};
+    for ([_]bool{ false, true }) |deferred| {
+        try std.testing.expectError(error.SqlConstraintNotFound, resolveConstraintTiming(std.testing.allocator, source, &metadata, &.{"access_key"}, deferred, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
 pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
 
 /// Request-owned arbiter proof. SQL carries this opaque envelope to its native
@@ -1270,11 +1338,23 @@ pub const ConflictOwner = struct {
     guards: []const planner.storage.Command,
 };
 
+pub const ConflictTarget = struct {
+    columns: []const []const u8 = &.{},
+    expressions: []const native.RelationalIndexKey = &.{},
+    predicate: []const native.UniquePredicate = &.{},
+    constraint_name: ?[]const u8 = null,
+};
+
 pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, columns: []const []const u8, expressions: []const native.RelationalIndexKey, arbiter_predicate: []const native.UniquePredicate, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    return resolveConflictTargetOwners(alloc, source, metadata, ranges, name, version, .{ .columns = columns, .expressions = expressions, .predicate = arbiter_predicate }, writes, previous, control);
+}
+
+pub fn resolveConflictTargetOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    if (target.constraint_name != null and (target.columns.len != 0 or target.expressions.len != 0 or target.predicate.len != 0)) return error.InvalidIntegrityDefinition;
     if (writes.len > 4096) return error.TransactionTooLarge;
     // Absence is useful only after EVERY current owner proves unique coverage.
     try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, &.{name}, control);
-    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(alloc, source, metadata, previous, control, null, true, &.{}, false) else null;
+    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(alloc, source, metadata, previous, control, &.{}, true, &.{}, false) else null;
     defer if (before) |*prepared| prepared.deinit();
     var builder: Builder = .{ .alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{} };
     defer builder.deinit();
@@ -1282,7 +1362,7 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
     if (table.view.version() != version) return error.PreparedGenerationChanged;
     var plan = try builder.bindingPlanSelected(table, true, false);
     defer plan.deinit();
-    const selected = try plan.bindConflictExpressions(alloc, columns, expressions, arbiter_predicate);
+    const selected = if (target.constraint_name) |constraint_name| try plan.bindNamedConflict(alloc, constraint_name) else try plan.bindConflictExpressions(alloc, target.columns, target.expressions, target.predicate);
     defer alloc.free(selected);
     const owners = try alloc.alloc(ConflictOwner, writes.len);
     const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
@@ -1313,7 +1393,7 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
             if (logical.claim) |claim| {
                 if (claim.state != .live) return error.ForeignKeyActionInProgress;
                 if (!std.mem.eql(u8, claim.parent_table, name) or !std.mem.eql(u8, claim.tuple, item.tuple)) return error.InvalidIntegrityRecord;
-                if (columns.len != 0) if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
+                if (target.constraint_name != null or target.columns.len != 0 or target.expressions.len != 0) if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
                 if (owner.key == null) owner.key = try alloc.dupe(u8, claim.parent_key);
             }
             if (owner.identity == null) owner.identity = identity.*;
@@ -1322,6 +1402,20 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
     return owners;
 }
 pub const BackfillPhase = enum { unique, foreign_key, check };
+
+test "distributed txn session repair preserves a duplicate tuples existing owner" {
+    var builder: Builder = .{ .alloc = std.testing.allocator, .source = undefined, .metadata = &.{} };
+    const address = try planner.storage.Address.init(@splat(1), "tuple");
+    var state: Builder.StatementState = .{ .claim = .{ .tuple = "tuple", .parent_table = "items", .parent_key = "a", .schema_version = 1 } };
+    const foreign_release: planner.storage.Command = .{ .address = address, .operation = .{ .repair_release = .{ .parent_table = "items", .parent_key = "b" } } };
+    try builder.applyStatementCommands(&state, address, &.{foreign_release}, true);
+    try std.testing.expectEqualStrings("a", state.claim.?.parent_key);
+    const duplicate: planner.storage.Command = .{ .address = address, .operation = .{ .establish = .{ .tuple = "tuple", .parent_table = "items", .parent_key = "b", .schema_version = 1 } } };
+    try std.testing.expectError(error.UniqueConstraintViolation, builder.applyStatementCommands(&state, address, &.{ foreign_release, duplicate }, true));
+    const owner_release: planner.storage.Command = .{ .address = address, .operation = .{ .repair_release = .{ .parent_table = "items", .parent_key = "a" } } };
+    try builder.applyStatementCommands(&state, address, &.{owner_release}, true);
+    try std.testing.expect(state.claim == null);
+}
 
 /// A positive local proof does not imply global uniqueness: another owner's
 /// historical rows may still be unclaimed. Check every current owner once per
@@ -1407,7 +1501,7 @@ pub fn preparationError(err: anyerror) anyerror {
 
 fn prepareWithCoverageOnce(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request: RequestContext) !Prepared {
     const control = try boundedControl(request);
-    var prepared = try prepareModeRouted(alloc, source, metadata, ranges, requests, control, null, false, &.{}, false);
+    var prepared = try prepareModeRouted(alloc, source, metadata, ranges, requests, control, &.{}, false, &.{}, false);
     errdefer prepared.deinit();
     const names = try alloc.alloc([]const u8, prepared.tables.len);
     defer alloc.free(names);
@@ -1528,17 +1622,52 @@ pub fn rejectDefiniteConflicts(alloc: Allocator, source: reads.TableReadSource, 
 /// external parent still needs global UNIQUE coverage. Native prepares require
 /// failed/diagnosed activation and lock its exact checkpoint through the repair decision.
 pub fn prepareRepair(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, request: contract.TableCommitRequest, control: RequestContext) !Prepared {
-    _ = try metadataRequiresCoordination(alloc, metadata, &.{request});
-    if (!try requiresActivation(alloc, (for (metadata) |table| {
-        if (std.mem.eql(u8, table.name, request.table_name)) break table.schema_json;
-    } else return error.TableNotFound))) return error.InvalidConstraintActivation;
-    var prepared = try prepareMode(alloc, source, metadata, &.{request}, control, request.table_name);
+    return prepareRepairs(alloc, source, metadata, ranges, &.{request}, &.{request.table_name}, control);
+}
+
+/// Discover eligible repairs only when primary mutations enter the cascade
+/// closure. Other participants continue to require global UNIQUE coverage.
+pub fn prepareWithRepairAdmission(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, admission: RepairAdmission, control: RequestContext) !Prepared {
+    return prepareWithRepairAdmissionOnce(alloc, source, metadata, ranges, requests, admission, control) catch |err| return preparationError(err);
+}
+
+fn prepareWithRepairAdmissionOnce(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, admission: RepairAdmission, control: RequestContext) !Prepared {
+    var prepared = try prepareModeRoutedWithTiming(alloc, source, metadata, ranges, requests, control, &.{}, false, &.{}, false, &.{}, admission);
     errdefer prepared.deinit();
     var parents: std.ArrayList([]const u8) = .empty;
     defer parents.deinit(alloc);
-    for (prepared.tables) |table| if (!std.mem.eql(u8, table.table_name, request.table_name)) try parents.append(alloc, table.table_name);
+    for (prepared.tables) |table| if (!table.relational_repair) try parents.append(alloc, table.table_name);
     try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, parents.items, control);
     return prepared;
+}
+
+/// Repair targets keep native failed-checkpoint admission even when cascades
+/// or other explicit writes enlist additional tables in the same transaction.
+/// Every participant outside that set still requires completed UNIQUE coverage.
+pub fn prepareRepairs(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, repair_tables: []const []const u8, control: RequestContext) !Prepared {
+    try validateRepairTargets(alloc, metadata, requests, repair_tables);
+    var prepared = try prepareModeRouted(alloc, source, metadata, ranges, requests, control, repair_tables, false, &.{}, false);
+    errdefer prepared.deinit();
+    var parents: std.ArrayList([]const u8) = .empty;
+    defer parents.deinit(alloc);
+    for (prepared.tables) |table| if (!table.relational_repair) try parents.append(alloc, table.table_name);
+    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, parents.items, control);
+    return prepared;
+}
+
+fn validateRepairTargets(alloc: Allocator, metadata: []const TableRecord, requests: []const contract.TableCommitRequest, repair_tables: []const []const u8) !void {
+    if (repair_tables.len == 0) return error.InvalidConstraintActivation;
+    for (repair_tables, 0..) |name, i| {
+        for (repair_tables[0..i]) |prior| if (std.mem.eql(u8, name, prior)) return error.InvalidConstraintActivation;
+        const included = for (requests) |request| {
+            if (std.mem.eql(u8, name, request.table_name)) break true;
+        } else false;
+        if (!included) return error.InvalidConstraintActivation;
+        const schema_json = for (metadata) |table| {
+            if (std.mem.eql(u8, name, table.name)) break table.schema_json;
+        } else return error.TableNotFound;
+        if (!try requiresActivation(alloc, schema_json)) return error.InvalidConstraintActivation;
+    }
 }
 
 /// Backfill writes only globally routed derived claims/references, never the
@@ -2187,19 +2316,19 @@ test "distributed txn session statement checks immediate references and overlays
         const metadata = [_]TableRecord{ .{ .table_id = 1, .name = "p", .schema_json = parent_schema }, .{ .table_id = 2, .name = "c", .schema_json = child_schema } };
         const child = [_]contract.TableCommitRequest{.{ .table_name = "c", .writes = &.{.{ .key = "child", .value = "{\"id\":1}" }} }};
         if (deferred) {
-            var accepted = try prepareModeInternal(alloc, reader, &metadata, &child, .{}, null, true, &.{}, true);
+            var accepted = try prepareModeInternal(alloc, reader, &metadata, &child, .{}, &.{}, true, &.{}, true);
             accepted.deinit();
-        } else try std.testing.expectError(error.ForeignKeyParentMissing, prepareModeInternal(alloc, reader, &metadata, &child, .{}, null, true, &.{}, true));
+        } else try std.testing.expectError(error.ForeignKeyParentMissing, prepareModeInternal(alloc, reader, &metadata, &child, .{}, &.{}, true, &.{}, true));
         const initial = [_]contract.TableCommitRequest{ .{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }} }, child[0] };
-        var previous = try prepareModeInternal(alloc, reader, &metadata, &initial, .{}, null, true, &.{}, true);
+        var previous = try prepareModeInternal(alloc, reader, &metadata, &initial, .{}, &.{}, true, &.{}, true);
         defer previous.deinit();
         const change = [_]contract.TableCommitRequest{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":2}" }} }};
         if (comptime std.mem.eql(u8, action, "restrict")) {
-            try std.testing.expectError(error.ForeignKeyReferenced, prepareModeInternal(alloc, reader, &metadata, &change, .{}, null, true, previous.tables, true));
+            try std.testing.expectError(error.ForeignKeyReferenced, prepareModeInternal(alloc, reader, &metadata, &change, .{}, &.{}, true, previous.tables, true));
         } else if (comptime std.mem.eql(u8, action, "no_action") and !deferred) {
-            try std.testing.expectError(error.ForeignKeyParentMissing, prepareModeInternal(alloc, reader, &metadata, &change, .{}, null, true, previous.tables, true));
+            try std.testing.expectError(error.ForeignKeyParentMissing, prepareModeInternal(alloc, reader, &metadata, &change, .{}, &.{}, true, previous.tables, true));
         } else {
-            var next = try prepareModeInternal(alloc, reader, &metadata, &change, .{}, null, true, previous.tables, true);
+            var next = try prepareModeInternal(alloc, reader, &metadata, &change, .{}, &.{}, true, previous.tables, true);
             defer next.deinit();
             if (comptime std.mem.eql(u8, action, "cascade")) {
                 const generated = for (next.tables) |table| {
@@ -2207,9 +2336,9 @@ test "distributed txn session statement checks immediate references and overlays
                 } else return error.TestExpectedEqual;
                 try std.testing.expectEqualStrings("{\"id\":2}", generated.writes[0].value);
                 const normalized = [_]contract.TableCommitRequest{ .{ .table_name = "p", .writes = change[0].writes }, .{ .table_name = "c", .writes = generated.writes } };
-                var staged_again = try prepareModeInternal(alloc, reader, &metadata, &normalized, .{}, null, true, &.{}, false);
+                var staged_again = try prepareModeInternal(alloc, reader, &metadata, &normalized, .{}, &.{}, true, &.{}, false);
                 defer staged_again.deinit();
-                var third = try prepareModeInternal(alloc, reader, &metadata, &.{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":3}" }} }}, .{}, null, true, staged_again.tables, true);
+                var third = try prepareModeInternal(alloc, reader, &metadata, &.{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":3}" }} }}, .{}, &.{}, true, staged_again.tables, true);
                 defer third.deinit();
                 for (third.tables) |table| if (std.mem.eql(u8, table.table_name, "c")) try std.testing.expectEqualStrings("{\"id\":3}", table.writes[0].value);
             }
@@ -2253,9 +2382,10 @@ test "distributed txn deferred unique overlay permits repair and validates immed
         defer plan.deinit();
         try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindConflictExpressions(alloc, &.{"id"}, &.{}, &.{}));
         try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindConflictExpressions(alloc, &.{}, &.{}, &.{}));
+        try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindNamedConflict(alloc, "u"));
     }
     const duplicate = [_]contract.TableCommitRequest{.{ .table_name = "rows", .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":1}" } } }};
-    var staged = try prepareModeInternal(alloc, source, &metadata, &duplicate, .{}, null, true, &.{}, true);
+    var staged = try prepareModeInternal(alloc, source, &metadata, &duplicate, .{}, &.{}, true, &.{}, true);
     defer staged.deinit();
     const immediate = [_]native.ConstraintTiming{.{ .deferred = false }};
     try std.testing.expectError(error.UniqueConstraintViolation, validateConstraintTiming(alloc, source, &metadata, &duplicate, .{}, &immediate));
@@ -2301,9 +2431,9 @@ test "distributed txn deferred unique overlay permits repair and validates immed
     defer original.deinit();
     fake.claims = original.tables[0].integrity_commands;
     fake.initial = true;
-    var half = try prepareModeInternal(alloc, source, &metadata, &.{.{ .table_name = "rows", .writes = &.{repaired[0].writes[0]} }}, .{}, null, true, &.{}, true);
+    var half = try prepareModeInternal(alloc, source, &metadata, &.{.{ .table_name = "rows", .writes = &.{repaired[0].writes[0]} }}, .{}, &.{}, true, &.{}, true);
     defer half.deinit();
-    var completed = try prepareModeInternal(alloc, source, &metadata, &.{.{ .table_name = "rows", .writes = &.{repaired[0].writes[1]} }}, .{}, null, true, half.tables, true);
+    var completed = try prepareModeInternal(alloc, source, &metadata, &.{.{ .table_name = "rows", .writes = &.{repaired[0].writes[1]} }}, .{}, &.{}, true, half.tables, true);
     defer completed.deinit();
     var swapped = try validateConstraintTiming(alloc, source, &metadata, &repaired, .{}, &immediate);
     defer swapped.deinit();

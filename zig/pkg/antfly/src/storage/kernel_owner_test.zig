@@ -3589,6 +3589,140 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque metadata relation reconciliation work retains owned cuts across progress and reopen" {
+    const a = std.testing.allocator;
+    const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const T = struct {
+        fn apply(store: *metadata_apply_client.RaftApplyStore, command: control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var expected: r.Work = undefined;
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+        defer store.deinit();
+        const empty = try store.relationReconciliationWork(group);
+        try std.testing.expect(empty.epoch == null and empty.current == null and empty.garbage == null);
+        const identity = "11111111111111111111111111111111".*;
+        const proof: protocol.Activation = .{ .version = protocol.relation_reconciliation_version, .incarnation = identity, .member_count = 1, .membership_fingerprint = @splat(7) };
+        const activation = try std.json.Stringify.valueAlloc(a, proof, .{});
+        defer a.free(activation);
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try T.apply(&store, .{ .adopt = proof });
+        const tracked = try store.relationReconciliationWork(group);
+        try std.testing.expectEqual(@as(u64, 1), tracked.epoch.?.revision);
+        try std.testing.expect(tracked.current == null);
+        const initial = try r.State.init(group, try r.nextJobId(null), tracked.epoch.?);
+        try T.apply(&store, .{ .start = .{ .next = initial } });
+        const before = try store.relationReconciliationWork(group);
+        for (0..3) |_| {
+            const work = try store.relationReconciliationWork(group);
+            try T.apply(&store, .{ .advance = work.current.? });
+        }
+        const ready = (try store.relationReconciliationWork(group)).current.?;
+        try std.testing.expectEqual(r.Phase.ready, ready.phase);
+        var evidence: ?@import("../metadata/storage/raft_apply_contract.zig").RelationPublicationEvidence = null;
+        for (0..16) |round| {
+            evidence = try store.stepRelationPublicationProof(ready, round);
+            if (evidence != null) break;
+        }
+        try std.testing.expect(evidence != null);
+        try std.testing.expect(std.meta.eql(ready, evidence.?.state));
+        try std.testing.expect(evidence.?.root == null);
+        try std.testing.expect(std.meta.eql(evidence, try store.stepRelationPublicationProof(ready, 17)));
+        try std.testing.expect(store.snapshotBuilder().isApplyRetryable(group, error.CatalogPublicationProofPending));
+        try std.testing.expectError(error.CatalogPublicationProofPending, error_identity.statusToError(error_identity.statusFromError(error.CatalogPublicationProofPending)));
+        try std.testing.expect(!store.snapshotBuilder().isApplyRetryable(group, error.ResourceTemporarilyUnavailable));
+        var result: abi.MetadataRelationPublicationResult = .{ .ready = 1 };
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .group_id = group,
+            .expected_state = .{ .len = r.State.encoded_len },
+        }, &result));
+        try std.testing.expectEqual(@as(u8, 0), result.ready);
+        const encoded_ready = try ready.encode();
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .group_id = group + 1,
+            .expected_state = .fromSlice(&encoded_ready),
+        }, &result));
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .operation = @fromBackingInt(@intCast(99)),
+        }, &result));
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{ .version = abi.abi_version + 1 }, &result));
+        try store.cancelRelationPublicationProof(group);
+        _ = try store.stepRelationPublicationProof(ready, 18);
+        try store.expireRelationPublicationProofs(18 + 60 * std.time.ns_per_s);
+        store.closeRelationPublicationProof(group);
+        try std.testing.expect(std.meta.eql(initial, before.current.?));
+        const next = try r.State.init(group, try r.nextJobId(&ready), ready.epoch);
+        try T.apply(&store, .{ .start = .{ .next = next, .prior = ready } });
+        try std.testing.expectError(error.CatalogGenerationChanged, store.stepRelationPublicationProof(ready, 19));
+        const retired = try store.relationReconciliationWork(group);
+        try std.testing.expect(retired.garbage.?.generation.eql(r.Generation.of(&ready)));
+        try T.apply(&store, .{ .garbage = retired.garbage.? });
+        expected = try store.relationReconciliationWork(group);
+        try std.testing.expect(expected.garbage == null and expected.root == null);
+        try std.testing.expect(std.meta.eql(next, expected.current.?));
+        try std.testing.expect(retired.garbage != null);
+        const conflicting_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"shared_key","keys":[{"column":"email"}]}]}
+        ;
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "one", .schema_json = conflicting_schema } });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "two", .schema_json = conflicting_schema } });
+        const changed = try store.relationReconciliationWork(group);
+        const attempt = try r.State.init(group, try r.nextJobId(&next), changed.epoch.?);
+        try T.apply(&store, .{ .start = .{ .next = attempt, .prior = next } });
+        try T.apply(&store, .{ .advance = attempt });
+        expected = try store.relationReconciliationWork(group);
+        try std.testing.expectEqual(r.FailureReason.name_conflict, expected.current.?.failure);
+        try std.testing.expectEqual(@as(u64, 0), expected.current.?.pass.claims);
+        try std.testing.expect(std.meta.eql(next, changed.current.?));
+    }
+    var recovered = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer recovered.deinit();
+    try std.testing.expect(std.meta.eql(expected, try recovered.relationReconciliationWork(group)));
+}
+
+test "opaque metadata snapshot retries retain later committed prefix across reopen" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "before", .schema_json = "{}" } });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 12, .entries_bytes = "completed-prefix" });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "after", .schema_json = "{}" } });
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    store.deinit();
+    store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
+    const table = (try store.getTable(a, group, 8)).?;
+    defer @import("../metadata/table_manager.zig").freeTable(a, table);
+    try std.testing.expectEqualStrings("after", table.name);
+    const changed = try a.dupe(u8, snapshot);
+    defer a.free(changed);
+    changed[changed.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 11, changed));
+    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 12, snapshot));
+    try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
+}
+
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";
     cleanup(path);

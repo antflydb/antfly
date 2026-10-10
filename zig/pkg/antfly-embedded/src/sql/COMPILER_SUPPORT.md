@@ -11,7 +11,12 @@ statement before any mutation.
   `COUNT(*)`; typed comparisons, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, IN/BETWEEN,
   arithmetic, casts, CASE, registered scalar functions and JSON extraction.
   Ordering supports source columns, aliases, ordinal positions, expressions,
-  ASC/DESC and NULLS FIRST/LAST; LIMIT/OFFSET accept nonnegative integers/parameters.
+  ASC/DESC and NULLS FIRST/LAST. LIMIT/OFFSET accept integer literals, parameters
+  and NULL; negative bounds fail at execution with PostgreSQL diagnostics.
+  LIMIT ALL is unbounded; OFFSET ROW/ROWS and FETCH FIRST/NEXT ROW/ROWS ONLY
+  normalize to the same bounded execution plan, with an omitted FETCH count
+  defaulting to one. FETCH WITH TIES and arbitrary bound expressions remain
+  unsupported.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
 - Linear recursive CTEs with seed-typed outputs, delta worklists, UNION ALL or
@@ -364,3 +369,10 @@ elapsed time. Three window layouts over 256 rows with 16 KiB payloads write
 4,255,232 bytes through shared payloads versus 29,524,992 through payload
 rewrites, with compression disabled. These fixtures validate equal results and
 alternate execution order; they do not measure total production query latency.
+
+Embedded backends additionally support the `antfly_search('table', request
+[, candidate_limit])` relation with schema-derived columns, `_id`, `score`
+and `_highlights`. Request/limit parameters are typed as text/integer. The
+backend must explicitly advertise search-relation support; other providers
+reject the relation before opening any scans. Embedded catalog index DDL uses
+the shared schema translator and a native schema version CAS.

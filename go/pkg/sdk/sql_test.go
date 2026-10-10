@@ -26,6 +26,61 @@ import (
 	"testing"
 )
 
+func TestPreparedSQLParameterContractsRetainElementIdentity(t *testing.T) {
+	var response SQLPreparedResponse
+	if err := json.Unmarshal([]byte(`{"prepared_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at_ms":123,"owner_node_id":"9007199254740993","parameter_types":["array","integer"],"parameter_descriptors":[{"type":"array","element_type":"int64","nullable":true},{"type":"integer","element_type":"int32","nullable":true}],"columns":[]}`), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.ParameterDescriptors) != 2 {
+		t.Fatalf("unexpected parameter count: %d", len(response.ParameterDescriptors))
+	}
+	var array SQLParameterDescriptor = response.ParameterDescriptors[0]
+	if array.Type != "array" || array.ElementType != "int64" || !array.Nullable {
+		t.Fatalf("lost array contract: %+v", array)
+	}
+	if response.ParameterDescriptors[1].ElementType != "int32" {
+		t.Fatal("lost primitive width")
+	}
+}
+
+func TestSQLNumericResultModifierRoundTrip(t *testing.T) {
+	for _, kind := range []SQLColumnType{"number", "array"} {
+		column := SQLColumn{Name: "n", Type: kind, ElementType: "numeric", NumericModifier: SQLNumericModifier{Precision: 2, Scale: -3}}
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded SQLColumn
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.NumericModifier != column.NumericModifier {
+			t.Fatalf("lost NUMERIC modifier: %#v", decoded)
+		}
+	}
+}
+
+func TestArrayColumnSchemaPreservesExplicitIdentityAndEnvelopeConstraints(t *testing.T) {
+	for _, kind := range []SQLArrayElementType{"int64", "numeric"} {
+		column := SQLArrayColumnSchema{Type: "sql_array", XAntflySqlType: kind, Nullable: true}
+		column.Set("properties", map[string]any{"values": map[string]any{"minItems": 2}})
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded SQLArrayColumnSchema
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Type != "sql_array" || decoded.XAntflySqlType != kind || !decoded.Nullable {
+			t.Fatalf("lost array column identity: %+v", decoded)
+		}
+		if _, found := decoded.Get("properties"); !found {
+			t.Fatal("lost envelope constraints")
+		}
+	}
+}
+
 func TestExecuteSQLPreservesBoundValuesAndResultOrdinals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/db/v1/sql" {
@@ -48,6 +103,29 @@ func TestExecuteSQLPreservesBoundValuesAndResultOrdinals(t *testing.T) {
 	}
 	if string(result.Rows[0][0]) != `"9223372036854775807"` || string(result.Rows[0][1]) != `{"id":9223372036854775807}` {
 		t.Fatalf("lost precision or result ordering: %#v", result.Rows)
+	}
+}
+
+func TestExecuteSQLNumericPreservesPrecisionScaleNullsAndSpecials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"columns":[{"name":"n","type":"number","element_type":"numeric"}],"rows":[["9007199254740993.1200"],["0.0000"],[null],["NaN"],["Infinity"],["-Infinity"]],"rows_affected":0,"command_tag":"SELECT 6"}`)
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ExecuteSQL(context.Background(), SQLRequest{Statement: "SELECT n FROM amounts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Columns) != 1 || result.Columns[0].ElementType != "numeric" || len(result.Rows) != 6 {
+		t.Fatalf("lost exact numeric contract: %#v", result)
+	}
+	for i, expected := range []string{`"9007199254740993.1200"`, `"0.0000"`, `null`, `"NaN"`, `"Infinity"`, `"-Infinity"`} {
+		if len(result.Rows[i]) != 1 || string(result.Rows[i][0]) != expected {
+			t.Fatalf("row %d lost numeric value: %#v", i, result.Rows[i])
+		}
 	}
 }
 

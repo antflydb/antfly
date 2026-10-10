@@ -19,6 +19,43 @@ const mapper = @import("document_mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 
+test "SQL expression DDL rewrite computes stored generated columns and admitted defaults from base cells" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("../../sql/compiler.zig");
+    var create = try compiler.compile(a, "CREATE TABLE exprs (n smallint, label text)", .{});
+    defer create.deinit();
+    const before = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table);
+    var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{});
+    for ([_][]const u8{
+        "ALTER TABLE exprs ADD COLUMN g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer)+1 END) STORED NOT NULL",
+        "ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL",
+    }) |sql| {
+        var added = try compiler.compile(a, sql, .{});
+        defer added.deinit();
+        try std.testing.expect(try @import("../../sql/schema_ddl.zig").apply(a, &candidate, added.statement.catalog_ddl));
+    }
+    const after = try std.json.Stringify.valueAlloc(a, candidate, .{});
+    var program = try transform.Program.init(alloc, before, after, .{ .default_columns = &.{"extra"} });
+    defer program.deinit();
+    for ([_][]const u8{ "{\"n\":3,\"label\":\"cold\"}", "{\"n\":null,\"label\":\"cold\"}" }, [_]i64{ 4, 0 }) |input, expected| {
+        var source = try sourceRow(&program, alloc, input);
+        defer source.deinit(alloc);
+        var result = try program.transform(alloc, source.packed_row);
+        defer result.deinit(alloc);
+        const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+        const columns = program.target.tableSchema().relational_columns;
+        const generated = (try view.findCell(program.target.physicalLayout().ordinalForName(columns, "g").?)).?;
+        const defaulted = (try view.findCell(program.target.physicalLayout().ordinalForName(columns, "extra").?)).?;
+        const cold = (try view.findCell(program.target.physicalLayout().ordinalForName(columns, "label").?)).?;
+        try std.testing.expectEqual(expected, generated.value.i64_val);
+        try std.testing.expectEqual(@as(i64, 20), defaulted.value.i64_val);
+        try std.testing.expectEqualStrings("cold", cold.value.bytes_val);
+        try std.testing.expectEqual(@as(usize, 1), result.expression_input_cells);
+    }
+}
+
 test "SQL primary-key rewrite retains a present key across nullable-to-required row mapping" {
     const compiler = @import("../../sql/compiler.zig");
     var create = try compiler.compile(alloc, "CREATE TABLE pk_good (id BIGINT, note TEXT)", .{});

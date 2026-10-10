@@ -181,6 +181,35 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
     try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
     try std.testing.expectEqual(@as(usize, 1), probe.commits);
+    // RETURNING's unqualified star is target-only; explicit source stars retain
+    // the captured source domain and never expose hidden physical metadata.
+    for ([_]struct { projection: []const u8, columns: usize }{
+        .{ .projection = "*", .columns = 2 },
+        .{ .projection = "t.*", .columns = 2 },
+        .{ .projection = "*, s.status AS source_status", .columns = 3 },
+        .{ .projection = "t.*, s.*", .columns = 4 },
+    }) |case| {
+        const statement = try std.fmt.allocPrint(std.testing.allocator, "MERGE INTO usage_records t USING source_records s ON t.id=s.id WHEN MATCHED THEN UPDATE SET status=s.status WHEN NOT MATCHED THEN INSERT (id,status) VALUES (s.id,s.status) RETURNING {s}", .{case.projection});
+        defer std.testing.allocator.free(statement);
+        var wildcard = try compiler.compile(std.testing.allocator, statement, .{});
+        defer wildcard.deinit();
+        var owner: Probe = .{};
+        var returned = try runtime.execute(std.testing.allocator, owner.backend(), &wildcard, &.{}, .{});
+        defer returned.deinit();
+        try std.testing.expectEqual(@as(usize, 1), owner.captures);
+        try std.testing.expectEqual(@as(usize, 1), owner.commits);
+        try std.testing.expectEqual(@as(usize, 2), returned.output.rows.len);
+        try std.testing.expectEqual(case.columns, returned.output.columns.len);
+        for (returned.output.rows, [_][]const u8{ "a", "b" }, [_][]const u8{ "updated", "new" }) |row, id, status| {
+            try std.testing.expectEqualStrings(id, row[0].string);
+            try std.testing.expectEqualStrings(status, row[1].string);
+            if (case.columns == 3) try std.testing.expectEqualStrings(status, row[2].string);
+            if (case.columns == 4) {
+                try std.testing.expectEqualStrings(id, row[2].string);
+                try std.testing.expectEqualStrings(status, row[3].string);
+            }
+        }
+    }
     // Decision predicates and assignments run only for the selected arm;
     // RETURNING completes before the native commit is published.
     const Provider = @import("antfly_local_sources").sql_decision_eval.testing.Provider;
@@ -748,6 +777,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try previous.put(alloc, "payload", .null);
     try previous.put(alloc, "unknown", .{ .integer = 42 });
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_document", .{ .object = previous });
+    try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_presence", .{ .string = "" });
     const updated = try update_plan.prepareMutations(alloc, probe.backend(), &.{update_row}, &.{update_flags}, &.{}, 1, 4096);
     try std.testing.expectEqual(@as(usize, 1), updated.len);
     try std.testing.expectEqual(@as(u64, 7), updated[0].expected_version);
@@ -767,6 +797,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_version", .{ .string = "7" });
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_digest", .{ .string = &digest });
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_document", .{ .object = previous });
+    try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_presence", .{ .string = "" });
     const default_updated = try default_update_plan.prepareMutations(alloc, probe.backend(), &.{default_update_row}, &.{default_update_flags}, &.{}, 1, 4096);
     try std.testing.expectEqual(@as(usize, 1), default_updated.len);
     try std.testing.expect(default_updated[0].row.?.object.get("n") == null);

@@ -868,6 +868,68 @@ pub const Request = struct {
     physical_name: ?[]const u8 = null,
 };
 
+/// Relation names share a namespace with tables, indexes and constraint indexes.
+/// Resolution never guesses a table owner from a schema inventory scan.
+pub const RelationTarget = struct {
+    database: []const u8 = default_database_name,
+    namespace: []const u8 = default_namespace_name,
+    name: []const u8,
+
+    pub fn validate(self: @This()) !void {
+        try validateName(self.database);
+        try validateName(self.namespace);
+        try (@import("relation_names.zig").Key{ .namespace_id = 1, .name = self.name }).validate();
+    }
+};
+
+pub const ResolvedRelation = struct {
+    owner: @import("relation_names.zig").Owner,
+    table: ResolvedTable,
+    /// Logical table name in the requested namespace, captured with ownership.
+    /// The physical routing name is never substituted for authorization.
+    logical_table: []const u8,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        self.table.deinit(alloc);
+        alloc.free(self.logical_table);
+    }
+};
+
+/// Retain the authorized logical owner through the write transaction. Source
+/// revisions are not CAS preconditions: independent DDL must not conflict.
+pub const RelationMutationGuard = struct {
+    target: RelationTarget,
+    logical_table: []const u8,
+    owner: @import("relation_names.zig").Owner,
+    incarnation: [16]u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.target.validate();
+        try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
+        try self.owner.validate();
+        if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+    }
+
+    pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.target.database);
+        alloc.free(self.target.namespace);
+        alloc.free(self.target.name);
+        alloc.free(self.logical_table);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        try self.validate();
+        const database = try alloc.dupe(u8, self.target.database);
+        errdefer alloc.free(database);
+        const namespace = try alloc.dupe(u8, self.target.namespace);
+        errdefer alloc.free(namespace);
+        const name = try alloc.dupe(u8, self.target.name);
+        errdefer alloc.free(name);
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+    }
+};
+
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
@@ -875,18 +937,64 @@ pub const ResolveMany = struct {
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
+    relations: []const RelationTarget = &.{},
+    expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.relations.len != 0 or self.expected_relation_epoch != null) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .expected_relation_epoch = self.expected_relation_epoch });
+        } else {
+            // Keep ordinary table resolution compatible with strict old peers.
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision });
+        }
+    }
 };
 
 pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
+    /// Null means the receiver did not attest authoritative relation resolution.
+    /// A missing field from an older peer must never prove name absence.
+    relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
+    relations: []const ?ResolvedRelation = &.{},
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.relation_epoch != null or self.relations.len != 0) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations });
+        } else {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names });
+        }
+    }
+
+    /// Validate the optional capability before consuming a peer's answers.
+    /// In particular, an old receiver's empty default is not a negative lookup.
+    pub fn validateRelations(self: @This(), request: ResolveMany) !void {
+        if (request.relations.len == 0) {
+            if (request.expected_relation_epoch != null) return error.InvalidCatalogMutation;
+            return;
+        }
+        const epoch = self.relation_epoch orelse return error.TableTopologyUpgradeRequired;
+        if (epoch.revision == 0 or std.mem.allEqual(u8, &epoch.incarnation, 0) or self.relations.len != request.relations.len) return error.InvalidCatalogRecord;
+        if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
+        for (self.relations, request.relations) |relation, target| if (relation) |value| {
+            try value.owner.validate();
+            if (value.owner.phase != .active or value.table.table_id != value.owner.table_id or value.table.name.len == 0) return error.InvalidCatalogRecord;
+            (Target{ .database = target.database, .namespace = target.namespace, .table = value.logical_table }).validate() catch return error.InvalidCatalogRecord;
+            if (request.include_query_definitions) {
+                const definition = value.table.query_definition orelse return error.InvalidCatalogRecord;
+                if (definition.table_id != value.owner.table_id) return error.InvalidCatalogRecord;
+            }
+        };
+    }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);
         alloc.free(self.logical_names);
+        for (self.relations) |relation| if (relation) |value| value.deinit(alloc);
+        alloc.free(self.relations);
     }
 };
 
@@ -969,7 +1077,9 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
-        error.TableTopologyProtocolUpgradeRequired, error.RowPolicyUnsupported => 426,
+        error.TableTopologyProtocolUpgradeRequired, error.TableTopologyUpgradeRequired, error.RowPolicyUnsupported => 426,
+        error.ExtensionOwnedObject => 405,
+        error.CatalogPublicationProofPending => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
         error.StoreRootEnrollmentChanged => 409,

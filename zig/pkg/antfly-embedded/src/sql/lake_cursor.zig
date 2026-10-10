@@ -1255,6 +1255,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     for ([_][]const u8{
         "SELECT amount % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT SUM(amount), COUNT(*) FROM events",
+        "SELECT amount % 7 AS bucket, SUM(amount::NUMERIC + '0.10'::NUMERIC), AVG(amount::NUMERIC + '0.10'::NUMERIC) FROM events GROUP BY amount % 7 ORDER BY bucket",
+        "SELECT SUM(amount::NUMERIC), AVG(amount::NUMERIC), COUNT(*) FROM events",
         "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
     }) |sql| {
         var compiled = try compiler.compile(a, sql, .{});

@@ -31,6 +31,7 @@ pub const MetadataStateMachine = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
+                .is_apply_retryable = isApplyRetryable,
                 .retire_group = retireGroup,
             },
         };
@@ -90,8 +91,99 @@ pub const MetadataStateMachine = struct {
         if (applied_index > 0) try self.applied_sink.setAppliedIndex(group_id, applied_index);
     }
 
+    fn isApplyRetryable(ptr: *anyopaque, group_id: u64, err: anyerror) bool {
+        const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
+        // Only the durable builder can opt this entire Ready into retry.
+        // Delegate or notification failures are not implicitly retryable.
+        const builder = self.snapshot_builder orelse return false;
+        return builder.isApplyRetryable(group_id, err);
+    }
+
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
         const self: *MetadataStateMachine = @ptrCast(@alignCast(ptr));
         if (self.delegate) |delegate| delegate.retireGroup(group_id);
     }
 };
+
+test "relation reconciliation worker metadata retry keeps apply and read completion behind prepared evidence" {
+    const Fixture = struct {
+        pages_left: usize = 3,
+        commits: usize = 0,
+        delegates: usize = 0,
+        notifications: usize = 0,
+        fault: ?anyerror = null,
+        fn build(_: *anyopaque, a: std.mem.Allocator, _: u64) ![]u8 {
+            return a.dupe(u8, "");
+        }
+        fn apply(ptr: *anyopaque, batch: mod.ApplyBatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), batch.group_id);
+            try std.testing.expectEqual(@as(u64, 11), batch.commit_index);
+            if (self.fault) |err| return err;
+            if (self.pages_left != 0) {
+                self.pages_left -= 1;
+                return error.CatalogPublicationProofPending;
+            }
+            self.commits += 1;
+        }
+        fn retry(_: *anyopaque, group: u64, err: anyerror) bool {
+            return group == 7 and err == error.CatalogPublicationProofPending;
+        }
+        fn delegate(ptr: *anyopaque, _: u64, _: ?raft_engine.core.types.Snapshot, _: []const raft_engine.core.Entry, reads: []const raft_engine.core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), self.commits);
+            try std.testing.expectEqual(@as(usize, 1), reads.len);
+            self.delegates += 1;
+        }
+        fn applied(ptr: *anyopaque, group: u64, index: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(u64, 11), index);
+            try std.testing.expectEqual(@as(usize, 1), self.delegates);
+            self.notifications += 1;
+        }
+    };
+    var fixture: Fixture = .{};
+    var metadata: MetadataStateMachine = .{
+        .alloc = std.testing.allocator,
+        .applied_sink = .{ .ptr = &fixture, .vtable = &.{ .set_applied_index = Fixture.applied } },
+        .snapshot_builder = .{ .ptr = &fixture, .vtable = &.{ .build_snapshot = Fixture.build, .apply_batch = Fixture.apply, .is_apply_retryable = Fixture.retry } },
+        .delegate = .{ .ptr = &fixture, .vtable = &.{ .apply_ready = Fixture.delegate } },
+    };
+    var routed: mod.RoutedStateMachine = .{
+        .metadata_group_id = 7,
+        .metadata_state_machine = metadata.stateMachine(),
+        .data_state_machine = metadata.delegate.?,
+    };
+    var worker = raft_engine.runtime.apply_worker.QueuedApplyWorker.init(std.testing.allocator, routed.stateMachine());
+    defer worker.deinit();
+    const queue = worker.queue();
+    try std.testing.expect(queue.isApplyRetryable(7, error.CatalogPublicationProofPending));
+    try std.testing.expect(!queue.isApplyRetryable(8, error.CatalogPublicationProofPending));
+    try std.testing.expect(!queue.isApplyRetryable(7, error.InvalidCatalogRecord));
+    try std.testing.expect(!queue.isApplyRetryable(7, error.OutOfMemory));
+    const legacy: mod.SnapshotBuilder = .{ .ptr = &fixture, .vtable = &.{ .build_snapshot = Fixture.build, .apply_batch = Fixture.apply } };
+    try std.testing.expect(!legacy.isApplyRetryable(7, error.CatalogPublicationProofPending));
+    for (0..3) |_| {
+        try queue.enqueueApply(7, null, &.{.{ .term = 2, .index = 11 }}, &.{.{ .index = 11, .request_ctx = @constCast("reader") }});
+        const result = queue.drain();
+        try std.testing.expectEqual(@as(usize, 0), result.completed);
+        try std.testing.expectEqual(error.CatalogPublicationProofPending, result.failure.?);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+        try std.testing.expectEqual(@as(usize, 0), fixture.delegates);
+        try std.testing.expectEqual(@as(usize, 0), fixture.notifications);
+        queue.abort(); // The runtime, not this adapter, retains the Ready.
+    }
+    fixture.fault = error.InvalidCatalogRecord;
+    try queue.enqueueApply(7, null, &.{.{ .term = 2, .index = 11 }}, &.{});
+    try std.testing.expectEqual(error.InvalidCatalogRecord, queue.drain().failure.?);
+    try std.testing.expectEqual(@as(usize, 0), fixture.notifications);
+    queue.abort();
+    fixture.fault = null;
+    try queue.enqueueApply(7, null, &.{.{ .term = 2, .index = 11 }}, &.{.{ .index = 11, .request_ctx = @constCast("reader") }});
+    const finished = queue.drain();
+    try std.testing.expectEqual(@as(usize, 1), finished.completed);
+    try std.testing.expect(finished.failure == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 1), fixture.notifications);
+}

@@ -38,6 +38,38 @@ fn sqlx_conformance_and_streaming() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&directory).unwrap();
+    {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json"
+        ))
+        .unwrap();
+        let database =
+            antfly_embedded::Database::create_default(directory.join("db.aflite")).unwrap();
+        database
+            .create_table_json(
+                fixture["table"].as_str().unwrap(),
+                serde_json::to_vec(&fixture["schema"]).unwrap(),
+            )
+            .unwrap();
+        let table = database
+            .open_table(fixture["table"].as_str().unwrap())
+            .unwrap();
+        database
+            .create_table_json(
+                "history_items",
+                serde_json::to_vec(&fixture["history"]).unwrap(),
+            )
+            .unwrap();
+        for index in fixture["indexes"].as_array().unwrap() {
+            table
+                .add_index_json(serde_json::to_vec(index).unwrap())
+                .unwrap();
+        }
+        table
+            .batch_json(serde_json::to_vec(&fixture["batch"]).unwrap())
+            .unwrap();
+        table.run_until_idle().unwrap();
+    }
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -347,4 +379,77 @@ fn sqlx_shares_an_open_database_with_the_document_api() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn sqlx_external_commit_and_document_read_close_inference_promptly() {
+    fn on_executor<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "antfly-sqlx-inference-close-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("db.aflite");
+    let document_path = path.clone();
+    let database = on_executor(move || {
+        let database = std::sync::Arc::new(
+            antfly_embedded::Database::create(
+                document_path,
+                &antfly_embedded::OpenOptions::new()
+                    .no_sync(true)
+                    .local_runtime_configured(true)
+                    .busy_timeout(std::time::Duration::from_secs(5)),
+            )
+            .unwrap(),
+        );
+        database
+            .batch_json(r#"{"inserts":{"doc":{"text":"document api"}}}"#)
+            .unwrap();
+        database
+    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let pool = sqlx_core::pool::PoolOptions::<Antfly>::new()
+            .max_connections(4)
+            .connect_with(AntflyConnectOptions::new(&path).no_sync(true))
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE codex_t (id TEXT PRIMARY KEY)".into_sql_str())
+            .await
+            .unwrap();
+        pool.execute("INSERT INTO codex_t (id) VALUES ('a')".into_sql_str())
+            .await
+            .unwrap();
+        let reader = std::sync::Arc::clone(&database);
+        on_executor(move || assert!(reader.lookup_json("doc").is_ok()));
+        pool.close().await;
+    });
+    on_executor(move || {
+        let start = std::time::Instant::now();
+        database.close().unwrap();
+        let elapsed = start.elapsed();
+        eprintln!("inference shutdown took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "inference shutdown took {elapsed:?}"
+        );
+    });
+    drop(runtime);
+    std::fs::remove_dir_all(directory).unwrap();
 }

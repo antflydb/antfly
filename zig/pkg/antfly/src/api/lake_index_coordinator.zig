@@ -111,11 +111,18 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
     const directory = ready.directory orelse return false;
     var handle = store.artifactStore();
     handle.allocator = a;
-    const bytes = handle.getVerifiedAllocWithCancellation(directory.artifact_id, directory.byte_len, directory.checksum, cancellation) catch |err| switch (err) {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const document = @import("lake_index_directory.zig").loadDocument(arena.allocator(), handle, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, cancellation, null) catch |err| switch (err) {
         error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
-    defer a.free(bytes);
+    if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
+    // Definition/source signatures do not change when reader formats advance.
+    // An intact obsolete directory is not a reason to skip the required build.
+    for (document.declarations) |declaration| {
+        if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != @import("lake_index_native_text.zig").metadata_version) return false;
+    }
     return true;
 }
 
@@ -295,6 +302,33 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer upgraded.deinit();
     try std.testing.expectEqual(catalog.native_reader_protocol, upgraded.value.published.?.reader_protocol);
     try std.testing.expectEqual(@as(u64, 4), upgraded.value.published.?.generation);
+    // A text format refresh must also rebuild when the reader protocol and
+    // every source/definition signature are current and the directory exists.
+    var old_text = upgraded.value.published.?;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var scoped = store.artifactStore();
+    scoped.upload_scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(publication.uploadDomainWithNamespace(mock.table.table_id, store.identity, old_text.namespace), old_text.generation, std.testing.io);
+    try @import("lake_index_directory.zig").hydrateLazy(scratch.allocator(), scoped, &old_text, .none, null);
+    const old_declarations = try scratch.allocator().dupe(local.serverless_segment_sidecar_manifest.DeclaredArtifact, old_text.declarations);
+    for (old_declarations) |*declaration| if (declaration.artifact.kind == .text_segment) {
+        declaration.artifact.metadata_version = @import("lake_index_native_text.zig").metadata_version - 1;
+    };
+    const old_directory = try @import("lake_index_directory.zig").publish(a, &scoped, old_declarations, .none);
+    defer a.free(old_directory.artifact_id);
+    defer a.free(old_directory.checksum);
+    old_text.directory = old_directory;
+    upgraded.value.published = old_text;
+    const old_catalog = try catalog.encode(a, upgraded.value);
+    if (mock.owned) |bytes| a.free(bytes);
+    mock.owned = old_catalog;
+    mock.table.lake_index_catalog_json = old_catalog;
+    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+    try std.testing.expectEqual(@as(usize, 9), mock.commits);
+    var refreshed = try catalog.parse(a, mock.table.lake_index_catalog_json);
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u64, 5), refreshed.value.published.?.generation);
+    try std.testing.expect(try durableDirectoryAvailable(a, &store, refreshed.value.published.?, .none));
 }
 
 test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {

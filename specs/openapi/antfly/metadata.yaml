@@ -1380,8 +1380,54 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
-      enum: [string, uuid, integer, number, boolean, datetime, json, unknown]
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
+    SQLArrayElementType:
+      $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
+    SQLArrayDimension:
+      type: object
+      additionalProperties: false
+      required: [length, lower_bound]
+      properties:
+        length:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        lower_bound:
+          type: integer
+          minimum: -2147483648
+          maximum: 2147483647
+    SQLArrayValue:
+      type: object
+      additionalProperties: false
+      required: [dimensions, values, sql_nulls]
+      description: |
+        Non-NULL SQL array result. Elements are flat, row-major values using the
+        column's element_type. Their count equals the product of dimension
+        lengths. Empty arrays have no dimensions and no elements. Integer
+        elements are canonical decimal strings. Exact numeric elements are
+        decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+        Floating elements are JSON
+        numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+        distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+        array is an outer null result cell, not an empty array or this envelope.
+      properties:
+        dimensions:
+          type: array
+          maxItems: 6
+          items:
+            $ref: "#/components/schemas/SQLArrayDimension"
+        values:
+          type: array
+          maxItems: 65536
+          items:
+            x-go-type: json.RawMessage
+        sql_nulls:
+          type: array
+          maxItems: 65536
+          description: Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements.
+          items:
+            type: boolean
     SQLColumn:
       type: object
       additionalProperties: false
@@ -1392,6 +1438,12 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: "#/components/schemas/SQLColumnType"
+        element_type:
+          $ref: "#/components/schemas/SQLArrayElementType"
+          description: Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
+        numeric_modifier:
+          $ref: "schema.yaml#/components/schemas/SQLNumericModifier"
+          description: Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
     SQLPrepareRequest:
       type: object
       additionalProperties: false
@@ -1474,10 +1526,22 @@ components:
           type: string
         namespace:
           type: string
+    SQLParameterDescriptor:
+      type: object
+      additionalProperties: false
+      required: [type, nullable]
+      description: Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+      properties:
+        type:
+          $ref: '#/components/schemas/SQLColumnType'
+        element_type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+        nullable:
+          type: boolean
     SQLPreparedResponse:
       type: object
       additionalProperties: false
-      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, columns]
+      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, parameter_descriptors, columns]
       properties:
         prepared_id:
           type: string
@@ -1494,6 +1558,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SQLColumnType'
+        parameter_descriptors:
+          type: array
+          maxItems: 1024
+          description: Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
+          items:
+            $ref: '#/components/schemas/SQLParameterDescriptor'
         columns:
           type: array
           items:
@@ -1663,6 +1733,8 @@ components:
         is JSON null; sql_nulls distinguishes it from a JSON column containing
         the JSON literal null. Integer-typed values are exact decimal strings; datetime
         values are strings. Objects and arrays in JSON columns remain JSON.
+        Array-typed columns contain SQLArrayValue envelopes, with their element
+        descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
         columns:
           type: array
