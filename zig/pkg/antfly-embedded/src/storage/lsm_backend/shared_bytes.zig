@@ -37,6 +37,10 @@ pub const SharedBytes = struct {
     pub fn registerRetirementWithAdmission(self: *SharedBytes, construction: *resources.ConstructionCredit, control: @import("../../common/read_admission.zig").Port) !void {
         try construction.manager.registerPayloadRetirementWithAdmission(&self.retirement, &self.reservation, construction, self, destroyRetired, control);
     }
+    pub fn enableRetirementWithAdmission(self: *SharedBytes, control: @import("../../common/read_admission.zig").Port) !void {
+        if (self.retirement.credit != null) return;
+        if (self.reservation) |*credit| try credit.manager.registerExistingPayloadRetirementWithAdmission(&self.retirement, credit, self, destroyRetired, control);
+    }
     fn destroyRetired(raw: *anyopaque) void {
         const self: *SharedBytes = @ptrCast(@alignCast(raw));
         const allocator = self.allocator;

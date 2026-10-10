@@ -1945,3 +1945,111 @@ test "text statistics trusted controls published payload retirement preserves cr
         }
     }
 }
+
+test "text statistics trusted controls local cache publication replacement and denial retain original authority" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..6) |fixture| {
+            var completion_checkpoint: usize = 0;
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048, std.math.maxInt(usize) }) |requested_stop| {
+                const stop_at = if (requested_stop == std.math.maxInt(usize)) completion_checkpoint else requested_stop;
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_lsm_backend.qualifyControlledLocalCache(admission.Port.init(&payload), fixture);
+                if (requested_stop == 0) completion_checkpoint = budget.calls;
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls local cache contention preserves phase deadlines and control progress" {
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { success, cancel, expire, shutdown };
+    const Fixture = struct {
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        calls: usize = 0,
+        fn sleep(raw: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const stats = self.scheduler.stats();
+            std.debug.assert(stats.runnable_slots == 0 and stats.resource_blocked == 1 and stats.operations == 1 and stats.retained_bytes == 23);
+            var control: native.Execution = .{};
+            defer control.finish();
+            control.start(self.scheduler, .{ .io = std.testing.io }, .control) catch unreachable;
+            control.checkpoint() catch unreachable;
+            control.finish();
+            switch (self.case) {
+                .success => try std.testing.io.sleep(.fromMilliseconds(1), .awake),
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown => self.scheduler.close(),
+            }
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..6) |stage| {
+            for (std.enums.values(Case)) |case| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                const deadline = clock.monotonicNs() + (if (case == .expire) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var read: Read = .{ .execution = &execution, .allocator = std.testing.allocator };
+                const team = try read.team();
+                var fixture = Fixture{ .scheduler = &scheduler, .canceled = &canceled, .case = case };
+                var vtable = std.testing.io.vtable.*;
+                vtable.sleep = Fixture.sleep;
+                const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+                var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = io };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_lsm_backend.qualifyControlledLocalCacheContention(admission.Port.init(&payload), stage);
+                switch (case) {
+                    .success => try result,
+                    .cancel => try std.testing.expectError(error.Canceled, result),
+                    .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+                    .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+                }
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}

@@ -1494,9 +1494,18 @@ pub const ResourceManager = struct {
         reclaim: ReclaimerFn,
         options: ReclaimerOptions,
     ) !u64 {
-        lockAtomic(&self.reclaimer_mutex);
+        return self.registerReclaimerControlled(slice, context, reclaim, options, null);
+    }
+
+    pub fn registerReclaimerWithAdmission(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, control: read_admission.Port) !u64 {
+        return self.registerReclaimerControlled(slice, context, reclaim, .{}, control);
+    }
+
+    fn registerReclaimerControlled(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: ?read_admission.Port) !u64 {
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, budget) else lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
         for (self.reclaimers.items) |slot| {
+            if (control) |budget| try budget.checkpoint();
             if (slot.identity != 0) continue;
             const identity = self.next_reclaimer_identity;
             self.next_reclaimer_identity +%= 1;
@@ -1512,7 +1521,9 @@ pub const ResourceManager = struct {
         }
         // Reserve the pointer before allocating a chunk: failure publishes no
         // owner and leaks no chunk. Existing cells and leases remain stable.
+        if (control) |budget| try budget.checkpoint();
         try self.reclaimers.ensureUnusedCapacity(self.identity_allocator, 1);
+        if (control) |budget| try budget.checkpoint();
         const chunk_offset = self.reclaimers.items.len % 64;
         if (chunk_offset == 0) {
             const chunk = try self.identity_allocator.create(ReclaimerChunk);
@@ -2821,6 +2832,20 @@ pub const ResourceManager = struct {
         // No fallible callback after transferring the sole credit owner.
     }
 
+    /// Upgrade a live legacy payload before scoped eviction drops its cache
+    /// reference. Its existing credit already covers the embedded record.
+    pub fn registerExistingPayloadRetirementWithAdmission(self: *ResourceManager, node: *PayloadRetirement, credit: *Reservation, context: *anyopaque, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
+        if (node.credit != null) return;
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
+        defer self.payload_retirement_mutex.unlock();
+        if (node.credit != null) return;
+        if (credit.manager != self or credit.released) return error.ResourceAccountingMismatch;
+        node.* = .{ .credit = credit, .context = context, .destroy = destroy, .next = self.payload_retirement_head };
+        if (self.payload_retirement_head) |head| head.previous = node;
+        self.payload_retirement_head = node;
+        if (self.payload_retirement_cursor == null) self.payload_retirement_cursor = node;
+    }
+
     fn unlinkPayloadRetirement(self: *ResourceManager, node: *PayloadRetirement) void {
         if (node.previous) |previous| previous.next = node.next else self.payload_retirement_head = node.next;
         if (node.next) |next| next.previous = node.previous;
@@ -3345,8 +3370,14 @@ pub const ResourceManager = struct {
     /// Reclassify an existing owner atomically without a second host charge.
     /// No allocation or callback occurs; destination slice admission still applies.
     fn reclassifyReservation(self: *ResourceManager, reservation: *Reservation, destination: Slice) !void {
-        lockAtomic(&self.mutex);
+        return self.reclassifyReservationControlled(reservation, destination, null);
+    }
+
+    fn reclassifyReservationControlled(self: *ResourceManager, reservation: *Reservation, destination: Slice, control: ?read_admission.Port) !void {
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        if (control != null and !self.pressure_change.tryLock()) return error.ParentMemoryBusy;
+        defer if (control != null) self.pressure_change.unlock();
         const owned = self.reservation_identities.getPtr(reservation.identity) orelse return error.ReservationReleased;
         if (reservation.manager != self or reservation.released or owned.slice != reservation.slice or owned.bytes != reservation.bytes)
             return error.ResourceAccountingMismatch;
@@ -3362,7 +3393,7 @@ pub const ResourceManager = struct {
         if (target.budget.soft_limit_bytes != 0 and next > target.budget.soft_limit_bytes) target.soft_limit_events +|= 1;
         owned.slice = destination;
         reservation.slice = destination;
-        self.pressure_change.advance();
+        if (control != null) self.pressure_change.advanceLocked() else self.pressure_change.advance();
     }
 
     /// Move already-accounted credit between two live reservations without
@@ -4485,6 +4516,23 @@ pub const Reservation = struct {
             return;
         }
         try self.manager.reclassifyReservation(self, destination);
+    }
+
+    pub fn reclassifyWithAdmission(self: *Reservation, destination: Slice, control: read_admission.Port) !void {
+        if (self.released) return error.ReservationReleased;
+        if (self.bytes == 0 and self.identity == 0) {
+            try control.checkpoint();
+            self.slice = destination;
+            return;
+        }
+        while (true) {
+            self.manager.reclassifyReservationControlled(self, destination, control) catch |err| {
+                if (err != error.ParentMemoryBusy) return err;
+                try control.waitForProgress();
+                continue;
+            };
+            return;
+        }
     }
 
     pub fn transferCreditTo(self: *Reservation, destination: *Reservation, bytes: u64) !void {

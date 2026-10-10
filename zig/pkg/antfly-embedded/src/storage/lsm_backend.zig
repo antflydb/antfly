@@ -7282,13 +7282,43 @@ pub const Backend = struct {
     /// Optional cache admission never fails the mandatory read. Only admitted
     /// payloads gain cache ownership; resource credit follows their last lease.
     pub fn cacheRunBlockLease(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes) bool {
+        return self.cacheRunBlockLeaseControlled(path, run_id, offset, len, payload, null) catch unreachable;
+    }
+
+    pub fn cacheRunBlockLeaseWithAdmission(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes, control: @import("../common/read_admission.zig").Port) !bool {
+        return self.cacheRunBlockLeaseControlled(path, run_id, offset, len, payload, control);
+    }
+
+    fn cachePathEqualWithAdmission(left: []const u8, right: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+        if (left.len != right.len) return false;
+        if (control) |budget| {
+            var checked: usize = 0;
+            while (checked < left.len) {
+                try budget.checkpoint();
+                const next = checked + @min(left.len - checked, 64 * 1024);
+                if (!std.mem.eql(u8, left[checked..next], right[checked..next])) return false;
+                checked = next;
+            }
+            try budget.checkpoint();
+            return true;
+        }
+        return std.mem.eql(u8, left, right);
+    }
+
+    fn cacheRunBlockLeaseControlled(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes, control: ?@import("../common/read_admission.zig").Port) !bool {
+        if (control) |budget| try budget.checkpoint();
         if (!self.localBlockCacheEligible(payload.bytes.len) or self.closing.load(.acquire) or payload.cache_admitted) return false;
         for (self.run_block_cache.items) |cached| {
-            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and std.mem.eql(u8, cached.path, path)) return false;
+            if (control) |budget| try budget.checkpoint();
+            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and try cachePathEqualWithAdmission(cached.path, path, control)) return false;
         }
         if (self.options.resource_manager) |manager| {
             // First read/cache admission occurs at the backend's stable address.
-            if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks) catch return false;
+            if (control != null and (payload.reservation == null or payload.reservation.?.manager != manager)) return false;
+            if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = (if (control) |budget| manager.registerReclaimerWithAdmission(.lsm_block_table_cache, self, reclaimLocalBlocks, budget) else manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks)) catch |err| {
+                if (err == error.OutOfMemory) return false;
+                return err;
+            };
         }
         // Only reclaim when this owner can actually make admission succeed.
         // An impossible candidate or metadata OOM must preserve useful blocks.
@@ -7296,29 +7326,50 @@ pub const Backend = struct {
             const required = payload.bytes.len + @sizeOf(SharedBytes);
             var reclaimable: u64 = 0;
             for (self.run_block_cache.items) |cached| {
-                if (cached.payload.refs.load(.acquire) == 1 and cached.payload.retirement.credit == null) {
+                if (control) |budget| try budget.checkpoint();
+                if (cached.payload.refs.load(.acquire) == 1 and (control != null or cached.payload.retirement.credit == null)) {
                     if (cached.payload.reservation) |credit| reclaimable +|= credit.reservedBytes();
                 }
             }
             const available = if (payload.reservation != null) blk: {
                 // The read payload already owns its host charge. Reclassification
                 // needs destination slice headroom, not another aggregate charge.
-                const stats = manager.sliceStats(.lsm_block_table_cache);
+                const stats = if (control) |budget| try manager.sliceStatsWithAdmission(.lsm_block_table_cache, budget) else manager.sliceStats(.lsm_block_table_cache);
                 break :blk if (stats.hard_limit_bytes == 0) std.math.maxInt(u64) else stats.hard_limit_bytes -| stats.used_bytes;
             } else manager.availableAdmissionBytes(.lsm_block_table_cache);
             if (required > available +| reclaimable) return false;
         }
-        const cached_path = self.allocator.dupe(u8, path) catch return false;
+        if (control) |budget| try budget.checkpoint();
+        const cached_path = self.allocator.alloc(u8, path.len) catch return false;
         var admitted = false;
         defer if (!admitted) self.allocator.free(cached_path);
+        if (control) |budget| {
+            var copied: usize = 0;
+            while (copied < path.len) {
+                try budget.checkpoint();
+                const next = copied + @min(path.len - copied, 64 * 1024);
+                @memcpy(cached_path[copied..next], path[copied..next]);
+                copied = next;
+            }
+            try budget.checkpoint();
+        } else @memcpy(cached_path, path);
         self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+        if (control) |budget| try budget.checkpoint();
         if (self.options.resource_manager) |manager| {
             const bytes = payload.bytes.len + @sizeOf(SharedBytes);
             while (true) {
                 if (payload.reservation) |*credit| {
-                    credit.reclassify(.lsm_block_table_cache) catch |err| {
-                        if (err != error.ResourceBudgetExceeded or self.run_block_cache.items.len == 0) return false;
-                        _ = self.evictOldestLocalBlock();
+                    (if (control) |budget| credit.reclassifyWithAdmission(.lsm_block_table_cache, budget) else credit.reclassify(.lsm_block_table_cache)) catch |err| {
+                        if (err != error.ResourceBudgetExceeded) {
+                            if (control != null) return err;
+                            return false;
+                        }
+                        if (self.run_block_cache.items.len == 0) return false;
+                        if (control) |budget| {
+                            _ = try self.evictOldestLocalBlockWithAdmission(budget);
+                            _ = try manager.drainPayloadRetirementWithAdmission(budget);
+                            try manager.drainConstructionCleanupWithAdmission(budget);
+                        } else _ = self.evictOldestLocalBlock();
                         continue;
                     };
                 } else {
@@ -7333,8 +7384,9 @@ pub const Backend = struct {
             }
         }
         while (self.run_block_cache.items.len >= max_local_cached_run_blocks or self.run_block_cache_bytes > self.options.local_block_cache_bytes - payload.bytes.len) {
-            _ = self.evictOldestLocalBlock();
+            if (control) |budget| _ = try self.evictOldestLocalBlockWithAdmission(budget) else _ = self.evictOldestLocalBlock();
         }
+        if (control) |budget| try budget.checkpoint();
         self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
         _ = payload.retain();
         payload.cache_admitted = true;
@@ -9007,6 +9059,22 @@ pub const Backend = struct {
             self.run_block_cache_bytes -= removed.payload.bytes.len;
             removed.deinit(self.allocator);
         }
+    }
+
+    fn evictOldestLocalBlockWithAdmission(self: *Backend, control: @import("../common/read_admission.zig").Port) !u64 {
+        std.debug.assert(self.run_block_cache.items.len != 0);
+        var victim: usize = 0;
+        for (self.run_block_cache.items, 0..) |cached, i| {
+            try control.checkpoint();
+            if (cached.last_access < self.run_block_cache.items[victim].last_access) victim = i;
+        }
+        try self.run_block_cache.items[victim].payload.enableRetirementWithAdmission(control);
+        try control.checkpoint();
+        var removed = self.run_block_cache.orderedRemove(victim);
+        self.run_block_cache_bytes -= removed.payload.bytes.len;
+        removed.deinit(self.allocator);
+        // Publication of readiness does not promise physical reclamation.
+        return 0;
     }
 
     fn evictOldestLocalBlock(self: *Backend) u64 {
@@ -27389,4 +27457,185 @@ pub fn qualifyLocalPayloadRetirement(control: @import("../common/read_admission.
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
     try result;
+}
+
+pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zig").Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const a = std.testing.allocator;
+    const cost = @sizeOf(SharedBytes) + 8;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * cost } });
+    defer parent.deinit(a);
+    var options: resources.Options = .{ .identity_allocator = a };
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = if (fixture == 3) 1 else if (fixture == 2) cost else 2 * cost;
+    var manager = resources.ResourceManager.init(options);
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    if (fixture == 2 or fixture == 4) {
+        const old = blk: {
+            const bytes = try a.dupe(u8, "oldbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer old.release();
+        old.reservation = try manager.reserveWithoutReclaim(.lsm_read_working_set, cost);
+        try std.testing.expect(backend.cacheRunBlockLease("/old", 1, 0, 8, old));
+    }
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "newbytes");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    defer value.release();
+    value.result_pins_allowed = false;
+    try value.registerRetirementWithAdmission(&credit, control);
+    const wide = if (fixture == 1) try a.alloc(u8, 192 * 1024) else null;
+    defer if (wide) |bytes| a.free(bytes);
+    if (wide) |bytes| @memset(bytes, 'p');
+    const path = wide orelse "/new";
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    var failures = std.testing.FailingAllocator.init(a, .{ .fail_index = if (fixture == 5) 1 else 0 });
+    const admitted = blk: {
+        if (fixture >= 4) backend.allocator = failures.allocator();
+        defer backend.allocator = a;
+        break :blk try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, value, control);
+    };
+    try std.testing.expectEqual(fixture < 3, admitted);
+    try std.testing.expectEqual(admitted, value.cache_admitted);
+    try std.testing.expectEqual(admitted, value.result_pins_allowed);
+    try std.testing.expectEqualStrings("newbytes", value.bytes);
+    if (admitted) {
+        try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+        try std.testing.expectEqualStrings(path, backend.run_block_cache.items[0].path);
+        // A duplicate never grows ownership. A fresh legacy caller receives
+        // the same stable payload and bytes after controlled publication.
+        try std.testing.expect(!try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, value, control));
+        var duplicate_credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+        defer duplicate_credit.retire();
+        const duplicate = blk: {
+            const bytes = try a.dupe(u8, "newbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer duplicate.release();
+        duplicate.result_pins_allowed = false;
+        try duplicate.registerRetirementWithAdmission(&duplicate_credit, control);
+        try std.testing.expect(!try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, duplicate, control));
+        try std.testing.expectEqual(resources.Slice.lsm_read_working_set, duplicate.reservation.?.slice);
+        try std.testing.expectEqual(@as(usize, 1), duplicate.refs.load(.acquire));
+        const pinned = backend.retainCachedRunBlock(path, 2, 0, 8) orelse return error.TestUnexpectedResult;
+        pinned.release();
+        try std.testing.expectEqual(@as(usize, 2), value.refs.load(.acquire));
+        try std.testing.expectEqual(resources.Slice.lsm_block_table_cache, value.reservation.?.slice);
+    } else {
+        try std.testing.expectEqual(@as(usize, if (fixture == 4) 1 else 0), backend.run_block_cache.items.len);
+        if (fixture == 4) try std.testing.expectEqualStrings("oldbytes", backend.run_block_cache.items[0].payload.bytes);
+        try std.testing.expectEqual(resources.Slice.lsm_read_working_set, value.reservation.?.slice);
+    }
+    try std.testing.expect(parent.snapshot().memory.peak_bytes <= 2 * cost);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_admission.zig").Port, stage: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    const cost = @sizeOf(SharedBytes) + 8;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var options: resources.Options = .{ .identity_allocator = a };
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = cost;
+    var manager = resources.ResourceManager.init(options);
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    if (stage >= 3) {
+        const old = blk: {
+            const bytes = try a.dupe(u8, "oldbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer old.release();
+        old.reservation = try manager.reserveWithoutReclaim(.lsm_read_working_set, cost);
+        try std.testing.expect(backend.cacheRunBlockLease("/old", 1, 0, 8, old));
+    }
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "newbytes");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    defer value.release();
+    value.result_pins_allowed = false;
+    try value.registerRetirementWithAdmission(&credit, control);
+    const Probe = struct {
+        control: admission.Port,
+        manager: *resources.ResourceManager,
+        held: ?*std.atomic.Mutex = null,
+        pressure: ?*std.c.pthread_mutex_t = null,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.control.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            // Cooperative waits must release the child's accounting lock.
+            if (self.held != &self.manager.mutex) {
+                try std.testing.expect(self.manager.mutex.tryLock());
+                self.manager.mutex.unlock();
+            }
+            self.waits += 1;
+            try self.control.waitForProgress();
+            self.unlock();
+        }
+        fn unlock(self: *@This()) void {
+            if (self.held) |mutex| mutex.unlock();
+            if (self.pressure) |mutex| std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
+            self.held = null;
+            self.pressure = null;
+        }
+        fn hold(self: *@This(), mutex: *std.atomic.Mutex) void {
+            std.debug.assert(mutex.tryLock());
+            self.held = mutex;
+        }
+        fn holdPressure(self: *@This(), mutex: *std.c.pthread_mutex_t) void {
+            std.debug.assert(std.c.pthread_mutex_trylock(mutex) == .SUCCESS);
+            self.pressure = mutex;
+        }
+    };
+    var probe = Probe{ .control = control, .manager = &manager };
+    defer probe.unlock();
+    switch (stage) {
+        0 => probe.hold(&manager.reclaimer_mutex),
+        1 => probe.hold(&manager.mutex),
+        2 => probe.holdPressure(&manager.pressure_change.mutex),
+        3 => probe.hold(&manager.payload_retirement_mutex),
+        4 => probe.hold(&parent.mutex),
+        else => probe.holdPressure(&parent.pressure_change.mutex),
+    }
+    const original_notify = manager.memory_parent.?.notify_fn;
+    defer manager.memory_parent.?.notify_fn = original_notify;
+    const Legacy = struct {
+        fn notify(_: *anyopaque) callconv(.c) void {
+            @panic("controlled local cache entered legacy parent notification");
+        }
+    };
+    manager.memory_parent.?.notify_fn = Legacy.notify;
+    var adapter = admission.Adapter(*Probe){ .budget = &probe };
+    const payload = adapter.payload();
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    try std.testing.expect(try backend.cacheRunBlockLeaseWithAdmission("/new", 2, 0, 8, value, admission.Port.init(&payload)));
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+    try std.testing.expectEqualStrings("newbytes", backend.run_block_cache.items[0].payload.bytes);
+    try std.testing.expectEqual(resources.Slice.lsm_block_table_cache, value.reservation.?.slice);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }

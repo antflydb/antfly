@@ -8945,7 +8945,9 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     // duplicate only publishes readiness for independent admitted cleanup.
     if (construction == null) lease.reservation = read_credit;
     read_credit = null;
-    if (admit) _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
+    if (admit) {
+        if (control) |budget| _ = try backend.cacheRunBlockLeaseWithAdmission(path, run.id, offset, len, lease, budget) else _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
+    }
     return lease;
 }
 
