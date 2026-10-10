@@ -1068,6 +1068,37 @@ const ReclaimerChunk = struct {
     slots: [64]ReclaimerSlot = @splat(.{}),
 };
 
+const ReclaimerPointers = struct {
+    allocator: std.mem.Allocator,
+    entries: []*ReclaimerSlot,
+    credit: ?Reservation = null,
+    retirement: PayloadRetirement = .{},
+
+    fn bytes(count: usize) !usize {
+        return std.math.add(usize, @sizeOf(ReclaimerPointers), try std.math.mul(usize, count, @sizeOf(*ReclaimerSlot)));
+    }
+    noinline fn create(manager: *ResourceManager, slice: Slice, count: usize, control: read_admission.Port) !*ReclaimerPointers {
+        var construction = try manager.reserveConstructionWithAdmission(slice, try bytes(count), control);
+        defer construction.retire();
+        const self = try manager.identity_allocator.create(ReclaimerPointers);
+        errdefer manager.identity_allocator.destroy(self);
+        const entries = try manager.identity_allocator.alloc(*ReclaimerSlot, count);
+        errdefer manager.identity_allocator.free(entries);
+        self.* = .{ .allocator = manager.identity_allocator, .entries = entries };
+        try manager.registerPayloadRetirementWithAdmission(&self.retirement, &self.credit, &construction, self, destroy, control);
+        return self;
+    }
+    fn destroy(raw: *anyopaque) void {
+        const self: *ReclaimerPointers = @ptrCast(@alignCast(raw));
+        const allocator = self.allocator;
+        allocator.free(self.entries);
+        allocator.destroy(self);
+    }
+    fn release(self: *ReclaimerPointers) void {
+        self.retirement.publish();
+    }
+};
+
 const ReclaimerInvocation = struct {
     slot: *ReclaimerSlot,
     context: *anyopaque,
@@ -1117,6 +1148,7 @@ pub const ResourceManager = struct {
     // registry mutex. Empty slots are reused, and the list grows on the
     // registration path instead of imposing a process-wide index-count cap.
     reclaimers: std.ArrayListUnmanaged(*ReclaimerSlot) = .empty,
+    reclaimer_pointers: ?*ReclaimerPointers = null,
     reclaimer_chunks: ?*ReclaimerChunk = null,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
@@ -1505,7 +1537,7 @@ pub const ResourceManager = struct {
         return self.registerReclaimerControlled(slice, context, reclaim, .{}, control);
     }
 
-    fn registerReclaimerControlled(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: ?read_admission.Port) !u64 {
+    noinline fn registerReclaimerControlled(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: ?read_admission.Port) !u64 {
         if (control) |budget| return self.registerReclaimerAdmitted(slice, context, reclaim, options, budget);
         if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, budget) else lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
@@ -1523,6 +1555,22 @@ pub const ResourceManager = struct {
                 .weight = @max(@as(u32, 1), options.weight),
             };
             return identity;
+        }
+        if (self.reclaimer_pointers != null) {
+            self.reclaimer_mutex.unlock();
+            const Legacy = struct {
+                fn checkpoint(_: *anyopaque) !void {}
+                fn wait(_: *anyopaque) !void {
+                    @import("antfly_platform").time.yieldNow();
+                }
+            };
+            var marker: u8 = 0;
+            const payload: read_admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Legacy.checkpoint, .wait_for_progress = Legacy.wait } };
+            // This branch has no admitted read borrow. Scoped callers always
+            // enter the admitted path with their original Port above.
+            const result = self.registerReclaimerAdmitted(slice, context, reclaim, options, read_admission.Port.init(&payload));
+            lockAtomic(&self.reclaimer_mutex);
+            return result;
         }
         // Reserve the pointer before allocating a chunk: failure publishes no
         // owner and leaks no chunk. Existing cells and leases remain stable.
@@ -1550,11 +1598,17 @@ pub const ResourceManager = struct {
         return identity;
     }
 
-    fn registerReclaimerAdmitted(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: read_admission.Port) !u64 {
+    noinline fn registerReclaimerAdmitted(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: read_admission.Port) !u64 {
         var construction: ?ConstructionCredit = null;
         defer if (construction) |*credit| credit.retire();
         var prepared: ?*ReclaimerChunk = null;
         defer if (prepared) |chunk| self.identity_allocator.destroy(chunk);
+        var pointers: ?*ReclaimerPointers = null;
+        defer if (pointers) |owned| owned.release();
+        var legacy_credit: ?ConstructionCredit = null;
+        defer if (legacy_credit) |*credit| credit.retire();
+        var legacy_ptr: ?[*]*ReclaimerSlot = null;
+        var legacy_capacity: usize = 0;
         while (true) {
             try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, control);
             var held = true;
@@ -1577,10 +1631,50 @@ pub const ResourceManager = struct {
                 prepared.?.* = .{};
                 continue;
             }
-            // Pointer-array accounting is separate from stable chunk ownership.
+            const replace = self.reclaimer_pointers == null or self.reclaimers.items.len == self.reclaimers.capacity;
+            if (replace) {
+                const capacity = if (self.reclaimers.capacity == 0) 64 else try std.math.mul(usize, self.reclaimers.capacity, 2);
+                if (pointers == null or pointers.?.entries.len < capacity) {
+                    self.reclaimer_mutex.unlock();
+                    held = false;
+                    if (pointers) |owned| owned.release();
+                    pointers = null;
+                    pointers = try ReclaimerPointers.create(self, slice, capacity, control);
+                    continue;
+                }
+                if (self.reclaimer_pointers == null and self.reclaimers.capacity != 0 and
+                    (legacy_credit == null or legacy_ptr != self.reclaimers.items.ptr or legacy_capacity != self.reclaimers.capacity))
+                {
+                    // Precharge a legacy source allocation before copying and
+                    // freeing it. A racing resize invalidates only this plan.
+                    const old_ptr = self.reclaimers.items.ptr;
+                    const old_capacity = self.reclaimers.capacity;
+                    self.reclaimer_mutex.unlock();
+                    held = false;
+                    if (legacy_credit) |*credit| credit.retire();
+                    legacy_credit = null;
+                    legacy_credit = try self.reserveConstructionWithAdmission(slice, try std.math.mul(usize, old_capacity, @sizeOf(*ReclaimerSlot)), control);
+                    legacy_ptr = old_ptr;
+                    legacy_capacity = old_capacity;
+                    continue;
+                }
+                for (self.reclaimers.items, 0..) |slot, i| {
+                    try control.checkpoint();
+                    pointers.?.entries[i] = slot;
+                }
+            }
             try control.checkpoint();
-            try self.reclaimers.ensureUnusedCapacity(self.identity_allocator, 1);
-            try control.checkpoint();
+            const old_pointers = if (replace) self.reclaimer_pointers else null;
+            const old_legacy = if (replace and self.reclaimer_pointers == null and self.reclaimers.capacity != 0) self.reclaimers.allocatedSlice() else null;
+            if (replace) {
+                const length = self.reclaimers.items.len;
+                const owned = pointers.?;
+                self.reclaimers = .empty;
+                self.reclaimers.items = owned.entries[0..length];
+                self.reclaimers.capacity = owned.entries.len;
+                self.reclaimer_pointers = owned;
+                pointers = null;
+            }
             if (offset == 0) {
                 const chunk = prepared.?;
                 chunk.credit = construction.?.transfer();
@@ -1592,8 +1686,12 @@ pub const ResourceManager = struct {
             const identity = self.nextReclaimerIdentity();
             slot.* = .{ .identity = identity, .slice = slice, .context = context, .reclaim = reclaim, .weight = @max(@as(u32, 1), options.weight) };
             self.reclaimers.appendAssumeCapacity(slot);
-            // Publication transfers the only chunk credit without a later
-            // fallible callback; active callback leases retain stable cells.
+            // All fallible authority checks precede publication. Physical
+            // retirement runs outside the registry, with its credit still owned.
+            self.reclaimer_mutex.unlock();
+            held = false;
+            if (old_pointers) |owned| owned.release();
+            if (old_legacy) |entries| self.identity_allocator.free(entries);
             return identity;
         }
     }
@@ -1603,6 +1701,11 @@ pub const ResourceManager = struct {
         self.next_reclaimer_identity +%= 1;
         if (self.next_reclaimer_identity == 0) self.next_reclaimer_identity = 1;
         return identity;
+    }
+
+    pub fn qualifyReclaimerInitialBytes() usize {
+        if (!builtin.is_test) @compileError("qualification requires a test build");
+        return @sizeOf(ReclaimerChunk) + (ReclaimerPointers.bytes(64) catch unreachable);
     }
 
     pub fn qualifyReclaimerChunkBytes() usize {
@@ -2169,6 +2272,35 @@ pub const ResourceManager = struct {
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
         std.debug.assert(!self.cleanup_consumer_bound.load(.acquire));
+        std.debug.assert(self.memory.external_bytes == 0);
+        self.dense_checkpoint_ready.assertUnbound();
+        self.dense_rerank_admission.assertIdle();
+        self.dense_driver_admission.assertIdle();
+        if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
+        if (self.dense_read_extra_tasks.load(.acquire) != 0)
+            @panic("resource manager deinitialized with active dense read workers");
+        lockAtomic(&self.dense_search_admission_mutex);
+        if (self.dense_search_active_queries != 0 or self.dense_search_waiters.head != null)
+            @panic("resource manager deinitialized with active dense search admission");
+        self.dense_search_admission_mutex.unlock();
+
+        _ = alloc;
+        lockAtomic(&self.reclaimer_mutex);
+        for (self.reclaimers.items) |slot| {
+            if (slot.identity != 0 or slot.in_flight.load(.acquire) != 0)
+                @panic("resource manager deinitialized with live reclaimers");
+        }
+        if (self.reclaimer_pointers) |owned| owned.release() else self.reclaimers.deinit(self.identity_allocator);
+        self.reclaimer_pointers = null;
+        self.reclaimers = .empty;
+        while (self.reclaimer_chunks) |chunk| {
+            self.reclaimer_chunks = chunk.next;
+            var credit = chunk.credit;
+            self.identity_allocator.destroy(chunk);
+            if (credit) |*owned| owned.release();
+        }
+        self.reclaimer_mutex.unlock();
+
         // Quiescent teardown: producers and admitted cleanup have joined.
         while (self.payload_retirement_head) |node| {
             if (!node.ready.load(.acquire)) @panic("resource manager closed with live payload owners");
@@ -2191,33 +2323,6 @@ pub const ResourceManager = struct {
                 else => @panic("resource manager closed with live construction cleanup"),
             }
         }
-        std.debug.assert(self.memory.external_bytes == 0);
-        self.dense_checkpoint_ready.assertUnbound();
-        self.dense_rerank_admission.assertIdle();
-        self.dense_driver_admission.assertIdle();
-        if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
-        if (self.dense_read_extra_tasks.load(.acquire) != 0)
-            @panic("resource manager deinitialized with active dense read workers");
-        lockAtomic(&self.dense_search_admission_mutex);
-        if (self.dense_search_active_queries != 0 or self.dense_search_waiters.head != null)
-            @panic("resource manager deinitialized with active dense search admission");
-        self.dense_search_admission_mutex.unlock();
-
-        _ = alloc;
-        lockAtomic(&self.reclaimer_mutex);
-        for (self.reclaimers.items) |slot| {
-            if (slot.identity != 0 or slot.in_flight.load(.acquire) != 0)
-                @panic("resource manager deinitialized with live reclaimers");
-        }
-        self.reclaimers.deinit(self.identity_allocator);
-        self.reclaimers = .empty;
-        while (self.reclaimer_chunks) |chunk| {
-            self.reclaimer_chunks = chunk.next;
-            var credit = chunk.credit;
-            self.identity_allocator.destroy(chunk);
-            if (credit) |*owned| owned.release();
-        }
-        self.reclaimer_mutex.unlock();
 
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -7726,8 +7831,10 @@ pub fn qualifyPressurePayloadRetirement(control: read_admission.Port, fixture: u
 pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool) !void {
     if (!builtin.is_test) @compileError("qualification requires a test build");
     const a = std.testing.allocator;
-    const cost = @sizeOf(ReclaimerChunk);
-    var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (grow) 2 * cost else cost } });
+    const cost = ResourceManager.qualifyReclaimerInitialBytes();
+    const grown = 2 * @sizeOf(ReclaimerChunk) + (try ReclaimerPointers.bytes(128));
+    const growth_peak = grown + (try ReclaimerPointers.bytes(64));
+    var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (grow) growth_peak else cost } });
     defer parent.deinit(a);
     var manager = ResourceManager.init(.{ .identity_allocator = a });
     var manager_live = true;
@@ -7750,8 +7857,10 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
     if (grow) {
         ids[64] = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &calls, Callback.reclaim, control);
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
-        try std.testing.expectEqual(@as(u64, 2 * cost), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, 2 * cost), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, growth_peak), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, growth_peak), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+        try std.testing.expectEqual(@as(u64, grown), parent.snapshot().memory.used_bytes);
     } else {
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         manager.identity_allocator = failing.allocator();
@@ -7776,9 +7885,80 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
         id.* = 0;
     }
     // Empty slots remain physically allocated and charged for later reuse.
-    try std.testing.expectEqual(@as(u64, if (grow) 2 * cost else cost), parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, if (grow) grown else cost), parent.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), calls);
     manager.deinit(a);
     manager_live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+pub fn qualifyControlledReclaimerPointers(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    var live = true;
+    defer if (live) manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var context: u8 = 0;
+    const Callback = struct {
+        fn reclaim(_: *anyopaque, _: u64) u64 {
+            return 0;
+        }
+    };
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(a);
+    defer if (live) for (ids.items) |id| manager.unregisterReclaimer(id);
+    if (fixture == 0) {
+        // Fill the exact legacy pointer capacity, then adopt it through scoped
+        // growth. Existing callbacks keep their original stable cell addresses.
+        try ids.append(a, try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim));
+        const capacity = manager.reclaimers.capacity;
+        while (ids.items.len < capacity) try ids.append(a, try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim));
+        const first = manager.reclaimers.items[0];
+        const old_bytes = capacity * @sizeOf(*ReclaimerSlot);
+        const expected = try ReclaimerPointers.bytes(capacity * 2);
+        try ids.append(a, try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control));
+        try std.testing.expectEqual(first, manager.reclaimers.items[0]);
+        try std.testing.expectEqual(@as(u64, expected), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, expected + old_bytes), parent.snapshot().memory.peak_bytes);
+    } else if (fixture == 1) {
+        for (0..64) |_| try ids.append(a, try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control));
+        const first = manager.reclaimers.items[0];
+        try ids.append(a, try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim));
+        try std.testing.expectEqual(first, manager.reclaimers.items[0]);
+        const expected = 2 * @sizeOf(ReclaimerChunk) + (try ReclaimerPointers.bytes(128));
+        try std.testing.expectEqual(@as(u64, expected + (try ReclaimerPointers.bytes(64))), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+        try std.testing.expectEqual(@as(u64, expected), parent.snapshot().memory.used_bytes);
+    } else {
+        // Failure may occur in credit identity, chunk, pointer header or array
+        // preparation. No callback identity may escape a failed preparation.
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fixture - 2 });
+        manager.identity_allocator = failing.allocator();
+        const result = manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control);
+        manager.identity_allocator = a;
+        if (result) |id| {
+            try ids.append(a, id);
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(usize, 0), manager.reclaimers.items.len);
+            _ = try manager.drainPayloadRetirementWithAdmission(control);
+            try manager.drainConstructionCleanupWithAdmission(control);
+            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        }
+        // Captured allocator contexts remain live through physical retirement.
+        for (ids.items) |id| manager.unregisterReclaimer(id);
+        ids.clearRetainingCapacity();
+        manager.deinit(a);
+        live = false;
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        return;
+    }
+    for (ids.items) |id| manager.unregisterReclaimer(id);
+    ids.clearRetainingCapacity();
+    manager.deinit(a);
+    live = false;
     try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
 }

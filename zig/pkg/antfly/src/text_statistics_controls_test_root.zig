@@ -2392,3 +2392,33 @@ test "text statistics trusted controls reclaimer chunks precharge growth preserv
         }
     }
 }
+
+test "text statistics trusted controls reclaimer pointer ownership retires replacement preserves mixed callers and allocation failures" {
+    const Budget = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..10) |fixture| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 60 * std.time.ns_per_s, .retained_bytes = 23 }, phase);
+            var budget = Budget{ .execution = &execution };
+            const admission = sources.common_read_admission;
+            var adapter = admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            try sources.storage_resource_manager.qualifyControlledReclaimerPointers(admission.Port.init(&payload), fixture);
+            try std.testing.expectEqual(phase, try execution.retainedClass());
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
+}

@@ -27561,7 +27561,7 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     const resources = @import("resource_manager.zig");
     const a = std.testing.allocator;
     const cost = @sizeOf(SharedBytes) + 8;
-    const metadata = resources.ResourceManager.qualifyReclaimerChunkBytes() + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
+    const metadata = resources.ResourceManager.qualifyReclaimerInitialBytes() + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
     const parent_limit = 2 * cost + metadata;
     var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
     defer parent.deinit(a);
@@ -27653,7 +27653,7 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
     var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
     defer parent.deinit(a);
     var options: resources.Options = .{ .identity_allocator = a };
-    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = resources.ResourceManager.qualifyReclaimerChunkBytes() + cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = resources.ResourceManager.qualifyReclaimerInitialBytes() + cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(a);
     try manager.installMemoryParent(parent.memoryParentPort());
@@ -27766,7 +27766,7 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
     const path = "/physically-charged-cache-path";
     const payload_cost = @sizeOf(SharedBytes) + 8;
     const path_cost = @sizeOf(SharedBytes) + path.len;
-    const registry_cost = resource_manager_mod.ResourceManager.qualifyReclaimerChunkBytes();
+    const registry_cost = resource_manager_mod.ResourceManager.qualifyReclaimerInitialBytes();
     const slab_cost = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
     var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost + registry_cost } });
     defer parent.deinit(a);
