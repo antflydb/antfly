@@ -41,10 +41,11 @@
   "design": [
     "Gather at most 128 references in source document order, validate selected rows, then gather bounded identity spans in source offset order and emit in requested output order.",
     "Reject sparse metadata/ID span expansion beyond four source rows/bytes per selected row/byte. Skip sorting already ordered references.",
-    "Keep native large-batch fallback bounded and stream already validated IDs without rereading metadata or allocating whole IDs. Mixed historical/native batches retain the streaming path.",
+    "Validate the batch once, then gather bounded output-order windows without replaying metadata reads. Shrink windows before I/O when sparse span expansion exceeds the gather cap; stream oversized individual native IDs separately. Heap IDs borrow their reader and share packed output writes with native IDs.",
     "Keep contiguous output writes; buffer fragmented small IDs into fixed 8 KiB writes. Returned values never borrow this gather scope.",
     "Seal stored-metadata append CRC tracking before body writes; intersect patches with the sealed range and reread only dirty checksum pages. Plain sinks retain the existing range-CRC contract.",
-    "Use deletion rank for live-input checks with and without a prepared frozen index."
+    "Use deletion rank for live-input checks with and without a prepared frozen index.",
+    "Traverse borrowed live ranges by cached Roaring container and bitmap word, with forward seeking after intact block copies. Reuse the traversal in stored-field passes and sort plans; derive streaming sort live counts from rank."
   ],
   "bounds": {
     "batch_documents": 128,
@@ -61,7 +62,31 @@
     "Injected cold ID read failure and invalid selected metadata row before gathered IDs are emitted; retry after failure.",
     "Sealed CRC ranges with unaligned tails, body-only patches and patches crossing the metadata boundary.",
     "Empty inputs and fully/partially deleted liveness with frozen and bitmap-only navigation.",
-    "File-backed sort plans fill each 128-document gather with reads of at most 64 records; in-memory plans copy their borrowed slices into the gather buffer."
+    "File-backed sort plans fill each 128-document gather with reads of at most 64 records; in-memory plans copy their borrowed slices into the gather buffer.",
+    "Long dense and reversed identities across the gather cap; mixed readers retain native gathering and packed writes.",
+    "Sparse/dense/missing Roaring containers, uint32 end boundary, forward seeks and randomized complement traversal; end-to-end merge with one surviving document."
   ],
-  "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count."
+  "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count.",
+  "long_id_windows": {
+    "documents": 128,
+    "bytes_per_identity": 1024,
+    "before_cache_probes": 131,
+    "after_cache_probes": 5,
+    "after_sink_appends": 2
+  },
+  "mixed_reader_windows": {
+    "native_documents": 127,
+    "heap_documents": 1,
+    "before_native_cache_probes": 254,
+    "after_native_cache_probes": 2,
+    "before_sink_appends": 128,
+    "after_sink_appends": 1
+  },
+  "sparse_survivor_navigation": {
+    "documents": 4096,
+    "survivors": 1,
+    "stored_writer_membership_checks_before": 12288,
+    "stored_writer_membership_checks_after": 0,
+    "measurement": "Review-only isDeleted instrumentation; all three stored-field production passes."
+  }
 }

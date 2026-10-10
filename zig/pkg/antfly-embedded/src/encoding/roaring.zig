@@ -758,6 +758,14 @@ pub const RoaringBitmap = struct {
         return self.keys.items.len == 0;
     }
 
+    /// Borrowed, bounded traversal of the complement in [lower, upper).
+    /// Sparse containers skip runs of members; dense containers skip words.
+    /// The bitmap must remain immutable for the iterator's lifetime.
+    pub fn absentRanges(self: *const RoaringBitmap, lower: u32, upper: u64) AbsentRangeIterator {
+        std.debug.assert(lower <= upper and upper <= 0x1_0000_0000);
+        return .{ .bitmap = self, .target = lower, .upper = upper, .chunk_idx = arraySearchPos(self.keys.items, @truncate(lower >> 16)) };
+    }
+
     pub fn iterator(self: *const RoaringBitmap) Iterator {
         return Iterator.init(self);
     }
@@ -1389,6 +1397,78 @@ fn insertShiftedContainer(result: *RoaringBitmap, key: u16, container: Container
 // ============================================================================
 // Iterator
 // ============================================================================
+
+pub const AbsentRangeIterator = struct {
+    pub const Range = struct { start: u32, end: u64 };
+    bitmap: *const RoaringBitmap,
+    target: u64,
+    upper: u64,
+    chunk_idx: usize,
+    array_pos: usize = 0,
+
+    /// Forward-only seek, used when a consumer copies an entire live block.
+    pub fn seekForward(self: *AbsentRangeIterator, lower: u64) void {
+        self.target = @min(self.upper, @max(self.target, lower));
+    }
+
+    pub fn next(self: *AbsentRangeIterator) ?Range {
+        const keys = self.bitmap.keys.items;
+        while (self.target < self.upper) {
+            const high = self.target >> 16;
+            while (self.chunk_idx < keys.len and keys[self.chunk_idx] < high) {
+                self.chunk_idx += 1;
+                self.array_pos = 0;
+            }
+            if (self.chunk_idx == keys.len or keys[self.chunk_idx] > high) {
+                const end = if (self.chunk_idx == keys.len) self.upper else @min(self.upper, @as(u64, keys[self.chunk_idx]) << 16);
+                const start = self.target;
+                self.target = end;
+                return .{ .start = @intCast(start), .end = end };
+            }
+            const base = high << 16;
+            const chunk_end = @min(self.upper, base + 65536);
+            switch (self.bitmap.containers.items[self.chunk_idx]) {
+                .array => |values| {
+                    while (self.array_pos < values.items.len and base + values.items[self.array_pos] < self.target) self.array_pos += 1;
+                    // Consume consecutive deleted members in one run.
+                    while (self.array_pos < values.items.len and base + values.items[self.array_pos] == self.target) {
+                        self.array_pos += 1;
+                        self.target += 1;
+                    }
+                    if (self.target >= chunk_end) continue;
+                    const end = if (self.array_pos == values.items.len) chunk_end else @min(chunk_end, base + values.items[self.array_pos]);
+                    const start = self.target;
+                    self.target = end;
+                    return .{ .start = @intCast(start), .end = end };
+                },
+                .bitmap => |words| {
+                    var word_index: usize = @intCast((self.target - base) / 64);
+                    const word_base = base + word_index * 64;
+                    const live = ~words[word_index] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @truncate(self.target)));
+                    if (live == 0) {
+                        self.target = @min(chunk_end, word_base + 64);
+                        continue;
+                    }
+                    const start = word_base + @ctz(live);
+                    if (start >= chunk_end) {
+                        self.target = chunk_end;
+                        continue;
+                    }
+                    var deleted = words[word_index] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @truncate(start)));
+                    while (deleted == 0) {
+                        word_index += 1;
+                        if (word_index == words.len or base + word_index * 64 >= chunk_end) break;
+                        deleted = words[word_index];
+                    }
+                    const end = if (deleted == 0) chunk_end else @min(chunk_end, base + word_index * 64 + @ctz(deleted));
+                    self.target = end;
+                    return .{ .start = @intCast(start), .end = end };
+                },
+            }
+        }
+        return null;
+    }
+};
 
 pub const Iterator = struct {
     bitmap: *const RoaringBitmap,
@@ -2311,4 +2391,58 @@ test "frozen rank membership cursor handles forward backwards and container gaps
         try std.testing.expectEqual(bitmap.rank(doc), result.below);
         try std.testing.expectEqual(bitmap.contains(doc), result.contains);
     }
+}
+
+test "absent ranges cover sparse dense and missing containers" {
+    const a = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    // An array, a dense bitmap crossing word boundaries, a missing container,
+    // and the final uint32 container exercise every navigation branch.
+    try bitmap.addRange(7, 14);
+    try bitmap.add(29);
+    try bitmap.addRange(65536, 65536 + 9000);
+    try bitmap.addRange(65536 + 9010, 65536 + 12000);
+    try bitmap.add(0xffff_fffe);
+    const windows = [_][2]u64{ .{ 0, 30 }, .{ 63, 65536 + 12020 }, .{ 2 * 65536, 3 * 65536 + 3 }, .{ 0xffff_fffc, 0x1_0000_0000 }, .{ 8, 8 }, .{ 8, 12 } };
+    for (windows) |window| {
+        var ranges = bitmap.absentRanges(@intCast(window[0]), window[1]);
+        var cursor = window[0];
+        while (ranges.next()) |range| {
+            try std.testing.expect(range.start >= cursor and range.end > range.start and range.end <= window[1]);
+            while (cursor < range.start) : (cursor += 1) try std.testing.expect(bitmap.contains(@intCast(cursor)));
+            while (cursor < range.end) : (cursor += 1) try std.testing.expect(!bitmap.contains(@intCast(cursor)));
+        }
+        while (cursor < window[1]) : (cursor += 1) try std.testing.expect(bitmap.contains(@intCast(cursor)));
+    }
+    var ranges = bitmap.absentRanges(0, 0x1_0000_0000);
+    ranges.seekForward(65536 + 8999);
+    const range = ranges.next().?;
+    try std.testing.expectEqual(@as(u32, 65536 + 9000), range.start);
+    try std.testing.expectEqual(@as(u64, 65536 + 9010), range.end);
+    ranges.seekForward(0xffff_ffff);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), ranges.next().?.start);
+    try std.testing.expectEqual(@as(?AbsentRangeIterator.Range, null), ranges.next());
+}
+
+test "absent ranges match randomized membership after forward seeks" {
+    const a = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    var state: u64 = 53125;
+    for (0..100000) |doc| {
+        state = state *% 6364136223846793005 +% 1;
+        if ((state >> 32) % 7 != 0) try bitmap.add(@intCast(doc));
+    }
+    var ranges = bitmap.absentRanges(0, 100000);
+    var cursor: u64 = 0;
+    while (ranges.next()) |range| {
+        while (cursor < range.start) : (cursor += 1) try std.testing.expect(bitmap.contains(@intCast(cursor)));
+        while (cursor < range.end) : (cursor += 1) try std.testing.expect(!bitmap.contains(@intCast(cursor)));
+        if (cursor % 17 == 0) {
+            cursor = @min(100000, cursor + 93);
+            ranges.seekForward(cursor);
+        }
+    }
+    while (cursor < 100000) : (cursor += 1) try std.testing.expect(bitmap.contains(@intCast(cursor)));
 }

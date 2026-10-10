@@ -2229,6 +2229,45 @@ pub const MergeInput = struct {
     }
 };
 
+/// Borrowed live-document traversal. Keep the input (and its immutable
+/// deletion bitmap) alive until the iterator is exhausted.
+const LiveDocs = struct {
+    ranges: ?roaring.AbsentRangeIterator,
+    cursor: u64,
+    end: u64,
+    upper: u64,
+
+    fn init(input: *const MergeInput, lower: u32, upper: u32) LiveDocs {
+        std.debug.assert(lower <= upper and upper <= input.reader.doc_count);
+        // Entirely deleted ranges need no word traversal or stored metadata.
+        if (lower == upper or input.deletedBefore(upper) - input.deletedBefore(lower) == upper - lower)
+            return .{ .ranges = null, .cursor = upper, .end = upper, .upper = upper };
+        if (input.deleted) |*deleted| return .{ .ranges = deleted.absentRanges(lower, upper), .cursor = lower, .end = lower, .upper = upper };
+        return .{ .ranges = null, .cursor = lower, .end = upper, .upper = upper };
+    }
+
+    fn next(self: *LiveDocs) ?u32 {
+        if (self.cursor == self.end) {
+            if (self.ranges) |*ranges| {
+                const range = ranges.next() orelse return null;
+                self.cursor = range.start;
+                self.end = range.end;
+            } else return null;
+        }
+        const doc: u32 = @intCast(self.cursor);
+        self.cursor += 1;
+        return doc;
+    }
+
+    fn seekForward(self: *LiveDocs, lower: u64) void {
+        self.cursor = @min(self.upper, @max(self.cursor, lower));
+        if (self.cursor >= self.end) {
+            self.end = self.cursor;
+            if (self.ranges) |*ranges| ranges.seekForward(self.cursor);
+        }
+    }
+};
+
 /// Task-private provenance. Append merges retain spans; sorted native merges
 /// retain private file coordinates with bounded caches. Heap callers can
 /// promote shuffled spans to a four-byte table per source document. Public IDs and
@@ -3262,16 +3301,16 @@ const StoredIdentityRow = struct {
     offset: u64 = 0,
     length: u32 = 0,
     buffer_offset: usize = 0,
+    borrowed: ?[]const u8 = null,
 };
 
 fn appendStoredIdentityRange(sink: *SegmentSink, input: MergeInput, start_doc: u32, count: u32, scratch: *SegmentReadScratch) !void {
     if (start_doc > input.reader.doc_count or count > input.reader.doc_count - start_doc) return error.InvalidSegment;
-    if (count == 0 or input.deletedBefore(start_doc + count) - input.deletedBefore(start_doc) == count) return;
+    if (count == 0) return;
     var rows: [stored_identity_batch_docs]SortedMergeDoc = undefined;
     var used: usize = 0;
-    for (0..count) |i| {
-        const doc = start_doc + @as(u32, @intCast(i));
-        if (input.isDeleted(doc)) continue;
+    var live = LiveDocs.init(&input, start_doc, start_doc + count);
+    while (live.next()) |doc| {
         rows[used] = .{ .ref = .{ .input_idx = 0, .doc_id = doc } };
         used += 1;
         if (used == rows.len) {
@@ -3296,17 +3335,22 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
     for (records) |record| {
         if (record.ref.input_idx >= inputs.len or record.ref.doc_id >= inputs[record.ref.input_idx].reader.doc_count) return error.InvalidSegment;
     }
-    // Heap-backed historical readers already own their IDs. Preserve support
-    // for mixed formats without allocating source-sized native identities.
-    for (records) |record| if (inputs[record.ref.input_idx].reader.native == null) {
-        for (records) |row| try appendStoredIdentitySingle(sink, inputs[row.ref.input_idx], row.ref.doc_id, scratch);
-        return;
-    };
     var rows: [stored_identity_batch_docs]StoredIdentityRow = undefined;
     var order: [stored_identity_batch_docs]usize = undefined;
+    var native_count: usize = 0;
     for (records, 0..) |record, i| {
         rows[i] = .{ .ref = record.ref };
-        order[i] = i;
+        const reader = inputs[record.ref.input_idx].reader;
+        if (reader.native == null) {
+            // Historical IDs borrow the reader. They do not disable gathering
+            // of neighboring native records or consume its read buffer.
+            const id = (try reader.storedIdScoped(scratch.allocator(), record.ref.doc_id)) orelse return error.InvalidSegment;
+            rows[i].borrowed = id;
+            rows[i].length = std.math.cast(u32, id.len) orelse return error.InvalidSegment;
+        } else {
+            order[native_count] = i;
+            native_count += 1;
+        }
     }
     const selected = rows[0..records.len];
     const ByDocument = struct {
@@ -3317,14 +3361,14 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
         }
     };
     const comparison_rows: []const StoredIdentityRow = selected;
-    if (!std.sort.isSorted(usize, order[0..records.len], comparison_rows, ByDocument.less))
-        std.mem.sort(usize, order[0..records.len], comparison_rows, ByDocument.less);
+    if (!std.sort.isSorted(usize, order[0..native_count], comparison_rows, ByDocument.less))
+        std.mem.sort(usize, order[0..native_count], comparison_rows, ByDocument.less);
     var entries: [stored_identity_batch_docs * stored_fields_v4_doc_entry_size]u8 = undefined;
     var cursor: usize = 0;
-    while (cursor < records.len) {
+    while (cursor < native_count) {
         const first = rows[order[cursor]].ref;
         var end = cursor + 1;
-        while (end < records.len) : (end += 1) {
+        while (end < native_count) : (end += 1) {
             const next = rows[order[end]].ref;
             if (next.input_idx != first.input_idx) break;
             const span = @as(u64, next.doc_id) - first.doc_id + 1;
@@ -3345,6 +3389,51 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
         }
         cursor = end;
     }
+    // Split in output order, retaining validated metadata. A large batch
+    // does not force its small neighboring IDs onto a per-document path.
+    var bytes: [stored_identity_gather_bytes]u8 = undefined;
+    cursor = 0;
+    while (cursor < selected.len) {
+        const first = selected[cursor];
+        if (first.length > bytes.len) {
+            if (first.borrowed) |id| {
+                try sink.appendSlice(id);
+            } else {
+                try appendStoredIdentitySpan(sink, storedIdentitySource(inputs[first.ref.input_idx]), storedIdentityBase(inputs[first.ref.input_idx]) + first.offset, first.length, &bytes);
+            }
+            cursor += 1;
+            continue;
+        }
+        var end = cursor;
+        var native_bytes: usize = 0;
+        while (end < selected.len) : (end += 1) {
+            const row = selected[end];
+            if (row.length > bytes.len) break;
+            if (row.borrowed == null) {
+                if (row.length > bytes.len - native_bytes) break;
+                native_bytes += row.length;
+            }
+        }
+        // Gap bytes can make a window larger than its selected identities.
+        // Plan before reading; shrink only that window, without replaying I/O.
+        while (!try appendStoredIdentityWindow(sink, inputs, selected[cursor..end], &bytes)) {
+            std.debug.assert(end - cursor > 1);
+            end = cursor + (end - cursor) / 2;
+        }
+        cursor = end;
+    }
+}
+
+/// False means the planned native spans exceed the buffer; nothing was read
+/// or emitted. Metadata has already been validated for every output record.
+fn appendStoredIdentityWindow(sink: *SegmentSink, inputs: []const MergeInput, selected: []StoredIdentityRow, bytes: []u8) !bool {
+    var order: [stored_identity_batch_docs]usize = undefined;
+    var native_count: usize = 0;
+    for (selected, 0..) |row, i| if (row.borrowed == null) {
+        order[native_count] = i;
+        native_count += 1;
+    };
+    const comparison_rows: []const StoredIdentityRow = selected;
     const ByOffset = struct {
         fn less(values: []const StoredIdentityRow, left: usize, right: usize) bool {
             const l = values[left];
@@ -3352,21 +3441,20 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
             return if (l.ref.input_idx != r.ref.input_idx) l.ref.input_idx < r.ref.input_idx else l.offset < r.offset;
         }
     };
-    if (!std.sort.isSorted(usize, order[0..records.len], comparison_rows, ByOffset.less))
-        std.mem.sort(usize, order[0..records.len], comparison_rows, ByOffset.less);
+    if (!std.sort.isSorted(usize, order[0..native_count], comparison_rows, ByOffset.less))
+        std.mem.sort(usize, order[0..native_count], comparison_rows, ByOffset.less);
     const Span = struct { input: usize, offset: u64, length: usize, buffer: usize };
     var spans: [stored_identity_batch_docs]Span = undefined;
     var span_count: usize = 0;
     var gathered_bytes: usize = 0;
-    var bytes: [stored_identity_gather_bytes]u8 = undefined;
-    cursor = 0;
-    while (cursor < records.len) {
-        const first = rows[order[cursor]];
+    var cursor: usize = 0;
+    while (cursor < native_count) {
+        const first = selected[order[cursor]];
         var end = cursor + 1;
         var span_end = first.offset + first.length;
         var live_bytes: u64 = first.length;
-        while (end < records.len) : (end += 1) {
-            const next = rows[order[end]];
+        while (end < native_count) : (end += 1) {
+            const next = selected[order[end]];
             if (next.ref.input_idx != first.ref.input_idx) break;
             const next_end = @max(span_end, next.offset + next.length);
             const selected_bytes = live_bytes + next.length;
@@ -3375,15 +3463,10 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
             live_bytes = selected_bytes;
         }
         const length = std.math.cast(usize, span_end - first.offset) orelse return error.InvalidSegment;
-        if (length > stored_identity_gather_bytes - gathered_bytes) {
-            // Large batches stream already validated identities directly. No
-            // gather read or output has happened, so fallback adds no replay.
-            for (selected) |row| try appendStoredIdentitySpan(sink, storedIdentitySource(inputs[row.ref.input_idx]), storedIdentityBase(inputs[row.ref.input_idx]) + row.offset, row.length, &bytes);
-            return;
-        }
+        if (length > bytes.len - gathered_bytes) return false;
         spans[span_count] = .{ .input = first.ref.input_idx, .offset = first.offset, .length = length, .buffer = gathered_bytes };
         span_count += 1;
-        for (order[cursor..end]) |index| rows[index].buffer_offset = gathered_bytes + @as(usize, @intCast(rows[index].offset - first.offset));
+        for (order[cursor..end]) |index| selected[index].buffer_offset = gathered_bytes + @as(usize, @intCast(selected[index].offset - first.offset));
         gathered_bytes += length;
         cursor = end;
     }
@@ -3398,17 +3481,17 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
     var output_bytes: usize = 0;
     var contiguous = true;
     for (selected) |row| {
-        if (row.length != 0 and row.buffer_offset != first_output + output_bytes) contiguous = false;
+        if (row.borrowed != null or (row.length != 0 and row.buffer_offset != first_output + output_bytes)) contiguous = false;
         output_bytes += row.length;
     }
     if (contiguous) {
         try sink.appendSlice(bytes[first_output..][0..output_bytes]);
-        return;
+        return true;
     }
     var output: [8 * 1024]u8 = undefined;
     var used: usize = 0;
     for (selected) |row| {
-        const value = bytes[row.buffer_offset..][0..row.length];
+        const value = row.borrowed orelse bytes[row.buffer_offset..][0..row.length];
         if (value.len > output.len - used) {
             if (used != 0) try sink.appendSlice(output[0..used]);
             used = 0;
@@ -3421,24 +3504,7 @@ fn appendStoredIdentityBatch(sink: *SegmentSink, inputs: []const MergeInput, rec
         }
     }
     if (used != 0) try sink.appendSlice(output[0..used]);
-}
-
-fn appendStoredIdentitySingle(sink: *SegmentSink, input: MergeInput, doc: u32, scratch: *SegmentReadScratch) !void {
-    if (input.reader.native == null) {
-        const id = (try input.reader.storedIdScoped(scratch.allocator(), doc)) orelse return error.InvalidSegment;
-        try sink.appendSlice(id);
-        return;
-    }
-    const range = &input.reader.native.?.range;
-    var entry: [stored_fields_v4_doc_entry_size]u8 = undefined;
-    const source = storedIdentitySource(input);
-    try source.readInto(range.stored_offset + 21 + @as(u64, doc) * entry.len, &entry);
-    const offset = std.mem.readInt(u64, entry[0..8], .little);
-    const length = std.mem.readInt(u32, entry[8..12], .little);
-    const block = std.mem.readInt(u32, entry[12..16], .little);
-    if (block >= range.num_blocks or offset > range.id_bytes_length or length > range.id_bytes_length - offset) return error.InvalidSegment;
-    var bytes: [stored_identity_gather_bytes]u8 = undefined;
-    try appendStoredIdentitySpan(sink, source, storedIdentityBase(input) + offset, length, &bytes);
+    return true;
 }
 
 fn appendStoredIdentitySpan(sink: *SegmentSink, source: @import("segment_source.zig").Source, offset: u64, length: u64, scratch: []u8) !void {
@@ -3490,13 +3556,8 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     var stored_cursor = SegmentReader.StoredDocBlockCache.init(alloc, 1024 * 1024);
     defer stored_cursor.deinit();
     for (inputs) |input| {
-        var doc_id_usize: usize = 0;
-        while (doc_id_usize < input.reader.doc_count) {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) {
-                doc_id_usize += 1;
-                continue;
-            }
+        var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+        while (live.next()) |doc_id| {
 
             // Flush a partial prefix before an intact source block, so one
             // damaged block does not force every subsequent block to decode.
@@ -3507,14 +3568,13 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
                 }
                 const copied = try copyMergedStoredBlock(sink, input, copy_locations[0..copied_docs], block_idx, &table, block_offsets_start, block_checksums_start, data_start);
                 if (copied != copied_docs) return error.InvalidSegment;
-                doc_id_usize += copied_docs;
+                live.seekForward(@as(u64, doc_id) + copied_docs);
                 block_idx += 1;
                 docs_in_block = 0;
                 continue;
             }
 
             const stored = (try stored_cursor.get(input.reader, doc_id)) orelse {
-                doc_id_usize += 1;
                 continue;
             };
             if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
@@ -3528,7 +3588,6 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
             try chunk.appendSlice(alloc, stored.data);
             try table.append(sink, stored.id.len, block_idx, doc_offset, stored.data.len);
             docs_in_block += 1;
-            doc_id_usize += 1;
         }
     }
     if (chunk.items.len > 0) {
@@ -3706,25 +3765,18 @@ fn countMergedStoredBlocks(inputs: []const MergeInput) !u32 {
     var docs_in_block: u32 = 0;
     var raw_bytes: usize = 0;
     for (inputs) |input| {
-        var doc_id_usize: usize = 0;
-        while (doc_id_usize < input.reader.doc_count) {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) {
-                doc_id_usize += 1;
-                continue;
-            }
-
+        var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+        while (live.next()) |doc_id| {
             if (try copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
                 if (raw_bytes != 0) blocks += 1;
                 blocks += 1;
-                doc_id_usize += copied_docs;
+                live.seekForward(@as(u64, doc_id) + copied_docs);
                 docs_in_block = 0;
                 raw_bytes = 0;
                 continue;
             }
 
             const length = (try input.reader.storedDocLength(doc_id)) orelse {
-                doc_id_usize += 1;
                 continue;
             };
             const doc_raw_bytes = @as(usize, 4) +| length;
@@ -3735,7 +3787,6 @@ fn countMergedStoredBlocks(inputs: []const MergeInput) !u32 {
             }
             docs_in_block += 1;
             raw_bytes +|= doc_raw_bytes;
-            doc_id_usize += 1;
         }
     }
     if (raw_bytes > 0) blocks += 1;
@@ -3936,9 +3987,8 @@ fn buildUnsortedMergePlanAlloc(
         doc_maps[input_idx] = map;
         doc_maps_initialized += 1;
 
-        for (0..input.reader.doc_count) |doc_id_usize| {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) continue;
+        var live = LiveDocs.init(&input, 0, input.reader.doc_count);
+        while (live.next()) |doc_id| {
             const keys = try loadSegmentSortKeysAlloc(alloc, &reads, inputs, .{ .input_idx = input_idx, .doc_id = doc_id }, index_sort, null, null, null);
             errdefer {
                 for (keys) |*key| key.deinit(alloc);
@@ -4334,9 +4384,10 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
         }
         alloc.free(payloads);
     }
-    const slots = try alloc.alloc(u1, inputs.len);
-    defer alloc.free(slots);
-    @memset(slots, 0);
+    const InputState = struct { slot: u1 = 0, live: LiveDocs };
+    const states = try alloc.alloc(InputState, inputs.len);
+    defer alloc.free(states);
+    for (states, 0..) |*state, i| state.* = .{ .live = LiveDocs.init(&inputs[i], 0, inputs[i].reader.doc_count) };
     const Heap = std.PriorityQueue(SortedMergeRecord, []const SegmentIndexSortField, struct {
         fn compare(fields: []const SegmentIndexSortField, a: SortedMergeRecord, b: SortedMergeRecord) std.math.Order {
             return if (sortedMergeRecordLessThan(fields, a, b)) .lt else if (sortedMergeRecordLessThan(fields, b, a)) .gt else .eq;
@@ -4369,14 +4420,8 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
             doc_maps[input_idx] = map;
             doc_maps_initialized += 1;
         }
-        var first: ?u32 = null;
-        for (0..input.reader.doc_count) |id| {
-            if (!input.isDeleted(@intCast(id))) {
-                live_count += 1;
-                if (first == null) first = @intCast(id);
-            }
-        }
-        if (first) |id| {
+        live_count += input.reader.doc_count - input.deletedBefore(input.reader.doc_count);
+        if (states[input_idx].live.next()) |id| {
             const head = SortedMergeRecord{
                 .ref = .{ .input_idx = input_idx, .doc_id = id },
                 .keys = try loadSegmentSortKeysAlloc(alloc, &reads, inputs, .{ .input_idx = input_idx, .doc_id = id }, index_sort, null, &streams, payloads[input_idx][0].allocator()),
@@ -4399,12 +4444,11 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
             doc_maps[head.ref.input_idx][head.ref.doc_id] = @intCast(out_id);
         }
         const input = inputs[head.ref.input_idx];
-        var next = @as(usize, head.ref.doc_id) + 1;
-        while (next < input.reader.doc_count and input.isDeleted(@intCast(next))) : (next += 1) {}
+        const next: usize = states[head.ref.input_idx].live.next() orelse input.reader.doc_count;
         if (next < input.reader.doc_count) {
             const reusable = spare_keys[head.ref.input_idx];
             spare_keys[head.ref.input_idx] = null;
-            const slot = slots[head.ref.input_idx] ^ 1;
+            const slot = states[head.ref.input_idx].slot ^ 1;
             const scratch = &payloads[head.ref.input_idx][slot];
             scratch.reset();
             const successor = SortedMergeRecord{
@@ -4417,7 +4461,7 @@ fn buildStreamingSortedMergePlanWithScratch(alloc: Allocator, inputs: []const Me
             // not silently produce a wrongly sorted output segment.
             if (sortedMergeRecordLessThan(index_sort, successor, head)) return error.NonMonotonicIndexSort;
             try heap.push(alloc, successor);
-            slots[head.ref.input_idx] = slot;
+            states[head.ref.input_idx].slot = slot;
             spare_keys[head.ref.input_idx] = head.keys;
             head_owned = false;
         }
@@ -10239,4 +10283,246 @@ test "stored identity gather rejects invalid rows and read failures without publ
     defer std.mem.writeInt(u64, bytes[row..][0..8], previous, .little);
     try std.testing.expectError(error.InvalidSegment, appendStoredIdentityBatch(&sink, &.{.{ .reader = &reader }}, &records, &scratch));
     try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
+}
+
+test "stored identity windows preserve long-ID batching" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..128) |doc| {
+        var id: [1024]u8 = undefined;
+        @memset(&id, @intCast(doc));
+        try writer.addStoredDoc(&id, "small stored document");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    for (0..128) |doc| {
+        const id = (try reader.storedIdAlloc(a, @intCast(doc))).?;
+        a.free(id);
+    }
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var ids: std.ArrayListUnmanaged(u8) = .empty;
+    defer ids.deinit(a);
+    const cache = &reader.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    for (0..128) |doc| {
+        scratch.reset();
+        const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(doc))).?;
+        try ids.appendSlice(a, id);
+    }
+    const per_doc_probes = cache.cache.clock - before;
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    const before_batch = cache.cache.clock;
+    const arena_before_batch = scratch.arena.queryCapacity();
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader }, 0, reader.doc_count, &scratch);
+    const batch_probes = cache.cache.clock - before_batch;
+    try std.testing.expectEqualSlices(u8, ids.items, output.out.items);
+    std.debug.print("STORED_ID_LONG_WINDOWS documents=128 identity_bytes={d} cache_probes={d}->{d}\n", .{ ids.items.len, per_doc_probes, batch_probes });
+    try std.testing.expect(batch_probes <= 5);
+    try std.testing.expectEqual(@as(usize, 2), output.test_append_calls);
+    output.out.clearRetainingCapacity();
+    var refs: [128]SortedMergeDoc = undefined;
+    for (&refs, 0..) |*ref, i| ref.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(127 - i) } };
+    const before_reverse = cache.cache.clock;
+    try appendStoredIdentityBatch(&sink, &.{.{ .reader = &reader }}, &refs, &scratch);
+    try std.testing.expect(cache.cache.clock - before_reverse <= 5);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), output.out.items.len);
+    for (output.out.items, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @intCast(127 - i / 1024)), byte);
+    try std.testing.expectEqual(arena_before_batch, scratch.arena.queryCapacity());
+}
+
+test "stored identity windows preserve shuffled duplicate and empty IDs" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..256) |doc| {
+        var id: [240]u8 = undefined;
+        for (&id, 0..) |*b, i| b.* = @intCast((doc + i) % 251);
+        try writer.addStoredDoc(id[0 .. (doc * 37) % 240], "{}");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer reader.deinit();
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(a);
+    var sink = output.sink();
+    var state: u64 = 734572;
+    for (0..40) |_| {
+        var refs: [128]SortedMergeDoc = undefined;
+        expected.clearRetainingCapacity();
+        output.out.clearRetainingCapacity();
+        for (&refs) |*ref| {
+            state = state *% 6364136223846793005 +% 1;
+            ref.* = .{ .ref = .{ .input_idx = @intCast((state >> 40) & 1), .doc_id = @intCast((state >> 32) % 256) } };
+            const id = (try reader.storedIdAlloc(a, ref.ref.doc_id)).?;
+            defer a.free(id);
+            try expected.appendSlice(a, id);
+        }
+        try appendStoredIdentityBatch(&sink, &.{ .{ .reader = &reader }, .{ .reader = &reader } }, &refs, &scratch);
+        try std.testing.expectEqualSlices(u8, expected.items, output.out.items);
+    }
+    std.debug.print("STORED_ID_WINDOW_ORACLE batches=40 refs=5120 empty_ids_duplicates_mixed_inputs=pass\n", .{});
+}
+
+test "section CRC sealed checkpoint patch oracle" {
+    const a = std.testing.allocator;
+    var memory = MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var destination = memory.sink();
+    var tracker = PageChecksumSink.init(a, &destination);
+    defer tracker.deinit();
+    var sink = tracker.sink();
+    var state: u64 = 5324;
+    for (0..12) |cycle| {
+        try sink.appendNTimes(31, cycle * 73);
+        sink.beginSection();
+        const start = sink.len();
+        const size = cycle * 19017;
+        try sink.appendNTimes(83, size);
+        sink.endSection();
+        const end = sink.len();
+        try sink.appendNTimes(71, 32000);
+        for (0..24) |_| {
+            state = state *% 6364136223846793005 +% 1;
+            const offset = @as(usize, @intCast(state >> 32)) % (sink.len() - 7);
+            try sink.writeAt(offset, "patched");
+            const actual = try sink.crc32Range(start, end - start);
+            try std.testing.expectEqual(Crc32.hash(memory.out.items[start..end]), actual);
+        }
+    }
+    std.debug.print("SECTION_CRC_ORACLE sections=12 patches=288 unaligned_empty_crossing=pass\n", .{});
+}
+
+test "stored identity mixed readers retain native gathering" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..128) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "{}");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    var heap = try SegmentReader.init(a, bytes);
+    defer heap.deinit();
+    var refs: [128]SortedMergeDoc = undefined;
+    for (&refs, 0..) |*ref, i| ref.* = .{ .ref = .{ .input_idx = if (i == 127) 1 else 0, .doc_id = @intCast(i) } };
+    var scratch = SegmentReadScratch.init(a, 65536);
+    defer scratch.deinit();
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    const cache = &native.native.?.metadata_cache.?;
+    var probes: [2]u64 = undefined;
+    var writes: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |mixed, i| {
+        const before = cache.cache.clock;
+        const before_writes = output.test_append_calls;
+        output.out.clearRetainingCapacity();
+        try appendStoredIdentityBatch(&sink, &.{ .{ .reader = &native }, .{ .reader = if (mixed) &heap else &native } }, &refs, &scratch);
+        probes[i] = cache.cache.clock - before;
+        writes[i] = output.test_append_calls - before_writes;
+    }
+    std.debug.print("STORED_ID_MIXED_WINDOWS native_probes={d} mixed_probes={d} native_appends={d} mixed_appends={d}\n", .{ probes[0], probes[1], writes[0], writes[1] });
+    try std.testing.expect(probes[1] <= 4);
+    try std.testing.expectEqual(@as(usize, 1), writes[1]);
+}
+
+test "live document ranges skip deleted prefixes and copied blocks" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..4096) |_| try writer.addStoredDoc("id", "{}");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer reader.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.addRange(0, 4095);
+    var rank = try roaring.FrozenRankIndex.init(a, deleted);
+    defer rank.deinit();
+    const input = MergeInput{ .reader = &reader, .deleted = deleted, .deletion_rank = &rank };
+    var live = LiveDocs.init(&input, 0, reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, 4095), live.next());
+    try std.testing.expectEqual(@as(?u32, null), live.next());
+    var sparse = roaring.RoaringBitmap.init(a);
+    defer sparse.deinit();
+    try sparse.addRange(100, 200);
+    const sparse_input = MergeInput{ .reader = &reader, .deleted = sparse };
+    var skipped = LiveDocs.init(&sparse_input, 0, reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, 0), skipped.next());
+    skipped.seekForward(150);
+    try std.testing.expectEqual(@as(?u32, 200), skipped.next());
+    skipped.seekForward(250);
+    try std.testing.expectEqual(@as(?u32, 250), skipped.next());
+    skipped.seekForward(200); // A backward request must not replay documents.
+    try std.testing.expectEqual(@as(?u32, 251), skipped.next());
+    skipped.seekForward(reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, null), skipped.next());
+    const plain_input = MergeInput{ .reader = &reader };
+    var plain = LiveDocs.init(&plain_input, 0, reader.doc_count);
+    plain.seekForward(128);
+    try std.testing.expectEqual(@as(?u32, 128), plain.next());
+    plain.seekForward(reader.doc_count);
+    try std.testing.expectEqual(@as(?u32, null), plain.next());
+    const merged = try mergeSegmentInputs(a, &.{input});
+    defer a.free(merged);
+    var result = try SegmentReader.init(a, merged);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.doc_count);
+    try std.testing.expectEqualStrings("id", (try result.storedDoc(0)).?.id);
+    const stored = (try result.storedDocDecompressed(a, 0)).?;
+    defer a.free(stored.data);
+    try std.testing.expectEqualStrings("{}", stored.data);
+}
+
+test "stored identity windows bound sparse expansion across the gather cap" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..384) |doc| {
+        var id: [512]u8 = undefined;
+        @memset(&id, @intCast(doc % 251));
+        try writer.addStoredDoc(&id, "{}");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer reader.deinit();
+    var refs: [128]SortedMergeDoc = undefined;
+    for (&refs, 0..) |*ref, i| ref.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast((127 - i) * 3) } };
+    var scratch = SegmentReadScratch.init(a, 65536);
+    defer scratch.deinit();
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    try appendStoredIdentityBatch(&sink, &.{.{ .reader = &reader }}, &refs, &scratch);
+    try std.testing.expectEqual(@as(usize, 128 * 512), output.out.items.len);
+    for (output.out.items, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @intCast(((127 - i / 512) * 3) % 251)), byte);
+    try std.testing.expectEqual(@as(usize, 0), scratch.arena.queryCapacity());
+    // Sparse gap reads force window reduction. Small IDs still pack into
+    // bounded output writes rather than falling back to 128 appends.
+    try std.testing.expect(output.test_append_calls < 20);
 }
