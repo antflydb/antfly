@@ -1400,3 +1400,131 @@ obsolete statistics remain reachable until the last pinned reader releases them.
 Archive-scale cold/warm throughput, fetched bytes, cache hit rates, planning and
 lane peaks, and process RSS still need measurement on a representative fragmented
 archive. No archive-scale speedup is asserted by these bounded regressions.
+
+## Term-directed planning and adaptive statistics follow-up
+
+Status: proposed; implementation and qualification are pending. This follows
+#1058, which persists global document frequencies and segment scoring summaries,
+shares request lowering, and routes sparse work to overlapping streams.
+
+### Intended behavior and delivery order
+
+1. Selective text queries discover segments from authenticated term incidence,
+   rather than seeking every segment's summary tree before scoring.
+2. Statistics publication chooses between small copy-on-write updates and a
+   bounded streaming merge for changes affecting much of the vocabulary.
+3. Compact frequency/length envelopes tighten segment bounds for broad queries
+   and custom BM25 parameters.
+4. Batched reads fetch missing statistics once and reuse decoded routing pages.
+
+Keep existing query syntax, ranking arithmetic, cursor identity and tie order.
+Each stage must retain exact legacy-reader fallback and publish its new artifacts
+through the existing fenced manifest commit. No measured speedup is claimed yet.
+
+### Authenticated term-to-segment directory
+
+Persist a term-first directory keyed by unambiguous field/term identity, with
+bounded pages of segment incidence and raw scoring envelopes. Incidence must
+name immutable segment identities; a request resolves those identities to the
+pinned corpus's original ordinal and document offset. A reused segment must not
+inherit a previous generation's ordinal or offset.
+
+Use immutable, content-addressed pages, publication domains and upload attempts.
+Store per-file contributions so append, replacement and removal can update the
+term directory without rereading unchanged native dictionaries. Share unchanged
+pages across generations and register all new references in durable GC traversal
+before publishing the new format. Readers retain only immutable data in shared
+owners and use current query authority for every read and warm cache hit.
+
+Compose candidate segment sets from the lowered query. Required clauses may
+intersect, optional clauses must respect minimum-should-match, and prohibited
+clauses cannot independently exclude an entire segment. Phrase incidence is an
+approximation and must retain positional verification. Match-all, pure-negative,
+optional-baseline and other shapes without a safe positive incidence restriction
+retain the complete domain. Do not apply positive-score pruning to signed or
+otherwise unsupported scoring shapes.
+
+Add hierarchical conservative bounds to avoid loading every matching segment
+page before scoring. Hierarchy nodes aggregate raw envelopes, not scores tied to
+one request's BM25 configuration. Missing optional acceleration metadata chooses
+the exact legacy path; a referenced malformed, missing or cross-domain artifact
+fails validation rather than silently dropping candidates.
+
+Acceptance: on thousands of segments with a term present in a small subset,
+assert metadata work follows relevant directory pages and matching segments.
+Compare exact hit IDs and score bits with the established path for nested
+Booleans, phrases, masks, distributed statistics, signed/zero boosts and cursors.
+Cover cold restart, generation overlap, incremental removal and reader-pinned GC.
+
+### Adaptive global-statistics publication
+
+Keep the current sorted signed-delta spill pipeline and small-update COW path.
+Add a streaming merge of sorted unique deltas with the prior global DF cursor.
+Carry counts with checked wide arithmetic, reject negative results, omit zero
+counts, and write the resulting sorted stream using bounded page construction.
+Never materialize the vocabulary or all mutations in memory.
+
+Choose the strategy using measured or bounded estimates of changed distinct
+terms, prior term count and expected page traffic. Include the cost of obtaining
+those estimates; avoid an extra full scan solely to choose a path. Dense updates
+must avoid a point lookup for every old count and repeated rewrites of shared
+routing pages. Empty deltas retain the exact prior root reference.
+
+Both paths obey publication working-set admission, cancellation, upload fencing,
+read/write budgets and temporary disk limits. Budget exhaustion leaves the prior
+publication readable. Orphan pages remain subject to the existing attempt-aware
+collector. Expose selected strategy and page/read/write counts in diagnostics.
+
+Acceptance: exercise empty, sparse and dense updates; replacements and removals;
+counts near their limits; forced spilling; allocation failure; cancellation and
+failed publication. Compare output counts across strategies. Assert small updates
+retain their bounded rewrite behavior and dense updates avoid per-term old seeks.
+
+### Compact scoring envelopes
+
+Replace a single segment-wide maximum frequency/minimum length pair with a
+bounded set of nondominated pairs derived from authenticated block metadata.
+A pair can be discarded only when another pair conservatively dominates it for
+all supported BM25 configurations. When exact nondominated state exceeds its
+budget, conservatively coarsen buckets or retain a wider envelope; never truncate
+possible winners. Saturated frequencies retain their open-ended ceiling.
+
+Derive scores using the request's average length, k1, b and IDF, including upward
+rounding allowances. Invalid or unsupported parameters use the established
+conservative fallback. Keep exact posting scores and their addition order intact.
+Version the summary representation explicitly and decode old scalar summaries.
+Use the same envelope representation in term-directory hierarchy nodes where
+possible, with bounded union and coarsening.
+
+Acceptance: prove each envelope bounds every represented block across a varied
+BM25 parameter matrix and adversarial frequency/length distributions. Cover
+saturation, zero/negative boosts and floating-point limits. Compare ranked results
+with an exhaustive reference; measure segment/posting reads on broad queries.
+
+### Batched statistics reads and bounded reuse
+
+Compact only missing global DF terms before invoking the persisted reader, then
+scatter returned counts into their original request slots. Preserve duplicate
+terms, current-authority checks, singleflight behavior and exact warm results.
+Batch per-segment summary seeks and reuse decoded B-tree routing pages within
+bounded worker/request caches. Cache raw immutable envelopes separately from
+request-specific derived bounds so changes in BM25 settings do not duplicate raw
+metadata. Shared caches must remain bounded and retain no query capability.
+
+Acceptance: instrument mixed warm/cold batches, duplicates, concurrent requests,
+authority changes, cancellation and cache eviction. Assert warm terms do not
+trigger persisted lookups and shared routing pages are not fetched per term.
+
+### Qualification and rollout
+
+Run focused Debug and optimized search/statistics suites, incremental publication
+and GC integration, and real Parquet/Iceberg E2Es. Keep the Iceberg fixtures in
+`e2e-full`; include migration/restart coverage for every new artifact version.
+
+Add reproducible fragmented-corpus benchmarks for rare and broad terms, nested
+filters, custom BM25, sparse and dense publication changes, and cursor pages.
+Report cold/warm latency distributions, metadata/posting bytes, provider request
+counts, decoded-page cache hits, publication amplification, temporary disk,
+planning/lane peaks and process RSS. Use work-count assertions for regressions;
+keep timing thresholds out of ordinary correctness tests. Record dataset shape,
+cache state, hardware and toolchain alongside results before claiming speedups.
