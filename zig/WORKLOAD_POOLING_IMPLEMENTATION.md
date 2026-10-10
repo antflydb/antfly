@@ -2086,3 +2086,25 @@ provenance records Nix Zig 0.17.0 using Nix glibc 2.44, separately from the
 container's system glibc 2.39. This proves the selected focused contracts, not
 the modified provisioned-owner fixture, complete holder graph, API/DB
 integration, runtime resource/performance matrix or automatic defaults.
+
+
+### Concurrent maintenance shutdown retirement
+
+A detached maintenance future previously let a second `stop` caller return
+while the first caller was still joining the active callback. The owner now
+tracks the shutdown join separately from its admission flag and detached
+future. Subsequent shutdown callers wait on an uncancelable completion event
+outside the lifecycle mutex. The joining caller signals completion only after
+the maintenance scheduler has physically joined and retired the callback.
+No-work shutdown also completes idempotently. An existing callback future
+requires its original runtime I/O lane to remain alive through the join.
+
+Ten native maintenance/scheduler checks passed, and the four ownership audit
+checks passed. The new regression uses two physical shutdown threads and a
+blocked callback. It observes the second caller inside the actual retirement
+event wait, verifies neither caller returns early, and verifies scheduler
+active capacity stays charged after registration detachment. Releasing the
+callback retires capacity and denies later work. Failure observations release
+and join all threads rather than leaving a hung test. This verifies the actual
+maintenance owner, but still does not qualify shared CPU admission for all
+background work or broader API/DB/resource/performance/default contracts.

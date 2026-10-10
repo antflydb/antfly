@@ -42,6 +42,8 @@ pub const Owner = struct {
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     future: ?runtime_mod.MaintenanceScheduler.Handle = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_started: bool = false,
+    joined: std.Io.Event = .unset,
     repair_retry_after_ns: u64 = 0,
     pub const idle_poll_ns: u64 = 5 * std.time.ns_per_s;
     pub const active_poll_ns: u64 = 100 * std.time.ns_per_ms;
@@ -64,18 +66,31 @@ pub const Owner = struct {
         };
     }
     pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
+        const io = runtime.io();
         self.lock();
+        if (self.stop_started) {
+            self.lifecycle_mutex.unlock();
+            // Detaching a future transfers its join, not its completed state.
+            // Every shutdown caller must observe physical callback retirement.
+            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
+            return;
+        }
+        self.stop_started = true;
         self.stopping.store(true, .release);
         var future = self.future;
         self.future = null;
+        if (future == null) {
+            // A runtime without an I/O lane cannot have a callback future.
+            // Complete this no-work shutdown before releasing admission.
+            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
+            self.lifecycle_mutex.unlock();
+            return;
+        }
         self.lifecycle_mutex.unlock();
         // The callback may invoke another local lifecycle operation. Join
         // outside admission so its completion cannot deadlock shutdown.
-        if (future) |*task| {
-            if (runtime.io()) |io| task.await(io);
-        }
-        self.lock();
-        self.lifecycle_mutex.unlock();
+        future.?.await(io orelse @panic("maintenance future outlived its runtime I/O lane"));
+        self.joined.set(io.?);
     }
     fn scheduledStep(self: *Owner) ?u64 {
         return self.step(self.port);
@@ -329,4 +344,88 @@ test "independent maintenance shutdown during readiness denies the first stage" 
     var fixture: Fixture = .{ .owner = &owner };
     const port: Owner.Port = .{ .ptr = &fixture, .runtime = undefined, .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity };
     try std.testing.expect(owner.step(port) == null);
+}
+
+test "independent maintenance concurrent shutdown callers both join physical callback retirement" {
+    const builtin = @import("builtin");
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.ptr().io().?;
+    var owner: Owner = .{};
+    const Fixture = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        retired: std.atomic.Value(bool) = .init(false),
+        later_stages: std.atomic.Value(usize) = .init(0),
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn ready(_: *anyopaque) bool {
+            return true;
+        }
+        fn run(raw: *anyopaque, work: Owner.Work) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (work == .upload) {
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                self.retired.store(true, .release);
+            } else _ = self.later_stages.fetchAdd(1, .acq_rel);
+            return false;
+        }
+        fn failed(_: *anyopaque, _: Owner.Work) void {}
+        fn activity(_: *anyopaque) Owner.Activity {
+            return .{};
+        }
+    };
+    const Stopper = struct {
+        owner: *Owner,
+        runtime: *runtime_mod.BackendRuntime,
+        returned: std.atomic.Value(bool) = .init(false),
+        fn stop(self: *@This()) void {
+            self.owner.stop(self.runtime);
+            self.returned.store(true, .release);
+        }
+    };
+    var fixture: Fixture = .{ .io = io };
+    defer owner.stop(runtime.ptr());
+    // Always release the callback before joining stoppers, even if a bounded
+    // observation fails. A regression must fail rather than strand shutdown.
+    owner.start(.{ .ptr = &fixture, .runtime = runtime.ptr(), .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity });
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    defer fixture.release.set(io);
+    while (!fixture.entered.isSet() and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(fixture.entered.isSet());
+    var first: Stopper = .{ .owner = &owner, .runtime = runtime.ptr() };
+    const first_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&first});
+    defer first_thread.join();
+    defer fixture.release.set(io);
+    while (!owner.stopping.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(owner.stopping.load(.acquire));
+    var second: Stopper = .{ .owner = &owner, .runtime = runtime.ptr() };
+    const second_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&second});
+    defer second_thread.join();
+    defer fixture.release.set(io);
+    while (@atomicLoad(std.Io.Event, &owner.joined, .acquire) != .waiting and
+        !second.returned.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    // The second caller really reached the retirement wait; this is not an
+    // inference from an arbitrary sleep while a thread might be unscheduled.
+    try std.testing.expectEqual(std.Io.Event.waiting, @atomicLoad(std.Io.Event, &owner.joined, .acquire));
+    try std.testing.expect(!first.returned.load(.acquire));
+    try std.testing.expect(!second.returned.load(.acquire));
+    try std.testing.expect(!fixture.retired.load(.acquire));
+    const scheduler = try runtime.ptr().maintenanceScheduler();
+    const held = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), held.registrations);
+    try std.testing.expectEqual(@as(usize, 1), held.active);
+    fixture.release.set(io);
+    owner.joined.waitUncancelable(io);
+    try std.testing.expect(fixture.retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.later_stages.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().active);
+    owner.stop(runtime.ptr());
 }
