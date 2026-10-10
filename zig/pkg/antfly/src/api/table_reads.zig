@@ -13198,6 +13198,10 @@ fn collectProvisionedAlgebraicDistributedPartials(
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
+    // This helper owns a native DB lease. The control-only consumer reaches
+    // distributed aggregation through its query kernel, never this shortcut.
+    // Preserve deadline and identity validation before rejecting native access.
+    if (comptime control_only_storage_sources) return error.UnsupportedQueryRequest;
     var partials = std.ArrayListUnmanaged(db_mod.algebraic.distributed.Partial).empty;
     // Capability fallback is a successful null return, so cleanup must run
     // on every exit, including after earlier shards supplied owned values.
@@ -23947,6 +23951,11 @@ fn consumerTests() type {
             try std.testing.expect((try collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, "alg", &.{}, .{
                 .output = .{ .input = 0 },
             }, null, null)) == null);
+            if (comptime control_only_storage_sources) {
+                try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAlgebraicDistributedPartials(&healthy_source, alloc, group_ids[0..], "docs", .{}, "alg", &.{}, .{
+                    .output = .{ .input = 0 },
+                }, null, null));
+            }
             try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_explicit_req, stats_hits, &text_analysis, null));
             try std.testing.expectError(error.UnsupportedQueryRequest, collectProvisionedAggregationBackgroundTextStats(&healthy_source, alloc, group_ids[0..], "docs", resolved_background_req, stats_hits, &text_analysis, null));
 
