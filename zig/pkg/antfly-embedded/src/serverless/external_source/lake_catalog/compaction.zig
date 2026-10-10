@@ -140,7 +140,9 @@ pub fn prepareOutputs(a: A, table: t.Table, files: rows.Files, selection: Select
     const previous_sequence = try m.int(try m.get(root, "last-sequence-number"));
     if (previous_sequence < 0 or previous_sequence == std.math.maxInt(i64)) return error.InvalidLakeMetadata;
     const sequence = previous_sequence + 1;
-    const identity = try std.json.Stringify.valueAlloc(a, .{ "compaction-v1", table.metadata_location, selection.manifests }, .{});
+    // Concurrent jobs share a parent but produce different immutable data URIs.
+    // Bind manifest names to their contents so both can reach the catalog CAS.
+    const identity = try std.json.Stringify.valueAlloc(a, .{ "compaction-v2", table.metadata_location, selection.manifests, outputs }, .{});
     const digest = t.digestHex(identity);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(identity, &hash, .{});
@@ -283,9 +285,16 @@ test "lake compaction resumable selection and output manifests exceed turn limit
     const outputs = try a.alloc(Output, images.len);
     for (outputs, images, 0..) |*output, image, n| output.* = try writeOutput(a, table, files, "resumable", n, &.{image});
     const rewritten = try prepareOutputs(a, table, files, selection, outputs, 3);
+    const competing_output = try writeOutput(a, table, files, "competing", 0, images);
+    const competing = try prepareOutputs(a, table, files, selection, &.{competing_output}, 3);
+    try std.testing.expect(competing.snapshot_id != rewritten.snapshot_id);
+    const replay = try prepareOutputs(a, table, files, selection, outputs, 3);
+    try std.testing.expectEqualStrings(rewritten.body, replay.body);
+    const parent_location = try a.dupe(u8, table.metadata_location);
     const next = try authority.commit(alloc, .{ .id = "resumable", .expected_metadata_location = table.metadata_location, .body = rewritten.body, .timestamp_ms = 3 });
     table.deinit(alloc);
     table = next;
+    try std.testing.expectError(error.LakeCommitConflict, authority.commit(alloc, .{ .id = "competing", .expected_metadata_location = parent_location, .body = competing.body, .timestamp_ms = 3 }));
     const list = try currentList(a, table, files);
     var total: u64 = 0;
     var data_manifests: usize = 0;

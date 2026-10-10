@@ -56,6 +56,20 @@ pub const Cut = struct {
 fn identity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
     return local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, kinds);
 }
+// Base SQL rows carry nanoseconds, whereas integer WAL keys carry micros.
+fn baseIdentity(a: A, keys: []const []const u8, row: V, kinds: []const stable_key.Kind) ![]const u8 {
+    if (row != .object or (kinds.len != 0 and kinds.len != keys.len)) return error.InvalidLakeKey;
+    var normalized: V = .{ .object = .empty };
+    for (keys, 0..) |key, i| {
+        var value = row.object.get(key) orelse return error.InvalidLakeKey;
+        if (kinds.len != 0 and kinds[i] == .timestamp and value == .integer) {
+            const formatted = try local.datetime.formatDateTimeSignedNsAlloc(a, value.integer);
+            value = .{ .string = formatted };
+        }
+        try normalized.object.put(a, key, value);
+    }
+    return identity(a, keys, normalized, kinds);
+}
 pub fn physicalRequest(a: A, request: catalog.Scan, cut: Cut) !catalog.Scan {
     // Ordered/physical selections cannot be translated to the new logical cut.
     if (request.index_range != null or request.primary_key != null or request.row_refs != null or request.after != null or request.before != null) return error.UnsupportedSqlExecution;
@@ -111,7 +125,7 @@ const Cursor = struct {
             self.base_done = page.after == null;
             for (page.rows) |row| {
                 try self.context.ensureActive();
-                const key = try identity(scratch, self.cut.pending.key_fields, row.value, self.cut.kinds);
+                const key = try baseIdentity(scratch, self.cut.pending.key_fields, row.value, self.cut.kinds);
                 if (self.cut.changed.contains(key)) continue;
                 if (!try matchesTyped(scratch, self.table, row, self.request.conditions)) continue;
                 try rows.append(scratch, try project(scratch, self.table, row, self.request.fields));
@@ -256,5 +270,38 @@ test "lake SQL accepted timestamp keys match canonical committed rows and numeri
     const pending = try std.json.parseFromSliceLeaky(V, a, encoded, .{});
     const cut = try Cut.initForTable(a, .{ .lsn = 9, .key_fields = &.{ "id", "time" }, .changes = &.{.{ .op = .delete, .row = pending }} }, table);
     const committed = try std.json.parseFromSliceLeaky(V, a, "{\"id\":7,\"time\":\"2026-10-09T08:00:00-07:00\"}", .{});
-    try std.testing.expect(cut.changed.contains(try identity(a, cut.pending.key_fields, committed, cut.kinds)));
+    try std.testing.expect(cut.changed.contains(try baseIdentity(a, cut.pending.key_fields, committed, cut.kinds)));
+}
+
+test "lake SQL timestamp base keys suppress accepted deletes and replacements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .columns = &.{.{ .name = "time", .path = "/time", .type = .datetime }} };
+    const Fixture = struct {
+        row: V,
+        fn next(raw: *anyopaque, alloc: A, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var owned = std.heap.ArenaAllocator.init(alloc);
+            const rows = try owned.allocator().alloc(catalog.Row, 1);
+            rows[0] = .{ .id = "base", .version = 0, .value = self.row };
+            return .{ .rows = rows, .owned_arena = owned };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    for ([_]i64{ -1000001000, 1000001000 }) |ns| {
+        for ([_]@FieldType(ingestion.Batch.Change, "op"){ .delete, .upsert }) |op| {
+            const wal = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"time\":{d}}}", .{@divExact(ns, std.time.ns_per_us)}), .{});
+            const base = try std.json.parseFromSliceLeaky(V, a, try std.fmt.allocPrint(a, "{{\"time\":{d}}}", .{ns}), .{});
+            const cut = try Cut.initForTable(a, .{ .lsn = 9, .key_fields = &.{"time"}, .changes = &.{.{ .op = op, .row = wal }} }, table);
+            var fixture: Fixture = .{ .row = base };
+            const cursor = try wrap(std.testing.allocator, .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close }, table, .{ .fields = &.{"time"}, .limit = 10 }, &cut, .{});
+            defer cursor.close(cursor.ptr);
+            const page = try cursor.next(cursor.ptr, std.testing.allocator, 10);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, if (op == .delete) 0 else 1), page.rows.len);
+            try std.testing.expect(page.after == null);
+            if (op == .upsert) try std.testing.expect(std.mem.startsWith(u8, page.rows[0].id, "wal1:"));
+        }
+    }
 }

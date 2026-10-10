@@ -130,9 +130,9 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
                     var bytes: usize = 0;
                     if (visible) {
                         const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
-                        for (columns) |column| {
+                        for (columns, fields) |column, field| {
                             const cell = try page.cell(scratch, 0, column);
-                            const cloned = try local.api_json_helpers.cloneJsonValue(scratch, cell.value);
+                            const cloned = try local.api_json_helpers.cloneJsonValue(scratch, try writerValue(field, cell.value));
                             bytes = try std.math.add(usize, bytes, (try std.json.Stringify.valueAlloc(scratch, cloned, .{})).len + column.len + 4);
                             try image.object.put(scratch, column, cloned);
                         }
@@ -208,4 +208,33 @@ test "external lake compaction resumable coordinator enforces per-turn admission
     const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "t", .format = .iceberg, .source_uri = "s3://bucket/table", .schema_fingerprint = "schema" };
     try std.testing.expectError(error.InvalidLakeMaintenanceLimits, run(std.testing.allocator, binding, .{}, .{}, .{ .operation_id = "" }));
     try std.testing.expectError(error.InvalidLakeMaintenanceLimits, run(std.testing.allocator, binding, .{}, .{}, .{ .operation_id = "job", .max_rows = 0 }));
+}
+
+// The scanner exposes timestamp nanoseconds; Iceberg's writer consumes micros.
+fn writerValue(field: V, value: V) !V {
+    const kind = try catalog.metadata.str(try catalog.metadata.get(field, "type"));
+    if (value == .integer and (std.mem.eql(u8, kind, "timestamp") or std.mem.eql(u8, kind, "timestamptz"))) {
+        if (@rem(value.integer, std.time.ns_per_us) != 0) return error.LakeTimestampPrecisionLoss;
+        return .{ .integer = @divExact(value.integer, std.time.ns_per_us) };
+    }
+    return value;
+}
+
+test "external lake compaction preserves timestamp units and signed microsecond precision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "timestamp", "timestamptz" }) |kind| {
+        var field: V = .{ .object = .empty };
+        try field.object.put(a, "type", .{ .string = kind });
+        for ([_]i64{ -1000001000, 0, 1000001000 }) |ns| {
+            const value = try writerValue(field, .{ .integer = ns });
+            try std.testing.expectEqual(ns, value.integer * std.time.ns_per_us);
+        }
+        try std.testing.expect((try writerValue(field, .null)) == .null);
+        try std.testing.expectError(error.LakeTimestampPrecisionLoss, writerValue(field, .{ .integer = 1 }));
+    }
+    var field: V = .{ .object = .empty };
+    try field.object.put(a, "type", .{ .string = "long" });
+    try std.testing.expectEqual(@as(i64, 1000001000), (try writerValue(field, .{ .integer = 1000001000 })).integer);
 }

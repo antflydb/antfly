@@ -7,7 +7,7 @@ import pytest
 
 from antfly_lake_maintenance.controller import Controller
 from antfly_lake_maintenance.server import resolve
-from antfly_lake_maintenance.store import Conflict, Store, encode
+from antfly_lake_maintenance.store import Conflict, Store, digest, encode
 
 
 def test_authority_concurrent_owners_do_not_lose_transitions(tmp_path):
@@ -136,3 +136,32 @@ def test_retention_cannot_bypass_minimum_age_with_nonintegers(bad_retention):
     )
     with pytest.raises(ValueError, match="integers"):
         controller.run_job(digest(body), body)
+
+
+@pytest.mark.parametrize("artifact_prefix", ["", "journal/", "nested/journal/"])
+def test_job_registry_matches_native_root_and_nested_prefixes(artifact_prefix):
+    controller = object.__new__(Controller)
+    controller.config = {
+        "artifact_uri": "s3://artifacts/" + artifact_prefix,
+        "artifact_connection": "s3",
+    }
+    job = {
+        "source_uri": "s3://warehouse/table",
+        "table_uuid": "table-uuid",
+    }
+    prefix = (
+        artifact_prefix
+        + "lake-readers/"
+        + digest(encode([job["source_uri"], job["table_uuid"]]))
+    )
+    job["reader_registry"] = {
+        "protocol": "antfly-snapshot-pins-v1",
+        "connection": "s3",
+        "bucket": "artifacts",
+        "prefix": prefix,
+        "lease_grace_ms": 30_000,
+    }
+    assert controller._job_registry(job) == f"s3://artifacts/{prefix}/snapshots/"
+    job["reader_registry"]["prefix"] = "/" + prefix
+    with pytest.raises(ValueError, match="does not match configured authority"):
+        controller._job_registry(job)

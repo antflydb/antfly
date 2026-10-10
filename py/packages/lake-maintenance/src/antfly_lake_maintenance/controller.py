@@ -489,9 +489,10 @@ class Controller:
     def _job_registry(self, job):
         registry = job["reader_registry"]
         parsed = urlsplit(self.config["artifact_uri"])
+        artifact_prefix = parsed.path.strip("/")
         prefix = (
-            parsed.path.strip("/")
-            + "/lake-readers/"
+            (artifact_prefix + "/" if artifact_prefix else "")
+            + "lake-readers/"
             + digest(encode([job["source_uri"], job["table_uuid"]]))
         )
         if (
