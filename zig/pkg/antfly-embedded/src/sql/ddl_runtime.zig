@@ -567,3 +567,82 @@ test "SQL catalog DDL parser preserves qualified scope and native operations" {
         try std.testing.expectEqual(case.action, compiled.statement.catalog_ddl.action);
     }
 }
+
+test "SQL boolean partial index predicates normalize without losing NULL membership" {
+    const compiler = @import("compiler.zig");
+    const ddl = @import("schema_ddl.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try compiler.compile(a, "CREATE TABLE threads (archived BOOLEAN NOT NULL, optional BOOLEAN, preview TEXT)", .{});
+    defer create.deinit();
+    const original = try createSchemaAlloc(a, create.statement.create_table);
+    const cases = [_]struct { sql: []const u8, column: []const u8 = "archived", op: []const u8 = "eq", value: bool }{
+        .{ .sql = "archived", .value = true },
+        .{ .sql = "NOT archived", .value = false },
+        .{ .sql = "NOT NOT archived", .value = true },
+        .{ .sql = "archived IS TRUE", .value = true },
+        .{ .sql = "archived IS FALSE", .value = false },
+        .{ .sql = "archived IS NOT TRUE", .op = "is_distinct", .value = true },
+        .{ .sql = "archived IS NOT FALSE", .op = "is_distinct", .value = false },
+        .{ .sql = "NOT (archived = true)", .value = false },
+        .{ .sql = "NOT (archived <> true)", .value = true },
+        .{ .sql = "NOT (archived IS FALSE)", .op = "is_distinct", .value = false },
+        .{ .sql = "optional", .column = "optional", .value = true },
+        .{ .sql = "NOT optional", .column = "optional", .value = false },
+        .{ .sql = "optional IS TRUE", .column = "optional", .value = true },
+        .{ .sql = "optional IS FALSE", .column = "optional", .value = false },
+        .{ .sql = "NOT (optional = true)", .column = "optional", .value = false },
+        .{ .sql = "optional IS NOT TRUE", .column = "optional", .op = "is_distinct", .value = true },
+        .{ .sql = "optional IS NOT FALSE", .column = "optional", .op = "is_distinct", .value = false },
+        .{ .sql = "NOT (optional IS TRUE)", .column = "optional", .op = "is_distinct", .value = true },
+        .{ .sql = "NOT (optional IS NOT FALSE)", .column = "optional", .value = false },
+    };
+    for (cases) |case| {
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, original, .{});
+        var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "CREATE INDEX visible ON threads(preview) WHERE {s}", .{case.sql}), .{});
+        defer compiled.deinit();
+        try std.testing.expect(try ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+        const conditions = schema.object.get("relational_indexes").?.array.items[0].object.get("where").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), conditions.len);
+        try std.testing.expectEqualStrings(case.column, conditions[0].object.get("column").?.string);
+        try std.testing.expectEqualStrings(case.op, conditions[0].object.get("op").?.string);
+        try std.testing.expectEqual(case.value, conditions[0].object.get("value").?.bool);
+    }
+    for ([_][]const u8{ "archived AND preview <> ''", "NOT (NOT archived OR preview = '')" }) |predicate| {
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, original, .{});
+        var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "CREATE UNIQUE INDEX visible ON threads(preview) WHERE {s}", .{predicate}), .{});
+        defer compiled.deinit();
+        try std.testing.expect(try ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+        const index_where = schema.object.get("relational_indexes").?.array.items[0].object.get("where").?;
+        const unique_where = schema.object.get("unique_constraints").?.array.items[0].object.get("where").?;
+        try std.testing.expectEqual(@as(usize, 2), index_where.array.items.len);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, index_where, .{}), try std.json.Stringify.valueAlloc(a, unique_where, .{}));
+        try std.testing.expectEqualStrings("eq", index_where.array.items[0].object.get("op").?.string);
+        try std.testing.expectEqual(true, index_where.array.items[0].object.get("value").?.bool);
+        try std.testing.expectEqualStrings("ne", index_where.array.items[1].object.get("op").?.string);
+    }
+}
+
+test "SQL boolean partial indexes reject nonboolean columns and unsupported disjunctions" {
+    const compiler = @import("compiler.zig");
+    const ddl = @import("schema_ddl.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try compiler.compile(a, "CREATE TABLE threads (archived BOOLEAN, preview TEXT)", .{});
+    defer create.deinit();
+    const original = try createSchemaAlloc(a, create.statement.create_table);
+    for ([_][]const u8{ "preview", "NOT preview", "preview IS FALSE" }) |predicate| {
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, original, .{});
+        var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "CREATE INDEX visible ON threads(preview) WHERE {s}", .{predicate}), .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlTypeMismatch, ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    for ([_][]const u8{ "archived OR preview = ''", "NOT (archived AND preview = '')" }) |predicate| {
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, original, .{});
+        var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "CREATE INDEX visible ON threads(preview) WHERE {s}", .{predicate}), .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnsupportedSqlShape, ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+}

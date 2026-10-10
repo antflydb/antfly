@@ -1553,6 +1553,12 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondRetrievalReadError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
+        const payload = retrieval_agent.retryableReadFailure(err) orelse return null;
+        try ctx.setHeader("Retry-After", "1");
+        return try ctx.status(if (err == error.StorageReadTemporarilyUnavailable) 503 else 409).json(payload);
+    }
+
     fn respondQueryOperationalError(ctx: *httpx.Context, err: anyerror) !?httpx.Response {
         const normalized = http_server_mod.normalizeQueryOperationalError(err) orelse return null;
         var response = switch (normalized) {
@@ -6274,6 +6280,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.response.build();
             }
             if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err), .upstream = generation_runner.chatgpt_failure.summary() });
+            if (try respondRetrievalReadError(ctx, err)) |response| return response;
             return switch (err) {
                 error.TreeRootSetTooLarge => {
                     _ = ctx.status(422);
@@ -17160,5 +17167,25 @@ test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NU
         }
         try std.testing.expectEqual(@as(i64, 24), result.columns[0].numeric_modifier.?.precision);
         try std.testing.expectEqual(@as(i64, 4), result.columns[0].numeric_modifier.?.scale);
+    }
+}
+
+test "httpx retrieval read failures preserve retryable JSON and conflict status" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+        var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = (try AntflyApiHandler.respondRetrievalReadError(&ctx, failure)).?;
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (failure == error.StorageReadTemporarilyUnavailable) 503 else 409), response.status.code);
+        try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+        var parsed = try std.json.parseFromSlice(retrieval_agent.RetryableReadFailure, alloc, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("read_unavailable", parsed.value.code);
+        try std.testing.expect(parsed.value.retryable);
+        try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
+        try std.testing.expect(try AntflyApiHandler.respondRetrievalReadError(&ctx, error.InvalidRetrievalAgentRequest) == null);
     }
 }

@@ -352,6 +352,88 @@ file or directory generation before atomically publishing the whole database.
 Table IDs and the next-ID counter survive restoration; dropped namespaces
 are excluded. A SHA-256 digest covers the complete database archive.
 
+Embedded SQL catalog DDL uses the shared schema translator and native schema
+publication. `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (...)`
+supports expression keys, direction/null ordering, INCLUDE columns and partial
+WHERE predicates. `DROP INDEX [IF EXISTS] name [ON table]` removes the index
+and its paired SQL uniqueness constraint. Without ON, the name must identify
+one table; ambiguity returns SQLSTATE 42725. DDL runs outside explicit
+transactions. Declaration changes increment the schema version through a
+compare-and-swap and return a receipt with the native build/validation state.
+`ALTER TABLE ... VALIDATE CONSTRAINT ...` retries failed coverage through the
+native guarded retry protocol without changing the schema version. Constraint
+activation uses the same bounded, guarded worker as the server. UNIQUE removal
+fences and drains the native claims with durable retirement checkpoints;
+interrupted retirement resumes before the next embedded operation. Foreign keys
+that own a retiring UNIQUE generation prevent admission; another equivalent
+UNIQUE can be dropped if it is not the selected foreign-key target. A pending
+receipt means the operation was durably admitted; inspect the schema and native
+status rather than replaying it.
+Partial-index predicates accept boolean columns, `NOT`, `IS [NOT] TRUE/FALSE`,
+and conjunctions of typed column/literal comparisons and NULL tests. Boolean
+shorthand shares the native equality predicates used by explicit comparisons.
+Negated truth tests retain NULL rows through native null-safe distinctness;
+`NOT flag` excludes NULL rows, while `flag IS NOT TRUE` includes them. Predicates
+that require a disjunction remain unsupported by the native conjunction format.
+
+Index creation advances bounded native build pages before reporting readiness.
+Large builds can return pending and resume through Lite maintenance or an
+explicit `run_until_idle`, which drains relational indexes as well as search
+indexes. MATCH PARTIAL FK publication requires ready parent support indexes;
+a readiness deadline expires before any FK publication decision is admitted.
+Admission builds only the selected witness indexes; unrelated builds and
+reclamation do not consume its deadline. Lite background maintenance advances
+one relational index page per table and releases the writer lease between
+turns, retaining pending work for subsequent turns.
+
+Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
+the exact native activation checkpoint, including SQL transactions with cascades and multiple repair targets.
+Repair admission follows the complete mutation closure, including failed tables
+first reached by CASCADE or SET NULL. Read-only FK parents retain their coverage
+requirements, and every cascaded postimage still obeys its declared constraints.
+Every repair target retains its failed native checkpoint guard; other participants
+still require completed UNIQUE coverage. After repairing the rows, VALIDATE
+CONSTRAINT resumes historical coverage. FK activation waits for parent UNIQUE
+coverage without blocking reads or parent repairs.
+FK-bearing CREATE TABLE and ALTER TABLE ADD/DROP CONSTRAINT publish accepted
+child generations at each parent before installing the child schema. DROP TABLE
+retires its outgoing FK generations before removing the namespace. These native
+owner transitions share a durable root publication plan; reopen or the next API
+call completes an interrupted plan before admitting more work. Recreating a
+table registers its fresh identity and FK generations rather than reusing old
+references or parent admission state.
+
+`antfly_search('table', request [, candidate_limit])` is a SQL relation. The
+table name is a literal so preparation can derive its columns; request is text
+or a text parameter containing the same public query JSON used by search_json.
+Plain query text uses the full-text query-string parser. JSON supports named
+indexes, filters, highlights, explicit dense/sparse embeddings, configured
+semantic embedders and hybrid fusion. The optional candidate limit overrides
+the JSON limit (1–10000), and may be written as `limit => 50`. SQL LIMIT applies
+after joins and filters; it does not expand the search candidate window.
+
+The relation exposes the declared table columns plus `_id`, nullable `score`
+and nullable JSON `_highlights`. `score` and `_highlights` are reserved in a
+search relation; conflicting declarations are rejected. All participating
+native tables are fenced together while search hits are ranked/hydrated and
+other scans capture snapshots. Cursors retain this statement view across
+fetches. Embedding resolution happens before capture. SQL search rejects
+uncommitted writes to the searched table because native indexes cannot rank
+staged rows; commit those writes first. Other session postimages remain
+available to ordinary table scans.
+Relational hits are hydrated from the retained native typed-row snapshot,
+preserving SQL NULL separately from JSON null. Document hydration preserves
+JSON number tokens, including decimals and integers beyond float precision.
+
+```sql
+SELECT t.id, s._id, s.score
+FROM antfly_search('history_items', $1, 50) s
+JOIN threads t ON t.id = s.thread_id
+WHERE t.project_id = $2 AND NOT t.archived
+ORDER BY s.score DESC, s._id
+LIMIT 20;
+```
+
 SQL requests contain `statement`, positional `parameters`, a materialized
 result `limit` (default 128, maximum 4096), and optional `session_id`.
 Sessions are independent connection contexts created by `sql_session_open`.

@@ -3002,3 +3002,83 @@ test "relational index system LSM write rebuild query and churn work benchmark" 
     try std.testing.expect(after.examined <= index_scan.examined + 1);
     std.debug.print("relational-index benchmark rows={} write_ns={} build_ns={} build_pages={} primary_records={} index_records={} churn_ns={} forward={} reverse={} logical_bytes={} active_sst_bytes={} obsolete_bytes={} wal_bytes={}\n", .{ count, write_ns, build_ns, build_pages, primary_scan.examined, index_scan.examined, churn_ns, forward, reverse, logical_bytes, usage.active_sst_bytes, usage.obsolete_file_bytes, usage.wal_retained_bytes });
 }
+
+test "relational index system runUntilIdle drains builds across maintenance slices without workers" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-idle-drain");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const base =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, base);
+    try db.batch(.{ .writes = &.{.{ .key = "row", .value = "{\"n\":7}" }} });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var declaration = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
+    try declaration.object.put(a, "version", .{ .integer = 2 });
+    var indexes: std.array_list.Managed(std.json.Value) = .init(a);
+    for (0..20) |i| {
+        const definition = try std.fmt.allocPrint(a, "{{\"name\":\"by_n_{d}\",\"keys\":[{{\"column\":\"n\"}}]}}", .{i});
+        try indexes.append(try std.json.parseFromSliceLeaky(std.json.Value, a, definition, .{}));
+    }
+    try declaration.object.put(a, "relational_indexes", .{ .array = indexes });
+    try db.setSchemaJson(alloc, try std.json.Stringify.valueAlloc(a, declaration, .{}));
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_0")).state);
+    try std.testing.expectError(error.DeadlineExceeded, db.runRelationalIndexMaintenanceUntilIdle(.none, time.monotonicNs()));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, db.runRelationalIndexMaintenanceUntilIdle(db_mod.types.CancellationToken.fromAtomic(&canceled), null));
+    try std.testing.expectError(error.DeadlineExceeded, db.ensureRelationalIndexesReady(&.{"by_n_19"}, .none, time.monotonicNs()));
+    try std.testing.expectError(error.Canceled, db.ensureRelationalIndexesReady(&.{"by_n_19"}, db_mod.types.CancellationToken.fromAtomic(&canceled), null));
+    try db.ensureRelationalIndexesReady(&.{"by_n_19"}, .none, null);
+    try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("by_n_19")).state);
+    // Targeted admission neither builds unrelated indexes nor requires a
+    // clean sweep. Background ownership advances one page and returns debt.
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_0")).state);
+    try std.testing.expect(try db.runBackgroundMaintenanceWithCancellation(.none));
+    try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("by_n_18")).state);
+    try db.runUntilIdle();
+    for (0..20) |i| {
+        const name = try std.fmt.allocPrint(a, "by_n_{d}", .{i});
+        try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus(name)).state);
+    }
+    // A clean sweep may need multiple slices even after builds are ready.
+    for (0..8) |_| {
+        if (!try db.runBackgroundMaintenanceWithCancellation(.none)) break;
+    } else return error.IndexMaintenanceDidNotConverge;
+    var reader = try db.beginRelationalRows(alloc, .{ .index = "by_n_19" });
+    defer reader.deinit();
+    var page = try reader.nextPage(alloc, db.backend_runtime.io(), .{ .rows = 10 });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+}
+
+test "relational index system query lease typed point hydration retains nulls numbers and snapshot" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("query-typed-points");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"payload":{"type":"json"},"optional":{"type":["json","null"]}},"required":["payload"],"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":null,\"optional\":null}", .json_null_fields = &.{"payload"} }} });
+    var reader = captured: {
+        var lease = try db.beginQueryReadLease();
+        defer lease.release();
+        break :captured try lease.relationalRows(alloc, &.{ "payload", "optional" }, 1);
+    };
+    defer reader.deinit();
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"payload\":{\"fraction\":0.123456789012345678901},\"optional\":null}" }} });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const retained = (try reader.lookupTypedRow(a, "a")).?;
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, retained.sql_nulls.?);
+    try std.testing.expect(retained.typed.?.object.get("payload").? == .null);
+    try std.testing.expect(try reader.lookupTypedRow(a, "missing") == null);
+    var current = try db.beginRelationalRows(alloc, .{ .fields = &.{ "payload", "optional" } });
+    defer current.deinit();
+    const updated = (try current.lookupTypedRow(a, "a")).?;
+    try std.testing.expectEqualStrings("0.123456789012345678901", updated.typed.?.object.get("payload").?.object.get("fraction").?.number_string);
+}

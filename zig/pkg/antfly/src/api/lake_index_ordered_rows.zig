@@ -42,6 +42,7 @@ pub const Root = struct {
     tie_version: u8 = 0,
     /// Derived once by loadRoot in the bounded decoded-metadata cache.
     public_digests: []const [32]u8 = &.{},
+    public_slots: []const u32 = &.{},
     file_slots: []const FileSlot = &.{},
     predicates: ?tree.Ref = null,
     source: []const u8,
@@ -52,7 +53,7 @@ pub const Root = struct {
     pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Root).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "public_digests") and !std.mem.eql(u8, field, "file_slots")) {
+            if (comptime !std.mem.eql(u8, field, "public_digests") and !std.mem.eql(u8, field, "public_slots") and !std.mem.eql(u8, field, "file_slots")) {
                 try stream.objectField(field);
                 try stream.write(@field(self, field));
             }
@@ -358,6 +359,14 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     const digests = try a.alloc([32]u8, root.files.len);
     for (root.files, digests) |file, *digest| digest.* = local.storage_rowsource_identity.fileDigest(root.source, root.snapshot, file);
     root.public_digests = digests;
+    const public_slots = try a.alloc(u32, root.files.len);
+    for (public_slots, 0..) |*slot, i| slot.* = @intCast(i);
+    std.mem.sort(u32, public_slots, digests, struct {
+        fn less(values: []const [32]u8, x: u32, y: u32) bool {
+            return std.mem.order(u8, &values[x], &values[y]) == .lt;
+        }
+    }.less);
+    root.public_slots = public_slots;
     const slots = try a.alloc(Root.FileSlot, root.files.len);
     for (root.files, slots, 0..) |file, *entry, slot| entry.* = .{ .file = file, .slot = @intCast(slot) };
     std.mem.sort(Root.FileSlot, slots, {}, struct {
@@ -787,5 +796,143 @@ test "external lake public ordering seeks complete ties across files and directi
                 try std.testing.expectEqual(if (before) boundary else expected.len - boundary - 1, seen);
             };
         }
+    }
+}
+
+test "external lake warm tie pagination reuses scoped file order with bounded page reads" {
+    const public = @import("lake_index_public_order.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("cached-public-ties");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 512);
+    for (files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = 2, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    const expected = try ca.alloc([]const u8, 1024);
+    const prefix: [256]u8 = @splat(1);
+    for (files, 0..) |file, slot| for (0..2) |row| {
+        const ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = row } };
+        var key: [272]u8 = undefined;
+        @memcpy(key[0..256], &prefix);
+        @memcpy(key[256..], &coordinate(@intCast(slot), ref.external));
+        const position = slot * 2 + row;
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = position });
+        expected[position] = try local.storage_rowsource_identity.allocId(ca, ref);
+    };
+    std.mem.sort([]const u8, expected, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.less);
+    const artifact = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRoot(ca, store, artifact, .none, null);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    cache.decoded.max_entries = 1;
+    var cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+    var reader: Reader = undefined;
+    try reader.initCached(a, &store, root, @splat(3), "", null, .none, cached);
+    defer reader.deinit();
+    const cold_start = reader.remaining_reads;
+    var first = try public.Cursor.init(a, &reader, "", null, null, null, false, false);
+    defer first.deinit();
+    const first_page = try first.next(ca, 3);
+    for (first_page, expected[0..3]) |ref, id| try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
+    const cold_reads = cold_start - reader.remaining_reads;
+    const hits_before = cache.decoded.hits;
+    const warm_start = reader.remaining_reads;
+    {
+        var next = try public.Cursor.init(a, &reader, "", null, &prefix, expected[2], false, false);
+        defer next.deinit();
+        const page = try next.next(ca, 3);
+        for (page, expected[3..6]) |ref, id| try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
+    }
+    try std.testing.expect(cache.decoded.hits > hits_before);
+    try std.testing.expect(warm_start - reader.remaining_reads < cold_reads);
+    // A new authorization scope gets its own entry. Evicting the old entry
+    // cannot invalidate files/rows already borrowed by an active cursor.
+    cached.scope = @splat(2);
+    reader.cached = cached;
+    const hits_scoped = cache.decoded.hits;
+    {
+        var scoped = try public.Cursor.init(a, &reader, "", null, null, null, true, false);
+        defer scoped.deinit();
+        const page = try scoped.next(ca, 3);
+        for (page, 0..) |ref, i| try std.testing.expectEqualStrings(expected[expected.len - 1 - i], try local.storage_rowsource_identity.allocId(ca, ref));
+    }
+    try std.testing.expectEqual(hits_scoped, cache.decoded.hits);
+    const retained = try first.next(ca, 3);
+    for (retained, expected[3..6]) |ref, id| try std.testing.expectEqualStrings(id, try local.storage_rowsource_identity.allocId(ca, ref));
+    for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |before| {
+        var cursor = try public.Cursor.init(a, &reader, "", null, &prefix, expected[511], descending, before);
+        defer cursor.deinit();
+        const page = try cursor.next(ca, 3);
+        try std.testing.expectEqual(@as(usize, 3), page.len);
+        for (page, 0..) |ref, i| {
+            const rank = if (descending != before) 510 - i else 512 + i;
+            try std.testing.expectEqualStrings(expected[rank], try local.storage_rowsource_identity.allocId(ca, ref));
+        }
+    };
+}
+
+test "external lake warm tie pagination distinct tuples retain sequential reads" {
+    const public = @import("lake_index_public_order.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("review-distinct-public-ties");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const count = 5000;
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, 1);
+    files[0] = .{ .file_id = @constCast("file"), .object_uri = @constCast("file://fixture"), .byte_len = 1, .row_count = count, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+    defer sort.deinit();
+    for (0..count) |row| {
+        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = "file", .row_group_ordinal = 0, .row_ordinal = row } };
+        var key: [24]u8 = undefined;
+        std.mem.writeInt(u64, key[0..8], row, .big);
+        @memcpy(key[8..], &coordinate(0, ref.external));
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = row });
+    }
+    const artifact = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+    const root = try loadRoot(ca, store, artifact, .none, null);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+    for ([_]bool{ false, true }) |reverse| {
+        var reader: Reader = undefined;
+        try reader.initCached(a, &store, root, @splat(3), "", null, .none, cached);
+        defer reader.deinit();
+        var cursor = try public.Cursor.init(a, &reader, "", null, null, null, false, reverse);
+        defer cursor.deinit();
+        const page = try cursor.next(ca, count);
+        try std.testing.expectEqual(@as(usize, count), page.len);
+        for (page, 0..) |ref, i| try std.testing.expectEqual(@as(u64, if (reverse) count - i - 1 else i), ref.external.row_ordinal);
     }
 }

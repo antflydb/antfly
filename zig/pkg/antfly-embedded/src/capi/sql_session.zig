@@ -92,7 +92,7 @@ pub const Session = struct {
         const requests = try self.commitRequests(a);
         const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
         const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
-        var prepared = try d.api_relational_integrity_commit.prepareSessionStatement(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, .{});
+        var prepared = try d.api_relational_integrity_commit.prepareSessionStatementWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, adapter.repairAdmission(), .{});
         defer prepared.deinit();
         const owned = self.arena.allocator();
         for (prepared.tables) |request| {
@@ -231,7 +231,7 @@ pub const Session = struct {
         }
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, requests[0].table_name), .table_name = requests[0].table_name };
         const metadata = try adapter.localCatalog(a, requests[0].schema_version.?);
-        var prepared = try d.api_relational_integrity_commit.prepareWithCoverage(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests);
+        var prepared = try d.api_relational_integrity_commit.prepareWithRepairAdmission(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, requests, adapter.repairAdmission(), .{});
         defer prepared.deinit();
         const outcome = @import("sql_commit.zig").commit(self.handle, prepared.tables, out_id) catch |err| {
             self.failed = true;

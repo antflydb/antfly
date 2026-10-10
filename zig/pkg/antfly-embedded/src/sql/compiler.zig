@@ -1097,7 +1097,7 @@ const Parser = struct {
         // Preserve the established compact representation of a lone * only
         // after validating its source; an empty projection loses that marker.
         if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
-        const simple = source != null and source.?.* == .table and source.?.table.alias == null;
+        const simple = source != null and source.?.* == .table and source.?.table.alias == null and source.?.table.search == null;
         const table = if (simple) source.?.table.name else null;
         const filter = try self.where();
         var group_by: std.ArrayList(*const ast.Scalar) = .empty;
@@ -1255,6 +1255,24 @@ const Parser = struct {
         }
         if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
+        if (name_value.database == null and name_value.namespace == null and std.ascii.eqlIgnoreCase(name_value.table, "antfly_search") and self.take(.lparen)) {
+            const table_value = try self.value();
+            if (table_value != .string or table_value.string.len == 0) return self.fail(error.InvalidSqlSyntax, "antfly_search requires a literal table name");
+            try self.expect(.comma);
+            const request = try self.value();
+            if (request != .string and request != .parameter) return self.fail(error.InvalidSqlSyntax, "antfly_search requires query text or a text parameter");
+            const limit = if (self.take(.comma)) limit: {
+                if (self.keyword(.limit)) {
+                    try self.expect(.eq);
+                    try self.expect(.gt);
+                }
+                break :limit try self.value();
+            } else null;
+            try self.expect(.rparen);
+            const search = try self.alloc.create(ast.Search);
+            search.* = .{ .request = request, .limit = limit };
+            return self.relationNode(.{ .table = .{ .name = .{ .table = table_value.string }, .search = search, .alias = (try self.sourceAlias()) orelse "antfly_search" } });
+        }
         return self.relationNode(.{ .table = .{ .name = name_value, .alias = try self.sourceAlias() } });
     }
 
@@ -2039,6 +2057,12 @@ const Parser = struct {
                 try targets.append(self.alloc, try self.name());
                 if (!self.take(.comma)) break;
             }
+            // Retain the embedded API's explicit table-owner extension.
+            if (self.keyword(.on)) {
+                if (concurrently or targets.items.len != 1 or targets.items[0].namespace != null or targets.items[0].database != null) return error.UnsupportedSqlShape;
+                const owner = try self.tableReferenceName();
+                return .{ .kind = .table, .action = .alter_schema, .name = owner, .conditional = conditional, .schema_change = .{ .drop_index = targets.items[0].table } };
+            }
             const cascade = self.keyword(.cascade);
             if (!cascade) _ = self.keyword(.restrict);
             const first = targets.items[0];
@@ -2578,7 +2602,9 @@ test "compiler index DDL retains namespace ownership and distributed statement c
     try std.testing.expect(!concurrent.statement.catalog_ddl.cascade);
     // CREATE names inherit the table's schema; DROP is not table-bound syntax.
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX tenant.email_key ON tenant.accounts (email)", .{}));
-    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "DROP INDEX email_key ON accounts", .{}));
+    var scoped = try compile(std.testing.allocator, "DROP INDEX email_key ON accounts", .{});
+    defer scoped.deinit();
+    try std.testing.expectEqualStrings("accounts", scoped.statement.catalog_ddl.name.table);
 }
 
 test "compiler ONLY scopes exact table references across read and write statements" {
@@ -3162,4 +3188,40 @@ test "SQL incomplete value expressions report syntax errors" {
     for ([_][]const u8{ "SELECT", "SELECT 1 +", "SELECT (1 +)", "INSERT INTO items (_id) VALUES (", "UPDATE items SET n =" }) |sql| {
         try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
     }
+}
+
+test "SQL search relations bind literal catalogs and explicit candidate limits" {
+    for ([_][]const u8{
+        "SELECT s._id FROM antfly_search('history',$1,50) AS s",
+        "SELECT s._id FROM antfly_search('history',$1,limit => 50) AS s",
+    }) |query| {
+        var compiled = try compile(std.testing.allocator, query, .{});
+        defer compiled.deinit();
+        const source = compiled.statement.select.source.?.table;
+        try std.testing.expectEqualStrings("history", source.name.table);
+        try std.testing.expectEqualStrings("s", source.alias.?);
+        try std.testing.expectEqual(@as(u32, 1), source.search.?.request.parameter);
+        try std.testing.expectEqual(@as(i64, 50), source.search.?.limit.?.integer);
+    }
+    for ([_][]const u8{
+        "SELECT * FROM antfly_search($1,$2)",
+        "SELECT * FROM antfly_search('history',1)",
+        "SELECT * FROM antfly_search('history','alpha',limit 50)",
+    }) |query| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, query, .{}));
+}
+
+test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
+    for ([_][]const u8{ "DROP INDEX IF EXISTS recency", "DROP INDEX IF EXISTS recency;" }) |query| {
+        var compiled = try compile(std.testing.allocator, query, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expect(ddl.conditional);
+        try std.testing.expect(ddl.kind == .index);
+        try std.testing.expectEqualStrings("recency", ddl.index_targets[0].table);
+        try std.testing.expectEqualStrings("recency", ddl.schema_change.?.drop_index);
+    }
+    var scoped = try compile(std.testing.allocator, "DROP INDEX recency ON public.threads", .{});
+    defer scoped.deinit();
+    try std.testing.expectEqualStrings("threads", scoped.statement.catalog_ddl.name.table);
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX recency", .{}));
 }

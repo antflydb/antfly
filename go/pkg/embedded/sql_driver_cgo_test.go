@@ -43,7 +43,9 @@ func TestSQLConformance(t *testing.T) {
 	if err = json.Unmarshal(raw, &cases); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "sql.aflite")+"?no_sync=1")
+	path := filepath.Join(t.TempDir(), "sql.aflite")
+	seedSQLSearchFixture(t, path)
+	db, err := sql.Open("antfly", "file:"+path+"?no_sync=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +125,51 @@ func TestSQLConformance(t *testing.T) {
 		if !reflect.DeepEqual(actual, c.Rows) {
 			t.Fatalf("got %#v want %#v", actual, c.Rows)
 		}
+	}
+}
+
+func seedSQLSearchFixture(t *testing.T, path string) {
+	t.Helper()
+	raw, err := os.ReadFile("../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Table   string
+		Schema  json.RawMessage
+		History json.RawMessage
+		Indexes []json.RawMessage
+		Batch   json.RawMessage
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	db, err := CreateWithOptions(path, OpenOptions{NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateTableJSON(fixture.Table, fixture.Schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTableJSON("history_items", fixture.History); err != nil {
+		t.Fatal(err)
+	}
+	table, err := db.OpenTable(fixture.Table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	for _, index := range fixture.Indexes {
+		if err := table.AddIndexJSON(index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := table.BatchJSON(fixture.Batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.RunUntilIdle(); err != nil {
+		t.Fatal(err)
 	}
 }
 

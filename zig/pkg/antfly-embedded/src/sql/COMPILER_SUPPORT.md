@@ -369,3 +369,10 @@ elapsed time. Three window layouts over 256 rows with 16 KiB payloads write
 4,255,232 bytes through shared payloads versus 29,524,992 through payload
 rewrites, with compression disabled. These fixtures validate equal results and
 alternate execution order; they do not measure total production query latency.
+
+Embedded backends additionally support the `antfly_search('table', request
+[, candidate_limit])` relation with schema-derived columns, `_id`, `score`
+and `_highlights`. Request/limit parameters are typed as text/integer. The
+backend must explicitly advertise search-relation support; other providers
+reject the relation before opening any scans. Embedded catalog index DDL uses
+the shared schema translator and a native schema version CAS.

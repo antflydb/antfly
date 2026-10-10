@@ -15,6 +15,34 @@
 
 //! Typed relational iterator execution. All physical cursors open together;
 //! hash join retains one build side and streams the probe side under quota.
+
+/// Search requests are execution-local, including statement captures used by
+/// mutation inputs. Never write parameter values into the immutable plan.
+pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
+    const has_search = for (input_scans) |scan| {
+        if (scan.request.search != null) break true;
+    } else false;
+    return if (has_search) bound: {
+        const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
+        for (bound_scans) |*scan| if (scan.request.search) |original| {
+            const search = try a.create(catalog.Scan.Search);
+            search.* = original.*;
+            scan.request.search = search;
+            const expression = search.expression;
+            const request = if (expression.request == .parameter) parameters[expression.request.parameter - 1] else try describe.bindLiteral(a, expression.request, .string);
+            if (request != .string) return error.InvalidSqlParameters;
+            search.request_text = request.string;
+            if (expression.limit) |input| {
+                const limit = if (input == .parameter) parameters[input.parameter - 1] else try describe.bindLiteral(a, input, .integer);
+                const number = if (limit == .integer) limit.integer else if (limit == .string) std.fmt.parseInt(i64, limit.string, 10) catch return error.InvalidSqlParameters else return error.InvalidSqlParameters;
+                if (number < 1 or number > 10000) return error.InvalidSqlParameters;
+                search.limit = @intCast(number);
+            }
+        };
+        break :bound bound_scans;
+    } else input_scans;
+}
+
 const std = @import("std");
 const catalog = @import("catalog.zig");
 const binding = @import("relation_binding.zig");
@@ -1874,6 +1902,10 @@ fn Engine(comptime Context: type) type {
                         if (self.hash_join) |hash| hash.deinit();
                         self.hash_join = null;
                         self.partition_join = owner;
+                        // Both inputs now belong to the spill files. Release their
+                        // decode arena before building or probing a partition;
+                        // return expressions execute before deferred cleanup.
+                        _ = scratch.reset(.free_all);
                         return self.nextPartitionJoin(alloc, join);
                     }
                     if (shared) {
@@ -2046,16 +2078,19 @@ fn Source(comptime Context: type) type {
             self.* = .{ .alloc = context.alloc, .regex_execution = .init(context.alloc, @min(16 * 1024 * 1024, context.limits.retained_bytes)), .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
             errdefer self.close();
             if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
-            if (relation.scans.len != 0) {
+            var search_arena = std.heap.ArenaAllocator.init(context.alloc);
+            defer search_arena.deinit();
+            const scans = try bindSearchScans(search_arena.allocator(), relation.scans, context.parameters);
+            if (scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
                 } else if (context.backend.vtable.open_statement) |open| {
-                    self.read = try open(context.backend.ptr, context.alloc, relation.scans);
+                    self.read = try open(context.backend.ptr, context.alloc, scans);
                     self.engine.cursors = self.read.?.cursors;
                     if (self.engine.cursors.len != relation.scans.len) return error.InvalidSqlBackendResponse;
                 } else if (relation.scans.len == 1) {
                     const open = context.backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
-                    self.single = (try open(context.backend.ptr, context.alloc, relation.scans[0].table, relation.scans[0].request)) orelse return error.SqlStatementSnapshotRequired;
+                    self.single = (try open(context.backend.ptr, context.alloc, scans[0].table, scans[0].request)) orelse return error.SqlStatementSnapshotRequired;
                     self.single_list[0] = self.single.?;
                     self.engine.cursors = &self.single_list;
                 } else return error.SqlStatementSnapshotRequired;

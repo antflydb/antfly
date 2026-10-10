@@ -25,7 +25,7 @@ alloc: std.mem.Allocator,
 entries: []const Entry,
 read: ?catalog.StatementRead,
 
-pub fn open(a: std.mem.Allocator, backend: catalog.Backend, bound: describe.BoundStatement) !Capture {
+pub fn open(a: std.mem.Allocator, backend: catalog.Backend, bound: describe.BoundStatement, parameters: []const std.json.Value) !Capture {
     var entries: std.ArrayList(Entry) = .empty;
     errdefer entries.deinit(a);
     var scans: std.ArrayList(catalog.StatementScan) = .empty;
@@ -33,7 +33,10 @@ pub fn open(a: std.mem.Allocator, backend: catalog.Backend, bound: describe.Boun
     try collect(a, bound, &entries, &scans, 0);
     const owned = try entries.toOwnedSlice(a);
     errdefer a.free(owned);
-    const read = if (scans.items.len == 0) null else try (backend.vtable.open_statement orelse return error.SqlStatementSnapshotRequired)(backend.ptr, a, scans.items);
+    var search_arena = std.heap.ArenaAllocator.init(a);
+    defer search_arena.deinit();
+    const bound_scans = try @import("relation_runtime.zig").bindSearchScans(search_arena.allocator(), scans.items, parameters);
+    const read = if (scans.items.len == 0) null else try (backend.vtable.open_statement orelse return error.SqlStatementSnapshotRequired)(backend.ptr, a, bound_scans);
     errdefer if (read) |value| value.close(value.ptr);
     if (read) |value| if (value.cursors.len != scans.items.len) return error.InvalidSqlBackendResponse;
     return .{ .alloc = a, .entries = owned, .read = read };

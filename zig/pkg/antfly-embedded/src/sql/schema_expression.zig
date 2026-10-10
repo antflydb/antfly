@@ -407,7 +407,9 @@ fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const 
 }
 
 pub fn lowerIndexPredicate(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar) ![]const Json {
-    const native = try lower(alloc, schema, expression, .boolean);
+    const lowered = try lowerTyped(alloc, schema, expression, .boolean);
+    if (lowered.type != .boolean) return error.SqlTypeMismatch;
+    const native = lowered.expression;
     const expressions = @import("../schema/relational_expression.zig");
     var memory: @import("memory_budget.zig") = .{ .backing = alloc, .limit = expressions.max_allocated_bytes };
     var arena = std.heap.ArenaAllocator.init(memory.allocator());
@@ -415,36 +417,79 @@ pub fn lowerIndexPredicate(alloc: std.mem.Allocator, schema: Json, expression: *
     var bytes: usize = expressions.max_allocated_bytes;
     var execution = expressions.Execution.init(arena.allocator(), &bytes);
     var predicates = std.ArrayList(Json).empty;
-    collectPredicates(alloc, native, &predicates, &execution) catch |err| {
+    collectPredicates(alloc, native, false, &predicates, &execution) catch |err| {
         if (err == error.OutOfMemory and memory.isExhausted()) return error.SqlProgramLimitExceeded;
         return err;
     };
     return predicates.toOwnedSlice(alloc);
 }
 
-fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *std.ArrayList(Json), execution: *@import("../schema/relational_expression.zig").Execution) anyerror!void {
-    const op = expression.object.get("op").?.string;
-    const args = expression.object.get("args") orelse return error.UnsupportedSqlShape;
-    if (std.mem.eql(u8, op, "and")) {
-        for (args.array.items) |arg| try collectPredicates(alloc, arg, predicates, execution);
+// Partial indexes store a conjunction of native predicates. Normalize SQL
+// truth tests in this context only: UNKNOWN and FALSE both exclude an index
+// row, while negated IS tests must retain their null-safe semantics.
+const PredicateOp = enum { eq, ne, lt, lte, gt, gte, is_null, is_not_null, is_distinct, is_not_distinct };
+
+fn inverse(op: PredicateOp) PredicateOp {
+    return switch (op) {
+        .eq => .ne,
+        .ne => .eq,
+        .lt => .gte,
+        .lte => .gt,
+        .gt => .lte,
+        .gte => .lt,
+        .is_null => .is_not_null,
+        .is_not_null => .is_null,
+        .is_distinct => .is_not_distinct,
+        .is_not_distinct => .is_distinct,
+    };
+}
+
+fn appendPredicate(alloc: std.mem.Allocator, predicates: *std.ArrayList(Json), predicate: Json) !void {
+    if (predicates.items.len >= 256) return error.SqlLimitExceeded;
+    try predicates.append(alloc, predicate);
+}
+
+fn collectPredicates(alloc: std.mem.Allocator, expression: Json, negated: bool, predicates: *std.ArrayList(Json), execution: *@import("../schema/relational_expression.zig").Execution) anyerror!void {
+    const operation = expression.object.get("op").?.string;
+    if (std.mem.eql(u8, operation, "column")) {
+        try appendPredicate(alloc, predicates, try json(alloc, .{ .column = expression.object.get("column").?.string, .op = "eq", .value = !negated }));
         return;
     }
-    if (predicates.items.len >= 256 or args.array.items.len == 0) return error.SqlLimitExceeded;
-    const left = args.array.items[0];
-    const column = left.object.get("column") orelse return error.UnsupportedSqlShape;
-    if (std.mem.eql(u8, op, "is_null") or std.mem.eql(u8, op, "is_not_null")) {
-        try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op }));
+    const args = (expression.object.get("args") orelse return error.UnsupportedSqlShape).array.items;
+    if (std.mem.eql(u8, operation, "not")) {
+        if (args.len != 1) return error.UnsupportedSqlShape;
+        return collectPredicates(alloc, args[0], !negated, predicates, execution);
+    }
+    // De Morgan's law permits NOT (a OR b), whose native form is a
+    // conjunction. Disjunctions still require a richer native index format.
+    if ((!negated and std.mem.eql(u8, operation, "and")) or (negated and std.mem.eql(u8, operation, "or"))) {
+        for (args) |arg| try collectPredicates(alloc, arg, negated, predicates, execution);
         return;
     }
-    const allowed = for ([_][]const u8{ "eq", "ne", "lt", "lte", "gt", "gte" }) |candidate| {
-        if (std.mem.eql(u8, op, candidate)) break true;
-    } else false;
-    if (!allowed or args.array.items.len != 2) return error.UnsupportedSqlShape;
-    const literal = @import("../schema/relational_expression.zig").foldConstantJson(execution, args.array.items[1]) catch |err| {
+    var op = std.meta.stringToEnum(PredicateOp, operation) orelse return error.UnsupportedSqlShape;
+    if (negated) op = inverse(op);
+    if (args.len == 0) return error.UnsupportedSqlShape;
+    const column = args[0].object.get("column") orelse return error.UnsupportedSqlShape;
+    if (op == .is_null or op == .is_not_null) {
+        try appendPredicate(alloc, predicates, try json(alloc, .{ .column = column.string, .op = @tagName(op) }));
+        return;
+    }
+    if (args.len != 2) return error.UnsupportedSqlShape;
+    var value = @import("../schema/relational_expression.zig").foldConstantJson(execution, args[1]) catch |err| {
         if (err == error.RelationalIndexColumnNotFound) return error.UnsupportedSqlShape;
         return err;
     };
-    try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op, .value = literal }));
+    if (value == .bool) {
+        // Equality and inequality exclude NULL in index membership. Distinct
+        // must retain NULL even for NOT NULL declarations: historical row
+        // layouts can lack columns added after those rows were written.
+        if (op == .is_not_distinct) op = .eq;
+        if (op == .ne) {
+            op = .eq;
+            value = .{ .bool = !value.bool };
+        }
+    }
+    try appendPredicate(alloc, predicates, try json(alloc, .{ .column = column.string, .op = @tagName(op), .value = value }));
 }
 
 test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {

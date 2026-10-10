@@ -40,7 +40,7 @@ pub fn Adapter(comptime native: type) type {
         outcome_transaction_id: ?types.TxnId = null,
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .ptr = self, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -49,22 +49,189 @@ pub fn Adapter(comptime native: type) type {
             return self.*;
         }
 
-        fn ddl(ptr: *anyopaque, _: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
+        fn ddl(ptr: *anyopaque, alloc: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.read_only) return error.SqlReadOnlyTransaction;
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
+            if (self.transaction) |session| if (session.active) return error.UnsupportedSqlExecution;
             switch (request) {
                 .create_table => |create| {
                     if (create.name.database != null or (create.name.namespace != null and !std.mem.eql(u8, create.name.namespace.?, "public")) or create.tablespace != null) return error.UnsupportedSqlExecution;
-                    try @import("tables.zig").create(handle, create.name.table, create.schema_json, create.if_not_exists);
+                    @import("tables.zig").create(handle, create.name.table, create.schema_json, create.if_not_exists) catch |err| switch (err) {
+                        error.SqlDdlPending => return .{ .mutation_outcome = .committed_pending },
+                        else => return err,
+                    };
                 },
                 .drop_table => |drop| {
                     if (drop.table.database != null or (drop.table.namespace != null and !std.mem.eql(u8, drop.table.namespace.?, "public"))) return error.UnsupportedSqlExecution;
-                    try @import("tables.zig").drop(handle, drop.table.table, drop.if_exists);
+                    @import("tables.zig").drop(handle, drop.table.table, drop.if_exists) catch |err| switch (err) {
+                        error.SqlDdlPending => return .{ .mutation_outcome = .committed_pending },
+                        else => return err,
+                    };
                 },
+                .catalog_ddl => |change| return self.alterSchema(alloc, change),
                 else => return error.UnsupportedSqlExecution,
             }
             return .{};
+        }
+
+        fn ownsIndex(db: *DB, alloc: std.mem.Allocator, name: []const u8) !bool {
+            const bytes = (try db.getSchemaJson(alloc)) orelse return false;
+            const schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
+            const indexes = schema.object.get("relational_indexes") orelse return false;
+            for (indexes.array.items) |index| if (std.mem.eql(u8, index.object.get("name").?.string, name)) return true;
+            return false;
+        }
+
+        fn alterSchema(self: *Self, alloc: std.mem.Allocator, ddl_request: ast.CatalogDdl) !catalog.DdlOutcome {
+            const handle = self.handle orelse return error.UnsupportedSqlExecution;
+            const tables = @import("tables.zig");
+            try tables.requireDatabase(handle);
+            var ddl_value = ddl_request;
+            if (ddl_value.kind == .index) {
+                if (ddl_value.concurrently) return error.UnsupportedSqlExecution;
+                switch (ddl_value.action) {
+                    .create => ddl_value.name = ddl_value.index_table orelse return error.InvalidSqlSyntax,
+                    .drop => {
+                        if (ddl_value.index_targets.len != 1) return error.UnsupportedSqlExecution;
+                        const index = ddl_value.index_targets[0];
+                        if (index.database != null or (index.namespace != null and !std.mem.eql(u8, index.namespace.?, "public"))) return error.UnsupportedSqlExecution;
+                        ddl_value.name = .{ .table = "" };
+                    },
+                    else => return error.UnsupportedSqlExecution,
+                }
+                ddl_value.kind = .table;
+                ddl_value.action = .alter_schema;
+            }
+            if (ddl_value.kind != .table or ddl_value.action != .alter_schema or ddl_value.schema_change == null) return error.UnsupportedSqlExecution;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            if (ddl_value.name.table.len == 0) {
+                if (ddl_value.schema_change.? != .drop_index) return error.InvalidSqlSyntax;
+                const name = ddl_value.schema_change.?.drop_index;
+                var found: ?[]const u8 = if (try ownsIndex(&handle.db, a, name)) "default" else null;
+                var iterator = handle.embedded_tables.valueIterator();
+                while (iterator.next()) |table| if (try ownsIndex(&table.*.db, a, name)) {
+                    if (found != null) return error.SqlAmbiguousIndex;
+                    found = table.*.name;
+                };
+                ddl_value.name.table = found orelse {
+                    if (ddl_value.conditional) return .{};
+                    return error.SqlIndexNotFound;
+                };
+            }
+            if (ddl_value.name.database != null or (ddl_value.name.namespace != null and !std.mem.eql(u8, ddl_value.name.namespace.?, "public"))) return error.UndefinedTable;
+            const db = try tables.get(handle, ddl_value.name.table);
+            const bytes = (try db.getSchemaJson(a)) orelse return error.UnsupportedSqlExecution;
+            const parsed = try native.public_api.tables.parseValidatedTableSchema(a, bytes);
+            const schema = try native.public_api.tables.deriveRuntimeTableSchema(a, parsed);
+            if (schema.storage_mode != .relational) return error.UnsupportedSqlShape;
+            var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
+            if (!try dependencies.sql_schema_ddl.apply(a, &candidate, ddl_value)) return .{};
+            const validation = ddl_value.schema_change.? == .validate_constraint;
+            const version = if (validation) schema.version else std.math.add(u32, schema.version, 1) catch return error.SqlProgramLimitExceeded;
+            try candidate.object.put(a, "version", .{ .integer = version });
+            const proposed = try std.json.Stringify.valueAlloc(a, candidate, .{});
+            var target = try self.selected(ddl_value.name.table);
+            defer self.outcome_transaction_id = target.outcome_transaction_id;
+            const metadata = try target.localCatalog(a, schema.version);
+            const proposed_schema = try native.public_api.tables.parseValidatedTableSchema(a, proposed);
+            const validator = dependencies.schema_relational_foreign_key_target;
+            for (try proposed_schema.relationalForeignKeyDefinitions(a)) |fk| {
+                const parent = for (metadata.table) |record| {
+                    if (std.mem.eql(u8, record.name, fk.parent_table)) break record;
+                } else return error.UndefinedTable;
+                try validator.validate(a, proposed, parent.name, if (parent.table_id == db.core.identity_namespace.table_id) proposed else parent.schema_json);
+            }
+            for (metadata.table) |record| {
+                const child_bytes = if (record.table_id == db.core.identity_namespace.table_id) proposed else record.schema_json;
+                const child = try native.public_api.tables.parseValidatedTableSchema(a, child_bytes);
+                for (try child.relationalForeignKeyDefinitions(a)) |fk| if (std.mem.eql(u8, fk.parent_table, ddl_value.name.table)) {
+                    validator.validate(a, child_bytes, ddl_value.name.table, proposed) catch |err| switch (err) {
+                        error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyPartialSupportIndexRequired => return error.SqlDependentConstraint,
+                        else => return err,
+                    };
+                };
+            }
+            // Receipt ownership precedes publication, including all allocations.
+            var receipt: catalog.DdlReceipt = .{
+                .database = try alloc.dupe(u8, "default"),
+                .namespace = try alloc.dupe(u8, "public"),
+                .table = try alloc.dupe(u8, ddl_value.name.table),
+                .table_id = try std.fmt.allocPrint(alloc, "{d}", .{db.core.identity_namespace.table_id}),
+                .schema_version = version,
+                .state = .pending,
+            };
+            if (validation) {
+                @import("sql_ddl.zig").retry(&target, version) catch |err| switch (err) {
+                    error.SqlDdlPending => return .{ .mutation_outcome = .committed_pending, .receipt = receipt },
+                    error.SqlMutationOutcomeUnknown => {
+                        receipt.state = .admission_unknown;
+                        return .{ .mutation_outcome = null, .receipt = receipt };
+                    },
+                    else => return err,
+                };
+            } else {
+                const published_fk = @import("sql_fk.zig").publish(&target, a, proposed, schema.version, false) catch |err| switch (err) {
+                    error.SqlDdlPending => return .{ .mutation_outcome = .committed_pending, .receipt = receipt },
+                    error.SqlMutationOutcomeUnknown => {
+                        receipt.state = .admission_unknown;
+                        return .{ .mutation_outcome = null, .receipt = receipt };
+                    },
+                    else => return err,
+                };
+                if (!published_fk) {
+                    const retired = @import("sql_ddl.zig").publish(&target, a, proposed, schema.version) catch |err| switch (err) {
+                        error.SqlDdlPending => return .{ .mutation_outcome = .committed_pending, .receipt = receipt },
+                        else => return err,
+                    };
+                    if (!retired) db.compareAndSetSchemaJson(a, proposed, schema.version) catch |err| switch (err) {
+                        error.DurabilityOutcomeUnknown => {
+                            receipt.state = .admission_unknown;
+                            return .{ .mutation_outcome = null, .receipt = receipt };
+                        },
+                        else => return err,
+                    };
+                }
+            }
+            if (ddl_value.schema_change.? == .create_index) {
+                target.db.ensureRelationalIndexesReady(&.{ddl_value.schema_change.?.create_index.name}, .none, native.platform_time.monotonicNs() +| 5 * std.time.ns_per_s) catch |err| switch (err) {
+                    // A failed derived build belongs in the invalid receipt;
+                    // ddlState below reads its authoritative diagnostic state.
+                    error.RelationalIndexNotReady => {},
+                    else => return .{ .mutation_outcome = .committed_pending, .receipt = receipt },
+                };
+            }
+            @import("sql_ddl.zig").activate(&target, version) catch return .{ .mutation_outcome = .committed_pending, .receipt = receipt };
+            receipt.state = target.ddlState(a, ddl_value.schema_change.?, proposed, version) catch return .{ .mutation_outcome = .committed_pending, .receipt = receipt };
+            return .{ .mutation_outcome = switch (receipt.state) {
+                .ready => .committed,
+                .invalid => .committed_repair_required,
+                else => .committed_pending,
+            }, .receipt = receipt };
+        }
+
+        fn ddlState(self: *Self, alloc: std.mem.Allocator, change: ast.SchemaChange, schema_json: []const u8, version: u32) !catalog.DdlReceipt.State {
+            // Coordinated coverage is authoritative for UNIQUE, FK and CHECK
+            // activation. The local CHECK-only job cannot describe other DDL.
+            var state: catalog.DdlReceipt.State = .ready;
+            if (try dependencies.api_relational_integrity_commit.requiresActivation(alloc, schema_json)) {
+                const response = (try self.db.lookup(alloc, "", .{ .relational_activation_json = "{}" })) orelse return error.ConstraintActivationUnavailable;
+                const status = try std.json.parseFromSliceLeaky(struct { schema_version: u32, state: dependencies.storage_db_relational_integrity_activation_contract.State }, alloc, response.json, .{ .ignore_unknown_fields = true });
+                if (status.schema_version != version) return error.PreparedGenerationChanged;
+                state = switch (status.state) {
+                    .enforced => .ready,
+                    .invalid => .invalid,
+                    .validating => .pending,
+                };
+            }
+            if (change == .create_index) {
+                const index = try self.db.relationalIndexBuildStatus(change.create_index.name);
+                if (index.state == .failed) return .invalid;
+                if (index.state != .ready and state != .invalid) return .pending;
+            }
+            return state;
         }
 
         pub const LocalCatalog = struct {
@@ -168,6 +335,7 @@ pub fn Adapter(comptime native: type) type {
                 .schema_version = request.schema_version,
                 .relational_schema_version = request.relational_schema_version,
                 .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                .relational_repair = request.relational_repair,
                 .writes = request.writes,
                 .deletes = request.deletes,
                 .predicates = request.predicates,
@@ -224,6 +392,15 @@ pub fn Adapter(comptime native: type) type {
             // cursors then retain their snapshots after writers are released.
             const io = self.db.backend_runtime.io() orelse return error.SqlStatementReadUnavailable;
             const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+            var search_arena = std.heap.ArenaAllocator.init(alloc);
+            defer search_arena.deinit();
+            const prepared = try search_arena.allocator().alloc(?native.public_api.query.OwnedQueryRequest, requests.len);
+            @memset(prepared, null);
+            defer for (prepared) |*request| if (request.*) |*owned| owned.deinit(search_arena.allocator());
+            for (requests, prepared) |request, *out| if (request.request.search) |search| {
+                var selected_adapter = try self.selected(request.table.physical_name);
+                out.* = try selected_adapter.prepareSearch(search_arena.allocator(), search);
+            };
             var owners: [64]*DB = undefined;
             var owner_count: usize = 0;
             for (requests) |request| {
@@ -259,12 +436,127 @@ pub fn Adapter(comptime native: type) type {
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
                 try io.sleep(.fromMilliseconds(1), .awake);
             }
-            for (requests, cursors) |request, *cursor| {
-                cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
+            for (requests, prepared, cursors) |request, *search, *cursor| {
+                if (search.*) |*owned| {
+                    var selected_adapter = try self.selected(request.table.physical_name);
+                    cursor.* = try selected_adapter.openSearch(alloc, request.table, request.request, owned.req);
+                } else cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
                 initialized += 1;
             }
             statement.* = .{ .alloc = alloc, .cursors = cursors };
             return .{ .ptr = statement, .cursors = cursors, .close = Statement.close };
+        }
+
+        const SemanticResolver = struct {
+            adapter: *Self,
+            fn resolveDense(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index: []const u8, text: []const u8, template: ?[]const u8, limit: u32) anyerror!types.DenseKnnQuery {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (template != null) return error.UnsupportedQueryRequest;
+                const handle = self.adapter.handle orelse return error.UnsupportedSqlExecution;
+                const configs = try self.adapter.db.listIndexes(alloc);
+                defer types.freeIndexConfigs(alloc, configs);
+                var json: std.json.Value = .{ .object = .empty };
+                for (configs) |config| {
+                    const normalized = try @import("db.zig").liteManagedEmbeddingIndexConfigJson(alloc, config.kind, config.config_json);
+                    try json.object.put(alloc, config.name, try std.json.parseFromSliceLeaky(std.json.Value, alloc, normalized, .{}));
+                }
+                const bytes = try std.json.Stringify.valueAlloc(alloc, json, .{});
+                var managed = try @import("handles.zig").managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, bytes, .{ .antfly_provider = handle.liteAntflyProvider() });
+                defer managed.deinit();
+                return .{ .vector = try managed.embedQuery(alloc, index, text), .k = limit };
+            }
+        };
+
+        fn prepareSearch(self: *Self, alloc: std.mem.Allocator, search: anytype) !native.public_api.query.OwnedQueryRequest {
+            if (self.transaction) |session| if (session.active) {
+                for (session.entries.items) |entry| if (std.mem.eql(u8, entry.table.physical_name, self.table_name)) return error.SqlSearchUncommittedWrites;
+            };
+            const text = search.request_text orelse return error.InvalidSqlParameters;
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            const bytes = if (std.mem.startsWith(u8, trimmed, "{")) trimmed else try std.json.Stringify.valueAlloc(alloc, .{ .full_text_search = .{ .query = text } }, .{});
+            var resolver = SemanticResolver{ .adapter = self };
+            var body = std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSqlParameters;
+            if (body != .object) return error.InvalidSqlParameters;
+            if (search.limit) |limit| try body.object.put(alloc, "limit", .{ .integer = limit });
+            const canonical = try std.json.Stringify.valueAlloc(alloc, body, .{});
+            var owned = native.public_api.query.parsePublicQueryRequest(alloc, .{ .ptr = &resolver, .vtable = &.{ .resolve_dense_query = SemanticResolver.resolveDense } }, self.table_name, canonical) catch |err| return if (native.public_api.query.isPublicQueryValidationError(err)) error.InvalidSqlParameters else err;
+            errdefer owned.deinit(alloc);
+            if (owned.req.limit == 0 or owned.req.limit > 10000) return error.SqlProgramLimitExceeded;
+            owned.req.include_stored = true;
+            owned.req.fields = &.{};
+            owned.req.include_all_fields = true;
+            return owned;
+        }
+
+        const SearchCursor = struct {
+            alloc: std.mem.Allocator,
+            arena: std.heap.ArenaAllocator,
+            rows: []catalog.Row,
+            position: usize = 0,
+            fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const end = @min(self.rows.len, self.position + limit);
+                const rows = self.rows[self.position..end];
+                self.position = end;
+                return .{ .rows = rows, .after = if (end < self.rows.len) try std.fmt.allocPrint(alloc, "{d}", .{end}) else null };
+            }
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.arena.deinit();
+                self.alloc.destroy(self);
+            }
+        };
+
+        fn openSearch(self: *Self, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, search: types.SearchRequest) !catalog.Cursor {
+            // Statement capture fences already exclude primary mutation on
+            // every participating table. The native lease also fences search
+            // index/schema access while ranking and hydrating these hits.
+            var lease = try self.db.beginQueryReadLease();
+            defer lease.release();
+            var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
+            defer view.release();
+            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            var captured = try lease.search(alloc, search);
+            defer captured.result.deinit();
+            const cursor = try alloc.create(SearchCursor);
+            errdefer alloc.destroy(cursor);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const rows = try a.alloc(catalog.Row, captured.result.hits.len);
+            var fields: std.ArrayList([]const u8) = .empty;
+            for (request.fields) |field| if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "score") and !std.mem.eql(u8, field, "_highlights")) {
+                try fields.append(a, field);
+            };
+            var typed_reader: ?DB.RelationalRows.Reader = if (table.storage_mode == .relational)
+                try lease.relationalRows(alloc, fields.items, table.schema_version)
+            else
+                null;
+            defer if (typed_reader) |*reader| reader.deinit();
+            for (captured.result.hits, rows) |hit, *out| {
+                const typed = if (typed_reader) |*reader| (try reader.lookupTypedRow(a, hit.id)) orelse return error.SqlStatementReadUnavailable else null;
+                var document = if (typed) |row| row.typed orelse return error.InvalidSqlBackendResponse else if (hit.source_value) |value| try types.cloneJsonValue(a, value) else if (hit.stored_data) |data| try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{ .parse_numbers = false }) else return error.InvalidSqlBackendResponse;
+                if (document != .object) return error.InvalidSqlBackendResponse;
+                try document.object.put(a, "score", if (hit.score) |score| .{ .float = score } else .null);
+                if (try native.public_api.query.highlightsJsonValue(a, hit.highlights)) |highlights| {
+                    const encoded = try std.json.Stringify.valueAlloc(a, highlights, .{});
+                    try document.object.put(a, "_highlights", try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{ .parse_numbers = false }));
+                } else _ = document.object.swapRemove("_highlights");
+                if (typed) |row| {
+                    // Native typed cells are already projected and owned. Add
+                    // only search metadata, keeping their SQL-null bitmap.
+                    var projected: std.json.ObjectMap = .empty;
+                    const nulls = try a.alloc(bool, request.fields.len);
+                    for (request.fields) |field| {
+                        if (std.mem.eql(u8, field, "_id")) continue;
+                        try projected.put(a, field, document.object.get(field) orelse .null);
+                        nulls[projected.count() - 1] = if (std.mem.eql(u8, field, "score")) hit.score == null else if (std.mem.eql(u8, field, "_highlights")) !document.object.contains("_highlights") else if (document.object.getIndex(field)) |index| row.sql_nulls.?[index] else true;
+                    }
+                    out.* = .{ .id = row.key, .version = row.version, .value = .{ .object = projected }, .sql_nulls = nulls[0..projected.count()] };
+                } else out.* = try dependencies.sql_document_row.projectValue(a, table, hit.id, 0, document, request.fields);
+            }
+            cursor.* = .{ .alloc = alloc, .arena = arena, .rows = rows };
+            return .{ .ptr = cursor, .next = SearchCursor.next, .close = SearchCursor.close };
         }
 
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -393,6 +685,7 @@ pub fn Adapter(comptime native: type) type {
         }
 
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            if (request.search != null) return error.SqlStatementSnapshotRequired;
             const self: *Self = @ptrCast(@alignCast(ptr));
             const native_cursor = (try openNative(ptr, alloc, table, request)) orelse return null;
             errdefer native_cursor.close(native_cursor.ptr);
@@ -466,7 +759,7 @@ pub fn Adapter(comptime native: type) type {
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
                 for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
-                prepared = try integrity.prepareWithCoverage(temporary, self.localSource(), metadata.table, metadata.range, &.{input});
+                prepared = try integrity.prepareWithRepairAdmission(temporary, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);
@@ -481,5 +774,21 @@ pub fn Adapter(comptime native: type) type {
         }
 
         fn checkpoint(_: *anyopaque) !void {}
+
+        pub fn repairAdmission(self: *Self) dependencies.api_relational_integrity_commit.RepairAdmission {
+            return .{ .ptr = self, .eligible = repairEligible };
+        }
+
+        fn repairEligible(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, version: u32) !bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var selected_adapter = try self.selected(name);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const response = (try selected_adapter.db.lookup(a, "", .{ .relational_activation_json = "{}" })) orelse return false;
+            const status = try std.json.parseFromSliceLeaky(struct { schema_version: u32, state: dependencies.storage_db_relational_integrity_activation_contract.State, failure: []const u8 }, a, response.json, .{ .ignore_unknown_fields = true });
+            if (status.schema_version != version) return error.PreparedGenerationChanged;
+            return status.state == .invalid or (status.state == .validating and std.mem.eql(u8, status.failure, "ForeignKeyParentMissing"));
+        }
     };
 }

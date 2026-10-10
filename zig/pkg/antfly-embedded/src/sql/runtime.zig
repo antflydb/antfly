@@ -284,7 +284,7 @@ pub const Context = struct {
         var capture: ?@import("mutation_capture.zig") = null;
         defer if (capture) |*owner| owner.deinit();
         if (context.binding.returning_query != null) {
-            capture = try @import("mutation_capture.zig").open(context.alloc, context.backend, context.binding);
+            capture = try @import("mutation_capture.zig").open(context.alloc, context.backend, context.binding, context.parameters);
             context.statement_capture = &capture.?;
         }
         if (context.binding.joined_mutation) |joined| return @import("joined_mutation.zig").execute(context, joined.*);
@@ -5119,4 +5119,34 @@ test "SQL floating underflow and POWER checks preserve valid zero and special re
         defer result.deinit();
         try std.testing.expect(result.output.rows[0][0].bool);
     }
+}
+
+test "SQL captured search scans bind execution parameters without mutating plans" {
+    const a = std.testing.allocator;
+    const Native = struct {
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            try std.testing.expectEqual(@as(usize, 1), scans.len);
+            const search = scans[0].request.search orelse return error.TestExpectedEqual;
+            try std.testing.expectEqualStrings("body:alpha", search.request_text.?);
+            try std.testing.expectEqual(@as(u32, 7), search.limit);
+            return TestBackend.openStatement(raw, alloc, scans);
+        }
+    };
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var backend = fixture.coordinated();
+    backend.supports_search_relations = true;
+    var vtable = backend.vtable.*;
+    vtable.open_statement = Native.open;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(a, "SELECT _id FROM antfly_search('things',$1,$2)", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bound = try describe.bind(arena.allocator(), backend, &compiled, &.{ .string, .integer });
+    var capture = try @import("mutation_capture.zig").open(a, backend, bound, &.{ .{ .string = "body:alpha" }, .{ .integer = 7 } });
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try capture.cursors(bound.relation.?)).len);
+    try std.testing.expect(bound.relation.?.scans[0].request.search.?.request_text == null);
+    capture.release();
+    try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
 }

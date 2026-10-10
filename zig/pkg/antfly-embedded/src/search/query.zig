@@ -1732,6 +1732,10 @@ pub const DocIdFilter = struct {
 pub const DocNumProducer = struct {
     ptr: *anyopaque,
     produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
+    /// Borrow a complete global membership after adaptive materialization.
+    /// The borrowed bitmap stays immutable and valid until the owner is released.
+    /// Candidate-local answers must never be exposed through this hook.
+    materialized: ?*const fn (*anyopaque) ?*const roaring.RoaringBitmap = null,
 };
 
 /// Global numeric document filter: matches documents by snapshot-global doc ID.

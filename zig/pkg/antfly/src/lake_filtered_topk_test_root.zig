@@ -13,5 +13,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Shared owner-fenced retry protocol; authorization belongs to the caller.
-pub const retry = @import("antfly_local_sources").api_relational_constraint_recovery.retry;
+//! Focused native filtering and tie-pagination qualification without HTTP routes.
+pub const antfly_sources = @import("source_owner_physical.zig");
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+test {
+    _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_text_query.zig");
+    _ = @import("antfly_local_sources").search_search;
+    _ = @import("antfly_local_sources").sparse_sparse;
+}

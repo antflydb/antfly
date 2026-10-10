@@ -180,9 +180,11 @@ pub const Cte = struct {
     recursive: bool = false,
     materialization: Materialization = .automatic,
 };
+pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
     table: struct {
         name: Name,
+        search: ?*const Search = null,
         alias: ?[]const u8 = null,
         mutation_target: bool = false,
         mutation_document: bool = false,
