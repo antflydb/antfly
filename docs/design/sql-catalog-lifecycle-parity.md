@@ -414,6 +414,19 @@ selects automatic occupancy adoption only once this binary advertises protocol
 restore/replay and distributed capability qualification. This is not yet
 production activation or original-case disposition credit.
 
+The optimized native relation-store gate now passes 43 tests. The same
+70-table staged-restore reconciliation fixture runs in relation-only and
+occupancy modes; the covered cut verifies 490 owner slots, including shared
+constraint names on distinct old/new table identities. It exercises bounded
+source/candidate scans, snapshot renewal, cancellation in both phases,
+source/index fence changes and forged publication ownership. Missing typed
+memberships, wrong table qualifiers, wrong owner kinds and forged publication
+IDs all fail independent native verification even when scalar publication
+fences still match. Hidden CREATE cursors now run in both coverage modes with
+CHECK/FK memberships; allocation and page-size assertions remain unchanged
+after adding 1,000 terminal plans. These are native metadata tests, not claims
+of distributed data-owner activation or PostgreSQL original-case completion.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining

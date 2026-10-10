@@ -1499,7 +1499,12 @@ test "system catalog relation namespace transaction hidden CREATE sources bind v
     try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationInitialSourceTableId("\x00\x00__metadata__:fk_initial_create:41:07", group));
 }
 
-test "system catalog relation namespace transaction hidden CREATE source cursors bound active pages independently of terminal history" {
+test "system catalog relation namespace transaction hidden CREATE source cursors bound active pages in both coverage modes independently of terminal history" {
+    try exerciseHiddenSourceCoverage(.relations);
+    try exerciseHiddenSourceCoverage(.constraint_names);
+}
+
+fn exerciseHiddenSourceCoverage(coverage: relation_reconciliation.Coverage) !void {
     const a = std.testing.allocator;
     const r = relation_reconciliation;
     const group: u64 = 41;
@@ -1512,7 +1517,7 @@ test "system catalog relation namespace transaction hidden CREATE source cursors
                 .id = @splat(9),
                 .namespace_id = system_catalog.default_namespace_id,
                 .logical_name = logical,
-                .child = .{ .table_id = id, .name = logical, .schema_json = "{\"version\":1}" },
+                .child = .{ .table_id = id, .name = logical, .schema_json = "{\"version\":1,\"checks\":[{\"name\":\"hidden_check\"}],\"foreign_keys\":[{\"name\":\"hidden_fk\"}]}" },
             } };
             const bytes = try std.json.Stringify.valueAlloc(alloc, projection, .{});
             defer alloc.free(bytes);
@@ -1538,16 +1543,17 @@ test "system catalog relation namespace transaction hidden CREATE source cursors
         errdefer txn.abort();
         for (100..170) |id| try T.seed(&txn, @intCast(id), true);
         try r.advanceSource(&txn, group);
-        const state = try r.State.init(group, try r.nextJobId(null), try RaftApplyStore.relationSourceEpochTxn(&txn, group));
+        const state = try r.State.initWithCoverage(group, try r.nextJobId(null), try RaftApplyStore.relationSourceEpochTxn(&txn, group), coverage);
         try r.start(&txn, &state, state.epoch, null);
         try txn.commit();
         break :blk state;
     };
     var baseline = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    const per_hidden: usize = if (coverage == .relations) 1 else 3;
     {
         var page = try store.prepareRelationReconciliationPage(baseline.allocator(), initial);
         defer page.deinit();
-        try std.testing.expectEqual(@as(usize, r.max_tables_per_page), page.claims.len);
+        try std.testing.expectEqual(r.max_tables_per_page * per_hidden, page.claims.len);
     }
     {
         var txn = try store.store.beginWriteTxn();
@@ -1559,7 +1565,7 @@ test "system catalog relation namespace transaction hidden CREATE source cursors
     var first = try store.prepareRelationReconciliationPage(measured.allocator(), initial);
     defer first.deinit();
     try std.testing.expectEqual(baseline.allocated_bytes, measured.allocated_bytes);
-    try std.testing.expectEqual(@as(usize, r.max_tables_per_page), first.claims.len);
+    try std.testing.expectEqual(r.max_tables_per_page * per_hidden, first.claims.len);
     for (first.claims) |claim| try std.testing.expect((try claim.entry()).active == null);
     {
         var txn = try store.store.beginWriteTxn();
@@ -1569,16 +1575,16 @@ test "system catalog relation namespace transaction hidden CREATE source cursors
     }
     var second = try store.prepareRelationReconciliationPage(a, first.after);
     defer second.deinit();
-    try std.testing.expectEqual(@as(usize, 7), second.claims.len);
-    for (second.claims[0..6]) |claim| try std.testing.expect((try claim.entry()).active == null);
-    try std.testing.expectEqualStrings("public_document", second.claims[6].key.name);
-    try std.testing.expect((try second.claims[6].entry()).active != null);
+    try std.testing.expectEqual(6 * per_hidden + 1, second.claims.len);
+    for (second.claims[0 .. 6 * per_hidden]) |claim| try std.testing.expect((try claim.entry()).active == null);
+    try std.testing.expectEqualStrings("public_document", second.claims[6 * per_hidden].key.name);
+    try std.testing.expect((try second.claims[6 * per_hidden].entry()).active != null);
     try std.testing.expectEqual(@as(u64, 71), second.after.expected.rows);
     var read = try store.store.beginReadTxn();
     defer read.abort();
     var table_buf: [160]u8 = undefined;
     var work_buf: [160]u8 = undefined;
-    var source: RaftApplyStore.RelationTableSource = .{ .a = a, .txn = &read, .group_id = group, .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&table_buf, group) } };
+    var source: RaftApplyStore.RelationTableSource = .{ .a = a, .txn = &read, .group_id = group, .coverage = coverage, .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&table_buf, group) } };
     defer source.deinit();
     source.initial = .{ .cursor = try read.openCursor(), .prefix = try fk_generation_publication.initialWorkPrefixForGroup(&work_buf, group) };
     try std.testing.expect(std.mem.order(u8, source.initial.?.prefix, source.raw.prefix) == .lt);
@@ -7799,6 +7805,14 @@ fn reconcileRestoreNamesForTest(store: *RaftApplyStore, a: std.mem.Allocator, in
 }
 
 test "system catalog restore reconciliation authenticates source phases and canonical physical aliases" {
+    try exerciseRestoreReconciliationCoverage(.relations);
+}
+
+test "system catalog relation namespace transaction occupancy restore authenticates typed memberships across native fault paths" {
+    try exerciseRestoreReconciliationCoverage(.constraint_names);
+}
+
+fn exerciseRestoreReconciliationCoverage(coverage: relation_reconciliation.Coverage) !void {
     const a = std.testing.allocator;
     const r = relation_reconciliation;
     const group = group_ids.main_metadata_group_id;
@@ -7811,20 +7825,20 @@ test "system catalog restore reconciliation authenticates source phases and cano
     defer store.deinit();
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
     var names: [70][32]u8 = undefined;
-    var schemas: [70][128]u8 = undefined;
+    var schemas: [70][256]u8 = undefined;
     var targets: [70]RaftApplyStore.RelationRestoreProjection.Target = undefined;
     for (&targets, &names, &schemas, 0..) |*target, *name, *schema, index| {
         const table_name = try std.fmt.bufPrint(name, "t{d:0>4}", .{100 + index});
         target.* = .{
-            .table = .{ .table_id = 100 + index, .name = table_name, .schema_json = try std.fmt.bufPrint(schema, "{{\"version\":2,\"relational_indexes\":[{{\"name\":\"new_idx_{d:0>4}\"}}]}}", .{index}) },
-            .replace = .{ .table = .{ .table_id = 1000 + index, .name = table_name, .schema_json = "{}" } },
+            .table = .{ .table_id = 100 + index, .name = table_name, .schema_json = try std.fmt.bufPrint(schema, "{{\"version\":2,\"relational_indexes\":[{{\"name\":\"new_idx_{d:0>4}\"}}],\"checks\":[{{\"name\":\"shared\"}},{{\"name\":\"new_check\"}}]}}", .{index}) },
+            .replace = .{ .table = .{ .table_id = 1000 + index, .name = table_name, .schema_json = "{\"version\":1,\"checks\":[{\"name\":\"shared\"},{\"name\":\"old_check\"}]}" } },
         };
     }
     const job: RaftApplyStore.RelationRestoreProjection = .{ .plan = .{ .id = id, .targets = &targets } };
     const json = try std.json.Stringify.valueAlloc(a, job, .{});
     defer a.free(json);
     const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 1 };
-    const initial = try r.State.init(group, try r.nextJobId(null), epoch);
+    const initial = try r.State.initWithCoverage(group, try r.nextJobId(null), epoch, coverage);
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -7858,7 +7872,7 @@ test "system catalog restore reconciliation authenticates source phases and cano
         try journal.attach();
         try page.apply(&txn, epoch);
         try store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal);
-        var reserved = try RaftApplyStore.relationRestoreTargetSnapshot(a, &txn, group, id, targets[0], false);
+        var reserved = try RaftApplyStore.relationRestoreTargetSnapshotWithCoverage(a, &txn, group, id, targets[0], false, coverage);
         defer reserved.deinit();
         var buf: [512]u8 = undefined;
         const claim = reserved.claims()[0];
@@ -7867,7 +7881,7 @@ test "system catalog restore reconciliation authenticates source phases and cano
     }
     const ready = try reconcileRestoreNamesForTest(&store, a, initial);
     try std.testing.expectEqual(@as(u64, 140), ready.expected.rows);
-    try std.testing.expectEqual(@as(u64, 210), ready.expected.claims);
+    try std.testing.expectEqual(@as(u64, if (coverage == .relations) 210 else 490), ready.expected.claims);
     const proof = try store.prepareRelationPublicationProof(a, ready);
     {
         // The replica pool owns the actual native snapshots, not a second
@@ -7999,6 +8013,36 @@ test "system catalog restore reconciliation authenticates source phases and cano
         try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
         try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
     }
+    if (coverage == .constraint_names) for (0..4) |fault| {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var journal = command_journal.Journal.initVerification(a, &txn, group, RaftApplyStore.relationSourceReplayBeforeKey);
+        defer journal.deinit();
+        try journal.attach();
+        var buf: [512]u8 = undefined;
+        const key = try r.candidateKey(&buf, &ready, .{ .namespace_id = system_catalog.default_namespace_id, .name = "new_check", .membership_table_id = 100 });
+        var forged = try relation_names.Entry.decode(try txn.get(key));
+        try std.testing.expect(forged.active == null);
+        try std.testing.expectEqual(relation_names.Kind.constraint_name, forged.pending.?.kind);
+        switch (fault) {
+            0 => try txn.delete(key),
+            1 => {
+                forged.pending.?.publication_id[0] ^= 1;
+                try txn.put(key, &(try forged.encode()));
+            },
+            2 => {
+                forged.pending.?.table_id += 1;
+                try txn.put(key, &(try forged.encode()));
+            },
+            else => {
+                forged.pending.?.kind = .table;
+                try txn.put(key, &(try forged.encode()));
+            },
+        }
+        if (fault != 0) try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
+        try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
+        try std.testing.expect(try proof.matchesTxn(&txn)); // Scalar fences alone are insufficient.
+    };
     for ([_]bool{ false, true }) |epoch_change| {
         const baseline = try store.prepareRelationPublicationProof(a, ready);
         var pool_time: u64 = 0;
