@@ -23,6 +23,8 @@ pub const Column = struct {
     name: []const u8,
     path: []const u8,
     type: ast.ColumnType,
+    element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     nullable: bool = true,
     /// Native stored generated columns are readable but never SQL assignable.
     generated: bool = false,
@@ -33,6 +35,43 @@ pub const Index = struct {
     /// Only direct ordered-tuple keys are exposed to SQL access planning.
     /// Expression and partial indexes require a separate implication proof.
     columns: []const []const u8,
+};
+
+/// Pinned declarative constraints, not similarly named access indexes. Native
+/// execution independently rebinds the name to its guarded durable generation.
+pub const Constraint = struct {
+    name: []const u8,
+    kind: enum { unique, check, foreign_key },
+    deferrable: bool = false,
+
+    fn namedConstraint(definition: anytype) bool {
+        if (comptime @hasField(@TypeOf(definition), "origin")) return (definition.origin orelse .constraint) != .index;
+        return true;
+    }
+
+    pub fn derive(alloc: std.mem.Allocator, schema: anytype) ![]const Constraint {
+        var count: usize = 0;
+        inline for (.{ "unique_constraints", "checks", "foreign_keys" }) |field| {
+            if (@field(schema, field)) |values| for (values.value) |definition| {
+                if (namedConstraint(definition)) count = try std.math.add(usize, count, 1);
+            };
+        }
+        const output = try alloc.alloc(Constraint, count);
+        errdefer alloc.free(output);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |value| alloc.free(value.name);
+        inline for (.{ "unique_constraints", "checks", "foreign_keys" }, .{ .unique, .check, .foreign_key }) |field, kind| {
+            if (@field(schema, field)) |values| for (values.value) |definition| {
+                // Native uniqueness ownership and SQL constraint identity are
+                // distinct. Classify once in this immutable schema view, not
+                // by scanning access indexes or mutable labels per request.
+                if (!namedConstraint(definition)) continue;
+                output[initialized] = .{ .name = try alloc.dupe(u8, definition.name), .kind = kind, .deferrable = if (@hasField(@TypeOf(definition), "deferrable")) definition.deferrable orelse false else false };
+                initialized += 1;
+            };
+        }
+        return output;
+    }
 };
 
 pub const Table = struct {
@@ -49,6 +88,14 @@ pub const Table = struct {
         namespace: []const u8,
         name: []const u8,
         revision: u64,
+
+        pub fn matchesQualifier(self: Scope, qualifier: []const u8) bool {
+            var parts = std.mem.splitScalar(u8, qualifier, 0);
+            const first = parts.next().?;
+            const second = parts.next() orelse return std.mem.eql(u8, first, self.name);
+            const third = parts.next() orelse return std.mem.eql(u8, first, self.namespace) and std.mem.eql(u8, second, self.name);
+            return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
+        }
     };
     id: u64,
     physical_name: []const u8,
@@ -59,6 +106,7 @@ pub const Table = struct {
     external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
+    constraints: []const Constraint = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
@@ -66,7 +114,24 @@ pub const Table = struct {
     pub fn column(self: Table, name: []const u8) !Column {
         if (std.mem.eql(u8, name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
         for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
+        // Point predicate planning must use the same pinned logical authority
+        // as relation binding; never strip a namespace before validating it.
+        const separator = std.mem.lastIndexOfScalar(u8, name, 0) orelse return error.UndefinedColumn;
+        const scope = self.scope orelse return error.UndefinedColumn;
+        if (!scope.matchesQualifier(name[0..separator])) return error.UndefinedColumn;
+        const column_name = name[separator + 1 ..];
+        if (std.mem.eql(u8, column_name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
+    }
+
+    pub fn columnAliases(self: Table, alloc: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+        const scope = self.scope orelse return &.{};
+        const aliases = try alloc.alloc([]const u8, 3);
+        aliases[0] = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ scope.name, name });
+        aliases[1] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ scope.namespace, scope.name, name });
+        aliases[2] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}\x00{s}", .{ scope.database, scope.namespace, scope.name, name });
+        return aliases;
     }
 };
 
@@ -136,13 +201,61 @@ pub const Row = struct {
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
     pattern_sources: ?[]const ?*@import("scalar.zig").PatternSet = null,
+    /// Internal relation rows retain complete, owned Datums and share a single
+    /// page-local name directory, without constructing per-row JSON objects.
+    /// Legacy backend rows continue to use JSON and the null/pattern channels.
+    typed_cells: ?struct { layout: TypedLayout, values: []const Cell, presence: ?[]const bool = null } = null,
 
-    pub const Cell = struct { value: std.json.Value, sql_null: bool, patterns: ?*@import("scalar.zig").PatternSet = null };
+    pub const Cell = @import("scalar.zig").Datum;
+    pub const TypedLayout = struct {
+        names: []const []const u8 = &.{},
+        ordinals: std.StringHashMapUnmanaged(usize) = .empty,
+
+        /// Names borrow the immutable relation binding; entries belong to the
+        /// page arena. Duplicate names must not silently overwrite an ordinal.
+        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
+            var result: TypedLayout = .{ .names = names };
+            for (names, 0..) |name, index| {
+                const entry = try result.ordinals.getOrPut(arena, name);
+                if (entry.found_existing) return error.InvalidSqlBackendResponse;
+                entry.value_ptr.* = index;
+            }
+            return result;
+        }
+
+        /// Clone once per emitted page, not once per row. No names or directory
+        /// entries may borrow a cursor that can close before the page consumer.
+        pub fn clone(self: TypedLayout, alloc: std.mem.Allocator) !TypedLayout {
+            const names = try alloc.alloc([]const u8, self.names.len);
+            for (self.names, names) |name, *out| out.* = try alloc.dupe(u8, name);
+            return init(alloc, names);
+        }
+    };
+
+    /// Clone once at the page ownership boundary; consumers borrow the typed
+    /// cells until that page is released. Layout and allocations must belong
+    /// to the same page owner (or a longer-lived immutable binding).
+    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: TypedLayout, values: []const Cell) !Row {
+        if (layout.ordinals.count() != values.len) return error.InvalidSqlBackendResponse;
+        const owned = try alloc.alloc(Cell, values.len);
+        for (values, owned) |value, *out| out.* = try @import("operators.zig").cloneDatum(alloc, value);
+        return .{ .id = try alloc.dupe(u8, id), .version = 0, .value = .null, .typed_cells = .{ .layout = layout, .values = owned } };
+    }
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            const index = cells.layout.ordinals.get(name) orelse return .{};
+            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
+            const result = cells.values[index];
+            if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
+            if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
+            if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
+            return result;
+        }
         if (self.value != .object) return error.InvalidSqlBackendResponse;
         if (self.sql_nulls) |flags| if (flags.len != self.value.object.count()) return error.InvalidSqlBackendResponse;
         const index = self.value.object.getIndex(name) orelse return .{ .value = .null, .sql_null = true };
@@ -150,6 +263,64 @@ pub const Row = struct {
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
         return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
+    }
+
+    fn validateTyped(self: Row) !void {
+        const cells = self.typed_cells orelse return error.InvalidSqlBackendResponse;
+        if (cells.values.len != cells.layout.ordinals.count() or cells.values.len != cells.layout.names.len or
+            self.value != .null or self.sql_nulls != null or self.pattern_sources != null)
+            return error.InvalidSqlBackendResponse;
+        if (cells.presence) |present| if (present.len != cells.values.len) return error.InvalidSqlBackendResponse;
+    }
+
+    pub fn fieldNames(self: Row) ![]const []const u8 {
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            return cells.layout.names;
+        }
+        if (self.value != .object) return error.InvalidSqlBackendResponse;
+        return self.value.object.keys();
+    }
+
+    pub fn hasField(self: Row, name: []const u8) !bool {
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            const index = cells.layout.ordinals.get(name) orelse return false;
+            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
+            return if (cells.presence) |present| present[index] else true;
+        }
+        if (self.value != .object) return error.InvalidSqlBackendResponse;
+        return self.value.object.contains(name);
+    }
+
+    pub fn cloneOwned(self: Row, alloc: std.mem.Allocator) !Row {
+        return self.cloneWithLayout(alloc, if (self.typed_cells) |cells| try cells.layout.clone(alloc) else null);
+    }
+
+    /// Payload ownership transfer with a page-shared, owned name directory.
+    /// Compiled pattern objects retain their existing statement-owner lifetime.
+    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?TypedLayout) !Row {
+        var result = self;
+        result.id = try alloc.dupe(u8, self.id);
+        if (self.index_cursor) |cursor| result.index_cursor = try alloc.dupe(u8, cursor);
+        if (self.document) |document| result.document = try @import("../storage/typed_json.zig").clone(alloc, document);
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            const owned_layout = layout orelse return error.InvalidSqlBackendResponse;
+            if (owned_layout.names.len != cells.values.len) return error.InvalidSqlBackendResponse;
+            const values = try alloc.alloc(Cell, cells.values.len);
+            for (cells.values, values, cells.layout.names, owned_layout.names) |value, *out, old_name, new_name| {
+                if (!std.mem.eql(u8, old_name, new_name)) return error.InvalidSqlBackendResponse;
+                _ = try self.cell(old_name);
+                out.* = try @import("operators.zig").cloneDatum(alloc, value);
+            }
+            result.typed_cells = .{ .layout = owned_layout, .values = values, .presence = if (cells.presence) |present| try alloc.dupe(bool, present) else null };
+        } else {
+            result.value = try @import("../storage/typed_json.zig").clone(alloc, self.value);
+            if (self.sql_nulls) |flags| result.sql_nulls = try alloc.dupe(bool, flags);
+            if (self.pattern_sources) |sources| result.pattern_sources = try alloc.dupe(?*@import("scalar.zig").PatternSet, sources);
+        }
+        return result;
     }
 };
 pub const Page = struct {
@@ -199,7 +370,7 @@ pub const ColumnPage = struct {
             if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
             for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
                 const value = try native.values.cell(alloc, index, ordinal);
-                return .{ .value = value.value, .sql_null = value.sql_null, .patterns = value.patterns };
+                return value;
             };
             return .{ .value = .null, .sql_null = true };
         }
@@ -278,6 +449,12 @@ pub const Mutation = struct {
     previous: ?*const Row = null,
 };
 pub const ConflictExpression = struct { json: []const u8, result_type: ast.ColumnType };
+pub const ConflictTarget = struct {
+    columns: []const []const u8 = &.{},
+    expressions: []const ConflictExpression = &.{},
+    conditions: []const Condition = &.{},
+    constraint_name: ?[]const u8 = null,
+};
 
 pub const ConflictOwner = struct {
     key: ?[]const u8,
@@ -318,7 +495,7 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 /// Complete, authorized aggregate states for one pinned table and recipe.
-/// Keys and AGS1 cells borrow the supplied page allocator until the next pull.
+/// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
@@ -328,6 +505,11 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    /// Execution-local only: never store this owner in an immutable plan.
+    regex_execution: ?*@import("regex_execution.zig") = null,
+    /// Native scalar callbacks cannot suspend/yield or perform provider I/O.
+    /// Carry an explicit context so lowering can change Backend.ptr safely.
+    scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
@@ -344,6 +526,15 @@ pub const Backend = struct {
     /// Authorized, immutable settings captured for this exact statement.
     /// Providers must never populate this from pgwire-local string settings.
     settings_view: ?*const @import("setting_catalog.zig").View = null,
+    /// Request-owned transport types fill only unconstrained parameters after
+    /// SQL inference. They never replace explicit or schema-derived types.
+    parameter_fallback_types: []const ?ast.ColumnType = &.{},
+    /// Authoritative Parse-time descriptors, including primitive widths and
+    /// array element identity. Unlike fallbacks these constrain SQL binding.
+    parameter_descriptor_hints: []const @import("scalar.zig").Type = &.{},
+    /// Shared precise parameter constraints and execution frame for this
+    /// statement, including its lowered/derived/mutation child plans.
+    parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,
@@ -367,7 +558,7 @@ pub const Backend = struct {
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
-        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const []const u8, []const ConflictExpression, []const Condition, []const Mutation) anyerror![]const ConflictOwner = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
@@ -422,6 +613,36 @@ test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("i"));
 }
 
+test "SQL typed rows own arrays without conflating JSON null or array null elements" {
+    const scalar = @import("scalar.zig");
+    const arrays = @import("array_value.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dimensions = [_]arrays.Dimension{.{ .length = 2, .lower = -3 }};
+    var elements = [_]scalar.Datum{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} };
+    var array = try arrays.Value.init(.int64, &dimensions, &elements, .{});
+    const layout = try Row.TypedLayout.init(a, &.{ "array", "json", "null" });
+    var row = try Row.fromDatums(a, "row", layout, &.{ scalar.Datum.typedArray(&array), scalar.Datum.json(.null), .{} });
+    dimensions[0].lower = 1;
+    elements[0].value = .{ .integer = 0 };
+    const cell = try row.cell("array");
+    try std.testing.expect(!cell.sql_null);
+    try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.elements[0].value.integer);
+    try std.testing.expect(cell.array.?.elements[1].sql_null);
+    try std.testing.expect(!(try row.cell("json")).sql_null);
+    try std.testing.expect((try row.cell("null")).sql_null);
+    try std.testing.expect((try row.cell("missing")).sql_null);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, Row.TypedLayout.init(a, &.{ "x", "x" }));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, Row.fromDatums(a, "", layout, &.{}));
+    row.sql_nulls = &.{ false, false, true };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("array"));
+    row.sql_nulls = null;
+    row.typed_cells.?.values = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("array"));
+}
+
 test "SQL native column pages preserve selection JSON null and validate schema width" {
     const Datum = @import("scalar.zig").Datum;
     const values = [_]Datum{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.null) };
@@ -438,4 +659,32 @@ test "SQL native column pages preserve selection JSON null and validate schema w
     page.selection = &.{0};
     page.native.?.names = &.{};
     try std.testing.expectError(error.InvalidSqlBackendResponse, page.validate());
+}
+
+test "SQL typed array column adapters preserve dimensions and owned index continuation" {
+    const scalar = @import("scalar.zig");
+    const arrays = @import("array_value.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dimensions = [_]arrays.Dimension{.{ .length = 2, .lower = -3 }};
+    const elements = [_]scalar.Datum{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} };
+    var array = try arrays.Value.init(.int64, &dimensions, &elements, .{});
+    const cells = [_]scalar.Datum{scalar.Datum.typedArray(&array)};
+    const rows = [_][]const scalar.Datum{&cells};
+    const source: @import("execution_batch.zig").Batch = .{ .rows = &rows };
+    const page: ColumnPage = .{ .native = .{ .values = &source, .names = &.{"a"} }, .selection = &.{0} };
+    const definitions = [_]scalar.Column{.{ .name = "a", .type = .array, .element_type = .int64 }};
+    const adapter: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = page, .definitions = &definitions } };
+    const cell = try adapter.cell(a, 0, 0);
+    try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.elements[0].value.integer);
+    try std.testing.expect(cell.array.?.elements[1].sql_null);
+    var cursor = [_]u8{ 'n', 'e', 'x', 't' };
+    var row = try Row.fromDatums(a, "row", try Row.TypedLayout.init(a, &.{"a"}), &cells);
+    row.index_cursor = &cursor;
+    const owned = try row.cloneOwned(a);
+    @memset(&cursor, 'x');
+    try std.testing.expectEqualStrings("next", owned.index_cursor.?);
+    try std.testing.expectEqual(@as(i32, -3), (try owned.cell("a")).array.?.dimensions[0].lower);
 }

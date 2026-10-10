@@ -269,6 +269,37 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_regex_tests = b.addRunArtifact(lib_regex_tests);
     const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
     lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
+    const capture_regex_tests = b.addTest(.{ .root_module = regex_mod.import_table.get("antfly_capture_regex").? });
+    const run_capture_regex_tests = b.addRunArtifact(capture_regex_tests);
+    lib_regex_test_step.dependOn(&run_capture_regex_tests.step);
+
+    const sql_regex_tests = b.addTest(.{ .root_module = @import("lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex")) });
+    const run_sql_regex_tests = b.addRunArtifact(sql_regex_tests);
+    b.step("sql-regex-test", "Run native PostgreSQL-compatible regex ownership and span contracts").dependOn(&run_sql_regex_tests.step);
+    b.step("sql-regex-check", "Compile PostgreSQL ARE backend contracts for the selected target").dependOn(&sql_regex_tests.step);
+
+    const numeric_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/numeric_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
+    b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
+
+    const exact_float_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/common/json_float_decimal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_exact_float_tests = b.addRunArtifact(exact_float_tests);
+    b.step("sql-exact-float-test", "Verify exact binary64 decimal expansion across finite exponents and benchmark its codec")
+        .dependOn(&run_exact_float_tests.step);
 
     const lib_scraping_tests = b.addTest(.{
         .root_module = scraping_mod,
@@ -682,6 +713,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_exact_float_tests.step);
+    unit_test_step.dependOn(&run_capture_regex_tests.step);
+    unit_test_step.dependOn(&run_sql_regex_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.

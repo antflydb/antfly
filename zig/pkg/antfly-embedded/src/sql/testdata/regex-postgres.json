@@ -1,0 +1,503 @@
+{
+  "format": 1,
+  "collation": "C",
+  "entries": [
+    {
+      "id": "fixed-bound-inherits-selection",
+      "expression": "regexp_substr('aa','(a{1})(a*?)')",
+      "value": "a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "equal-bounds-impose-selection",
+      "expression": "regexp_substr('aa','(a{1,1})(a*?)')",
+      "value": "aa",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "nullable-greedy-capture",
+      "expression": "regexp_substr('','(a*)*?',1,1,'',1)",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "nullable-lazy-capture",
+      "expression": "regexp_substr('','(a*?)*?',1,1,'',1)",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "fixed-bound-occurrences",
+      "expression": "regexp_count('aa','(a{1})(a*?)')",
+      "value": 2,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "fixed-bound-replacement",
+      "expression": "regexp_replace('aa','(a{1})(a*?)','X')",
+      "value": "Xa",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "BRE-interior-anchor",
+      "expression": "regexp_like('a^b','a^b','b')",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "complement-newline-membership",
+      "expression": "regexp_like(E'\\n\\n','\\D{2}','n')",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "empty-capture-position",
+      "expression": "regexp_instr('','(a*)*?',1,1,0,'',1)",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "grouped-assertion-occurrences",
+      "expression": "regexp_count('ab','(?:(?<=a))+')",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-match",
+      "expression": "'abc' ~ 'a'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-imatch",
+      "expression": "'abc' ~* 'A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-match",
+      "expression": "'abc' !~ 'A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-imatch",
+      "expression": "'abc' !~* 'A'",
+      "value": false,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-null-left",
+      "expression": "NULL !~ '['",
+      "value": null,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-null-right",
+      "expression": "'abc' ~ NULL",
+      "value": null,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-precedence",
+      "expression": "NOT 'abc' ~ 'z'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-concat-precedence",
+      "expression": "'a' || 'bc' ~ '^abc$'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-comparison-precedence",
+      "expression": "'abc' ~ 'a' = true",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-invalid-regex",
+      "expression": "'abc' ~ '['",
+      "value": null,
+      "oid": null,
+      "sqlstate": "2201B"
+    },
+    {
+      "id": "operator-wrong-type",
+      "expression": "42 ~ 'a'",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "id": "operator-lazy-and",
+      "expression": "false AND 'abc' ~ '['",
+      "value": false,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-inline-flags",
+      "expression": "'abc' ~ '(?i)A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "like",
+      "expression": "regexp_like('雪ABC😀','abc','i')",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "like-miss",
+      "expression": "regexp_like('abc','z')",
+      "value": false,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "like-null",
+      "expression": "regexp_like(NULL,'[','z')",
+      "value": null,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "like-global-refused",
+      "expression": "regexp_like('a','a','g')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "count",
+      "expression": "regexp_count('雪😀a😀','😀')",
+      "value": 2,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "count-start",
+      "expression": "regexp_count('雪😀a😀','😀',3)",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "count-flags",
+      "expression": "regexp_count('aA','a',1,'i')",
+      "value": 2,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "count-empty",
+      "expression": "regexp_count('雪😀','')",
+      "value": 3,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "count-past-end",
+      "expression": "regexp_count('雪','.',9)",
+      "value": 0,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "count-negative-start",
+      "expression": "regexp_count('a','a',-1)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "count-null-start",
+      "expression": "regexp_count('a','[',NULL)",
+      "value": null,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr",
+      "expression": "regexp_instr('雪😀A1B22','([A-Z])([0-9]+)')",
+      "value": 3,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-next",
+      "expression": "regexp_instr('雪😀A1B22','([A-Z])([0-9]+)',1,2)",
+      "value": 5,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-end",
+      "expression": "regexp_instr('雪😀A1B22','([A-Z])([0-9]+)',1,2,1)",
+      "value": 8,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-capture",
+      "expression": "regexp_instr('雪😀A1B22','([a-z])([0-9]+)',1,2,0,'i',2)",
+      "value": 6,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-missing-capture",
+      "expression": "regexp_instr('a','(a)',1,1,0,'',9)",
+      "value": 0,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-unmatched",
+      "expression": "regexp_instr('b','(a)?b',1,1,0,'',1)",
+      "value": 0,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-empty",
+      "expression": "regexp_instr('雪😀','$',1,1,1)",
+      "value": 3,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "instr-bad-end",
+      "expression": "regexp_instr('a','a',1,1,2)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "instr-zero-occurrence",
+      "expression": "regexp_instr('a','a',1,0)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "substr",
+      "expression": "regexp_substr('雪😀A1B22','([A-Z])([0-9]+)')",
+      "value": "A1",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-next",
+      "expression": "regexp_substr('雪😀A1B22','([A-Z])([0-9]+)',1,2)",
+      "value": "B22",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-capture",
+      "expression": "regexp_substr('雪😀A1B22','([a-z])([0-9]+)',1,2,'i',2)",
+      "value": "22",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-empty",
+      "expression": "regexp_substr('雪😀','$')",
+      "value": "",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-miss",
+      "expression": "regexp_substr('a','z')",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-unmatched",
+      "expression": "regexp_substr('b','(a)?b',1,1,'',1)",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "substr-negative-group",
+      "expression": "regexp_substr('a','(a)',1,1,'',-1)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "substr-text-position",
+      "expression": "regexp_substr('雪😀a','.', '2')",
+      "value": "😀",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-first",
+      "expression": "regexp_replace('aba','a','X')",
+      "value": "Xba",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-global",
+      "expression": "regexp_replace('aba','a','X','g')",
+      "value": "XbX",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-start",
+      "expression": "regexp_replace('ababa','a','X',2)",
+      "value": "abXba",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-nth",
+      "expression": "regexp_replace('ababa','a','X',2,2)",
+      "value": "ababX",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-all-from-start",
+      "expression": "regexp_replace('ababa','a','X',2,0)",
+      "value": "abXbX",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-explicit-n-ignores-g",
+      "expression": "regexp_replace('aAa','a','X',1,2,'gi')",
+      "value": "aXa",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-captures",
+      "expression": "regexp_replace('ab a','(a)(b)?',E'<\\\\2>-\\\\1-\\\\&','g')",
+      "value": "<b>-a-ab <>-a-a",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-empty",
+      "expression": "regexp_replace('雪😀','','X','g')",
+      "value": "X雪X😀X",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-null-pattern",
+      "expression": "regexp_replace('a',NULL,'X','z')",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-null-fourth",
+      "expression": "regexp_replace('a','[','X',NULL)",
+      "value": null,
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "replace-zero-start",
+      "expression": "regexp_replace('a','a','X',0)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "replace-negative-nth",
+      "expression": "regexp_replace('a','a','X',1,-1)",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "invalid-regex",
+      "expression": "regexp_replace('a','[','X')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "2201B"
+    },
+    {
+      "id": "invalid-flags",
+      "expression": "regexp_replace('a','a','X','z')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "22023"
+    },
+    {
+      "id": "lazy-case",
+      "expression": "CASE WHEN false THEN regexp_replace('a','[','X') ELSE 'safe' END",
+      "value": "safe",
+      "oid": 25,
+      "sqlstate": null
+    },
+    {
+      "id": "missing-overload",
+      "expression": "regexp_replace('a','a')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "id": "wrong-type",
+      "expression": "regexp_like(42,'a')",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "id": "bigint-position",
+      "expression": "regexp_count('abc','a',CAST(1 AS bigint))",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "id": "smallint-position",
+      "expression": "regexp_count('abc','a',CAST(1 AS smallint))",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    },
+    {
+      "id": "int-position",
+      "expression": "regexp_count('abc','a',CAST(1 AS integer))",
+      "value": 1,
+      "oid": 23,
+      "sqlstate": null
+    }
+  ]
+}

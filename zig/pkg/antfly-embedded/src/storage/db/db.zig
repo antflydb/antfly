@@ -7914,8 +7914,6 @@ pub const DB = struct {
             return 0;
         }
 
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         // Recheck after lock acquisition to close publication racing the fast
@@ -9314,8 +9312,6 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         try self.lockApplyForPortableRuntime();
@@ -22046,6 +22042,17 @@ pub const DB = struct {
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !?u64 {
         if (self.core.schema) |current_schema| {
             if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            // A new epoch cannot reinterpret retained rows or index keys under
+            // a different SQL domain. Explicit typed conversion belongs to the
+            // staged rewrite path, not ordinary metadata publication.
+            if (current_schema.storage_mode == .relational) for (current_schema.relational_columns) |previous| {
+                for (next_schema.relational_columns) |next| {
+                    if (std.mem.eql(u8, previous.path, next.path) and
+                        (previous.sql_element_type != next.sql_element_type or
+                            !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(previous.numeric_modifier, next.numeric_modifier)))
+                        return error.InvalidSchemaUpdateRequest;
+                }
+            };
             // Attaching/detaching an external base must never hide or resurrect
             // native rows under the same identity. Create a new table instead.
             if ((current_schema.external_base_source == null) != (next_schema.external_base_source == null)) return error.InvalidSchemaUpdateRequest;
@@ -27698,8 +27705,6 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         try self.lockApplyForPortableRuntime();
@@ -29300,7 +29305,7 @@ pub const DB = struct {
     }
 
     pub fn waitForCurrentSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
-        try self.executor.failIfUnhealthy();
+        try self.executor.checkSyncLevelHealth(sync_level);
         const sequence = self.core.nextDerivedSequence();
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
@@ -29314,11 +29319,8 @@ pub const DB = struct {
     pub const waitForResolvedTransactionSync = local_mutation.waitForResolvedTransactionSync;
 
     pub fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
-        if (sequence == 0 or sync_level == .propose or sync_level == .write) {
-            try self.executor.failIfUnhealthy();
-            return;
-        }
-        try self.executor.failIfUnhealthy();
+        try self.executor.checkSyncLevelHealth(sync_level);
+        if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
         defer sync_targets.deinit(self.alloc);
@@ -33113,9 +33115,8 @@ pub const DB = struct {
             .clock = visibility_clock,
         };
         switch (sync_level) {
-            .propose, .write => try self.executor.failIfUnhealthy(),
+            .propose, .write => {},
             .enrichments => {
-                try self.executor.failIfUnhealthy();
                 if (!skip_enrichment_runtime_wait)
                     try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
@@ -48455,9 +48456,8 @@ fn currentReplayTargetSequenceContext(ctx: *const BatchExecutionContext) u64 {
 
 fn waitForSyncLevelContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
     switch (sync_level) {
-        .propose, .write => try ctx.executor.failIfUnhealthy(),
+        .propose, .write => {},
         .enrichments => {
-            try ctx.executor.failIfUnhealthy();
             try runEnrichmentUntilContext(ctx, sequence);
         },
         .full_text => {
@@ -63933,6 +63933,46 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
     try std.testing.expectEqual(@as(u64, 0), stats.dirty_ranges_read);
     try std.testing.expect(db.relational_column_maintenance.ranges_merged.load(.monotonic) >= 3);
     try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > 0);
+}
+
+test "relational index system NUMERIC cold column projections preserve precision scale and logical hashes" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.initFast("numeric-columns");
+    defer directory.cleanup();
+    const backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var writes: [32]types.BatchWrite = undefined;
+    const documents = [_][]const u8{
+        "{\"n\":123456789012345678901234567890.00001}",
+        "{\"n\":1.2000}",
+        "{\"n\":\"NaN\"}",
+        "{\"n\":null}",
+    };
+    for (&writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = documents[i % documents.len] };
+    try db.batch(.{ .writes = &writes });
+    const options: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .include_content_hashes = true };
+    var before = try db.scan(alloc, "", "", options);
+    defer before.deinit(alloc);
+    try drainTestRelationalMaintenance(&db);
+    db.close();
+    db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    var stats: types.ColumnarScanStats = .{};
+    var projected_options = options;
+    projected_options.columnar_stats = &stats;
+    var after = try db.scan(alloc, "", "", projected_options);
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, writes.len), after.documents.len);
+    try std.testing.expectEqualDeep(before.documents, after.documents);
+    try std.testing.expectEqualDeep(before.hashes, after.hashes);
+    try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
 }
 
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
@@ -133719,4 +133759,68 @@ test "lite bounded reader integration publishes full text mappings through db" {
         try std.testing.expectEqual(@as(u32, 1), result.total_hits);
         try std.testing.expectEqualStrings("b", result.hits[0].id);
     }
+}
+
+test "issue1015 primary writes survive failed derived runtime and visibility stays fail closed" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("issue1015-primary-durability");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    var open = true;
+    defer if (open) db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+    const io = runtime.threaded.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.last_error_name = "InjectedPermanentFailure";
+    runtime.mutex.unlock(io);
+    try std.testing.expectError(error.AsyncWorkerFailed, db.executor.failIfUnhealthy());
+    try db.batch(.{ .writes = &.{.{ .key = "primary", .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write });
+    const value = (try db.get(alloc, "primary")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"search_text\":\"durable\"}", value);
+    try db.waitForCurrentSyncLevel(.write);
+    try std.testing.expectError(error.AsyncWorkerFailed, db.batch(.{ .writes = &.{.{ .key = "rejected", .value = "{}" }}, .sync_level = .full_text }));
+    try std.testing.expect((try db.get(alloc, "rejected")) == null);
+    db.close();
+    open = false;
+    var reopened = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    defer reopened.close();
+    try reopened.waitForCurrentSyncLevel(.full_text);
+    const durable = (try reopened.get(alloc, "primary")).?;
+    defer alloc.free(durable);
+    try std.testing.expectEqualStrings(value, durable);
+}
+
+test "issue1015 degraded primary writes reject backlog exhaustion before commit" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 4096 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var directory = try TestDirectory.init("issue1015-bounded-degraded-writes");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .resource_manager = &manager, .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+    const io = runtime.threaded.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.last_error_name = "InjectedPermanentFailure";
+    runtime.mutex.unlock(io);
+    var accepted: usize = 0;
+    while (accepted < 200) : (accepted += 1) {
+        var key_buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "primary-{d}", .{accepted});
+        db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write }) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+            try std.testing.expect(accepted > 0);
+            try std.testing.expect((try db.get(alloc, key)) == null);
+            try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes <= 4096);
+            return;
+        };
+    }
+    return error.TestUnexpectedResult;
 }

@@ -38,6 +38,48 @@ owner, run SQL again, and assert disk hits with zero repeated provider range rea
 Separate tests cover credential/version isolation, unversioned-read rejection,
 bounded priority eviction across restart, and unavailable local cache fallback.
 
+### Diagnosing cold queries and restart reuse
+
+The write worker has its own server-owned `std.Io` executor: it does not consume
+the last request executor slot. Initialization failures preserve source reads and
+retry opportunistically after one minute. A published owner bypasses startup
+locking on warm queries. Accepted writes drain during graceful shutdown; abrupt
+termination may lose queued cache writes, never authoritative source data.
+
+If a configured cache directory stays empty, inspect these process metrics before
+changing cache sizes or adding prewarming:
+
+- `antfly_lake_cache_disk_ready` and `antfly_lake_cache_disk_unavailable{reason}`:
+  check the effective local root, node-user permissions, one owner per directory,
+  and executor/resource admission. `WouldBlock` means another owner holds the root.
+- `antfly_lake_disk_cache_writes_completed_total`, `write_errors_total`,
+  `last_write_error{reason}`, `queued_entries`, and `queued_bytes`: distinguish an
+  unavailable owner, accepted pending work, and failed publication.
+- `antfly_lake_disk_cache_writes_dropped_total` and `drops_*_total`: distinguish
+  policy, queue, memory, capacity, allocation, and shutdown admission refusal.
+
+Run the same authorized highlighted query before and after a graceful restart
+with the same root and credentials. Compare per-run deltas of
+`antfly_lake_cache_provider_reads_total`, `provider_bytes_total`, `disk_hits_total`,
+and `disk_bytes_total`; process counters reset on restart. Immutable payloads can
+be reused, while decoded navigation is rebuilt and publication/source authority
+must still be revalidated. Changed versions, eviction, or a new credential scope
+legitimately cause fresh remote reads. A cached payload is never offline authority.
+
+Use `antfly_lake_query_{source,publication,index,ranking,hydration,highlight,total}`
+`_calls_total` / `_nanoseconds_total` to separate phases. Timings include failed
+work and can overlap; do not add them to infer request latency. Empty-cache reads
+use bounded parallel range/segment acquisition and packed authenticated units.
+For eligible single-text-index results, covered display/highlight fields come
+from stored sidecars; uncovered fields stay on delete-aware Parquet projection.
+Hydration uses a request-owned 1 MiB decoded-block LRU, preserving ranked order
+and reusing blocks across hits/segments. One oversized block may be held alone
+and is released before another block is decoded; the scope closes with the batch.
+
+The local restart regression denies all provider reads after rebuilding the cache
+owner and still ranks, hydrates, and highlights successfully. It does not prove
+the cause of missing files in a deployed cache or measure live GCS latency.
+
 The integrated serving paths are:
 
 | Path | Implemented behavior |

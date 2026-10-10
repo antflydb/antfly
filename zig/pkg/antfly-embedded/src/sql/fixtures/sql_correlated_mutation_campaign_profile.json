@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "description": "Non-key mutation evidence with duplicate and NULL membership witnesses. SQL logical id is a PostgreSQL primary key, not a claim about native constraint-owner coordination. Keys are never changed; distributed atomicity is separate evidence.",
+  "schema": {
+    "version": 1,
+    "storage_mode": "relational",
+    "default_type": "row",
+    "document_schemas": {"row": {"schema": {
+      "type": "object",
+      "properties": {"id": {"type": "keyword"}, "status": {"type": "keyword", "nullable": true}, "organization_id": {"type": "keyword", "nullable": true}},
+      "additionalProperties": false
+    }}}
+  },
+  "primary_key": ["id"],
+  "rows": [
+    {"key": "a", "value": {"id": "u1", "status": "active", "organization_id": "tenant-a"}},
+    {"key": "b", "value": {"id": "u2", "status": "closed", "organization_id": "tenant-b"}},
+    {"key": "c", "value": {"id": "o1", "status": "active", "organization_id": "root"}},
+    {"key": "d", "value": {"id": "u-null", "status": null, "organization_id": "root"}},
+    {"key": "e", "value": {"id": "no-match", "status": "active", "organization_id": "root"}}
+  ],
+  "additional_tables": [
+    {
+      "name": "archived_records",
+      "schema": {
+        "version": 1,
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {"row": {"schema": {
+          "type": "object",
+          "properties": {"id": {"type": "keyword"}, "status": {"type": "keyword", "nullable": true}, "organization_id": {"type": "keyword", "nullable": true}},
+          "additionalProperties": false
+        }}}
+      },
+      "primary_key": ["id"],
+      "rows": [
+        {"key": "archive-a", "value": {"id": "archive-1", "organization_id": "u1", "status": "active"}},
+        {"key": "archive-b", "value": {"id": "archive-2", "organization_id": "u2", "status": "closed"}},
+        {"key": "archive-c", "value": {"id": "archive-3", "organization_id": "o1", "status": "active"}},
+        {"key": "archive-d", "value": {"id": "archive-4", "organization_id": "o1", "status": "active"}},
+        {"key": "archive-e", "value": {"id": "archive-5", "organization_id": "u-null", "status": null}},
+        {"key": "archive-f", "value": {"id": "archive-6", "organization_id": "no-match", "status": null}},
+        {"key": "archive-g", "value": {"id": "archive-7", "organization_id": null, "status": "active"}}
+      ]
+    },
+    {
+      "name": "source_records",
+      "schema": {
+        "version": 1,
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {"row": {"schema": {
+          "type": "object",
+          "properties": {"id": {"type": "keyword"}},
+          "additionalProperties": false
+        }}}
+      },
+      "primary_key": ["id"],
+      "rows": []
+    }
+  ]
+}

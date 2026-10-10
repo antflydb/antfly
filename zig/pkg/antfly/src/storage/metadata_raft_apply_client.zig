@@ -125,6 +125,7 @@ pub const RaftApplyStore = struct {
             .prepare_snapshot = prepareSnapshot,
             .install_snapshot = installSnapshot,
             .apply_batch = applyBatch,
+            .is_apply_retryable = isApplyRetryable,
         } };
     }
 
@@ -135,6 +136,10 @@ pub const RaftApplyStore = struct {
             .commit_index = batch.commit_index,
             .entries = .fromSlice(batch.entries_bytes),
         }));
+    }
+
+    fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
+        return err == error.CatalogPublicationProofPending;
     }
 
     fn buildSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
@@ -395,7 +400,10 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(?system_catalog.ResolvedTable, alloc, group_id, .{ .catalog_resolve_identity = target });
     }
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
-        return self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+        const result = try self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+        errdefer result.deinit(alloc);
+        try result.validateRelations(request);
+        return result;
     }
     pub fn tableWriteValidation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_write_validation = name });
@@ -408,6 +416,46 @@ pub const RaftApplyStore = struct {
     }
     pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
         return self.catalogProjection(?topology_protocol.Activation, self.alloc, group_id, .{ .topology_activation = {} });
+    }
+    pub fn relationSourceTrackingActive(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .relation_source_tracking);
+    }
+    pub fn relationReconciliationWork(self: *RaftApplyStore, group_id: u64) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
+        return self.catalogProjection(@import("antfly_local_sources").system_catalog_relation_reconciliation.Work, self.alloc, group_id, .relation_reconciliation_work);
+    }
+
+    pub fn stepRelationPublicationProof(self: *RaftApplyStore, state: @import("antfly_local_sources").system_catalog_relation_reconciliation.State, now_ns: u64) !?contract.RelationPublicationEvidence {
+        const encoded = try state.encode();
+        var result: abi.MetadataRelationPublicationResult = .{};
+        try statusToError(abi.antfly_metadata_apply_store_relation_publication(self.handle, &.{
+            .group_id = state.group_id,
+            .now_ns = now_ns,
+            .expected_state = .fromSlice(&encoded),
+        }, &result));
+        if (result.ready > 1 or result.has_root > 1 or !std.mem.allEqual(u8, &result._reserved, 0)) return error.StorageKernelFailure;
+        if (result.ready == 0) {
+            if (result.has_root != 0 or result.applied_index != 0 or !std.mem.allEqual(u8, &result.root, 0)) return error.StorageKernelFailure;
+            return null;
+        }
+        const root = if (result.has_root == 1) try @import("antfly_local_sources").system_catalog_relation_reconciliation.Generation.decode(&result.root) else null;
+        if (root) |value| {
+            if (value.group_id != state.group_id) return error.StorageKernelFailure;
+        } else if (!std.mem.allEqual(u8, &result.root, 0)) return error.StorageKernelFailure;
+        return .{ .state = state, .applied_index = result.applied_index, .root = root };
+    }
+    pub fn cancelRelationPublicationProof(self: *RaftApplyStore, group: u64) !void {
+        var result: abi.MetadataRelationPublicationResult = .{};
+        try statusToError(abi.antfly_metadata_apply_store_relation_publication(self.handle, &.{ .operation = .cancel, .group_id = group }, &result));
+    }
+    pub fn closeRelationPublicationProof(self: *RaftApplyStore, group: u64) void {
+        var result: abi.MetadataRelationPublicationResult = .{};
+        // Fixed-layout teardown performs no serialization or allocation.
+        const status = abi.antfly_metadata_apply_store_relation_publication(self.handle, &.{ .operation = .close, .group_id = group }, &result);
+        std.debug.assert(status == .ok);
+    }
+    pub fn expireRelationPublicationProofs(self: *RaftApplyStore, now_ns: u64) !void {
+        var result: abi.MetadataRelationPublicationResult = .{};
+        try statusToError(abi.antfly_metadata_apply_store_relation_publication(self.handle, &.{ .operation = .expire, .now_ns = now_ns }, &result));
     }
     pub fn reportBaselineProgress(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !@import("../metadata/store_report_baseline.zig").Progress {
         return self.reportBaselineProgressForKey(group_id, try request.progressQuery());

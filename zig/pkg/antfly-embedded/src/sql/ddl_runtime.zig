@@ -59,12 +59,14 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
                 .database => "CREATE DATABASE",
                 .namespace => "CREATE SCHEMA",
                 .tablespace => "CREATE TABLESPACE",
+                .index => "CREATE INDEX",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
                 .database => "DROP DATABASE",
                 .namespace => "DROP SCHEMA",
                 .tablespace => "DROP TABLESPACE",
+                .index => "DROP INDEX",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -72,6 +74,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
                 .namespace => "ALTER SCHEMA",
                 .tablespace => "ALTER TABLESPACE",
                 .table => "ALTER TABLE",
+                .index => "ALTER INDEX",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt };
@@ -86,7 +89,7 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     const a = arena.allocator();
     var properties: std.json.ObjectMap = .empty;
     var required: std.ArrayList([]const u8) = .empty;
-    var defaults: std.ArrayList(std.json.Value) = .empty;
+    var generated: std.ArrayList(std.json.Value) = .empty;
     for (create.columns) |column| {
         const primary = primary: {
             for (create.constraints) |constraint| {
@@ -98,46 +101,132 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
         const nullable = column.nullable and !primary;
         if (std.mem.eql(u8, column.name, "_id")) return error.DuplicateSqlColumn;
         if (properties.contains(column.name)) return error.DuplicateSqlColumn;
-        const property_bytes = if (column.type == .uuid)
-            try std.json.Stringify.valueAlloc(a, .{ .type = "keyword", .nullable = nullable, .format = "uuid" }, .{})
-        else
-            try std.json.Stringify.valueAlloc(a, .{
-                .type = switch (column.type) {
-                    .string => "keyword",
-                    .uuid => unreachable,
-                    .integer => "integer",
-                    .number => "number",
-                    .boolean => "boolean",
-                    .datetime => "datetime",
-                    .json => "json",
-                },
-                .nullable = nullable,
-            }, .{});
-        const property = try std.json.parseFromSliceLeaky(std.json.Value, a, property_bytes, .{});
-        try properties.put(a, column.name, property);
+        try properties.put(a, column.name, try columnProperty(a, column, nullable));
         if (!nullable) try required.append(a, column.name);
-        if (column.default_value) |value| {
-            if (value == .parameter) return error.InvalidSqlParameters;
-            const literal = try @import("describe.zig").bindLiteral(a, value, column.type);
-            if (literal == .null and !nullable) return error.SqlNotNullViolation;
-            try defaults.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = .{ .op = "literal", .type = if (column.type == .uuid) "string" else @tagName(column.type), .value = literal } }, .{}), .{ .parse_numbers = false }));
+        if (column.generated_expression != null) {
+            if (column.default_expression != null) return error.InvalidSqlSyntax;
+            try generated.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = @as(?u8, null) }, .{}), .{}));
         }
     }
     const base = try std.json.Stringify.valueAlloc(a, .{
         .storage_mode = "relational",
         .default_type = "row",
-        .column_defaults = defaults.items,
+        .column_defaults = @as([]const std.json.Value, &.{}),
+        .generated_columns = generated.items,
         .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = std.json.Value{ .object = properties }, .required = required.items, .additionalProperties = false } } },
     }, .{});
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{ .parse_numbers = false });
+    // Bind only after every declared base/generated name is present. Forward
+    // base references work; any generated-to-generated reference is rejected.
+    var generated_index: usize = 0;
+    for (create.columns) |column| {
+        if (column.default_expression) |expression| {
+            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, false);
+            try schema.object.getPtr("column_defaults").?.array.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = lowered }, .{}), .{ .parse_numbers = false }));
+        }
+        if (column.generated_expression) |expression| {
+            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, true);
+            try schema.object.getPtr("generated_columns").?.array.items[generated_index].object.put(a, "expression", lowered);
+            generated_index += 1;
+        }
+    }
     for (create.constraints) |constraint| {
         switch (constraint) {
             .add_unique, .add_check, .add_foreign_key => {},
             else => return error.InvalidSqlSyntax,
         }
-        _ = try @import("schema_ddl.zig").apply(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint });
+        _ = try @import("schema_ddl.zig").applyCandidate(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint });
     }
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
+}
+
+test "SQL NUMERIC modifier declarations publish exact constrained column identity" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE constrained (n numeric(4,2))", .{});
+    defer compiled.deinit();
+    const column = compiled.statement.create_table.columns[0];
+    try std.testing.expectEqual(@as(u16, 4), column.numeric_modifier.?.precision);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const property = try columnProperty(arena.allocator(), column, true);
+    const resolved = try @import("schema_columns.zig").column("n", property);
+    try std.testing.expectEqual(column.numeric_modifier, resolved.numeric_modifier);
+}
+
+pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bool) !std.json.Value {
+    if (column.numeric_modifier != null and ((column.type != .number and column.type != .array) or column.element_type != .numeric)) return error.UnsupportedSqlShape;
+    if (column.type == .array and column.element_type == null) return error.UnsupportedSqlShape;
+    const bytes = if (column.type == .uuid)
+        try std.json.Stringify.valueAlloc(alloc, .{ .type = "keyword", .nullable = nullable, .format = "uuid" }, .{})
+    else
+        try std.json.Stringify.valueAlloc(alloc, .{
+            .type = switch (column.type) {
+                .array => "sql_array",
+                .string => "keyword",
+                .uuid => unreachable,
+                .integer => "integer",
+                .number => "number",
+                .boolean => "boolean",
+                .datetime => "datetime",
+                .json => "json",
+            },
+            .nullable = nullable,
+        }, .{});
+    var property = try std.json.parseFromSliceLeaky(std.json.Value, alloc, bytes, .{});
+    if (column.element_type) |kind| try property.object.put(alloc, "x-antfly-sql-type", .{ .string = @tagName(kind) });
+    if (column.numeric_modifier) |modifier| {
+        try modifier.validate();
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, modifier, .{}), .{});
+        try property.object.put(alloc, "x-antfly-sql-numeric-modifier", value);
+    }
+    return property;
+}
+
+pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+    const describe = @import("describe.zig");
+    const literal = try describe.bindLiteral(alloc, value, kind);
+    return (try describe.coerceDatum(alloc, .{ .value = literal, .sql_null = literal == .null }, kind, element)).value;
+}
+
+/// PostgreSQL retains assignment casts on numeric defaults. Their overflow is
+/// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
+/// the source literal separate from its target domain in the durable plan.
+pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+    if (kind == .array and value == .null) return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+        .op = "literal",
+        .type = "sql_array",
+        .sql_type = @tagName(element orelse return error.UnsupportedSqlShape),
+        .value = @as(?u8, null),
+    }, .{}), .{});
+    if (kind == .array) return error.UnsupportedSqlShape;
+    if (value == .numeric and (kind == .integer or kind == .number)) {
+        const target = element orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64;
+        const source = try @import("schema_expression.zig").numericLiteral(alloc, .{ .string = value.numeric });
+        // Keep the exact source and assignment domain separate. Overflow and
+        // rounding belong to mutation execution, just as for integer defaults.
+        return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+            .op = "cast",
+            .type = if (target == .numeric) "numeric" else @tagName(kind),
+            .sql_type = @tagName(target),
+            .args = &[_]std.json.Value{source},
+        }, .{}), .{ .parse_numbers = false });
+    }
+    const numeric = (kind == .integer and value == .integer) or (kind == .number and (value == .integer or value == .number));
+    if (numeric) {
+        const source: ast.ColumnType = if (value == .integer) .integer else .number;
+        const source_type: @import("array_value.zig").ElementType = if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else .float64;
+        const literal: std.json.Value = if (value == .integer) .{ .integer = value.integer } else .{ .float = value.number };
+        const target_type: @import("array_value.zig").ElementType = element orelse if (kind == .integer) .int64 else .float64;
+        return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+            .op = "cast",
+            .type = if (target_type == .numeric) "numeric" else @tagName(kind),
+            .sql_type = @tagName(target_type),
+            .args = &.{.{ .op = "literal", .type = @tagName(source), .sql_type = @tagName(source_type), .value = literal }},
+        }, .{}), .{ .parse_numbers = false });
+    }
+    if (kind == .number and element == .numeric and (value == .null or value == .string))
+        return @import("schema_expression.zig").numericLiteral(alloc, if (value == .null) .null else .{ .string = value.string });
+    const literal = try bindDefault(alloc, value, kind, element);
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
 }
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
@@ -171,8 +260,137 @@ test "SQL DDL lowers exact defaults nullability and native relational types" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{ .parse_numbers = false });
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("version") == null);
-    try std.testing.expectEqualStrings("9007199254740993", parsed.value.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", parsed.value.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.number_string);
     try std.testing.expectEqualStrings("id", parsed.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("required").?.array.items[0].string);
+}
+
+test "SQL precise scalar DDL preserves CREATE ALTER default assignment casts" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE widths (n smallint DEFAULT 32767, f real DEFAULT 0.1, b bigint DEFAULT 9007199254740993)", .{});
+    defer compiled.deinit();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, try createSchemaAlloc(a, compiled.statement.create_table), .{});
+    const properties = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("int16", properties.get("n").?.object.get("x-antfly-sql-type").?.string);
+    try std.testing.expectEqualStrings("float32", properties.get("f").?.object.get("x-antfly-sql-type").?.string);
+    const defaults = schema.object.get("column_defaults").?.array.items;
+    try std.testing.expectEqualStrings("float32", defaults[1].object.get("expression").?.object.get("sql_type").?.string);
+    const source = defaults[1].object.get("expression").?.object.get("args").?.array.items[0];
+    try std.testing.expectEqualStrings("numeric", source.object.get("type").?.string);
+    try std.testing.expectEqualStrings("0.1", source.object.get("value").?.string);
+    for ([_][]const u8{ "CREATE TABLE bad (n smallint DEFAULT 32768)", "CREATE TABLE bad (n integer DEFAULT 2147483648)" }) |sql| {
+        var bad = try @import("compiler.zig").compile(a, sql, .{});
+        defer bad.deinit();
+        _ = try createSchemaAlloc(a, bad.statement.create_table);
+    }
+    var alter = try @import("compiler.zig").compile(a, "ALTER TABLE widths ALTER COLUMN n SET DEFAULT 32768", .{});
+    defer alter.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, alter.statement.catalog_ddl));
+    try std.testing.expectEqualStrings("int16", schema.object.get("column_defaults").?.array.items[2].object.get("expression").?.object.get("sql_type").?.string);
+}
+
+test "SQL ALTER DEFAULT uses explicit builtin identity with nullable union schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"u":{"type":["string","null"],"x-antfly-sql-type":"uuid"},"n":{"type":["integer","null"],"x-antfly-sql-type":"int16"}},"additionalProperties":false}}}}
+    , .{});
+    var valid = try @import("compiler.zig").compile(alloc, "ALTER TABLE widths ALTER COLUMN u SET DEFAULT '{A0EEBC999C0B4EF8BB6D6BB9BD380A11}'", .{});
+    defer valid.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(alloc, &schema, valid.statement.catalog_ddl));
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", schema.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?.string);
+    var numeric = try @import("compiler.zig").compile(alloc, "ALTER TABLE widths ALTER COLUMN n SET DEFAULT 32768", .{});
+    defer numeric.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(alloc, &schema, numeric.statement.catalog_ddl));
+    const assignment = schema.object.get("column_defaults").?.array.items[1].object.get("expression").?;
+    try std.testing.expectEqualStrings("cast", assignment.object.get("op").?.string);
+    try std.testing.expectEqualStrings("int16", assignment.object.get("sql_type").?.string);
+    try std.testing.expectEqualStrings("32768", assignment.object.get("args").?.array.items[0].object.get("value").?.number_string);
+}
+
+test "SQL expression DDL binds defaults and generated columns against the complete candidate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var created = try @import("compiler.zig").compile(a, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer)+1 END) STORED, n smallint DEFAULT (32767+1), label text DEFAULT lower('READY'), slug text GENERATED ALWAYS AS (lower(label)||'-ok') STORED)", .{});
+    defer created.deinit();
+    const bytes = try createSchemaAlloc(a, created.statement.create_table);
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
+    try std.testing.expectEqual(@as(usize, 2), schema.object.get("generated_columns").?.array.items.len);
+    try std.testing.expectEqualStrings("int16", schema.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("sql_type").?.string);
+    for ([_][]const u8{
+        "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT (2+3)",
+        "ALTER TABLE exprs ADD COLUMN h bigint GENERATED ALWAYS AS (n*2) STORED NOT NULL",
+        "ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL",
+        "ALTER TABLE exprs ADD COLUMN rounded real DEFAULT CAST(0.1+0.2 AS double precision)",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    try std.testing.expectEqual(@as(usize, 3), schema.object.get("generated_columns").?.array.items.len);
+    const before = try std.json.Stringify.valueAlloc(a, schema, .{});
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (g+1) STORED", .failure = error.SqlInvalidGenerationExpression },
+        .{ .sql = "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (absent+1) STORED", .failure = error.UndefinedColumn },
+        .{ .sql = "ALTER TABLE exprs ALTER COLUMN g SET DEFAULT 5", .failure = error.InvalidSqlSyntax },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, @import("schema_ddl.zig").apply(a, &schema, compiled.statement.catalog_ddl));
+        try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    }
+    var dropped = try @import("compiler.zig").compile(a, "ALTER TABLE exprs DROP COLUMN h", .{});
+    defer dropped.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, dropped.statement.catalog_ddl));
+    try std.testing.expectEqual(@as(usize, 2), schema.object.get("generated_columns").?.array.items.len);
+}
+
+test "SQL expression DDL staging unwinds every allocation fault" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var created = try @import("compiler.zig").compile(a, "CREATE TABLE exprs (n smallint DEFAULT (2+3), g integer GENERATED ALWAYS AS (n+1) STORED)", .{});
+            defer created.deinit();
+            const bytes = try createSchemaAlloc(a, created.statement.create_table);
+            var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+            var added = try @import("compiler.zig").compile(a, "ALTER TABLE exprs ADD COLUMN h integer GENERATED ALWAYS AS (n+2) STORED", .{});
+            defer added.deinit();
+            _ = try @import("schema_ddl.zig").apply(a, &schema, added.statement.catalog_ddl);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL array DDL preserves precise element identity through CREATE and ALTER" {
+    var create = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE arrays (a int4[2][3])", .{});
+    defer create.deinit();
+    const created = try createSchemaAlloc(std.testing.allocator, create.statement.create_table);
+    defer std.testing.allocator.free(created);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var base = try @import("compiler.zig").compile(alloc, "CREATE TABLE arrays (id bigint)", .{});
+    const candidate = try std.json.parseFromSliceLeaky(std.json.Value, alloc, created, .{});
+    const properties = try @import("schema_columns.zig").properties(candidate);
+    const column = try @import("schema_columns.zig").column("a", properties.object.get("a").?);
+    try std.testing.expectEqual(.array, column.type);
+    try std.testing.expectEqual(.int32, column.element_type.?);
+    defer base.deinit();
+    const original = try createSchemaAlloc(alloc, base.statement.create_table);
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc, original, .{});
+    var alter = try @import("compiler.zig").compile(alloc, "ALTER TABLE arrays ADD COLUMN a jsonb[]", .{});
+    defer alter.deinit();
+    _ = try @import("schema_ddl.zig").apply(alloc, &schema, alter.statement.catalog_ddl);
+    const altered = try @import("schema_columns.zig").properties(schema);
+    const added = try @import("schema_columns.zig").column("a", altered.object.get("a").?);
+    try std.testing.expectEqual(.array, added.type);
+    try std.testing.expectEqual(.jsonb, added.element_type.?);
 }
 
 test "SQL UUID CREATE TABLE retains typed native schema format" {
@@ -221,9 +439,9 @@ test "SQL schema DDL preserves index ownership defaults and unrelated metadata" 
         "ALTER TABLE items ALTER COLUMN title SET DEFAULT 'unknown'",
         "ALTER TABLE items ALTER COLUMN title DROP DEFAULT",
         "ALTER TABLE items DROP COLUMN enabled",
-        "DROP INDEX items_id ON items",
+        "DROP INDEX items_id",
         "CREATE UNIQUE INDEX items_lower_title ON items ((lower(title))) WHERE title IS NOT NULL",
-        "DROP INDEX items_lower_title ON items",
+        "DROP INDEX items_lower_title",
     };
     for (commands, 0..) |command, i| {
         var compiled = try @import("compiler.zig").compile(alloc, command, .{});

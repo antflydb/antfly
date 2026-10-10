@@ -380,6 +380,7 @@ const ColumnInput = struct {
     pub fn fillTyped(self: ColumnInput, ordinal: u32, target: anytype) !bool {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const definition = self.columns[ordinal];
+        const sql_floating = definition.element_type == .float32 or definition.element_type == .float64;
         if (self.page.native) |native| {
             const index = for (native.names, 0..) |name, i| {
                 if (std.mem.eql(u8, name, definition.name)) break i;
@@ -402,7 +403,7 @@ const ColumnInput = struct {
                         else => false,
                     };
                     if (!exact) return false;
-                    if (value.value == .float and !std.math.isFinite(value.value.float)) return error.SqlTypeMismatch;
+                    if (value.value == .float and !std.math.isFinite(value.value.float) and !sql_floating) return error.SqlTypeMismatch;
                 }
                 try target.set(row, value);
             }
@@ -426,12 +427,12 @@ const ColumnInput = struct {
             const value: std.json.Value = switch (column.values) {
                 .dictionary_i64 => |v| .{ .integer = v.at(physical) },
                 .dictionary_f64 => |v| blk: {
-                    if (!std.math.isFinite(v.at(physical))) return error.SqlTypeMismatch;
+                    if (!std.math.isFinite(v.at(physical)) and !sql_floating) return error.SqlTypeMismatch;
                     break :blk .{ .float = v.at(physical) };
                 },
                 .i64 => |v| .{ .integer = v[physical] },
                 .f64 => |v| blk: {
-                    if (!std.math.isFinite(v[physical])) return error.SqlTypeMismatch;
+                    if (!std.math.isFinite(v[physical]) and !sql_floating) return error.SqlTypeMismatch;
                     break :blk .{ .float = v[physical] };
                 },
                 .bool => |v| .{ .bool = v[physical] },
@@ -502,7 +503,8 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
     return vectors[0];
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
-    if (op == .is_null or op == .is_not_null) return Datum.json(.{ .bool = value.sql_null == (op == .is_null) });
+    if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
+    if (value.array != null or value.numeric != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;
         const matches = value.value == .bool and value.value.bool == target;
@@ -513,7 +515,7 @@ pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
         .positive => if (value.value == .integer or value.value == .float) value else error.SqlTypeMismatch,
         .negative => switch (value.value) {
             .integer => |v| Datum.json(.{ .integer = std.math.negate(v) catch return error.SqlNumericOutOfRange }),
-            .float => |v| if (std.math.isFinite(v)) Datum.json(.{ .float = -v }) else error.SqlNumericOutOfRange,
+            .float => |v| Datum.json(.{ .float = -v }),
             else => error.SqlTypeMismatch,
         },
         .not => if (value.value == .bool) Datum.json(.{ .bool = !value.value.bool }) else error.SqlTypeMismatch,
@@ -528,11 +530,12 @@ fn comparison(op: Binary) bool {
 }
 pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
     if (op == .is_distinct or op == .is_not_distinct) {
-        const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compare(left.value, right.value)) == .eq;
+        const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compareDatums(left, right)) == .eq;
         return Datum.json(.{ .bool = equal == (op == .is_not_distinct) });
     }
     if (left.sql_null or right.sql_null) return .{};
-    if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compare(left.value, right.value)));
+    if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compareDatums(left, right)));
+    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null) return error.SqlTypeMismatch;
     // Arithmetic shares the scalar overflow/division/finite-number contract.
     // JSON null is a value for comparison, but remains null in arithmetic.
     if (left.value == .null or right.value == .null) return .{};
@@ -660,7 +663,7 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
     const nulls = [_]u8{ 0, 0, 0, 1, 0, 0 };
     const columns = [_]types.ColumnVector{.{ .name = "n", .values = .{ .i64 = &numbers }, .nulls = .{ .bytes = &nulls } }};
     const page = @import("catalog.zig").ColumnPage{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &columns }, .selection = &.{ 5, 3, 1, 0, 1 } };
-    for ([_][]const u8{ "n * 2", "n > 9007199254740992", "n + 0.5", "n IS NOT DISTINCT FROM NULL" }) |sql| {
+    for ([_][]const u8{ "n * 2", "n > 9007199254740992", "n + 0.5::double precision", "n IS NOT DISTINCT FROM NULL" }) |sql| {
         var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
         defer compiled.deinit();
         const bound_columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
@@ -672,6 +675,23 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
             try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), &.{input}, &.{}, .{}), actual);
         }
     }
+}
+
+test "SQL NUMERIC integer decimal expressions retain exact scalar fallback instead of float kernels" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 0.5", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, program.output_type.element_type.?);
+    const input: Datum = Datum.json(.{ .integer = 9007199254740993 });
+    const cells = [_][]const Datum{ &.{input}, &.{input}, &.{input}, &.{input} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expect((try evaluate(arena.allocator(), &program, &cells, &.{})) == null);
+    const result = try program.evaluate(arena.allocator(), &.{input}, &.{}, .{});
+    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("9007199254740993.5", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
 }
 
 test "SQL shared scheduled column kernels match scalar values over permuted nullable pages" {
@@ -959,7 +979,7 @@ fn fusedDictionaryScenario(a: std.mem.Allocator) !void {
 }
 test "SQL fused dictionary projections share referenced inputs and release all allocation failures" {
     try fusedDictionaryScenario(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, fusedDictionaryScenario, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, fusedDictionaryScenario, .{});
 }
 
 fn dictionaryTupleScenario(a: std.mem.Allocator) !void {

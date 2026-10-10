@@ -1,0 +1,146 @@
+{
+  "rows": [
+    {
+      "key": "a",
+      "value": {
+        "id": 9007199254740993,
+        "name": "exact",
+        "amount": 10,
+        "quantity": 2,
+        "status": "OPEN",
+        "enabled": true,
+        "customer_id": 1,
+        "tenant_id": 1,
+        "created_at": "2026-01-01",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "b",
+      "value": {
+        "id": 2,
+        "name": "other",
+        "amount": 15,
+        "quantity": 4,
+        "status": "open",
+        "customer_id": 1,
+        "tenant_id": 1,
+        "created_at": "2026-01-02",
+        "metadata": {
+          "source": "internal"
+        }
+      }
+    },
+    {
+      "key": "c",
+      "value": {
+        "id": 3,
+        "name": "third",
+        "amount": 17,
+        "quantity": 3,
+        "status": "closed",
+        "customer_id": 2,
+        "tenant_id": 1,
+        "created_at": "2026-01-03",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "d",
+      "value": {
+        "id": 4,
+        "name": "fourth",
+        "amount": 18,
+        "quantity": 7,
+        "status": "open",
+        "customer_id": 3,
+        "tenant_id": 2,
+        "created_at": "2026-01-04",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "e",
+      "value": {
+        "id": 5,
+        "name": "fifth",
+        "amount": 6,
+        "quantity": 2,
+        "status": "pending",
+        "customer_id": 3,
+        "tenant_id": 2,
+        "created_at": "2026-01-05",
+        "metadata": {
+          "source": "internal"
+        }
+      }
+    },
+    {
+      "key": "f",
+      "value": {
+        "id": 6,
+        "name": "sixth",
+        "amount": 25,
+        "quantity": 5,
+        "status": "OPEN",
+        "customer_id": 4,
+        "tenant_id": 3,
+        "created_at": "2026-01-06",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "g",
+      "value": {
+        "id": 7,
+        "name": "seventh",
+        "amount": 1,
+        "quantity": 0,
+        "status": "open",
+        "customer_id": 5,
+        "tenant_id": 2,
+        "created_at": "2026-01-07",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    },
+    {
+      "key": "h",
+      "value": {
+        "id": 8,
+        "name": "eighth",
+        "amount": 3,
+        "quantity": 0,
+        "status": "Open",
+        "customer_id": 6,
+        "tenant_id": 4,
+        "created_at": "2026-01-08",
+        "metadata": {}
+      }
+    },
+    {
+      "key": "i",
+      "value": {
+        "id": 9,
+        "name": "ninth",
+        "amount": 2,
+        "quantity": 0,
+        "customer_id": 7,
+        "tenant_id": 4,
+        "created_at": "2026-01-09",
+        "metadata": {
+          "source": "api"
+        }
+      }
+    }
+  ]
+}

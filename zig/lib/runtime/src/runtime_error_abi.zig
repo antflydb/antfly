@@ -726,6 +726,8 @@ pub const Detail = enum(c_int) {
     metric_not_ready,
     metric_stale,
     invalid_generated_tool_arguments,
+    sql_feature_not_supported,
+    catalog_publication_proof_pending,
 };
 
 pub const Status = extern struct {
@@ -851,6 +853,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
+        error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -1549,6 +1553,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_feature_not_supported => "SqlFeatureNotSupported",
+        .catalog_publication_proof_pending => "CatalogPublicationProofPending",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
@@ -2287,6 +2293,17 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageBusy));
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
+}
+
+test "catalog publication preparation preserves explicit retry identity across archives" {
+    const pending = statusFromError(error.CatalogPublicationProofPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), pending.code);
+    try std.testing.expectEqual(error.CatalogPublicationProofPending, errorFromStatus(pending));
+    try std.testing.expect(pending.detail != statusFromError(error.ResourceTemporarilyUnavailable).detail);
+    try std.testing.expect(pending.detail != statusFromError(error.InvalidCatalogRecord).detail);
+    var forged = pending;
+    forged.code = @backingInt(Code.corrupt);
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {

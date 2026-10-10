@@ -21,6 +21,21 @@ pub const std_options: std.Options = .{
     .logFn = log,
 };
 
+// SafeAllocator and allocation-failure probes capture stacks on their hot
+// paths. Zig's default debug arena never reclaims the temporary DWARF virtual
+// machine buffers freed by SelfUnwinder.deinit, so suite RSS grows with the
+// number of traces rather than live test data. Keep process-lifetime debug
+// caches valid, but allow their temporary allocations to be reused. This must
+// not use the test allocator: diagnostics also run during allocator teardown.
+pub const debug = struct {
+    pub fn getDebugInfoAllocator() std.mem.Allocator {
+        if (comptime builtin.link_libc) return std.heap.c_allocator;
+        if (comptime builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) return std.heap.wasm_allocator;
+        if (comptime builtin.single_threaded) return std.heap.page_allocator;
+        return std.heap.smp_allocator;
+    }
+};
+
 var log_err_count: std.atomic.Value(usize) = .init(0);
 var expected_error_log_count: std.atomic.Value(usize) = .init(0);
 var test_filters: []const []const u8 = &.{};

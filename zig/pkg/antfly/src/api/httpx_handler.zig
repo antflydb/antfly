@@ -5564,7 +5564,7 @@ pub const AntflyApiHandler = struct {
                 for (0..page.values.len()) |row| {
                     if (rows != 0) try writer.writer.writeByte(',');
                     try writer.writer.writeByte('[');
-                    for (columns, 0..) |_, column| {
+                    for (columns, 0..) |definition, column| {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
@@ -5572,6 +5572,14 @@ pub const AntflyApiHandler = struct {
                         cells += 1;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
+                        } else if (value.array) |array| {
+                            if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
+                        } else if (value.numeric) |number| {
+                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
+                            const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else if (value.patterns) |patterns| {
                             try writer.writer.writeByte('[');
                             var offset: u64 = 0;
@@ -5583,9 +5591,10 @@ pub const AntflyApiHandler = struct {
                                 try std.json.Stringify.value(pattern.value, .{}, &writer.writer);
                             }
                             try writer.writer.writeByte(']');
-                        } else if (value.value == .integer) {
+                        } else if (definition.type == .integer) {
+                            const integer = try @import("antfly_local_sources").sql_describe.coerce(value.value, .integer);
                             var buffer: [20]u8 = undefined;
-                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{value.value.integer});
+                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{integer.integer});
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else try std.json.Stringify.value(value.value, .{}, &writer.writer);
                     }
@@ -5784,10 +5793,14 @@ pub const AntflyApiHandler = struct {
                 for (description.binding.parameter_types, parameter_types) |kind, *output| output.* = if (kind) |value| switch (value) {
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
-                const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+                const parameter_descriptors = try description.arena.allocator().alloc(sql_wire.SQLParameterDescriptor, parameter_types.len);
+                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .element_type = if (descriptor.element_type) |element| switch (element) {
+                    inline else => |tag| @field(sql_wire.SQLArrayElementType, @tagName(tag)),
+                } else null };
+                const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
-                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .bindings = bindings.items }, now_ms);
+                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
                 self.prepared_response = response;
                 return;
             }
@@ -5803,7 +5816,9 @@ pub const AntflyApiHandler = struct {
             self.preparation.release();
             self.execution_entered = true;
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
+            var execution_backend = self.adapter.backend();
+            if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
+            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, if (resource != null) execution_backend else null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -6027,9 +6042,16 @@ pub const AntflyApiHandler = struct {
             return err;
         };
         defer ctx.allocator.free(columns);
-        for (result.output.columns, columns) |column, *output| output.* = .{ .name = column.name, .type = switch (column.type) {
-            inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
-        } };
+        for (result.output.columns, columns) |column, *output| output.* = .{
+            .name = column.name,
+            .type = switch (column.type) {
+                inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
+            },
+            .element_type = if (column.type == .array or column.element_type == .numeric) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
+                inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
+            } else null,
+            .numeric_modifier = if (column.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
+        };
         const output: sql_wire.SQLResponse = .{
             .columns = columns,
             .rows = result.output.rows,
@@ -13155,7 +13177,895 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
 }
 
+test "httpx SQL malformed catalog requests fail before publication" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        publications: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, _: std.mem.Allocator, _: operation_contract.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return error.UnexpectedCatalogCall;
+        }
+    };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source: Source = .{};
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Harness = struct {
+        fn check(a: std.mem.Allocator, h: *AntflyApiHandler, sql: []const u8, code: []const u8, status: u16) !void {
+            const body = try std.json.Stringify.valueAlloc(a, .{ .statement = sql }, .{});
+            defer a.free(body);
+            var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try h.executeSQL(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(status, response.status.code);
+            const diagnostic = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(code, diagnostic.value.object.get("code").?.string);
+        }
+    };
+    for ([_][]const u8{ "CREATE TABLE broken (", "CREATE TABLE broken (n bigint", "CREATE TABLE broken (n bigint CONSTRAINT only_name" }) |sql|
+        try Harness.check(alloc, &handler, sql, "42601", 400);
+    for ([_][]const u8{ "ALTER TABLE items ADD COLUMN n bigint DEFAULT $1", "ALTER TABLE items ALTER COLUMN n SET DEFAULT $1" }) |sql|
+        try Harness.check(alloc, &handler, sql, "0A000", 501);
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    for (1109..1141) |ordinal| {
+        var buffer: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "sql-{d:0>4}", .{ordinal});
+        try Harness.check(alloc, &handler, (try corpus.get(id)).sql, "0A000", 501);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.publications);
+}
+
+test "httpx SQL document campaign verifies exact native mutation and storage outcomes" {
+    // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
+    // sql-0886, sql-0887, sql-0888, sql-0890, sql-0893, sql-0947.
+    // sql-0948, sql-0949, sql-0950, sql-0951, sql-0952, sql-0953.
+    // sql-0954, sql-0955, sql-0981, sql-0986, sql-0995, sql-1000.
+    // sql-1008, sql-1013, sql-1029, sql-1054, sql-1055, sql-1056.
+    // sql-1057, sql-1059, sql-1060, sql-1061, sql-1062, sql-1063.
+    // sql-1064, sql-1070, sql-1076, sql-1077, sql-1081, sql-1084.
+    // sql-1085, sql-1086, sql-1087, sql-1089, sql-1090, sql-1092.
+    // sql-1093, sql-1094, sql-1095, sql-1096, sql-1098, sql-1099.
+    // sql-1100.
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        schema: []const u8 = "",
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 7, .name = "docs", .schema_json = "" }},
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.storage_names.len != 0) {
+                if (input.resolve_many.storage_names.len != 1 or !std.mem.eql(u8, input.resolve_many.storage_names[0], "docs")) return error.UnexpectedCatalogCall;
+                const name = try (system_catalog.Target{ .table = "docs" }).resourceNameAlloc(a);
+                defer a.free(name);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = &.{name} }, .{});
+            }
+            if (input.resolve_many.targets.len == 0) return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{} }, .{});
+            const tables = try a.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            for (input.resolve_many.targets, tables) |target, *table| {
+                if (!std.mem.eql(u8, target.table, "docs")) return error.UnexpectedCatalogCall;
+                table.* = .{ .table_id = 7, .name = "docs", .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = 7, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } else null };
+            }
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.records, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-document-campaign");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    var reads = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("docs", &db);
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var source: Source = .{};
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, reads.source(), writes.source());
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const parity = @import("sql_parity_reference.zig");
+    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.document_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
+}
+
+test "httpx SQL LATERAL original campaign executes captured native table relations" {
+    // Also sql-0549 (set-operation apply), sql-1217 and sql-1218.
+    // Exact source IDs, not rewritten SQL: sql-1345, sql-1346, sql-1347,
+    // sql-1348, sql-1349, sql-1350, sql-1351, sql-1352, sql-1353, sql-1354,
+    // sql-1355, sql-1356, sql-1358, sql-1359, sql-1360, sql-1361, sql-1362,
+    // sql-1363, sql-1364, sql-1365. sql-1357 is invalid in PostgreSQL: output
+    // aliases are not input variables inside an ORDER BY arithmetic expression.
+    const alloc = std.testing.allocator;
+    const native = @import("antfly_local_sources").api_table_read_source;
+    const Row = struct { key: []const u8, value: std.json.Value };
+    const Table = struct { name: []const u8, schema: std.json.Value, rows: []const Row };
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.lateral_campaign_reference;
+    const parsed = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const Row, additional_tables: []const Table },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 23), parsed.value.entries.len);
+    const schema = try std.json.Stringify.valueAlloc(alloc, parsed.value.profile.schema, .{});
+    defer alloc.free(schema);
+    const Source = struct {
+        schema: []const u8,
+        reads: [2]table_reads.BoundTableReadSource,
+        captures: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.storage_names.len != 0) {
+                const names = try a.alloc(?[]const u8, input.resolve_many.storage_names.len);
+                @memset(names, null);
+                defer {
+                    for (names) |name| if (name) |value| a.free(value);
+                    a.free(names);
+                }
+                for (input.resolve_many.storage_names, names) |name, *logical| logical.* = try (system_catalog.Target{ .table = name }).resourceNameAlloc(a);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = names }, .{});
+            }
+            const tables = try a.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            defer a.free(tables);
+            for (input.resolve_many.targets, tables) |target, *table| {
+                const id: u64 = if (std.mem.eql(u8, target.table, "usage_records")) 7 else if (std.mem.eql(u8, target.table, "balance_records")) 8 else return error.TableNotFound;
+                table.* = .{ .table_id = id, .name = target.table, .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = id, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } else null };
+            }
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
+        }
+        const Capture = struct {
+            alloc: std.mem.Allocator,
+            views: []native.RelationalReadView,
+            owners: [2]?native.RelationalStatementRead = @splat(null),
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                for (self.owners) |owner| if (owner) |read| read.deinit();
+                self.alloc.free(self.views);
+                self.alloc.destroy(self);
+            }
+        };
+        fn open(ptr: *anyopaque, a: std.mem.Allocator, scans: []const native.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !native.RelationalStatementRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (scans) |request_scan| if (!std.mem.eql(u8, request_scan.table, "usage_records") and !std.mem.eql(u8, request_scan.table, "balance_records")) return error.TableNotFound;
+            const retained = try a.create(Capture);
+            errdefer a.destroy(retained);
+            const views = try a.alloc(native.RelationalReadView, scans.len);
+            errdefer a.free(views);
+            retained.* = .{ .alloc = a, .views = views };
+            errdefer for (retained.owners) |owner| if (owner) |read| read.deinit();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (&self.reads, &retained.owners) |*read, *owner| {
+                var grouped: std.ArrayList(native.RelationalStatementScan) = .empty;
+                var ordinals: std.ArrayList(usize) = .empty;
+                for (scans, 0..) |request_scan, i| if (std.mem.eql(u8, request_scan.table, read.table_name)) {
+                    try grouped.append(scratch.allocator(), request_scan);
+                    try ordinals.append(scratch.allocator(), i);
+                };
+                if (grouped.items.len == 0) continue;
+                owner.* = try read.source().openRelationalStatement(a, grouped.items, consistency);
+                for (ordinals.items, owner.*.?.views) |i, view| views[i] = view;
+            }
+            self.captures += 1;
+            return .{ .ptr = retained, .views = views, .vtable = &.{ .close = Capture.close } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedFallbackRead;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedFallbackRead;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedFallbackRead;
+        }
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-lateral-originals");
+    defer directory.cleanup();
+    const secondary_path = try std.fmt.allocPrint(alloc, "{s}/balances", .{directory.path()});
+    defer alloc.free(secondary_path);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    var secondary = try db_mod.DB.open(alloc, secondary_path, .{});
+    defer secondary.close();
+    for ([_]*db_mod.DB{ &db, &secondary }, [_][]const Row{ parsed.value.profile.rows, parsed.value.profile.additional_tables[0].rows }) |database, rows| {
+        try database.setSchemaJson(alloc, schema);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const writes = try arena.allocator().alloc(db_mod.types.BatchWrite, rows.len);
+        for (rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(arena.allocator(), row.value, .{}) };
+        try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    }
+    // Both databases remain immutable throughout this fixture. This test-only
+    // router exercises grouped native capture, not distributed cut guarantees.
+    var source: Source = .{ .schema = schema, .reads = .{ table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier()), table_reads.BoundTableReadSource.init("balance_records", 8, &secondary, raft_mod.read_gate.alreadyReadSafeBarrier()) } };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = Source.lookup, .scan = Source.scan, .query = Source.query, .open_relational_statement = Source.open } }, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = try alloc.alloc([]const u8, parsed.value.entries.len);
+    defer alloc.free(ids);
+    for (parsed.value.entries, ids) |entry, *id| id.* = entry.id;
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
+    try std.testing.expectEqual(ids.len, source.captures);
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const invalid = try corpus.get("sql-1357");
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = invalid.sql }, .{});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("42703", diagnostic.value.code);
+    try std.testing.expectEqual(ids.len, source.captures);
+}
+
+test "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls" {
+    // Original SQL and parameters are loaded by ID, never rewritten for this
+    // test. Logical IDs repeat across distinct physical row keys deliberately.
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.set_read_reference;
+    const Row = struct { key: []const u8, value: std.json.Value };
+    const Table = struct { name: []const u8, schema: std.json.Value, rows: []const Row };
+    const parsed = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const Row, additional_tables: []const Table },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 21), parsed.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.profile.additional_tables.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-set-originals");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = [_]Table{
+        .{ .name = "usage_records", .schema = parsed.value.profile.schema, .rows = parsed.value.profile.rows },
+        parsed.value.profile.additional_tables[0],
+        parsed.value.profile.additional_tables[1],
+    };
+    const Source = @import("sql_parity_sources.zig").Tables(3);
+    var source: Source = undefined;
+    source.captures = 0;
+    var databases: [3]db_mod.DB = undefined;
+    var opened: usize = 0;
+    defer for (databases[0..opened]) |*database| database.close();
+    for (tables, &databases, &source.records, &source.reads, 0..) |table, *database, *record, *read, i| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), table.name });
+        database.* = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        opened += 1;
+        const schema = try std.json.Stringify.valueAlloc(a, table.schema, .{});
+        try database.setSchemaJson(alloc, schema);
+        const writes = try a.alloc(db_mod.types.BatchWrite, table.rows.len);
+        for (table.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+        try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        const id: u64 = @intCast(7 + i);
+        record.* = .{ .table_id = id, .name = table.name, .schema_json = schema };
+        read.* = table_reads.BoundTableReadSource.init(table.name, id, database, raft_mod.read_gate.alreadyReadSafeBarrier());
+    }
+    // Fixture tables are immutable throughout capture: this proves native
+    // multi-table execution, not distributed snapshot publication semantics.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = [_][]const u8{
+        "sql-0459", "sql-0468", "sql-0471", "sql-0473",
+        "sql-0475", "sql-0476", "sql-0477", "sql-0492",
+        "sql-0493", "sql-0494", "sql-0495", "sql-0516",
+        "sql-0537", "sql-0540", "sql-0541", "sql-0542",
+        "sql-0543", "sql-0544", "sql-0547", "sql-0548",
+        "sql-0553",
+    };
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try std.testing.expectEqual(ids.len, source.captures);
+}
+
+test "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls" {
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.aggregate_read_reference;
+    const profile = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer profile.deinit();
+    try std.testing.expectEqual(@as(usize, 12), profile.value.entries.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-aggregate-originals");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.Stringify.valueAlloc(a, profile.value.profile.schema, .{});
+    try db.setSchemaJson(alloc, schema);
+    const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+    for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = [_][]const u8{
+        "sql-1225", "sql-1232", "sql-1242", "sql-1243", "sql-1244", "sql-1245",
+        "sql-1246", "sql-1247", "sql-1248", "sql-1250", "sql-1251", "sql-1252",
+    };
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    // Single-table aggregates use the retained native scan, not the separate
+    // multi-table capture hook exercised by the set-operation fixture above.
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
+test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference;
+    const profile = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer profile.deinit();
+    try std.testing.expectEqual(@as(usize, 14), profile.value.entries.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-typed-array-originals");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.Stringify.valueAlloc(a, profile.value.profile.schema, .{});
+    try db.setSchemaJson(alloc, schema);
+    const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+    for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = [_][]const u8{
+        "sql-0167", "sql-0168", "sql-0185", "sql-0186", "sql-0187", "sql-0200", "sql-0288",
+        "sql-0289", "sql-0290", "sql-0291", "sql-0293", "sql-0294", "sql-0298", "sql-0299",
+    };
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+}
+
+test "httpx SQL joined source RETURNING preserves native array storage and PostgreSQL images" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const reference = try std.json.parseFromSlice(struct { entries: []const struct { sql: []const u8, target_first: []const u8, target_lower: i32, duplicates: bool = false } }, alloc, local.sql_parity_fixtures.joined_returning_reference, .{});
+    defer reference.deinit();
+    const schemas = [_][]const u8{
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"n":{"type":"integer"},"cold":{"type":"keyword"},"a":{"type":"sql_array","x-antfly-sql-type":"int64"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"}},"additionalProperties":false}}}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"delta":{"type":"integer"},"a":{"type":"sql_array","x-antfly-sql-type":"int16"}},"additionalProperties":false}}}}
+        ,
+    };
+    for (reference.value.entries) |entry| {
+        var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-joined-source-returning");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Source = @import("sql_parity_sources.zig").Tables(2);
+        var source: Source = .{ .records = undefined, .reads = undefined };
+        var databases: [2]db_mod.DB = undefined;
+        var opened: usize = 0;
+        defer for (databases[0..opened]) |*database| database.close();
+        const json_array = (try local.sql_array_text.decodeLeaky(a, .jsonb, "{\"null\",NULL}", .{})).value;
+        const json = try local.sql_array_wire.toJsonLeaky(a, json_array, .{});
+        for (&databases, [_][]const u8{ "target", "source" }, schemas, 0..) |*database, name, schema, index| {
+            database.* = try db_mod.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), name }), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            opened += 1;
+            try database.setSchemaJson(alloc, schema);
+            source.records[index] = .{ .table_id = 7 + index, .name = name, .schema_json = schema };
+            source.reads[index] = table_reads.BoundTableReadSource.init(name, 7 + index, database, raft_mod.read_gate.alreadyReadSafeBarrier());
+            const array = (try local.sql_array_text.decodeLeaky(a, if (index == 0) .int64 else .int16, if (index == 0) "[-1:1]={9007199254740993,NULL,2}" else "[3:4]={3,NULL}", .{})).value;
+            const wire_array = try local.sql_array_wire.toJsonLeaky(a, array, .{});
+            var writes: [2]db_mod.types.BatchWrite = undefined;
+            for ([_][]const u8{ "a", "b" }, &writes, 0..) |key, *write, row| write.* = .{ .key = key, .value = if (index == 0) try std.json.Stringify.valueAlloc(a, .{ .id = key, .n = row + 1, .cold = "old", .a = wire_array, .j = json }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .id = if (entry.duplicates) "a" else key, .delta = (row + 1) * 10, .a = wire_array }, .{}) };
+            try database.batch(.{ .writes = &writes, .timestamp_ns = 42 });
+        }
+        var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("target", &databases[0]);
+        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_runtime.deinit();
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = entry.sql }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("joined source RETURNING rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        try std.testing.expectEqual(@as(i64, if (entry.duplicates) 1 else 2), result.value.rows_affected);
+        try std.testing.expectEqual(@as(usize, if (entry.duplicates) 1 else 2), result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 3), result.value.columns.len);
+        for (result.value.columns, [_][]const u8{ "a", "j", "a" }, [_]sql_wire.SQLArrayElementType{ .int64, .jsonb, .int16 }) |column_, name, element| {
+            try std.testing.expectEqualStrings(name, column_.name);
+            try std.testing.expectEqual(.array, column_.type);
+            try std.testing.expectEqual(element, column_.element_type.?);
+        }
+        try std.testing.expectEqual(@as(usize, 1), source.captures);
+        const expected_target = (try local.sql_array_text.decodeLeaky(a, .int64, if (std.mem.eql(u8, entry.target_first, "3")) "[3:4]={3,NULL}" else "[-1:1]={9007199254740993,NULL,2}", .{})).value;
+        const expected_source = (try local.sql_array_text.decodeLeaky(a, .int16, "[3:4]={3,NULL}", .{})).value;
+        for (result.value.rows, result.value.sql_nulls.?) |row, flags| {
+            try std.testing.expectEqualSlices(bool, &.{ false, false, false }, flags);
+            var work: local.sql_array_value.Budget = .{};
+            var target = try local.sql_array_wire.decode(alloc, .int64, row[0], .{});
+            defer target.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try target.value.compare(expected_target, &work));
+            const returned_json = try local.sql_array_wire.decodeLeaky(a, .jsonb, row[1], .{});
+            try std.testing.expectEqual(std.math.Order.eq, try returned_json.compare(json_array, &work));
+            var source_array = try local.sql_array_wire.decode(alloc, .int16, row[2], .{});
+            defer source_array.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(expected_source, &work));
+        }
+        var stored = try databases[0].scan(a, "", "", .{ .include_documents = true, .limit = 3 });
+        defer stored.deinit(a);
+        try std.testing.expectEqual(@as(usize, if (std.mem.startsWith(u8, entry.sql, "DELETE")) 0 else 2), stored.documents.len);
+        for (stored.documents) |document| {
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, a, document.json, .{});
+            const unchanged = entry.duplicates and std.mem.eql(u8, document.id, "b");
+            try std.testing.expectEqualStrings(if (unchanged) "old" else "new", value.object.get("cold").?.string);
+            const array = try local.sql_array_wire.decodeLeaky(a, .int64, value.object.get("a").?, .{});
+            var work: local.sql_array_value.Budget = .{};
+            const expected = if (unchanged) (try local.sql_array_text.decodeLeaky(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{})).value else expected_target;
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(expected, &work));
+        }
+    }
+}
+
+test "httpx SQL catalog expressions preserve nullable typed schemas through native admission" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":["integer","null"],"x-antfly-sql-type":"int16"},"label":{"type":["keyword","null"]},"cold":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"}},"additionalProperties":false}}}}
+    , .{});
+    for ([_][]const u8{
+        "ALTER TABLE items ADD CONSTRAINT positive CHECK (n > 0 AND lower(label) = 'ready')",
+        "CREATE INDEX label_key ON items ((lower(label))) WHERE n > 0",
+        "ALTER TABLE items ALTER COLUMN n SET DEFAULT 7",
+    }) |sql| {
+        var compiled = try sources.sql_compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    const bytes = try std.json.Stringify.valueAlloc(a, schema, .{});
+    var validator = try sources.schema_mod.CompiledTableValidator.init(alloc, bytes);
+    defer validator.deinit(alloc);
+    const native = try sources.schema_mod.deriveRuntimeTableSchema(alloc, validator.schema);
+    defer sources.storage_schema.freeSchema(alloc, native);
+    try std.testing.expectEqual(@as(usize, 3), native.relational_columns.len);
+    var valid = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"label":"READY","cold":{"dimensions":[{"length":2,"lower_bound":-1}],"values":["9007199254740993",null],"sql_nulls":[false,true]}}
+    , .{});
+    try validator.prepareValue(a, alloc, &valid);
+    try std.testing.expectEqual(@as(i64, 7), valid.object.get("n").?.integer);
+    const cold = try sources.sql_array_wire.decodeLeaky(a, .int64, valid.object.get("cold").?, .{});
+    try std.testing.expectEqual(@as(i32, -1), cold.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cold.elements[0].value.integer);
+    try std.testing.expect(cold.elements[1].sql_null);
+    for ([_][]const u8{ "{\"n\":-1,\"label\":\"READY\"}", "{\"n\":1,\"label\":\"wrong\"}" }) |document| {
+        var invalid = try std.json.parseFromSliceLeaky(std.json.Value, a, document, .{});
+        try std.testing.expectError(error.RelationalCheckViolation, validator.prepareValue(a, alloc, &invalid));
+    }
+    var nullable = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":null,\"label\":\"READY\"}", .{});
+    try validator.prepareValue(a, alloc, &nullable);
+    try std.testing.expect(nullable.object.get("n").? == .null);
+    // Numeric assignment casts are admitted durably; overflow occurs only
+    // when the default is used, exactly as in PostgreSQL.
+    var overflow = try sources.sql_compiler.compile(a, "ALTER TABLE items ALTER COLUMN n SET DEFAULT 32768", .{});
+    defer overflow.deinit();
+    try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema, overflow.statement.catalog_ddl));
+    var deferred = try sources.schema_mod.CompiledTableValidator.init(alloc, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    defer deferred.deinit(alloc);
+    var missing = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"label\":\"READY\"}", .{});
+    try std.testing.expectError(error.RelationalExpressionOverflow, deferred.prepareValue(a, alloc, &missing));
+    var explicit = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":1,\"label\":\"READY\"}", .{});
+    try deferred.prepareValue(a, alloc, &explicit);
+}
+
+test "httpx SQL numeric expression schemas preserve deferred defaults atomic writes and restore" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE items (n smallint DEFAULT 32768, f real DEFAULT 0.1, CONSTRAINT sum_positive CHECK (CASE WHEN n IS NULL THEN true WHEN n>0 THEN n+n>0 ELSE false END))", .{});
+    defer compiled.deinit();
+    const schema_bytes = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    var schema_json = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_bytes, .{});
+    var index = try sources.sql_compiler.compile(a, "CREATE INDEX conditional_n ON items ((CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer) END))", .{});
+    defer index.deinit();
+    try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema_json, index.statement.catalog_ddl));
+    const schema = try std.json.Stringify.valueAlloc(a, schema_json, .{});
+    var directory = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions");
+    defer directory.cleanup();
+    var target = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions-restore");
+    defer target.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "bad-default", .value = "{}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "kept", .value = "{\"n\":1}" }} });
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":2}" }, .{ .key = "bad-check", .value = "{\"n\":30000}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try sources.storage_portable_backup.exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, sources.storage_db_doc_identity.default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        try std.testing.expectEqual(sources.storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        const bytes = (try db.get(alloc, "kept")).?;
+        defer alloc.free(bytes);
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        try std.testing.expectEqual(@as(i64, 1), row.object.get("n").?.integer);
+        try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), row.object.get("f").?.float);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-default", .value = "{}" }} }));
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-check", .value = "{\"n\":30000}" }} }));
+    }
+}
+
+test "httpx SQL expression DDL defaults generated mutations and restore" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer)+1 END) STORED, n smallint DEFAULT (2+3), overflow smallint DEFAULT (32767+1), label text DEFAULT lower('READY'), slug text GENERATED ALWAYS AS (lower(label)||'-ok') STORED, h smallint GENERATED ALWAYS AS (n+1) STORED)", .{});
+    defer compiled.deinit();
+    const schema = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    var directory = try sources.common_test_directory.TestDirectory.init("sql-expression-ddl");
+    defer directory.cleanup();
+    var target = try sources.common_test_directory.TestDirectory.init("sql-expression-ddl-restore");
+    defer target.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        try db.batch(.{ .writes = &.{ .{ .key = "original", .value = "{\"overflow\":1}" }, .{ .key = "null", .value = "{\"n\":null,\"overflow\":1}" } } });
+        var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, schema, .{});
+        var altered = try sources.sql_compiler.compile(a, "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 8 ELSE 9 END", .{});
+        defer altered.deinit();
+        try std.testing.expect(try sources.sql_schema_ddl.apply(a, &candidate, altered.statement.catalog_ddl));
+        // Publication creates a new immutable schema epoch, just as catalog CAS does.
+        try candidate.object.put(a, "version", .{ .integer = 2 });
+        try db.setSchemaJson(alloc, try std.json.Stringify.valueAlloc(a, candidate, .{}));
+        try db.batch(.{ .writes = &.{.{ .key = "changed", .value = "{\"overflow\":1}" }} });
+        for ([_][]const u8{ "{}", "{\"n\":32767,\"overflow\":1}" }) |bad| {
+            try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":2,\"overflow\":1}" }, .{ .key = "bad", .value = bad } } }));
+            try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        }
+        try sources.storage_portable_backup.exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    for ([_]*db_mod.DB{ &reopened, &restored }, 0..) |db, i| {
+        if (i == 1) try db.importPortableIntoEmpty(alloc, archive.items, sources.storage_db_doc_identity.default_namespace);
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        for ([_][]const u8{ "original", "changed", "null" }, [_]?i64{ 5, 8, null }) |key, expected| {
+            const bytes = (try db.get(alloc, key)).?;
+            defer alloc.free(bytes);
+            const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+            try std.testing.expectEqualStrings("ready", row.object.get("label").?.string);
+            try std.testing.expectEqualStrings("ready-ok", row.object.get("slug").?.string);
+            try std.testing.expectEqual(if (expected) |n| n + 1 else @as(i64, 0), row.object.get("g").?.integer);
+            if (expected) |n| {
+                try std.testing.expectEqual(n, row.object.get("n").?.integer);
+                try std.testing.expectEqual(n + 1, row.object.get("h").?.integer);
+            } else {
+                try std.testing.expect(row.object.get("n").? == .null);
+                try std.testing.expect(row.object.get("h").? == .null);
+            }
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "after-recovery", .value = "{\"overflow\":1}" }} });
+        const bytes = (try db.get(alloc, "after-recovery")).?;
+        defer alloc.free(bytes);
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        try std.testing.expectEqual(@as(i64, 8), row.object.get("n").?.integer);
+        try std.testing.expectEqual(@as(i64, 9), row.object.get("g").?.integer);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-default", .value = "{}" }} }));
+    }
+}
+
+test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {
+    // Exact-source mutations over genuinely activated native logical PKs:
+    // sql-0012, sql-0013,
+    // sql-0571, sql-0572, sql-0598, sql-0599, sql-0606, sql-0607,
+    // sql-0608, sql-0609, sql-0619, sql-0620, sql-0657, sql-0667,
+    // sql-1499, sql-1500, sql-1508, sql-1519, sql-1533, sql-1564.
+    // Correlated-source campaign: sql-0600, sql-0601, sql-0602,
+    // sql-0610, sql-0611, sql-0612.
+    // Cross-table INSERT/CTE sources: sql-1452, sql-1453, sql-1454.
+    // Multi-row DO NOTHING: sql-1482, sql-1483.
+    // Qualified RETURNING: sql-1489, sql-1490, sql-1491, sql-1492.
+    try postgresNativeMutationCampaigns(&.{});
+}
+
+test "httpx SQL PostgreSQL regex mutations preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{ "sql-1443", "sql-1471", "sql-1473", "sql-1474", "sql-1475" });
+}
+
+test "httpx SQL PostgreSQL named conflict targets preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{"sql-1463"});
+}
+
+test "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{ "sql-1390", "sql-1392", "sql-1393", "sql-1439", "sql-1465" });
+}
+
+fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void {
+    try postgresNativeMutationCampaignsWithConstraints(selected, false, .constraint);
+}
+
+test "httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages" {
+    try postgresNativeMutationCampaignsWithConstraints(&.{
+        "sql-1394", "sql-1395", "sql-1398", "sql-1399",
+        "sql-1400", "sql-1402", "sql-1406", "sql-1407",
+    }, true, .constraint);
+}
+
+test "httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases" {
+    // All statements in this cohort use inference, not constraint names.
+    // PostgreSQL independently verifies index/constraint inference equivalence;
+    // this variant exercises the distinct native index-owned representation.
+    try postgresNativeMutationCampaignsWithConstraints(&.{
+        "sql-1394", "sql-1395", "sql-1398", "sql-1399",
+        "sql-1400", "sql-1402", "sql-1406", "sql-1407",
+    }, true, .index);
+}
+
+test "httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages" {
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1455"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1458"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1460"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1461"}, true, .expression);
+}
+
+const PostgresMutationOwner = enum { constraint, index, expression };
+
+test "httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages" {
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1509", "sql-1514" }, true, .index, true);
+    try postgresNativeMutationCampaignsWithReadPolicy(&.{ "sql-1510", "sql-1515" }, true, .expression, true);
+}
+
+fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner) !void {
+    try postgresNativeMutationCampaignsWithReadPolicy(selected, unique, index_owned, false);
+}
+
+fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: PostgresMutationOwner, comptime indexed_selectors: bool) !void {
+    const alloc = std.testing.allocator;
+    const parity = @import("sql_parity_reference.zig");
+    const Source = @import("sql_parity_sources.zig").Tables(3);
+    var completed_campaigns: usize = 0;
+    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false }{
+        .{
+            .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference,
+            .ids = &.{
+                "sql-0012", "sql-0013", "sql-0571", "sql-0572", "sql-0598", "sql-0599",
+                "sql-0606", "sql-0607", "sql-0608", "sql-0609", "sql-0619", "sql-0620",
+                "sql-0657", "sql-0667", "sql-1499", "sql-1500", "sql-1508", "sql-1519",
+                // Schema-dependent CHECK and unique-selector contracts need their
+                // own activated owner profiles, not this primary-key-only fixture.
+                "sql-1533", "sql-1564", "sql-1390", "sql-1392", "sql-1393", "sql-1439",
+                "sql-1443", "sql-1452", "sql-1453", "sql-1454", "sql-1463", "sql-1465",
+                "sql-1471", "sql-1473", "sql-1474", "sql-1475", "sql-1482", "sql-1483",
+                "sql-1488", "sql-1489", "sql-1490", "sql-1491", "sql-1492",
+            },
+        },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.correlated_mutation_postgres_reference, .ids = &.{ "sql-0600", "sql-0601", "sql-0602", "sql-0610", "sql-0611", "sql-0612" }, .expected_captures = 6 },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.unique_mutation_postgres_reference, .ids = &.{}, .unique = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.partial_mutation_postgres_reference, .ids = &.{ "sql-1455", "sql-1510", "sql-1515" }, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.lower_mutation_postgres_reference, .ids = &.{"sql-1458"}, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mixed_mutation_postgres_reference, .ids = &.{"sql-1460"}, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.upper_mutation_postgres_reference, .ids = &.{"sql-1461"}, .unique = true, .expression = true },
+    }) |campaign| {
+        if (campaign.unique != unique) continue;
+        if (campaign.expression != (index_owned == .expression)) continue;
+        if (campaign.expression) {
+            var matches = false;
+            for (selected) |id| for (campaign.ids) |candidate| {
+                matches = matches or std.mem.eql(u8, id, candidate);
+            };
+            if (!matches) continue;
+        }
+        if (selected.len != 0 and campaign.expected_captures != null) continue;
+        const parsed = try std.json.parseFromSlice(parity.PostgresMutationReference, alloc, campaign.bytes, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const profile = parsed.value.profile;
+        try std.testing.expectEqual(@as(usize, 2), profile.additional_tables.len);
+        try std.testing.expectEqualStrings("archived_records", profile.additional_tables[0].name);
+        try std.testing.expectEqualStrings("source_records", profile.additional_tables[1].name);
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-postgres-mutations");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const names = [_][]const u8{ "usage_records", "archived_records", "source_records" };
+        const declarations = [_]std.json.Value{ profile.schema, profile.additional_tables[0].schema, profile.additional_tables[1].schema };
+        const primary_keys = [_][]const []const u8{ profile.primary_key, profile.additional_tables[0].primary_key, profile.additional_tables[1].primary_key };
+        const unique_keys = [_][]const []const []const u8{ profile.unique, profile.additional_tables[0].unique, profile.additional_tables[1].unique };
+        var schemas: [3][]const u8 = undefined;
+        var selector_index_name: ?[]const u8 = null;
+        for (declarations, primary_keys, unique_keys, names, &schemas) |declaration, columns, keys, name, *schema| {
+            var owned = declaration;
+            try std.testing.expect(columns.len != 0);
+            try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
+                .kind = .table,
+                .action = .alter_schema,
+                .name = .{ .table = name },
+                .schema_change = .{ .add_unique = .{ .name = try std.fmt.allocPrint(a, "{s}_pkey", .{name}), .columns = columns, .primary = true } },
+            }));
+            for (keys, 0..) |key, ordinal| {
+                try std.testing.expect(key.len != 0);
+                const owner_name = try std.fmt.allocPrint(a, "{s}_unique_{d}", .{ name, ordinal });
+                if (indexed_selectors and std.mem.eql(u8, name, "usage_records")) selector_index_name = owner_name;
+                const Change = @import("antfly_local_sources").sql_ast.SchemaChange;
+                const change: Change = if (index_owned == .index) index: {
+                    const orders = try a.alloc(@import("antfly_local_sources").sql_ast.Order, key.len);
+                    for (orders, key) |*order, column| order.* = .{ .field = column };
+                    break :index .{ .create_index = .{ .name = owner_name, .keys = orders, .unique = true } };
+                } else .{ .add_unique = .{ .name = owner_name, .columns = key } };
+                try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
+                    .kind = .table,
+                    .action = .alter_schema,
+                    .name = .{ .table = name },
+                    .schema_change = change,
+                }));
+            }
+            if (std.mem.eql(u8, name, "usage_records")) if (profile.index_owner_ddl) |ddl| {
+                var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, ddl, .{});
+                defer compiled.deinit();
+                const change = compiled.statement.catalog_ddl;
+                try std.testing.expectEqualStrings(name, change.name.table);
+                try std.testing.expect(change.schema_change.?.create_index.unique);
+                if (indexed_selectors) selector_index_name = try a.dupe(u8, change.schema_change.?.create_index.name);
+                try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, change));
+            };
+            schema.* = try std.json.Stringify.valueAlloc(a, owned, .{});
+        }
+        var databases: [3]db_mod.DB = undefined;
+        var opened: usize = 0;
+        defer for (databases[0..opened]) |*database| database.close();
+        var ranges: [3]@import("antfly_local_sources").common_topology_records.RangeRecord = undefined;
+        var source: Source = .{ .records = undefined, .reads = undefined, .ranges = &ranges, .require_indexed_reads = indexed_selectors };
+        const Table = struct { name: []const u8, db: *db_mod.DB };
+        var tables: [3]Table = undefined;
+        for (&databases, names, schemas, 0..) |*database, name, schema, i| {
+            const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), name });
+            database.* = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7 + i, .shard_id = 1, .range_id = 1 } });
+            opened += 1;
+            try database.setSchemaJson(alloc, schema);
+            if (indexed_selectors) {
+                try database.batch(.{ .activate_range_tracking = true });
+                if (i == 0) {
+                    const index_name = selector_index_name orelse return error.MissingSelectorIndexOwner;
+                    for (0..64) |_| {
+                        if ((try database.relationalIndexBuildStatus(index_name)).state == .ready) break;
+                        try database.buildRelationalIndexStep(index_name, .{ .records = 128, .time_ns = std.time.ns_per_s });
+                    }
+                    try std.testing.expectEqual(.ready, (try database.relationalIndexBuildStatus(index_name)).state);
+                }
+            }
+            source.records[i] = .{ .table_id = 7 + i, .name = name, .schema_json = schema };
+            ranges[i] = .{ .table_id = 7 + i, .group_id = 7 + i, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 };
+            source.reads[i] = table_reads.BoundTableReadSource.init(name, 7 + i, database, raft_mod.read_gate.alreadyReadSafeBarrier());
+            tables[i] = .{ .name = name, .db = database };
+        }
+        var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &databases[0]);
+        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_runtime.deinit();
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var reference = parsed.value;
+        if (index_owned == .index) {
+            const probes = try a.alloc(parity.PostgresMutationReference.AdmissionProbe, profile.admission_probes.len + 1);
+            @memcpy(probes[0..profile.admission_probes.len], profile.admission_probes);
+            probes[profile.admission_probes.len] = .{
+                .sql = "INSERT INTO usage_records(id,email) VALUES ('index_alias_probe','c@example.test') ON CONFLICT ON CONSTRAINT usage_records_unique_0 DO NOTHING",
+                .sqlstate = "42704",
+            };
+            reference.profile.admission_probes = probes;
+        }
+        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, reference, if (selected.len != 0) selected else campaign.ids);
+        completed_campaigns += 1;
+        if (unique) {
+            // Logical UNIQUE ownership must resolve through native point
+            // reads, not table-size-dependent statement capture or scans.
+            try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
+            if (indexed_selectors) {
+                try std.testing.expect(source.indexed_reads.load(.monotonic) > 0);
+                try std.testing.expect(source.normalization_views.load(.monotonic) > 0);
+            } else try std.testing.expectEqual(@as(usize, 0), source.unbounded_reads.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 0), source.captures);
+        }
+        if (selected.len == 0) try std.testing.expect(source.captures != 0);
+        if (campaign.expected_captures) |count| try std.testing.expectEqual(count, source.captures);
+    }
+    try std.testing.expect(completed_campaigns != 0);
+}
+
 test "httpx SQL executes one relational page with exact integer parameters" {
+    // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
+    // sql-0166, sql-0169, sql-0182, sql-0191, sql-0192, sql-0193.
+    // sql-0196, sql-0199, sql-0209, sql-0226, sql-0227, sql-0228.
+    // sql-0232, sql-0233, sql-0238, sql-0239, sql-0240, sql-0241.
+    // sql-0242, sql-0243, sql-0246, sql-0253, sql-0254, sql-0255.
+    // sql-0202, sql-0245, sql-0248, sql-0249, sql-0250, sql-0251.
+    // sql-0258, sql-0271, sql-0272, sql-0273, sql-0275.
+    // sql-0276, sql-0277, sql-0278, sql-0279, sql-0281, sql-0282.
+    // sql-0454, sql-0455, sql-0457, sql-0458, sql-0491, sql-0511.
+    // sql-0512, sql-0514, sql-0515, sql-0554, sql-0555, sql-0556.
+    // sql-0557, sql-1205, sql-1206, sql-1265, sql-1268, sql-1269.
+    // sql-1578.
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"},"amount":{"type":"integer"},"quantity":{"type":"integer"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"customer_id":{"type":"integer"},"tenant_id":{"type":"integer"},"created_at":{"type":"keyword"},"metadata":{"type":"object","properties":{"source":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}}}}
@@ -13201,17 +14111,16 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var db = try db_mod.DB.open(alloc, directory.path(), .{});
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
-    try db.batch(.{ .writes = &.{
-        .{ .key = "a", .value = "{\"id\":9007199254740993,\"name\":\"exact\",\"amount\":10,\"quantity\":2,\"status\":\"OPEN\",\"enabled\":true,\"customer_id\":1,\"tenant_id\":1,\"created_at\":\"2026-01-01\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "b", .value = "{\"id\":2,\"name\":\"other\",\"amount\":15,\"quantity\":4,\"status\":\"open\",\"customer_id\":1,\"tenant_id\":1,\"created_at\":\"2026-01-02\",\"metadata\":{\"source\":\"internal\"}}" },
-        .{ .key = "c", .value = "{\"id\":3,\"name\":\"third\",\"amount\":17,\"quantity\":3,\"status\":\"closed\",\"customer_id\":2,\"tenant_id\":1,\"created_at\":\"2026-01-03\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "d", .value = "{\"id\":4,\"name\":\"fourth\",\"amount\":18,\"quantity\":7,\"status\":\"open\",\"customer_id\":3,\"tenant_id\":2,\"created_at\":\"2026-01-04\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "e", .value = "{\"id\":5,\"name\":\"fifth\",\"amount\":6,\"quantity\":2,\"status\":\"pending\",\"customer_id\":3,\"tenant_id\":2,\"created_at\":\"2026-01-05\",\"metadata\":{\"source\":\"internal\"}}" },
-        .{ .key = "f", .value = "{\"id\":6,\"name\":\"sixth\",\"amount\":25,\"quantity\":5,\"status\":\"OPEN\",\"customer_id\":4,\"tenant_id\":3,\"created_at\":\"2026-01-06\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "g", .value = "{\"id\":7,\"name\":\"seventh\",\"amount\":1,\"quantity\":0,\"status\":\"open\",\"customer_id\":5,\"tenant_id\":2,\"created_at\":\"2026-01-07\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "h", .value = "{\"id\":8,\"name\":\"eighth\",\"amount\":3,\"quantity\":0,\"status\":\"Open\",\"customer_id\":6,\"tenant_id\":4,\"created_at\":\"2026-01-08\",\"metadata\":{}}" },
-        .{ .key = "i", .value = "{\"id\":9,\"name\":\"ninth\",\"amount\":2,\"quantity\":0,\"customer_id\":7,\"tenant_id\":4,\"created_at\":\"2026-01-09\",\"metadata\":{\"source\":\"api\"}}" },
-    }, .timestamp_ns = 42 });
+    {
+        var seed_arena = std.heap.ArenaAllocator.init(alloc);
+        defer seed_arena.deinit();
+        const seed_alloc = seed_arena.allocator();
+        const seeds = try std.json.parseFromSliceLeaky(std.json.Value, seed_alloc, @import("antfly_local_sources").sql_parity_fixtures.read_rows, .{});
+        const rows = seeds.object.get("rows").?.array.items;
+        const writes = try seed_alloc.alloc(db_mod.types.BatchWrite, rows.len);
+        for (rows, writes) |row, *write| write.* = .{ .key = row.object.get("key").?.string, .value = try std.json.Stringify.valueAlloc(seed_alloc, row.object.get("value").?, .{}) };
+        try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    }
     var reads = table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
@@ -13224,6 +14133,97 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    const reference_cases = [_][]const u8{
+        "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
+        "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",
+        "sql-0300", "sql-0301", "sql-0303", "sql-0304", "sql-0305", "sql-0450", "sql-0451",
+        "sql-0452", "sql-0453", "sql-0456", "sql-0460", "sql-0461", "sql-0462", "sql-0463",
+        "sql-0464", "sql-0465", "sql-0466", "sql-0467", "sql-0469", "sql-0470", "sql-0472",
+        "sql-0474", "sql-0478", "sql-0479", "sql-0480", "sql-0481", "sql-0482", "sql-0483",
+        "sql-0484", "sql-0485", "sql-0486", "sql-0487", "sql-0488", "sql-0489", "sql-0490",
+        "sql-0496", "sql-0497", "sql-0498", "sql-0499", "sql-0500", "sql-0501", "sql-0502",
+        "sql-0503", "sql-0504", "sql-0505", "sql-0506", "sql-0507", "sql-0508", "sql-0509",
+        "sql-0510", "sql-0513", "sql-0517", "sql-0518", "sql-0519", "sql-0520", "sql-0521",
+        "sql-0522", "sql-0523", "sql-0524", "sql-0525", "sql-0526", "sql-0527", "sql-0528",
+        "sql-0529", "sql-0530", "sql-0531", "sql-0532", "sql-0533", "sql-0534", "sql-0535",
+        "sql-0536", "sql-0538", "sql-0539", "sql-0545", "sql-0546", "sql-0550", "sql-0551",
+        "sql-0558", "sql-0559", "sql-1220", "sql-1223", "sql-1240", "sql-1241", "sql-1249",
+        "sql-1252", "sql-1267", "sql-1337", "sql-1367", "sql-1368", "sql-1371", "sql-1372",
+        "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384", "sql-1385", "sql-1386",
+        "sql-1387",
+    };
+    try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
+    try @import("sql_parity_reference.zig").runJsonExistenceExpressions(alloc, &handler);
+    try @import("sql_parity_reference.zig").runInternalArrayQueries(alloc, &handler);
+    // SQL integer transport is lossless text, whereas a JSON numeric value
+    // remains a number even when its physical cell also uses an i64 tag.
+    for ([_]struct { sql: []const u8, integer: i64 }{
+        .{ .sql = "SELECT 3::bigint AS n, to_jsonb(3) AS j", .integer = 3 },
+        .{ .sql = "SELECT 9007199254740993::bigint AS n, to_jsonb(9007199254740993) AS j", .integer = 9007199254740993 },
+    }) |case| {
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+        defer alloc.free(request.body.?);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(sql_wire.SQLColumnType.integer, result.value.columns[0].type);
+        try std.testing.expectEqual(sql_wire.SQLColumnType.json, result.value.columns[1].type);
+        try std.testing.expectEqual(case.integer, try std.fmt.parseInt(i64, result.value.rows[0][0].string, 10));
+        try std.testing.expectEqual(case.integer, result.value.rows[0][1].integer);
+    }
+    // These historical SQLite-positive originals are invalid in PostgreSQL:
+    // an output alias is not an input variable inside ORDER BY arithmetic.
+    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
+    try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
+    {
+        const parity = @import("sql_parity_reference.zig");
+        const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
+        try parity.runNumberWireContracts(alloc);
+        try parity.runArrayWireContracts(alloc);
+        const profile = try std.json.parseFromSlice(struct {
+            profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+            entries: []const struct { id: []const u8 },
+        }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+        defer profile.deinit();
+        const schema = try std.json.Stringify.valueAlloc(alloc, profile.value.profile.schema, .{});
+        defer alloc.free(schema);
+        var campaign_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-read-campaign");
+        defer campaign_directory.cleanup();
+        var campaign_db = try db_mod.DB.open(alloc, campaign_directory.path(), .{});
+        defer campaign_db.close();
+        try campaign_db.setSchemaJson(alloc, schema);
+        var seed_arena = std.heap.ArenaAllocator.init(alloc);
+        defer seed_arena.deinit();
+        const a = seed_arena.allocator();
+        const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+        for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+        try campaign_db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        var campaign_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &campaign_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var campaign_source: Source = .{ .schema = schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }} };
+        var campaign_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &campaign_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, campaign_reads.source(), null);
+        defer campaign_server.deinit();
+        var campaign_handler = AntflyApiHandler{ .api_server = &campaign_server };
+        const ids = try a.alloc([]const u8, profile.value.entries.len);
+        for (profile.value.entries, ids) |entry, *id| id.* = entry.id;
+        // These source-owned pagination/array contracts must not silently disappear when
+        // regenerating the campaign or discovering other unsupported shapes.
+        for ([_][]const u8{ "sql-0188", "sql-0189", "sql-0195", "sql-0197", "sql-0198", "sql-0205", "sql-0206", "sql-0207", "sql-0214", "sql-0216", "sql-0218", "sql-0220", "sql-0221", "sql-0222", "sql-0225", "sql-0230", "sql-0231", "sql-0244", "sql-0256", "sql-0284", "sql-0302", "sql-0560", "sql-0561", "sql-0562", "sql-0563", "sql-0564", "sql-0565", "sql-0566", "sql-1226", "sql-1227", "sql-1340" }) |required| {
+            var found = false;
+            for (ids) |id| if (std.mem.eql(u8, id, required)) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+        }
+        try parity.runReferenceStrict(alloc, &campaign_handler, ids, reference_bytes);
+    }
+    try @import("sql_parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
     for ([_][]const u8{
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = $1\",\"parameters\":[\"a\"]}",
@@ -13336,15 +14336,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
-            try std.testing.expectEqual(@as(u16, 200), response.status.code);
-            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            // PostgreSQL does not expose SELECT labels to HAVING, even when
+            // the label is also a legal bare GROUP BY / ORDER BY name.
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
-            try std.testing.expectEqual(@as(usize, 2), result.value.columns.len);
-            try std.testing.expectEqualStrings("status_key", result.value.columns[0].name);
-            try std.testing.expectEqualStrings("row_count", result.value.columns[1].name);
-            try std.testing.expectEqualStrings("open", result.value.rows[0][0].string);
-            try std.testing.expectEqualStrings("6", result.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("42703", result.value.code);
         }
     }
     {
@@ -13569,6 +14566,58 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 try std.testing.expectEqual(@as(u16, 200), closed_response.status.code);
             }
         }
+    }
+    {
+        var prepare_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared");
+        defer prepare_request.deinit();
+        prepare_request.body = "{\"statement\":\"SELECT $1::bigint[] a,$2::integer+1 n FROM usage_records LIMIT 1\"}";
+        var prepare_context = httpx.Context.init(alloc, std.testing.io, &prepare_request);
+        defer prepare_context.deinit();
+        var prepared = try handler.prepareSQL(&prepare_context);
+        defer prepared.deinit();
+        try std.testing.expectEqual(@as(u16, 200), prepared.status.code);
+        const description = try std.json.parseFromSlice(sql_wire.SQLPreparedResponse, alloc, prepared.body.?, .{});
+        defer description.deinit();
+        try std.testing.expectEqual(@as(usize, 2), description.value.parameter_descriptors.len);
+        try std.testing.expectEqual(sql_wire.SQLColumnType.array, description.value.parameter_descriptors[0].type);
+        try std.testing.expectEqual(@as(?sql_wire.SQLArrayElementType, .int64), description.value.parameter_descriptors[0].element_type);
+        try std.testing.expectEqual(@as(?sql_wire.SQLArrayElementType, .int32), description.value.parameter_descriptors[1].element_type);
+        const cases = [_]struct { body: []const u8, success: bool }{
+            .{ .body = "{\"parameters\":[\"[-1:1]={9007199254740993,NULL,2}\",41]}", .success = true },
+            .{ .body = "{\"parameters\":[{\"dimensions\":[{\"length\":3,\"lower_bound\":-1}],\"values\":[\"9007199254740993\",null,\"2\"],\"sql_nulls\":[false,true,false]},41]}", .success = true },
+            .{ .body = "{\"parameters\":[\"{1}\",9007199254740993]}", .success = false },
+            .{ .body = "{\"parameters\":[[1,2],41]}", .success = false },
+            .{ .body = "{\"parameters\":[{\"dimensions\":[{\"length\":1,\"lower\":0}],\"values\":[\"1\"],\"sql_nulls\":[false]},41]}", .success = false },
+        };
+        for (cases) |case| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared/id/execute");
+            defer request.deinit();
+            request.body = case.body;
+            var context = httpx.Context.init(alloc, std.testing.io, &request);
+            defer context.deinit();
+            var response = try handler.executePreparedSQL(&context, description.value.prepared_id);
+            defer response.deinit();
+            if (!case.success) {
+                try std.testing.expectEqual(@as(u16, 400), response.status.code);
+                continue;
+            }
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("42", result.value.rows[0][1].string);
+            var actual = try @import("antfly_local_sources").sql_array_wire.decode(alloc, .int64, result.value.rows[0][0], .{});
+            defer actual.deinit();
+            try std.testing.expectEqual(@as(i32, -1), actual.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), actual.value.elements[0].value.integer);
+            try std.testing.expect(actual.value.elements[1].sql_null);
+        }
+        var close_request = try httpx.Request.init(alloc, .DELETE, "http://127.0.0.1/db/v1/sql/prepared/id");
+        defer close_request.deinit();
+        var close_context = httpx.Context.init(alloc, std.testing.io, &close_request);
+        defer close_context.deinit();
+        var closed = try handler.closePreparedSQL(&close_context, description.value.prepared_id);
+        defer closed.deinit();
+        try std.testing.expectEqual(@as(u16, 200), closed.status.code);
     }
     // Force several physical pages through the real native adapter, not a
     // synthetic Backend claiming snapshot support. The cursor owns the view
@@ -13948,7 +14997,158 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
             try std.testing.expectEqualStrings("reset", result.value.rows[0][0].string);
+            try std.testing.expect(result.value.rows[0][1] == .string);
             try std.testing.expectEqualStrings("3", result.value.rows[0][1].string);
+        }
+        {
+            // A row-valued wildcard binds against the captured source layout,
+            // then publishes one native image. Width/cardinality errors must
+            // leave that image untouched, including sparse nullable fields.
+            for ([_]struct { sql: []const u8, code: ?[]const u8 = null }{
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT s.* FROM (SELECT quantity+1 AS q,'reviewed' AS s FROM usage_records WHERE id='u2') s) WHERE id='u2' RETURNING status,quantity" },
+                .{ .sql = "UPDATE usage_records t SET (quantity,status)=(SELECT u.quantity,'reviewed' FROM usage_records u WHERE u.id=t.id) WHERE t.id='u2' RETURNING status,quantity" },
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity FROM usage_records WHERE false) s) WHERE id='u2'", .code = "42601" },
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity,status FROM usage_records) s) WHERE id='u2'", .code = "21000" },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, if (case.code == null) 200 else 400), response.status.code);
+                if (case.code) |code| {
+                    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+                    defer diagnostic.deinit();
+                    try std.testing.expectEqualStrings(code, diagnostic.value.code);
+                } else {
+                    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+                    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                    try std.testing.expectEqualStrings("reviewed", result.value.rows[0][0].string);
+                    try std.testing.expectEqualStrings("4", result.value.rows[0][1].string);
+                }
+                var stored = (try text_db.lookup(alloc, "b", .{})).?;
+                defer stored.deinit(alloc);
+                const raw = try std.json.parseFromSlice(std.json.Value, alloc, stored.json, .{});
+                defer raw.deinit();
+                try std.testing.expectEqual(@as(i64, 4), raw.value.object.get("quantity").?.integer);
+                try std.testing.expectEqualStrings("reviewed", raw.value.object.get("status").?.string);
+                try std.testing.expect(!raw.value.object.contains("created_at_ns"));
+            }
+            try text_db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"u2\",\"status\":\"reset\",\"quantity\":3}" }}, .timestamp_ns = 44 });
+        }
+        {
+            // Complete correlated children retain per-parent paging and NULL
+            // witnesses against the same native table used by row mutations.
+            for ([_]struct { sql: []const u8, expected: ?bool }{
+                .{ .sql = "SELECT t.id,t.quantity IN (SELECT u.quantity FROM usage_records u WHERE u._id=t._id ORDER BY u.quantity DESC LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity < ANY (SELECT u.quantity+1 FROM usage_records u WHERE u._id=t._id ORDER BY u.quantity DESC LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity <> ALL (SELECT u.quantity FROM usage_records u WHERE u._id=t._id LIMIT 0) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity = ANY (SELECT u.quantity FROM usage_records u WHERE u._id=t._id LIMIT 0) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = false },
+                .{ .sql = "SELECT t.id,t.quantity IN (SELECT CAST(NULL AS BIGINT) FROM usage_records u WHERE u._id=t._id LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = null },
+                .{ .sql = "SELECT t.id,t.status LIKE ANY (SELECT u.status FROM usage_records u WHERE u._id=t._id LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, 200), response.status.code);
+                const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 2), result.value.rows.len);
+                for (result.value.rows, 0..) |row, index| {
+                    try std.testing.expectEqualStrings(if (index == 0) "u1" else "u2", row[0].string);
+                    if (case.expected) |truth| try std.testing.expectEqual(truth, row[1].bool) else try std.testing.expect(result.value.sql_nulls.?[index][1]);
+                }
+            }
+        }
+        {
+            for ([_]struct { suffix: []const u8, code: ?[]const u8 }{
+                .{ .suffix = "ORDER BY 2 DESC LIMIT 1", .code = null },
+                .{ .suffix = "ORDER BY 2 ASC LIMIT 1 OFFSET 1", .code = "21000" },
+                .{ .suffix = "ORDER BY 3 DESC LIMIT 1", .code = "21000" },
+            }) |case| {
+                const sql = try std.fmt.allocPrint(alloc, "SELECT q.*,(SELECT u.quantity FROM usage_records u WHERE u._id IN ('a','b') AND q.id='u1') AS v FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q {s}", .{case.suffix});
+                defer alloc.free(sql);
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, if (case.code == null) 200 else 400), response.status.code);
+                if (case.code) |code| {
+                    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+                    defer diagnostic.deinit();
+                    try std.testing.expectEqualStrings(code, diagnostic.value.code);
+                } else {
+                    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                    try std.testing.expectEqualStrings("u2", result.value.rows[0][0].string);
+                    try std.testing.expectEqualStrings("3", result.value.rows[0][1].string);
+                    try std.testing.expect(result.value.sql_nulls.?[0][2]);
+                }
+            }
+        }
+        {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = "{\"statement\":\"SELECT q.id,row_number() OVER w,rank() OVER w FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q WINDOW w AS (ORDER BY (SELECT q.quantity) DESC) ORDER BY q.quantity DESC LIMIT 1\"}";
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try text_handler.executeSQL(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+            try std.testing.expectEqualStrings("u2", result.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("1", result.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("1", result.value.rows[0][2].string);
+        }
+        {
+            for ([_]struct { sql: []const u8, n: ?[]const u8 }{
+                .{ .sql = "SELECT q.id,SUM(q.quantity) AS n,(SELECT q.id) AS v FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id ORDER BY n DESC LIMIT 1", .n = "3" },
+                .{ .sql = "SELECT q.id,row_number() OVER (ORDER BY q.quantity DESC) AS n,(SELECT u.quantity FROM usage_records u WHERE u._id IN ('a','b') AND q.id='u1') AS v FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q ORDER BY q.quantity DESC LIMIT 1", .n = "1" },
+                .{ .sql = "SELECT q.id,SUM(q.quantity),row_number() OVER (ORDER BY q.id),(SELECT q.id) FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id HAVING (SELECT q.id)='u2' ORDER BY q.id", .n = "3" },
+                .{ .sql = "SELECT q.id,(SELECT q.quantity) FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id", .n = null },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, if (case.n == null) 400 else 200), response.status.code);
+                if (case.n) |n| {
+                    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                    try std.testing.expectEqualStrings("u2", result.value.rows[0][0].string);
+                    try std.testing.expectEqualStrings(n, result.value.rows[0][1].string);
+                } else {
+                    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+                    defer diagnostic.deinit();
+                    try std.testing.expectEqualStrings("42803", diagnostic.value.code);
+                }
+            }
         }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
             .{ .body = "{\"statement\":\"INSERT INTO usage_records (id,status,quantity) VALUES ('u_default',DEFAULT,7) RETURNING id,status\"}", .expected_id = "u_default" },
@@ -14060,6 +15260,47 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         }
     }
     {
+        const mutation_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        var mutation_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-point-parity");
+        defer mutation_directory.cleanup();
+        var mutation_db = try db_mod.DB.open(alloc, mutation_directory.path(), .{});
+        defer mutation_db.close();
+        try mutation_db.setSchemaJson(alloc, mutation_schema);
+        var mutation_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &mutation_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var mutation_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &mutation_db);
+        var mutation_source: Source = .{ .schema = mutation_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = mutation_schema }} };
+        var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
+        defer mutation_server.deinit();
+        var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
+        try @import("sql_parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
+            "sql-1497", "sql-1498", "sql-1504", "sql-1505", "sql-1506", "sql-1507",
+            "sql-1513", "sql-1518", "sql-1519", "sql-1520", "sql-1521", "sql-1522",
+        });
+    }
+    {
+        const parity = @import("sql_parity_reference.zig");
+        const reference = try std.json.parseFromSlice(parity.MutationReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.mutation_reference, .{ .ignore_unknown_fields = true });
+        defer reference.deinit();
+        const mutation_schema = try std.json.Stringify.valueAlloc(alloc, reference.value.schema, .{});
+        defer alloc.free(mutation_schema);
+        var mutation_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-mutation-campaign");
+        defer mutation_directory.cleanup();
+        var mutation_db = try db_mod.DB.open(alloc, mutation_directory.path(), .{});
+        defer mutation_db.close();
+        try mutation_db.setSchemaJson(alloc, mutation_schema);
+        var mutation_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &mutation_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var mutation_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &mutation_db);
+        var mutation_source: Source = .{ .schema = mutation_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = mutation_schema }} };
+        var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
+        defer mutation_server.deinit();
+        var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
+        // Exact source cases: sql-0571, sql-0572, sql-0606, sql-0607,
+        // sql-1488, sql-1493. Golden regeneration is an independent gate.
+        try parity.runMutationReference(alloc, &mutation_handler, &mutation_db, reference.value);
+    }
+    {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query
         // uses the bounded native spool. Verify pull ownership and ordering
         // before exercising the pgwire DECLARE/FETCH lifecycle below.
@@ -14088,6 +15329,84 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .io = std.testing.io,
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
+        };
+        for ([_][]const u8{
+            "SELECT ARRAY[1,NULL,9223372036854775807]::bigint[]",
+            "SELECT '[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}'::jsonb[]",
+            "SELECT ARRAY[]::text[]",
+            "SELECT NULL::int4[]",
+        }) |sql| {
+            var array_arena: std.heap.ArenaAllocator = .init(alloc);
+            defer array_arena.deinit();
+            const array_alloc = array_arena.allocator();
+            var array_request = request;
+            array_request.statement = sql;
+            const description = try wire_backend.vtable.describe(wire_backend.context, array_alloc, credential, array_request);
+            try std.testing.expectEqual(@import("../pgwire/backend.zig").Type.array, description.columns[0].type);
+            try std.testing.expect(description.columns[0].element_type != null);
+            var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            const column = result.columns[0];
+            try std.testing.expectEqual(description.columns[0].element_type, column.element_type);
+            try std.testing.expectEqual(try @import("../pgwire/values.zig").columnOid(description.columns[0]), try @import("../pgwire/values.zig").columnOid(column));
+            if (result.sql_nulls.?[0][0]) {
+                try std.testing.expect(result.rows[0][0] == .null);
+                continue;
+            }
+            for ([_]u16{ 0, 1 }) |format| {
+                var output: std.Io.Writer.Allocating = .init(alloc);
+                defer output.deinit();
+                try @import("../pgwire/values.zig").encodeColumnInto(alloc, &output.writer, column, format, result.rows[0][0], 8 * 1024 * 1024);
+                var decoded = if (format == 0) try @import("antfly_local_sources").sql_array_text.decode(alloc, column.element_type.?, output.written(), .{}) else try @import("antfly_local_sources").sql_array_binary.decode(alloc, column.element_type.?, output.written(), .{});
+                defer decoded.deinit();
+                var expected = try @import("antfly_local_sources").sql_array_wire.decode(alloc, column.element_type.?, result.rows[0][0], .{});
+                defer expected.deinit();
+                var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+                try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
+            }
+        }
+        // Exercise the real authenticated adapter, not only a protocol mock:
+        // inferred/declared element identity must survive describe, execution
+        // and the pull cursor path after text/binary wire decoding.
+        for ([_]bool{ false, true }) |declared| for ([_]u16{ 0, 1 }) |format| {
+            var array_arena: std.heap.ArenaAllocator = .init(alloc);
+            defer array_arena.deinit();
+            const array_alloc = array_arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const wire_values = @import("../pgwire/values.zig");
+            var source_array = try sources.sql_array_text.decode(alloc, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+            defer source_array.deinit();
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            if (format == 0) try sources.sql_array_text.encode(source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source_array.value, &encoded.writer, .{});
+            var array_request = request;
+            array_request.statement = "SELECT $1::bigint[] a,cardinality($1) n FROM usage_records LIMIT 1";
+            array_request.parameter_types = if (declared) &.{.array} else &.{};
+            array_request.parameter_descriptors = if (declared) &.{.{ .kind = .array, .element_type = .int64 }} else &.{};
+            const description = try wire_backend.vtable.describe(wire_backend.context, array_alloc, credential, array_request);
+            try std.testing.expectEqual(@as(usize, 1), description.parameter_descriptors.len);
+            try std.testing.expectEqual(@as(u32, 1016), try wire_values.parameterOid(description.parameter_descriptors[0]));
+            array_request.parameter_types = description.parameter_types;
+            array_request.parameter_descriptors = description.parameter_descriptors;
+            array_request.parameters = &.{try wire_values.decode(array_alloc, 1016, format, encoded.written())};
+            var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            var actual = try sources.sql_array_wire.decode(alloc, .int64, result.rows[0][0], .{});
+            defer actual.deinit();
+            var work: sources.sql_array_value.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.value, &work));
+            const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, array_alloc, credential, array_request)).?;
+            defer stream.close(stream.context);
+            var page = try stream.next(stream.context, array_alloc, array_request, 1);
+            defer page.result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
+            const streamed_cell = try page.result.cell(array_alloc, 0, 0);
+            try std.testing.expect(!streamed_cell.sql_null);
+            var streamed = try sources.sql_array_wire.decode(alloc, .int64, streamed_cell.value, .{});
+            defer streamed.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
         };
         {
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
@@ -15802,6 +17121,53 @@ test "httpx lake query delivery requires a transport and forwards delegated JSON
     try sink.write_fn(sink.ptr, "{}");
     try delivery.writer.?.close();
     try std.testing.expect(state.closed);
+}
+
+test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NULLs" {
+    const alloc = std.testing.allocator;
+    const schema = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("http-numeric-delivery");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "1", .value = "{\"id\":1}" }} });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{ .records = .{.{ .table_id = 7, .name = "docs", .schema_json = schema }}, .reads = .{table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())} };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    for ([_][]const u8{
+        "SELECT '9007199254740993.1200'::numeric(24,4) AS n, NULL::numeric AS missing, 'NaN'::numeric AS special",
+        "SELECT '9007199254740993.1200'::numeric(24,4) AS n, NULL::numeric AS missing, 'NaN'::numeric AS special FROM docs",
+    }) |statement| {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+        defer parsed.deinit();
+        const result = parsed.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993.1200", result.rows[0][0].string);
+        try std.testing.expect(result.rows[0][1] == .null);
+        try std.testing.expectEqualStrings("NaN", result.rows[0][2].string);
+        try std.testing.expectEqualSlices(bool, &.{ false, true, false }, result.sql_nulls.?[0]);
+        for (result.columns) |column| {
+            try std.testing.expectEqual(sql_wire.SQLColumnType.number, column.type);
+            try std.testing.expectEqual(sql_wire.SQLArrayElementType.numeric, column.element_type.?);
+        }
+        try std.testing.expectEqual(@as(i64, 24), result.columns[0].numeric_modifier.?.precision);
+        try std.testing.expectEqual(@as(i64, 4), result.columns[0].numeric_modifier.?.scale);
+    }
 }
 
 test "httpx retrieval read failures preserve retryable JSON and conflict status" {

@@ -3964,6 +3964,12 @@ pub const ApiHttpServer = struct {
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
     lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
+    // A persistent worker must not consume the last request executor slot or
+    // inherit the single-threaded provider fallback. Allocate at a stable
+    // address on first use; drain the cache before releasing this lane.
+    lake_cache_io: ?*std.Io.Threaded = null,
+    lake_cache_start_mutex: std.Io.Mutex = .init,
+    lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
@@ -3979,6 +3985,7 @@ pub const ApiHttpServer = struct {
         query_embedding_cache: query_embedding_cache.Stats = .{},
         lake_range_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.Stats = .{},
         lake_disk_cache: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats = null,
+        lake_query: @import("lake_query_metrics.zig").Stats = .{},
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4280,6 +4287,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .lake_range_cache = self.lake_read_cache.snapshot(),
             .lake_disk_cache = self.lake_read_cache.persistentStats(),
+            .lake_query = self.lake_query_metrics.snapshot(),
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
@@ -4719,6 +4727,10 @@ pub const ApiHttpServer = struct {
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
+        if (self.lake_cache_io) |io_impl| {
+            io_impl.deinit();
+            self.owner_alloc.destroy(io_impl);
+        }
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -12873,6 +12885,38 @@ pub const ApiHttpServer = struct {
         self.lake_text_corpora.attachResourceManager(self.shared_resource_manager orelse &self.local_resource_manager);
         const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};
         if (!(self.cfg.lake_cache_enabled orelse config.enabled)) return;
+        // Configuration and the published disk owner are server-lifetime
+        // immutable. Warm queries need neither path allocation nor the
+        // serialized startup lane. Failed startup still retries below.
+        if (self.lake_read_cache.persistentReady()) return;
+        const configured_root = self.cfg.lake_cache_root orelse config.root;
+        const root = configured_root orelse path: {
+            const node = self.cfg.node_config orelse {
+                self.lake_read_cache.recordDiskUnavailable(error.NoLocalCacheDirectory);
+                return;
+            };
+            const base = node.storage.local_base_dir orelse
+                (if (node.storage.lite_path) |file| std.fs.path.dirname(file) orelse "." else {
+                    self.lake_read_cache.recordDiskUnavailable(error.NoLocalCacheDirectory);
+                    return;
+                });
+            break :path std.fs.path.join(self.alloc, &.{ base, "cache", "lake-ranges" }) catch |err| {
+                self.lake_read_cache.recordDiskUnavailable(err);
+                return;
+            };
+        };
+        defer if (configured_root == null) self.alloc.free(root);
+        try self.lake_cache_start_mutex.lock(self.embedding_provider_runtime.io);
+        defer self.lake_cache_start_mutex.unlock(self.embedding_provider_runtime.io);
+        if (self.lake_cache_io == null) {
+            const io_impl = self.owner_alloc.create(std.Io.Threaded) catch |err| {
+                self.lake_read_cache.recordDiskUnavailable(err);
+                return;
+            };
+            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+            self.lake_cache_io = io_impl;
+        }
+        const cache_io = self.lake_cache_io.?.io();
         const policy = self.cfg.lake_cache_policy orelse @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCachePolicy{
             .max_total_bytes = config.max_disk_bytes,
             .max_entries = config.max_entries,
@@ -12880,17 +12924,7 @@ pub const ApiHttpServer = struct {
             .max_write_queue_entries = config.max_write_queue_entries,
             .protected_bytes = config.protected_bytes,
         };
-        if (self.cfg.lake_cache_root orelse config.root) |root| {
-            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, root, policy, .{ .resource_manager = self.cfg.resource_manager });
-        } else {
-            const node = self.cfg.node_config orelse return;
-            const base = node.storage.local_base_dir orelse
-                (if (node.storage.lite_path) |path| std.fs.path.dirname(path) orelse "." else return);
-            const path = try std.fs.path.join(self.alloc, &.{ base, "cache", "lake-ranges" });
-            defer self.alloc.free(path);
-            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, path, policy, .{ .resource_manager = self.cfg.resource_manager });
-            return;
-        }
+        try self.lake_read_cache.ensurePersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {
@@ -13553,6 +13587,13 @@ pub const ApiHttpServer = struct {
         return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation);
     }
 
+    /// Only use at read-only preparation boundaries, never around commit.
+    /// Generic catalog unavailability after admission does not prove abort.
+    fn precommitIntegrityPreparationError(err: anyerror) anyerror {
+        const classified = @import("antfly_local_sources").api_relational_integrity_commit.preparationError(err);
+        return if (classified == error.IntegrityCatalogUnavailable) error.PreDecisionReadUnavailable else classified;
+    }
+
     fn commitPublicTableBatchWithIntegrity(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -13638,7 +13679,7 @@ pub const ApiHttpServer = struct {
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else blk: {
             const optimistic = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| {
-                if (err != error.PreparedGenerationChanged) return err;
+                if (err != error.PreparedGenerationChanged) return precommitIntegrityPreparationError(err);
                 // Preparation only reads and owns speculative commands; no
                 // transaction has begun. Rebind the entire plan once against
                 // a read-indexed catalog, under the original deadline.
@@ -13648,7 +13689,7 @@ pub const ApiHttpServer = struct {
                 if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables)) {
                     return self.commitPublicBatchWithPolicy(alloc, source, tables, snapshot.tables, sync_level, request);
                 }
-                break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
+                break :blk integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |read_err| return precommitIntegrityPreparationError(read_err);
             };
             break :blk optimistic;
         };
@@ -13659,7 +13700,7 @@ pub const ApiHttpServer = struct {
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         try self.authorizeIntegrityMutations(request, prepared.tables);
         if (request.relational_recovery == .none) {
-            integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return integrity.preparationError(err);
+            integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return precommitIntegrityPreparationError(err);
         }
         return self.commitPublicBatchWithPolicy(alloc, source, prepared.tables, snapshot.tables, sync_level, request);
     }
@@ -13788,6 +13829,7 @@ pub const ApiHttpServer = struct {
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
             error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
+            error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that
             // definite result instead of the generic unknown-write 503.
             error.ConstraintActivationPending => return error.ConstraintActivationUnavailable,
@@ -39890,6 +39932,9 @@ test "api http server coordinated batch outcomes retain prepared names and confl
     const Fake = struct {
         db: *db_mod.DB,
         committed: bool = false,
+        read_failure: ?anyerror = null,
+        commit_failure: ?anyerror = null,
+        commit_calls: usize = 0,
         expected_key: ?[]u8 = null,
         snapshots_released: usize = 0,
         tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 701, .name = "lifetime_rows", .placement_role = "data", .schema_json = public_schema }},
@@ -39908,6 +39953,7 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         }
         fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, _: read_gate.ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.read_failure) |err| return err;
             const value = (try self.db.lookup(allocator, key, opts)) orelse return null;
             return .{ .json = value.json, .version = value.version orelse 0, .expected_content_digest = value.expected_content_digest };
         }
@@ -39925,6 +39971,8 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         }
         fn commit(ptr: *anyopaque, _: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) !?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            if (self.commit_failure) |err| return err;
             try std.testing.expectEqual(@as(usize, 1), tables.len);
             try std.testing.expectEqual(@as(usize, 1), tables[0].integrity_commands.len);
             // Return the actual arena-owned slices, not copies that could
@@ -39966,6 +40014,17 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
     }
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots_released);
+    const calls = fake.commit_calls;
+    var retained: ?integrity.Prepared = null;
+    defer if (retained) |*prepared| prepared.deinit();
+    fake.read_failure = error.StorageReadTemporarilyUnavailable;
+    try std.testing.expectError(error.PreDecisionReadUnavailable, server.commitPublicTableBatchWithIntegrity(alloc, writer, &requests, .write, .{}, &retained));
+    try std.testing.expect(retained == null);
+    try std.testing.expectEqual(calls, fake.commit_calls);
+    fake.read_failure = null;
+    fake.commit_failure = error.CommitDecisionUnknown;
+    try std.testing.expectError(error.CommitDecisionUnknown, server.commitPublicTableBatchWithIntegrity(alloc, writer, &requests, .write, .{}, &retained));
+    try std.testing.expectEqual(calls + 1, fake.commit_calls);
 }
 
 test "api http server stale no-FK catalog cannot take uncoordinated batch path" {

@@ -1,0 +1,225 @@
+{
+  "reference": "PostgreSQL 18 partial-index constant bounds",
+  "entries": [
+    {
+      "identity": "numeric",
+      "sql": "CAST(CAST(9007199254740993.5 AS bigint) AS numeric)",
+      "expected": "9007199254740994"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST(1 AS numeric)",
+      "expected": "1"
+    },
+    {
+      "identity": "numeric",
+      "sql": "9007199254740993.2500+0.0001",
+      "expected": "9007199254740993.2501"
+    },
+    {
+      "identity": "numeric",
+      "sql": "-(9007199254740993.2500)",
+      "expected": "-9007199254740993.2500"
+    },
+    {
+      "identity": "numeric",
+      "sql": "1.00/8.0",
+      "expected": "0.12500000000000000000"
+    },
+    {
+      "identity": "numeric",
+      "sql": "10.50%3.0",
+      "expected": "1.50"
+    },
+    {
+      "identity": "numeric",
+      "sql": "COALESCE(NULL::numeric,1.2500)",
+      "expected": "1.2500"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CASE WHEN true THEN 1.2500 ELSE 1.0/0.0 END",
+      "expected": "1.2500"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CASE WHEN false THEN 1.0/0.0 ELSE 1.2500 END",
+      "expected": "1.2500"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST(CAST(0.1 AS real) AS numeric)",
+      "expected": "0.1"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST(CAST(0.1 AS double precision) AS numeric)",
+      "expected": "0.1"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST('NaN' AS numeric)",
+      "expected": "NaN"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST('Infinity' AS numeric)",
+      "expected": "Infinity"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST('-Infinity' AS numeric)",
+      "expected": "-Infinity"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST(NULL AS numeric)",
+      "expected": null
+    },
+    {
+      "identity": "numeric",
+      "sql": "1e-99+1e-100",
+      "expected": "0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011"
+    },
+    {
+      "identity": "numeric",
+      "sql": "1.0/0.0",
+      "error": "22012"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST('not-a-number' AS numeric)",
+      "error": "22P02"
+    },
+    {
+      "identity": "numeric",
+      "sql": "CAST('1e131072' AS numeric)",
+      "error": "22003"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(9007199254740993.5 AS bigint)",
+      "expected": "9007199254740994"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(-9007199254740993.5 AS bigint)",
+      "expected": "-9007199254740994"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(2.5 AS bigint)",
+      "expected": "3"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(-2.5 AS bigint)",
+      "expected": "-3"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(CAST(2.5 AS double precision) AS bigint)",
+      "expected": "2"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(9223372036854775807.5 AS bigint)",
+      "error": "22003"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(-9223372036854775808.5 AS bigint)",
+      "error": "22003"
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(NULL AS bigint)",
+      "expected": null
+    },
+    {
+      "identity": "int64",
+      "sql": "CAST(2 AS bigint)+CAST(3 AS bigint)",
+      "expected": "5"
+    },
+    {
+      "identity": "int16",
+      "sql": "CAST(32767.4 AS smallint)",
+      "expected": "32767"
+    },
+    {
+      "identity": "int16",
+      "sql": "CAST(32767.5 AS smallint)",
+      "error": "22003"
+    },
+    {
+      "identity": "int32",
+      "sql": "CAST(2147483647.5 AS integer)",
+      "error": "22003"
+    },
+    {
+      "identity": "int32",
+      "sql": "2147483647+1",
+      "error": "22003"
+    },
+    {
+      "identity": "float32",
+      "sql": "CAST(0.100000001490116119384765625 AS real)",
+      "expected": "0.1"
+    },
+    {
+      "identity": "float32",
+      "sql": "CAST(16777217 AS real)",
+      "expected": "1.6777216e+07"
+    },
+    {
+      "identity": "float32",
+      "sql": "CAST(1e-45 AS real)",
+      "expected": "1e-45"
+    },
+    {
+      "identity": "float32",
+      "sql": "CAST(1e-1000 AS real)",
+      "error": "22003"
+    },
+    {
+      "identity": "float64",
+      "sql": "CAST(9007199254740993.5 AS double precision)",
+      "expected": "9.007199254740994e+15"
+    },
+    {
+      "identity": "float64",
+      "sql": "CAST(0.1+0.2 AS double precision)",
+      "expected": "0.3"
+    },
+    {
+      "identity": "float64",
+      "sql": "CAST(1e400 AS double precision)",
+      "error": "22003"
+    },
+    {
+      "identity": "text",
+      "sql": "lower('READY')",
+      "expected": "ready"
+    },
+    {
+      "identity": "text",
+      "sql": "'left'||'right'",
+      "expected": "leftright"
+    },
+    {
+      "identity": "text",
+      "sql": "COALESCE(NULL::text,'ready')",
+      "expected": "ready"
+    },
+    {
+      "identity": "boolean",
+      "sql": "true AND false",
+      "expected": "false"
+    },
+    {
+      "identity": "boolean",
+      "sql": "CASE WHEN true THEN true ELSE false END",
+      "expected": "true"
+    }
+  ]
+}

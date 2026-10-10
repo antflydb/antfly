@@ -309,7 +309,7 @@ test "relational mutation expression composite keys use the unified generated co
     defer alloc.free(projected);
     try std.testing.expect(std.mem.indexOf(u8, projected, "\"value\":\"9007199254740993\"") != null);
     // Admission and projection use the same lossless literal spelling.
-    try std.testing.expectEqualStrings("9007199254740993", definition.keys[1].expression.?.args.?[1].value.?.string);
+    try std.testing.expectEqualStrings("9007199254740993", definition.keys[1].expression.?.args.?[1].value.value.string);
     const roundtrip = try create(alloc, created, "computed", projected);
     defer @import("../metadata/table_manager.zig").freeTable(alloc, roundtrip);
     try std.testing.expectEqual(try tables.schemaVersion(created.schema_json), try tables.schemaVersion(roundtrip.schema_json));

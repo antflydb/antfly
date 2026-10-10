@@ -27,7 +27,9 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 8;
+// Includes v8 ordered producer identities and stored projection coverage.
+// Never reuse a v8 source-free segment as a covered stored-text sidecar.
+pub const metadata_version: u16 = 9;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
 /// Source duplication is an explicit per-index policy. The complete config
@@ -83,6 +85,9 @@ pub const FileGroup = struct {
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
+    /// Stored JSON contains exactly the binding projection, never an implicit
+    /// full source document. Older publications require a format refresh.
+    stored_projection: bool = false,
     domain: [32]u8,
     binding: local.serverless_segment_source_binding.Binding,
     config_json: []const u8,
@@ -278,7 +283,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v6:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v9:{s}", .{want.binding.index_config_hash});
         const recipe = sourceRecipe(table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -354,8 +359,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     previous_id = id[0..96].*;
                     input_bytes +|= id.len + 128;
                     const before = builder.batch().docs.len;
-                    const stored_data = if (store_source) try std.json.Stringify.valueAlloc(ba, root, .{}) else "";
-                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored_data, .typed_source = null });
+                    const stored = if (store_source) try std.json.Stringify.valueAlloc(ba, root, .{}) else "";
+                    input_bytes +|= stored.len;
+                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
                     if (builder.batch().docs.len != before) {
                         if (ref != .external) return error.InvalidNativeLakeTextCorpus;
                         try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
@@ -376,7 +382,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
         }
-        var root: Root = .{ .seekable = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        var root: Root = .{ .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
         // Publish one immutable manifest per file. Large corpora do not put
         // every native segment reference (twice) into the root artifact.

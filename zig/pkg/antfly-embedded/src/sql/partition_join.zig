@@ -502,7 +502,14 @@ pub const Join = struct {
                     self.partition += 1;
                 }
             }
-            self.hash = try operators.HashJoin.create(self.a, self.limits);
+            var build_limits = self.limits;
+            if (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+                // Input decoding, probe scratch and the enclosing operator are
+                // already live. A build's allowance must use remaining shared
+                // capacity, not the original statement ceiling a second time.
+                build_limits.bytes = @min(build_limits.bytes, available - available / 4);
+            }
+            self.hash = try operators.HashJoin.create(self.a, build_limits);
             var hash_union: u64 = 0;
             var hash_intersection: u64 = std.math.maxInt(u64);
             var repartitioned = false;

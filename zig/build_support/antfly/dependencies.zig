@@ -336,8 +336,11 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "system_catalog.policies" }) });
-    const run_sql_tests = b.addRunArtifact(sql_tests);
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    // Use the same exact-filter runner as extracted SQL owners. Besides
+    // consistent failure/leak attribution, this keeps compile-only anonymous
+    // reachability anchors out of runtime selection.
+    const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 3072 * 1024 * 1024;
@@ -346,6 +349,26 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const relation_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_relation_name_tests = b.addRunArtifact(relation_name_tests);
+    relation_name_tests.root_module.addImport("antfly_platform", platform_mod);
+    b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
+        .dependOn(&run_relation_name_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    relation_reconciliation_tests.root_module.addImport("antfly_platform", platform_mod);
+    const run_relation_reconciliation_tests = b.addRunArtifact(relation_reconciliation_tests);
+    b.step("system-catalog-reconciliation-test", "Test resumable, fenced relation ownership reconciliation")
+        .dependOn(&run_relation_reconciliation_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_reconciliation_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
         .target = target,
@@ -573,6 +596,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
+    regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -1216,6 +1241,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .casbin = casbin_mod,
         .fst = fst_mod,
         .regex = regex_mod,
+        .sql_regex = sql_regex_mod,
         .json = json_mod,
         .jsonschema = jsonschema_mod,
         .mcp = mcp_mod,
@@ -1250,6 +1276,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
+    sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
@@ -1263,6 +1290,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_sql_regex", sql_regex_mod);
     refinement_bench_mod.addImport("antfly_hash", hash_mod);
     refinement_bench_mod.addImport("bloom", bloom_mod);
     refinement_bench_mod.link_libc = link_libc;

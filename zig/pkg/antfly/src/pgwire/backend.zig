@@ -18,8 +18,14 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, unknown };
-pub const Column = struct { name: []const u8, type: Type };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
+pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
+pub const Column = struct {
+    name: []const u8,
+    type: Type,
+    element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
+    numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
+};
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {
@@ -31,6 +37,7 @@ pub const Request = struct {
     statement: []const u8,
     parameters: []const std.json.Value = &.{},
     parameter_types: []const Type = &.{},
+    parameter_descriptors: []const Parameter = &.{},
     database: ?[]const u8 = null,
     namespace: ?[]const u8 = null,
     /// Ordered lookup candidates for unqualified SQL relations. The first
@@ -87,6 +94,7 @@ pub const MutationOutcome = enum { committed, committed_pending, committed_repai
 pub const Description = struct {
     columns: []const Column = &.{},
     parameter_types: []const Type = &.{},
+    parameter_descriptors: []const Parameter = &.{},
     binding_guard: ?[]const u8 = null,
     setting_epoch: ?u64 = null,
 };

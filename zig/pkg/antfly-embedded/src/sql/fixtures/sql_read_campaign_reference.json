@@ -1,0 +1,6492 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "keyword"
+              },
+              "name": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword"
+              },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "customer_id": {
+                "type": "keyword"
+              },
+              "created_at": {
+                "type": "keyword"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "keyword"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "metadata": {
+                "type": "json"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "r01",
+        "value": {
+          "id": "u1",
+          "name": "Ada",
+          "status": "active",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r02",
+        "value": {
+          "id": "u2",
+          "name": "Grace",
+          "status": "ready",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 6,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-02T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r03",
+        "value": {
+          "id": "u3",
+          "name": "Other",
+          "status": "pending",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 9,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-03T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r04",
+        "value": {
+          "id": "u4",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-04T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r05",
+        "value": {
+          "id": "u5",
+          "name": "Grace",
+          "status": "closed",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 15,
+          "quantity": 1,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-05T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r06",
+        "value": {
+          "id": "u6",
+          "name": "Other",
+          "status": "draft",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 18,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-06T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r07",
+        "value": {
+          "id": "u7",
+          "name": "Ada",
+          "status": "queued",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 21,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-07T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r08",
+        "value": {
+          "id": "u8",
+          "name": "Grace",
+          "status": "deleted",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 24,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-08T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r09",
+        "value": {
+          "id": "u9",
+          "name": "Other",
+          "status": "archived",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 27,
+          "quantity": 1,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-09T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r10",
+        "value": {
+          "id": "u10",
+          "name": "Ada",
+          "status": "active-123",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 30,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-10T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r11",
+        "value": {
+          "id": "u11",
+          "name": "Grace",
+          "status": "--active-",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 33,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-11T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r12",
+        "value": {
+          "id": "u12",
+          "name": "Other",
+          "status": "active-user",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 36,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-12T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r13",
+        "value": {
+          "id": "u13",
+          "name": "Ada",
+          "status": "active ready",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 39,
+          "quantity": 1,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-13T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r14",
+        "value": {
+          "id": "u14",
+          "name": "Grace",
+          "status": "hello",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 42,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-14T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r15",
+        "value": {
+          "id": "u15",
+          "name": "Other",
+          "status": "a_b",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 45,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-15T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r16",
+        "value": {
+          "id": "u16",
+          "name": "Ada",
+          "status": "active  user",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 48,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-16T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r17",
+        "value": {
+          "id": "u17",
+          "name": "Grace",
+          "status": "manual",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 51,
+          "quantity": 1,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-17T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "manual",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r18",
+        "value": {
+          "id": "u18",
+          "name": "Other",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 54,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-18T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "autoscale_delta",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r19",
+        "value": {
+          "id": "u19",
+          "name": "Ada",
+          "status": "ready",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 57,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-19T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "meter",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r20",
+        "value": {
+          "id": "u20",
+          "name": "Grace",
+          "status": "ready",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 60,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-20T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "meter",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r21",
+        "value": {
+          "id": "u21",
+          "name": "Other",
+          "status": "ready",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 63,
+          "quantity": 1,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-21T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "meter",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r22",
+        "value": {
+          "id": "u22",
+          "name": "Ada",
+          "status": "ready",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 66,
+          "quantity": 2,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-22T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "cold"
+          ],
+          "metadata": {
+            "source": "meter",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "r23",
+        "value": {
+          "id": "u23",
+          "name": "Grace",
+          "status": "ready",
+          "organization_id": "org_1",
+          "email": "grace@example.test",
+          "amount": 69,
+          "quantity": 3,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-23T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [],
+          "metadata": {
+            "source": "meter",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "r24",
+        "value": {
+          "id": "u24",
+          "name": "Other",
+          "status": "ready",
+          "organization_id": "org_2",
+          "email": "blocked@example.test",
+          "amount": 72,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2025-01-24T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "hot",
+            null,
+            "new"
+          ],
+          "metadata": {
+            "source": "meter",
+            "kind": "internal",
+            "flags": [],
+            "billing": {
+              "plan": "free"
+            }
+          }
+        }
+      },
+      {
+        "key": "c1",
+        "value": {
+          "id": "c1",
+          "name": "Ada Customer",
+          "status": "customer",
+          "organization_id": "org_2",
+          "email": "customer@example.test",
+          "amount": 0,
+          "quantity": 0,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2024-12-31T00:00:00Z",
+          "enabled": true,
+          "kind": "customer",
+          "tags": [],
+          "metadata": {
+            "source": "internal",
+            "flags": []
+          }
+        }
+      },
+      {
+        "key": "c2",
+        "value": {
+          "id": "c2",
+          "name": "Grace Customer",
+          "status": "customer",
+          "organization_id": "org_2",
+          "email": "customer@example.test",
+          "amount": 0,
+          "quantity": 0,
+          "tenant_id": "t2",
+          "customer_id": "c2",
+          "created_at": "2024-12-31T00:00:00Z",
+          "enabled": true,
+          "kind": "customer",
+          "tags": [],
+          "metadata": {
+            "source": "internal",
+            "flags": []
+          }
+        }
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0166",
+      "columns": [
+        "id",
+        "source",
+        "flags"
+      ],
+      "rows": [
+        [
+          "u19",
+          "meter",
+          [
+            "rated"
+          ]
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        3802
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0169",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u24"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0182",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u24"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0188",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0189",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0191",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u18"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u12"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0192",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u18"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u12"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0193",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u17"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u5"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0195",
+      "columns": [
+        "id",
+        "flag_count"
+      ],
+      "rows": [
+        [
+          "u2",
+          1
+        ],
+        [
+          "u4",
+          1
+        ],
+        [
+          "u5",
+          1
+        ],
+        [
+          "u7",
+          1
+        ],
+        [
+          "u1",
+          1
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        23
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u1",
+              1
+            ],
+            [
+              "u2",
+              1
+            ],
+            [
+              "u4",
+              1
+            ],
+            [
+              "u5",
+              1
+            ],
+            [
+              "u7",
+              1
+            ],
+            [
+              "u8",
+              1
+            ],
+            [
+              "u10",
+              1
+            ],
+            [
+              "u11",
+              1
+            ],
+            [
+              "u13",
+              1
+            ],
+            [
+              "u14",
+              1
+            ],
+            [
+              "u16",
+              1
+            ],
+            [
+              "u17",
+              1
+            ],
+            [
+              "u19",
+              1
+            ],
+            [
+              "u20",
+              1
+            ],
+            [
+              "u22",
+              1
+            ],
+            [
+              "u23",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0196",
+      "columns": [
+        "id",
+        "flags_type"
+      ],
+      "rows": [
+        [
+          "c1",
+          "array"
+        ],
+        [
+          "c2",
+          "array"
+        ],
+        [
+          "u1",
+          "array"
+        ],
+        [
+          "u2",
+          "array"
+        ],
+        [
+          "u3",
+          "array"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0197",
+      "columns": [
+        "id",
+        "has_flags"
+      ],
+      "rows": [
+        [
+          "c1",
+          true
+        ],
+        [
+          "c2",
+          true
+        ],
+        [
+          "u1",
+          true
+        ],
+        [
+          "u10",
+          true
+        ],
+        [
+          "u11",
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        16
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0198",
+      "columns": [
+        "id",
+        "has_any_key"
+      ],
+      "rows": [
+        [
+          "u1",
+          true
+        ],
+        [
+          "u10",
+          true
+        ],
+        [
+          "u11",
+          true
+        ],
+        [
+          "u12",
+          true
+        ],
+        [
+          "u13",
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        16
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0199",
+      "columns": [
+        "id",
+        "plan"
+      ],
+      "rows": [
+        [
+          "u1",
+          "pro"
+        ],
+        [
+          "u3",
+          "pro"
+        ],
+        [
+          "u5",
+          "pro"
+        ],
+        [
+          "u7",
+          "pro"
+        ],
+        [
+          "u9",
+          "pro"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0202",
+      "columns": [
+        "id",
+        "status_prefix",
+        "status_bucket",
+        "status_overlay",
+        "status_translated",
+        "dash_pos",
+        "status_left",
+        "status_right",
+        "status_lpad",
+        "status_rpad",
+        "status_repeat",
+        "status_reverse"
+      ],
+      "rows": [
+        [
+          "u4",
+          "ope",
+          "",
+          "oXen",
+          "open",
+          0,
+          "open",
+          "open",
+          "000000open",
+          "open______",
+          "openopen",
+          "nepo"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        25,
+        25,
+        25,
+        23,
+        25,
+        25,
+        25,
+        25,
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0205",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u18"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u9"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "c1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u22"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u21"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u20"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u19"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u18"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u17"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u16"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u15"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u14"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u13"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u12"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u11"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u10"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u9"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u8"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u7"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u6"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u5"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u4"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u2"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u1"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c2"
+            ],
+            [
+              "c1"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0206",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u24"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u18"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u9"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "c1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u24"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u23"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u22"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u21"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u20"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u19"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u18"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u17"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u16"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u15"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u14"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u13"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u12"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u11"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u10"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u9"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u8"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u7"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u6"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u5"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u4"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u2"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u1"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c2"
+            ],
+            [
+              "c1"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0207",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0209",
+      "columns": [
+        "email_key",
+        "usage_id"
+      ],
+      "rows": [
+        [
+          "ada@example.test",
+          "u7"
+        ],
+        [
+          "ada@example.test",
+          "u4"
+        ],
+        [
+          "ada@example.test",
+          "u22"
+        ],
+        [
+          "ada@example.test",
+          "u19"
+        ],
+        [
+          "ada@example.test",
+          "u16"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0214",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0216",
+      "columns": [
+        "id",
+        "status_digits"
+      ],
+      "rows": [
+        [
+          "u10",
+          1
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        23
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0218",
+      "columns": [
+        "id",
+        "status_digit_pos"
+      ],
+      "rows": [
+        [
+          "u10",
+          8
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        23
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0220",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0221",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0222",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0225",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u18"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u24"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u9"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0226",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u18"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0227",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u19"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0228",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0230",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0231",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0232",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0233",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u12"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u4"
+            ],
+            [
+              "u8"
+            ],
+            [
+              "u12"
+            ],
+            [
+              "u16"
+            ],
+            [
+              "u20"
+            ],
+            [
+              "u24"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u9"
+            ],
+            [
+              "u21"
+            ],
+            [
+              "u13"
+            ],
+            [
+              "u17"
+            ],
+            [
+              "u5"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u14"
+            ],
+            [
+              "u22"
+            ],
+            [
+              "u18"
+            ],
+            [
+              "u10"
+            ],
+            [
+              "u6"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u7"
+            ],
+            [
+              "u11"
+            ],
+            [
+              "u23"
+            ],
+            [
+              "u15"
+            ],
+            [
+              "u19"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ],
+            [
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0238",
+      "columns": [
+        "max_amount",
+        "min_amount"
+      ],
+      "rows": [
+        [
+          36,
+          0
+        ],
+        [
+          48,
+          0
+        ],
+        [
+          12,
+          0
+        ],
+        [
+          24,
+          0
+        ],
+        [
+          60,
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        20,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              12,
+              0
+            ],
+            [
+              60,
+              0
+            ],
+            [
+              48,
+              0
+            ],
+            [
+              72,
+              0
+            ],
+            [
+              24,
+              0
+            ],
+            [
+              36,
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              27,
+              1
+            ],
+            [
+              15,
+              1
+            ],
+            [
+              51,
+              1
+            ],
+            [
+              63,
+              1
+            ],
+            [
+              39,
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              42,
+              2
+            ],
+            [
+              18,
+              2
+            ],
+            [
+              30,
+              2
+            ],
+            [
+              12,
+              2
+            ],
+            [
+              54,
+              2
+            ],
+            [
+              66,
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              45,
+              3
+            ],
+            [
+              33,
+              3
+            ],
+            [
+              21,
+              3
+            ],
+            [
+              69,
+              3
+            ],
+            [
+              57,
+              3
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0239",
+      "columns": [
+        "id",
+        "status_bytes"
+      ],
+      "rows": [
+        [
+          "u16",
+          12
+        ],
+        [
+          "u13",
+          12
+        ],
+        [
+          "u12",
+          11
+        ],
+        [
+          "u10",
+          10
+        ],
+        [
+          "u11",
+          9
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        23
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u16",
+              12
+            ],
+            [
+              "u13",
+              12
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u12",
+              11
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u10",
+              10
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u11",
+              9
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c1",
+              8
+            ],
+            [
+              "c2",
+              8
+            ],
+            [
+              "u9",
+              8
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3",
+              7
+            ],
+            [
+              "u8",
+              7
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u7",
+              6
+            ],
+            [
+              "u5",
+              6
+            ],
+            [
+              "u1",
+              6
+            ],
+            [
+              "u17",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u24",
+              5
+            ],
+            [
+              "u14",
+              5
+            ],
+            [
+              "u23",
+              5
+            ],
+            [
+              "u6",
+              5
+            ],
+            [
+              "u19",
+              5
+            ],
+            [
+              "u20",
+              5
+            ],
+            [
+              "u21",
+              5
+            ],
+            [
+              "u22",
+              5
+            ],
+            [
+              "u2",
+              5
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u4",
+              4
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0240",
+      "columns": [
+        "id",
+        "status_bits"
+      ],
+      "rows": [
+        [
+          "u16",
+          96
+        ],
+        [
+          "u13",
+          96
+        ],
+        [
+          "u12",
+          88
+        ],
+        [
+          "u10",
+          80
+        ],
+        [
+          "u11",
+          72
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        23
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u16",
+              96
+            ],
+            [
+              "u13",
+              96
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u12",
+              88
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u10",
+              80
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u11",
+              72
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c1",
+              64
+            ],
+            [
+              "c2",
+              64
+            ],
+            [
+              "u9",
+              64
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u8",
+              56
+            ],
+            [
+              "u3",
+              56
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u5",
+              48
+            ],
+            [
+              "u17",
+              48
+            ],
+            [
+              "u1",
+              48
+            ],
+            [
+              "u7",
+              48
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u6",
+              40
+            ],
+            [
+              "u24",
+              40
+            ],
+            [
+              "u2",
+              40
+            ],
+            [
+              "u14",
+              40
+            ],
+            [
+              "u22",
+              40
+            ],
+            [
+              "u23",
+              40
+            ],
+            [
+              "u19",
+              40
+            ],
+            [
+              "u20",
+              40
+            ],
+            [
+              "u21",
+              40
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u4",
+              32
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u15",
+              24
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0241",
+      "columns": [
+        "status_trimmed"
+      ],
+      "rows": [
+        [
+          "active"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0242",
+      "columns": [
+        "status_clean"
+      ],
+      "rows": [
+        [
+          "active"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0243",
+      "columns": [
+        "status_words"
+      ],
+      "rows": [
+        [
+          "active user"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0244",
+      "columns": [
+        "status_key"
+      ],
+      "rows": [
+        [
+          "active-#"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0245",
+      "columns": [
+        "status_translated"
+      ],
+      "rows": [
+        [
+          "hello"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0246",
+      "columns": [
+        "status_label"
+      ],
+      "rows": [
+        [
+          "active:u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0248",
+      "columns": [
+        "status_mid"
+      ],
+      "rows": [
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0249",
+      "columns": [
+        "status_overlay"
+      ],
+      "rows": [
+        [
+          "aXve"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0250",
+      "columns": [
+        "status_part"
+      ],
+      "rows": [
+        [
+          "123"
+        ],
+        [
+          ""
+        ],
+        [
+          "user"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0251",
+      "columns": [
+        "dash_pos"
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          7
+        ],
+        [
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        23
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0253",
+      "columns": [
+        "status_padded"
+      ],
+      "rows": [
+        [
+          "00active"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0254",
+      "columns": [
+        "status_twice"
+      ],
+      "rows": [
+        [
+          "activeactive"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0255",
+      "columns": [
+        "status_reversed"
+      ],
+      "rows": [
+        [
+          "evitca"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0256",
+      "columns": [
+        "status_title"
+      ],
+      "rows": [
+        [
+          "Active Ready"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0258",
+      "columns": [
+        "status_has_prefix"
+      ],
+      "rows": [
+        [
+          true
+        ],
+        [
+          true
+        ],
+        [
+          true
+        ],
+        [
+          true
+        ],
+        [
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        16
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0271",
+      "columns": [
+        "status_key"
+      ],
+      "rows": [
+        [
+          "active:u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0272",
+      "columns": [
+        "id",
+        "metadata_view"
+      ],
+      "rows": [
+        [
+          "u1",
+          {
+            "amount": 12,
+            "source": "api"
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        3802
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0273",
+      "columns": [
+        "id",
+        "status_json"
+      ],
+      "rows": [
+        [
+          "c1",
+          "customer"
+        ],
+        [
+          "c2",
+          "customer"
+        ],
+        [
+          "u1",
+          "active"
+        ],
+        [
+          "u10",
+          "active-123"
+        ],
+        [
+          "u11",
+          "--active-"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        3802
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0275",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u19"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0276",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0277",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0278",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0279",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u19"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0281",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u18"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0282",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u18"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0284",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0302",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u5"
+        ],
+        [
+          "u3"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u5"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-0454",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0455",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0457",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0458",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u8"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0491",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0511",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0512",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0514",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u4"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0515",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u8"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0554",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u9"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u18"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u24"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0555",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0556",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u11"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u13"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0557",
+      "columns": [
+        "id",
+        "status_doc"
+      ],
+      "rows": [
+        [
+          "u18",
+          {
+            "status": null
+          }
+        ],
+        [
+          "u11",
+          {
+            "status": "--active-"
+          }
+        ],
+        [
+          "u15",
+          {
+            "status": "a_b"
+          }
+        ],
+        [
+          "u1",
+          {
+            "status": "active"
+          }
+        ],
+        [
+          "u16",
+          {
+            "status": "active  user"
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        3802
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0560",
+      "columns": [
+        "customer_id",
+        "modal_status"
+      ],
+      "rows": [
+        [
+          "c1",
+          "ready"
+        ],
+        [
+          "c2",
+          "ready"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0561",
+      "columns": [
+        "customer_id",
+        "amount_percentiles"
+      ],
+      "rows": [
+        [
+          "c1",
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              15.0,
+              33.0,
+              51.0
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false
+            ]
+          }
+        ],
+        [
+          "c2",
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              18.0,
+              36.0,
+              54.0
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false
+            ]
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1022
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0562",
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0563",
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0564",
+      "columns": [
+        "customer_id",
+        "open_median"
+      ],
+      "rows": [
+        [
+          "c1",
+          null
+        ],
+        [
+          "c2",
+          12.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0565",
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33
+        ],
+        [
+          "c2",
+          36
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0566",
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1205",
+      "columns": [
+        "order_id",
+        "customer_name",
+        "amount"
+      ],
+      "rows": [
+        [
+          "u20",
+          "Grace Customer",
+          60
+        ],
+        [
+          "u19",
+          "Ada Customer",
+          57
+        ],
+        [
+          "u18",
+          "Grace Customer",
+          54
+        ],
+        [
+          "u17",
+          "Ada Customer",
+          51
+        ],
+        [
+          "u16",
+          "Grace Customer",
+          48
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ],
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        20
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1206",
+      "columns": [
+        "order_id",
+        "customer_name"
+      ],
+      "rows": [
+        [
+          "u1",
+          "Ada Customer"
+        ],
+        [
+          "u10",
+          "Grace Customer"
+        ],
+        [
+          "u11",
+          "Ada Customer"
+        ],
+        [
+          "u12",
+          "Grace Customer"
+        ],
+        [
+          "u13",
+          "Ada Customer"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1226",
+      "columns": [
+        "organization_id",
+        "openish_count"
+      ],
+      "rows": [
+        [
+          "org_1",
+          6
+        ],
+        [
+          "org_2",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "org_1",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_2",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1227",
+      "columns": [
+        "organization_id",
+        "openish_count"
+      ],
+      "rows": [
+        [
+          "org_1",
+          6
+        ],
+        [
+          "org_2",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "org_1",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_2",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1265",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u24"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u20"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1268",
+      "columns": [
+        "order_id",
+        "customer_id"
+      ],
+      "rows": [
+        [
+          "u1",
+          "c1"
+        ],
+        [
+          "u10",
+          "c2"
+        ],
+        [
+          "u11",
+          "c1"
+        ],
+        [
+          "u12",
+          "c2"
+        ],
+        [
+          "u13",
+          "c1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1269",
+      "columns": [
+        "order_id",
+        "customer_id"
+      ],
+      "rows": [
+        [
+          "u1",
+          "c1"
+        ],
+        [
+          "u10",
+          "c2"
+        ],
+        [
+          "u11",
+          "c1"
+        ],
+        [
+          "u12",
+          "c2"
+        ],
+        [
+          "u13",
+          "c1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1340",
+      "columns": [
+        "order_id",
+        "customer_name"
+      ],
+      "rows": [
+        [
+          "c1",
+          "Ada Customer"
+        ],
+        [
+          "c2",
+          "Grace Customer"
+        ],
+        [
+          "u1",
+          "Ada Customer"
+        ],
+        [
+          "u10",
+          "Grace Customer"
+        ],
+        [
+          "u11",
+          "Ada Customer"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1578",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}
