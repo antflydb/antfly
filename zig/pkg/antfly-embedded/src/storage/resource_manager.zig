@@ -1183,6 +1183,14 @@ pub const ResourceManager = struct {
                 .policy = options.policies[i],
             };
         }
+        // Whole source documents are buffered in this slice before parsing, so
+        // the default caps ingestible remote documents at roughly 256 MiB.
+        // Operators ingesting larger sources can raise it explicitly.
+        const extraction_hard = @import("antfly_platform").env.getenvU64("ANTFLY_DOCUMENT_EXTRACTION_WORKING_SET_BYTES") orelse 0;
+        if (extraction_hard > 0) slices[sliceIndex(.document_extraction_working_set)].budget = .{
+            .soft_limit_bytes = extraction_hard / 4 * 3,
+            .hard_limit_bytes = extraction_hard,
+        };
         const high_sequences = options.derived_backlog_high_sequences;
         return .{
             .memory = .{ .budget = options.memory_budget },
