@@ -51,7 +51,15 @@ pub const Limits = struct {
     max_attention_scratch_bytes: usize = 8 * 1024 * 1024,
 };
 
-pub const Options = struct { limits: Limits = .{}, control: ?Control = null };
+/// Optional owner-managed scope for a hybrid host backend. Browser sessions
+/// enable WebGPU only around the encoder and restore CPU mode before heads.
+/// Native serving leaves this null; it confers no qualification or admission.
+pub const EncoderScope = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque) void,
+    leave: *const fn (*anyopaque) void,
+};
+pub const Options = struct { limits: Limits = .{}, control: ?Control = null, scope: ?EncoderScope = null };
 
 pub const RelationRoute = struct {
     group_index: usize,
@@ -369,14 +377,34 @@ const CombinedControl = struct {
 /// The caller owns beginRequest/endRequest and backend workspace admission.
 /// All returned states are owned; the full subword tensor is released here.
 pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const boundary.Config, prepared: *const processor.PreparedBatch, options: Options) !Result {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
-    if (config.encoder.family != .deberta) return error.UnsupportedGlinerBoundaryEncoder;
+    // The host encoder contract is also implemented by WasmCompute. Device
+    // admission/qualification remains the responsibility of the caller.
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
+    if (config.encoder.family != .deberta and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryEncoder;
     try cb.checkExecutionControl();
     const checked = try plan(config, prepared, options);
+    if (options.scope) |scope| scope.enter(scope.ptr);
+    defer if (options.scope) |scope| scope.leave(scope.ptr);
     var combined = CombinedControl{ .first = cb.execution_control, .second = options.control };
     var request_backend = cb.*;
     request_backend.execution_control = combined.view();
-    const states = try deberta.forward(&request_backend, allocator, config.encoder.toDeberta(), prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length);
+    const states = if (config.encoder.family == .deberta)
+        try deberta.forward(&request_backend, allocator, config.encoder.toDeberta(), prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length)
+    else blk: {
+        const e = config.encoder;
+        const modern = @import("../modern_bert.zig");
+        const cfg: modern.Config = .{ .vocab_size = e.vocab_size, .hidden_size = e.hidden_size, .num_hidden_layers = e.num_hidden_layers, .num_attention_heads = e.num_attention_heads, .intermediate_size = e.intermediate_size, .max_position_embeddings = e.max_position_embeddings, .global_rope_theta = e.global_rope_theta, .local_rope_theta = e.local_rope_theta, .global_attn_every_n_layers = e.global_attn_every_n_layers, .local_attention_window = e.local_attention_window, .layer_norm_eps = e.layer_norm_eps, .rope_interleaved = false, .checkpoint_layout = .huggingface_fused_qkv_no_bias };
+        const hidden = try modern.forwardCT(&request_backend, allocator, cfg, prepared.input_ids, prepared.attention_mask, checked.batch, prepared.sequence_length);
+        defer request_backend.free(hidden);
+        if (config.neck == .none) break :blk try request_backend.toFloat32(hidden, allocator);
+        const w = try request_backend.getWeight(boundary.neck_prefix ++ ".weight");
+        defer request_backend.free(w);
+        const b = try request_backend.getWeight(boundary.neck_prefix ++ ".bias");
+        defer request_backend.free(b);
+        const mapped = try request_backend.linear(hidden, w, b, prepared.input_ids.len, e.hidden_size, e.hidden_size);
+        defer request_backend.free(mapped);
+        break :blk try request_backend.toFloat32(mapped, allocator);
+    };
     defer allocator.free(states);
     var result = try routePlanned(allocator, config, prepared, states, checked, .{ .limits = options.limits, .control = request_backend.execution_control });
     errdefer result.deinit();

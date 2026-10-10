@@ -96,9 +96,8 @@ pub const Tensor = struct {
     allocator: std.mem.Allocator,
     owns_data: bool,
     owns_shape: bool,
-    /// Alignment used to allocate owned `data`. Most constructors allocate a
-    /// byte slice; adopting typed storage must preserve its original alignment
-    /// for the allocator's free contract.
+    /// Alignment used to allocate owned `data`. Typed constructors and adopted
+    /// storage preserve their original alignment for the allocator's free contract.
     data_alignment: std.mem.Alignment = .@"1",
     /// When set, `data` is a slice inside this stable mmap-backed byte range.
     mmap_source_bytes: ?[]const u8 = null,
@@ -120,17 +119,21 @@ pub const Tensor = struct {
         data: []const T,
         dtype: DType,
     ) !Tensor {
-        const owned_bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(data));
-        errdefer allocator.free(owned_bytes);
+        // A byte allocation is not guaranteed to satisfy T's alignment (most
+        // notably inside an arena after string allocations). asInt64/asFloat32
+        // require typed alignment, including on repeated WASM requests.
+        const owned_data = try allocator.dupe(T, data);
+        errdefer allocator.free(owned_data);
         const owned_shape = try allocator.dupe(i64, shape);
         return .{
-            .data = owned_bytes,
+            .data = std.mem.sliceAsBytes(owned_data),
             .dtype = dtype,
             .shape = owned_shape,
             .name = name,
             .allocator = allocator,
             .owns_data = true,
             .owns_shape = true,
+            .data_alignment = .of(T),
         };
     }
 
@@ -272,6 +275,22 @@ test "tensor f32 round-trip" {
     const slice = t.asFloat32();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), slice[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), slice[3], 1e-6);
+}
+
+test "tensor constructors preserve typed alignment after odd arena allocations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    _ = try a.alloc(u8, 1);
+    var ints = try Tensor.initInt64(a, "ids", &.{2}, &.{ 50281, 50282 });
+    defer ints.deinit();
+    try std.testing.expect(ints.isAlignedFor(i64));
+    try std.testing.expectEqualSlices(i64, &.{ 50281, 50282 }, ints.asInt64());
+    _ = try a.alloc(u8, 3);
+    var floats = try Tensor.initFloat32(a, "logits", &.{2}, &.{ 1, 2 });
+    defer floats.deinit();
+    try std.testing.expect(floats.isAlignedFor(f32));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, floats.asFloat32());
 }
 
 test "tensor constructor frees copied data when shape allocation fails" {
