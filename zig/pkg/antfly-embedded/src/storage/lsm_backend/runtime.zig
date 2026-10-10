@@ -6338,9 +6338,11 @@ fn pathRunSurvivesPointPrecheck(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !bool {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (!runMayContain(run.*, namespace, key)) return false;
 
-    const filter = try ensureRunBloomFilterForReadMaybeLocked(backend, run, backend_locked);
+    const filter = try ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, control);
     if (filter) |present_filter| {
         const present = lsm_table_file.maybeContains(present_filter, namespace.name, key);
         if (!present) {
@@ -6354,11 +6356,11 @@ fn pathRunSurvivesPointPrecheck(
             const state = try indexes.state(backend, run, run_index);
             break :blk lsm_table_file.maybeContains(state.handle.runTableIndex().borrowFilter(), namespace.name, key);
         }
-        var handle = try loadRunTableIndexHandle(backend, run);
+        var handle = try loadRunTableIndexHandleWithAdmission(backend, run, control);
         defer handle.release();
         break :blk lsm_table_file.maybeContains(handle.runTableIndex().borrowFilter(), namespace.name, key);
     } else blk: {
-        const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+        const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
         break :blk lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
     };
     if (!present) backend.recordBloomNegative();
@@ -6378,6 +6380,8 @@ fn readPointRunCandidate(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     const run = &runs[candidate.run_index];
     if (backend.options.cache != null) {
         const located = if (batch_run_indexes) |indexes|
@@ -6393,7 +6397,7 @@ fn readPointRunCandidate(
         };
         return located.entry.value;
     }
-    if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+    if (try getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, control)) |value| {
         read_hint.* = null;
         return value;
     }
@@ -6413,12 +6417,15 @@ fn getFromPathRunIndicesPrechecked(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     var stack_candidates: [max_stack_point_run_candidates]PointRunCandidate = undefined;
     var stack_candidate_len: usize = 0;
     var overflow_candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
     defer overflow_candidates.deinit(value_allocator);
 
     for (run_indices) |run_index| {
+        if (control) |budget| try budget.checkpoint();
         backend.recordRunProbe();
         recordPointRunPrecheck(backend);
         if (!try pathRunSurvivesPointPrecheck(backend, &runs[run_index], run_index, namespace, key, backend_locked, batch_run_indexes)) continue;
@@ -7715,11 +7722,14 @@ fn getFromRunIndices(
     backend_locked: bool,
     batch_run_indexes: ?*RunBatchIndexHandles,
 ) !?[]const u8 {
+    const control = if (batch_run_indexes) |indexes| indexes.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (runIndicesUsePathBackedPointPrecheck(backend, runs, run_indices)) {
         return try getFromPathRunIndicesPrechecked(backend, runs, run_indices, read_hint, held_blocks, held_values, value_allocator, namespace, key, backend_locked, batch_run_indexes);
     }
 
     for (run_indices) |run_index| {
+        if (control) |budget| try budget.checkpoint();
         backend.recordRunProbe();
         const run = &runs[run_index];
         if (run.state) |*state| {
@@ -7746,7 +7756,7 @@ fn getFromRunIndices(
                 }
             }
             const run_filter_checked = run.bloom_filter != null or run.path != null;
-            if (run_filter_checked and !try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
+            if (run_filter_checked and !try runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, control)) continue;
             if (backend.options.cache != null) {
                 const located = if (batch_run_indexes) |indexes|
                     try getFromRunWithBlockCacheBatch(backend, run, run_index, read_hint, held_blocks, held_values, value_allocator, namespace, key, run_filter_checked, indexes) orelse continue
@@ -7761,16 +7771,16 @@ fn getFromRunIndices(
                 };
                 return located.entry.value;
             }
-            if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+            if (try getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, control)) |value| {
                 read_hint.* = null;
                 return value;
             }
             continue;
         }
 
-        if (!try runMayContainWithFilterMaybeLocked(backend, run, namespace, key, backend_locked)) continue;
+        if (!try runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, control)) continue;
 
-        const table = try tableForRunMaybeLocked(backend, run, backend_locked);
+        const table = try tableForRunMaybeLockedWithAdmission(backend, run, backend_locked, control);
         var read_hint_attempted = false;
         const positioned = if (read_hint.*) |hint|
             if (hint.run_index == run_index and
@@ -8313,7 +8323,23 @@ fn findExactEntryInCachedPrefixWithScratch(
     key: []const u8,
     lifetime: PointResultLifetime,
 ) !?LocatedTableEntry {
-    try lsm_table_file.validateBlockPayload(payload, window.checksum);
+    return findExactEntryInCachedPrefixWithScratchWithAdmission(backend, payload, block, window, held_values, value_allocator, scratch, namespace, key, lifetime, null);
+}
+
+fn findExactEntryInCachedPrefixWithScratchWithAdmission(
+    backend: anytype,
+    payload: []const u8,
+    block: lsm_table_file.TableIndex.BlockMeta,
+    window: lsm_table_file.EntryDataWindow,
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    scratch: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    lifetime: PointResultLifetime,
+    control: ?read_admission.Port,
+) !?LocatedTableEntry {
+    try lsm_table_file.validateBlockPayloadWithAdmission(payload, window.checksum, control);
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = if (window.compression == .prefix_snappy) blk: {
         try lsm_table_file.validatePrefixDecodedSize(payload, window.len);
@@ -8324,6 +8350,7 @@ fn findExactEntryInCachedPrefixWithScratch(
     defer reader.deinit(scratch);
     if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
     const found = try reader.find(scratch, namespace.name, key) orelse return null;
+    if (control) |budget| try budget.checkpoint();
     if (lifetime == .transaction_owned) {
         var entry = found.entry;
         entry.value = if (entry.tombstone) "" else try copyPointValue(backend, value_allocator, held_values, entry.value);
@@ -8648,7 +8675,21 @@ fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTable
 }
 
 fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
-    const lease = try loadLocalBlockLease(backend, run, index, window, locked, namespace.retainDataBlocks());
+    return findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, locked, null);
+}
+
+fn findExactEntryInLocalLeaseWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    block_index: usize,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    locked: bool,
+    control: ?read_admission.Port,
+) !?OwnedTableEntry {
+    const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, locked, namespace.retainDataBlocks(), control);
     return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
 }
 
@@ -8679,10 +8720,21 @@ fn localBlockCacheEligible(backend: anytype, bytes: usize) bool {
 }
 
 fn beginLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool) bool {
+    return beginLocalBlockPromotionWithAdmission(backend, run, index, window, locked, null) catch unreachable;
+}
+
+fn beginLocalBlockPromotionWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    locked: bool,
+    control: ?read_admission.Port,
+) !bool {
     if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotion")) return false;
     if (window.compression != .prefix and window.compression != .prefix_snappy) return false;
     const path = run.path orelse return false;
-    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    const held = if (locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, held);
     return backend.beginLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
 }
@@ -8801,12 +8853,22 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
 }
 
 fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow) !?*SharedBytes {
+    return joinLocalBlockDecodeWithAdmission(backend, run, index, window, null);
+}
+
+fn joinLocalBlockDecodeWithAdmission(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    window: lsm_table_file.EntryDataWindow,
+    control: ?read_admission.Port,
+) !?*SharedBytes {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         const path = run.path orelse return null;
         const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-        const flight = backend.local_reader.join(path, run.id, offset, window.physicalLen(), true) orelse return null;
+        const flight = try backend.local_reader.joinWithAdmission(path, run.id, offset, window.physicalLen(), true, control) orelse return null;
         defer backend.local_reader.releaseFlight(flight);
-        return try backend.local_reader.wait(flight);
+        return try backend.local_reader.waitWithAdmission(flight, control);
     }
     return null;
 }
@@ -8955,7 +9017,7 @@ fn loadOwnedBlockForWindowMaybeLocked(
     return try loadOwnedBlockForWindowAllocMaybeLocked(backend, backend.allocator, run, index, window, backend_locked);
 }
 
-const PointValueOutput = struct { allocator: Allocator, held: *PointResultValues };
+const PointValueOutput = struct { allocator: Allocator, held: *PointResultValues, control: ?read_admission.Port = null };
 
 fn findExactEntryInCompressedPrefixBlock(
     backend: anytype,
@@ -8966,6 +9028,8 @@ fn findExactEntryInCompressedPrefixBlock(
     key: []const u8,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     const block = index.blocks[block_index];
     const window = index.blockWindow(block_index);
     switch (window.compression) {
@@ -8974,13 +9038,13 @@ fn findExactEntryInCompressedPrefixBlock(
     }
     const path = run.path orelse return error.RunStateUnavailable;
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window, true) else null;
+    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspaceWithAdmission(backend, window, true, control) else null;
     defer if (workspace) |*work| work.release();
     const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
-    const payload = try loadRunTableBlockWithStats(backend, scratch, path, absolute_offset, window.physicalLen());
+    const payload = try loadRunTableBlockWithStatsAndAdmission(backend, scratch, path, absolute_offset, window.physicalLen(), control);
     defer scratch.free(payload);
     if (output) |target| {
-        const found = try findExactEntryInCachedPrefixWithScratch(backend, payload, block, window, target.held, target.allocator, scratch, namespace, key, .transaction_owned) orelse return null;
+        const found = try findExactEntryInCachedPrefixWithScratchWithAdmission(backend, payload, block, window, target.held, target.allocator, scratch, namespace, key, .transaction_owned, control) orelse return null;
         return .{ .entry = found.entry, .final_point_value = true };
     }
     const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadWithScratchAlloc(
@@ -9018,6 +9082,8 @@ fn findExactEntryWithLocalIndexBlockMetaWithOutput(
     key: []const u8,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
     if (!block.mayContainKeyByBounds(namespace.name, key)) return null;
@@ -9029,24 +9095,24 @@ fn findExactEntryWithLocalIndexBlockMetaWithOutput(
     // Borrow a warm decoded block before allocating compressed lookup scratch.
     // A miss preserves the compact direct-prefix lookup for cold point reads.
     if (localBlockCacheEnabled(backend)) {
-        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+        if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, false, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
-        if (namespace.retainDataBlocks()) if (try joinLocalBlockDecode(backend, run, index, window)) |lease| {
+        if (namespace.retainDataBlocks()) if (try joinLocalBlockDecodeWithAdmission(backend, run, index, window, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         };
-        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, false)) {
+        if (namespace.retainDataBlocks() and try beginLocalBlockPromotionWithAdmission(backend, run, index, window, false, control)) {
             var admitted = false;
             defer finishLocalBlockPromotion(backend, run, index, window, false, admitted);
-            const lease = try loadLocalBlockLease(backend, run, index, window, false, namespace.retainDataBlocks());
+            const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, false, namespace.retainDataBlocks(), control);
             admitted = lease.cache_admitted;
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
         return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
-    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
-    const bytes = try loadOwnedBlockForWindow(
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, false, control);
+    const bytes = if (control != null) try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control) else try loadOwnedBlockForWindow(
         backend,
         run,
         index,
@@ -9089,6 +9155,8 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
     backend_locked: bool,
     output: ?PointValueOutput,
 ) !?OwnedTableEntry {
+    const control = if (output) |target| target.control else null;
+    if (control) |budget| try budget.checkpoint();
     if (!backend_locked) return try findExactEntryWithLocalIndexBlockMetaWithOutput(backend, run, index, namespace, key, output);
 
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
@@ -9102,21 +9170,21 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
     // Borrow a warm decoded block before allocating compressed lookup scratch.
     // A miss preserves the compact direct-prefix lookup for cold point reads.
     if (localBlockCacheEnabled(backend)) {
-        if (retainLocalCachedBlock(backend, run, index, window, true)) |lease| {
+        if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, true, control)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
-        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, true)) {
+        if (namespace.retainDataBlocks() and try beginLocalBlockPromotionWithAdmission(backend, run, index, window, true, control)) {
             var admitted = false;
             defer finishLocalBlockPromotion(backend, run, index, window, true, admitted);
-            const lease = try loadLocalBlockLease(backend, run, index, window, true, namespace.retainDataBlocks());
+            const lease = try loadLocalBlockLeaseWithAdmission(backend, run, index, window, true, namespace.retainDataBlocks(), control);
             admitted = lease.cache_admitted;
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
         return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
-    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
-    const bytes = try loadOwnedBlockForWindowMaybeLocked(
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLeaseWithAdmission(backend, run, index, window, block_index, namespace, key, true, control);
+    const bytes = if (control != null) try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control) else try loadOwnedBlockForWindowMaybeLocked(
         backend,
         run,
         index,
@@ -9183,11 +9251,27 @@ fn getFromRunWithLocalIndex(
     key: []const u8,
     backend_locked: bool,
 ) !?[]const u8 {
-    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    return getFromRunWithLocalIndexWithAdmission(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked, null);
+}
+
+fn getFromRunWithLocalIndexWithAdmission(
+    backend: anytype,
+    run: *Run,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?[]const u8 {
+    if (control) |budget| try budget.checkpoint();
+    const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
     try requireTableBlocks(index);
-    const loaded = try findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, .{ .allocator = value_allocator, .held = held_values }) orelse return null;
+    const loaded = try findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, .{ .allocator = value_allocator, .held = held_values, .control = control }) orelse return null;
     var transferred = false;
     defer if (!transferred) loaded.deinit(backend.allocator);
+    if (control) |budget| try budget.checkpoint();
     if (loaded.entry.tombstone) return error.NotFound;
     if (loaded.final_point_value) return loaded.entry.value;
     if (namespace.borrow_local_point_results) if (held_blocks) |pins| if (loaded.local) |payload| {
@@ -9239,10 +9323,21 @@ fn runMayContainWithFilterMaybeLocked(
     key: []const u8,
     backend_locked: bool,
 ) !bool {
-    if (!backend_locked) return try runMayContainWithFilter(backend, run, namespace, key);
+    return runMayContainWithFilterMaybeLockedWithAdmission(backend, run, namespace, key, backend_locked, null);
+}
+
+fn runMayContainWithFilterMaybeLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !bool {
+    if (control) |budget| try budget.checkpoint();
 
     if (!runMayContain(run.*, namespace, key)) return false;
-    const filter = try ensureRunBloomFilterForReadMaybeLocked(backend, run, true);
+    const filter = try ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, control);
     if (filter) |present_filter| {
         const present = lsm_table_file.maybeContains(present_filter, namespace.name, key);
         if (!present) backend.recordBloomNegative();
@@ -9250,11 +9345,11 @@ fn runMayContainWithFilterMaybeLocked(
     }
     if (run.path != null) {
         const present = if (backend.options.cache != null) blk: {
-            var handle = try loadRunTableIndexHandle(backend, run);
+            var handle = try loadRunTableIndexHandleWithAdmission(backend, run, control);
             defer handle.release();
             break :blk lsm_table_file.maybeContains(handle.runTableIndex().borrowFilter(), namespace.name, key);
         } else blk: {
-            const index = try indexForRunNoCacheMaybeLocked(backend, run, true);
+            const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
             break :blk lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
         };
         if (!present) backend.recordBloomNegative();
@@ -9278,21 +9373,50 @@ fn ensureRunBloomFilterForRead(backend: anytype, run: *Run) !?bloom.OwnedFilter 
 }
 
 fn ensureRunBloomFilterForReadMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
-    if (!backend_locked) return try ensureRunBloomFilterForRead(backend, run);
-    return try ensureRunBloomFilterForReadLocked(backend, run, true);
+    return ensureRunBloomFilterForReadMaybeLockedWithAdmission(backend, run, backend_locked, null);
+}
+
+fn ensureRunBloomFilterForReadMaybeLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
+    const budget = control orelse {
+        if (!backend_locked) return ensureRunBloomFilterForRead(backend, run);
+        return ensureRunBloomFilterForReadLocked(backend, run, true);
+    };
+    try budget.checkpoint();
+    if (run.shared_read_version) return null;
+    if (run.bloom_filter) |filter| return filter;
+    if (backend.options.cache != null or run.path == null) return null;
+    const held = if (backend_locked) false else try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    return ensureRunBloomFilterForReadLockedWithAdmission(backend, run, true, budget);
 }
 
 fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    return ensureRunBloomFilterForReadLockedWithAdmission(backend, run, backend_locked, null);
+}
+
+fn ensureRunBloomFilterForReadLockedWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
+    if (control) |budget| try budget.checkpoint();
     if (run.shared_read_version) return null;
     if (run.bloom_filter) |filter| return filter;
 
     if (@hasField(@TypeOf(backend.*), "runs")) {
         for (0..run_store.count(backend)) |rank| {
+            if (control) |budget| try budget.checkpoint();
             const source_run = run_store.at(backend, rank);
             if (source_run.id != run.id) continue;
             if (!sameRunPath(source_run.path, run.path)) continue;
 
-            const filter = try materializeRunBloomFilterForRead(backend, source_run, backend_locked);
+            const filter = try materializeRunBloomFilterForReadWithAdmission(backend, source_run, backend_locked, control);
             if (source_run != run) {
                 run.bloom_filter = filter;
                 run.owns_bloom_filter = false;
@@ -9301,10 +9425,19 @@ fn ensureRunBloomFilterForReadLocked(backend: anytype, run: *Run, backend_locked
         }
     }
 
-    return try materializeRunBloomFilterForRead(backend, run, backend_locked);
+    return try materializeRunBloomFilterForReadWithAdmission(backend, run, backend_locked, control);
 }
 
 fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked: bool) !?bloom.OwnedFilter {
+    return materializeRunBloomFilterForReadWithAdmission(backend, run, backend_locked, null);
+}
+
+fn materializeRunBloomFilterForReadWithAdmission(
+    backend: anytype,
+    run: *Run,
+    backend_locked: bool,
+    control: ?read_admission.Port,
+) !?bloom.OwnedFilter {
     if (run.bloom_filter) |filter| return filter;
     if (run.path == null) return null;
 
@@ -9315,8 +9448,10 @@ fn materializeRunBloomFilterForRead(backend: anytype, run: *Run, backend_locked:
     // may safely proceed without the optional Bloom precheck.
     if (backend.options.cache != null) return null;
 
-    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
-    const filter = try index.borrowFilter().clone(backend.allocator);
+    const index = try indexForRunNoCacheMaybeLockedWithAdmission(backend, run, backend_locked, control);
+    var filter = try index.borrowFilter().clone(backend.allocator);
+    errdefer filter.deinit(backend.allocator);
+    if (control) |budget| try budget.checkpoint();
     run.bloom_filter = filter;
     run.owns_bloom_filter = true;
     return run.bloom_filter.?;
@@ -13416,6 +13551,53 @@ pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope:
             return err;
         };
         cache.invalidatePrefix("/controlled-native-read-batch");
+        for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
+    }
+}
+
+pub fn qualifyControlledUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/uncached-batch", .{tmp.sub_path});
+    defer a.free(path);
+    var storage = try storage_io.NativeStorage.init(a, .threaded);
+    defer storage.deinit();
+    var backend = try B.open(a, path, .{ .storage = storage.storage(), .flush_threshold = 1, .local_block_cache_enabled = local_cache });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [128][64]u8 = undefined;
+    var keys: [128][]const u8 = undefined;
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        for (&keys, 0..) |*key, i| {
+            key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+            try write.put(key.*, key.*);
+        }
+        try write.commit();
+    }
+    var handle_owner = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    var read = backend_erased.readTxnFrom(a, handle_owner) catch |err| {
+        handle_owner.abort();
+        return err;
+    };
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    var values: [128]?[]const u8 = @splat(null);
+    const sparse = [_][]const u8{ keys[0], keys[keys.len - 1] };
+    // Cursor, grouped and sparse plans, then warm repeat without changing the
+    // snapshot. No shared Cache: local-index and local-block paths are real.
+    for ([_][]const []const u8{ &sparse, &keys, keys[0..16], &sparse }) |batch| {
+        const result = if (use_scope) scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        result catch |err| {
+            for (values[0..batch.len]) |value| try std.testing.expect(value == null);
+            return err;
+        };
         for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
     }
 }

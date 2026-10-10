@@ -258,7 +258,11 @@ pub const Pool = struct {
         }
     }
     pub fn join(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool) ?*Flight {
-        platform.sync.lockYielding(&self.mutex);
+        return self.joinWithAdmission(path, run_id, offset, len, admit, null) catch unreachable;
+    }
+
+    pub fn joinWithAdmission(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool, control: ?read_admission.Port) !?*Flight {
+        try self.lockWithAdmission(control);
         defer self.mutex.unlock();
         for (&self.flights) |*flight| {
             if (flight.refs != 0 and flight.run_id == run_id and flight.offset == offset and flight.len == len and flight.admit == admit and std.mem.eql(u8, flight.path, path)) {
