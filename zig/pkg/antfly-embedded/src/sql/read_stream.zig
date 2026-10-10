@@ -555,12 +555,14 @@ const ParallelScan = struct {
             for (children) |child| child.close(child.ptr);
             return null;
         }
-        const fanout = @import("parallel_scheduler.zig").global().fanout(children.len, source.context.limits.retained_bytes / 2, 4 * 1024 * 1024);
+        const scheduler = @import("parallel_scheduler.zig").global();
+        const workspace_budget = scheduler.workspaceBudget(source.context.limits.retained_bytes / 2);
+        const fanout = scheduler.fanout(children.len, workspace_budget, 4 * 1024 * 1024);
         if (fanout < 2) {
             for (children) |child| child.close(child.ptr);
             return null;
         }
-        const workspace = source.context.limits.retained_bytes / (2 * fanout);
+        const workspace = workspace_budget / fanout;
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
@@ -2075,7 +2077,7 @@ test "SQL native page quotas survive ordered task fragmentation and delivery siz
         backend.execution_io = if (parallel) std.testing.io else null;
         var compiled = try compiler.compile(a, "SELECT n FROM docs LIMIT 8192", .{});
         defer compiled.deinit();
-        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_pages = 3 })).?;
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_pages = 3, .retained_bytes = 64 * 1024 * 1024 })).?;
         defer stream.close();
         var count: usize = 0;
         while (true) {

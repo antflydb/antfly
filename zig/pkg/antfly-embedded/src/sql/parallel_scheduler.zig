@@ -69,6 +69,13 @@ pub const Scheduler = struct {
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    /// Cap an operator workspace by currently available shared admission.
+    /// Larger statement quotas must not increase leases beyond node capacity.
+    pub fn workspaceBudget(self: *Scheduler, requested: usize) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return @min(requested, self.max_bytes -| self.bytes);
+    }
     /// Advisory fan-out; submit still arbitrates races with other statements.
     /// One caller lane needs no lease. Every concurrent lane has a useful
     /// minimum workspace and shares the operator's total memory allowance.
@@ -226,10 +233,13 @@ test "SQL completed speculative work releases admission before owner joins" {
 
 test "SQL adaptive fanout respects useful work, occupied leases and workspace" {
     var scheduler: Scheduler = .{ .max_workers = 8, .max_bytes = 1024 };
+    try std.testing.expectEqual(@as(usize, 1024), scheduler.workspaceBudget(4096));
+    try std.testing.expectEqual(@as(usize, 256), scheduler.workspaceBudget(256));
     try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
     try std.testing.expectEqual(@as(usize, 3), scheduler.fanout(3, 1024, 128));
     try std.testing.expectEqual(@as(usize, 2), scheduler.fanout(16, 256, 128));
     try std.testing.expect(scheduler.acquire(896));
+    try std.testing.expectEqual(@as(usize, 128), scheduler.workspaceBudget(4096));
     try std.testing.expectEqual(@as(usize, 1), scheduler.fanout(16, 1024, 128));
     scheduler.release(896);
     try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
