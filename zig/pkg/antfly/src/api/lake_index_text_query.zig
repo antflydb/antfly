@@ -101,12 +101,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     if (has_vectors) {
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
         if (effective.filter_query_json.len != 0) {
-            const resolved = (try resolver.resolve(ca, effective.filter_query_json)) orelse return error.UnsupportedQueryRequest;
-            owner.vector_include = resolved.bitmap;
+            owner.vector_include_provider = try resolver.openMembership(a, effective.filter_query_json);
         }
         if (effective.exclusion_query_json.len != 0) {
-            const resolved = (try resolver.resolve(ca, effective.exclusion_query_json)) orelse return error.UnsupportedQueryRequest;
-            owner.vector_exclude = resolved.bitmap;
+            owner.vector_exclude_provider = try resolver.openMembership(a, effective.exclusion_query_json);
         }
     } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
@@ -158,6 +156,8 @@ const Execution = struct {
     request: local.api_operation.RequestContext,
     schema_json: []const u8,
     hydration_fields: ?[]const []const u8 = null,
+    vector_include_provider: ?@import("lake_index_text_predicate.zig").PhysicalResolver.Membership = null,
+    vector_exclude_provider: ?@import("lake_index_text_predicate.zig").PhysicalResolver.Membership = null,
     vector_include: ?@import("lake_index_physical_set.zig").Set = null,
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
@@ -180,12 +180,22 @@ const Execution = struct {
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
-        if (self.vector_include != null or self.vector_exclude != null) {
+        if (self.vector_include != null or self.vector_exclude != null or self.vector_include_provider != null or self.vector_exclude_provider != null) {
             result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
         return result;
+    }
+    fn includeSet(self: *Execution) ?*const @import("lake_index_physical_set.zig").Set {
+        if (self.vector_include) |*set| return set;
+        if (self.vector_include_provider) |*provider| if (provider.complete) |*set| return set;
+        return null;
+    }
+    fn excludeSet(self: *Execution) ?*const @import("lake_index_physical_set.zig").Set {
+        if (self.vector_exclude) |*set| return set;
+        if (self.vector_exclude_provider) |*provider| if (provider.complete) |*set| return set;
+        return null;
     }
     fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
@@ -193,15 +203,22 @@ const Execution = struct {
         errdefer result.deinit();
         // Materialize only inexpensive masks. Broad constraints are checked
         // against reached native identities inside bounded DAAT scoring.
-        if (self.vector_include) |*include| {
+        if (self.vector_include_provider) |provider| if (provider.complete == null) {
+            result.residual = true;
+            return result;
+        };
+        if (self.vector_exclude_provider) |provider| {
+            if (provider.complete == null) result.residual = true;
+        }
+        if (self.includeSet()) |include| {
             if (include.boundedCardinality(4096) == null) {
                 result.residual = true;
                 return result;
             }
             // Subtract in physical space before resolving a selective include;
             // a broad exclusion need not be converted for one included row.
-            result.include = try self.selectSparseSet(a, lookup, include, if (self.vector_exclude) |*exclude| exclude else null);
-        } else if (self.vector_exclude) |*exclude| {
+            result.include = try self.selectSparseSet(a, lookup, include, self.excludeSet());
+        } else if (self.excludeSet()) |exclude| {
             if (exclude.boundedCardinality(4096) == null) result.residual = true else result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
         }
         return result;
@@ -240,11 +257,16 @@ const Execution = struct {
         const self: *Execution = @ptrCast(@alignCast(raw));
         const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
         const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+        const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
+        if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
+        if (self.vector_exclude_provider) |*provider| if (try provider.allows(ref)) return false;
         if (self.vector_include) |*include| if (!include.contains(file, coordinate.group, coordinate.row)) return false;
         if (self.vector_exclude) |*exclude| if (exclude.contains(file, coordinate.group, coordinate.row)) return false;
         return true;
     }
     fn deinit(self: *Execution) void {
+        if (self.vector_include_provider) |*provider| provider.deinit();
+        if (self.vector_exclude_provider) |*provider| provider.deinit();
         for (self.highlight_pins.items) |*pin| pin.deinit();
         for (self.runtimes.items) |runtime| runtime.release();
     }
@@ -1170,6 +1192,8 @@ test "external lake sparse predicate planning defers broad masks and subtracts s
     // Only the predicate-planning fields are needed; no HTTP/server is opened.
     var execution: Execution = undefined;
     execution.vector_include = null;
+    execution.vector_include_provider = null;
+    execution.vector_exclude_provider = null;
     execution.vector_exclude = Set.init(a);
     defer execution.vector_exclude.?.deinit();
     execution.private_digests = .empty;

@@ -124,8 +124,8 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         pytest.importorskip("fastavro")
         pytest.importorskip("pyarrow")
         pytest.importorskip("psycopg")
-    import pyarrow as pa
     import psycopg
+    import pyarrow as pa
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.partitioning import PartitionField, PartitionSpec
     from pyiceberg.schema import Schema
@@ -284,6 +284,8 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
             "body": ["common"] * count,
             "category": ["story"] * 2 + ["comment"] * (count - 2),
             "amount": range(count),
+            "sparse_native": ['{"1":1}'] * (count - 1) + ['{"1":1,"97":1}'],
+            "dense_native": ["[1,0]"] * count,
             "label": ["other"] * (count - 3) + ["kept"] * 3,
         }
     )
@@ -308,6 +310,8 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
                 NestedField(2, "category", StringType(), required=False),
                 NestedField(3, "amount", LongType(), required=False),
                 NestedField(4, "label", StringType(), required=False),
+                NestedField(5, "sparse_native", StringType(), required=False),
+                NestedField(6, "dense_native", StringType(), required=False),
             ),
         )
         table.append(rows)
@@ -359,13 +363,31 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
                         {"name": "amount_idx", "keys": [{"column": "amount"}]},
                     ],
                 },
-                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+                "indexes": {
+                    "body_text": {"type": "full_text", "field": "body"},
+                    "sparse_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "sparse": True,
+                    },
+                    "dense_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "dimension": 2,
+                    },
+                },
             },
         )
         deadline = time.monotonic() + 300
         while True:
             resource = call("GET", "/tables/sort_pages/indexes/body_text")
-            if resource["status"]["readiness"]["queryable"]:
+            sparse_resource = call("GET", "/tables/sort_pages/indexes/sparse_native")
+            dense_resource = call("GET", "/tables/sort_pages/indexes/dense_native")
+            if (
+                resource["status"]["readiness"]["queryable"]
+                and sparse_resource["status"]["readiness"]["queryable"]
+                and dense_resource["status"]["readiness"]["queryable"]
+            ):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
@@ -385,6 +407,82 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
         for restart in (False, True):
             if restart:
                 server.restart()
+            # A rare posting can probe a broad indexed physical predicate;
+            # a common posting must cross the budget into full membership.
+            sparse_base = {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                "indexes": ["sparse_native"],
+                "fields": ["amount"],
+                "limit": 10,
+            }
+            rare = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    embeddings={"sparse_native": {"indices": [97], "values": [1]}},
+                    filter_query=category,
+                ),
+            )
+            assert [
+                (h["_source"]["amount"], h["_score"]) for h in rare["hits"]["hits"]
+            ] == [(count - 1, 1)]
+            common = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    filter_query={"range": {"path": "/amount", "gte": count // 2}},
+                ),
+            )
+            assert len(common["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] >= count // 2 and h["_score"] == 1
+                for h in common["hits"]["hits"]
+            )
+            excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    exclusion_query=category,
+                ),
+            )
+            assert {h["_source"]["amount"] for h in excluded["hits"]["hits"]} == {0, 1}
+            dense_base = dict(
+                sparse_base,
+                embeddings={"dense_native": [1, 0]},
+                indexes=["dense_native"],
+            )
+            dense = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    dense_base,
+                    filter_query={"range": {"path": "/amount", "gte": count // 2}},
+                ),
+            )
+            assert len(dense["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] >= count // 2 for h in dense["hits"]["hits"]
+            )
+            hybrid = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    embeddings={
+                        "dense_native": [1, 0],
+                        "sparse_native": {"indices": [97], "values": [1]},
+                    },
+                    indexes=["dense_native", "sparse_native"],
+                    filter_query=category,
+                ),
+            )
+            assert any(
+                h["_source"]["amount"] == count - 1 for h in hybrid["hits"]["hits"]
+            )
+            assert all(h["_source"]["amount"] >= 2 for h in hybrid["hits"]["hits"])
             for predicate in predicates:
                 request = {
                     "full_text_search": {"term": "common", "field": "body"},

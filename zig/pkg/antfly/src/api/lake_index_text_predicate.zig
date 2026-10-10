@@ -264,6 +264,66 @@ fn PredicateResolver(comptime Set: type) type {
         pinned: ?rows.PredicateContext = null,
         allow_partial: bool = true,
 
+        /// Query-owned exact physical membership, adaptive between point probes
+        /// and the existing whole-predicate index/scan planner.
+        pub const Membership = struct {
+            a: A,
+            resolver: Self,
+            arena: std.heap.ArenaAllocator,
+            json: []const u8,
+            predicate: ?rows.Predicate = null,
+            complete: ?PhysicalSet = null,
+            spent: u64 = 0,
+            budget: u64 = 0,
+            pub fn deinit(self: *@This()) void {
+                if (self.predicate) |*predicate| predicate.deinit();
+                if (self.complete) |*set| set.deinit();
+                self.arena.deinit();
+            }
+            fn materialize(self: *@This()) !void {
+                if (self.complete != null) return;
+                const resolved = (try self.resolver.resolve(self.a, self.json)) orelse return error.UnsupportedQueryRequest;
+                self.complete = resolved.bitmap;
+                if (self.predicate) |*predicate| predicate.deinit();
+                self.predicate = null;
+            }
+            pub fn allows(self: *@This(), ref: local.storage_rowsource_types.RowRef) !bool {
+                try self.resolver.context.ensureActive();
+                try self.resolver.read_context.ensureActive();
+                if (self.complete == null) {
+                    if (self.predicate != null and self.predicate.?.canProbeMembership() and 64 <= self.budget -| self.spent) {
+                        self.spent += 64;
+                        return self.predicate.?.contains(ref);
+                    }
+                    try self.materialize();
+                }
+                if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                const row = ref.external;
+                return self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+            }
+        };
+        pub fn openMembership(self: Self, a: A, json: []const u8) !Membership {
+            if (Set != PhysicalSet) @compileError("adaptive physical membership requires physical coordinates");
+            var result: Membership = .{ .a = a, .resolver = self, .arena = .init(a), .json = undefined };
+            errdefer result.deinit();
+            const ca = result.arena.allocator();
+            result.json = try ca.dupe(u8, json);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, json, .{});
+            const compiled = try Graph.compilePatternFilter(ca, parsed);
+            var conditions: std.ArrayList(Condition) = .empty;
+            if (try collectConditions(ca, compiled, &conditions, 0)) {
+                if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) |predicate| {
+                    result.predicate = predicate;
+                    result.budget = @min(predicate.work, rows.predicateScanWork(self.source, conditions.items) orelse std.math.maxInt(u64));
+                    if (predicate.hasMembership() and predicate.canProbeMembership() and predicate.estimatedRows() != 0 and result.budget > 64) return result;
+                }
+            }
+            // Residuals/OR and inexpensive point selections use the same exact
+            // planner as before; no approximate membership escapes this owner.
+            try result.materialize();
+            return result;
+        }
+
         pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();

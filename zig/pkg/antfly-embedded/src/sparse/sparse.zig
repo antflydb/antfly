@@ -25,6 +25,20 @@
 //! delta path for incremental writes.
 
 const std = @import("std");
+
+/// DAAT reuses its current document's decision. Unordered spill passes may
+/// evict and re-probe, without retaining archive-sized decision bitmaps.
+const PredicateDecisionCache = struct {
+    const Value = struct { doc: u32, allowed: bool };
+    slots: [256]?Value = @splat(null),
+    fn get(self: *const @This(), doc: u32) ?bool {
+        const value = self.slots[doc % self.slots.len] orelse return null;
+        return if (value.doc == doc) value.allowed else null;
+    }
+    fn put(self: *@This(), doc: u32, allowed: bool) void {
+        self.slots[doc % self.slots.len] = .{ .doc = doc, .allowed = allowed };
+    }
+};
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -4736,17 +4750,14 @@ pub const SparseIndex = struct {
         defer visibility.deinit();
 
         // Point-seek the native reverse identity only for postings reached by
-        // this query. Cache compressed decisions across terms; bulk publication
+        // this query. Bound decision reuse across terms; bulk publication
         // already persists reverse keys, so no corpus dictionary pass is needed.
         const Decisions = struct {
-            allowed: @import("../encoding/roaring.zig").RoaringBitmap,
-            denied: @import("../encoding/roaring.zig").RoaringBitmap,
+            values: PredicateDecisionCache = .{},
             complete: bool,
             identities: ?backend_erased.Cursor = null,
         };
-        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc), .complete = try completeLocatorMap(&txn) };
-        defer decisions.allowed.deinit();
-        defer decisions.denied.deinit();
+        var decisions: Decisions = .{ .complete = try completeLocatorMap(&txn) };
         defer if (decisions.identities) |*cursor| cursor.close();
         const ScoreSource = enum { segment, delta };
         const AccumulateContext = struct {
@@ -4796,8 +4807,8 @@ pub const SparseIndex = struct {
                 return true;
             }
             fn allowsKey(ctx: *@This(), doc_num: u32) !bool {
-                if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
-                    if (ctx.decisions.denied.contains(doc_num)) return false;
+                if (ctx.key_predicate) |predicate| {
+                    if (ctx.decisions.values.get(doc_num)) |allowed| return allowed;
                     if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
                     var owned: ?[]u8 = null;
                     defer if (owned) |id| ctx.alloc.free(id);
@@ -4818,12 +4829,10 @@ pub const SparseIndex = struct {
                         };
                         break :blk owned.?;
                     };
-                    if (!try predicate.allows(predicate.ptr, id)) {
-                        try ctx.decisions.denied.add(doc_num);
-                        return false;
-                    }
-                    try ctx.decisions.allowed.add(doc_num);
-                };
+                    const allowed = try predicate.allows(predicate.ptr, id);
+                    ctx.decisions.values.put(doc_num, allowed);
+                    return allowed;
+                }
                 return true;
             }
             pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
@@ -7999,4 +8008,16 @@ test "sparse exclusion masks retain bounded scoring without reverse key callback
             }
         }
     }
+}
+
+test "sparse predicate decisions remain bounded and exact through collisions" {
+    var cache: PredicateDecisionCache = .{};
+    for (0..100000) |i| {
+        const doc: u32 = @intCast(i);
+        try std.testing.expect(cache.get(doc) == null);
+        cache.put(doc, doc % 3 != 0);
+        try std.testing.expectEqual(doc % 3 != 0, cache.get(doc).?);
+        if (i >= 256) try std.testing.expect(cache.get(doc - 256) == null);
+    }
+    try std.testing.expect(@sizeOf(PredicateDecisionCache) <= 4096);
 }

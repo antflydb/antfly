@@ -665,130 +665,128 @@ unmeasured.
 
 ## Follow-up to #1046: adaptive vector membership and bounded scoring state
 
-Status: planned; the work below is not implemented by this draft. PR #1046
-added bounded filtered text top-k, sparse include/exclude planning, and reusable
-public tie ordering. This follow-up covers the four remaining opportunities
-identified during its complete branch review. Preserve existing public query
-semantics and native storage ownership throughout; benchmark improvements rather
-than assuming a speedup from an algorithm change.
+Status: implemented in #1051, on top of merged main `cc5fb8abfb`. These changes
+preserve the public query API and native artifact formats. They address the four
+remaining opportunities from the #1046 review.
 
 ### Adaptive metadata membership for vector queries
 
-Today `lake_index_text_query.zig` resolves complete physical include/exclude sets
-before dense or sparse ranking starts. Deferring broad physical-to-ordinal
-translation saves work, but it still pays for the full physical predicate result.
-Reuse the text predicate planner's exact candidate membership capability for
-vector candidates, with a query-owned adaptive membership provider:
+`lake_index_text_predicate.zig` now owns an adaptive physical membership provider
+for each vector include/exclude predicate. `lake_index_text_query.zig` shares
+those query-owned providers across dense, sparse, and hybrid consumers while
+keeping the existing source, publication, authorization and runtime pins alive.
 
-- Pin the source snapshot, publication, authorization scope, and native generation
-  for the provider's lifetime. Keep physical row coordinates separate from native
-  ordinals; never reuse ordinals across generations.
-- Materialize cheap selective index predicates up front. Probe expensive exact
-  predicates only for reached candidates, using bounded batches and a bounded
-  decision cache. Include and exclusion providers remain independent.
-- Bound accumulated point work by the cheaper exact index-walk or scan estimate.
-  Once that budget is reached, publish one immutable compressed physical set and
-  reuse it for the remainder of the query, including hybrid consumers.
-- Filter before sparse heap admission and use the dense engine's existing exact
-  predicate contract. Do not add a final-page-only filter that can underfill a
-  result or incorrectly claim top-k completeness. Dense ANN retains its existing
-  approximation contract; graph traversal and result eligibility stay distinct.
-- Retain authoritative scans for unsupported/residual predicates. Only a proven
-  exact whole predicate may use direct membership. Cancellation, deadline checks,
-  lease renewal, and query memory admission apply even on fully cached reads.
+Cheap exact selections still materialize immediately. A broader predicate can
+start with reverse-row-index probes of candidates actually reached by ranking.
+Direct probes require an authenticated reverse tree and proof that tuple bounds
+enforce **every** condition (`rangeEnforcesConditions`); an indexed superset is
+insufficient. OR/residual shapes retain the existing full predicate planner.
 
-Acceptance: differential dense, sparse, and hybrid results for selective includes,
-exclusion-only queries, broad predicates, empty sets, deletes, nulls, and snapshot
-changes. A rare sparse query with a broad indexed predicate must avoid walking the
-whole metadata range. A broad query must switch to one materialization rather
-than continue point probing indefinitely. Measure point probes, predicate/index
-pages, decoded Parquet rows/bytes, peak scratch, and cold/warm latency. Include
-real Parquet and Iceberg coverage in `e2e-full`, plus cancellation and allocation
-failure tests at the transition.
+Each point probe costs 64 relative work units, consistent with the text producer.
+Accumulated point work cannot exceed the cheaper full index-walk/column-scan
+estimate. Exhausting this budget, or the reader's independent authenticated
+page-read budget, switches once to the full planner's compressed physical set.
+Subsequent hybrid consumers reuse that set. Include/exclude state is independent.
+Cancellation and lease/deadline checks run even when membership is fully cached.
 
-### Per-document predicate decisions in sparse DAAT
+Sparse planning converts only inexpensive completed physical sets to ordinal
+masks. An incomplete or broad provider remains an exact candidate predicate
+inside scoring, before heap admission. Dense ranking uses its existing exact
+eligibility callback and retains its existing ANN approximation contract.
+Physical coordinates remain distinct from native ordinals across generations.
 
-`SparseIndex.search` currently memoizes allowed and denied ordinals in two
-compressed bitmaps. Those grow with the documents reached by a broad scan.
-DAAT consumes all contributing streams for one document before advancing to the
-next document, so its predicate decision needs only the current ordinal and a
-tri-state decision (unknown, allowed, denied).
+### Bounded sparse predicate decisions
 
-- Keep deletion/incarnation checks per stream. Cache only the shared key predicate
-  decision after those checks; do not memoize stream-specific visibility.
-- Evaluate the key predicate at most once per reached document, after at least one
-  stream proves current visibility. Reuse the dedicated reverse-identity cursor
-  and its bounded scratch.
-- Separate this monotone DAAT state from the term-at-a-time/spill fallback. That
-  fallback revisits ordinals and needs its own bounded cache or uncached exact
-  probes; it must never assume the same traversal order.
-- Preserve signed contribution order, exact score ties, inclusion/exclusion masks,
-  cancellation, and page-admission fallback behavior.
+Sparse scoring replaces two growing allowed/denied bitmaps with a fixed 256-slot
+exact-tag decision cache. Its storage is at most 4 KiB, independent of archive
+size. DAAT processes a document's contributing streams together and reuses one
+predicate decision. The unordered term-at-a-time/spill fallback can evict and
+repeat exact probes; it never assumes monotone order or reuses a colliding tag.
 
-Acceptance: multiple terms/segments for one document call the predicate once in
-DAAT; a stale stream cannot suppress a later valid stream. Randomized differential
-results must match the reference for signed/zero weights, deletes, and mixed
-incarnations. Record predicate-state bytes across increasing archive sizes and
-exercise the spill fallback without relying on monotone order.
+Deletion and incarnation checks remain per stream and precede shared key
+membership. The reverse-identity cursor and existing bounded scratch remain in
+place. Score accumulation order, signed contributions and bitmap constraints are
+unchanged. A 100,000-ordinal collision regression verifies exact eviction, and
+existing sparse differential tests verify multi-term predicate reuse and signed
+score equivalence.
 
-### Shared heap-based native text top-k
+### Shared native text top-k heap
 
-Both `FastTopK` and `scorer.TopKCollector` retain a window and scan all retained
-hits after each accepted replacement. Introduce one shared bounded heap with the
-existing score-descending, document-ID-ascending ranking contract. The worst hit
-is the heap root; accepted replacement becomes O(log k) and cutoff lookup O(1).
+`scorer.offerTopK` provides one worst-first bounded heap to both `FastTopK` and
+`TopKCollector`. The root supplies the competitive score and tie document ID in
+O(1); accepted replacements take O(log k). Equal scores retain the smallest
+document IDs. Counts, relations, producer batching, deletion checks and final
+result ownership remain in their existing layers. Underfilled collectors retain
+the established zero competitive threshold, and final output is sorted once.
 
-- Use the same heap primitive in filtered and unfiltered text collectors. Keep
-  total-count/relation tracking, deletion checks, pending predicate batches, and
-  final result ownership in their existing layers.
-- Preserve deterministic equal-score selection and the scorer's zero threshold
-  until the heap is full. `k = 0`, an underfilled window, and offsets retain their
-  current semantics. Propagate allocation failure without losing owned storage.
-- Benchmark small default windows as well as large limits/offsets. A small-window
-  specialization is justified only by measurement and must use the same ranking
-  contract.
+Differential tests compare full sorted output for 4,096 deterministic arrivals
+with ties, forward/reverse order, k=0, underfilled windows and k up to 5,000. WAND
+cutoff/tie, filtered producer and allocation-failure regressions also pass.
 
-Acceptance: compare heap output and competitive cutoffs with a full stable sort
-for randomized arrival orders, equal scores, empty/underfilled windows, k=0,
-and large k. Rerun WAND pruning/tie differential tests and filtered producer
-regressions. Report replacement counts and latency for k=10, 100, 1,000, and
-10,000 with both mostly rejected and frequently replaced candidates.
+A ReleaseFast microbenchmark offers 40,000 increasing-score candidates (every
+candidate after filling the window is an accepted replacement). It compares the
+previous linear replacement primitive with the shared heap and verifies exact
+final output. One local run measured:
 
-### Streaming execution for more Boolean shapes
+| k | Linear replacement | Heap replacement |
+|---|---:|---:|
+| 10 | 1.71 ms | 0.79 ms |
+| 100 | 16.40 ms | 0.96 ms |
+| 1,000 | 165.90 ms | 1.56 ms |
+| 10,000 | 881.70 ms | 1.84 ms |
 
-Unsupported nested and mixed-field Boolean queries still reach
-`executeBoolAllHit`, which materializes all-hit arrays and score maps. Extend the
-native document-at-a-time scorer tree beyond the existing same-field fast paths.
-Preserve the existing public query syntax.
+These are collector microbenchmarks, not archive-query speedups. Rejected
+candidates compare with the root without rescanning the heap. Default-window
+results do not justify adding a separate small-window implementation.
 
-- Compile supported leaves and Boolean nodes into monotone seekable iterators.
-  Implement conjunction, disjunction/minimum-should-match, and prohibition with
-  bounded live iterator state, preserving nested boosts and optional-clause rules.
-- Keep per-field full-corpus BM25 statistics and established f32 contribution
-  order. Do not reuse single-field bounds across mixed fields. Add competitive
-  pruning only when the complete subtree supplies a conservative bound.
-- Apply exact document constraints before heap admission. Phrase/position leaves
-  must verify positions before admission; unsupported leaves retain the existing
-  authoritative fallback.
-- Keep exact counts separate from early-stopping top-k work. Aggregations,
-  distributed statistics, sort, and cursor handling may use the new execution
-  only when their complete contracts are preserved. Do not silently downgrade a
-  supported request to approximate counting or filtering.
+### Streaming nested and mixed-field Boolean queries
 
-Acceptance: randomized differential tests against the all-hit reference for
-nested must/should/must-not, mixed fields, duplicate clauses, minimum-should-match,
-boosts (including zero/negative where supported), deletes, filters, counts, and
-pagination. Include phrase leaves and unsupported fallback cases. Profile peak
-scratch and scored/visited candidates on broad nested queries; the supported
-streaming path must retain O(live iterators + k) ranking state rather than a
-corpus-sized score map.
+Native Boolean execution now lowers supported nested/mixed-field clauses into
+per-segment monotone seekable nodes. Term, analyzed match, match-all/match-none,
+and bitmap leaves compose with must, should/minimum-should-match, must-not,
+pure optional clauses and nested boosts. Each clause retains its current hit;
+ranking retains a bounded heap and existing 64-candidate predicate batches.
+Per-field document frequencies and average lengths are cached once per query,
+not recomputed across every segment. Segment iterator arenas reset between
+segments after owned iterators/readers close.
 
-### Delivery and qualification
+Existing same-field fast paths remain first. Nested simple nodes preserve their
+established lowering and f32 arithmetic order, including legacy BM25 normalization,
+boost placement and grouped optional contributions. Mixed-field bounds are not
+reused across subtrees. The new tree visits matching documents to retain exact
+counts and does not claim competitive subtree pruning it has not proved.
 
-Implement and qualify the shared heap and monotone DAAT decision state first,
-then adaptive vector membership, then broader Boolean lowering. Every stage must
-leave the existing fallback operational. Record the exact tested commit and
-optimization mode; rerun relevant tests after merging main. Extend the existing
-real Parquet/Iceberg E2E fixtures instead of adding a synthetic-only qualification.
-The draft becomes ready only after the implementations, differential tests,
-work-count/memory benchmarks, and applicable `e2e-full` cases are complete.
+Phrase/position and other unsupported leaves, distributed statistics,
+aggregations and search-after retain the authoritative existing paths. Public
+sort/cursor orchestration remains unchanged. Future streaming position leaves
+must verify positions before admission; conservative subtree bounds could add
+further pruning, but neither is required for the delivered term/match tree.
+
+Seeded randomized differential coverage compares 100 nested shapes across two
+segments with mixed fields, duplicate clauses, zero/negative boosts, optional
+clauses, minimum-should-match, deletes, bitmap filters and offsets. Candidate
+producer includes/exclusions are compared separately with the all-hit reference.
+Scores, counts, relations and document IDs must match exactly, without a floating
+point tolerance. Phrase fallback eligibility is checked explicitly. Exhaustive
+allocation-failure injection covers iterator, statistics, producer-batch, heap
+and stored-result cleanup for a nested mixed-field tree.
+
+### Qualification
+
+The implementation was qualified after merging main using Zig 0.17.0:
+
+- Debug: 64 sparse tests, 386 bounded native reader tests (one ReleaseFast-only
+  benchmark skipped), 19 focused filtered text/scorer tests (one benchmark skipped),
+  and four filtered reader tests; no failures or leaks.
+- ReleaseFast: 20 focused text/scorer tests, including the heap benchmark, and
+  four filtered reader tests; no failures or leaks.
+- Production Debug `antfly` build passed.
+- The existing real Parquet/Iceberg `e2e-full` fixture now publishes text, sparse
+  and dense indexes, exercises rare/common sparse candidates with broad predicates,
+  exclusion-only queries, dense/hybrid filters, and retains text sort/cursor
+  assertions before and after restart: both formats passed (22.61 seconds total).
+  The separate quantized sparse-score E2E regression also passed (1.97 seconds).
+
+Representative 50-million-row cold/warm throughput and peak process memory
+remain unmeasured. The heap microbenchmark and bounded state guarantees do not
+substitute for that archive-scale qualification.
