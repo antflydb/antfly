@@ -131561,13 +131561,14 @@ test "db graph endpoint cleanup pages preserve original pass through rejected ap
     const Clock = struct {
         var apply: *@import("apply_rw_lock.zig").ApplyRwLock = undefined;
         var stopping: *std.atomic.Value(bool) = undefined;
+        var value: u64 = 0;
         var reject: bool = true;
         var cancel: bool = false;
         fn now() u64 {
             if (reject and apply.exclusive_waiters.load(.acquire) != 0) {
-                if (cancel) stopping.store(true, .release) else return 10;
+                if (cancel) stopping.store(true, .release) else value = 10;
             }
-            return 0;
+            return value;
         }
     };
     const alloc = std.testing.allocator;
@@ -131584,6 +131585,7 @@ test "db graph endpoint cleanup pages preserve original pass through rejected ap
         Clock.stopping = &stopping;
         Clock.cancel = cancel;
         Clock.reject = true;
+        Clock.value = 0;
         const pass: GraphPass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
         db.core.apply_mutex.lockShared();
         var held = true;
@@ -131598,10 +131600,12 @@ test "db graph endpoint cleanup pages preserve original pass through rejected ap
         db.core.apply_mutex.unlockShared();
         held = false;
         Clock.reject = false;
-        stopping.store(false, .release);
-        try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, pass.check());
+        var healthy_stopping: std.atomic.Value(bool) = .init(false);
+        const healthy: GraphPass = .{ .stopping = &healthy_stopping, .deadline_ns = 20, .now_ns = Clock.now };
+        try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
         try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
-        try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
     }
 }
 
