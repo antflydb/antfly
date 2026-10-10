@@ -802,3 +802,21 @@ original rejection, retry, and mandatory completion after publication. Physical
 DB/mirror integration remains a separate gate. Recovery still retains its service
 leases and CPU capacity: adopting the whole holder dependency graph and mandatory
 CPU reentry is required before these waits may loan CPU or qualify fair defaults.
+
+### Retained serial cleanup CPU
+
+When managed cleanup CPU is configured, activating a preauthorized cleanup phase
+uses the same reserved CPU partition as independent cleanup roots. The original
+operation, retained bytes and policy class remain charged to their original
+owner. After foreground children are fenced and joined, activation retires the
+old running CPU team and admits one serial cleanup slot. Further team growth is
+rejected by the cleanup capacity bound. Generic callers with no configured
+cleanup partition retain their existing scheduling behavior.
+
+Retained cleanup competes fairly with other cleanup work and retains its one-shot
+physical deadline while queued. Saturating ordinary CPU cannot prevent its grant
+or consume health CPU. Rejection while waiting retains the operation and bytes
+until owning finish after physical cleanup or authoritative transfer. Focused
+scheduler/native-owner tests establish these transitions; physical API/storage,
+service-holder CPU loans, runtime pressure and automatic defaults remain separate
+qualification requirements.

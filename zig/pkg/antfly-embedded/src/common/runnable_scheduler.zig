@@ -164,10 +164,10 @@ pub const Scheduler = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     fn cpuIndex(self: *const Scheduler, e: *const Entry) usize {
-        return if (e.protected_cleanup_root and self.config.cleanup_slots != 0) 5 else @backingInt(e.class);
+        return if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) 5 else @backingInt(e.class);
     }
     fn capacityFor(self: *const Scheduler, e: *const Entry, class: Class) usize {
-        if (e.protected_cleanup_root and self.config.cleanup_slots != 0) return self.config.cleanup_slots;
+        if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) return self.config.cleanup_slots;
         return if (class == .control) self.config.control_slots else self.config.ordinarySlots();
     }
 
@@ -714,6 +714,12 @@ pub const Scheduler = struct {
             .fresh, .finished => return error.InvalidRunnableTransition,
         }
         const running = e.state == .running;
+        const isolated = self.config.cleanup_slots != 0;
+        // Foreground children are fenced above. Retire the old team grant before
+        // changing its CPU partition; cleanup is serial and cannot publish new
+        // foreground children. Operation/policy class and bytes remain retained.
+        if (running and isolated) self.used[self.cpuIndex(e)] -= e.slots;
+        if (isolated) e.slots = 1;
         e.options = cleanup;
         e.cleanup_options = cleanup;
         e.cleanup_duration_ns = null;
@@ -724,7 +730,7 @@ pub const Scheduler = struct {
         e.failure = null;
         e.bypasses = 0;
         e.waited = false;
-        if (!running) {
+        if (!running or isolated) {
             self.sequence +|= 1;
             e.sequence = self.sequence;
             self.enqueue(e, now);
@@ -2225,7 +2231,7 @@ test "runnable scheduler cleanup reenters retained foreground states after cance
         try query.park(.resource_blocked);
         try std.testing.expectError(error.InvalidRunnableTransition, query.enter(.control));
         try query.enter(.query);
-        try std.testing.expectEqual(@as(usize, 0), owner.stats().control_slots);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().control_slots - owner.stats().cleanup_runnable_slots);
         try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
         try std.testing.expectEqual(@as(u64, 32), owner.stats().retained_bytes);
         query.finish();
@@ -3004,4 +3010,127 @@ test "runnable scheduler reserved child packets hold no CPU demand before physic
     try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
     try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
+}
+
+test "runnable scheduler retained serial cleanup progresses with saturated ordinary CPU" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    for (0..3) |cause| {
+        Clock.value = 0;
+        var canceled = false;
+        var owner = try Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 });
+        defer owner.close();
+        var original: Execution = .{};
+        defer original.finish();
+        try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17, .deadline_ns = 5, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .write);
+        try original.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now });
+        try original.park(.resource_blocked);
+        var holder: Execution = .{};
+        defer holder.finish();
+        try holder.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+        if (cause == 0) canceled = true else if (cause == 1) Clock.value = 10 else owner.close();
+        const rejection: anyerror = if (cause == 0) error.Canceled else if (cause == 1) error.DeadlineExceeded else error.SchedulerClosed;
+        try std.testing.expectError(rejection, original.enter(.write));
+        try original.activateCleanup();
+        try std.testing.expectEqual(Class.write, try original.retainedClass());
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 40), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().control_slots - owner.stats().cleanup_runnable_slots);
+        try std.testing.expectEqual(State.running, holder.entry.?.state);
+        try std.testing.expectError(error.InvalidRunnableDemand, original.resizeTeam(2));
+        try original.checkpoint();
+        if (cause != 2) {
+            var health: Execution = .{};
+            try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try std.testing.expectEqual(@as(usize, 3), owner.stats().runnable_slots);
+            health.finish();
+        }
+        original.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().cleanup_runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+        holder.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
+test "runnable scheduler cleanup transfers a fenced CPU team to one isolated slot" {
+    var owner = try Scheduler.init(.{ .slots = 6, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 });
+    defer owner.close();
+    var original: Execution = .{};
+    defer original.finish();
+    try original.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .inference, 3);
+    const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, std.testing.io).nanoseconds));
+    try original.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = now + 250 * std.time.ns_per_ms });
+    try original.activateCleanup();
+    try std.testing.expectEqual(Class.inference, try original.retainedClass());
+    try std.testing.expectEqual(@as(usize, 1), original.entry.?.slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+    try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+    var holder: Execution = .{};
+    defer holder.finish();
+    try holder.startWithSlots(&owner, .{ .io = std.testing.io, .allow_wait = false }, .write, 4);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    try std.testing.expectEqual(@as(usize, 6), owner.stats().runnable_slots);
+    original.finish();
+    holder.finish();
+    health.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "runnable scheduler retained cleanup waits fairly for isolated capacity without refreshing its deadline" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 });
+    defer owner.close();
+    var original: Execution = .{};
+    defer original.finish();
+    try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17, .native_now_ns = Clock.now }, .query);
+    try original.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 30, .native_now_ns = Clock.now });
+    try original.park(.resource_blocked);
+    var holder: Execution = .{};
+    defer holder.finish();
+    try holder.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+    var retiring: Execution = .{};
+    defer retiring.finish();
+    try retiring.startCleanupRoot(&owner, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 3, .deadline_ns = 1000, .native_now_ns = Clock.now });
+    try owner.activateCleanup(&original.entry.?);
+    try std.testing.expectEqual(State.queued, original.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().queued);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+    try std.testing.expectEqual(@as(u64, 43), owner.stats().retained_bytes);
+    var health: Execution = .{};
+    try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    health.finish();
+    Clock.value = 31;
+    try std.testing.expectError(error.DeadlineExceeded, owner.waitRetained(&original.entry.?));
+    try std.testing.expectEqual(State.stopped, original.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().queued);
+    try std.testing.expectEqual(@as(u64, 43), owner.stats().retained_bytes);
+    // Only owning finish after cleanup/transfer returns the old reservation.
+    original.finish();
+    try std.testing.expectEqual(@as(u64, 26), owner.stats().retained_bytes);
+    retiring.finish();
+    holder.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
 }
