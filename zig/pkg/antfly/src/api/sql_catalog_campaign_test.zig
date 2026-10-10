@@ -61,7 +61,9 @@ fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) 
     // implied by CREATE's topology readiness or a local decoder version.
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, protocol.relation_reconciliation_version);
     const bytes = try (control.Command{ .adopt = .{
-        .version = readiness.required_version,
+        // The wire proof names this command's decoder, not a newer admitted
+        // cluster floor. Membership identity still comes from readiness.
+        .version = protocol.relation_reconciliation_version,
         .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
         .member_count = readiness.protected_member_count,
         .membership_fingerprint = readiness.protected_membership_fingerprint,
@@ -69,6 +71,9 @@ fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) 
     defer svc.alloc.free(bytes);
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_relation_reconciliation = bytes });
     try svc.waitForTransitionApplied(receipt);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const work = try store.relationReconciliationWork(svc.metadata_group_id);
+    if (work.epoch == null) return error.SourceAdoptionNotApplied;
 }
 
 fn settleNativeOwner(svc: *@import("../metadata/service.zig").MetadataService, stage: []const u8) !void {
