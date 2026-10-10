@@ -369,6 +369,13 @@ that own a retiring UNIQUE generation prevent admission; another equivalent
 UNIQUE can be dropped if it is not the selected foreign-key target. A pending
 receipt means the operation was durably admitted; inspect the schema and native
 status rather than replaying it.
+Partial-index predicates accept boolean columns, `NOT`, `IS [NOT] TRUE/FALSE`,
+and conjunctions of typed column/literal comparisons and NULL tests. Boolean
+shorthand shares the native equality predicates used by explicit comparisons.
+Negated truth tests retain NULL rows through native null-safe distinctness;
+`NOT flag` excludes NULL rows, while `flag IS NOT TRUE` includes them. Predicates
+that require a disjunction remain unsupported by the native conjunction format.
+
 Index creation advances bounded native build pages before reporting readiness.
 Large builds can return pending and resume through Lite maintenance or an
 explicit `run_until_idle`, which drains relational indexes as well as search

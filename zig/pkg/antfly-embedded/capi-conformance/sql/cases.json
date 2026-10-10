@@ -469,5 +469,56 @@
   },
   {
     "statement": "DROP TABLE partial_parent"
+  },
+  {
+    "statement": "CREATE TABLE boolean_partial (n BIGINT, archived BOOLEAN)"
+  },
+  {
+    "statement": "INSERT INTO boolean_partial(_id,n,archived) VALUES ('false',1,false),('true',2,true),('null',3,NULL)"
+  },
+  {
+    "statement": "CREATE INDEX boolean_visible ON boolean_partial(n DESC) WHERE NOT archived"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived = false ORDER BY n DESC",
+    "rows": [
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "UPDATE boolean_partial SET archived=false WHERE _id='true'"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived = false ORDER BY n DESC",
+    "rows": [
+      [
+        "2"
+      ],
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE INDEX boolean_not_true ON boolean_partial(n DESC) WHERE archived IS NOT TRUE"
+  },
+  {
+    "statement": "SELECT n FROM boolean_partial WHERE n >= 0 AND archived IS NOT TRUE ORDER BY n DESC",
+    "rows": [
+      [
+        "3"
+      ],
+      [
+        "2"
+      ],
+      [
+        "1"
+      ]
+    ]
+  },
+  {
+    "statement": "DROP TABLE boolean_partial"
   }
 ]

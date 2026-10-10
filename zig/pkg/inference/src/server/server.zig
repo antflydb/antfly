@@ -3827,6 +3827,7 @@ pub const Node = struct {
     compatibility_cache_lock: std.atomic.Mutex = .unlocked,
     readiness_inventory: ReadinessInventory = .{},
     readiness_refresh_group: std.Io.Group = .init,
+    readiness_refresh_stop: std.Io.Event = .unset,
     readiness_refresh_io: ?std.Io = null,
     readiness_refresh_started: bool = false,
     hard_cancellation_watchdog: ?*HardCancellationWatchdog = null,
@@ -4074,7 +4075,10 @@ pub const Node = struct {
         self.speaker_embedders.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
-        if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
+        if (self.readiness_refresh_io) |io| {
+            self.readiness_refresh_stop.set(io);
+            self.readiness_refresh_group.cancel(io);
+        }
         if (self.executor_microbatch_broker) |*broker| broker.deinit();
         // Manager-owned loads can outlive their request and retain watchdog
         // guards. Drain those tasks (including guard cleanup) while their
@@ -4313,10 +4317,16 @@ pub const Node = struct {
 
     fn readinessRefreshLoop(self: *Node, io: std.Io) std.Io.Cancelable!void {
         while (true) {
-            try io.sleep(
-                std.Io.Duration.fromMilliseconds(readiness_inventory_refresh_interval_ms),
-                .awake,
-            );
+            // Explicit shutdown wakes the timer without relying on the host's
+            // signal handlers or signal mask to interrupt a sleeping syscall.
+            self.readiness_refresh_stop.waitTimeout(io, .{ .duration = .{
+                .raw = .fromMilliseconds(readiness_inventory_refresh_interval_ms),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
+            if (self.readiness_refresh_stop.isSet()) return;
             self.refreshReadinessInventory(io) catch |err| {
                 // Preserve the last-known-good snapshot through transient cache
                 // or publication failures. A never-successful initialization
@@ -29272,6 +29282,41 @@ test "readiness inventory initializes once and owns its refresh task" {
     try std.testing.expectEqual(@as(usize, 0), snapshot.counts.total());
     try std.testing.expect(node.readiness_refresh_started);
     try std.testing.expect(node.readiness_refresh_io != null);
+}
+
+test "inference maintenance shutdown wakes parked timers without sleep interruption" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const Timer = struct {
+        fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            @panic("maintenance must wait on its shutdown event, not sleep");
+        }
+    };
+    var vtable = threaded.io().vtable.*;
+    vtable.sleep = Timer.sleep;
+    const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &vtable };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(path);
+    var node = try Node.init(allocator, .{ .models_dir = path });
+    var live = true;
+    defer if (live) node.deinit();
+    node.model_manager.configureModelCache(120_000, 0);
+    try node.model_manager.attachIo(io);
+    try node.startReadinessInventory(io);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (@atomicLoad(std.Io.Event, &node.readiness_refresh_stop, .acquire) != .waiting or
+        @atomicLoad(std.Io.Event, &node.model_manager.eviction_stop, .acquire) != .waiting)
+    {
+        try std.testing.expect(std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds);
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    node.deinit();
+    live = false;
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds() < 1000);
 }
 
 test "readiness inventory starts with no async worker capacity" {
