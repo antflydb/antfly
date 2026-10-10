@@ -153,7 +153,10 @@ pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, a
         try cancellation.check();
         return result;
     }
-    return writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
+    try cancellation.check();
+    const result = try writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
+    try cancellation.check();
+    return result;
 }
 
 fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
@@ -224,6 +227,10 @@ pub const ParticipantWorker = struct {
     }
 
     pub const VTable = struct {
+        status_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnStatusRequest, ?u64, runnable_abi.Borrowed) anyerror!db_mod.types.TxnStatus = null,
+        resolve_group_until_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, u64, runnable_abi.Borrowed) anyerror!void = null,
+        acknowledge_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeRequest, runnable_abi.Borrowed) anyerror!void = null,
+        acknowledge_many_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeManyRequest, runnable_abi.Borrowed) anyerror!void = null,
         begin_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnBeginRequest, runnable_abi.Borrowed) anyerror!void = null,
         prepare_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnPrepareRequest, runnable_abi.Borrowed) anyerror!void = null,
         resolve_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, db_mod.types.CancellationToken, runnable_abi.Borrowed) anyerror!void = null,
@@ -332,6 +339,7 @@ pub const ParticipantWorker = struct {
 
     pub fn statusGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         try self.checkExecution();
+        if (self.execution_runnable != null) return self.statusGroupWithRequest(alloc, group_id, table_name, .{ .txn_id = txn_id }, null);
         return try self.vtable.status_group(self.ptr, alloc, group_id, table_name, txn_id);
     }
 
@@ -339,6 +347,10 @@ pub const ParticipantWorker = struct {
         try self.checkExecution();
         try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.status_group_with_execution orelse return error.CommitDecisionUnknown;
+            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns, borrow);
+        }
         if (req.restore_staging_scope != null) {
             if (req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
             const callback = self.vtable.status_group_scoped orelse return error.CommitDecisionUnknown;
@@ -350,6 +362,10 @@ pub const ParticipantWorker = struct {
     pub fn resolveGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64) !void {
         try self.checkExecution();
         try ensureDecisionRecoveryDeadline(deadline_ns);
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.resolve_group_until_with_execution orelse return error.CommitDecisionUnknown;
+            return callback(self.ptr, alloc, group_id, table_name, req, deadline_ns, borrow);
+        }
         // A legacy implementation cannot prove that its routing or transport
         // honors this deadline. Fail closed instead of turning a bounded
         // recovery operation back into an unbounded request.
@@ -360,19 +376,35 @@ pub const ParticipantWorker = struct {
     pub fn statusGroupUntil(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
         try self.checkExecution();
         try ensureDecisionRecoveryDeadline(deadline_ns);
+        if (self.execution_runnable != null) return self.statusGroupWithRequest(alloc, group_id, table_name, .{ .txn_id = txn_id }, deadline_ns);
         const status = self.vtable.status_group_until orelse return error.CommitDecisionUnknown;
         return try status(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     pub fn acknowledgeGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest) !void {
         try self.checkExecution();
+        if (self.execution_runnable) |borrow| {
+            const callback = self.vtable.acknowledge_group_with_execution orelse return error.UnsupportedOperation;
+            return callback(self.ptr, alloc, group_id, table_name, req, borrow);
+        }
         const acknowledge = self.vtable.acknowledge_group orelse return;
         try acknowledge(self.ptr, alloc, group_id, table_name, req);
     }
     pub fn acknowledgeManyGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
         try self.checkExecution();
         if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
-        if (self.vtable.acknowledge_many_group) |callback| {
+        if (self.execution_runnable) |borrow| {
+            if (self.vtable.acknowledge_many_group_with_execution) |callback| {
+                const delivered = delivered: {
+                    callback(self.ptr, alloc, group_id, table_name, req, borrow) catch |err| switch (err) {
+                        error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :delivered false,
+                        else => return err,
+                    };
+                    break :delivered true;
+                };
+                if (delivered) return;
+            }
+        } else if (self.vtable.acknowledge_many_group) |callback| {
             const delivered = delivered: {
                 callback(self.ptr, alloc, group_id, table_name, req) catch |err| switch (err) {
                     // Acknowledgements are idempotent. Mixed-version hosts retain
@@ -457,6 +489,7 @@ pub const HostedParticipantWorker = struct {
     pre_decision_timeout_ms: u32 = default_pre_decision_timeout_ms,
     pre_decision_attempt_timeout_ms: u32 = default_pre_decision_attempt_timeout_ms,
     execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary = null,
+    execution_deadline_ns: ?u64 = null,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -503,6 +536,9 @@ pub const HostedParticipantWorker = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .status_group_with_execution = statusGroupWithExecution,
+                .resolve_group_until_with_execution = resolveGroupUntilWithExecution,
+                .acknowledge_group_with_execution = acknowledgeGroupWithExecution,
                 .begin_group_with_execution = beginGroupWithExecution,
                 .prepare_group_with_execution = prepareGroupWithExecution,
                 .resolve_group_with_execution = resolveGroupWithExecution,
@@ -516,8 +552,48 @@ pub const HostedParticipantWorker = struct {
                 .status_group_until = statusGroupUntil,
                 .acknowledge_group = acknowledgeGroup,
                 .acknowledge_many_group = acknowledgeManyGroup,
+                .acknowledge_many_group_with_execution = acknowledgeManyGroupWithExecution,
             },
         };
+    }
+
+    fn statusGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, maximum: ?u64, borrow: runnable_abi.Borrowed) !db_mod.types.TxnStatus {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        const result = try statusGroupWithin(&view, alloc, group_id, table_name, req, try completionDeadline(borrow, maximum));
+        try borrow.checkLifetime();
+        return result;
+    }
+
+    fn resolveGroupUntilWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, maximum: u64, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        try resolveGroupWithin(&view, alloc, group_id, table_name, req, .none, try completionDeadline(borrow, maximum));
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.execution_deadline_ns = try completionDeadline(borrow, null);
+        try acknowledgeGroup(&view, alloc, group_id, table_name, req);
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeManyGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        var view = self.*;
+        var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
+        view.execution_wait = wait.boundary();
+        view.execution_deadline_ns = try completionDeadline(borrow, null);
+        try acknowledgeManyGroup(&view, alloc, group_id, table_name, req);
+        try borrow.checkLifetime();
     }
 
     fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
@@ -542,8 +618,7 @@ pub const HostedParticipantWorker = struct {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         // Sample the destination clock first. The original remaining duration
         // cannot be extended by translating it or beginning another RPC.
-        const before = platform_time.monotonicNs();
-        const deadline = before +| try borrow.completionRemainingNs();
+        const deadline = try completionDeadline(borrow, null);
         var view = self.*;
         var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
         view.execution_wait = wait.boundary();
@@ -987,13 +1062,19 @@ pub const HostedParticipantWorker = struct {
         try validateAcknowledgementMany(req);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        var deadline_control: DecisionRecoveryCancellation = .{ .deadline_ns = self.execution_deadline_ns orelse 0 };
+        const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
+        try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
+                var response = if (self.execution_deadline_ns) |deadline|
+                    try client.fetchGroupTxnAcknowledgeManyWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline))
+                else
+                    try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -1003,13 +1084,19 @@ pub const HostedParticipantWorker = struct {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        var deadline_control: DecisionRecoveryCancellation = .{ .deadline_ns = self.execution_deadline_ns orelse 0 };
+        const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
+        try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
+                var response = if (self.execution_deadline_ns) |deadline|
+                    try client.fetchGroupTxnAcknowledgeWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline))
+                else
+                    try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
                 response.deinit(alloc);
             },
         }
@@ -1108,6 +1195,12 @@ fn ensurePreDecisionDeadline(deadline_ns: u64, now_ns: u64) !void {
     if (now_ns >= deadline_ns) return error.Timeout;
 }
 
+fn completionDeadline(borrow: runnable_abi.Borrowed, maximum: ?u64) !u64 {
+    const before = platform_time.monotonicNs();
+    const inherited = before +| try borrow.completionRemainingNs();
+    return if (maximum) |limit| @min(inherited, limit) else inherited;
+}
+
 fn ensureDecisionRecoveryDeadline(deadline_ns: u64) !void {
     if (platform_time.monotonicNs() >= deadline_ns) return error.CommitDecisionUnknown;
 }
@@ -1152,6 +1245,9 @@ pub const LocalTableWriteParticipantWorker = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .status_group_with_execution = statusGroupWithExecution,
+                .resolve_group_until_with_execution = resolveGroupUntilWithExecution,
+                .acknowledge_group_with_execution = acknowledgeGroupWithExecution,
                 .begin_group_with_execution = beginGroupWithExecution,
                 .prepare_group_with_execution = prepareGroupWithExecution,
                 .resolve_group_with_execution = resolveGroupWithExecution,
@@ -1166,6 +1262,29 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .acknowledge_group = acknowledgeGroup,
             },
         };
+    }
+
+    fn statusGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnStatusRequest, maximum: ?u64, borrow: runnable_abi.Borrowed) !db_mod.types.TxnStatus {
+        const deadline = try completionDeadline(borrow, maximum);
+        const result = if (req.restore_staging_scope != null)
+            try statusGroupScoped(ptr, alloc, group_id, table_name, req, deadline)
+        else
+            try statusGroupUntil(ptr, alloc, group_id, table_name, req.txn_id, deadline);
+        try borrow.checkLifetime();
+        return result;
+    }
+
+    fn resolveGroupUntilWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, maximum: u64, borrow: runnable_abi.Borrowed) !void {
+        var deadline: DecisionRecoveryCancellation = .{ .deadline_ns = try completionDeadline(borrow, maximum) };
+        try resolveGroupWithExecution(ptr, alloc, group_id, table_name, req, deadline.token(), borrow);
+        try borrow.checkLifetime();
+    }
+
+    fn acknowledgeGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        var control: CompletionCancellation = .{ .borrow = borrow, .foreground = .none };
+        _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .{ .ptr = &control, .check_fn = CompletionCancellation.check })) orelse return error.UnknownGroup;
+        try borrow.checkLifetime();
     }
 
     fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
@@ -2262,7 +2381,7 @@ fn resolveCoordinatorDecisionAfterFailureChecked(
         }, deadline_ns) catch |retry_err| {
             last_resolve_error = retry_err;
             const now_ns = platform_time.monotonicNs();
-            if (now_ns < deadline_ns) sleepNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns));
+            if (now_ns < deadline_ns) try sleepRecoveryNs(@min(coordinator_resolution_retry_ns, deadline_ns - now_ns), completion);
             continue;
         };
         return .committed;
@@ -4046,6 +4165,15 @@ fn participantTornStateConflict(participant: ParticipantTxn, phase: ParticipantP
         .group_id = participant.group_id,
         .phase = phase,
     };
+}
+
+fn sleepRecoveryNs(duration_ns: u64, completion: ?runnable_abi.Borrowed) !void {
+    var wait: runnable_fanout.RemoteWait = .{ .borrow = completion };
+    if (wait.boundary()) |boundary| {
+        try boundary.beginWait();
+        sleepNs(duration_ns);
+        try boundary.endWait();
+    } else sleepNs(duration_ns);
 }
 
 fn sleepNs(duration_ns: u64) void {
@@ -7554,6 +7682,10 @@ test "distributed txn independently scheduled windows retain physical children i
             try std.testing.expect(req.status == .committed or req.status == .aborted);
             try perform(raw, allocator, borrow);
         }
+        fn acknowledgeControlled(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+            try borrow.checkLifetime();
+            try acknowledge(raw, alloc, group, table, req);
+        }
         fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             _ = self.acknowledgements.fetchAdd(1, .monotonic);
@@ -7590,7 +7722,7 @@ test "distributed txn independently scheduled windows retain physical children i
             if (self.expire_on_second_return and call == 2) Clock.current.store(20 * std.time.ns_per_s, .release);
         }
         fn worker(self: *@This()) ParticipantWorker {
-            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
+            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .acknowledge_group_with_execution = acknowledgeControlled, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
         }
     };
     for ([_]bool{ false, true }) |expire| {
@@ -7827,6 +7959,10 @@ test "distributed txn independently scheduled coordinator reserves reusable pack
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
             _ = self.resolves.fetchAdd(1, .acq_rel);
         }
+        fn acknowledgeControlled(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
+            try borrow.checkLifetime();
+            try acknowledge(raw, alloc, group, table, req);
+        }
         fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(u64, 7001), group);
@@ -7834,7 +7970,7 @@ test "distributed txn independently scheduled coordinator reserves reusable pack
             self.acknowledgements += 1;
         }
         fn worker(self: *@This()) ParticipantWorker {
-            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
+            return .{ .ptr = self, .vtable = &.{ .begin_group = begin, .prepare_group = prepare, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .acknowledge_group_with_execution = acknowledgeControlled, .begin_group_with_execution = beginControlled, .prepare_group_with_execution = prepareControlled, .resolve_group_with_execution = resolveControlled } };
         }
     };
     const io = std.testing.io;
@@ -7881,4 +8017,213 @@ test "distributed txn independently scheduled coordinator reserves reusable pack
         try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
         try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
     }
+}
+
+test "distributed txn independently scheduled hosted coordinator waits preserve original budget and health progress" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const writes = @import("runnable_write_team.zig");
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    const Executor = struct {
+        scheduler: *native.Scheduler,
+        root: *native.Execution,
+        ceiling_ms: u32 = 14000,
+        calls: usize = 0,
+        many: usize = 0,
+        fail_resume: bool = false,
+        uncertain_many: bool = false,
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const timeout = request.timeout_ms orelse return error.TestMissingTimeout;
+            try std.testing.expect(timeout > 0 and timeout <= self.ceiling_ms);
+            const wait = request.execution_wait orelse return error.TestMissingExecutionWait;
+            try wait.beginWait();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            var health: native.Execution = .{};
+            defer health.finish();
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try health.checkpoint();
+            health.finish();
+            if (self.fail_resume) Clock.current = 20 * std.time.ns_per_s;
+            try wait.endWait();
+            try std.testing.expectEqual(native.Class.write, try self.root.retainedClass());
+            if (std.mem.endsWith(u8, request.uri, "/txn-acknowledge-many")) {
+                self.many += 1;
+                if (self.uncertain_many) return http_route_helpers.textResponseWithHeaders(alloc, 404, "write outcome unknown", &.{.{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_unknown_v1 }});
+                return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
+            }
+            return .{ .status = 200, .body = try alloc.dupe(u8, if (std.mem.endsWith(u8, request.uri, "/txn-status")) "{\"status\":\"committed\"}" else "") };
+        }
+    };
+    Clock.current = 0;
+    defer Clock.current = 0;
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var root: native.Execution = .{};
+    defer root.finish();
+    try root.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 5 * std.time.ns_per_s, .retained_bytes = 256 }, .write);
+    var bridge = try writes.Completion.init(&root, std.testing.allocator);
+    var team = try bridge.team();
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 20 * std.time.ns_per_s });
+    try team.borrow.activateCompletion();
+    Clock.current = 6 * std.time.ns_per_s;
+    var executor: Executor = .{ .scheduler = &scheduler, .root = &root };
+    var hosted = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, executor.iface());
+    var worker = hosted.worker();
+    worker.execution_runnable = team.borrow;
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try worker.statusGroup(std.testing.allocator, 7001, "docs", @splat(1)));
+    Clock.current = 10 * std.time.ns_per_s;
+    executor.ceiling_ms = 10000;
+    try worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{ "table2:00000004:docs:7002", "table2:00000004:docs:7003" } });
+    try std.testing.expectEqual(@as(usize, 1), executor.many);
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.uncertain_many = true;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7002"} }));
+    // An uncertain batch cannot be converted into claimed per-participant ACKs.
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    executor.uncertain_many = false;
+    const retry_limit = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    executor.ceiling_ms = 2000;
+    try worker.resolveGroupUntil(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 }, retry_limit);
+    try std.testing.expect(hosted.execution_wait == null and hosted.execution_deadline_ns == null);
+    try sleepRecoveryNs(std.time.ns_per_ms, team.borrow);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    executor.ceiling_ms = 10000;
+    executor.fail_resume = true;
+    try std.testing.expectError(error.DeadlineExceeded, worker.acknowledgeGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:7002" }));
+    const before = executor.calls;
+    try std.testing.expectError(error.DeadlineExceeded, worker.statusGroup(std.testing.allocator, 7001, "docs", @splat(1)));
+    try std.testing.expectEqual(before, executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    root.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "distributed txn independently scheduled recovery backoff attempts original resumption exactly once" {
+    const runtime = @import("antfly_runtime_abi");
+    const Probe = struct {
+        parks: usize = 0,
+        enters: usize = 0,
+        fn ok(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            out.* = @backingInt(runnable_abi.Class.write);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(reason == @backingInt(runnable_abi.Wait.resource));
+            self.parks += 1;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(class == @backingInt(runnable_abi.Class.write));
+            self.enters += 1;
+            return runtime.error_abi.statusFromError(error.SchedulerClosed);
+        }
+    };
+    var probe: Probe = .{};
+    const borrow: runnable_abi.Borrowed = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Probe.ok, .check_lifetime = Probe.ok, .current_class = Probe.current, .park = Probe.park, .enter = Probe.enter };
+    try std.testing.expectError(error.SchedulerClosed, sleepRecoveryNs(0, borrow));
+    try std.testing.expectEqual(@as(usize, 1), probe.parks);
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+}
+
+test "distributed txn independently scheduled coordinator rejects legacy unscoped callback fallback" {
+    const runtime = @import("antfly_runtime_abi");
+    const Probe = struct {
+        calls: usize = 0,
+        fn ok(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("unexpected CPU transition");
+        }
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+            @panic("unexpected legacy BEGIN");
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+            @panic("unexpected legacy prepare");
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {
+            @panic("unexpected legacy resolve");
+        }
+        fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .pending;
+        }
+        fn ack(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn ackMany(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeManyRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{};
+    const worker: ParticipantWorker = .{ .ptr = &probe, .execution_runnable = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Probe.ok, .check_lifetime = Probe.ok, .park = Probe.transition, .enter = Probe.transition }, .vtable = &.{ .begin_group = Probe.begin, .prepare_group = Probe.prepare, .resolve_group = Probe.resolve, .status_group = Probe.status, .acknowledge_group = Probe.ack, .acknowledge_many_group = Probe.ackMany } };
+    const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.statusGroup(std.testing.allocator, 1, "docs", @splat(1)));
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.statusGroupUntil(std.testing.allocator, 1, "docs", @splat(1), deadline));
+    try std.testing.expectError(error.CommitDecisionUnknown, worker.resolveGroupUntil(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 }, deadline));
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:2" }));
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeManyGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:2"} }));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
 }

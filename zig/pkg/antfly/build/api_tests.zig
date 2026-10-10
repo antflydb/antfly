@@ -2347,7 +2347,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const participant_fanout_control_tests = b.addTest(.{
         .name = "participant-fanout-control-tests",
         .root_module = participant_fanout_control_root,
-        .filters = &.{"distributed txn independently scheduled"},
+        .filters = &.{
+            "distributed txn independently scheduled",
+            "hosted participant bulk acknowledgements use typed transport and only definite legacy fallback",
+            "distributed txn retries an ambiguous coordinator decision under the same id",
+            "distributed txn propagates one absolute deadline through ambiguous decision recovery",
+        },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-participant-fanout-control-test", "Verify independent participant scopes, CPU-free physical joins and original completion authority")

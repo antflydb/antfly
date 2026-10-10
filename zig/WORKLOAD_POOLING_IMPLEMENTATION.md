@@ -1568,3 +1568,22 @@ physical durable storage waits are not qualified by the mock coordinator tests.
 Pinned Nix/glibc Linux and cumulative physical integration are separate gates.
 The full resource/overload/performance matrix and automatic defaults remain
 unqualified.
+
+Coordinator status, single/bulk acknowledgement and ambiguous decision retries
+now dispatch through execution-aware callbacks when an invocation owns a
+runnable borrow. Incapable callbacks cannot fall back to an unscoped legacy RPC.
+Hosted workers construct call-local remote wait boundaries and cap status,
+resolve-retry and acknowledgement timeouts by the original finite completion
+budget, additionally respecting a shorter recovery deadline. Mixed-version
+bulk ACK fallback uses the same authority for each single ACK; uncertain batch
+outcomes retain recovery debt without claiming single deliveries. Shared hosted
+worker state remains unchanged. Recovery backoff parks the captured coordinator
+class and always attempts the original resumption before proceeding.
+
+Local coordinator callbacks retain original lifetime checks before/after calls
+and pass finite deadlines to existing bounded status/resolve APIs. ACK helpers
+now check supplied cancellation around ordinary as well as restore operations.
+These local adapters still hold CPU across internal physical waits: completing
+the storage/Raft service-wait dependency graph remains required, and parking
+around an entire local operation would leave CPU work unscheduled. Routing,
+credentials and complete physical HTTP dependency coverage also remain open.

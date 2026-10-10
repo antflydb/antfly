@@ -3284,6 +3284,14 @@ pub const ApiHttpClient = struct {
         return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, null, null, true);
     }
 
+    pub fn fetchGroupTxnAcknowledgeWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !EmptyResponse {
+        return fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, timeout_ms, null);
+    }
+
+    pub fn fetchGroupTxnAcknowledgeManyWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !EmptyResponse {
+        return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, timeout_ms, null, true);
+    }
+
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
         try request.validate();
         if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
