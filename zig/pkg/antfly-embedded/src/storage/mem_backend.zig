@@ -21,6 +21,7 @@ const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const internal_keys = @import("internal_keys.zig");
 const ordered = @import("mem_ordered.zig");
+const read_admission = @import("../common/read_admission.zig");
 
 const State = struct {
     tree: ordered.Tree = .empty,
@@ -130,6 +131,11 @@ pub const Backend = struct {
             return try BoundTxn.open(self.backend, self.namespace, true);
         }
 
+        pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !BoundTxn {
+            _ = admission; // Persistent memory snapshots have no block cache.
+            return BoundTxn.openReadWithAdmission(self.backend, self.namespace, control);
+        }
+
         pub fn beginWrite(self: *@This()) !BoundTxn {
             return try BoundTxn.open(self.backend, self.namespace, false);
         }
@@ -228,6 +234,26 @@ pub const Backend = struct {
             return self.forward(try self.inner.next());
         }
 
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !backend_adapter.Entry {
+            try control.checkpoint();
+            const entry = self.seekAtOrAfter(key) catch |err| {
+                try control.checkpoint();
+                return err;
+            };
+            try control.checkpoint();
+            return entry;
+        }
+
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !backend_adapter.Entry {
+            try control.checkpoint();
+            const entry = self.next() catch |err| {
+                try control.checkpoint();
+                return err;
+            };
+            try control.checkpoint();
+            return entry;
+        }
+
         pub fn last(self: *@This()) !backend_adapter.Entry {
             var found = try self.inner.last(self.tree);
             while (found) |entry| {
@@ -292,6 +318,16 @@ pub const Backend = struct {
             };
         }
 
+        fn openReadWithAdmission(backend: *Backend, namespace: backend_types.Namespace, control: read_admission.Port) !BoundTxn {
+            try @import("../common/bounded_mutex.zig").lockAtomic(&backend.mutex, control);
+            defer backend.mutex.unlock();
+            const rc = try backend.ensureStateLocked();
+            retainState(rc);
+            errdefer releaseState(backend.allocator, rc);
+            try control.checkpoint();
+            return .{ .allocator = backend.allocator, .backend = backend, .namespace = namespace, .read_only = true, .rc = rc };
+        }
+
         pub fn abort(self: *@This()) void {
             const rc = self.rc orelse return;
             lockBackend(self.backend);
@@ -315,6 +351,18 @@ pub const Backend = struct {
             return try self.rc.?.state.get(self.namespace, key);
         }
 
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+            for (keys, values) |key, *value| {
+                try control.checkpoint();
+                value.* = self.get(key) catch null;
+            }
+            try control.checkpoint();
+        }
+
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
             if (self.read_only) return error.ReadOnly;
             try self.rc.?.state.put(self.allocator, self.namespace, key, value);
@@ -327,6 +375,14 @@ pub const Backend = struct {
 
         pub fn openCursor(self: *@This()) !BoundCursor {
             return BoundCursor.init(self.allocator, self.rc.?.state.tree, self.namespace);
+        }
+
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !BoundCursor {
+            try control.checkpoint();
+            var cursor = try self.openCursor();
+            errdefer cursor.close();
+            try control.checkpoint();
+            return cursor;
         }
     };
 

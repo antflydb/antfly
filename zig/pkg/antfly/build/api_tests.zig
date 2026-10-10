@@ -2472,6 +2472,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
 
+    const outbox_read_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/outbox_read_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, outbox_read_admission_root, true, true);
+    outbox_read_admission_root.addImport("antfly_source_root", outbox_read_admission_root);
+    const outbox_read_admission_tests = b.addTest(.{
+        .name = "outbox-read-admission-tests",
+        .root_module = outbox_read_admission_root,
+        .filters = &.{"durable outbox storage"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-outbox-read-admission-test", "Verify original lifetime through physical outbox page reads and finite copy quanta")
+        .dependOn(&b.addRunArtifact(outbox_read_admission_tests).step);
+
     const replication_startup_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/replication_startup_admission_test_root.zig"),
         .target = target,

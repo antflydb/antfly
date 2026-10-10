@@ -3279,7 +3279,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try admission.lockApply(self, retained);
             var apply_held = true;
             errdefer if (apply_held) self.core.unlockApply();
-            var page = try durable_outbox_store.readPending(self.alloc, self.core.store);
+            var read_scope: admission.IntentCollection = .{};
+            const read_control = read_scope.bind(retained, self.backend_runtime.io());
+            var page = if (read_control) |control|
+                try durable_outbox_store.readPendingWithAdmission(self.alloc, self.core.store, control)
+            else
+                try durable_outbox_store.readPending(self.alloc, self.core.store);
             defer page.deinit(self.alloc);
             const batch_raw = page.legacy_batch;
             const replay_raw = page.legacy_replay;

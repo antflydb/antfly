@@ -762,3 +762,13 @@ next entry may observe rejection. Provider waits and page materialization still
 need physical lifetime/bounded-work coverage. Legacy recovery wrappers and durable
 completion owners are preserved. Focused startup-helper fixtures use real service
 locks but stand-in recovery callbacks; physical DB tests remain a separate gate.
+
+Controlled startup outbox reads borrow the original read port only through the
+synchronous DocStore call. Partial singleton/page buffers, cursor and snapshot
+references retire before rejection returns. No page retains the port. Physical
+backend/payload reader gate rejection must preserve the caller's existing lock
+and all pending keys. Payload copying checks lifetime between 64 KiB chunks;
+allocation, snapshot construction, tree comparisons and foreign I/O are not
+qualified by that quantum. The memory-store capability supports admitted snapshot,
+point-batch and cursor boundaries without an uncontrolled fallback. Focused
+fixtures use the actual memory backend; DB/provider/LSM integration remains open.

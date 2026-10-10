@@ -2261,3 +2261,33 @@ retry. Both physical fixtures require cumulative integration. The small focused
 suite exercises the actual shared startup helper with real IO mutex and apply
 rw-locks in six rejection/retry scenarios, using stand-in recovery callbacks;
 it does not instantiate a DB or prove provider delivery/durable acknowledgement.
+
+### Admitted durable-outbox page materialization
+
+Pre-decision startup recovery now carries the original synchronous read-admission
+port into the physical DocStore snapshot, singleton point batch, cursor seek and
+page iteration. Legacy recovery still uses its existing read wrapper. Controlled
+reads own one consistent snapshot while the caller holds apply, copy no more than
+sixteen mutation obligations, and check the original lifetime between 64 KiB
+payload-copy chunks. Partial pages, cursors and readers retire on every rejection
+or allocation failure. Reading never clears or publishes an outbox obligation;
+the existing delivery/mandatory acknowledgement path is unchanged.
+
+Memory-backed stores now implement admitted read snapshots, point batches and
+forward cursor operations. Snapshot admission waits cooperatively on the actual
+backend mutex; rejection after retaining a snapshot rolls that reference back
+before unlocking. Rejected point batches clear borrowed output slots. The memory
+backend originally rejected this read capability with ExecutionWaitUnsupported;
+no uncontrolled fallback was added to conceal that boundary.
+
+The six focused checks include the two existing storage page/cleanup fixtures,
+large-payload checked copies, allocation failure, every observed lifetime
+checkpoint for cancellation/deadline/scheduler closure, and held payload-policy
+and memory-backend reader gates. They use a real DocStore and persistent memory
+backend, checking exact pending entries, singleton contents, unrelated data and
+snapshot reference recovery. They instantiate no physical DB/API/provider. LSM
+cold-reader integration, full production startup callers, provider deadlines,
+mandatory acknowledgement latency, overall memory accounting and fair CPU holder
+adoption remain separate open requirements. The copy quantum bounds local memcpy
+between checks; it does not bound allocation, snapshot construction, tree key
+comparison or foreign I/O latency.
