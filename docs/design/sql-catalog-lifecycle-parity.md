@@ -372,6 +372,24 @@ it, the worker correctly remains idle. The fixture now performs that durable
 adoption and reports compact diagnostics on convergence failure. Its expanded
 native gate is still running; this is not yet activation or recovery evidence.
 
+Native integration in progress now carries a pinned job's coverage through the
+existing table/hidden-create/staged-restore source cursor, publication scan and
+snapshot renewal. Active and pending schema cuts use the same membership
+projection; restore contribution filtering applies after typed claims are
+materialized. Relation-only cuts still skip constraint membership extraction.
+Captured write deltas select coverage from the live root, and independent
+source-owner and checkpoint/recovery checks select the corresponding job/root
+mode. Structural record dispatch does not authorize a typed record; decoding
+still requires its owning coverage contract.
+
+The fresh optimized native run passes all 40 selected tests, including
+scratch-read ownership and allocation-failure checks for both modes and the
+new real-storage write/checkpoint/restart regression. The fixture supplies adoption barriers externally;
+it is not evidence of production all-voter capability activation. Protocol 34
+remains unadvertised. Remaining work includes capability/adoption and migration
+coordination, full restore/replay fault qualification, generated-name admission
+and unchanged original SQL lifecycle/DML qualification.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining

@@ -300,6 +300,14 @@ fn decodeTypedCandidateGenerationKey(bytes: []const u8, generation: Generation) 
 pub fn logicalCandidateKey(bytes: []const u8, generation: Generation) !names.Key {
     return decodeCandidateGenerationKey(bytes, generation);
 }
+/// The caller pins this verified live manifest in the same transaction as
+/// the entry. A bare generation ID cannot authorize constraint occupancy.
+pub fn logicalLiveCandidateKey(bytes: []const u8, root: LiveRoot) !names.Key {
+    return decodeCandidateGenerationKeyWithCoverage(bytes, root.generation, root.coverage);
+}
+pub fn logicalJobCandidateKey(bytes: []const u8, state: State) !names.Key {
+    return decodeCandidateKey(bytes, &state);
+}
 
 pub fn rootKey(buf: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidCatalogRecord;
@@ -604,6 +612,11 @@ pub fn retirementsForGroup(buf: []u8, group: u64) ![]const u8 {
 pub const Record = struct { kind: RecordKind, group_id: u64, generation: ?Generation = null };
 pub fn classify(key: []const u8) !?Record {
     return classifyWithCoverage(key, .relations);
+}
+/// Structural dispatch only, never proof that a typed entry is covered.
+/// Every candidate consumer must select the owning job/live/retirement mode.
+pub fn classifyStructure(key: []const u8) !?Record {
+    return classifyWithCoverage(key, .constraint_names);
 }
 // Structural classification is not coverage authorization. Verifiers select
 // the owning job/root/retirement below before interpreting candidate entries.
@@ -1669,6 +1682,13 @@ fn exerciseOccupancyLifecycle(a: A) !void {
     defer ready.deinit();
     try ready.apply(&txn, test_epoch);
     const root = try publishVerifiedRoot(&txn, ready.after, test_epoch, null);
+    const structural = (try classifyStructure(candidates[1].key)).?;
+    try std.testing.expectEqual(RecordKind.candidate, structural.kind);
+    try std.testing.expectEqual(@as(u64, 7), (try logicalLiveCandidateKey(candidates[1].key, root)).membership_table_id);
+    try std.testing.expectEqual(@as(u64, 7), (try logicalJobCandidateKey(candidates[1].key, ready.after)).membership_table_id);
+    var legacy_root = root;
+    legacy_root.coverage = .relations;
+    try std.testing.expectError(error.InvalidCatalogRecord, logicalLiveCandidateKey(candidates[1].key, legacy_root));
     try std.testing.expectEqual(@as(u64, 2), root.claims);
     try verifyLiveRootForTest(&txn, test_epoch);
     var before = TestTxn.init();

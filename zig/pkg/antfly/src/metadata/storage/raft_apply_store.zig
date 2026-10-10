@@ -163,6 +163,9 @@ fn adoptLiveRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, 
 }
 
 fn publishLiveRelationRootForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !relation_reconciliation.State {
+    return publishLiveRelationRootWithCoverageForTest(store, a, group, .relations);
+}
+fn publishLiveRelationRootWithCoverageForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64, coverage: relation_reconciliation.Coverage) !relation_reconciliation.State {
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -175,7 +178,7 @@ fn publishLiveRelationRootForTest(store: *RaftApplyStore, a: std.mem.Allocator, 
         defer read.abort();
         break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
     };
-    const initial = try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), epoch);
+    const initial = try relation_reconciliation.State.initWithCoverage(group, try relation_reconciliation.nextJobId(null), epoch, coverage);
     const ready = try reconcileRestoreNamesForTest(store, a, initial);
     const proof = try store.prepareRelationPublicationProof(a, ready);
     var txn = try store.store.beginWriteTxn();
@@ -185,6 +188,51 @@ fn publishLiveRelationRootForTest(store: *RaftApplyStore, a: std.mem.Allocator, 
     try verifyRelationCheckpointTxn(a, &txn);
     try txn.commit();
     return ready;
+}
+
+test "system catalog relation namespace transaction occupancy follows native writes checkpoint and restart" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const T = struct {
+        fn verify(store: *RaftApplyStore) !void {
+            try verifyRelationRecoveryForTest(store, std.testing.allocator, 41);
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, 41)).?;
+            try std.testing.expectEqual(relation_reconciliation.Coverage.constraint_names, live.root.coverage);
+            try std.testing.expectEqual(@as(u64, 5), live.root.claims);
+            const ns = system_catalog.default_namespace_id;
+            try std.testing.expect((try live.getEntry(.{ .namespace_id = ns, .name = "shared", .membership_table_id = 7 })) == null);
+            try std.testing.expectEqual(@as(u32, 2), (try live.getClaim(.{ .namespace_id = ns, .name = "new_check", .membership_table_id = 7 })).?.schema_version);
+            try std.testing.expectEqual(@as(u32, 1), (try live.getClaim(.{ .namespace_id = ns, .name = "shared", .membership_table_id = 8 })).?.schema_version);
+            try std.testing.expectEqual(@as(u64, 9), (try live.getClaim(.{ .namespace_id = ns, .name = "shared" })).?.table_id);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/constraint-occupancy", .{tmp.sub_path});
+    defer a.free(path);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+        const schema = "{\"version\":1,\"checks\":[{\"name\":\"shared\"}]}";
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "items", .schema_json = schema } });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "other", .schema_json = schema } });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 9, .name = "shared", .schema_json = "{\"version\":1}" } });
+        // This lower-level fixture supplies adoption barriers externally;
+        // production advertising remains disabled until all-voter activation.
+        try adoptRelationWriterForTest(&store, a, group);
+        _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+        try verifyRelationRecoveryForTest(&store, a, group);
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "items", .schema_json = "{\"version\":2,\"checks\":[{\"name\":\"new_check\"}]}" } });
+        try T.verify(&store);
+    }
+    {
+        var reopened = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer reopened.deinit();
+        try T.verify(&reopened);
+    }
 }
 
 test "system catalog relation namespace transaction bulk resolution requires a live root and follows schema ownership" {
@@ -1320,13 +1368,17 @@ test "system catalog relation namespace transaction FK source projection owns sc
             }
         };
         fn run(alloc: std.mem.Allocator) !void {
-            const schema = "{\"version\":1}";
+            try runCoverage(alloc, .relations);
+            try runCoverage(alloc, .constraint_names);
+        }
+        fn runCoverage(alloc: std.mem.Allocator, coverage: relation_reconciliation.Coverage) !void {
+            const schema = "{\"version\":1,\"checks\":[{\"name\":\"shared\"}]}";
             const table = try encodeTableRecord(alloc, .{ .table_id = 7, .name = "items", .schema_json = schema });
             defer alloc.free(table);
             const projection: RaftApplyStore.RelationFkProjection = .{ .phase = .fencing_child, .plan = .{
                 .id = @splat(9),
                 .child_before = .{ .table_id = 7, .name = "items", .schema_json = schema },
-                .child_after = .{ .table_id = 7, .name = "items", .schema_json = "{\"version\":2,\"relational_indexes\":[{\"name\":\"new_idx\"}]}" },
+                .child_after = .{ .table_id = 7, .name = "items", .schema_json = "{\"version\":2,\"relational_indexes\":[{\"name\":\"new_idx\"}],\"checks\":[{\"name\":\"shared\"},{\"name\":\"new_check\"}]}" },
             } };
             const plan = try std.json.Stringify.valueAlloc(alloc, projection, .{});
             defer alloc.free(plan);
@@ -1335,18 +1387,31 @@ test "system catalog relation namespace transaction FK source projection owns sc
             var table_buf: [160]u8 = undefined;
             var plan_buf: [160]u8 = undefined;
             var reader: Reader = .{ .table_key = try tableKeyForGroup(&table_buf, 41, 7), .plan_key = try fk_generation_publication.key(&plan_buf, 41, 7), .table = table, .plan = plan, .scratch = scratch };
-            var cut = try RaftApplyStore.relationReconciliationSnapshot(alloc, &reader, 41, 7);
+            var cut = try RaftApplyStore.relationWriterSnapshotWithCoverage(alloc, &reader, 41, 7, true, coverage);
             defer cut.deinit();
             try std.testing.expectEqual(@as(usize, 1), reader.table_reads);
             try std.testing.expectEqual(@as(usize, 1), reader.plan_reads);
             @memset(scratch, 0);
-            try std.testing.expectEqual(@as(usize, 2), cut.claims().len);
+            try std.testing.expectEqual(@as(usize, if (coverage == .relations) 2 else 4), cut.claims().len);
             try std.testing.expectEqualStrings("items", cut.claims()[0].key.name);
             try std.testing.expectEqualStrings("new_idx", cut.claims()[1].key.name);
             const existing = try cut.claims()[0].entry();
             try std.testing.expect(existing.active != null and existing.pending != null);
             const added = try cut.claims()[1].entry();
             try std.testing.expect(added.active == null and added.pending != null);
+            if (coverage == .constraint_names) {
+                const shared = cut.claims()[2];
+                try std.testing.expectEqualStrings("shared", shared.key.name);
+                try std.testing.expectEqual(@as(u64, 7), shared.key.membership_table_id);
+                const entry = try shared.entry();
+                try std.testing.expectEqual(relation_names.Kind.constraint_name, entry.active.?.kind);
+                try std.testing.expectEqual(@as(u32, 1), entry.active.?.schema_version);
+                try std.testing.expectEqual(@as(u32, 2), entry.pending.?.schema_version);
+                try std.testing.expectEqualSlices(u8, &projection.plan.id, &entry.pending.?.publication_id);
+                const member = cut.claims()[3];
+                try std.testing.expectEqualStrings("new_check", member.key.name);
+                try std.testing.expect((try member.entry()).active == null);
+            } else try std.testing.expect(!cut.cut.?.membership_projection);
         }
     };
     try Probe.run(std.testing.allocator);
@@ -18614,7 +18679,7 @@ pub const RaftApplyStore = struct {
             owned = false;
             self.verifier.read = &self.read;
             if (self.verifier.state.phase == .verifying_source)
-                self.verifier.source = try relationTableSource(self.a, &self.read, self.verifier.proof.state.group_id, &self.verifier.buffers);
+                self.verifier.source = try relationTableSource(self.a, &self.read, self.verifier.proof.state.group_id, &self.verifier.buffers, self.verifier.proof.state.coverage);
         }
         /// null means another bounded step is required, never partial proof.
         /// After an error/cancel the handle is closed and cannot be resumed.
@@ -18668,7 +18733,7 @@ pub const RaftApplyStore = struct {
             _ = try r.Verifier(docstore.DocStore.Txn).init(read, expected.group_id);
             self.* = .{ .a = a, .read = read, .proof = .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root }, .state = expected };
             self.state.phase = .verifying_source;
-            self.source = try relationTableSource(a, read, expected.group_id, &self.buffers);
+            self.source = try relationTableSource(a, read, expected.group_id, &self.buffers, expected.coverage);
         }
         fn deinit(self: *@This()) void {
             if (self.source) |*source| source.deinit();
@@ -18717,16 +18782,17 @@ pub const RaftApplyStore = struct {
         initial: [160]u8,
         restore: [160]u8,
     };
-    fn relationTableSource(a: std.mem.Allocator, read: *docstore.DocStore.Txn, group: u64, buffers: *RelationSourceBuffers) !RelationTableSource {
+    fn relationTableSource(a: std.mem.Allocator, read: *docstore.DocStore.Txn, group: u64, buffers: *RelationSourceBuffers, coverage: relation_reconciliation.Coverage) !RelationTableSource {
         var source: RelationTableSource = .{
             .a = a,
             .txn = read,
             .group_id = group,
+            .coverage = coverage,
             .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&buffers.tables, group) },
         };
         errdefer source.deinit();
         source.initial = .{ .cursor = try read.openCursor(), .prefix = try fk_generation_publication.initialWorkPrefixForGroup(&buffers.initial, group) };
-        source.restore = .{ .a = a, .txn = read, .group_id = group, .raw = .{ .cursor = try read.openCursor(), .prefix = try restore_staging.activePrefix(&buffers.restore, group) } };
+        source.restore = .{ .a = a, .txn = read, .group_id = group, .coverage = coverage, .raw = .{ .cursor = try read.openCursor(), .prefix = try restore_staging.activePrefix(&buffers.restore, group) } };
         return source;
     }
     fn prepareRelationReconciliationPageTxn(a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !relation_reconciliation.Page {
@@ -18742,7 +18808,7 @@ pub const RaftApplyStore = struct {
             return relation_reconciliation.Page.prepareCandidate(a, expected, epoch, &source);
         }
         var buffers: RelationSourceBuffers = undefined;
-        var source = try relationTableSource(a, read, expected.group_id, &buffers);
+        var source = try relationTableSource(a, read, expected.group_id, &buffers, expected.coverage);
         defer source.deinit();
         return relation_reconciliation.Page.prepareSource(a, expected, epoch, &source);
     }
@@ -18806,6 +18872,7 @@ pub const RaftApplyStore = struct {
         a: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
+        coverage: relation_reconciliation.Coverage = .relations,
         raw: RelationCursor,
         initial: ?RelationCursor = null,
         restore: ?RelationRestoreSource = null,
@@ -18825,7 +18892,7 @@ pub const RaftApplyStore = struct {
             if (self.initial) |*source| if (std.mem.order(u8, after, self.raw.prefix) == .lt) {
                 if (try source.nextAfter(after)) |row| {
                     const id = (try relationInitialWorkTableId(row.key, self.group_id)) orelse return error.InvalidCatalogRecord;
-                    self.cut = try relationInitialSnapshot(self.a, self.txn, self.group_id, id);
+                    self.cut = try relationInitialSnapshotWithCoverage(self.a, self.txn, self.group_id, id, self.coverage);
                     if (self.cut.?.claims().len == 0) return error.InvalidCatalogRecord;
                     return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
                 }
@@ -18833,7 +18900,7 @@ pub const RaftApplyStore = struct {
             if (self.restore) |*source| if (std.mem.order(u8, after, source.raw.prefix) != .lt) return source.nextAfter(after);
             if (try self.raw.nextAfter(after)) |row| {
                 const id = (try capturedRelationTableId(row.key, self.group_id)) orelse return error.InvalidCatalogRecord;
-                self.cut = try relationReconciliationSnapshot(self.a, self.txn, self.group_id, id);
+                self.cut = try relationWriterSnapshotWithCoverage(self.a, self.txn, self.group_id, id, true, self.coverage);
                 return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
             }
             if (self.restore) |*source| return source.nextAfter(after);
@@ -18847,6 +18914,7 @@ pub const RaftApplyStore = struct {
         a: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
+        coverage: relation_reconciliation.Coverage = .relations,
         raw: RelationCursor,
         cached: ?std.json.Parsed(RelationRestoreProjection) = null,
         base: [relation_reconciliation.max_cursor_bytes]u8 = undefined,
@@ -18901,7 +18969,7 @@ pub const RaftApplyStore = struct {
             }
             const plan = self.cached.?.value.plan;
             const target = plan.targets[index];
-            self.cut = try relationRestoreTargetSnapshot(self.a, self.txn, self.group_id, plan.id, target, true);
+            self.cut = try relationRestoreTargetSnapshotWithCoverage(self.a, self.txn, self.group_id, plan.id, target, true, self.coverage);
             const key = try std.fmt.bufPrint(&self.row_key, "{s}:{x:0>4}", .{ self.base[0..self.base_len], index });
             return .{ .key = key, .table_id = if (target.replace) |old| old.table.table_id else target.table.table_id, .pending_table_id = target.table.table_id, .claims = self.cut.?.claims() };
         }
@@ -18936,6 +19004,9 @@ pub const RaftApplyStore = struct {
             pub fn getClaim(self: *@This(), key: relation_names.Key) !?relation_names.Owner {
                 return if (try self.getEntry(key)) |entry| entry.active else null;
             }
+            fn coverage(self: *const @This()) relation_reconciliation.Coverage {
+                return if (self.live) |live| live.root.coverage else .relations;
+            }
         };
     }
     fn relationRegistryLogicalKey(group: u64, key: []const u8, live: ?relation_reconciliation.LiveRoot) !?relation_names.Key {
@@ -18946,9 +19017,11 @@ pub const RaftApplyStore = struct {
             return logical;
         }
         const root = live orelse return null;
-        const record = (try relation_reconciliation.classify(key)) orelse return null;
-        if (record.kind != .candidate or record.group_id != group or !record.generation.?.eql(root.generation)) return null;
-        return try relation_reconciliation.logicalCandidateKey(key, root.generation);
+        if (root.generation.group_id != group) return error.InvalidCatalogRecord;
+        var prefix_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+        const prefix = try relation_reconciliation.candidateGenerationPrefix(&prefix_buf, root.generation);
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        return try relation_reconciliation.logicalLiveCandidateKey(key, root);
     }
 
     /// Read from the same pinned transaction as the source rows. An absent
@@ -18978,9 +19051,26 @@ pub const RaftApplyStore = struct {
         }
     };
     fn relationSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool) !RelationSnapshot {
-        return relationSnapshotMode(a, reader, group_id, table_id, allow_legacy, false);
+        return relationSnapshotMode(a, reader, group_id, table_id, allow_legacy, false, .relations);
     }
-    fn relationSnapshotMode(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool, include_pending: bool) !RelationSnapshot {
+    // Materialize the selected projection once into the owned schema arena.
+    // Native snapshots expose only claims(), so filtering restore contributions
+    // below applies equally to relations and table-qualified memberships.
+    fn relationCutInit(a: std.mem.Allocator, definition: relation_names.TableCut.Definition, coverage: relation_reconciliation.Coverage) !relation_names.TableCut {
+        if (coverage == .relations) return relation_names.TableCut.init(a, definition);
+        var cut = try relation_names.TableCut.initWithConstraintMemberships(a, definition);
+        errdefer cut.deinit();
+        cut.claims = try cut.claimsIncludingConstraints();
+        return cut;
+    }
+    fn relationCutSuccessor(a: std.mem.Allocator, before: ?relation_names.TableCut.Definition, next: relation_names.TableCut.Definition, coverage: relation_reconciliation.Coverage) !relation_names.TableCut {
+        if (coverage == .relations) return relation_names.TableCut.initSuccessor(a, before, next);
+        var cut = try relation_names.TableCut.initSuccessorWithConstraintMemberships(a, before, next);
+        errdefer cut.deinit();
+        cut.claims = try cut.claimsIncludingConstraints();
+        return cut;
+    }
+    fn relationSnapshotMode(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool, include_pending: bool, coverage: relation_reconciliation.Coverage) !RelationSnapshot {
         var binding = try system_catalog_storage.getById(a, reader, group_id, .table, table_id);
         defer if (binding) |*value| value.deinit();
         var buf: [160]u8 = undefined;
@@ -19023,10 +19113,10 @@ pub const RaftApplyStore = struct {
             if (relationFkReserved(publication.phase)) {
                 const before = publication.plan.child_before;
                 if (!std.mem.eql(u8, table.name, before.name) or !std.mem.eql(u8, definition.schema_json, before.schema_json)) return error.InvalidCatalogRecord;
-                return .{ .bound = binding != null, .cut = try relation_names.TableCut.initSuccessor(a, definition, .{ .namespace_id = definition.namespace_id, .table_id = table_id, .name = definition.name, .schema_json = publication.plan.child_after.schema_json, .phase = .reserved, .publication_id = publication.plan.id }) };
+                return .{ .bound = binding != null, .cut = try relationCutSuccessor(a, definition, .{ .namespace_id = definition.namespace_id, .table_id = table_id, .name = definition.name, .schema_json = publication.plan.child_after.schema_json, .phase = .reserved, .publication_id = publication.plan.id }, coverage) };
             }
         }
-        return .{ .bound = binding != null, .cut = try relation_names.TableCut.init(a, definition) };
+        return .{ .bound = binding != null, .cut = try relationCutInit(a, definition, coverage) };
     }
     fn validateRelationBindingHierarchy(a: std.mem.Allocator, reader: anytype, group_id: u64, namespace_id: u64) !void {
         var namespace = try system_catalog_storage.getById(a, reader, group_id, .namespace, namespace_id);
@@ -19097,9 +19187,12 @@ pub const RaftApplyStore = struct {
         return relationWriterSnapshot(a, reader, group_id, table_id, true);
     }
     fn relationWriterSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool) !RelationSnapshot {
-        const active = try relationSnapshotMode(a, reader, group_id, table_id, allow_legacy, true);
+        return relationWriterSnapshotWithCoverage(a, reader, group_id, table_id, allow_legacy, .relations);
+    }
+    fn relationWriterSnapshotWithCoverage(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool, coverage: relation_reconciliation.Coverage) !RelationSnapshot {
+        const active = try relationSnapshotMode(a, reader, group_id, table_id, allow_legacy, true, coverage);
         if (active.cut != null) return active;
-        return relationInitialSnapshot(a, reader, group_id, table_id);
+        return relationInitialSnapshotWithCoverage(a, reader, group_id, table_id, coverage);
     }
     /// Project namespace inputs, not potentially large artifact/receipt DOMs.
     /// These records are already admitted by the complete restore validator.
@@ -19232,6 +19325,9 @@ pub const RaftApplyStore = struct {
     /// Target belongs to an owned job projection loaded from this same pinned
     /// reader. Pointer checks are dependencies, not independent plan authority.
     fn relationRestoreTargetSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, id: [16]u8, target: RelationRestoreProjection.Target, contributions: bool) !RelationSnapshot {
+        return relationRestoreTargetSnapshotWithCoverage(a, reader, group_id, id, target, contributions, .relations);
+    }
+    fn relationRestoreTargetSnapshotWithCoverage(a: std.mem.Allocator, reader: anytype, group_id: u64, id: [16]u8, target: RelationRestoreProjection.Target, contributions: bool, coverage: relation_reconciliation.Coverage) !RelationSnapshot {
         var buf: [catalog_name_key_buffer_bytes]u8 = undefined;
         try relationRestoreRequirePointer(reader, try restore_staging.activeKey(&buf, group_id, id), id);
         try relationRestoreRequirePointer(reader, try restore_staging.nameKey(&buf, group_id, target.table.name), id);
@@ -19272,7 +19368,7 @@ pub const RaftApplyStore = struct {
         const name = if (target.catalog_binding) |binding| binding.name else if (old_binding) |binding| binding.value.name else target.table.name;
         if (old_binding != null and (before.?.namespace_id != namespace_id or !std.mem.eql(u8, before.?.name, name))) return error.InvalidCatalogRecord;
         try validateRelationBindingHierarchy(a, reader, group_id, namespace_id);
-        var cut = try relation_names.TableCut.initSuccessor(a, before, .{ .namespace_id = namespace_id, .table_id = target.table.table_id, .name = name, .schema_json = target.table.schema_json, .phase = .reserved, .publication_id = id });
+        var cut = try relationCutSuccessor(a, before, .{ .namespace_id = namespace_id, .table_id = target.table.table_id, .name = name, .schema_json = target.table.schema_json, .phase = .reserved, .publication_id = id }, coverage);
         errdefer cut.deinit();
         if (contributions) {
             const claims = @constCast(cut.claims);
@@ -19406,6 +19502,9 @@ pub const RaftApplyStore = struct {
         return relationInitialSourceDigest(parsed.value, table_id);
     }
     fn relationInitialSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !RelationSnapshot {
+        return relationInitialSnapshotWithCoverage(a, reader, group_id, table_id, .relations);
+    }
+    fn relationInitialSnapshotWithCoverage(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, coverage: relation_reconciliation.Coverage) !RelationSnapshot {
         var buf: [160]u8 = undefined;
         const work = reader.get(try fk_generation_publication.initialWorkKey(&buf, group_id, table_id)) catch |err| switch (err) {
             error.NotFound => return .{},
@@ -19436,7 +19535,7 @@ pub const RaftApplyStore = struct {
         if (!std.mem.eql(u8, logical, &plan_id)) return error.InvalidCatalogRecord;
         const physical = try reader.get(try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, plan.child.name));
         if (!std.mem.eql(u8, physical, &plan_id)) return error.InvalidCatalogRecord;
-        return .{ .cut = try relation_names.TableCut.init(a, .{ .namespace_id = plan.namespace_id, .table_id = table_id, .name = plan.logical_name, .schema_json = plan.child.schema_json, .phase = .reserved, .publication_id = plan.id }) };
+        return .{ .cut = try relationCutInit(a, .{ .namespace_id = plan.namespace_id, .table_id = table_id, .name = plan.logical_name, .schema_json = plan.child.schema_json, .phase = .reserved, .publication_id = plan.id }, coverage) };
     }
     fn relationInitialWorkTableId(key: []const u8, group_id: u64) !?u64 {
         var buf: [160]u8 = undefined;
@@ -19642,7 +19741,7 @@ pub const RaftApplyStore = struct {
         }
     }
     fn reconciliationReplayBeforeKey(group_id: u64, key: []const u8) !bool {
-        const record = (try relation_reconciliation.classify(key)) orelse return false;
+        const record = (try relation_reconciliation.classifyStructure(key)) orelse return false;
         if (record.group_id != group_id) return error.InvalidCatalogRecord;
         return true;
     }
@@ -19670,7 +19769,7 @@ pub const RaftApplyStore = struct {
         var count: usize = 0;
         var entries = journal.originals.iterator();
         while (entries.next()) |entry| {
-            const record = (try relation_reconciliation.classify(entry.key_ptr.*)) orelse continue;
+            const record = (try relation_reconciliation.classifyStructure(entry.key_ptr.*)) orelse continue;
             if (record.kind != .candidate) continue;
             // Live effects are independently checked as complete producer
             // before/after cuts by capturedRelationsPlanTxn, including deletes.
@@ -19698,7 +19797,7 @@ pub const RaftApplyStore = struct {
                 if (targets.count() > relation_reconciliation.max_tables_per_page) return error.CatalogCommandTooLarge;
                 slot.value_ptr.* = .{ .table_id = owner.table_id, .restore = restore };
             }
-            const logical = try relation_reconciliation.logicalCandidateKey(entry.key_ptr.*, record.generation.?);
+            const logical = try relation_reconciliation.logicalJobCandidateKey(entry.key_ptr.*, state.?);
             try slot.value_ptr.candidates.append(a, .{ .key = logical, .entry = candidate });
         }
         // Retain only touched candidates across targets. A page containing a
@@ -19710,9 +19809,9 @@ pub const RaftApplyStore = struct {
         while (groups.next()) |group| {
             _ = scratch.reset(.retain_capacity);
             var cut = if (group.restore) |proof|
-                try relationRestoreTargetSnapshot(self.alloc, txn, group_id, proof.plan_id, proof.target, false)
+                try relationRestoreTargetSnapshotWithCoverage(self.alloc, txn, group_id, proof.plan_id, proof.target, false, state.?.coverage)
             else
-                try relationReconciliationSnapshot(self.alloc, txn, group_id, group.table_id);
+                try relationWriterSnapshotWithCoverage(self.alloc, txn, group_id, group.table_id, true, state.?.coverage);
             defer cut.deinit();
             var by_name: relation_names.EntryMap = .empty;
             try by_name.ensureTotalCapacity(scratch.allocator(), @intCast(cut.claims().len));
@@ -19743,9 +19842,10 @@ pub const RaftApplyStore = struct {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer ids.deinit(self.alloc);
         var before_reader = journal.beforeReader();
-        const before_live = if (include_registry) try relation_reconciliation.LiveStore(command_journal.Journal.BeforeReader).open(&before_reader, group_id) else null;
-        const after_live = if (include_registry) try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id) else null;
+        const before_live = try relation_reconciliation.LiveStore(command_journal.Journal.BeforeReader).open(&before_reader, group_id);
+        const after_live = try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id);
         const live_root = if (after_live) |value| value.root else if (before_live) |value| value.root else null;
+        const coverage = if (live_root) |root| root.coverage else .relations;
         var before_restores: RelationRestoreOwnerCache(command_journal.Journal.BeforeReader) = .{ .a = self.alloc, .txn = &before_reader, .group_id = group_id, .check_progress = false };
         defer before_restores.deinit();
         var after_restores: RelationRestoreProofCache = .{ .a = self.alloc, .txn = txn, .group_id = group_id };
@@ -19823,11 +19923,11 @@ pub const RaftApplyStore = struct {
             const next = try after_restores.lookup(id.*, null);
             if (prior) |proof| _ = try after_restores.loadJob(proof.plan_id);
             if (next) |proof| _ = try before_restores.loadJob(proof.plan_id);
-            const before = appendRelationWriterSource(self.alloc, &before_reader, group_id, id.*, true, &before_restores, &before_sources, &builder, .before) catch |err| switch (err) {
+            const before = appendRelationWriterSource(self.alloc, &before_reader, group_id, id.*, true, &before_restores, &before_sources, &builder, .before, coverage) catch |err| switch (err) {
                 error.CatalogAlreadyExists, error.InvalidCatalogName => return error.InvalidCatalogRecord,
                 else => return err,
             };
-            _ = appendRelationWriterSource(self.alloc, txn, group_id, id.*, !before.bound, &after_restores, &after_sources, &builder, .after) catch |err| switch (err) {
+            _ = appendRelationWriterSource(self.alloc, txn, group_id, id.*, !before.bound, &after_restores, &after_sources, &builder, .after, coverage) catch |err| switch (err) {
                 error.InvalidCatalogRecord, error.InvalidCatalogName => return error.InvalidSchemaUpdateRequest,
                 else => return err,
             };
@@ -19843,7 +19943,7 @@ pub const RaftApplyStore = struct {
         return plan;
     }
     const RelationWriterSourceStamp = struct { bound: bool, nonempty: bool, plan_id: ?[16]u8 };
-    fn appendRelationWriterSource(a: std.mem.Allocator, reader: anytype, group: u64, id: u64, allow_legacy: bool, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, RelationWriterSourceStamp), builder: *relation_names.Plan.Builder, comptime side: anytype) !RelationWriterSourceStamp {
+    fn appendRelationWriterSource(a: std.mem.Allocator, reader: anytype, group: u64, id: u64, allow_legacy: bool, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, RelationWriterSourceStamp), builder: *relation_names.Plan.Builder, comptime side: anytype, coverage: relation_reconciliation.Coverage) !RelationWriterSourceStamp {
         const proof = try restores.lookup(id, null);
         const canonical = if (proof) |value| value.canonical_id else id;
         const plan_id: ?[16]u8 = if (proof) |value| value.plan_id else null;
@@ -19852,9 +19952,9 @@ pub const RaftApplyStore = struct {
             return prior;
         }
         var cut = if (proof) |value|
-            try relationRestoreTargetSnapshot(a, reader, group, value.plan_id, value.target, false)
+            try relationRestoreTargetSnapshotWithCoverage(a, reader, group, value.plan_id, value.target, false, coverage)
         else
-            try relationWriterSnapshot(a, reader, group, id, allow_legacy);
+            try relationWriterSnapshotWithCoverage(a, reader, group, id, allow_legacy, coverage);
         defer cut.deinit();
         const stamp: RelationWriterSourceStamp = .{ .bound = cut.bound, .nonempty = cut.claims().len != 0, .plan_id = plan_id };
         if (!allow_legacy and stamp.nonempty and !stamp.bound) return error.InvalidCatalogRecord;
@@ -29235,7 +29335,7 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
 }
 
 fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, registry: anytype) !usize {
-    var table = try RaftApplyStore.relationWriterSnapshot(alloc, reader, group_id, table_id, true);
+    var table = try RaftApplyStore.relationWriterSnapshotWithCoverage(alloc, reader, group_id, table_id, true, registry.coverage());
     defer table.deinit();
     return verifyRelationClaims(registry, table.claims());
 }
@@ -29245,7 +29345,7 @@ fn verifyRelationWriterTableCut(alloc: std.mem.Allocator, reader: anytype, group
 }
 fn verifyRelationRestoreTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, plan_id: [16]u8, target: RaftApplyStore.RelationRestoreProjection.Target, seen: *std.AutoHashMapUnmanaged(u64, void), registry: anytype) !usize {
     if (seen.contains(target.table.table_id)) return 0;
-    var cut = try RaftApplyStore.relationRestoreTargetSnapshot(alloc, reader, group, plan_id, target, false);
+    var cut = try RaftApplyStore.relationRestoreTargetSnapshotWithCoverage(alloc, reader, group, plan_id, target, false, registry.coverage());
     defer cut.deinit();
     const count = try verifyRelationClaims(registry, cut.claims());
     try seen.put(alloc, target.table.table_id, {});
@@ -29261,7 +29361,7 @@ fn verifyRelationRestoreRemainder(alloc: std.mem.Allocator, reader: anytype, gro
     return count;
 }
 fn verifyRelationInitialCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, registry: anytype) !usize {
-    var hidden = try RaftApplyStore.relationInitialSnapshot(alloc, reader, group_id, table_id);
+    var hidden = try RaftApplyStore.relationInitialSnapshotWithCoverage(alloc, reader, group_id, table_id, registry.coverage());
     defer hidden.deinit();
     if (hidden.claims().len == 0) return error.InvalidCatalogRecord;
     return verifyRelationClaims(registry, hidden.claims());
@@ -29337,7 +29437,7 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
     while (entry) |row| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, row.key, claims)) break;
         if (live) |value| {
-            _ = try relation_reconciliation.logicalCandidateKey(row.key, value.root.generation);
+            _ = try relation_reconciliation.logicalLiveCandidateKey(row.key, value.root);
         } else _ = (try relation_names.Key.fromStorageKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
         _ = try relation_names.Entry.decode(row.value);
         received += 1;
@@ -29409,7 +29509,7 @@ fn verifyReconciliationCheckpointTxn(txn: *docstore.DocStore.Txn) !void {
         var entry = try cursor.seekAtOrAfter(prefix);
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            const record = (try r.classify(row.key)) orelse return error.InvalidCatalogRecord;
+            const record = (try r.classifyStructure(row.key)) orelse return error.InvalidCatalogRecord;
             if (kind == .live) {
                 const live = try r.LiveRoot.decode(row.value);
                 if (!try RaftApplyStore.relationWriterEnabledTxn(txn, record.group_id) or
