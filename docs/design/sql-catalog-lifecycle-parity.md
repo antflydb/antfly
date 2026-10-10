@@ -89,3 +89,56 @@ The native regression belongs to `zig build public-api-parity-test` in `zig/`.
 Runtime selection of the exact `api.sql_catalog.test.SQL index DDL drops the
 exact qualified owner without a catalog snapshot` test is useful for development
 but does not constitute a passing full public API or distributed release gate.
+
+## SQL uniqueness null-policy activation
+
+The next shared semantic gap is the SQL-to-native declaration boundary for
+`NULLS DISTINCT` and `NULLS NOT DISTINCT`. Native public schemas, immutable
+constraint fingerprints, integrity tuple encoding and conflict-owner resolution
+already represent this policy. SQL CREATE TABLE, ALTER TABLE and CREATE INDEX
+must retain it rather than introduce another uniqueness mechanism.
+
+The implementation now carries one null-policy flag through SQL IR and schema
+lowering, for inline/named/composite constraints and plain/expression/partial
+unique indexes. Included columns remain outside the unique tuple. PostgreSQL
+places the clause immediately after UNIQUE for constraints, and after optional
+INCLUDE for indexes. A nonunique index may accept the clause without acquiring
+unique enforcement. Durable schema formats and per-row encoding are unchanged.
+
+The isolated PostgreSQL oracle covers eight declaration profiles, NULL and
+nonnull duplicate rejection, partial-index exclusions, composite/all-NULL keys,
+complete ID postimages after failures, nonunique behavior and six malformed
+clause placements. Native tests cover parsing, public-schema lowering,
+deferrability, NULL-distinct row-specific witnesses versus shared NOT DISTINCT
+claims, conflict arbiters and allocation-failure cleanup.
+
+The cross-layer sweep exposed a preexisting schema-cloning leak during partial
+full-text field construction. Decoder ownership now transfers complete fields,
+rules and path collections to their parent, with one cleanup owner for each
+completed subtree. The expanded mapping fault test checks nested allocations,
+multiple documents and byte-for-byte serialization round trips. The SQL gate
+explicitly selects these cross-layer tests; test discovery is audited, not
+assumed from a passing compiler/executor subset.
+
+These are implementation and component qualification steps. Original cases
+`sql-0692`, `sql-0706` and `sql-0731` still need unchanged-source mounted catalog
+activation and their required lifecycle evidence before disposition changes.
+Distributed owner/failover qualification and the larger pools remain open.
+
+### Qualification checkpoint (2026-10-10)
+
+- Full optimized `zig build sql-test`: 17/17 steps, 694 local and 226 native
+  tests passed, with no failures or leaks. This includes the unchanged original
+  compiler checks and the nested schema allocation-failure regression.
+- PostgreSQL 19beta4: all four isolated lifecycle/original-DDL oracle tests pass.
+  The reference statements are loaded from the frozen original inventory.
+- Formatting, new Python lint, inventory integrity and the 1,991-file Apache
+  source boundary pass. Original dispositions remain 478 / 136 / 73 / 899.
+- Final current-source debug SQL validation and the server-side
+  `antfly-sql-index-ddl-test` are still running; their completion is not claimed.
+  An earlier broad, pre-change API build was retired, not counted as passing.
+
+The next delivery is mounted catalog activation/recovery evidence for the
+original index and constraint cohort, including real ownership and readiness
+checks. This checkpoint does not close the larger SQL goal or its remaining
+distributed, lifecycle and public execution requirements.

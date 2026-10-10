@@ -813,168 +813,14 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
     const full_text_documents: []FullTextDocument = if (fmt_version >= 2) blk: {
         const doc_count = readU32(data, &pos);
         const docs = try alloc.alloc(FullTextDocument, doc_count);
-        var docs_initialized: usize = 0;
+        var initialized: usize = 0;
         errdefer {
-            for (docs[0..docs_initialized]) |doc| {
-                alloc.free(doc.name);
-                for (doc.fields) |field| {
-                    alloc.free(field.path);
-                    alloc.free(field.emitted_name);
-                    alloc.free(field.analyzer);
-                }
-                if (doc.fields.len > 0) alloc.free(doc.fields);
-                for (doc.dynamic_rules) |rule| {
-                    alloc.free(rule.parent_path);
-                    if (rule.segment_pattern) |pattern| alloc.free(pattern);
-                    alloc.free(rule.relative_path);
-                    for (rule.variants) |variant| {
-                        alloc.free(variant.suffix);
-                        alloc.free(variant.analyzer);
-                    }
-                    if (rule.variants.len > 0) alloc.free(rule.variants);
-                }
-                if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
-                for (doc.open_dynamic_paths) |open_path| alloc.free(open_path);
-                if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
-                for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
-                if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
-                freeOwnedPaths(alloc, doc.declared_paths);
-                freeOwnedPaths(alloc, doc.unindexed_paths);
-            }
+            for (docs[0..initialized]) |doc| freeFullTextDocument(alloc, doc);
             alloc.free(docs);
         }
-
         for (docs) |*doc| {
-            const name = try alloc.dupe(u8, readStr(data, &pos));
-            errdefer alloc.free(name);
-
-            const field_count = readU32(data, &pos);
-            const fields = try alloc.alloc(FullTextField, field_count);
-            var fields_initialized: usize = 0;
-            errdefer {
-                for (fields[0..fields_initialized]) |field| {
-                    alloc.free(field.path);
-                    alloc.free(field.emitted_name);
-                    alloc.free(field.analyzer);
-                }
-                alloc.free(fields);
-            }
-            for (fields) |*field| {
-                field.* = .{
-                    .path = try alloc.dupe(u8, readStr(data, &pos)),
-                    .emitted_name = try alloc.dupe(u8, readStr(data, &pos)),
-                    .analyzer = try alloc.dupe(u8, readStr(data, &pos)),
-                    .include_in_all = data[pos] == 1,
-                };
-                pos += 1;
-                fields_initialized += 1;
-            }
-
-            doc.* = .{
-                .name = name,
-                .fields = fields,
-                .dynamic_rules = &.{},
-                .open_dynamic_paths = &.{},
-                .infer_type_dynamic_paths = &.{},
-            };
-            if (fmt_version >= 3) {
-                const dynamic_rule_count = readU32(data, &pos);
-                const dynamic_rules = try alloc.alloc(FullTextDynamicRule, dynamic_rule_count);
-                var dynamic_rules_initialized: usize = 0;
-                errdefer {
-                    for (dynamic_rules[0..dynamic_rules_initialized]) |rule| {
-                        alloc.free(rule.parent_path);
-                        if (rule.segment_pattern) |pattern| alloc.free(pattern);
-                        alloc.free(rule.relative_path);
-                        for (rule.variants) |variant| {
-                            alloc.free(variant.suffix);
-                            alloc.free(variant.analyzer);
-                        }
-                        if (rule.variants.len > 0) alloc.free(rule.variants);
-                    }
-                    alloc.free(dynamic_rules);
-                }
-                for (dynamic_rules) |*rule| {
-                    const parent_path = try alloc.dupe(u8, readStr(data, &pos));
-                    errdefer alloc.free(parent_path);
-                    const has_segment_pattern = if (fmt_version >= 5) data[pos] == 1 else false;
-                    if (fmt_version >= 5) pos += 1;
-                    const segment_pattern = if (has_segment_pattern)
-                        try alloc.dupe(u8, readStr(data, &pos))
-                    else
-                        null;
-                    errdefer if (segment_pattern) |pattern| alloc.free(pattern);
-                    const relative_path = if (fmt_version >= 4)
-                        try alloc.dupe(u8, readStr(data, &pos))
-                    else
-                        try alloc.dupe(u8, "");
-                    errdefer alloc.free(relative_path);
-
-                    const variant_count = readU32(data, &pos);
-                    const variants = try alloc.alloc(FullTextDynamicVariant, variant_count);
-                    var variants_initialized: usize = 0;
-                    errdefer {
-                        for (variants[0..variants_initialized]) |variant| {
-                            alloc.free(variant.suffix);
-                            alloc.free(variant.analyzer);
-                        }
-                        alloc.free(variants);
-                    }
-                    for (variants) |*variant| {
-                        variant.* = .{
-                            .suffix = try alloc.dupe(u8, readStr(data, &pos)),
-                            .analyzer = try alloc.dupe(u8, readStr(data, &pos)),
-                            .include_in_all = data[pos] == 1,
-                        };
-                        pos += 1;
-                        variants_initialized += 1;
-                    }
-
-                    rule.* = .{
-                        .parent_path = parent_path,
-                        .segment_pattern = segment_pattern,
-                        .relative_path = relative_path,
-                        .variants = variants,
-                    };
-                    dynamic_rules_initialized += 1;
-                }
-                doc.dynamic_rules = dynamic_rules;
-            }
-            if (fmt_version >= 6) {
-                const open_dynamic_path_count = readU32(data, &pos);
-                const open_dynamic_paths = try alloc.alloc([]const u8, open_dynamic_path_count);
-                var open_dynamic_paths_initialized: usize = 0;
-                errdefer {
-                    for (open_dynamic_paths[0..open_dynamic_paths_initialized]) |open_path| alloc.free(open_path);
-                    alloc.free(open_dynamic_paths);
-                }
-                for (open_dynamic_paths) |*open_path| {
-                    open_path.* = try alloc.dupe(u8, readStr(data, &pos));
-                    open_dynamic_paths_initialized += 1;
-                }
-                doc.open_dynamic_paths = open_dynamic_paths;
-            }
-            if (fmt_version >= 8) {
-                const infer_type_dynamic_path_count = readU32(data, &pos);
-                const infer_type_dynamic_paths = try alloc.alloc([]const u8, infer_type_dynamic_path_count);
-                var infer_type_dynamic_paths_initialized: usize = 0;
-                errdefer {
-                    for (infer_type_dynamic_paths[0..infer_type_dynamic_paths_initialized]) |infer_path| alloc.free(infer_path);
-                    alloc.free(infer_type_dynamic_paths);
-                }
-                for (infer_type_dynamic_paths) |*infer_path| {
-                    infer_path.* = try alloc.dupe(u8, readStr(data, &pos));
-                    infer_type_dynamic_paths_initialized += 1;
-                }
-                doc.infer_type_dynamic_paths = infer_type_dynamic_paths;
-            }
-            if (fmt_version >= 14) {
-                const declared_paths = try readOwnedPaths(alloc, data, &pos);
-                errdefer freeOwnedPaths(alloc, declared_paths);
-                doc.unindexed_paths = try readOwnedPaths(alloc, data, &pos);
-                doc.declared_paths = declared_paths;
-            }
-            docs_initialized += 1;
+            doc.* = try readFullTextDocument(alloc, data, &pos, fmt_version);
+            initialized += 1;
         }
         break :blk docs;
     } else &.{};
@@ -1096,6 +942,13 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
+    errdefer {
+        for (relational_columns) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+        }
+        if (relational_columns.len > 0) alloc.free(relational_columns);
+    }
     const external = if (fmt_version >= 15 and data[pos] == 1) blk: {
         pos += 1;
         const bytes = readStr(data, &pos);
@@ -1486,34 +1339,119 @@ pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
     if (s.index_sort.len > 0) alloc.free(s.index_sort);
 }
 
+fn freeFullTextRule(alloc: Allocator, rule: FullTextDynamicRule) void {
+    alloc.free(rule.parent_path);
+    if (rule.segment_pattern) |pattern| alloc.free(pattern);
+    alloc.free(rule.relative_path);
+    for (rule.variants) |variant| {
+        alloc.free(variant.suffix);
+        alloc.free(variant.analyzer);
+    }
+    if (rule.variants.len > 0) alloc.free(rule.variants);
+}
+
+fn freeFullTextDocument(alloc: Allocator, doc: FullTextDocument) void {
+    alloc.free(doc.name);
+    for (doc.fields) |field| {
+        alloc.free(field.path);
+        alloc.free(field.emitted_name);
+        alloc.free(field.analyzer);
+    }
+    if (doc.fields.len > 0) alloc.free(doc.fields);
+    for (doc.dynamic_rules) |rule| freeFullTextRule(alloc, rule);
+    if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
+    freeOwnedPaths(alloc, doc.open_dynamic_paths);
+    freeOwnedPaths(alloc, doc.infer_type_dynamic_paths);
+    freeOwnedPaths(alloc, doc.declared_paths);
+    freeOwnedPaths(alloc, doc.unindexed_paths);
+}
+
 fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) void {
-    for (documents) |doc| {
-        alloc.free(doc.name);
-        for (doc.fields) |field| {
-            alloc.free(field.path);
-            alloc.free(field.emitted_name);
-            alloc.free(field.analyzer);
-        }
-        if (doc.fields.len > 0) alloc.free(doc.fields);
-        for (doc.dynamic_rules) |rule| {
-            alloc.free(rule.parent_path);
-            if (rule.segment_pattern) |pattern| alloc.free(pattern);
-            alloc.free(rule.relative_path);
-            for (rule.variants) |variant| {
+    for (documents) |doc| freeFullTextDocument(alloc, doc);
+    if (documents.len > 0) alloc.free(documents);
+}
+
+/// Completed children transfer to their parent immediately. The parent then
+/// owns cleanup if a later child fails; partially built children stay local.
+fn readFullTextRule(alloc: Allocator, data: []const u8, pos: *usize, version: u32) !FullTextDynamicRule {
+    var rule: FullTextDynamicRule = .{ .parent_path = try alloc.dupe(u8, readStr(data, pos)) };
+    errdefer freeFullTextRule(alloc, rule);
+    const has_pattern = if (version >= 5) data[pos.*] == 1 else false;
+    if (version >= 5) pos.* += 1;
+    if (has_pattern) rule.segment_pattern = try alloc.dupe(u8, readStr(data, pos));
+    rule.relative_path = if (version >= 4) try alloc.dupe(u8, readStr(data, pos)) else try alloc.dupe(u8, "");
+    rule.variants = variants: {
+        const count = readU32(data, pos);
+        const variants = try alloc.alloc(FullTextDynamicVariant, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (variants[0..initialized]) |variant| {
                 alloc.free(variant.suffix);
                 alloc.free(variant.analyzer);
             }
-            if (rule.variants.len > 0) alloc.free(rule.variants);
+            alloc.free(variants);
         }
-        if (doc.dynamic_rules.len > 0) alloc.free(doc.dynamic_rules);
-        for (doc.open_dynamic_paths) |open_path| alloc.free(open_path);
-        if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
-        for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
-        if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
-        freeOwnedPaths(alloc, doc.declared_paths);
-        freeOwnedPaths(alloc, doc.unindexed_paths);
+        for (variants) |*variant| {
+            const suffix = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(suffix);
+            const analyzer = try alloc.dupe(u8, readStr(data, pos));
+            variant.* = .{ .suffix = suffix, .analyzer = analyzer, .include_in_all = data[pos.*] == 1 };
+            pos.* += 1;
+            initialized += 1;
+        }
+        break :variants variants;
+    };
+    return rule;
+}
+
+fn readFullTextDocument(alloc: Allocator, data: []const u8, pos: *usize, version: u32) !FullTextDocument {
+    var doc: FullTextDocument = .{ .name = try alloc.dupe(u8, readStr(data, pos)) };
+    errdefer freeFullTextDocument(alloc, doc);
+    doc.fields = fields: {
+        const count = readU32(data, pos);
+        const fields = try alloc.alloc(FullTextField, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |field| {
+                alloc.free(field.path);
+                alloc.free(field.emitted_name);
+                alloc.free(field.analyzer);
+            }
+            alloc.free(fields);
+        }
+        for (fields) |*field| {
+            const path = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(path);
+            const emitted_name = try alloc.dupe(u8, readStr(data, pos));
+            errdefer alloc.free(emitted_name);
+            const analyzer = try alloc.dupe(u8, readStr(data, pos));
+            field.* = .{ .path = path, .emitted_name = emitted_name, .analyzer = analyzer, .include_in_all = data[pos.*] == 1 };
+            pos.* += 1;
+            initialized += 1;
+        }
+        break :fields fields;
+    };
+    if (version >= 3) doc.dynamic_rules = rules: {
+        const count = readU32(data, pos);
+        const rules = try alloc.alloc(FullTextDynamicRule, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (rules[0..initialized]) |rule| freeFullTextRule(alloc, rule);
+            alloc.free(rules);
+        }
+        for (rules) |*rule| {
+            rule.* = try readFullTextRule(alloc, data, pos, version);
+            initialized += 1;
+        }
+        break :rules rules;
+    };
+    if (version >= 6) doc.open_dynamic_paths = try readOwnedPaths(alloc, data, pos);
+    if (version >= 8) doc.infer_type_dynamic_paths = try readOwnedPaths(alloc, data, pos);
+    if (version >= 14) {
+        doc.declared_paths = try readOwnedPaths(alloc, data, pos);
+        doc.unindexed_paths = try readOwnedPaths(alloc, data, pos);
     }
-    if (documents.len > 0) alloc.free(documents);
+    return doc;
 }
 
 fn readOwnedPaths(alloc: Allocator, data: []const u8, pos: *usize) ![]const []const u8 {
@@ -3413,7 +3351,18 @@ test "schema deserialization cleans initialized mappings on allocation failure" 
         }},
         .storage_mode = .relational,
         .relational_columns = &.{.{ .name = "title", .path = "title", .column_type = .string }},
-        .full_text_documents = &.{.{ .name = "row", .fields = &.{} }},
+        .full_text_documents = &.{
+            .{
+                .name = "row",
+                .fields = &.{.{ .path = "title", .emitted_name = "title.keyword", .analyzer = "keyword", .include_in_all = true }},
+                .dynamic_rules = &.{.{ .parent_path = "meta", .segment_pattern = "*", .relative_path = "value", .variants = &.{.{ .suffix = "keyword", .analyzer = "keyword", .include_in_all = true }} }},
+                .open_dynamic_paths = &.{"meta.open"},
+                .infer_type_dynamic_paths = &.{"meta.inferred"},
+                .declared_paths = &.{"title"},
+                .unindexed_paths = &.{"private"},
+            },
+            .{ .name = "second", .fields = &.{.{ .path = "title", .emitted_name = "title", .analyzer = "standard" }} },
+        },
         .index_sort = &.{.{ .field = "title.keyword", .desc = false }},
     });
     defer alloc.free(encoded);
@@ -3422,9 +3371,12 @@ test "schema deserialization cleans initialized mappings on allocation failure" 
         fn run(failing_alloc: Allocator, data: []const u8) !void {
             const schema = try deserializeSchema(failing_alloc, data);
             defer freeSchema(failing_alloc, schema);
+            const roundtrip = try serializeSchema(failing_alloc, schema);
+            defer failing_alloc.free(roundtrip);
+            try std.testing.expectEqualSlices(u8, data, roundtrip);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{encoded});
 }
 
 test "schema save/load via DocStore" {

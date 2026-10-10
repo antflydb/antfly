@@ -94,6 +94,11 @@ statement before any mutation.
   schema-version-conditional column/default changes and multicolumn covering
   indexes. Unique declarations await native constraint activation; a durable
   pending receipt is not a successful CREATE acknowledgement.
+  UNIQUE constraints and indexes retain PostgreSQL NULLS DISTINCT (default)
+  versus NULLS NOT DISTINCT semantics in native integrity declarations. The
+  clause follows UNIQUE for constraints and INCLUDE for indexes; covering
+  columns remain outside the unique key. Nonunique indexes accept the clause
+  without becoming unique. Public/lifecycle qualification remains case-specific.
 - `BEGIN`/`START TRANSACTION` isolation/read modes, `COMMIT`, `ROLLBACK`, named
   SAVEPOINT/ROLLBACK TO/RELEASE, backed by durable native session ownership.
 - Deferrable UNIQUE and `SET CONSTRAINTS ... IMMEDIATE/DEFERRED`, with durable
