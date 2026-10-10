@@ -4997,6 +4997,37 @@ test "SQL floating special values leave moving frames when their rows leave" {
     }
 }
 
+test "SQL floating RANGE frames order NaN peers in memory and spill" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "real", "double precision" }) |kind| for ([_]bool{ false, true }) |descending| for ([_]bool{ false, true }) |spilled| {
+        const sql = try std.fmt.allocPrint(
+            a,
+            "SELECT count(*) OVER (ORDER BY x {s} RANGE BETWEEN 1 PRECEDING AND CURRENT ROW), " ++
+                "count(*) OVER (ORDER BY x {s} RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) " ++
+                "FROM (VALUES ('-Infinity'::{s}),(1),(2),('Infinity'),('NaN'),('NaN'),(NULL)) t(x) ORDER BY x {s}",
+            .{ if (descending) "DESC" else "ASC", if (descending) "DESC" else "ASC", kind, if (descending) "DESC" else "ASC" },
+        );
+        defer a.free(sql);
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var backend = fixture.iface();
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+        defer manager.deinit();
+        if (spilled) backend.spill_manager = &manager;
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = if (spilled) 1 else 256, .retained_bytes = 256 * 1024 });
+        defer result.deinit();
+        if (spilled) try std.testing.expect(manager.written_bytes > 0);
+        const preceding: []const []const u8 = if (descending) &.{ "1", "2", "2", "1", "1", "2", "1" } else &.{ "1", "1", "2", "1", "2", "2", "1" };
+        const following: []const []const u8 = if (descending) &.{ "1", "2", "2", "1", "2", "1", "1" } else &.{ "1", "2", "1", "1", "2", "2", "1" };
+        try std.testing.expectEqual(preceding.len, result.output.rows.len);
+        for (result.output.rows, preceding, following) |row, before, after| {
+            try std.testing.expectEqualStrings(before, row[0].string);
+            try std.testing.expectEqualStrings(after, row[1].string);
+        }
+    };
+}
+
 test "SQL floating special values unwind prepared reducer allocation failures" {
     const Harness = struct {
         fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {

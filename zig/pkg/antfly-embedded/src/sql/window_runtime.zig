@@ -180,7 +180,7 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: anytype, indi
             const result = if (current.value == .integer)
                 std.math.order(@as(i128, value.value.integer), integer_target)
             else
-                std.math.order(value.value.float, float_target);
+                try scalar.compareDatums(value, Datum.json(.{ .float = float_target }));
             break :blk if (direction.descending) result.invert() else result;
         };
         if (order == .lt or (end and order == .eq)) low = middle + 1 else high = middle;
