@@ -56,6 +56,30 @@ pub const MutationBarrier = struct {
         }
     };
 
+    /// One independently owned root. Its physical reader is not thread-local
+    /// nesting state. Nested consumers must borrow this root explicitly and
+    /// physically join before release; they must not reacquire behind a writer.
+    pub const RootSharedLease = struct {
+        barrier: *MutationBarrier,
+        pub fn release(self: *@This()) void {
+            self.barrier.unlockShared();
+            self.* = undefined;
+        }
+    };
+
+    /// Fresh-operation acquisition. This never borrows another operation's
+    /// same-thread legacy marker. Original controls outlive acquisition.
+    pub fn acquireSharedRootControlled(self: *@This(), io: std.Io, controls: anytype) !RootSharedLease {
+        try controls.checkpoint();
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
+        while (!self.tryLockShared()) try waitControlled(io, controls);
+        var lease: RootSharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
+
     pub const ExclusiveLease = struct {
         barrier: *MutationBarrier,
 

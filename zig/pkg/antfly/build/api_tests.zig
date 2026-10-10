@@ -2570,6 +2570,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")
         .dependOn(&b.addRunArtifact(maintenance_shutdown_admission_tests).step);
 
+    const mutation_root_lease_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/mutation_root_lease_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, mutation_root_lease_root, true, true);
+    mutation_root_lease_root.addImport("antfly_source_root", mutation_root_lease_root);
+    const mutation_root_lease_tests = b.addTest(.{
+        .name = "mutation-root-lease-tests",
+        .root_module = mutation_root_lease_root,
+        .filters = &.{ "mutation root lease", "storage.hot_standby mutation barrier" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-mutation-root-lease-test", "Verify independent mutation root leases preserve original C1 ownership and writer priority")
+        .dependOn(&b.addRunArtifact(mutation_root_lease_tests).step);
+
     const text_scoring_authority_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/text_scoring_authority_test_root.zig"),
         .target = target,

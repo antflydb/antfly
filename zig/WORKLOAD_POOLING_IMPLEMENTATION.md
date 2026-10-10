@@ -2495,3 +2495,27 @@ complete holder adoption and finite operation policy remain necessary. Managed
 streaming workers still require independent capsules and safe CPU-return points,
 and whole-request memory, resource/fairness measurements and defaults remain
 unqualified.
+
+### Operation-owned mutation root migration: lease primitive
+
+`MutationBarrier.acquireSharedRootControlled` now returns a distinct
+`RootSharedLease` that owns one physical reader independently of thread-local
+legacy nesting. Its release can run on another worker after physical joining.
+It retains original acquisition controls, writer admission priority and final
+rejection rollback. Legacy `SharedLease` callers and nesting are unchanged.
+
+Two focused fixtures cover same-thread distinct operations at C1/H1, cross-worker
+physical release, genuine legacy nesting after that release, root/byte ownership
+through caller retirement, and the original deadline across CPU parking while
+a reader and the writer gate remain held. The gate also retains existing barrier
+regressions. These checks qualify the primitive only, not production adoption.
+
+The migration must next propagate explicit enclosing root scope through
+`BatchExecutionContext`, `BatchExecutionOptions`, synchronous mutation/recovery
+receivers, nested DB helpers and commit/resolution cleanup. Nested work must
+borrow its root rather than reacquire behind a queued writer. Root release stays
+before remote durability waits after the replication record is complete, and
+accepted work retains its separate completion authority. No production outer
+lease is switched until that complete graph is wired and physically verified.
+`retainedLeaseControls` still prohibits CPU transfer inside unconverted holders;
+this work does not enable defaults or qualify whole-holder CPU lending.
