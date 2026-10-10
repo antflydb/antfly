@@ -568,7 +568,7 @@ const Owner = struct {
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
                 if (slot == self.pending.len) return;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces }) orelse return;
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces }) orelse return;
                 self.offsets[slot] = piece.offset;
                 self.lengths[slot] = offset - piece.offset;
             }
@@ -654,7 +654,7 @@ const Owner = struct {
                 const take = @min(out.len - done, finish - position);
                 const target = out[done..][0..take];
                 if (lane < tasks.len) {
-                    tasks[lane] = local.sql_parallel_scheduler.global().submit(io, pack_bytes * 3, readSerial, .{ self, capability, start + done, target });
+                    tasks[lane] = local.sql_parallel_scheduler.global().submitIo(io, pack_bytes * 3, readSerial, .{ self, capability, start + done, target });
                     if (tasks[lane] == null) try self.readSerial(capability, start + done, target);
                 } else try self.readSerial(capability, start + done, target);
                 done += take;

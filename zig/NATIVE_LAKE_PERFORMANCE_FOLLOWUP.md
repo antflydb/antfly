@@ -1525,16 +1525,56 @@ inventory against the publication. Only Iceberg uses a catalog snapshot ID; its
 empty-publication sentinel retains current-snapshot discovery. Mismatched source
 kinds return a catalog-generation error rather than accessing an inactive union.
 
+### Remote fetch scheduling refinement
+
+Remote range work now has a separate admission class from CPU kernels, joins,
+partition scans and decode work. The defaults admit eight CPU tasks and up to
+32 I/O tasks under the existing 64 MiB temporary-work allowance. I/O may reserve
+at most 32 MiB and never more than half the configured shared allowance, leaving
+workspace for CPU operators. CPU fan-out counts only occupied CPU slots, while
+both classes charge the same available bytes. Required work retains its inline
+fallback when admission or the I/O backend is unavailable; speculative work
+yields. Native posting-range prefetch and parallel required posting reads, raw
+Parquet range prefetch and Bloom lookahead use I/O admission. Mixed fetch/decode
+lookahead remains CPU work.
+
+Parquet range prefetch uses an eight-slot rolling queue rather than draining the
+previous batch before submitting more work. Each reader also caps outstanding
+range bytes at 32 MiB; the shared admission uses the existing workspace estimate of
+twice the range length and can shrink that window further. Duplicate in-flight
+versioned ranges share a slot. Oversized or unadmitted ranges do not prevent a
+later small range from being tried. Scan pulls reap completed workers without
+waiting for unrelated slow ranges. Required reads retain the versioned cache's
+singleflight contract. Completion releases execution admission before joining;
+close still cancels and joins all borrowers before metadata or providers are
+freed. Resident physical and decoded caches retain their separate bounded
+budgets; this is temporary-work admission, not a replacement buffer manager.
+
+This follows the scheduling lesson in
+[DuckDB's asynchronous I/O design](https://duckdb.org/2026/07/31/asynchronous-io):
+remote request concurrency and CPU concurrency need independent controls, with
+read-ahead constrained by memory. It uses the existing `std.Io.concurrent`
+backend and keeps production Threaded defaults. See `lib/platform/EVENTED.md`
+for Evented qualification. Full multi-row-group ready queues with cross-query
+fairness, typed nested Parquet/JSON path execution and semantics-aware partial
+aggregation below joins remain separate work. No latency-adaptive tuning or
+archive-scale speedup is claimed by this refinement.
+
 ### Qualification
 
-With Zig 0.17.0 after merging origin/main at `083142678c`, Debug qualification
-passed 50 focused tests (one optimized-only benchmark skipped), all 314 lake
-integration tests and the production server build. ReleaseFast passed all 51
-focused tests, including the collector
-benchmark. All 16 page-tree tests also passed independently, including generic
-legacy encoding, integrity, snapshot retention, allocation failure and recovery.
-Final qualification reported no failures or allocator leaks. Zig formatting,
-Python lint/format checks and `git diff --check` also pass.
+With Zig 0.17.0 after merging origin/main at `c0562216e1` and adding the I/O
+refinement, Debug qualification passed all 50 focused tests (one optimized-only
+benchmark skipped), all 314 lake integration tests and the production server
+build. The five standalone scheduling tests passed in both Debug and ReleaseFast.
+The shared integration owner includes the blocked-batch, duplicate range,
+small-budget and cancellation regression. Final qualification reported no
+failures or allocator leaks. Zig formatting, Python lint/format checks, the full
+license/boundary gate and `git diff --check` also pass.
+
+Before the I/O refinement, after the earlier `083142678c` main merge, ReleaseFast
+passed all 51 focused tests, including the collector benchmark. All 16 page-tree
+tests also passed independently, including generic legacy encoding, integrity,
+snapshot retention, allocation failure and recovery.
 
 Regressions cover scalar-bound tightening, conservative envelope coarsening over
 custom BM25 configurations, saturation, dense-merge/COW equivalence, zero dense
@@ -1552,8 +1592,8 @@ fragmented parallel text path. They compare nested Boolean and phrase results,
 zero/negative scores, repeated requests and cold restart. They also cover the
 oversized-term competitive-refinement fallback, limit-1 ranking, broad
 alternatives and prohibited-only queries. All six real-data E2Es passed in one
-fresh post-merge run against the rebuilt production server (250.83 seconds),
-with the disk safety floor enabled. The Parquet and Iceberg pagination fixtures
+fresh run after the I/O refinement against the rebuilt production server
+(253.11 seconds), with the disk safety floor enabled. The Parquet and Iceberg pagination fixtures
 exercise retained snapshot tokens with forward and backward cursors. These are
 the five Iceberg/Parquet SQL fixtures and the native sparse metadata score/ranking
 regression. Iceberg remains in `e2e-full`.

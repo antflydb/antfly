@@ -173,7 +173,7 @@ pub const Stream = struct {
             if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
             // Probe before the first matching group, including all-negative
             // cursor scans. A monotonic plan position avoids duplicate jobs.
-            self.bloom_lookahead[slot] = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
+            self.bloom_lookahead[slot] = reader.scheduler.submitIoTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
             if (self.bloom_lookahead[slot] == null) return; // Required reads remain synchronous on pressure.
             slot += 1;
         }
@@ -564,7 +564,7 @@ pub const Stream = struct {
     pub fn next(self: *Stream) !?types.ColumnBatch {
         try self.context.ensureActive();
         self.clearBatch();
-        if (self.source.scanner.shared_reader) |reader| reader.drain(false);
+        if (self.source.scanner.shared_reader) |reader| reader.reapPrefetch();
         while (true) {
             if (self.page_cursor) |*cursor| {
                 if (try cursor.next()) |batch| {

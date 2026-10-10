@@ -649,26 +649,54 @@ pub const Cache = struct {
     }
 };
 pub const Reader = struct {
+    const Scheduling = @import("../../sql/parallel_scheduler.zig");
+    const Prefetch = struct {
+        task: Scheduling.Task(anyerror!void),
+        bytes: usize,
+        key: [32]u8,
+    };
     cache: *Cache,
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
-    pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
+    scheduler: *Scheduling.Scheduler = Scheduling.global(),
+    pending: [8]?Prefetch = @splat(null),
     prefetch_bytes: usize = 0,
     prefetch_cancelled: std.atomic.Value(bool) = .init(false),
-    /// One lookahead batch, four concurrent ranges, at most 32 MiB in flight.
+    /// Rolling lookahead, at most eight ranges and 32 MiB per reader. Shared
+    /// I/O admission further limits in-flight bytes under memory pressure.
     /// Workers use independent page allocations, never a SQL arena/quota.
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
-        self.drain(false);
+        self.reapPrefetch();
         const io = self.context.io orelse return;
         try self.context.ensureActive();
         self.prefetch_cancelled.store(false, .release);
-        self.prefetch_bytes = 0;
-        for (reads[0..@min(reads.len, self.pending.len)], 0..) |read, i| {
-            if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) break;
+        for (reads) |read| {
+            const slot = for (self.pending, 0..) |pending, i| {
+                if (pending == null) break i;
+            } else break;
+            if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) continue;
+            const key = try self.objectKey(std.heap.page_allocator, read, "prefetch-v1");
+            const duplicate = for (self.pending) |pending| {
+                if (pending) |active| if (std.mem.eql(u8, &key, &active.key)) break true;
+            } else false;
+            if (duplicate) continue;
+            const task = self.scheduler.submitIoTransient(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse continue;
+            self.pending[slot] = .{ .task = task, .bytes = @intCast(read.range.len), .key = key };
             self.prefetch_bytes += @intCast(read.range.len);
-            self.pending[i] = @import("../../sql/parallel_scheduler.zig").global().submit(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse break;
         }
+    }
+    /// Completed workers have already released execution admission. Joining
+    /// them here only reclaims descriptors; unrelated slow reads never stall
+    /// a scan pull or the submission of another batch.
+    pub fn reapPrefetch(self: *Reader) void {
+        const io = self.context.io orelse return;
+        for (&self.pending) |*pending| if (pending.*) |*active| {
+            if (!active.task.isComplete()) continue;
+            active.task.await(io) catch {};
+            self.prefetch_bytes -= active.bytes;
+            pending.* = null;
+        };
     }
     fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
@@ -696,9 +724,9 @@ pub const Reader = struct {
         const io = self.context.io orelse return;
         for (&self.pending) |*future| if (future.*) |*active| {
             if (cancel) {
-                active.cancel(io) catch {};
+                active.task.cancel(io) catch {};
             } else {
-                active.await(io) catch {};
+                active.task.await(io) catch {};
             }
             future.* = null;
         };
@@ -840,14 +868,14 @@ test "external lake shared cache bounds memory and segregates versions and crede
     try std.testing.expectEqual(@as(u64, 1), stats.evictions);
 }
 
-test "external lake prefetch overlaps bounded ranges warms versions and joins on close" {
+test "external lake prefetch rolls across blocked batches warms versions and joins on close" {
     const storage = @import("../../storage/object_storage.zig");
     const a = std.testing.allocator;
     var memory = storage.MemoryObjectStorage.init(a);
     defer memory.deinit();
     var client = memory.client();
     try client.makeBucket("bucket");
-    var put = try client.putObject("bucket", "data", "abcdefghijklmnop", .{});
+    var put = try client.putObject("bucket", "data", "abcdefghijklmnopqrstuvwxyz012345", .{});
     defer put.deinit(a);
     const Slow = struct {
         base: storage.ObjectStorage,
@@ -877,9 +905,10 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.vtable.get_object = Slow.get;
     var cache = Cache.init(a);
     defer cache.deinit();
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
     defer reader.drain(true);
-    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 32, .version = .{ .etag = put.etag.? } };
     var reads: [4]ranges.RangeRead = undefined;
     for (&reads, 0..) |*read, i| read.* = .{ .object = object, .range = .{ .offset = i * 4, .len = 4 }, .purpose = .parquet_column_chunk };
     try reader.prefetch(&reads);
@@ -889,13 +918,41 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expect(slow.entered.load(.acquire) >= 2);
+    var next_reads = reads;
+    for (&next_reads) |*read| read.range.offset += 16;
+    const Rolling = struct {
+        fn run(target: *Reader, next: []const ranges.RangeRead, finished: *std.atomic.Value(bool)) !void {
+            try target.prefetch(next);
+            finished.store(true, .release);
+        }
+    };
+    var finished: std.atomic.Value(bool) = .init(false);
+    var rolling = try std.testing.io.concurrent(Rolling.run, .{ &reader, &next_reads, &finished });
+    var rolling_joined = false;
+    defer if (!rolling_joined) {
+        slow.gate.store(true, .release);
+        _ = rolling.cancel(std.testing.io) catch {};
+    };
+    for (0..200) |_| {
+        if (finished.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const submitted_while_blocked = finished.load(.acquire);
+    // Open the provider before joining even on regression, so a drain-before-
+    // submit implementation fails the assertion instead of wedging the suite.
     slow.gate.store(true, .release);
+    const rolling_result = rolling.await(std.testing.io);
+    rolling_joined = true;
+    try rolling_result;
+    try std.testing.expect(submitted_while_blocked);
+    try std.testing.expectEqual(@as(usize, 32), reader.prefetch_bytes);
     reader.drain(false);
-    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
     const bytes = try reader.reader().readPlannedAlloc(a, reads[2]);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("ijkl", bytes);
-    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), slow.entered.load(.acquire));
     try std.testing.expect(cache.snapshot().hits > 0);
     // Concurrent misses for an identical immutable range share one provider
     // request. Each waiter remains cancelable under its own read context.
@@ -917,7 +974,13 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.gate.store(false, .release);
     reader.scope[0] = 1;
     const entered_before = slow.entered.load(.acquire);
-    try reader.prefetch(&reads);
+    // Shared memory pressure shrinks the rolling window. A large first range
+    // must not prevent a later small useful range from being admitted.
+    scheduler.max_bytes = 24;
+    var large = reads[0];
+    large.range.len = 16;
+    try reader.prefetch(&.{ large, reads[0], reads[1], reads[2], reads[3] });
+    try std.testing.expectEqual(@as(usize, 4), reader.prefetch_bytes);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > entered_before) break;
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
@@ -925,6 +988,8 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);
     for (reader.pending) |future| try std.testing.expect(future == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_bytes);
 }
 
 test "external lake immutable artifact cache survives restart without provider reads" {
