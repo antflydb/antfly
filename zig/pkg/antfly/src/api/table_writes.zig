@@ -44820,9 +44820,9 @@ fn implementationTests() type {
                     state.reject = null;
                     try db.batchWithAdmissionControls(request, original, .none);
                     try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
-                    const row = (try db.lookup(alloc, "doc:startup", .{})) orelse return error.MissingHealthyRetry;
-                    defer alloc.free(row);
-                    try std.testing.expectEqualStrings("{}", row);
+                    var row = (try db.lookup(alloc, "doc:startup", .{})) orelse return error.MissingHealthyRetry;
+                    defer row.deinit(alloc);
+                    try std.testing.expectEqualStrings("{}", row.json);
                     try std.testing.expectEqual(@as(usize, 0), state.transitions);
                     try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
                     db.local_execution.durable_replication_flush_mutex.unlock(io);
