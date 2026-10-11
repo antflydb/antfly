@@ -2155,3 +2155,23 @@ bounded-input C-ABI/private-kernel Debug gate passes all 56 steps and both tests
 without skips, failures or leaks. Optimized qualification for inspection and
 pre-fence integrity remains in progress. No SQL inventory credits or public
 activation claim are made.
+
+### Provisioned native index owner adapter (in qualification)
+
+The provisioned owner source now offers typed native job inspection, admission
+and fence/reservation control through the actual private storage-owner ABI.
+Each operation retains its physical-owner lease through response decoding,
+checks the exact namespace and owner group, and bounds raw admission inputs
+before acquiring an owner. Request cancellation and platform-normalized
+deadlines govern cold catalog/owner acquisition and are rechecked immediately
+before storage dispatch. No post-commit cancellation check disguises a committed
+pending outcome as an uncommitted timeout. Returned parsed values own their
+memory independently of the C response and owner lease.
+
+This adapter is not a metadata permission grant or signed ACK producer. Its
+caller must independently authenticate and fetch publication permission; actual
+storage execution continues to validate native authority and durable job state.
+The focused source test requires canceled, expired and foreign-group requests
+to reject before touching an uninitialized catalog/owner, and rejects empty
+admission inputs before acquisition. Production-linked source qualification is
+in progress. This does not activate public publication or change SQL credits.
