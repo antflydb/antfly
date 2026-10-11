@@ -248,14 +248,14 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     var hash: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(prior.value, &hash, .{});
     const fence: topology.Fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .catalog_digest = hash };
-    const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &private_addition);
+    const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, .native, &candidate, &private_addition);
     const substituted_definitions = try declaration_arena.allocator().dupe(native_index.RelationalIndexDefinition, definitions);
     for (substituted_definitions) |*definition| if (std.mem.eql(u8, definition.name, "email_idx")) {
         definition.keys = &.{.{ .column = "id" }};
     };
     var substituted = try physical.PrivateAddition.init(a, before_view, after_view, if (initial_loaded) |*value| value else null, substituted_definitions, "email_idx");
     defer substituted.deinit();
-    try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &substituted));
+    try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, .native, &candidate, &substituted));
     const encoded = try binding.encode();
     try std.testing.expectEqualSlices(u8, &encoded, &try (try jobs.Binding.decode(&encoded)).encode());
     var damaged = encoded;
@@ -287,6 +287,16 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         }
         try txn.commit();
     }
+    const authority = @import("../source_authority.zig");
+    const namespace_bytes = @import("online_source_contract.zig").namespaceBytes(fence.namespace);
+    {
+        // Provision authority after loading rows, never by mixing a control
+        // mutation with raw primary writes in a captured source transaction.
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try authority.bind(&txn, .native, namespace_bytes);
+        try txn.commit();
+    }
     var manager = try @import("../transactions.zig").TxnManager.init(a, &store);
     defer manager.deinit();
     try manager.initTransaction(@splat(9), 1);
@@ -301,18 +311,23 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         defer txn.abort();
         try std.testing.expect(try jobs.load(&txn) == null);
         try std.testing.expect(try topology.current(&txn) == null);
+        try std.testing.expectEqual(@as(u64, 0), (try authority.load(&txn)).?.sequence);
+        try std.testing.expectError(error.NotFound, txn.get(&jobs.nativeEffectKey(.admitted)));
     }
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try std.testing.expect(try jobs.stageBegin(&txn, binding));
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
+        try std.testing.expectEqual(@as(u64, 1), (try authority.load(&txn)).?.sequence);
         try txn.commit();
     }
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expectError(error.TransactionTopologyBusy, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expectError(error.TransactionTopologyBusy, jobs.stageNativeFenced(&txn, &manager, binding));
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, jobs.nativeReceipt(&txn, binding, .fenced));
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.requireReserved(&txn, binding));
         try std.testing.expectError(error.IntegrityTopologyBusy, topology.requireUnfenced(&txn));
         try std.testing.expectError(error.PrivateIndexPublicationRequired, topology.stageRelease(&txn, fence));
@@ -329,6 +344,27 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     }
     try manager.resolveIntents(@splat(9), .aborted, 2);
     try testOwnerRecovery(a, &store, before_view, binding, false);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        _ = try jobs.stageNativeFenced(&txn, &manager, binding);
+        try std.testing.expectEqual(@as(u64, 2), (try authority.load(&txn)).?.sequence);
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 1), (try authority.load(&txn)).?.sequence);
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, jobs.nativeReceipt(&txn, binding, .fenced));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const receipt = try jobs.stageNativeFenced(&txn, &manager, binding);
+        try std.testing.expectEqual(@as(u64, 2), receipt.position.native.sequence);
+        try std.testing.expectEqualDeep(receipt, try jobs.stageNativeFenced(&txn, &manager, binding));
+        try txn.commit();
+    }
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
@@ -369,6 +405,7 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
         try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
+        try std.testing.expectEqual(@as(u64, 3), (try authority.load(&txn)).?.sequence);
         try txn.commit();
     }
     {
@@ -386,6 +423,18 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         try std.testing.expectEqual(existing, recovered.reservation.expected != null);
         try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &recovered));
         try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.key));
+        for (std.enums.values(jobs.NativeEffect)) |effect| try std.testing.expect(physical.Controller.isReservedMetadataKey(&jobs.nativeEffectKey(effect)));
+        const fenced = try jobs.nativeReceipt(&txn, binding, .fenced);
+        const reserved = try jobs.nativeReceipt(&txn, binding, .reserved);
+        try std.testing.expectEqual(@as(u64, 2), fenced.position.native.sequence);
+        try std.testing.expectEqual(@as(u64, 3), reserved.position.native.sequence);
+        // Feed actual locally derived proofs through the shared metadata
+        // progress reducer. This is not server/RPC or root-signature evidence.
+        const progress = @import("relational_index_publication_progress.zig");
+        const head: progress.Head = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .candidate_digest = binding.integrity_candidate, .reservation_digest = binding.integrity_reserved, .table_id = binding.fence.namespace.table_id, .owner_count = 1 };
+        const fenced_update = try progress.acknowledge(head, .{ .owner = fenced.owner }, head.revision, fenced);
+        const reserved_update = try progress.acknowledge(fenced_update.head, fenced_update.owner, fenced_update.head.revision, reserved);
+        try std.testing.expectEqual(progress.Phase.building, reserved_update.head.phase);
     }
     try testOwnerRecovery(a, &store, before_view, binding, true);
     try testPrivateBuildPages(a, &store, before_view, binding, &private_addition);
@@ -406,14 +455,18 @@ fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, 
         defer txn.abort();
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, testOwnerRecoveryAllocations, .{&txn});
     }
-    const Fault = enum { missing_job, missing_fence, namespace, integrity, schema, completed, progress_owner, progress_phase, candidate_missing, candidate_corrupt };
+    const Fault = enum { missing_job, missing_fence, namespace, integrity, schema, completed, progress_owner, progress_phase, candidate_missing, candidate_corrupt, native_admitted_missing, native_fenced_missing, native_reserved_missing, native_corrupt, native_clock_behind, authority_domain, raft_marker, native_padding, native_action, native_position_domain, native_namespace, native_zero_sequence, native_evidence, native_checksum, native_context, native_fence_order };
     for (std.enums.values(Fault)) |fault| {
         if (!reserved and (fault == .candidate_missing or fault == .candidate_corrupt)) continue;
+        if (!reserved and (fault == .native_fenced_missing or fault == .native_reserved_missing or fault == .native_fence_order)) continue;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const ca = scratch.allocator();
         const progress_key = pages.progressKey(binding.index);
         const blob_key = physical.blobKey(binding.physical_candidate.blob_digest);
+        const admitted_key = owner.nativeEffectKey(.admitted);
+        const fenced_key = owner.nativeEffectKey(.fenced);
+        const reserved_key = owner.nativeEffectKey(.reserved);
         const target: []const u8 = switch (fault) {
             .missing_job => owner.key,
             .missing_fence => topology.fence_key,
@@ -423,6 +476,13 @@ fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, 
             .completed => topology.receipt_key,
             .progress_owner, .progress_phase => &progress_key,
             .candidate_missing, .candidate_corrupt => &blob_key,
+            .native_admitted_missing, .native_corrupt => &admitted_key,
+            .native_padding, .native_action, .native_position_domain, .native_namespace, .native_zero_sequence, .native_evidence, .native_checksum, .native_context => &admitted_key,
+            .native_fence_order => &fenced_key,
+            .native_fenced_missing => &fenced_key,
+            .native_reserved_missing => &reserved_key,
+            .native_clock_behind, .authority_domain => @import("../source_authority.zig").key,
+            .raft_marker => &@import("../internal_keys.zig").ordered_document_applied_entry_key,
         };
         const previous = store.get(ca, target) catch |err| switch (err) {
             error.NotFound => null,
@@ -438,10 +498,37 @@ fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, 
         namespace.range_id += 1;
         @import("doc_identity.zig").encodeNamespace(&namespace_bytes, namespace);
         const fence_bytes = try binding.fence.encode();
+        const source_bytes = (@import("../source_authority.zig").State{ .kind = if (fault == .authority_domain) .raft else .native, .namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), .sequence = 0 }).encode();
+        const raft_bytes: [16]u8 = @splat(1);
+        var tampered: [136]u8 = undefined;
+        switch (fault) {
+            .native_padding, .native_action, .native_position_domain, .native_namespace, .native_zero_sequence, .native_evidence, .native_checksum, .native_context, .native_fence_order => {
+                @memcpy(&tampered, previous.?);
+                switch (fault) {
+                    .native_padding => tampered[5] = 1,
+                    .native_action => tampered[4] = @backingInt(owner.NativeEffect.reserved),
+                    .native_position_domain => @memcpy(tampered[71..104], &try (@import("receipt_position.zig").Position{ .raft = .{ .term = 1, .index = 1 } }).encode()),
+                    .native_namespace => std.mem.writeInt(u64, tampered[88..96], namespace.range_id, .little),
+                    .native_zero_sequence => @memset(tampered[96..104], 0),
+                    .native_evidence => tampered[39] ^= 1,
+                    .native_checksum => tampered[104] ^= 1,
+                    .native_context => tampered[7] ^= 1,
+                    .native_fence_order => std.mem.writeInt(u64, tampered[96..104], 1, .little),
+                    else => unreachable,
+                }
+                // Most faults have a valid physical checksum: recovery must
+                // enforce the logical cut, not just trust intact bytes.
+                if (fault != .native_checksum) std.crypto.hash.Blake3.hash(tampered[0..104], tampered[104..136], .{});
+            },
+            else => {},
+        }
         const value: ?[]const u8 = switch (fault) {
-            .missing_job, .missing_fence, .candidate_missing => null,
+            .missing_job, .missing_fence, .candidate_missing, .native_admitted_missing, .native_fenced_missing, .native_reserved_missing => null,
             .namespace => &namespace_bytes,
-            .integrity, .schema, .candidate_corrupt => "corrupt",
+            .integrity, .schema, .candidate_corrupt, .native_corrupt => "corrupt",
+            .native_clock_behind, .authority_domain => &source_bytes,
+            .raft_marker => &raft_bytes,
+            .native_padding, .native_action, .native_position_domain, .native_namespace, .native_zero_sequence, .native_evidence, .native_checksum, .native_context, .native_fence_order => &tampered,
             .completed => &fence_bytes,
             .progress_owner, .progress_phase => try (pages.Progress{
                 .id = binding.index,
@@ -450,8 +537,15 @@ fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, 
                 .phase = if (fault == .progress_phase) .forward else .primary,
             }).encode(ca),
         };
-        {
+        if (fault == .raft_marker) {
             var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.OnlineSourceScopeChanged, txn.put(target, &raft_bytes));
+        }
+        {
+            // Simulate persisted corruption below the document-store guards.
+            // Ordinary writes must not be able to create these invalid cuts.
+            var txn = try store.runtime_store.beginWrite();
             errdefer txn.abort();
             if (value) |bytes| try txn.put(target, bytes) else try txn.delete(target);
             try txn.commit();
@@ -466,10 +560,25 @@ fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, 
             .progress_owner, .progress_phase => error.InvalidRelationalIndexProgress,
             .candidate_missing => error.MissingRelationalIndexDefinitions,
             .candidate_corrupt => error.InvalidRelationalIndexCatalog,
+            .native_admitted_missing, .native_fenced_missing, .native_reserved_missing, .native_corrupt, .native_clock_behind => error.InvalidPrivateIndexNativeReceipt,
+            .native_padding, .native_action, .native_position_domain, .native_zero_sequence, .native_evidence, .native_checksum, .native_context, .native_fence_order => error.InvalidPrivateIndexNativeReceipt,
+            .native_namespace => error.IdentityNamespaceMismatch,
+            .authority_domain, .raft_marker => error.OnlineSourceScopeChanged,
         };
         try std.testing.expectError(expected, physical.Controller.loadSnapshot(a, store, before));
+        if (reserved) switch (fault) {
+            .namespace, .schema, .native_admitted_missing, .native_fenced_missing, .native_reserved_missing, .native_corrupt, .native_clock_behind, .authority_domain, .raft_marker, .native_padding, .native_action, .native_position_domain, .native_namespace, .native_zero_sequence, .native_evidence, .native_checksum, .native_context, .native_fence_order => {
+                // A worker already open at the old cut must reject corruption
+                // too; restart validation alone cannot guard signing/writes.
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectError(expected, owner.requireReserved(&txn, binding));
+                try std.testing.expectError(expected, owner.nativeReceipt(&txn, binding, .reserved));
+            },
+            else => {},
+        };
         {
-            var txn = try store.beginWriteTxn();
+            var txn = try store.runtime_store.beginWrite();
             errdefer txn.abort();
             if (previous) |bytes| try txn.put(target, bytes) else try txn.delete(target);
             try txn.commit();
@@ -513,6 +622,17 @@ fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocSto
     var manager = try core.initTxnManager();
     defer manager.deinit();
     const budget: jobs.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+    for (std.enums.values(@import("relational_index_owner_job.zig").NativeEffect)) |effect| {
+        // Preparation may succeed before the durable cut is corrupted. Apply
+        // must recheck it before writing even the first candidate or cursor.
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(&@import("relational_index_owner_job.zig").nativeEffectKey(effect));
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, page.stage(&core, &manager, &txn));
+        try std.testing.expectError(error.NotFound, txn.get(&jobs.progressKey(binding.index)));
+    }
     {
         var foreign = binding;
         foreign.plan_digest[0] ^= 1;

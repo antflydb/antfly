@@ -1791,3 +1791,62 @@ The inventory integrity checker still reports 478 implemented, 136 rejected,
 73 superseded and 899 unresolved original cases. Latest fetched `origin/main`
 at `2afbdd306c` is fully included. The public SQL atomicity gate was not rerun
 for this metadata-only checkpoint and remains an open activation requirement.
+
+### Native owner effect cuts and recovery
+
+The local private-index binding now pins the receipt authority as well as the
+namespace. Its PR-private AIOJ v2 encoding remains 656 bytes; the new authority
+byte is checked, padding is zero, and the prior unpublished v1 is rejected.
+Provisioned native ownership cannot be inferred from a request or substituted
+for Raft ownership, and a native owner rejects a retained Raft apply marker.
+
+Admission, drained-fence sealing and dual-catalog reservation now each stage a
+native clock advance and a fixed-size receipt in the SAME storage transaction
+as the effect. Admission alone is deliberately not a fenced acknowledgement:
+the seal requires the actual transaction manager to report all predecessor
+participants drained. Reservation requires that durable seal before burning
+either catalog allocation. Aborted effects leave neither a receipt nor a clock
+advance; exact retries return the original cut without consuming a new sequence.
+
+There are three reusable 136-byte effect slots, not an append-only per-job
+history. Each binds the immutable job context, action, evidence and typed native
+namespace/sequence, with a physical checksum. Old-job slots are inert and are
+replaced by the next admitted job. These hashes are not authentication. Returned
+staged receipts must not be signed or sent until the enclosing transaction and
+its durable replication outbox commit successfully.
+
+Cold recovery verifies admitted/fenced/reserved cut ordering against the durable
+native clock, provisioned authority and namespace, in addition to the existing
+schema, catalog, private definition and page-ownership checks. The recovery fault
+campaign now includes missing cuts, clock rollback, authority substitution,
+cross-namespace positions, zero sequences, forged evidence, wrong actions,
+noncanonical padding, mismatched contexts, checksum errors and invalid fence
+ordering. Most malformed-byte cases deliberately retain a correct physical
+checksum. Corrupt persisted records are injected below document-store guards;
+a separate assertion verifies that ordinary writes reject the forbidden Raft
+marker before recovery is exercised. Memory and LSM backends exercise the same
+campaign, alongside allocation-failure, abort, retry and drained-participant tests.
+
+Live receipt production and page admission share the same cut-order checks as
+cold recovery. A prepared page cannot write after any required receipt vanishes,
+even if its controller was opened before that corruption. The guard also checks
+the durable schema and provisioned authority. It reads the native clock once
+for the three fixed-slot checks and does not revisit transaction history.
+
+This completes local effect staging for admission/seal/reservation, not the
+distributed worker. Ordered DB/C-ABI/RPC commands, forwarded standby positions,
+outbox/replay integration, independently fetched metadata owner decisions,
+page/validation/install/cancel/release continuations, global UNIQUE claims,
+public SQL activation and end-to-end distributed faults remain unfinished.
+The original SQL inventory dispositions are unchanged.
+
+Qualification on the final frozen native-cut implementation passes all 65 build
+steps in both Debug and ReleaseFast for `antfly-relational-index-candidate-test`,
+`antfly-relational-index-pages-test` and `relational-index-catalog-test`. The
+custom artifacts report four native system/page tests, nine candidate/private
+addition tests, six overlapping candidate tests and fourteen catalog tests,
+with no skips, failures or leaks. Earlier interrupted optimized compilation is
+not counted as a passing gate. Formatting, diff checks, license headers, Apache
+boundary and control-catalog freshness pass. The inventory checker remains
+478 implemented / 136 rejected / 73 superseded / 899 unresolved; these native
+component tests do not qualify the still-open public SQL atomicity gate.
