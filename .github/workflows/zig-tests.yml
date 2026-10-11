@@ -1596,6 +1596,13 @@ jobs:
           uv run --no-project --with requests --with pytest
           --with 'psycopg[binary]==3.3.6' --with asyncpg==0.31.0
           python scripts/test_pgwire_drivers.py --binary zig/zig-out/bin/antfly
+      - name: Test large-catalog PostgreSQL startup readiness
+        env:
+          ANTFLY_BIN: zig/zig-out/bin/antfly
+        run: >-
+          uv run --no-project --with requests --with pytest --with pytest-xdist
+          --with 'psycopg[binary]==3.3.6'
+          python -m pytest zig/e2e/antfly/test_pgwire_startup.py -q
 
   e2e-base-plan:
     if: >-

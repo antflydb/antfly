@@ -45,6 +45,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             value
         );
     }
+    // Keep a pooled connection and its default SQLx statement cache alive
+    // across migrations on another connection.
+    sqlx::query("CREATE TABLE cached_sqlx (id TEXT PRIMARY KEY, n BIGINT)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO cached_sqlx (id, n) VALUES ('a', 1)")
+        .execute(&pool)
+        .await?;
+    let mut cached = pool.acquire().await?;
+    let query = "SELECT n FROM cached_sqlx WHERE id = $1";
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(query)
+            .bind("a")
+            .fetch_one(&mut *cached)
+            .await?,
+        1
+    );
+    sqlx::query("ALTER TABLE cached_sqlx ADD COLUMN note TEXT")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(query)
+            .bind("a")
+            .fetch_one(&mut *cached)
+            .await?,
+        1
+    );
+    sqlx::query("CREATE INDEX cached_sqlx_n ON cached_sqlx(n)")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(query)
+            .bind("a")
+            .fetch_one(&mut *cached)
+            .await?,
+        1
+    );
+    drop(cached);
     let mut tx = pool.begin().await?;
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT 1")
