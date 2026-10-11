@@ -133,6 +133,7 @@ pub const Identities = struct {
         }
     };
     const FileSpan = struct { file: []const u8, span: Span };
+    partial_inventory: bool = false,
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
     offsets: []const u32,
@@ -141,7 +142,7 @@ pub const Identities = struct {
         const offsets = try a.alloc(u32, snapshot.segments.len + 1);
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
-        var result: Identities = .{ .offsets = offsets };
+        var result: Identities = .{ .offsets = offsets, .partial_inventory = root.partial_inventory };
         const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
         for (root.file_groups, 0..) |group, group_index| {
@@ -171,7 +172,10 @@ pub const Identities = struct {
         return cache.load(a, store, cached, block);
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
-        const file = self.files.get(selected.file) orelse return error.ExternalLakeSnapshotMismatch;
+        const file = self.files.get(selected.file) orelse {
+            if (self.partial_inventory) return;
+            return error.ExternalLakeSnapshotMismatch;
+        };
         const blocks = try file.blocks(cache, store, cached, selected.file);
         const index = corpus.physical.find(blocks, selected.group, selected.base) orelse return;
         const block = blocks[index];
@@ -212,7 +216,10 @@ pub const Identities = struct {
     pub fn ordinal(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         const ref = row.external;
-        const span = self.files.get(ref.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+        const span = self.files.get(ref.file_id) orelse {
+            if (self.partial_inventory) return null;
+            return error.ExternalLakeSnapshotMismatch;
+        };
         const blocks = try span.blocks(cache, store, cached, ref.file_id);
         const index = corpus.physical.find(blocks, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
         const block = blocks[index];

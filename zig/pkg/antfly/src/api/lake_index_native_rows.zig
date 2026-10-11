@@ -58,8 +58,10 @@ const Entry = struct {
     changed: []const bool,
     slots: []const u32,
     delta: ordered.Delta,
+    reverse: ?*ordered.ReverseBuilder = null,
     fn deinit(self: *Entry) void {
         self.sort.deinit();
+        if (self.reverse) |reverse| reverse.deinit();
         if (self.predicate) |*predicate| predicate.deinit();
         self.tuple.deinit();
     }
@@ -159,8 +161,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     const orders = [_]local.sql_operators.Order{.{}};
     var first: usize = 0;
     while (first < definitions.len) {
-        // Reserve four retained runs per fused sort plus pending/merge files
-        // within the shared 64-file manager, without enlarging its budget.
+        // Retained runs share one anonymous extent container per sort.
+        // Pending runs and bounded merges remain within the 64-file manager.
         const end = @min(first + 8, definitions.len);
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
@@ -228,9 +230,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 digest.* = @splat(0);
             };
             try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
-            entries.items[entries.items.len - 1].sort.run_limit = 4;
+            entries.items[entries.items.len - 1].sort.shared_runs = true;
         }
         if (entries.items.len == 0) continue;
+        for (entries.items) |*entry| if (entry.delta.previous == null) {
+            entry.reverse = try ordered.ReverseBuilder.create(a, store, cancellation);
+        };
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
         var keys = columns.keyIterator();
@@ -296,12 +301,17 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         const cell = try page.cell(row_scratch.allocator(), 0, column);
                         value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
                     }
+                    if (entry.reverse) |reverse| try reverse.add(key.items);
                     try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal });
                     ordinal = std.math.add(u64, ordinal, 1) catch return error.LakeSidecarBuildLimitExceeded;
                 }
             }
         }
         for (entries.items) |*entry| {
+            if (entry.reverse) |reverse| {
+                entry.delta.built_reverse = try reverse.finish();
+                entry.delta.reverse_built = true;
+            }
             const root = try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
             var owned_binding = entry.binding;
             owned_binding.source_id = try out.dupe(u8, entry.binding.source_id);

@@ -156,7 +156,9 @@ test "external lake overlapping text generations share every physical segment on
     var parsed = try local.metadata_lake_index_catalog.parse(a, published);
     defer parsed.deinit();
     try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
-    const declaration = parsed.value.published.?.declarations[0];
+    const declaration = for (parsed.value.published.?.declarations) |candidate| {
+        if (std.mem.eql(u8, candidate.name, "body_text")) break candidate;
+    } else return error.TestUnexpectedResult;
     const full = try @import("lake_index_native_text.zig").loadRoot(ca, store, declaration.artifact, .none, null);
     try std.testing.expectEqual(@as(usize, 3), full.segments.len);
     var read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
@@ -251,6 +253,37 @@ test "external lake overlapping text generations share every physical segment on
             try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none));
             try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
             try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
+        }
+        {
+            var owner: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer owner.deinit();
+            const chosen = [_][32]u8{try stores.sha256DigestFromChecksum(directory_root.manifests[1].checksum)};
+            var selected = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &chosen);
+            defer selected.deinit();
+            var complete = try owner.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
+            defer complete.deinit();
+            try std.testing.expectEqual(@as(u32, 1), selected.snapshot.liveDocCount());
+            try std.testing.expectEqual(@as(u32, 3), selected.snapshot.scoringDocCount());
+            try std.testing.expectEqual(@as(u32, 3), try selected.snapshot.termDocFreq(a, "body", "needle"));
+            try std.testing.expectEqual(complete.snapshot.textAvgDocLen("body"), selected.snapshot.textAvgDocLen("body"));
+            const stats = (try selected.snapshot.textTermStats(a, "body", "needle", 0)).?;
+            const oracle = (try complete.snapshot.textTermStats(a, "body", "needle", 1)).?;
+            try std.testing.expectEqual(oracle.score, stats.score);
+            const request: local.search_search.SearchRequest = .{ .query = .{ .term = .{ .field = "body", .term = "needle" } }, .k = 10 };
+            var result = try local.search_search.execute(a, selected.snapshot, request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqual(oracle.score, result.hits[0].score);
+            // A different file subset gets its own corpus and statistics facade.
+            const other = [_][32]u8{try stores.sha256DigestFromChecksum(directory_root.manifests[2].checksum)};
+            var different = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &other);
+            defer different.deinit();
+            try std.testing.expect(different.snapshot.inventory_owner != selected.snapshot.inventory_owner);
+            var none = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{});
+            defer none.deinit();
+            try std.testing.expectEqual(@as(u32, 0), none.snapshot.liveDocCount());
+            try std.testing.expectEqual(@as(u32, 3), none.snapshot.scoringDocCount());
+            try std.testing.expectEqual(@as(u64, 4), owner.inventory_builds.load(.monotonic));
         }
         var legacy = directory_root;
         legacy.serving_inventory = null;

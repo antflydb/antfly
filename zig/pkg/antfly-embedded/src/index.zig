@@ -940,6 +940,7 @@ pub const IndexSnapshot = struct {
     epoch: u64,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
+    collection_doc_count: ?u32 = null,
     term_doc_freq_cache_mu: std.atomic.Mutex,
     // Bounded singleflight stripes. Warm hits avoid these; cold readers of
     // the same term batch reuse the first reader's exact, generation-bound result.
@@ -971,17 +972,110 @@ pub const IndexSnapshot = struct {
     /// Installed only on a query facade. Shared scoring caches retain values,
     /// never the caller's credentials, publication lease or read capability.
     text_statistics: ?TextStatistics = null,
+    binding_flights: std.AutoHashMapUnmanaged(usize, *BindingFlight) = .empty,
+    binding_allocator: ?@import("sql/parallel_scheduler.zig").LockedAllocator = null,
+    const BindingFlight = struct {
+        references: std.atomic.Value(usize) = .init(2), // map and constructor
+        finished: std.atomic.Value(bool) = .init(false),
+        ready: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn release(self: *BindingFlight, a: Allocator) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) a.destroy(self);
+        }
+    };
+    fn awaitBinding(self: *const IndexSnapshot, flight: *BindingFlight, cancelable: bool) !void {
+        const protection = if (!cancelable) (if (self.read_context_io) |io| io.swapCancelProtection(.blocked) else null) else null;
+        defer {
+            if (protection) |saved| _ = self.read_context_io.?.swapCancelProtection(saved);
+        }
+        while (!flight.finished.load(.acquire)) {
+            if (cancelable) if (self.read_context_check) |check| try check(self.read_context.?);
+            if (self.read_context_io) |io| {
+                flight.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1) } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => if (cancelable) return err,
+                };
+            } else spinOrYield();
+        }
+        if (cancelable) {
+            if (self.read_context_check) |check| try check(self.read_context.?);
+            if (flight.failure) |failure| return failure;
+        }
+    }
     pub fn readSegment(self: *const IndexSnapshot, ordinal: usize) !*SegmentEntry {
         if (ordinal >= self.segments.len) return error.InvalidArgument;
         if (self.read_context_check) |check| try check(self.read_context.?);
         const context = self.read_context orelse return &self.segments[ordinal];
         const mutable = @constCast(self);
-        while (!mutable.bound_mu.tryLock()) spinOrYield();
-        defer mutable.bound_mu.unlock();
-        if (mutable.quiesced) return error.Canceled;
-        if (mutable.bound_segments.get(ordinal)) |entry| return entry;
-        const physical = self.segments[ordinal].physical();
-        if (physical.reader.postings_loader == null and !(physical.data == .native and physical.data.native == .ranges and physical.data.native.ranges.bind_read_context != null)) return &self.segments[ordinal];
+        while (true) {
+            while (!mutable.bound_mu.tryLock()) spinOrYield();
+            if (mutable.quiesced) {
+                mutable.bound_mu.unlock();
+                return error.Canceled;
+            }
+            if (mutable.bound_segments.get(ordinal)) |entry| {
+                mutable.bound_mu.unlock();
+                return entry;
+            }
+            if (mutable.binding_flights.get(ordinal)) |flight| {
+                _ = flight.references.fetchAdd(1, .monotonic);
+                mutable.bound_mu.unlock();
+                defer flight.release(self.alloc);
+                try self.awaitBinding(flight, true);
+                continue;
+            }
+            const physical = self.segments[ordinal].physical();
+            if (physical.reader.postings_loader == null and !(physical.data == .native and physical.data.native == .ranges and physical.data.native.ranges.bind_read_context != null)) {
+                mutable.bound_mu.unlock();
+                return &self.segments[ordinal];
+            }
+            const flight = self.alloc.create(BindingFlight) catch |err| {
+                mutable.bound_mu.unlock();
+                return err;
+            };
+            flight.* = .{};
+            mutable.binding_flights.put(self.alloc, ordinal, flight) catch |err| {
+                mutable.bound_mu.unlock();
+                self.alloc.destroy(flight);
+                return err;
+            };
+            mutable.bound_mu.unlock();
+            defer flight.release(self.alloc);
+            // Required provider I/O and navigation allocation never hold the
+            // inventory lock. Only callers selecting this ordinal join its flight.
+            const result = self.bindSegment(physical, ordinal, context);
+            var entry = result catch |err| blk: {
+                flight.failure = err;
+                break :blk null;
+            };
+            while (!mutable.bound_mu.tryLock()) spinOrYield();
+            if (entry) |bound| {
+                if (mutable.quiesced) {
+                    flight.failure = error.Canceled;
+                } else mutable.bound_segments.put(self.alloc, ordinal, bound) catch |err| {
+                    flight.failure = err;
+                };
+                if (flight.failure == null) entry = null; // ready map owns it
+            }
+            // Keep the flight installed until failed readers have fully closed,
+            // so quiescence also joins decoder/source cleanup outside the lock.
+            mutable.bound_mu.unlock();
+            if (entry) |failed| {
+                failed.releaseRef();
+                self.alloc.destroy(failed);
+            }
+            while (!mutable.bound_mu.tryLock()) spinOrYield();
+            _ = mutable.binding_flights.remove(ordinal);
+            flight.finished.store(true, .release);
+            if (self.read_context_io) |io| flight.ready.set(io);
+            mutable.bound_mu.unlock();
+            flight.release(self.alloc); // map reference
+            if (flight.failure) |failure| return failure;
+            // Recheck authority and quiescence through the normal ready path.
+            if (self.read_context_check) |check| try check(self.read_context.?);
+        }
+    }
+    fn bindSegment(self: *const IndexSnapshot, physical: SegmentEntry, ordinal: usize, context: *anyopaque) !*SegmentEntry {
         const entry = try self.alloc.create(SegmentEntry);
         errdefer self.alloc.destroy(entry);
         entry.* = physical;
@@ -999,8 +1093,6 @@ pub const IndexSnapshot = struct {
             }
         }
         entry.retain();
-        errdefer entry.releaseRef();
-        try mutable.bound_segments.put(self.alloc, ordinal, entry);
         return entry;
     }
     pub fn segmentOrdinal(self: *const IndexSnapshot, entry: *const SegmentEntry) usize {
@@ -1116,8 +1208,19 @@ pub const IndexSnapshot = struct {
     /// authority. Stop capability-bound work before releasing that authority.
     pub fn quiesceReadContext(self: *IndexSnapshot) void {
         while (!self.bound_mu.tryLock()) spinOrYield();
-        defer self.bound_mu.unlock();
         self.quiesced = true;
+        while (self.binding_flights.count() != 0) {
+            var iterator = self.binding_flights.valueIterator();
+            const flight = iterator.next().?.*;
+            _ = flight.references.fetchAdd(1, .monotonic);
+            self.bound_mu.unlock();
+            self.awaitBinding(flight, false) catch {};
+            flight.release(self.alloc);
+            while (!self.bound_mu.tryLock()) spinOrYield();
+        }
+        self.bound_mu.unlock();
+        // No constructor can publish after the fence. Join source workers
+        // without making unrelated completed bindings wait on provider I/O.
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| if (entry.*.query_source) |source| source.quiesceReadContext();
         if (self.inventory_owner == null) for (self.segments) |entry| if (entry.query_source) |source| source.quiesceReadContext();
@@ -1140,7 +1243,9 @@ pub const IndexSnapshot = struct {
     /// Free everything this snapshot owns and destroy it. Only valid once
     /// the refcount has reached zero.
     fn freeFinal(self: *IndexSnapshot) void {
+        self.quiesceReadContext();
         const alloc = self.alloc;
+        self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
         while (entries.next()) |entry| {
             entry.*.releaseRef();
@@ -1174,7 +1279,8 @@ pub const IndexSnapshot = struct {
         self.text_summaries.deinit(alloc);
         if (self.inventory_owner) |owner| owner.release() else self.global_total_field_len.deinit(alloc);
         if (self.scoring_owner) |owner| owner.release();
-        alloc.destroy(self);
+        const backing = if (self.binding_allocator) |locked| locked.backing else alloc;
+        backing.destroy(self);
     }
 
     pub fn bm25BoundTable(
@@ -1593,6 +1699,7 @@ pub const IndexSnapshot = struct {
     /// Lucene/Tantivy. Tombstones mask hits immediately; merges rebuild these
     /// compact statistics without making every delete rewrite scoring data.
     pub fn scoringDocCount(self: *const IndexSnapshot) u32 {
+        if (self.collection_doc_count) |count| return count;
         var total: u32 = 0;
         for (self.segments) |*seg| total +|= seg.reader.doc_count;
         return total;
@@ -2041,9 +2148,12 @@ pub const IndexWriter = struct {
         const facade = empty.current;
         facade.segments = old.segments;
         facade.global_total_field_len = old.global_total_field_len;
+        facade.collection_doc_count = old.collection_doc_count;
         facade.epoch = old.epoch;
         facade.inventory_owner = old;
         facade.read_context = context;
+        facade.binding_allocator = .{ .backing = facade.alloc };
+        facade.alloc = facade.binding_allocator.?.allocator();
         facade.scoring_owner = old.scoringCache().retain();
         return facade;
     }
@@ -2065,7 +2175,9 @@ pub const IndexWriter = struct {
         errdefer totals.deinit(self.alloc);
         var next_id = self.next_segment_id;
         for (sources, segments[old.segments.len..]) |source, *target| {
-            if (source.snapshot.alloc.ptr != self.alloc.ptr or source.snapshot.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
+            var owner = source.snapshot;
+            while (owner.inventory_owner) |parent| owner = parent;
+            if (owner.alloc.ptr != self.alloc.ptr or owner.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
             if (source.ordinal >= source.snapshot.segments.len) return error.InvalidSegment;
             const segment = source.snapshot.segments[source.ordinal].physical();
             if (segment.shared.deleted_count.load(.acquire) != 0) return error.InvalidSegment;
@@ -4409,4 +4521,129 @@ test "external lake explicit read capabilities bind only selected immutable segm
     source.allowed = true;
     facade.quiesceReadContext();
     try std.testing.expectError(error.Canceled, facade.readSegment(18));
+}
+
+test "external lake cold bindings singleflight by ordinal while unrelated providers overlap" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        entered: std.atomic.Value(usize) = .init(0),
+        gate: std.Io.Event = .unset,
+        fn check(_: *anyopaque) !void {}
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.entered.fetchAdd(1, .release);
+            try self.gate.wait(std.testing.io);
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } };
+        }
+    };
+    var first: State = .{ .bytes = bytes };
+    var second: State = .{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    for ([_]*State{ &first, &second }, 1..) |state, id| try writer.addSegmentWithIdData(id, .fromNative(.{ .ranges = .{ .ptr = state, .length = bytes.len, .read_into = State.read, .close = State.close, .bind_read_context = State.bind } }));
+    const snapshot = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &first, .check = State.check, .io = std.testing.io });
+    defer snapshot.release();
+    const Reader = struct {
+        snapshot: *IndexSnapshot,
+        ordinal: usize,
+        result: ?*SegmentEntry = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.result = self.snapshot.readSegment(self.ordinal) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var leader: Reader = .{ .snapshot = snapshot, .ordinal = 0 };
+    var waiter: Reader = .{ .snapshot = snapshot, .ordinal = 0 };
+    var independent: Reader = .{ .snapshot = snapshot, .ordinal = 1 };
+    var left = try std.testing.io.concurrent(Reader.run, .{&leader});
+    defer {
+        first.gate.set(std.testing.io);
+        second.gate.set(std.testing.io);
+        left.await(std.testing.io);
+    }
+    var same = try std.testing.io.concurrent(Reader.run, .{&waiter});
+    defer {
+        first.gate.set(std.testing.io);
+        second.gate.set(std.testing.io);
+        same.await(std.testing.io);
+    }
+    var right = try std.testing.io.concurrent(Reader.run, .{&independent});
+    defer {
+        first.gate.set(std.testing.io);
+        second.gate.set(std.testing.io);
+        right.await(std.testing.io);
+    }
+    // Always release the providers before checking, so a regression fails
+    // cleanly instead of leaving a blocked worker in test teardown.
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while ((first.entered.load(.acquire) == 0 or second.entered.load(.acquire) == 0) and @import("antfly_platform").time.monotonicNs() < deadline) spinOrYield();
+    const overlap = first.entered.load(.acquire) == 1 and second.entered.load(.acquire) == 1;
+    first.gate.set(std.testing.io);
+    second.gate.set(std.testing.io);
+    left.await(std.testing.io);
+    same.await(std.testing.io);
+    right.await(std.testing.io);
+    try std.testing.expect(overlap);
+    try std.testing.expect(leader.failure == null and waiter.failure == null and independent.failure == null);
+    try std.testing.expect(leader.result == waiter.result);
+    try std.testing.expectEqual(@as(usize, 1), first.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), second.entered.load(.acquire));
+    snapshot.quiesceReadContext();
+    try std.testing.expectError(error.Canceled, snapshot.readSegment(0));
+
+    first.entered.store(0, .release);
+    first.gate = .unset;
+    const pending = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &first, .check = State.check, .io = std.testing.io });
+    defer pending.release();
+    var blocked: Reader = .{ .snapshot = pending, .ordinal = 0 };
+    var loading = try std.testing.io.concurrent(Reader.run, .{&blocked});
+    defer {
+        first.gate.set(std.testing.io);
+        loading.await(std.testing.io);
+    }
+    const loading_deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (first.entered.load(.acquire) == 0 and @import("antfly_platform").time.monotonicNs() < loading_deadline) spinOrYield();
+    if (first.entered.load(.acquire) != 1) return error.TestUnexpectedResult;
+    // Canceling a waiter joins only that waiter, not the constructor's I/O.
+    var canceled_waiter: Reader = .{ .snapshot = pending, .ordinal = 0 };
+    var canceling = try std.testing.io.concurrent(Reader.run, .{&canceled_waiter});
+    canceling.cancel(std.testing.io);
+    try std.testing.expectEqual(error.Canceled, canceled_waiter.failure.?);
+    const Quiesce = struct {
+        fn run(value: *IndexSnapshot) void {
+            value.quiesceReadContext();
+        }
+    };
+    var teardown = try std.testing.io.concurrent(Quiesce.run, .{pending});
+    defer {
+        first.gate.set(std.testing.io);
+        teardown.await(std.testing.io);
+    }
+    var fenced = false;
+    const fence_deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!fenced and @import("antfly_platform").time.monotonicNs() < fence_deadline) {
+        while (!pending.bound_mu.tryLock()) spinOrYield();
+        fenced = pending.quiesced;
+        pending.bound_mu.unlock();
+        if (!fenced) spinOrYield();
+    }
+    first.gate.set(std.testing.io);
+    loading.await(std.testing.io);
+    teardown.await(std.testing.io);
+    try std.testing.expect(fenced);
+    try std.testing.expectEqual(error.Canceled, blocked.failure.?);
+    try std.testing.expectEqual(@as(u32, 0), pending.bound_segments.count());
+    try std.testing.expectEqual(@as(u32, 0), pending.binding_flights.count());
 }

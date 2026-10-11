@@ -28,7 +28,7 @@ const Ref = corpus.statistics.Ref;
 const Chunk = artifacts.ChunkRef;
 const chunk_bytes = 16 * 1024;
 const FileRouting = struct { file: @import("lake_index_native_state.zig").File, segments: []const corpus.SegmentRouting };
-pub const Roots = struct { full: ?Ref, routes: ?Ref };
+pub const Roots = struct { full: ?Ref, routes: ?Ref, segments: ?Ref = null };
 
 fn encode(a: A, group: corpus.FileGroup, compact: bool) ![]u8 {
     if (!compact) return std.json.Stringify.valueAlloc(a, group, .{});
@@ -123,20 +123,23 @@ pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGr
     return update(a, pages.store(), groups, refs, prior, cancellation);
 }
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, prior: ?corpus.Root, cancellation: Cancellation) !Roots {
-    const old = prior orelse return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true) };
-    if (old.inventory_version != 2 or old.manifests.len != old.file_groups.len) return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true) };
+    const old = prior orelse return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true), .segments = try segmentFiles(a, storage, groups, refs) };
+    if (old.inventory_version != 2 or old.manifests.len != old.file_groups.len) return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true), .segments = try segmentFiles(a, storage, groups, refs) };
     var before: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer before.deinit(a);
     var after: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer after.deinit(a);
     for (old.manifests) |ref| try before.put(a, try identity(ref), {});
     for (refs) |ref| try after.put(a, try identity(ref), {});
-    var result: Roots = .{ .full = old.serving_inventory, .routes = old.serving_routes };
+    var result: Roots = .{ .full = old.serving_inventory, .routes = old.serving_routes, .segments = old.segment_files };
+    const rebuild_segments = old.segment_files == null;
+    if (rebuild_segments) result.segments = try segmentFiles(a, storage, groups, refs);
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     for (old.manifests, old.file_groups) |ref, group| {
         try cancellation.check();
         if (after.contains(try identity(ref))) continue;
+        if (!rebuild_segments) result.segments = try mutateSegmentFiles(a, storage, result.segments, group, null);
         result.full = try mutate(a, storage, result.full, ref, null, @intCast(ref.byte_len));
         _ = scratch.reset(.free_all);
         const encoded = try encode(scratch.allocator(), group, true);
@@ -146,11 +149,73 @@ fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []c
         try cancellation.check();
         if (before.contains(try identity(ref))) continue;
         _ = scratch.reset(.free_all);
+        if (!rebuild_segments) result.segments = try mutateSegmentFiles(a, storage, result.segments, group, try identity(ref));
         result.full = try mutate(a, storage, result.full, ref, try encode(scratch.allocator(), group, false), 0);
         _ = scratch.reset(.free_all);
         result.routes = try mutate(a, storage, result.routes, ref, try encode(scratch.allocator(), group, true), 0);
     }
     return result;
+}
+
+fn segmentFiles(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk) !?Ref {
+    const Record = struct { key: [32]u8, file: [32]u8 };
+    var records: std.ArrayList(Record) = .empty;
+    defer records.deinit(a);
+    for (groups, refs) |group, ref| for (group.segments) |segment| try records.append(a, .{ .key = corpus.term_directory.identity(segment.artifact_id), .file = try identity(ref) });
+    std.mem.sort(Record, records.items, {}, struct {
+        fn less(_: void, l: Record, r: Record) bool {
+            return std.mem.order(u8, &l.key, &r.key) == .lt;
+        }
+    }.less);
+    const Source = struct {
+        records: []const Record,
+        index: usize = 0,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.index == self.records.len) return null;
+            const record = &self.records[self.index];
+            self.index += 1;
+            return .{ .key = &record.key, .value = &record.file };
+        }
+    };
+    var source: Source = .{ .records = records.items };
+    return tree.buildSorted(a, storage, &source);
+}
+fn mutateSegmentFiles(a: A, storage: tree.Store, root: ?Ref, group: corpus.FileGroup, digest: ?[32]u8) !?Ref {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const mutations = try scratch.alloc(tree.Mutation, group.segments.len);
+    for (mutations, group.segments) |*mutation, segment| {
+        const key_ = try scratch.create([32]u8);
+        key_.* = corpus.term_directory.identity(segment.artifact_id);
+        const value: ?[]const u8 = if (digest) |file| blk: {
+            const owned = try scratch.create([32]u8);
+            owned.* = file;
+            break :blk owned;
+        } else null;
+        mutation.* = .{ .key = key_, .value = value };
+    }
+    std.mem.sort(tree.Mutation, mutations, {}, struct {
+        fn less(_: void, l: tree.Mutation, r: tree.Mutation) bool {
+            return std.mem.order(u8, l.key, r.key) == .lt;
+        }
+    }.less);
+    return tree.apply(a, storage, root, mutations);
+}
+
+pub fn loadSelected(a: A, scratch: A, directory: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, selection: []const [32]u8) !corpus.Root {
+    var wanted: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer wanted.deinit(scratch);
+    for (selection) |id| try wanted.put(scratch, id, {});
+    var refs: std.ArrayList(Chunk) = .empty;
+    for (directory.manifests) |ref| if (wanted.contains(try identity(ref))) {
+        try refs.append(a, ref);
+    };
+    if (refs.items.len != wanted.count()) return error.InvalidNativeLakeTextCorpus;
+    var subset = directory;
+    subset.manifests = refs.items;
+    subset.partial_inventory = true;
+    return load(a, scratch, subset, store, cached, cancellation, true);
 }
 
 pub fn load(a: A, scratch: A, directory: corpus.Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, compact: bool) !corpus.Root {
@@ -182,25 +247,33 @@ pub fn load(a: A, scratch: A, directory: corpus.Root, store_value: stores.Artifa
     const routing = try a.alloc([]const corpus.SegmentRouting, if (compact) groups.len else 0);
     var seen = try std.DynamicBitSetUnmanaged.initEmpty(scratch, groups.len);
     defer seen.deinit(scratch);
-    var cursor = try tree.Cursor.init(scratch, pages.store(), if (compact) directory.serving_routes else directory.serving_inventory, "", null);
-    defer cursor.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(scratch);
-    var digest: ?[32]u8 = null;
-    while (try cursor.next()) |record| {
-        try cached.context.ensureActive();
-        try cancellation.check();
-        if (record.key.len != 36 or record.value.len == 0 or record.value.len > chunk_bytes) return error.InvalidNativeLakeTextCorpus;
-        const current: [32]u8 = record.key[0..32].*;
-        if (digest != null and !std.mem.eql(u8, &digest.?, &current)) {
-            try append(a, directory, groups, routing, &seen, indices, digest.?, bytes.items, compact);
-            bytes.clearRetainingCapacity();
+    // Selected partitions seek directly to their immutable digest prefix.
+    const passes = if (directory.partial_inventory) groups.len else 1;
+    for (0..passes) |pass| {
+        var start_key: [36]u8 = @splat(0);
+        if (directory.partial_inventory) start_key = try key(directory.manifests[pass], 0);
+        var cursor = try tree.Cursor.init(scratch, pages.store(), if (compact) directory.serving_routes else directory.serving_inventory, if (directory.partial_inventory) &start_key else "", null);
+        defer cursor.deinit();
+        bytes.clearRetainingCapacity();
+        var digest: ?[32]u8 = null;
+        while (try cursor.next()) |record| {
+            try cached.context.ensureActive();
+            try cancellation.check();
+            if (record.key.len != 36 or record.value.len == 0 or record.value.len > chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+            const current: [32]u8 = record.key[0..32].*;
+            if (directory.partial_inventory and !std.mem.eql(u8, &current, start_key[0..32])) break;
+            if (digest != null and !std.mem.eql(u8, &digest.?, &current)) {
+                try append(a, directory, groups, routing, &seen, indices, digest.?, bytes.items, compact);
+                bytes.clearRetainingCapacity();
+            }
+            digest = current;
+            if (std.mem.readInt(u32, record.key[32..36], .big) != bytes.items.len or record.value.len > corpus.max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+            try bytes.appendSlice(scratch, record.value);
         }
-        digest = current;
-        if (std.mem.readInt(u32, record.key[32..36], .big) != bytes.items.len or record.value.len > corpus.max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
-        try bytes.appendSlice(scratch, record.value);
+        if (digest) |id| try append(a, directory, groups, routing, &seen, indices, id, bytes.items, compact);
     }
-    if (digest) |id| try append(a, directory, groups, routing, &seen, indices, id, bytes.items, compact);
     if (seen.count() != groups.len) return error.InvalidNativeLakeTextCorpus;
     var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
     for (groups) |group| try segments.appendSlice(a, group.segments);
@@ -292,4 +365,45 @@ test "external lake serving inventory COW retains old readers and touches only c
     const noop = try update(a, memory.store(), groups, refs, prior, .none);
     try std.testing.expectEqualDeep(second, noop);
     try std.testing.expectEqual(before_noop, memory.writes);
+}
+
+test "external lake selected compact inventory seeks file partitions and retains global totals" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("selected-serving-inventory");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(6), .attempt = @splat(4) };
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: pages_mod.PageStore = .{ .domain = @splat(6), .attempt = @splat(4), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const groups = try ca.alloc(corpus.FileGroup, 64);
+    const refs = try ca.alloc(Chunk, groups.len);
+    for (groups, refs, 0..) |*group, *ref, i| {
+        group.* = .{ .file = .{ .id = try std.fmt.allocPrint(ca, "file-{d}-{s}", .{ i, @as([512]u8, @splat('x')) }), .digest = @splat(1) }, .segments = &.{} };
+        const encoded = try encode(ca, group.*, false);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        ref.* = .{ .artifact_id = "", .checksum = try ca.dupe(u8, &std.fmt.bytesToHex(&digest, .lower)), .byte_len = encoded.len };
+    }
+    const roots = try update(a, pages.store(), groups, refs, null, .none);
+    const root: corpus.Root = .{ .domain = @splat(6), .binding = undefined, .config_json = "{}", .inventory_version = 2, .serving_inventory = roots.full, .serving_routes = roots.routes, .manifests = refs, .collection = .{ .documents = 1234, .fields = &.{.{ .name = "body", .total_length = 9876 }} } };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(3), .context = .{} };
+    const selected = try loadSelected(ca, a, root, store, cached, .none, &.{ try identity(refs[50]), try identity(refs[1]) });
+    try std.testing.expect(selected.partial_inventory);
+    try std.testing.expectEqual(@as(usize, 2), selected.file_groups.len);
+    try std.testing.expectEqualStrings(groups[1].file.id, selected.file_groups[0].file.id);
+    try std.testing.expectEqualStrings(groups[50].file.id, selected.file_groups[1].file.id);
+    try std.testing.expectEqual(@as(u32, 1234), selected.collection.?.documents);
+    try std.testing.expectEqual(@as(u64, 9876), selected.collection.?.fields[0].total_length);
+    const empty = try loadSelected(ca, a, root, store, cached, .none, &.{});
+    try std.testing.expect(empty.partial_inventory and empty.file_groups.len == 0 and empty.segments.len == 0);
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadSelected(ca, a, root, store, cached, .none, &.{@splat(9)}));
 }

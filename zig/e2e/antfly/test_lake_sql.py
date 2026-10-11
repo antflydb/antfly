@@ -2867,6 +2867,23 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [
                 amount
             ]
+            # The prefix clause forces full-corpus admission but cannot match.
+            # Selective routing must retain global BM25 collection statistics.
+            full_corpus = query(
+                {"match_all": {}},
+                full_text_search={
+                    "disjuncts": [
+                        search,
+                        {"prefix": "never_present_in_fixture", "field": "body"},
+                    ]
+                },
+            )
+            assert [h["_id"] for h in full_corpus["hits"]["hits"]] == [
+                h["_id"] for h in unfiltered["hits"]["hits"]
+            ]
+            assert full_corpus["hits"]["hits"][0]["_score"] == pytest.approx(
+                unfiltered["hits"]["hits"][0]["_score"], abs=1e-6
+            )
             selected = query(broad, full_text_search=search)
             assert [h["_source"]["amount"] for h in selected["hits"]["hits"]] == (
                 [amount] if matches else []

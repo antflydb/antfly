@@ -281,6 +281,7 @@ pub const Collector = struct {
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
+                    try self.markPages(a, root.domain, root.segment_files, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
                     try self.markPages(a, root.domain, root.term_directory.leaves, false);

@@ -205,6 +205,8 @@ pub const File = struct {
     id: u64,
     size: u64 = 0,
     closed: bool = false,
+    run_store: ?*RunStore = null,
+    run_blocks: std.ArrayList(u64) = .empty,
     write_buffer: []u8 = &.{},
     write_start: u64 = 0,
     write_len: usize = 0,
@@ -239,9 +241,9 @@ pub const File = struct {
         if (self.write_len == 0) return;
         try self.awaitWrite();
         try self.manager.check();
-        if (self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
+        if (self.run_store == null and self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
             const job = self.prepareAsync() orelse {
-                try self.file.writePositionalAll(self.manager.io, self.write_buffer[0..self.write_len], self.write_start);
+                try self.writePhysical(self.write_buffer[0..self.write_len], self.write_start);
                 self.manager.increment("write_calls", 1);
                 self.write_len = 0;
                 return;
@@ -258,7 +260,7 @@ pub const File = struct {
             self.write_buffer = self.spare;
             self.spare = &.{};
         } else {
-            try self.file.writePositionalAll(self.manager.io, self.write_buffer[0..self.write_len], self.write_start);
+            try self.writePhysical(self.write_buffer[0..self.write_len], self.write_start);
         }
         self.manager.increment("write_calls", 1);
         self.write_len = 0;
@@ -290,12 +292,20 @@ pub const File = struct {
         try self.awaitWrite();
     }
     fn bufferedWrite(self: *File, bytes: []const u8, offset: u64) !void {
+        if (self.run_store) |store| {
+            const end = try std.math.add(u64, offset, bytes.len);
+            const needed = std.math.divCeil(u64, end, RunStore.block_bytes) catch unreachable;
+            while (self.run_blocks.items.len < needed) {
+                try self.run_blocks.ensureUnusedCapacity(self.manager.allocator(), 1);
+                self.run_blocks.appendAssumeCapacity(try store.allocate());
+            }
+        }
         self.read_start = none;
         if (self.write_buffer.len == 0) self.write_buffer = try self.manager.allocator().alloc(u8, @max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
         if (self.write_len != 0 and offset != self.write_start + self.write_len) try self.submit();
         if (bytes.len > self.write_buffer.len) {
             try self.flush();
-            try self.file.writePositionalAll(self.manager.io, bytes, offset);
+            try self.writePhysical(bytes, offset);
             self.manager.increment("write_calls", 1);
             return;
         }
@@ -304,11 +314,41 @@ pub const File = struct {
         @memcpy(self.write_buffer[self.write_len..][0..bytes.len], bytes);
         self.write_len += bytes.len;
     }
+    fn writePhysical(self: *File, bytes: []const u8, offset: u64) !void {
+        if (self.run_store == null) return self.file.writePositionalAll(self.manager.io, bytes, offset);
+        var position: usize = 0;
+        while (position < bytes.len) {
+            const logical = offset + position;
+            const block: usize = @intCast(logical / RunStore.block_bytes);
+            const within = logical % RunStore.block_bytes;
+            const n: usize = @intCast(@min(bytes.len - position, RunStore.block_bytes - within));
+            if (block >= self.run_blocks.items.len) return error.InvalidSqlSpill;
+            try self.file.writePositionalAll(self.manager.io, bytes[position..][0..n], self.run_blocks.items[block] + within);
+            if (position != 0) self.manager.increment("write_calls", 1);
+            position += n;
+        }
+    }
+    fn readPhysical(self: *File, bytes: []u8, offset: u64) !usize {
+        if (self.run_store == null) return self.file.readPositionalAll(self.manager.io, bytes, offset);
+        var position: usize = 0;
+        while (position < bytes.len) {
+            const logical = offset + position;
+            const block: usize = @intCast(logical / RunStore.block_bytes);
+            const within = logical % RunStore.block_bytes;
+            const n: usize = @intCast(@min(bytes.len - position, RunStore.block_bytes - within));
+            if (block >= self.run_blocks.items.len) return error.InvalidSqlSpill;
+            const count = try self.file.readPositionalAll(self.manager.io, bytes[position..][0..n], self.run_blocks.items[block] + within);
+            if (count != n) return error.InvalidSqlSpill;
+            if (position != 0) self.manager.increment("read_calls", 1);
+            position += count;
+        }
+        return position;
+    }
     fn bufferedRead(self: *File, offset: u64, bytes: []u8) !void {
         try self.flush();
         if (self.read_buffer.len == 0) self.read_buffer = try self.manager.allocator().alloc(u8, @max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
         if (bytes.len > self.read_buffer.len) {
-            const count = try self.file.readPositionalAll(self.manager.io, bytes, offset);
+            const count = try self.readPhysical(bytes, offset);
             self.manager.increment("read_calls", 1);
             self.manager.increment("read_bytes", count);
             if (count != bytes.len) return error.InvalidSqlSpill;
@@ -317,7 +357,7 @@ pub const File = struct {
         if (self.read_start == none or offset < self.read_start or offset - self.read_start > self.read_len or bytes.len > self.read_len -| (offset - self.read_start)) {
             self.read_start = offset;
             self.read_len = @intCast(@min(self.read_buffer.len, self.size - offset));
-            const count = try self.file.readPositionalAll(self.manager.io, self.read_buffer[0..self.read_len], offset);
+            const count = try self.readPhysical(self.read_buffer[0..self.read_len], offset);
             self.manager.increment("read_calls", 1);
             self.manager.increment("read_bytes", count);
             if (count != self.read_len) return error.InvalidSqlSpill;
@@ -333,11 +373,14 @@ pub const File = struct {
         }
         if (self.write_job) |job| self.manager.allocator().destroy(job);
         self.write_job = null;
-        self.file.close(self.manager.io);
+        if (self.run_store) |store| {
+            store.release(self.run_blocks.items);
+            self.run_blocks.deinit(self.manager.allocator());
+        } else self.file.close(self.manager.io);
         self.manager.allocator().free(self.spare);
         self.manager.allocator().free(self.write_buffer);
         self.manager.allocator().free(self.read_buffer);
-        self.manager.closeFile(self.size);
+        if (self.run_store == null) self.manager.closeFile(self.size);
         self.closed = true;
     }
     pub fn append(self: *File, row: Row, link: u64) !u64 {
@@ -361,8 +404,8 @@ pub const File = struct {
         const compressed_record = compressed != null and compressed.?.len + 32 < bytes.items.len;
         const stored = if (compressed_record) compressed.? else bytes.items;
         const growth = stored.len + frame_bytes;
-        try self.manager.reserve(growth);
-        errdefer self.manager.releaseBytes(growth);
+        if (self.run_store == null) try self.manager.reserve(growth);
+        errdefer if (self.run_store == null) self.manager.releaseBytes(growth);
         var frame: [frame_bytes]u8 = @splat(0);
         std.mem.writeInt(u64, frame[0..8], stored.len, .little);
         frame[24] = if (compressed_record) 2 else 0;
@@ -413,8 +456,8 @@ pub const File = struct {
         if (offset > self.size) return error.InvalidSqlSpill;
         const end = std.math.add(u64, offset, bytes.len) catch return error.SqlProgramLimitExceeded;
         const growth = end -| self.size;
-        try self.manager.reserve(growth);
-        errdefer self.manager.releaseBytes(growth);
+        if (self.run_store == null) try self.manager.reserve(growth);
+        errdefer if (self.run_store == null) self.manager.releaseBytes(growth);
         try self.bufferedWrite(bytes, offset);
         self.size = @max(self.size, end);
         self.manager.increment("written_bytes", bytes.len);
@@ -1624,6 +1667,70 @@ pub const Sequential = struct {
     }
 };
 
+/// Immutable runs write directly into reusable 64 KiB extents in one anonymous
+/// file. The map scales with disk quota, not rows; unrelated runs read/write
+/// disjoint extents concurrently. Only extent allocation and release serialize.
+const RunStore = struct {
+    const block_bytes: u64 = 64 * 1024;
+    file: File,
+    free: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    references: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    fn lock(self: *RunStore) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn run(self: *RunStore, block_size: usize) Sequential {
+        self.lock();
+        self.references += 1;
+        self.mutex.unlock();
+        const manager = self.file.manager;
+        return .{ .file = .{ .manager = manager, .file = self.file.file, .id = self.file.id, .run_store = self }, .block_bytes = block_size, .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
+    }
+    fn allocate(self: *RunStore) !u64 {
+        self.lock();
+        defer self.mutex.unlock();
+        var available = self.free.keyIterator();
+        if (available.next()) |key| {
+            const offset = key.*;
+            _ = self.free.remove(offset);
+            return offset;
+        }
+        const end = try std.math.add(u64, self.file.size, block_bytes);
+        // Reserve free-map capacity now: close/cancellation never allocate.
+        try self.free.ensureTotalCapacity(self.file.manager.allocator(), std.math.cast(u32, end / block_bytes) orelse return error.SqlProgramLimitExceeded);
+        try self.file.manager.reserve(block_bytes);
+        errdefer self.file.manager.releaseBytes(block_bytes);
+        try self.file.file.setLength(self.file.manager.io, end);
+        const offset = self.file.size;
+        self.file.size = end;
+        return offset;
+    }
+    fn release(self: *RunStore, blocks: []const u64) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.references != 0);
+        self.references -= 1;
+        for (blocks) |offset| self.free.putAssumeCapacityNoClobber(offset, {});
+        var end = self.file.size;
+        while (end != 0 and self.free.contains(end - block_bytes)) end -= block_bytes;
+        if (end == self.file.size) return;
+        const protection = self.file.manager.io.swapCancelProtection(.blocked);
+        defer _ = self.file.manager.io.swapCancelProtection(protection);
+        self.file.file.setLength(self.file.manager.io, end) catch return;
+        var offset = end;
+        while (offset < self.file.size) : (offset += block_bytes) _ = self.free.remove(offset);
+        self.file.manager.releaseBytes(self.file.size - end);
+        self.file.size = end;
+    }
+    fn deinit(self: *RunStore) void {
+        std.debug.assert(self.references == 0);
+        const manager = self.file.manager;
+        self.free.deinit(manager.allocator());
+        self.file.close();
+        manager.allocator().destroy(self);
+    }
+};
+
 pub const Sort = struct {
     const Entry = struct { normalized: ?@import("sort_key.zig").Key, position: usize, ordinal: u64 };
     manager: *Manager,
@@ -1641,6 +1748,11 @@ pub const Sort = struct {
     runs: [32]?Sequential = @splat(null),
     /// Cohort callers also reserve file capacity for pending runs and merges.
     run_limit: usize = 32,
+    /// Archive retained runs into anonymous reusable extents. Cohorts retain
+    /// balanced logical levels while reserving only one descriptor per sort.
+    shared_runs: bool = false,
+    run_store: ?*RunStore = null,
+    owns_run_store: bool = true,
     run_levels: [32]u8 = @splat(0),
     outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
@@ -1686,7 +1798,7 @@ pub const Sort = struct {
         task: ?@import("parallel_scheduler.zig").Task(anyerror!Sequential) = null,
         fn run(self: *RunJob) anyerror!Sequential {
             try self.sort.sortRows();
-            var file = try Sequential.init(self.sort.manager, self.sort.blockBytes());
+            var file = try self.sort.createRun();
             errdefer file.close();
             try self.sort.writeRows(&file);
             try file.seal();
@@ -1732,6 +1844,7 @@ pub const Sort = struct {
             if (file.*) |*open_file| open_file.close();
             arena.deinit();
         }
+        if (self.owns_run_store) if (self.run_store) |store| store.deinit();
     }
     pub fn add(self: *Sort, input: Row) !void {
         var row = input;
@@ -1752,7 +1865,7 @@ pub const Sort = struct {
             try self.flush();
             try self.collectRun();
             const run = blk: {
-                var file = try Sequential.init(self.manager, self.blockBytes());
+                var file = try self.createRun();
                 errdefer file.close();
                 _ = try file.append(row, none);
                 try file.seal();
@@ -1870,8 +1983,9 @@ pub const Sort = struct {
         try self.collectRun();
         if (self.rows.items.len == 0) return;
         if (self.parallel_runs and self.memory_bytes >= 128 * 1024) {
+            try self.ensureRunStore();
             const job = try self.a.create(RunJob);
-            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false } };
+            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false, .shared_runs = self.shared_runs, .run_store = self.run_store, .owns_run_store = false } };
             if (@import("parallel_scheduler.zig").global().submit(self.manager.io, self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
                 job.task = task;
                 self.pending_run = job;
@@ -1887,7 +2001,7 @@ pub const Sort = struct {
             self.a.destroy(job);
         }
         try self.sortRows();
-        var run = try Sequential.init(self.manager, self.blockBytes());
+        var run = try self.createRun();
         var transferred = false;
         errdefer if (!transferred) run.close();
         try self.writeRows(&run);
@@ -1902,10 +2016,24 @@ pub const Sort = struct {
         transferred = true;
         return self.admitRun(run);
     }
+    fn ensureRunStore(self: *Sort) !void {
+        if (!self.shared_runs or self.run_store != null) return;
+        std.debug.assert(self.owns_run_store);
+        const store = try self.a.create(RunStore);
+        errdefer self.a.destroy(store);
+        store.* = .{ .file = try self.manager.create() };
+        self.run_store = store;
+    }
+    fn createRun(self: *Sort) !Sequential {
+        try self.ensureRunStore();
+        if (self.shared_runs) return self.run_store.?.run(self.blockBytes());
+        return Sequential.init(self.manager, self.blockBytes());
+    }
     fn admitRun(self: *Sort, input: Sequential) !void {
         std.debug.assert(self.run_limit >= 1 and self.run_limit <= self.runs.len);
         var run = input;
         errdefer run.close();
+        std.debug.assert(!self.shared_runs or run.file.run_store == self.run_store);
         var level: u8 = 0;
         const fan_in = self.fanIn();
         while (true) {
@@ -1976,7 +2104,7 @@ pub const Sort = struct {
     }
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
         std.debug.assert(inputs.len >= 2 and inputs.len <= self.fanIn());
-        var output = try Sequential.init(self.manager, self.blockBytes());
+        var output = try self.createRun();
         errdefer output.close();
         var arenas: [8]std.heap.ArenaAllocator = undefined;
         var heads: [8]?Decoded = @splat(null);
@@ -2017,6 +2145,9 @@ pub const Sort = struct {
                 local.max_row_bytes = self.max_row_bytes;
                 local.merge_fan_in = self.merge_fan_in;
                 local.parallel_runs = false;
+                local.shared_runs = self.shared_runs;
+                local.run_store = self.run_store;
+                local.owns_run_store = false;
                 const width = @min(local.fanIn(), count - claimed);
                 if (width < 2) {
                     local.deinit();
@@ -3175,7 +3306,7 @@ test "SQL fused sort cohorts reserve shared file capacity for merges" {
         var sorts: [8]Sort = undefined;
         for (&sorts) |*sort| {
             sort.* = Sort.init(a, &manager, &.{.{}}, 4096);
-            sort.run_limit = 4;
+            sort.shared_runs = true;
             sort.parallel_runs = false;
         }
         defer for (&sorts) |*sort| sort.deinit();
@@ -3222,4 +3353,68 @@ test "SQL spill sorts singleton rows larger than the preferred run buffer" {
     defer arena.deinit();
     try std.testing.expect((try sort.next(arena.allocator())) == null);
     try std.testing.expect(quota.peak <= quota.limit);
+}
+
+fn sharedSortFaultScenario(a: Allocator) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    {
+        var sort = Sort.init(a, &manager, &.{.{}}, 1024);
+        defer sort.deinit();
+        sort.shared_runs = true;
+        sort.parallel_runs = false;
+        for (0..24) |i| try sort.add(.{ .values = &.{Datum.json(.{ .integer = 9007199254740993 })}, .keys = &.{Datum.json(.{ .integer = @intCast(23 - i) })}, .ordinal = i });
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (0..24) |i| {
+            _ = arena.reset(.free_all);
+            const row = (try sort.next(arena.allocator())).?;
+            try std.testing.expectEqual(@as(i64, @intCast(i)), row.keys[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row.values[0].value.integer);
+        }
+        try std.testing.expect((try sort.next(arena.allocator())) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+}
+test "SQL shared spill extents unwind every allocation failure" {
+    try sharedSortFaultScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sharedSortFaultScenario, .{});
+}
+
+test "SQL shared logical runs avoid repeatedly rewriting large retained runs" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var written: [2]u64 = undefined;
+    for (0..2) |mode| {
+        var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        {
+            var sort = Sort.init(a, &manager, &.{.{}}, 4096);
+            defer sort.deinit();
+            sort.parallel_runs = false;
+            sort.shared_runs = mode == 1;
+            if (mode == 0) sort.run_limit = 4;
+            for (0..4096) |i| try sort.add(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(4095 - i) })}, .ordinal = i });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            for (0..4096) |i| {
+                _ = arena.reset(.retain_capacity);
+                const row = (try sort.next(arena.allocator())).?;
+                try std.testing.expectEqual(@as(i64, @intCast(i)), row.keys[0].value.integer);
+            }
+            written[mode] = manager.written_bytes;
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+    }
+    std.debug.print("Shared spill runs: legacy_written={d} balanced_written={d}\n", .{ written[0], written[1] });
+    try std.testing.expect(written[1] < written[0]);
 }

@@ -2045,3 +2045,48 @@ Debug):
   a bounded 600-second setup window, the isolated full fixture passes in
   419 seconds. Its row count and predicate/restart assertions are unchanged;
   the test does not establish a bulk-publication latency improvement.
+
+
+### Per-segment cold admission, balanced bulk runs, and selective file routing
+
+Query facades now singleflight each selected segment independently. The snapshot
+mutex protects the ready map and flight publication; provider binding, manifest
+navigation, failed-constructor cleanup, and worker joins happen outside it.
+Waiters retain the flight and recheck current authority after completion. Teardown
+fences new bindings, waits for constructors and their cleanup, then joins bound
+source workers before releasing the read capability. A locked allocator protects
+concurrent decoder construction without serializing provider I/O.
+
+Ordered-index cohorts retain balanced logical merge levels in reusable 64 KiB
+extents of one anonymous spill file per cohort. Extent directories scale with
+physical disk quota; tail truncation returns that quota immediately. Retained logical runs no longer
+consume one open descriptor each, so eight cohorts can retain the normal 32-run
+merge directory within the existing 64-file cap. Encoded blocks write directly into
+extents without an intermediate run copy; merges retain the existing typed codec, cancellation, compression, and
+bounded parallel scheduler. Initial publication builds reverse-coordinate trees
+from the file-slot/row scan order using the shared sorted page builder, avoiding
+a second external sort. Incremental and legacy publications retain the sorted
+reverse-tree fallback.
+
+New text publications persist global document/field-length totals and a
+copy-on-write segment-to-file tree beside compact file routes. A bounded necessary
+term proof chooses a conservative set of file partitions before cache admission.
+Exact terms, analyzed matches, exact term phrases, and supported Boolean clauses
+can narrow the set; unknown clauses, broad sets, and exhausted optional planning
+budgets use full admission. Negative clauses never establish a positive
+restriction. Selected partitions seek their immutable digest prefixes in the
+compact route tree rather than decoding all file routes. Cache keys distinguish
+full and selected corpora and their file sets. Selected snapshots retain global
+BM25 document counts, average lengths, and term frequencies, while local ordinals
+and predicate membership cover only the selected files. Highlights reuse the
+same query selection. WAL-overlay composition keeps full admission.
+
+These optional root fields preserve reading of existing publications; the next
+rebuild upgrades their routing contract. Garbage collection traverses the new
+segment-to-file tree under the existing reader-safe publication leases. The root
+still contains a flat manifest-reference list: root decoding and locating selected
+references remain proportional to file count, while route decoding and physical
+segment admission scale with selected files. Fuzzy/pattern queries and broad
+necessary sets retain the full-inventory path. Archive-scale latency, RSS, and
+provider request-count qualification remain separate from deterministic regression
+coverage and fixture timings.

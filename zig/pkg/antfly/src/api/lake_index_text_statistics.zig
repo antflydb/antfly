@@ -360,6 +360,7 @@ pub fn identityLess(_: void, left: IdentityOrdinal, right: IdentityOrdinal) bool
 
 /// Query-owned capability. The corpus owner retains refs only, never this reader.
 pub const Reader = struct {
+    partial_inventory: bool = false,
     read: @import("lake_index_seekable_text.zig").Read,
     domain: [32]u8,
     global: ?Ref,
@@ -512,6 +513,7 @@ pub const Reader = struct {
         const result = try a.alloc(Candidate, @intCast(count));
         errdefer a.free(result);
         var position: usize = 0;
+        var visited: usize = 0;
         while (cursor.next() catch |err| switch (err) {
             error.ArtifactReadBudgetExceeded => {
                 a.free(result);
@@ -519,7 +521,8 @@ pub const Reader = struct {
             },
             else => return err,
         }) |record| {
-            if (position == result.len or record.key.len != prefix.len + 32 or !std.mem.startsWith(u8, record.key, prefix)) return error.InvalidNativeLakeTermDirectory;
+            if (visited == result.len or record.key.len != prefix.len + 32 or !std.mem.startsWith(u8, record.key, prefix)) return error.InvalidNativeLakeTermDirectory;
+            visited += 1;
             _ = try Summary.decode(record.value);
             const id = record.key[prefix.len..][0..32];
             var lo: usize = 0;
@@ -528,19 +531,22 @@ pub const Reader = struct {
                 const mid = lo + (hi - lo) / 2;
                 if (std.mem.order(u8, &self.ordinals[mid].identity, id) == .lt) lo = mid + 1 else hi = mid;
             }
-            if (lo == self.ordinals.len or !std.mem.eql(u8, &self.ordinals[lo].identity, id)) return error.InvalidNativeLakeTermDirectory;
+            if (lo == self.ordinals.len or !std.mem.eql(u8, &self.ordinals[lo].identity, id)) {
+                if (self.partial_inventory) continue;
+                return error.InvalidNativeLakeTermDirectory;
+            }
             result[position] = .{ .segment_idx = self.ordinals[lo].segment_idx, .doc_offset = self.ordinals[lo].doc_offset };
             position += 1;
         }
-        if (position != result.len) return error.InvalidNativeLakeTermDirectory;
-        std.mem.sort(Candidate, result, {}, struct {
+        if (visited != result.len) return error.InvalidNativeLakeTermDirectory;
+        std.mem.sort(Candidate, result[0..position], {}, struct {
             fn less(_: void, left: Candidate, right: Candidate) bool {
                 return left.segment_idx < right.segment_idx;
             }
         }.less);
         self.candidate_bytes += result.len * @sizeOf(Candidate);
         try self.check();
-        return result;
+        return try a.realloc(result, position);
     }
     fn planning(raw: *anyopaque, a: A, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?local.index.IndexSnapshot.TextTermSummary {
         const self: *Reader = @ptrCast(@alignCast(raw));

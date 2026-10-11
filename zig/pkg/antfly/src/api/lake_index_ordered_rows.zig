@@ -95,7 +95,41 @@ pub const Delta = struct {
     keep: []const bool = &.{},
     files: []const []const u8 = &.{},
     fingerprints: []const [32]u8 = &.{},
+    reverse_built: bool = false,
+    built_reverse: ?tree.Ref = null,
 };
+/// Initial scans arrive in file-slot/row coordinates. Build the reverse tree
+/// directly in that order instead of sorting the tuple stream a second time.
+/// The address stays stable while the push builder borrows its page store.
+pub const ReverseBuilder = struct {
+    a: A,
+    pages: page_store.PageStore,
+    reads: u64 = 0,
+    writes: u64 = 512 * 1024 * 1024,
+    builder: tree.SortedBuilder,
+    pub fn create(a: A, store: *stores.ArtifactStore, cancellation: Cancellation) !*ReverseBuilder {
+        const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+        const self = try a.create(ReverseBuilder);
+        self.* = .{ .a = a, .pages = undefined, .builder = undefined };
+        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes };
+        self.builder = .{ .alloc = a, .store = self.pages.store() };
+        return self;
+    }
+    pub fn add(self: *ReverseBuilder, key: []const u8) !void {
+        if (key.len < 16) return error.InvalidNativeLakeRowIndex;
+        const bytes = try std.mem.concat(self.a, u8, &.{ key[key.len - 16 ..], key });
+        defer self.a.free(bytes);
+        try self.builder.add(bytes, "");
+    }
+    pub fn finish(self: *ReverseBuilder) !?tree.Ref {
+        return self.builder.finish();
+    }
+    pub fn deinit(self: *ReverseBuilder) void {
+        self.builder.deinit();
+        self.a.destroy(self);
+    }
+};
+
 pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, sort: *local.sql_spill.Sort, name: []const u8, fingerprint: [32]u8, inventory: local.serverless_external_source_types.Inventory, cover: []const []const u8, cancellation: Cancellation, delta: Delta) !Ref {
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     var read_bytes: u64 = 256 * 1024 * 1024;
@@ -105,7 +139,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);
     defer reverse_sort.deinit();
-    reverse_sort.run_limit = 4;
+    reverse_sort.shared_runs = true;
     var tie_builder = tie_directory.Builder.init(a, sort.manager);
     defer tie_builder.deinit();
     const Sorted = struct {
@@ -293,7 +327,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         // Initial and legacy roots get a streaming reverse tree once.
         const Collect = struct {
             merge: *Merge,
-            reverse_sort: *local.sql_spill.Sort,
+            reverse_sort: ?*local.sql_spill.Sort,
             predicates: *predicate_blocks.Builder,
             ties: *tie_directory.Builder,
             arena: std.heap.ArenaAllocator,
@@ -303,13 +337,15 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 try self.predicates.add(record.key);
                 try self.ties.add(record.key);
                 _ = self.arena.reset(.retain_capacity);
-                const key = try std.mem.concat(self.arena.allocator(), u8, &.{ record.key[record.key.len - 16 ..], record.key });
-                try self.reverse_sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = self.ordinal });
+                if (self.reverse_sort) |sort_| {
+                    const key = try std.mem.concat(self.arena.allocator(), u8, &.{ record.key[record.key.len - 16 ..], record.key });
+                    try sort_.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = self.ordinal });
+                }
                 self.ordinal += 1;
                 return record;
             }
         };
-        var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .ties = &tie_builder, .arena = .init(a) };
+        var collect: Collect = .{ .merge = &merge, .reverse_sort = if (delta.reverse_built) null else &reverse_sort, .predicates = &predicates, .ties = &tie_builder, .arena = .init(a) };
         defer collect.arena.deinit();
         page = try tree.buildSorted(a, pages.store(), &collect);
         ties = try tie_builder.finish(pages.store());
@@ -323,7 +359,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             }
         };
         var reverse_source: ReverseSource = .{ .sorted = &reverse_sorted };
-        reverse = try tree.buildSorted(a, pages.store(), &reverse_source);
+        reverse = if (delta.reverse_built) delta.built_reverse else try tree.buildSorted(a, pages.store(), &reverse_source);
+        if (delta.reverse_built and (page != null) != (reverse != null)) return error.InvalidNativeLakeRowIndex;
     }
     const predicate_root = try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
     const files = try a.alloc([]const u8, inventory.files.len);

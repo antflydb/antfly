@@ -593,33 +593,11 @@ fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8
 pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
     var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
     defer builder.deinit();
-    while (try source.next()) |record| {
-        try store.check(store.ptr);
-        if (record.key.len == 0 or record.key.len > max_key_bytes or
-            record.value.len > max_record_bytes - 8 - record.key.len)
-            return error.GraphPageRecordTooLarge;
-        if (builder.previous) |previous| if (!less(previous, record.key)) return error.UnsortedGraphPageMutations;
-        const previous = try alloc.dupe(u8, record.key);
-        errdefer alloc.free(previous);
-        try builder.append(0, .{ .key = record.key, .value = record.value });
-        if (builder.previous) |old| alloc.free(old);
-        builder.previous = previous;
-    }
-    try store.check(store.ptr);
-    for (0..builder.levels.len) |height| {
-        const level = &builder.levels[height];
-        if (level.entries.items.len == 0) continue;
-        if (height > 0 and level.entries.items.len == 1) {
-            var higher_pending = false;
-            for (builder.levels[height + 1 ..]) |higher| higher_pending = higher_pending or higher.entries.items.len > 0;
-            if (!higher_pending) return level.entries.items[0].child.?;
-        }
-        try builder.flush(height);
-    }
-    return null;
+    while (try source.next()) |record| try builder.add(record.key, record.value);
+    return builder.finish();
 }
 
-const SortedBuilder = struct {
+pub const SortedBuilder = struct {
     alloc: Allocator,
     store: Store,
     previous: ?[]u8 = null,
@@ -640,6 +618,31 @@ const SortedBuilder = struct {
             self.bytes = header_bytes;
         }
     };
+
+    pub fn add(self: *SortedBuilder, key: []const u8, value: []const u8) !void {
+        try self.store.check(self.store.ptr);
+        if (key.len == 0 or key.len > max_key_bytes or value.len > max_record_bytes - 8 - key.len) return error.GraphPageRecordTooLarge;
+        if (self.previous) |previous| if (!less(previous, key)) return error.UnsortedGraphPageMutations;
+        const previous = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(previous);
+        try self.append(0, .{ .key = key, .value = value });
+        if (self.previous) |old| self.alloc.free(old);
+        self.previous = previous;
+    }
+    pub fn finish(self: *SortedBuilder) !?Ref {
+        try self.store.check(self.store.ptr);
+        for (0..self.levels.len) |height| {
+            const level = &self.levels[height];
+            if (level.entries.items.len == 0) continue;
+            if (height > 0 and level.entries.items.len == 1) {
+                var higher_pending = false;
+                for (self.levels[height + 1 ..]) |higher| higher_pending = higher_pending or higher.entries.items.len > 0;
+                if (!higher_pending) return level.entries.items[0].child.?;
+            }
+            try self.flush(height);
+        }
+        return null;
+    }
 
     pub fn deinit(self: *SortedBuilder) void {
         if (self.previous) |previous| self.alloc.free(previous);

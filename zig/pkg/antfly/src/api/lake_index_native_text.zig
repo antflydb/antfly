@@ -98,6 +98,41 @@ pub const FileGroup = struct {
         }
     }
 };
+pub const Collection = struct {
+    pub const Field = struct { name: []const u8, total_length: u64 };
+    documents: u32,
+    fields: []const Field,
+    fn validate(self: Collection) !void {
+        for (self.fields, 0..) |field, i| {
+            if (field.name.len == 0 or (i != 0 and std.mem.order(u8, self.fields[i - 1].name, field.name) != .lt)) return error.InvalidNativeLakeTextCorpus;
+        }
+    }
+};
+fn collectionTotals(a: A, groups: []const FileGroup) !Collection {
+    var totals: std.StringHashMapUnmanaged(u64) = .empty;
+    defer totals.deinit(a);
+    var documents: u32 = 0;
+    for (groups) |group| for (group.admissions) |segment| {
+        documents = try std.math.add(u32, documents, segment.doc_count);
+        for (segment.fields) |field| if (field.stats) |stats| {
+            const entry = try totals.getOrPut(a, field.name);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* = try std.math.add(u64, entry.value_ptr.*, stats.total_field_len);
+        };
+    };
+    const fields = try a.alloc(Collection.Field, totals.count());
+    var iterator = totals.iterator();
+    for (fields) |*field| {
+        const entry = iterator.next().?;
+        field.* = .{ .name = entry.key_ptr.*, .total_length = entry.value_ptr.* };
+    }
+    std.mem.sort(Collection.Field, fields, {}, struct {
+        fn less(_: void, left: Collection.Field, right: Collection.Field) bool {
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.less);
+    return .{ .documents = documents, .fields = fields };
+}
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
@@ -115,6 +150,10 @@ pub const Root = struct {
     serving_inventory: ?statistics.Ref = null,
     inventory_version: u8 = 1,
     serving_routes: ?statistics.Ref = null,
+    segment_files: ?statistics.Ref = null,
+    collection: ?Collection = null,
+    /// Query-selected serving view only; never persisted.
+    partial_inventory: bool = false,
     /// Expanded serving view only; never accepted in a persisted directory.
     routing: []const []const SegmentRouting = &.{},
     admission_version: u8 = 0,
@@ -131,6 +170,8 @@ pub const Root = struct {
         if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
         if (self.serving_inventory) |ref| try ref.validate();
         if (self.serving_routes) |ref| try ref.validate();
+        if (self.segment_files) |ref| try ref.validate();
+        if (self.collection) |collection| try collection.validate();
         if (self.inventory_version < 1 or self.inventory_version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
@@ -174,7 +215,7 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
-    if (root.routing.len != 0) return error.InvalidNativeLakeTextCorpus;
+    if (root.routing.len != 0 or root.partial_inventory) return error.InvalidNativeLakeTextCorpus;
     if (root.manifests.len != 0 and (root.segments.len != 0 or root.file_groups.len != 0)) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
@@ -506,7 +547,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var exact_seed: ?Root = null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and (root.serving_inventory != null or root.file_groups.len == 0) and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and (root.segment_files != null or root.manifests.len == 0) and (root.serving_inventory != null or root.file_groups.len == 0) and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -677,6 +718,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const inventory = try @import("lake_index_serving_inventory.zig").publish(a, store, groups, manifests, seed, cancellation);
         root.serving_inventory = inventory.full;
         root.serving_routes = inventory.routes;
+        root.segment_files = inventory.segments;
+        root.collection = try collectionTotals(ca, groups);
         root.inventory_version = 2;
         root.manifests = manifests;
         root.file_groups = &.{};

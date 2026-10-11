@@ -300,6 +300,7 @@ const Execution = struct {
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
+    active_text: ?types.TextQuery = null,
     text_identities: std.AutoHashMapUnmanaged(usize, @import("lake_index_text_predicate.zig").Identities) = .empty,
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
@@ -578,7 +579,14 @@ const Execution = struct {
         const source_recipe = corpus.sourceRecipe(.{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true);
         const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &source_recipe, &root.recipe);
         try self.text_stores_source.put(self.arena, selected.name, stores_source);
-        var pin = try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
+        var selection: ?[]const [32]u8 = null;
+        if (self.overlay == null) if (self.active_text) |text| {
+            selection = self.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
+                error.OutOfMemory => null, // optional proof; full admission remains authoritative
+                else => return err,
+            };
+        };
+        var pin = try self.server.lake_text_corpora.acquireSelected(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation, selection);
         errdefer pin.deinit();
         const identities = @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus))).*;
         if (self.overlay) |overlay| {
@@ -593,6 +601,29 @@ const Execution = struct {
         try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities);
         return pin;
     }
+    fn selectFiles(self: *Execution, text: types.TextQuery, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, cancellation: @import("antfly_cancellation").CancellationToken) !?[]const [32]u8 {
+        if (root.collection == null or root.segment_files == null or root.serving_routes == null or root.inventory_version != 2 or root.term_directory.version != 2) return null;
+        switch (text) {
+            .match_none => return &.{},
+            .term, .match, .phrase, .bool_query => {},
+            else => return null,
+        }
+        var budget: local.sql_memory_budget = .{ .backing = self.result_allocator, .limit = 8 * 1024 * 1024 };
+        var temporary = std.heap.ArenaAllocator.init(budget.allocator());
+        defer temporary.deinit();
+        const sa = temporary.allocator();
+        var schema_ = try local.schema_mod.parseValidatedTableSchema(sa, self.schema_json);
+        defer schema_.deinit(sa);
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(sa, schema_);
+        const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(sa, root.config_json, runtime);
+        return @import("lake_index_serving_selection.zig").select(self.arena, root, self.store.artifactStore(), cached, cancellation, text, analysis, runtime);
+    }
+    fn acquireForText(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?search.PinnedTextSource {
+        const previous = self.active_text;
+        self.active_text = text;
+        defer self.active_text = previous;
+        return acquire(self, name);
+    }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
         const options = req.highlight orelse return;
         if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
@@ -605,7 +636,7 @@ const Execution = struct {
 
             if (req.full_text_queries.len != 0) {
                 for (req.full_text_queries) |named| {
-                    var pin = (try acquire(self, named.index_name)) orelse continue;
+                    var pin = (try self.acquireForText(named.index_name, named.query)) orelse continue;
                     self.highlight_pins.append(self.arena, pin) catch |err| {
                         pin.deinit();
                         return err;
@@ -613,7 +644,7 @@ const Execution = struct {
                     try queries.append(self.arena, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
                 }
             } else if (req.full_text) |query| {
-                var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return;
+                var pin = (try self.acquireForText(req.primary_text_index_name orelse req.index_name, query)) orelse return;
                 self.highlight_pins.append(self.arena, pin) catch |err| {
                     pin.deinit();
                     return err;
@@ -783,7 +814,7 @@ const Execution = struct {
         // fetch a potentially large body column solely for highlighting when
         // the selected immutable text index explicitly retains that source.
         if (req.full_text != null and req.full_text_queries.len == 0) {
-            if (try acquire(self, req.primary_text_index_name orelse req.index_name)) |source| {
+            if (try self.acquireForText(req.primary_text_index_name orelse req.index_name, req.full_text.?)) |source| {
                 var pin = source;
                 defer pin.deinit();
                 if (storedHighlightEligible(req, pin.selected_field, self.text_stores_source.get(pin.name) orelse false)) {
@@ -797,12 +828,12 @@ const Execution = struct {
             for (options.fields) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
         } else if (req.full_text_queries.len != 0) {
             for (req.full_text_queries) |named| {
-                var pin = (try acquire(self, named.index_name)) orelse continue;
+                var pin = (try self.acquireForText(named.index_name, named.query)) orelse continue;
                 defer pin.deinit();
                 if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
             }
         } else {
-            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return fields.items;
+            var pin = (try self.acquireForText(req.primary_text_index_name orelse req.index_name, req.full_text.?)) orelse return fields.items;
             defer pin.deinit();
             if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
         }
@@ -1009,6 +1040,9 @@ const Execution = struct {
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
+        const previous_text = self.active_text;
+        self.active_text = text;
+        defer self.active_text = previous_text;
         // The engine uses one callback for includes and excludes. Require an
         // exact plan for the exclusion expression; identical include/exclude
         // expressions conservatively share that requirement.
