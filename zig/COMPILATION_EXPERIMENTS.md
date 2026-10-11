@@ -5160,6 +5160,17 @@ A minimal Linux-musl Debug build through that production helper passes
 and verifies its exact dynamic export boundary. This checks the backend
 failure directly; it is not a substitute for the full Linux E2E suite.
 
+## 2026-10-11: approved public-library budget adjustment
+
+After reviewing the native 65.97 MiB measurement and retained-code
+attribution above, the user explicitly approved raising the Darwin
+diagnostic library budget from 60 MiB to **80 MiB (83,886,080 bytes)**.
+The guard still rejects libraries at or above the limit. This accepts
+headroom for the current storage and inference product; it does not
+change compilation, runtime behavior, or the preceding measurements.
+Linker maps remain available for subsequent growth investigations. The
+earlier experiment decisions describe the budget before this approval.
+
 ## Definition of done
 
 This compilation architecture work is complete when:

@@ -513,10 +513,10 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 60 MiB release gate (raised from 20 MiB on
-  2026-09-17 when the standalone inference runtime was embedded into
-  `libantfly` by default; measured stripped ReleaseFast size is
-  approximately 48 MiB, leaving headroom for other targets/platforms).
+- `libantfly` has a hard 80 MiB release gate (raised from 60 MiB on
+  2026-10-11 with explicit approval after a native stripped ReleaseFast
+  profile measured 65.97 MiB). Retained linker maps attribute storage and
+  inference code and support investigation of subsequent size growth.
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -576,7 +576,7 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 60 MiB (see the raised gate above) and exposes
+- `libantfly` remains below 80 MiB (see the raised gate above) and exposes
   only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
