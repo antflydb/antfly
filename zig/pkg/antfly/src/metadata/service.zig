@@ -18940,6 +18940,10 @@ test "relation reconciliation worker HTTP capability observation does not append
         .transport = .{ .snapshot = .{ .root_dir = snapshots } },
     } }, .{ .http = .{ .http = .{ .host = .{ .descriptor_factory = factory.iface() } } } }, .{ .observe_local_replica_root = false });
     defer svc.deinit();
+    // Isolate observation from the background migration that now adopts
+    // occupancy automatically. The probe itself must still append nothing,
+    // publish no cache entry and leave durable activation absent.
+    svc.relation_reconciliation_worker.next_round_at_ns = std.math.maxInt(u64);
     _ = try svc.ensureMetadataReplica(.{ .group_id = group, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
     try svc.campaignMetadataGroup();
     for (0..8) |_| try svc.runRound();
@@ -19062,7 +19066,8 @@ test "relation reconciliation worker activates and publishes verified roots in r
     try std.testing.expect(rebuilt.root != null and rebuilt.garbage == null);
     try std.testing.expect(!std.meta.eql(failed.current.?.job_id, rebuilt.current.?.job_id));
     const publication_activation = (try store.topologyActivation(group)).?;
-    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, publication_activation.version);
+    try std.testing.expectEqual(r.Coverage.constraint_names, rebuilt.current.?.coverage);
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, publication_activation.version);
     try std.testing.expectEqualSlices(u8, &proof.membership_fingerprint, &publication_activation.membership_fingerprint);
     // A live producer mutation invalidates the old candidate cut, then the
     // worker builds, verifies, swaps and collects its replacement.
@@ -19099,7 +19104,7 @@ test "relation reconciliation worker activates and publishes verified roots in r
     }, .{});
     defer a.free(stale_activation);
     try std.testing.expectError(error.NotLeader, svc.proposeTopologyActivationWithReceipt(stale_activation, stale_membership));
-    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, (try store.topologyActivation(group)).?.version);
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
     const reply = try catalog_operations.call(&svc, a, .{ .setting_admin = true }, replace_call);
     defer a.free(reply);
     var result = try std.json.parseFromSlice(catalog_calls.RelationReplacementResult, a, reply, .{});

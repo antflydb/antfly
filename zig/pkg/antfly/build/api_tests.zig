@@ -2139,8 +2139,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const sql_primary_key_rewrite_run = addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests);
+    sql_primary_key_rewrite_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
-        .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
+        .dependOn(&sql_primary_key_rewrite_run.step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,
@@ -2180,8 +2182,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "mounted initial FK hidden three voter owner transfers before release", "hosted initial FK real services and facade retain all required capabilities" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const hosted_initial_fk_transfer_run = addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests);
+    hosted_initial_fk_transfer_run.addArg("--require-no-skips");
     b.step("antfly-api-hosted-initial-fk-transfer-test", "Run hidden initial-child three-voter Raft leadership transfer")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests).step);
+        .dependOn(&hosted_initial_fk_transfer_run.step);
     const hosted_initial_fk_offline_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial FK canceled offline replica returns and signs exact unlink ACK", "mounted initial FK published obsolete released replica retires without canceling current owner", "hosted initial FK real services and facade retain all required capabilities" },

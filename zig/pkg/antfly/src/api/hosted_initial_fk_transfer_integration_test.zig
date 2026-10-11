@@ -15,5 +15,8 @@
 
 //! Hidden initial-child Raft failover, distinct from ALTER publication.
 test "mounted initial FK hidden three voter owner transfers before release" {
-    try @import("hosted_initial_fk_fault_integration_test.zig").mountedInitialFault(true);
+    // Keep the three-voter fault scenario, and exercise the SQL preparation
+    // boundary as well. Explicit REST creation remains covered by the cold
+    // restart and offline-owner fixtures sharing this publication machinery.
+    try @import("hosted_initial_fk_fault_integration_test.zig").mountedInitialScenario(.generated_transfer);
 }

@@ -270,10 +270,13 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
     const token = try test_helpers.encodeTrustedPrincipalToken(alloc, trusted_secret, claims);
     defer alloc.free(token);
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
-    const cases = [_]struct { name: []const u8, rows: []const u8, succeeds: bool }{
+    const cases = [_]struct { name: []const u8, rows: []const u8, succeeds: bool, generated: bool = false, has_null: bool = false }{
         .{ .name = "pk_good", .rows = "{\"inserts\":{\"row-a\":{\"id\":1,\"note\":\"first\"},\"row-b\":{\"id\":2,\"note\":\"second\"}},\"sync_level\":\"full_text\"}", .succeeds = true },
-        .{ .name = "pk_null", .rows = "{\"inserts\":{\"row-null\":{\"id\":null,\"note\":\"missing\"}},\"sync_level\":\"full_text\"}", .succeeds = false },
+        .{ .name = "pk_null", .rows = "{\"inserts\":{\"row-null\":{\"id\":null,\"note\":\"missing\"}},\"sync_level\":\"full_text\"}", .succeeds = false, .has_null = true },
         .{ .name = "pk_duplicate", .rows = "{\"inserts\":{\"row-a\":{\"id\":7,\"note\":\"first\"},\"row-b\":{\"id\":7,\"note\":\"second\"}},\"sync_level\":\"full_text\"}", .succeeds = false },
+        .{ .name = "pk_anonymous", .rows = "{\"inserts\":{\"row-a\":{\"id\":1,\"note\":\"first\"},\"row-b\":{\"id\":2,\"note\":\"second\"}},\"sync_level\":\"full_text\"}", .succeeds = true, .generated = true },
+        .{ .name = "pk_anonymous_null", .rows = "{\"inserts\":{\"row-null\":{\"id\":null,\"note\":\"missing\"}},\"sync_level\":\"full_text\"}", .succeeds = false, .generated = true, .has_null = true },
+        .{ .name = "pk_anonymous_duplicate", .rows = "{\"inserts\":{\"row-a\":{\"id\":7,\"note\":\"first\"},\"row-b\":{\"id\":7,\"note\":\"second\"}},\"sync_level\":\"full_text\"}", .succeeds = false, .generated = true },
     };
     var terminal_table_ids: [cases.len]u64 = undefined;
     for (cases, 0..) |case, case_index| {
@@ -337,7 +340,10 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
                 return error.UnexpectedSqlRows;
             }
         }
-        const alter = try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD CONSTRAINT {s}_key PRIMARY KEY (id)", .{ case.name, case.name });
+        const alter = if (case.generated)
+            try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD PRIMARY KEY (id)", .{case.name})
+        else
+            try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD CONSTRAINT {s}_key PRIMARY KEY (id)", .{ case.name, case.name });
         defer alloc.free(alter);
         var forbidden = try sql(alloc, transport, &reader_headers, metadata_uri, alter);
         defer forbidden.deinit(alloc);
@@ -386,7 +392,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
             if (std.mem.eql(u8, phase, if (case.succeeds) "succeeded" else "failed")) {
                 std.debug.print("PK job terminal table={s} body={s}\n", .{ case.name, response.body });
                 if (!case.succeeds) try std.testing.expectEqualStrings(
-                    if (std.mem.eql(u8, case.name, "pk_null")) "BackupIntegrityFailure" else "ConstraintActivationFailed",
+                    if (case.has_null) "BackupIntegrityFailure" else "ConstraintActivationFailed",
                     (try field(parsed.value, "error")).string,
                 );
                 terminal = true;
@@ -409,12 +415,15 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
         const constraints = if (schema == .object) schema.object.get("unique_constraints") else null;
         try std.testing.expectEqual(case.succeeds, constraints != null and constraints.? == .array and constraints.?.array.items.len == 1);
         if (case.succeeds) {
+            const expected_name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ case.name, if (case.generated) "pkey" else "key" });
+            defer alloc.free(expected_name);
+            try std.testing.expectEqualStrings(expected_name, (try field(constraints.?.array.items[0], "name")).string);
             var duplicate = try batch(alloc, transport, &headers, base, case.name, "{\"inserts\":{\"row-duplicate\":{\"id\":1,\"note\":\"duplicate\"}},\"sync_level\":\"full_text\"}");
             defer duplicate.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 409), duplicate.status);
             try std.testing.expect(std.mem.indexOf(u8, duplicate.body, "UniqueConstraintViolation") != null);
         } else {
-            const keys: []const []const u8 = if (std.mem.eql(u8, case.name, "pk_null")) &.{"row-null"} else &.{ "row-a", "row-b" };
+            const keys: []const []const u8 = if (case.has_null) &.{"row-null"} else &.{ "row-a", "row-b" };
             for (keys) |key| {
                 var fetched = try document(alloc, transport, &headers, base, case.name, key);
                 defer fetched.deinit(alloc);
@@ -468,11 +477,14 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
         const schema = try field(parsed.value, "schema");
         const constraints = if (schema == .object) schema.object.get("unique_constraints") else null;
         try std.testing.expectEqual(case.succeeds, constraints != null and constraints.? == .array and constraints.?.array.items.len == 1);
-        const key = if (std.mem.eql(u8, case.name, "pk_null")) "row-null" else "row-a";
+        const key = if (case.has_null) "row-null" else "row-a";
         var fetched = try document(alloc, transport, &headers, restarted_base, case.name, key);
         defer fetched.deinit(alloc);
         try std.testing.expectEqual(@as(u16, 200), fetched.status);
         if (case.succeeds) {
+            const expected_name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ case.name, if (case.generated) "pkey" else "key" });
+            defer alloc.free(expected_name);
+            try std.testing.expectEqualStrings(expected_name, (try field(constraints.?.array.items[0], "name")).string);
             var duplicate = try batch(alloc, transport, &headers, restarted_base, case.name, "{\"inserts\":{\"restart-duplicate\":{\"id\":1}},\"sync_level\":\"full_text\"}");
             defer duplicate.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 409), duplicate.status);
