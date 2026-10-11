@@ -2741,3 +2741,50 @@ input/job retirement and separate coordinated epoch release. Local emptiness is
 not a signed owner acknowledgement and cannot substitute for distributed fault
 qualification. The public failed-UNIQUE-build atomicity gate remains open, and
 the original inventory remains 478 / 136 / 73 / 899.
+
+### Bounded private-claim creation provenance (implementation under qualification)
+
+The isolated ordered-claim implementation originally retained one exact-cut
+receipt per canonical batch. Reordering and coalescing were idempotent, but
+different subsets of the same claims could accumulate receipts without adding
+data. Bound retry metadata by claims, not producer batching choices.
+
+Each inventory entry instead retains its immutable native creation cut and a
+contextual digest of the normalized job binding, full inventory key, canonical
+claim digest and cut. The compact representation is forty bytes: eight for the
+cut, thirty-two for the digest. The generation registration owns shared binding
+identity; it need not be repeated as plaintext in every entry. No separate batch
+receipt key, batch-identity hash or receipt-only cleanup phase is necessary.
+
+For a batch containing new claims, all new members receive the transaction's
+next source cut; existing members retain their cuts. For a batch containing only
+existing identical claims, return the maximum member creation cut, without
+advancing the source clock or creating an outbox effect. This maximum is exactly
+the cut of an original effect that introduced a member of that batch. It also
+defines an exact idempotent result for regrouped subsets; it is not an invented
+acknowledgement of a new write. Forwarded replay must match that cut. Claim
+postimages and provenance are validated together in the committing transaction.
+
+Transfer and cancellation GC validate creation cuts strictly after reservation
+and strictly before cancellation intent, not merely against the current source
+clock. GC captures each immutable cut and rechecks it before paired deletion.
+Claims and provenance retire in one bounded page protocol. This remains local
+physical evidence, not a signed distributed owner acknowledgement.
+
+Frozen-source qualification is running on isolated commits `e7eb0d5fbc` and
+`94af0fefa9`; these are not yet integrated or claimed passing. The new churn
+regression admits 258 distinct claims, commits 128 distinct mixed-age regrouped
+retries, and checks exactly 258 inventory entries and an unchanged source clock.
+The physical accounting is eight extra value bytes per claim versus the earlier
+hash-only inventory, replacing batch-count-dependent receipt storage. This is a
+storage/work bound, not a measured throughput or latency claim. Original SQL
+case dispositions and the public producer activation barriers remain unchanged.
+
+Follow-up `17445a6766` tightens page admission before allocating the next owned
+claim. Both command and prepared admission charge the AFC1 fixed bytes, both
+paired keys and provenance bytes, using the same accounting. GC stops before
+the next record would exceed 1 MiB instead of checking only after appending.
+Large-record regressions add two 600-KiB claims, reject oversized command and
+prepared admission, and check the complete paired-byte total of every page.
+This follow-up is committed locally and awaits its own frozen-source gate;
+passing earlier provenance tests cannot qualify this later change.
