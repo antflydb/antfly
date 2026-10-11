@@ -836,6 +836,159 @@ class IndexLifecycleTest(unittest.TestCase):
                 db.execute("SELECT to_regclass('public.items_id')").fetchone()[0]
             )
 
+    def test_original_unique_index_build_failure_is_atomic(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        with postgres() as db:
+            for case_id in ("sql-0692", "sql-0706", "sql-0705"):
+                with self.subTest(case_id=case_id):
+                    db.execute(
+                        "CREATE TABLE usage_records "
+                        "(id UUID PRIMARY KEY, email TEXT, tenant_id TEXT, status TEXT)"
+                    )
+                    email = None if case_id == "sql-0692" else "owner@example.com"
+                    for ordinal in (1, 2):
+                        db.execute(
+                            "INSERT INTO usage_records VALUES (%s,%s,%s,%s)",
+                            (
+                                f"00000000-0000-0000-0000-{ordinal:012d}",
+                                email,
+                                f"tenant-{ordinal}",
+                                "pending",
+                            ),
+                        )
+                    row_query = (
+                        "SELECT id::text,email,tenant_id,status "
+                        "FROM usage_records ORDER BY id"
+                    )
+                    index_query = (
+                        "SELECT c.relname,i.indisvalid,i.indisready "
+                        "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+                        "WHERE i.indrelid='usage_records'::regclass ORDER BY c.relname"
+                    )
+                    before_rows = db.execute(row_query).fetchall()
+                    before_indexes = db.execute(index_query).fetchall()
+                    with self.assertRaises(psycopg.errors.UniqueViolation) as failed:
+                        db.execute(originals[case_id]["sql"])
+                    self.assertEqual("23505", failed.exception.sqlstate)
+                    self.assertEqual(before_rows, db.execute(row_query).fetchall())
+                    self.assertEqual(before_indexes, db.execute(index_query).fetchall())
+                    # The rejected declaration neither reserves its name nor
+                    # poisons later writes. A deliberate repaired retry works.
+                    db.execute(
+                        "DELETE FROM usage_records "
+                        "WHERE id='00000000-0000-0000-0000-000000000002'"
+                    )
+                    db.execute(originals[case_id]["sql"])
+                    self.assertEqual(
+                        len(before_indexes) + 1, len(db.execute(index_query).fetchall())
+                    )
+                    db.execute("DROP TABLE usage_records")
+
+    def test_original_unique_index_owner_campaign(self):
+        originals = {
+            entry["id"]: entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        columns = "id::text, email, tenant_id, status"
+        seed = [
+            ("00000000-0000-0000-0000-000000000001", None, "tenant", "pending"),
+            (
+                "00000000-0000-0000-0000-000000000002",
+                "owner@example.com",
+                "tenant",
+                "pending",
+            ),
+        ]
+        with postgres() as db:
+            for case_id, namespace, nulls_not_distinct in (
+                ("sql-0692", "nulls_not_distinct", True),
+                ("sql-0706", "nulls_distinct", False),
+                ("sql-0705", "included_columns", False),
+            ):
+                with self.subTest(case_id=case_id):
+                    db.execute(
+                        pgsql.SQL("CREATE SCHEMA {}").format(
+                            pgsql.Identifier(namespace)
+                        )
+                    )
+                    db.execute(
+                        pgsql.SQL("SET search_path TO {}").format(
+                            pgsql.Identifier(namespace)
+                        )
+                    )
+                    db.execute(
+                        "CREATE TABLE usage_records "
+                        "(id UUID PRIMARY KEY, email TEXT, tenant_id TEXT, status TEXT)"
+                    )
+                    for row in seed:
+                        db.execute(
+                            "INSERT INTO usage_records VALUES (%s,%s,%s,%s)", row
+                        )
+                    original = originals[case_id]
+                    self.assertEqual([], original["params"])
+                    db.execute(original["sql"])
+                    with self.assertRaises(psycopg.errors.UniqueViolation) as duplicate:
+                        db.execute(
+                            "INSERT INTO usage_records VALUES "
+                            "('00000000-0000-0000-0000-000000000004',"
+                            "'owner@example.com','other','changed')"
+                        )
+                    self.assertEqual("23505", duplicate.exception.sqlstate)
+                    self.assertEqual(
+                        seed,
+                        db.execute(
+                            f"SELECT {columns} FROM usage_records ORDER BY id"
+                        ).fetchall(),
+                    )
+                    second_null = (
+                        "00000000-0000-0000-0000-000000000003",
+                        None,
+                        "other",
+                        "changed",
+                    )
+                    if nulls_not_distinct:
+                        with self.assertRaises(psycopg.errors.UniqueViolation) as null:
+                            db.execute(
+                                "INSERT INTO usage_records VALUES (%s,%s,%s,%s)",
+                                second_null,
+                            )
+                        self.assertEqual("23505", null.exception.sqlstate)
+                    else:
+                        db.execute(
+                            "INSERT INTO usage_records VALUES (%s,%s,%s,%s)",
+                            second_null,
+                        )
+                    self.assertEqual(
+                        seed if nulls_not_distinct else seed + [second_null],
+                        db.execute(
+                            f"SELECT {columns} FROM usage_records ORDER BY id"
+                        ).fetchall(),
+                    )
+                    if not nulls_not_distinct:
+                        further_null = (
+                            "00000000-0000-0000-0000-000000000004",
+                            None,
+                            "other",
+                            "changed",
+                        )
+                        db.execute(
+                            "INSERT INTO usage_records VALUES (%s,%s,%s,%s)",
+                            further_null,
+                        )
+                        self.assertEqual(
+                            seed + [second_null, further_null],
+                            db.execute(
+                                f"SELECT {columns} FROM usage_records ORDER BY id"
+                            ).fetchall(),
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

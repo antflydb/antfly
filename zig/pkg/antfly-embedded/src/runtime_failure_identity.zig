@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
     .{ .status = .setting_authority_unavailable, .err = error.SettingAuthorityUnavailable },
     .{ .status = .online_merge_artifact_tails_unsupported, .err = error.OnlineMergeArtifactTailsUnsupported },
     .{ .status = .artifact_catalog_corrupt, .err = error.ArtifactCatalogCorrupt },
@@ -981,6 +982,12 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // Typed occupancy is a publication precondition, not an undeclared
+    // provider defect or proof of an uncertain admitted mutation.
+    const occupancy = failureFromError(error.CatalogOccupancyNotReady, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.catalog_occupancy_not_ready, occupancy.status);
+    try validateFailureEnvelope(occupancy.status, &occupancy, abi.abi_version);
+    try std.testing.expectError(error.CatalogOccupancyNotReady, statusToError(occupancy.status));
     // A stale FK attachment must remain a semantic rejection across the
     // storage-owner ABI. Collapsing it to StorageKernelFailure can poison a
     // replicated apply entry and stall every later proposal on that owner.

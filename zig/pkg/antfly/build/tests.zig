@@ -4654,6 +4654,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Both aggregates share this run node, so the default test DAG executes
     // the stateful parity suite once. The focused alias remains independent.
     integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // These are the same run nodes as the focused aliases: real owner
+    // lifecycle coverage must execute in CI, without duplicate DAG campaigns.
+    for (api_tests_addTests_result.run_sql_owner_lifecycle_tests) |run| {
+        integration_test_step.dependOn(&run.step);
+    }
     // Keep document-identity regressions in the owning integration suite.
     // The mixed lifecycle artifact remains intact so removing its public
     // shortcut does not discard metadata, cache, or distributed-query cases.

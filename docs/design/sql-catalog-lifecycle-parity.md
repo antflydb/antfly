@@ -1,6 +1,6 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: follow-up to merged PR #1048, merged with `origin/main` at `121699433e`.
+Status: follow-up to merged PR #1048, merged with `origin/main` at `7d6b35000d`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -884,3 +884,51 @@ actionable hints without changing SQLSTATE or non-retryable semantics.
 The PostgreSQL 18 oracle passes all 14 tests again on the merged worktree.
 The original parity inventory is unchanged; this is qualified scoped work,
 not completion of the remaining SQL architecture.
+
+### Shared mounted owner qualification for index lifecycles
+
+The next delivery extracts the existing PK campaign's real metadata/data-owner
+setup into `api/sql_owner_test_fixture.zig`. Campaigns borrow a context only
+while both runtimes and their progress drivers are alive. The harness owns
+startup, driver-error checks, orderly cold data-owner restart and teardown;
+callbacks own their expected postimages and durable table identities. The
+linked-control root is named for SQL owner lifecycles rather than one feature.
+Existing PK qualification remains a separate, no-skips gate.
+
+The new `antfly-api-sql-index-lifecycle-test` selects exact original statements
+`sql-0692`, `sql-0706` and `sql-0705` from the pinned corpus, without editing
+their SQL. Isolated namespaces retain all three policies across one restart.
+Every source has a logical UUID primary key. Assertions cover complete typed
+postimages, duplicate rejection with SQLSTATE 23505, included fields excluded
+from the unique key, NULL policy, committed owner identity and enforcement after
+cold restart. Only typed retryable pure reads can be repeated; mutation requests
+are submitted once. HTTP requests and publication/activation waits are bounded.
+
+The PostgreSQL 18 oracle passes all 16 lifecycle tests with the same owner
+profiles and exact original index statements. Its failed-build contract also
+checks that a regular failed CREATE UNIQUE INDEX leaves rows and the index
+catalog unchanged before a deliberate repair and resubmission. This is an
+oracle contract, not a claim of native failed-build cleanup qualification.
+
+Mounted qualification exposed two production error-identity problems. The
+runtime failure ABI now preserves CatalogOccupancyNotReady as an append-only
+status rather than converting a known publication precondition into an unknown
+mutation outcome. Physical snapshot opening for an already-bound logical table
+classifies missing serving state as temporary read unavailability. Logical-name
+resolution still preserves undefined_table, and corruption and unknown mutation
+outcomes remain distinct; neither fix authorizes mutation replay.
+
+The owner campaigns share one compiled linked-owner artifact and independent
+no-skips run nodes, also wired into antfly-integration-test. Invalid-build
+cleanup, metadata failover and concurrent DDL remain separate required
+qualification boundaries, not implied by cold data-owner recovery. The original
+inventory remains 899 unresolved; no disposition changes are claimed here.
+
+Qualification checkpoint: the final combined Debug run passed both mounted
+campaigns (six PK scenarios and three original unique-index profiles) and both
+read-admission tests, with zero skips, failures or leaks. The DISTINCT profiles
+also admit an additional NULL row after restart and verify the full postimage;
+NOT DISTINCT still rejects it. Read-admission and runtime failure-identity gates
+also pass in ReleaseFast; failure identity passes in Debug as well. PostgreSQL
+18 passes all 16 lifecycle tests. This is scoped qualification, not a claim
+that the full integration suite or every distributed fault boundary passed.

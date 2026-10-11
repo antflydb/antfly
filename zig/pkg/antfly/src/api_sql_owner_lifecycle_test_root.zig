@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Linked-control owner composition for mounted SQL primary-key rewrites.
+//! Linked-control owner composition for mounted SQL catalog lifecycle.
 
 const sql_primary_key_rewrite_integration_test = @import("api/sql_primary_key_rewrite_integration_test.zig");
 
@@ -27,6 +27,7 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
     _ = sql_primary_key_rewrite_integration_test;
+    _ = @import("api/sql_index_lifecycle_integration_test.zig");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.
