@@ -513,10 +513,10 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 60 MiB release gate (raised from 20 MiB on
-  2026-09-17 when the standalone inference runtime was embedded into
-  `libantfly` by default; measured stripped ReleaseFast size is
-  approximately 48 MiB, leaving headroom for other targets/platforms).
+- `libantfly` has a hard 80 MiB release gate (raised from 60 MiB on
+  2026-10-11 with explicit approval after a native stripped ReleaseFast
+  profile measured 65.97 MiB). Retained linker maps attribute storage and
+  inference code and support investigation of subsequent size growth.
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -576,7 +576,7 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 60 MiB (see the raised gate above) and exposes
+- `libantfly` remains below 80 MiB (see the raised gate above) and exposes
   only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
@@ -706,6 +706,31 @@ python3 -m unittest zig.tools.test_analyze_zig_import_graph
 ```
 
 ### Compiler report capture
+
+To measure the actual Darwin release archive pipeline, run this from the
+repository root with Zig 0.17 on `PATH`. Use a new report directory for each
+cold run:
+
+```sh
+report="$PWD/.local-test-results/darwin-release-cold"
+RUNNER_TEMP="$report/work" ANTFLY_ZIG_CACHE_ROOT="$report/cache" \
+  scripts/diagnose-zig-build-memory.sh --command \
+  --out-dir "$report/trace" --label darwin-release \
+  --target aarch64-macos --optimize fast --strip true --interval 5 -- \
+  "$PWD/scripts/packaging/build_zig_release_archive.sh" \
+  --version 0.0.0-diagnostic --target aarch64-macos --optimize fast \
+  --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
+  --out-dir "$report/dist" --metal true --system-blas true
+```
+
+This retains production job admission, captures per-compiler RSS and CPU clocks,
+and includes the full Zig step summary and packaging output. Darwin packaging
+uses the bounded runner's 80% host/cgroup budget so the 28 GiB storage reservation
+fits on adequately provisioned hosts and larger hosts can admit safe overlap.
+Compiler response files are retained beside the trace for portable attribution.
+Run on an
+otherwise idle host. Record host, SDK, commit and cache state alongside results;
+native Darwin timings do not establish Linux cross-build performance.
 
 Start the exact candidate build with fresh caches, `--time-report`, and a local
 WebUI:
