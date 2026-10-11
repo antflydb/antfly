@@ -23,6 +23,12 @@ const ScoreSink = @import("backend_types.zig").ScoreSink;
 // A rebuild gets a process-unique identity, including after deinit and address
 // reuse. Row/column permutations keep the canonical physical key identity.
 var next_identity = std.atomic.Value(u64).init(1);
+pub fn newCanonicalIdentity() u64 {
+    const identity = next_identity.fetchAdd(1, .monotonic);
+    if (identity == 0 or identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
+    return identity;
+}
+
 pub const PreparedScorePlan = struct {
     pub const max_bytes = 256 * 1024;
     pub const max_keys = 4096;
@@ -279,8 +285,7 @@ pub const PreparedScorePlan = struct {
                 break;
             }
         };
-        self.identity = next_identity.fetchAdd(1, .monotonic);
-        if (self.identity == 0 or self.identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
+        self.identity = newCanonicalIdentity();
         self.valid = true;
         return true;
     }

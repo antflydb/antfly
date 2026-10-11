@@ -28,6 +28,7 @@ pub const PreparedChunks = @import("../storage/prepared_score_request.zig").Prep
 
 pub fn populateChunks(a: std.mem.Allocator, txn: anytype, request: *const PreparedChunks, columns: []const []?f64) !Stats {
     try request.validateColumns(columns);
+    if (request.combinedRequest()) |combined| return populatePrepared(a, txn, combined, columns);
     request.clearAbsentColumns(columns);
     errdefer for (columns) |column| @memset(column, null);
     var stats = Stats{};
@@ -85,9 +86,9 @@ pub fn populatePrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: 
 /// Read an immutable request without comparing caller inputs or rebuilding keys.
 /// The sink assigns by canonical index; retries may overwrite partial delivery.
 pub fn visitPrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !Stats {
-    const plan = request.plan();
-    if (!plan.valid) return error.InvalidBatch;
-    if (plan.read_keys.len == 0) return .{};
+    const read_keys = request.readKeys();
+    if (request.canonicalIdentity() == 0) return error.InvalidBatch;
+    if (read_keys.len == 0) return .{};
     const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
     if (scoped) {
         var scope = txn.openReadScope(caller_alloc) catch |err| switch (@as(anyerror, err)) {
@@ -108,7 +109,7 @@ pub fn visitPrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *co
                     },
                     else => return err,
                 };
-                return .{ .keys = plan.read_keys.len, .batches = 1 };
+                return .{ .keys = read_keys.len, .batches = 1 };
             }
         }
     }
@@ -119,7 +120,7 @@ pub fn visitPrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *co
 // loses clone remaps and repeats encoding/sorting. Keep the same pinned txn and
 // stream the owned key spans through a bounded transport instead.
 fn streamPrepared(a: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !Stats {
-    const read_keys = request.plan().read_keys;
+    const read_keys = request.readKeys();
     const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
     const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(a))).error_union.payload else void;
     var scope: ?Scope = if (scoped) txn.openReadScope(a) catch |err|
@@ -720,5 +721,56 @@ test "graph metric physical cloned fallback preserves null column remaps and cle
         try std.testing.expectEqualSlices(?f64, &.{ 2, 1, 1 }, &columns[2]);
         try std.testing.expectEqualSlices(?f64, &columns[2], &columns[3]);
         try std.testing.expectEqual(@as(usize, 2), txn.closed);
+    }
+}
+
+test "graph metric physical compact chunk fallback overwrites partial pressure delivery" {
+    const a = std.testing.allocator;
+    var nodes: [4098][]const u8 = undefined;
+    var storage: [4097][8]u8 = undefined;
+    for (&storage, 0..) |*bytes, i| {
+        _ = try std.fmt.bufPrint(bytes, "{d:0>8}", .{i});
+        nodes[4096 - i] = bytes;
+    }
+    nodes[4097] = nodes[0];
+    var request = try PreparedChunks.init(a, &.{ "p/", null, "p/" }, &nodes);
+    defer request.deinit();
+    const Probe = struct {
+        raw: [8]u8 = undefined,
+        pressure: bool,
+        const Self = @This();
+        const Scope = struct {
+            parent: *Self,
+            pub fn close(_: *@This()) void {}
+            pub fn supportsPreparedRequest(self: *@This()) bool {
+                return self.parent.pressure;
+            }
+            pub fn visitPreparedRequest(_: *@This(), _: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !void {
+                sink.write(sink.context, 0, 99);
+                return error.ResourceBudgetExceeded;
+            }
+            pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+                return self.parent.getManySorted(requested, values);
+            }
+        };
+        pub fn openReadScope(self: *@This(), _: std.mem.Allocator) !Scope {
+            return .{ .parent = self };
+        }
+        pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+            std.mem.writeInt(u64, &self.raw, @bitCast(@as(f64, 7)), .little);
+            for (requested, values) |key, *value| value.* = if (std.mem.eql(u8, key, "p/00000000\x00\x00")) null else &self.raw;
+        }
+    };
+    for ([_]bool{ false, true }) |pressure| {
+        var txn = Probe{ .pressure = pressure };
+        var columns: [3][4098]?f64 = @splat(@splat(77));
+        const stats = try populateChunks(a, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+        try std.testing.expectEqual(@as(usize, 4097), stats.keys);
+        try std.testing.expectEqual(@as(?f64, null), columns[0][4096]);
+        for (columns[0], 0..) |value, i| if (i != 4096) {
+            try std.testing.expectEqual(@as(?f64, 7), value);
+        };
+        for (columns[1]) |value| try std.testing.expect(value == null);
+        try std.testing.expectEqualSlices(?f64, &columns[0], &columns[2]);
     }
 }

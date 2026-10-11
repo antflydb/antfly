@@ -3113,10 +3113,10 @@ pub const Txn = struct {
         /// cache owns its identity and decoded scores; it never retains the
         /// request pointer.
         pub fn visitPreparedRequest(self: *@This(), request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
-            if (!request.plan().valid) return error.InvalidBatch;
-            if (request.plan().read_keys.len == 0) return;
+            if (request.canonicalIdentity() == 0) return error.InvalidBatch;
+            if (request.readKeys().len == 0) return;
             const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
-            self.readPreparedScores(request.plan(), sink) catch |err| {
+            self.readOwnedScores(request, sink) catch |err| {
                 if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
                 return err;
             };
@@ -3124,6 +3124,13 @@ pub const Txn = struct {
                 w.resolved_scores.recovered_optional_failure = false;
                 w.allocation_failed = previous_failure;
             };
+        }
+
+        fn readOwnedScores(self: *@This(), request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
+            if (self.parent.pending_count != 0) return self.visitScores(request.readKeys(), sink);
+            defer self.resetBatchScratch();
+            const file = try self.parent.readFile();
+            return file.visitOwnedScoresAtCheckpointWithState((try self.batchScratch()).allocator(), self.parent.checkpoint, request, self.parent.prefix, sink, try self.nativeState());
         }
 
         fn readPreparedScores(self: *@This(), plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
@@ -9153,6 +9160,28 @@ test "lite prepared chunks preserve large namespaced snapshot and global duplica
     _ = try reader.populateChunks(a, &fresh, &compiled, &.{ first, missing, duplicate });
     try std.testing.expectEqual(@as(?f64, 9), first[0]);
     try std.testing.expectEqual(@as(?f64, 9), first[count]);
+    var erased = try backend_erased.readTxnFrom(a, try Txn.openReadWithPrefix(&store, "ns\x00"));
+    defer erased.abort();
+    _ = try reader.populateChunks(a, &erased, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(?f64, 9), first[0]);
+    const file = try fresh.readFile();
+    file.page_cache_enabled.store(false, .monotonic);
+    defer file.page_cache_enabled.store(true, .monotonic);
+    _ = try reader.populateChunks(a, &fresh, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(?f64, 9), first[0]);
+    var write = try Txn.openWriteWithPrefix(&store, "ns\x00");
+    defer write.abort();
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 11)), .little);
+    try write.put(storage[count - 1][3..], &raw);
+    _ = try reader.populateChunks(a, &write, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(?f64, 11), first[0]);
+    try std.testing.expectEqual(@as(?f64, 11), first[count]);
+    try write.delete(storage[count - 1][3..]);
+    _ = try reader.populateChunks(a, &write, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expect(first[0] == null and first[count] == null);
+    try write.put(storage[count - 1][3..], "invalid");
+    try std.testing.expectError(error.InvalidGraphMetricScore, reader.populateChunks(a, &write, &compiled, &.{ first, missing, duplicate }));
+    for (first) |value| try std.testing.expect(value == null);
 }
 
 test "lite prepared immutable handle and large chunks measurement" {
@@ -9219,4 +9248,112 @@ test "lite prepared immutable handle and large chunks measurement" {
             std.debug.print("HANDLE_CHUNKS keys={d} direct={d} queries={d} cpu_us={d} allocations={d} build_cpu_us={d} setup_allocations={d} owned_bytes={d}\n", .{ count, @intFromBool(direct), queries, cpu, counter.alloc_calls - before, build_cpu, setup_allocations, owned_bytes });
         }
     }
+}
+
+test "lite prepared review multiple columns retain combined decoded reuse" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-multi-columns.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var keys: [2][512][12]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [1024]native.DocumentMutation = undefined;
+    var raw: [2][8]u8 = undefined;
+    for (0..2) |c| {
+        std.mem.writeInt(u64, &raw[c], @bitCast(@as(f64, if (c == 0) 3 else 9)), .little);
+        for (&keys[c], 0..) |*key, i| {
+            @memcpy(key[0..2], if (c == 0) "p/" else "q/");
+            _ = try std.fmt.bufPrint(key[2..10], "{d:0>8}", .{i});
+            key[10] = 0;
+            key[11] = 0;
+            if (c == 0) nodes[i] = key[2..10];
+            docs[c * 512 + i] = .{ .key = key, .value = &raw[c] };
+        }
+    }
+    try store.file.putDocumentBatch(&docs);
+    const reader = @import("../../graph/score_read.zig");
+    const prefixes = [_]?[]const u8{ "p/", "q/" };
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var compiled = try reader.PreparedChunks.init(alloc, &prefixes, &nodes);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.combinedRequest() != null);
+    try std.testing.expect(compiled.combinedRequest().?.retainDecoded());
+    var owned = try reader.PreparedRequest.init(alloc, &prefixes, &nodes);
+    defer owned.deinit();
+    var columns: [2][512]?f64 = undefined;
+    const output = [_][]?f64{ &columns[0], &columns[1] };
+    for (0..3) |mode| {
+        for (0..3) |_| switch (mode) {
+            0 => _ = try reader.populate(alloc, &txn, &prefixes, &nodes, &output),
+            1 => _ = try reader.populateChunks(alloc, &txn, &compiled, &output),
+            2 => _ = try reader.populatePrepared(alloc, &txn, &owned, &output),
+            else => unreachable,
+        };
+        if (mode == 1) {
+            var captured = false;
+            for (store.workspaces) |slot| if (slot) |w| {
+                if (w.resolved_scores.decoded_ready) captured = true;
+            };
+            try std.testing.expect(captured);
+        }
+        const before = counter.alloc_calls;
+        const started = std.posix.getrusage(0);
+        for (0..2000) |_| switch (mode) {
+            0 => _ = try reader.populate(alloc, &txn, &prefixes, &nodes, &output),
+            1 => _ = try reader.populateChunks(alloc, &txn, &compiled, &output),
+            2 => _ = try reader.populatePrepared(alloc, &txn, &owned, &output),
+            else => unreachable,
+        };
+        const ended = std.posix.getrusage(0);
+        const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+        for (columns[0]) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+        for (columns[1]) |score| try std.testing.expectEqual(@as(?f64, 9), score);
+        try std.testing.expectEqual(before, counter.alloc_calls);
+        std.debug.print("REVIEW_MULTI mode={d} cpu_us={d} allocations={d}\n", .{ mode, cpu, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared duplicate heavy single compact chunk retains decoded scores" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "single-compact.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    try store.file.putDocument("p/a\x00\x00", &raw);
+    var nodes: [5000][]const u8 = @splat("a");
+    nodes[0] = "missing";
+    const reader = @import("../../graph/score_read.zig");
+    var compiled = try reader.PreparedChunks.init(a, &.{ "p/", null, "p/" }, &nodes);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.combinedRequest() == null);
+    try std.testing.expectEqual(@as(usize, 1), compiled.chunkPlans().len);
+    try std.testing.expect(compiled.chunkPlans()[0].request.retainDecoded());
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var columns: [3][5000]?f64 = undefined;
+    for (0..3) |_| _ = try reader.populateChunks(alloc, &txn, &compiled, &.{ &columns[0], &columns[1], &columns[2] });
+    const before = counter.alloc_attempts;
+    _ = try reader.populateChunks(alloc, &txn, &compiled, &.{ &columns[0], &columns[1], &columns[2] });
+    try std.testing.expectEqual(before, counter.alloc_attempts);
+    try std.testing.expect(columns[0][0] == null);
+    for (columns[0][1..]) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+    for (columns[1]) |value| try std.testing.expect(value == null);
+    try std.testing.expectEqualSlices(?f64, &columns[0], &columns[2]);
+    var captured = false;
+    for (store.workspaces) |slot| if (slot) |w| {
+        if (w.resolved_scores.decoded_ready) captured = true;
+    };
+    try std.testing.expect(captured);
 }

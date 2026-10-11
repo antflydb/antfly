@@ -6184,12 +6184,24 @@ pub const NativeFile = struct {
     /// flag or identity can bypass input checks. The plan stays immutable during
     /// delivery. Namespace translation preserves its sorted, unique order.
     pub fn visitPreparedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
+        if (!plan.valid or plan.identity == 0) return error.InvalidBatch;
+        return self.visitCanonicalScores(temporary, checkpoint, plan.read_keys, plan.identity, plan.retain_decoded, namespace, sink, state);
+    }
+
+    pub fn visitOwnedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
+        if (request.canonicalIdentity() == 0) return error.InvalidBatch;
+        return self.visitCanonicalScores(temporary, checkpoint, request.readKeys(), request.canonicalIdentity(), request.retainDecoded(), namespace, sink, state);
+    }
+
+    // This private entry only receives canonical keys proven by an owning plan
+    // or request. It is never a caller-supplied sortedness/identity escape hatch.
+    fn visitCanonicalScores(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, read_keys: []const []const u8, canonical_identity: u64, retain_decoded: bool, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
         // A compiled scan knows it will advance through multiple identities.
         // Reuse required reader scratch without allocating decoded entries that
         // would be displaced before their next use. Restore the independently
         // owned cache pointer before scope cleanup and retention accounting.
         const retained = state.resolved;
-        if (!plan.retain_decoded) {
+        if (!retain_decoded) {
             if (retained) |resolved| {
                 resolved.deinit(state.allocator orelse self.allocator);
                 resolved.recovered_optional_failure = false;
@@ -6197,17 +6209,16 @@ pub const NativeFile = struct {
             state.resolved = null;
         }
         defer state.resolved = retained;
-        if (!plan.valid or plan.identity == 0) return error.InvalidBatch;
-        const identity = ReadIdentity{ .canonical = plan.identity, .namespace = namespace };
+        const identity = ReadIdentity{ .canonical = canonical_identity, .namespace = namespace };
         if (checkpoint.document_index_root_page == 0) {
-            for (0..plan.read_keys.len) |i| sink.write(sink.context, i, null);
+            for (0..read_keys.len) |i| sink.write(sink.context, i, null);
             return;
         }
         // Owned physical keys and decoded values survive scope detach. A hit
         // needs no namespace reconstruction, record reader, or temporary arena.
         if (state.binding) |binding| if (state.resolved) |resolved| {
             if (self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0 and
-                resolved.decoded_ready and resolved.matchesPrepared(binding, checkpoint, identity, plan.read_keys.len))
+                resolved.decoded_ready and resolved.matchesPrepared(binding, checkpoint, identity, read_keys.len))
             {
                 resolved.borrowed = true;
                 defer resolved.borrowed = false;
@@ -6216,7 +6227,7 @@ pub const NativeFile = struct {
                 return;
             }
         };
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity, true);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity, true);
     }
 
     // Keep record and external-score reads inside the same recovery boundary.
@@ -17988,8 +17999,14 @@ test "lite decoded streaming plans initialize lazy state ownership" {
     defer file.close();
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
-    try file.putDocument("a\x00\x00", &raw);
-    var compiled = try @import("../prepared_score_request.zig").PreparedScoreChunks.init(a, &.{ "", "q/" }, &.{"a"});
+    try file.putDocument("00000000\x00\x00", &raw);
+    var nodes: [4097][]const u8 = undefined;
+    var encoded: [4097][8]u8 = undefined;
+    for (&encoded, &nodes, 0..) |*bytes, *node, i| {
+        _ = try std.fmt.bufPrint(bytes, "{d:0>8}", .{i});
+        node.* = bytes;
+    }
+    var compiled = try @import("../prepared_score_request.zig").PreparedScoreChunks.init(a, &.{""}, &nodes);
     defer compiled.deinit();
     var resolved = ResolvedScoreBatch{};
     var state = DocumentBatchReadState{ .resolved = &resolved };
@@ -17998,11 +18015,11 @@ test "lite decoded streaming plans initialize lazy state ownership" {
         value: ?f64 = null,
         fn write(ctx: *anyopaque, _: usize, score: ?f64) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.value = score;
+            if (score != null) self.value = score;
         }
     };
     var output = Output{};
-    try file.visitPreparedScoresAtCheckpointWithState(a, file.activeCheckpoint(), compiled.chunkPlans()[0].request.plan(), "", .{ .context = &output, .write = Output.write }, &state);
+    try file.visitOwnedScoresAtCheckpointWithState(a, file.activeCheckpoint(), &compiled.chunkPlans()[0].request, "", .{ .context = &output, .write = Output.write }, &state);
     try std.testing.expectEqual(@as(?f64, 3), output.value);
     try std.testing.expect(state.allocator != null);
     try std.testing.expect(resolved.storage == null);

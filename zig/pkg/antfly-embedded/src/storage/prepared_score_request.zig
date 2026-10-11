@@ -22,14 +22,75 @@ pub const PreparedScoreRequest = struct {
     // The pointee is immutable outside this owner. Moving the handle is fine;
     // copying it does not transfer ownership and must not produce two deinits.
     handle: *const State,
-    const State = struct { allocator: std.mem.Allocator, plan: Plan };
+    const Canonical = struct {
+        bytes: []u8,
+        keys: [][]const u8,
+        identity: u64,
+        retain_decoded: bool = false,
+    };
+    const State = struct { allocator: std.mem.Allocator, payload: union(enum) { full: Plan, canonical: Canonical } };
+
+    /// A compact owner has no mutable input matching or output fanout. Only
+    /// this constructor can create its sorted, unique canonical identity.
+    fn initCanonical(a: std.mem.Allocator, prefix: []const u8, nodes: []const []const u8) !PreparedScoreRequest {
+        const encoding = @import("internal_keys.zig");
+        if (nodes.len == 0 or nodes.len > Plan.max_keys) return error.GraphMetricQueryBudgetExceeded;
+        var size = try std.math.mul(usize, nodes.len, @sizeOf([]const u8));
+        const descriptors = size;
+        for (nodes, 0..) |node, i| {
+            if (i != 0 and std.mem.order(u8, nodes[i - 1], node) != .lt) return error.InvalidBatch;
+            size = std.math.add(usize, size, prefix.len) catch return error.GraphMetricQueryBudgetExceeded;
+            size = std.math.add(usize, size, encoding.encodedComponentLen(node)) catch return error.GraphMetricQueryBudgetExceeded;
+            if (size > Plan.max_bytes) return error.GraphMetricQueryBudgetExceeded;
+        }
+        const state = try a.create(State);
+        errdefer a.destroy(state);
+        const bytes = try a.alloc(u8, size - descriptors);
+        errdefer a.free(bytes);
+        const keys = try a.alloc([]const u8, nodes.len);
+        var offset: usize = 0;
+        for (nodes, keys) |node, *key| {
+            const len = prefix.len + encoding.encodedComponentLen(node);
+            key.* = bytes[offset..][0..len];
+            @memcpy(bytes[offset..][0..prefix.len], prefix);
+            _ = encoding.encodeComponent(bytes[offset + prefix.len ..][0 .. len - prefix.len], node);
+            offset += len;
+        }
+        state.* = .{ .allocator = a, .payload = .{ .canonical = .{ .bytes = bytes, .keys = keys, .identity = @import("prepared_score_plan.zig").newCanonicalIdentity() } } };
+        return .{ .handle = state };
+    }
+
+    pub fn readKeys(self: *const PreparedScoreRequest) []const []const u8 {
+        return switch (self.handle.payload) {
+            .full => |*p| p.read_keys,
+            .canonical => |*c| c.keys,
+        };
+    }
+    pub fn canonicalIdentity(self: *const PreparedScoreRequest) u64 {
+        return switch (self.handle.payload) {
+            .full => |*p| if (p.valid) p.identity else 0,
+            .canonical => |*c| c.identity,
+        };
+    }
+    pub fn retainDecoded(self: *const PreparedScoreRequest) bool {
+        return switch (self.handle.payload) {
+            .full => |*p| p.retain_decoded,
+            .canonical => |*c| c.retain_decoded,
+        };
+    }
+    pub fn ownedKeyBytes(self: *const PreparedScoreRequest) usize {
+        return switch (self.handle.payload) {
+            .full => |*p| p.storage.?.len,
+            .canonical => |*c| c.bytes.len + c.keys.len * @sizeOf([]const u8),
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, prefixes: []const ?[]const u8, nodes: []const []const u8) !PreparedScoreRequest {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.* = .{ .allocator = allocator, .plan = .{} };
-        errdefer state.plan.deinit();
-        if (!try state.plan.prepare(allocator, prefixes, nodes)) return error.GraphMetricQueryBudgetExceeded;
+        state.* = .{ .allocator = allocator, .payload = .{ .full = .{} } };
+        errdefer state.payload.full.deinit();
+        if (!try state.payload.full.prepare(allocator, prefixes, nodes)) return error.GraphMetricQueryBudgetExceeded;
         return .{ .handle = state };
     }
     /// Clone while the source scope is exclusively leased. Independent lifetime
@@ -37,25 +98,30 @@ pub const PreparedScoreRequest = struct {
     pub fn fromPlan(allocator: std.mem.Allocator, source: *const Plan) !PreparedScoreRequest {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.* = .{ .allocator = allocator, .plan = try source.clone(allocator) };
+        state.* = .{ .allocator = allocator, .payload = .{ .full = try source.clone(allocator) } };
         return .{ .handle = state };
     }
-    fn disableDecodedRetention(self: *PreparedScoreRequest) void {
-        @constCast(self.handle).plan.retain_decoded = false;
-    }
+    /// Full plans are supplied by init/fromPlan and combinedRequest(). Compact
+    /// chunks expose readKeys()/canonicalIdentity() instead of mutable mappings.
     pub fn plan(self: *const PreparedScoreRequest) *const Plan {
-        return &self.handle.plan;
+        return &self.handle.payload.full;
     }
     pub fn deinit(self: *PreparedScoreRequest) void {
         const state = @constCast(self.handle);
         const allocator = state.allocator;
-        state.plan.deinit();
+        switch (state.payload) {
+            .full => |*p| p.deinit(),
+            .canonical => |*c| {
+                allocator.free(c.keys);
+                allocator.free(c.bytes);
+            },
+        }
         allocator.destroy(state);
         self.* = undefined;
     }
 };
 
-/// Query-owned compiled chunks. Each plan obeys the existing 4096-key/256 KiB
+/// Query-owned compiled chunks. Each canonical batch obeys the existing 4096-key/256 KiB
 /// limits; native workspace retention is unchanged. Total ownership is charged
 /// to the caller allocator. Global duplicate fanout is compiled once, including
 /// duplicates crossing chunk boundaries; no input bytes are compared on reads.
@@ -69,6 +135,8 @@ pub const PreparedScoreChunks = struct {
         row_heads: []const usize,
         duplicate_next: []const usize,
         chunks: []const Chunk,
+        combined: ?PreparedScoreRequest = null,
+        unique_rows: usize = 0,
     };
     const absent = std.math.maxInt(usize);
     pub const Chunk = struct {
@@ -80,6 +148,20 @@ pub const PreparedScoreChunks = struct {
     pub fn init(a: std.mem.Allocator, prefixes: []const ?[]const u8, nodes: []const []const u8) !@This() {
         const state = try a.create(State);
         errdefer a.destroy(state);
+        // Preserve the decoded cache and full fanout when the entire request
+        // fits the bounded plan, regardless of the number of metric columns.
+        const has_dependencies = blk: {
+            for (prefixes) |prefix| if (prefix != null) break :blk true;
+            break :blk false;
+        };
+        const combined = if (nodes.len != 0 and has_dependencies) PreparedScoreRequest.init(a, prefixes, nodes) catch |err| switch (err) {
+            error.GraphMetricQueryBudgetExceeded => null,
+            else => return err,
+        } else null;
+        if (combined) |request| {
+            state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = true, .column_owners = &.{}, .row_heads = &.{}, .duplicate_next = &.{}, .chunks = &.{}, .combined = request };
+            return .{ .handle = state };
+        }
         const owners = try a.alloc(usize, prefixes.len);
         errdefer a.free(owners);
         @memset(owners, absent);
@@ -134,7 +216,7 @@ pub const PreparedScoreChunks = struct {
             while (first < unique.items.len) {
                 var count = @min(Plan.max_keys, unique.items.len - first);
                 const request = while (true) {
-                    const candidate = PreparedScoreRequest.init(a, &.{prefixes[column]}, unique.items[first..][0..count]) catch |err| switch (err) {
+                    const candidate = PreparedScoreRequest.initCanonical(a, prefixes[column].?, unique.items[first..][0..count]) catch |err| switch (err) {
                         error.GraphMetricQueryBudgetExceeded => {
                             if (count == 1) return err;
                             count = @max(1, count / 2);
@@ -152,17 +234,26 @@ pub const PreparedScoreChunks = struct {
                 first += count;
             }
         }
-        if (chunks.items.len > 1) for (chunks.items) |*chunk| chunk.request.disableDecodedRetention();
+        // A duplicate-heavy logical request may exceed the mutable plan's
+        // target budget yet deduplicate to one canonical batch. It can reuse
+        // decoded scores just like a combined full plan.
+        if (chunks.items.len == 1) @constCast(chunks.items[0].request.handle).payload.canonical.retain_decoded = true;
         var row_order_identity = heads.items.len == nodes.len;
         for (heads.items, 0..) |head, i| row_order_identity = row_order_identity and head == i;
+        const unique_rows = heads.items.len;
         const owned_heads = try heads.toOwnedSlice(a);
         errdefer a.free(owned_heads);
-        state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .row_heads = owned_heads, .duplicate_next = next, .chunks = try chunks.toOwnedSlice(a) };
+        state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .row_heads = if (row_order_identity) &.{} else owned_heads, .duplicate_next = if (row_order_identity) &.{} else next, .chunks = try chunks.toOwnedSlice(a), .unique_rows = unique_rows };
+        if (row_order_identity) {
+            a.free(next);
+            a.free(owned_heads);
+        }
         return .{ .handle = state };
     }
 
     pub fn deinit(self: *@This()) void {
         const state = self.handle;
+        if (@constCast(state).combined) |*request| request.deinit();
         for (@constCast(state.chunks)) |*chunk| chunk.request.deinit();
         const a = state.allocator;
         a.free(state.chunks);
@@ -173,14 +264,42 @@ pub const PreparedScoreChunks = struct {
         self.* = undefined;
     }
 
+    pub fn combinedRequest(self: *const @This()) ?*const PreparedScoreRequest {
+        if (self.handle.combined) |*request| return request;
+        return null;
+    }
+
     pub fn chunkPlans(self: *const @This()) []const Chunk {
         return self.handle.chunks;
     }
     pub fn uniqueRowCount(self: *const @This()) usize {
-        return self.handle.row_heads.len;
+        if (self.combinedRequest()) |request| {
+            const plan = request.plan();
+            var count: usize = 0;
+            // Hash heads are unique when lookup construction completed. The
+            // rare adversarial-collision plan falls back to its sorted targets.
+            if (plan.row_lookup_valid) {
+                for (plan.row_heads) |row| {
+                    if (row != 0) count += 1;
+                }
+            } else {
+                const column = for (plan.prefixes, 0..) |prefix, i| {
+                    if (prefix != null) break i;
+                } else return 0;
+                var previous: ?[]const u8 = null;
+                for (plan.targets) |target| if (target.column == column) {
+                    const node = plan.nodes[target.row];
+                    if (previous == null or !std.mem.eql(u8, previous.?, node)) count += 1;
+                    previous = node;
+                };
+            }
+            return count;
+        }
+        return self.handle.unique_rows;
     }
     pub fn validateColumns(self: *const @This(), columns: []const []?f64) !void {
-        if (columns.len != self.handle.column_owners.len) return error.InvalidBatch;
+        const count = if (self.combinedRequest()) |request| request.plan().prefixes.len else self.handle.column_owners.len;
+        if (columns.len != count) return error.InvalidBatch;
         for (columns) |column| if (column.len != self.handle.rows) return error.InvalidBatch;
     }
 
@@ -193,6 +312,10 @@ pub const PreparedScoreChunks = struct {
         }
         fn write(ctx: *anyopaque, i: usize, score: ?f64) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.owner.handle.row_order_identity) {
+                self.columns[self.chunk.column][self.chunk.first + i] = score;
+                return;
+            }
             var row = self.owner.handle.row_heads[self.chunk.first + i];
             while (row != absent) {
                 self.columns[self.chunk.column][row] = score;
@@ -278,7 +401,7 @@ fn chunkAllocationFailureCase(a: std.mem.Allocator) !void {
     var stable = StableAllocator{ .backing = a };
     var request = try PreparedScoreChunks.init(stable.allocator(), &.{ "p/", null, "p/", "q/" }, &.{ "b", "a", "b", "" });
     defer request.deinit();
-    try std.testing.expectEqual(@as(usize, 2), request.chunkPlans().len);
+    try std.testing.expect(request.combinedRequest() != null);
     try std.testing.expectEqual(@as(usize, 3), request.uniqueRowCount());
 }
 
@@ -289,8 +412,8 @@ test "prepared score chunks allocation failures release partial ownership" {
 
 test "prepared score chunks enforce byte bounds and skip empty dependencies" {
     const a = std.testing.allocator;
-    var storage: [130][1024]u8 = undefined;
-    var nodes: [130][]const u8 = undefined;
+    var storage: [260][1024]u8 = undefined;
+    var nodes: [260][]const u8 = undefined;
     for (&storage, &nodes, 0..) |*key, *node, i| {
         @memset(key, 'x');
         _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
@@ -300,9 +423,9 @@ test "prepared score chunks enforce byte bounds and skip empty dependencies" {
     defer compiled.deinit();
     try std.testing.expect(compiled.chunkPlans().len > 1);
     for (compiled.chunkPlans()) |chunk| {
-        try std.testing.expect(chunk.request.plan().storage.?.len <= Plan.max_bytes);
-        try std.testing.expect(chunk.request.plan().read_keys.len <= Plan.max_keys);
-        try std.testing.expect(!chunk.request.plan().retain_decoded);
+        try std.testing.expect(chunk.request.ownedKeyBytes() <= Plan.max_bytes);
+        try std.testing.expect(chunk.request.readKeys().len <= Plan.max_keys);
+        try std.testing.expect(!chunk.request.retainDecoded());
     }
     var empty = try PreparedScoreChunks.init(a, &.{ null, null }, &nodes);
     defer empty.deinit();
@@ -311,4 +434,46 @@ test "prepared score chunks enforce byte bounds and skip empty dependencies" {
     var zero_rows = try PreparedScoreChunks.init(a, &.{"p/"}, &.{});
     defer zero_rows.deinit();
     try std.testing.expectEqual(@as(usize, 0), zero_rows.chunkPlans().len);
+}
+
+fn canonicalAllocationFailureCase(a: std.mem.Allocator) !void {
+    var node: [3]u8 = .{ 'a', 0, 'b' };
+    var prefix: [2]u8 = .{ 'p', '/' };
+    var request = try PreparedScoreRequest.initCanonical(a, &prefix, &.{ "", &node, "z" });
+    defer request.deinit();
+    node[0] = 'x';
+    prefix[0] = 'q';
+    try std.testing.expectEqualStrings("p/a\x00\xffb\x00\x00", request.readKeys()[1]);
+    try std.testing.expect(!request.retainDecoded());
+    try std.testing.expect(request.canonicalIdentity() != 0);
+    var full = try PreparedScoreRequest.init(a, &.{"p/"}, &.{"a"});
+    defer full.deinit();
+    try std.testing.expect(full.canonicalIdentity() != request.canonicalIdentity());
+}
+
+test "prepared score canonical ownership validates keys and allocation cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, canonicalAllocationFailureCase, .{});
+    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", &.{ "b", "a" }));
+    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", &.{ "a", "a" }));
+}
+
+fn largeChunkAllocationFailureCase(a: std.mem.Allocator) !void {
+    var stable = StableAllocator{ .backing = a };
+    var nodes: [4097][]const u8 = undefined;
+    var storage: [4097][8]u8 = undefined;
+    for (&storage, &nodes, 0..) |*bytes, *node, i| {
+        _ = try std.fmt.bufPrint(bytes, "{d:0>8}", .{i});
+        node.* = bytes;
+    }
+    var compiled = try PreparedScoreChunks.init(stable.allocator(), &.{"p/"}, &nodes);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.combinedRequest() == null);
+    try std.testing.expectEqual(@as(usize, 4097), compiled.uniqueRowCount());
+    try std.testing.expectEqual(@as(usize, 0), compiled.handle.row_heads.len);
+    try std.testing.expectEqual(@as(usize, 0), compiled.handle.duplicate_next.len);
+    for (compiled.chunkPlans()) |chunk| try std.testing.expect(chunk.request.ownedKeyBytes() <= Plan.max_bytes);
+}
+
+test "prepared score compact chunks release partial ownership under allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, largeChunkAllocationFailureCase, .{});
 }
