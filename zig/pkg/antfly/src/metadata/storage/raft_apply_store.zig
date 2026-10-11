@@ -238,6 +238,53 @@ test "system catalog relation namespace transaction bulk resolution requires a l
         stale.revision += 1;
         try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = stale }));
     }
+    {
+        const Apply = struct {
+            fn command(s: *RaftApplyStore, allocator: std.mem.Allocator, g: u64, index: u64, value: restore_staging.Command) !void {
+                const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+                defer allocator.free(json);
+                const wire = try encodeTransitionCommand(allocator, .{ .apply_restore_staging = json });
+                defer allocator.free(wire);
+                const batch = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+                defer allocator.free(batch);
+                try s.snapshotBuilder().applyBatch(.{ .group_id = g, .commit_index = index, .entries_bytes = batch });
+            }
+        };
+        const plan: restore_staging.Plan = .{
+            .id = @splat(8),
+            .cohort_digest = @splat(9),
+            .targets = &.{.{
+                .source_table_id = 1,
+                .table = .{ .table_id = 11, .name = "hidden_restore", .schema_json = "{}" },
+                .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+            }},
+        };
+        try plan.validate(a);
+        const catalog_before = (try store.captureCatalogCursor(group)).revision;
+        try Apply.command(&store, a, group, 3, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        var staged = (try store.loadRestoreStaging(a, group, plan.id)) orelse return error.MissingRestoreReservation;
+        defer staged.deinit();
+        try std.testing.expectEqual(catalog_before, (try store.captureCatalogCursor(group)).revision);
+        // Even a lookup for unrelated names must reject the old source cut.
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = allocation_epoch }));
+        const reserved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true });
+        defer reserved.deinit(a);
+        try std.testing.expectEqualSlices(u8, &allocation_epoch.incarnation, &reserved.relation_epoch.?.incarnation);
+        try std.testing.expect(reserved.relation_epoch.?.revision > allocation_epoch.revision);
+        for ([_][]const u8{"hidden_restore"}) |name| {
+            try std.testing.expectError(error.CatalogPublicationProofPending, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = name }}, .name_allocation = true }));
+        }
+        try Apply.command(&store, a, group, 4, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 1 });
+        try Apply.command(&store, a, group, 5, .{ .id = plan.id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = try plan.digest(a), .completion_digest = @splat(3) } });
+        try Apply.command(&store, a, group, 6, .{ .id = plan.id, .action = .finish_cancel, .expected_revision = 2 });
+        try std.testing.expectEqual(catalog_before, (try store.captureCatalogCursor(group)).revision);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = reserved.relation_epoch }));
+        const released = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "hidden_restore" }}, .name_allocation = true });
+        defer released.deinit(a);
+        try std.testing.expect(released.relation_epoch.?.revision > reserved.relation_epoch.?.revision);
+        try std.testing.expectEqualSlices(u8, &allocation_epoch.incarnation, &released.relation_epoch.?.incarnation);
+        try std.testing.expect(released.relations[0] == null);
+    }
     _ = try adoptLiveRelationWriterForTest(&store, a, group);
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = allocation_epoch }));
     var epoch: relation_reconciliation.Epoch = undefined;
@@ -14171,12 +14218,10 @@ pub const RaftApplyStore = struct {
         var epoch_digest: [32]u8 = undefined;
         epoch_hash.final(&epoch_digest);
         incarnation = epoch_digest[0..16].*;
-        const raw_revision = txn.get(try catalogRevisionKeyForGroup(&buf, group_id)) catch |err| switch (err) {
-            error.NotFound => return error.CatalogPublicationProofPending,
-            else => return err,
-        };
-        if (raw_revision.len != 8) return error.InvalidCatalogRecord;
-        const epoch: relation_reconciliation.Epoch = .{ .incarnation = incarnation, .revision = std.mem.readInt(u64, raw_revision[0..8], .little) };
+        // The published catalog cursor excludes hidden restore reservations.
+        // Every hosted source mutation commits with the group's applied index;
+        // read that complete watermark from this same pinned source cut.
+        const epoch: relation_reconciliation.Epoch = .{ .incarnation = incarnation, .revision = try durableAppliedIndexTxn(txn, group_id) };
         if (epoch.revision == 0) return error.CatalogPublicationProofPending;
         if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
         const relations = try alloc.alloc(?system_catalog.ResolvedRelation, request.relations.len);
