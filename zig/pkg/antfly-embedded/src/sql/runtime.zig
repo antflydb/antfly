@@ -5277,6 +5277,31 @@ test "external lake SQL exact join partial aggregation preserves fanout NULLs fi
     try std.testing.expectError(error.SqlProgramLimitExceeded, execute(a, backend.iface(), &baseline, &.{}, .{ .scan_rows = 64 }));
 }
 
+test "external lake SQL finalized join state preserves empty globals HAVING and delivery" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*), SUM(l.v) FROM (VALUES (1,2)) l(k,v) JOIN (VALUES (2)) r(k) ON l.k=r.k",
+        "SELECT l.v, COUNT(*), SUM(r.k) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k GROUP BY l.v HAVING COUNT(*)>1 ORDER BY SUM(r.k) DESC LIMIT 1",
+        "SELECT l.v, COUNT(*), SUM(r.k) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k WHERE l.v=2 GROUP BY l.v",
+        "SELECT l.v, COUNT(*), SUM(r.k) FILTER (WHERE l.v=2) FROM (VALUES (1,2),(2,2),(3,4)) l(k,v) JOIN (VALUES (1),(1),(2),(3)) r(k) ON l.k=r.k GROUP BY l.v ORDER BY l.v",
+    }) |sql| {
+        const end = (std.mem.indexOf(u8, sql, "l.k=r.k") orelse unreachable) + "l.k=r.k".len;
+        const fallback = try std.mem.concat(a, u8, &.{ sql[0..end], " AND (l.k IS NOT DISTINCT FROM l.k)", sql[end..] });
+        defer a.free(fallback);
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var reference = try compiler.compile(a, fallback, .{});
+        defer reference.deinit();
+        var actual = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer actual.deinit();
+        var expected = try execute(a, backend.iface(), &reference, &.{}, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualDeep(expected.output.rows, actual.output.rows);
+        try std.testing.expectEqualDeep(expected.output.sql_nulls, actual.output.sql_nulls);
+    }
+}
+
 test "external lake SQL plain count consumes resident and spilled typed join partials" {
     const a = std.testing.allocator;
     for ([_][]const u8{

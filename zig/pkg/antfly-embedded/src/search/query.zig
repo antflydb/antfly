@@ -1816,7 +1816,9 @@ pub fn executeFilter(
 
     var doc_offset: u32 = 0;
     for (snap.segments, 0..) |_, segment_idx| {
-        const seg = try snap.readSegment(segment_idx);
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 
@@ -1852,7 +1854,9 @@ pub fn executeFilterBitmap(
     var doc_offset: u32 = 0;
     var has_result = false;
     for (snap.segments, 0..) |_, segment_idx| {
-        const seg = try snap.readSegment(segment_idx);
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1889,7 +1893,9 @@ pub fn countFilterIntersection(
     var total: usize = 0;
     var doc_offset: u32 = 0;
     for (snap.segments, 0..) |_, segment_idx| {
-        const seg = try snap.readSegment(segment_idx);
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        const seg = segment_lease.entry;
         var local = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer local.deinit();
         {
@@ -1934,7 +1940,9 @@ pub fn countFilter(
                 continue;
             }
         }
-        seg = try snap.readSegment(segment_idx);
+        var segment_lease = try snap.leaseSegment(segment_idx);
+        defer segment_lease.deinit();
+        seg = segment_lease.entry;
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 

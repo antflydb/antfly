@@ -2783,7 +2783,59 @@ pub const TypedReadScope = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     signed_sort_fields: std.StringHashMapUnmanaged(bool) = .empty,
     cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
+    owners: [4]?Owner = @splat(null),
+    age: u64 = 0,
+    const Owner = struct { segment: *const SegmentReader, ptr: *anyopaque, close: *const fn (Allocator, *anyopaque) void, age: u64 };
 
+    /// Pin query-bound readers only while their typed fields are resident. A
+    /// bounded LRU evicts fields before dropping the source lease. Plain local
+    /// readers continue to borrow their snapshot's stable lifetime.
+    pub fn retainSegment(self: *TypedReadScope, lease: anytype) !void {
+        if (lease.snapshot == null) return;
+        self.age +%= 1;
+        const segment = &lease.entry.reader;
+        var victim: usize = 0;
+        for (&self.owners, 0..) |*slot, i| {
+            if (slot.*) |*owner| {
+                if (owner.segment == segment) {
+                    owner.age = self.age;
+                    return;
+                }
+                if (self.owners[victim] != null and owner.age < self.owners[victim].?.age) victim = i;
+            } else victim = i;
+        }
+        const Lease = @TypeOf(lease);
+        const owned = try self.allocator.create(Lease);
+        errdefer self.allocator.destroy(owned);
+        owned.* = try lease.clone();
+        if (self.owners[victim]) |prior| {
+            self.forget(prior.segment);
+            prior.close(self.allocator, prior.ptr);
+        }
+        self.owners[victim] = .{ .segment = segment, .ptr = owned, .age = self.age, .close = struct {
+            fn close(a: Allocator, raw: *anyopaque) void {
+                const value: *Lease = @ptrCast(@alignCast(raw));
+                value.deinit();
+                a.destroy(value);
+            }
+        }.close };
+    }
+    fn forget(self: *TypedReadScope, segment: *const SegmentReader) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.segment != segment) {
+                i += 1;
+                continue;
+            }
+            if (entry.reader) |reader| {
+                if (self.cache) |cache| cache.forget(reader);
+                reader.deinit();
+                self.allocator.destroy(reader);
+            }
+            _ = self.entries.swapRemove(i);
+        }
+    }
     pub fn init(allocator: Allocator) TypedReadScope {
         return .{ .allocator = allocator };
     }
@@ -2797,6 +2849,7 @@ pub const TypedReadScope = struct {
             self.allocator.destroy(reader);
         };
         self.entries.deinit(self.allocator);
+        for (self.owners) |owner| if (owner) |retained| retained.close(self.allocator, retained.ptr);
         self.signed_sort_fields.deinit(self.allocator);
         self.* = undefined;
     }

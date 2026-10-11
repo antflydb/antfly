@@ -2204,3 +2204,70 @@ file identities across resume. Formatting, Python syntax, license headers, the
 Apache product boundary and diff checks pass. The legacy lexical boundary
 analyzer stops at obsolete storage paths that moved to the embedded package;
 its unchanged full audit cannot complete.
+
+
+### Canonical v3 admission, reader leases and finalized join ownership
+
+The public text query path now accepts v3 necessary-term segment proofs. Both
+full admission and selective admission consume the canonical segment directory;
+new publications omit the legacy full inventory, compact routing tree and
+segment-to-file tree. File catalogs and combined maintenance manifests remain
+for incremental updates and GC. Compatibility readers and GC marking still
+recognize older publications. Segment prefix seeks have an exclusive bound,
+which prevents loading a neighboring leaf just to discover the prefix ended.
+
+Refresh validation streams canonical segment records one at a time. It never
+reopens unchanged maintenance manifests. Up to eight retained-object metadata
+checks overlap through shared I/O admission, with a 64 KiB allocator per check
+and serialized access to the build allocator. Queue entries own their references
+until joined; all outstanding tasks are canceled and joined on error. The audit
+still authenticates retained metadata and checks every retained serving leaf.
+Delta-only validation requires a backend retention certificate that survives
+restores and invalidates on artifact loss or collection. The present backend
+contract cannot supply that proof, so an unchanged root digest alone does not
+suppress the audit.
+
+Query facades expose active segment leases alongside the existing stable-pointer
+borrow. Streaming search and prepared Boolean readers use leases. Four idle
+bindings may remain cached; active users and compatibility borrows cannot be
+evicted. Retired bindings join speculative workers outside the inventory lock,
+and quiescence waits for those detached retirements. Typed value scopes retain
+at most four leased segments, evict their field readers first, and remove point
+cache identities before pointer reuse. Prefetch workers release navigation pins
+on completion; a small join-owned descriptor also handles cancellation before
+worker entry.
+
+Aggregate providers may transfer ownership of a reducer already grouped by the
+final recipe keys. Join reduction uses this contract when no upper key predicate
+or aggregate FILTER adjustment remains. HAVING, ordering and result projection
+consume the transferred typed state directly, including its spill fallback.
+Empty global aggregates retain their single SQL result row. Predicates and
+FILTER adjustments retain the existing exact merge path.
+
+Regressions cover eviction with active and stable borrows, typed scope bounds,
+point-cache pointer reuse, worker pin release before joining, empty joins,
+HAVING/order/limit and predicate/FILTER fallback. The fragmented real-file HTTP
+fixture checks both Parquet and Iceberg after cold restart with unrelated segment
+routing leaves temporarily unavailable. This tests actual selective admission,
+in addition to result and BM25 score equivalence.
+
+Deferred typed delivery now shares ownership of the exact scoring pin instead
+of reopening a corpus after ranking. Native document numbers therefore keep the
+same meaning through source projection even if optional admission would choose
+a different fallback on a second acquisition. Final shared release quiesces the
+query facade and releases provider metadata; intermediate releases preserve
+current authorization checks. Scalar identity/ordinal reads, score planning,
+filter membership, sort coverage checks and sorted-segment iteration also use
+scoped segment leases rather than stable compatibility borrows.
+
+Qualification after merging `origin/main` through `d3bbb9a0c6` (Zig 0.17.0,
+Debug): all 345 lake checks pass (141 shared, 204 API), with no allocator leaks;
+all 43 focused reader/sort checks and 66 scorer checks pass. The production CLI
+builds and all eight selected real Parquet/Iceberg HTTP E2Es pass, including both
+cold-cache routing-page exclusion cases, fragmented native segments, real
+Iceberg snapshot/schema/delete transitions, ranking/highlights/cursors,
+incremental artifact reuse, and wide partial join delivery. Formatting, Python
+syntax, changed-file license headers, the Apache product boundary (2026 sources)
+and diff checks pass. Archive-scale throughput, RSS and provider-request
+benchmarks remain unqualified; retained serving-closure auditing remains
+corpus-wide as described above.

@@ -451,6 +451,18 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 self.probe = try self.build.?.probe(self.current.?.keys[0..self.plan.join_count]);
             }
         }
+        fn takeFinalGroups(raw: *anyopaque) anyerror!?*operators.Grouped {
+            const self = from(raw);
+            if (self.ready or self.done) return error.InvalidSqlBackendResponse;
+            if (!self.plan.canReducePairs()) return null;
+            try self.prepare();
+            try self.reducePairs();
+            const result = self.reduced.?;
+            if (self.plan.recipe.keys.len == 0) try result.ensureGlobalGroup();
+            self.reduced = null;
+            self.done = true;
+            return result;
+        }
         fn next(raw: *anyopaque, out: A, maximum: u32) anyerror!?[]const operators.GroupResult {
             const self = from(raw);
             if (maximum == 0) return error.InvalidSqlBackendResponse;
@@ -510,5 +522,5 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
     };
     const state = try a.create(State);
     state.* = .{ .a = a, .engine = engine, .iterator = iterator, .plan = plan, .arena = .init(a), .probe_arena = .init(a) };
-    return .{ .ptr = state, .next = State.next, .close = State.close };
+    return .{ .ptr = state, .next = State.next, .close = State.close, .take_final_groups = State.takeFinalGroups };
 }

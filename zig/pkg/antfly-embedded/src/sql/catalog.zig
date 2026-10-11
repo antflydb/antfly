@@ -526,6 +526,11 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
+    /// Optional ownership transfer before the first pull. The provider proves
+    /// one state per final recipe key, with the exact recipe slots and limits.
+    /// A successful transfer leaves close responsible only for cursor resources.
+    /// Upper key predicates and FILTER adjustments must be absent for adoption.
+    take_final_groups: ?*const fn (*anyopaque) anyerror!?*@import("operators.zig").Grouped = null,
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
     close: *const fn (*anyopaque) void,

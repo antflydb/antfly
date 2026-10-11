@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -720,8 +721,8 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / source_format
-    parts, rows = (17, 256) if layout == "files" else (1, 196609)
-    expected = {3 * 256, 11 * 256, 16 * 256} if layout == "files" else {0, 65536, 196608}
+    parts, rows = (65, 64) if layout == "files" else (1, 196609)
+    expected = {3 * 64, 31 * 64, 64 * 64} if layout == "files" else {0, 65536, 196608}
     batches = [
         pa.table(
             {
@@ -901,6 +902,72 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     hit["_score"] == 0 if boost == 0 else hit["_score"] < 0
                     for hit in signed
                 )
+        if layout == "files":
+            pages = {}
+            roots = []
+            for path in (server.root / "artifacts").rglob("*"):
+                if not path.is_file():
+                    continue
+                payload = path.read_bytes()
+                begin = payload.find(b"AFGPT003")
+                if begin >= 0:
+                    page = payload[begin:]
+                    pages[hashlib.sha256(page).digest()] = (path, page)
+                begin = payload.find(b'{"version":')
+                if begin >= 0:
+                    try:
+                        document = json.loads(payload[begin:])
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if document.get("inventory_version") == 3:
+                        roots.append(document)
+            assert roots
+            root_document = roots[-1]
+            assert all(root_document.get(key) is None for key in (
+                "serving_inventory", "serving_routes", "segment_files"))
+
+            def leaves(ref):
+                path, page = pages[bytes(ref["digest"])]
+                count = struct.unpack_from("<I", page, 12)[0]
+                offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                records = []
+                for _ in range(count):
+                    key_size, value_size = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    key = page[offset:offset + key_size]
+                    offset += key_size
+                    value = page[offset:offset + value_size]
+                    offset += value_size
+                    records.append((key, value))
+                if ref["height"]:
+                    for _, value in records:
+                        yield from leaves({"digest": list(value[:32]), "height": value[36]})
+                else:
+                    yield path, records
+
+            # A rare query must never read an unrelated routing leaf. Restart
+            # clears in-memory admission and decoded page caches first.
+            required = {key[-32:] for _, records in leaves(root_document["term_directory"]["leaves"])
+                        for key, _ in records if b"quasar" in key}
+            assert len(required) == 3
+            unrelated = [path for path, records in leaves(root_document["directories"]["segments"])
+                         if all(key[:32] not in required for key, _ in records)]
+            assert unrelated, "Fixture must have a leaf outside the necessary segment set"
+            server.pause()
+            for cache_root in server.root.rglob("lake-ranges"):
+                if cache_root.is_dir():
+                    shutil.rmtree(cache_root)
+            originals = [(path, path.read_bytes()) for path in unrelated]
+            try:
+                for path, _ in originals:
+                    path.unlink()
+                server.resume()
+                assert query(nested) == baseline
+            finally:
+                server.pause()
+                for path, payload in originals:
+                    path.write_bytes(payload)
+                server.resume()
         failed = False
     finally:
         server.stop(test_failed=failed)

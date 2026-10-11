@@ -259,12 +259,22 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
     }
 }
 
-fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, table: catalog.Table) !bool {
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
     const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
     const recipe = reuse.recipe;
     const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
     defer cursor.close(cursor.ptr);
+    if (bound.input.predicate == null and for (bound.filters) |filter| {
+        if (filter != null) break false;
+    } else true) if (cursor.take_final_groups) |take| {
+        if (try take(cursor.ptr)) |final| {
+            grouped_owner.*.deinit();
+            grouped_owner.* = final;
+            return true;
+        }
+    };
+    const grouped = grouped_owner.*;
     var pages: usize = 0;
     var groups: usize = 0;
     while (true) {
@@ -345,7 +355,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
-    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
+    var grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
     defer grouped.deinit();
     // Backends without an Io still support bounded in-memory execution. A
     // zero-byte manager rejects spill admission before touching the filesystem.
@@ -370,7 +380,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, grouped, table) else false;
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table) else false;
+        collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
         } else true;

@@ -294,6 +294,7 @@ const Execution = struct {
     use_stored_highlights: bool = false,
     text_stores_source: std.StringHashMapUnmanaged(bool) = .empty,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
+    delivery_pin: ?search.PinnedTextSource = null,
     highlight_queries: ?[]const search.HighlightQuery = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
@@ -493,6 +494,7 @@ const Execution = struct {
         if (self.vector_include_provider) |*provider| provider.deinit();
         if (self.vector_exclude_provider) |*provider| provider.deinit();
         for (self.highlight_pins.items) |*pin| pin.deinit();
+        if (self.delivery_pin) |*pin| pin.deinit();
         for (self.runtimes.items) |runtime| runtime.release();
     }
     fn from(raw: ?*anyopaque) *Execution {
@@ -611,7 +613,7 @@ const Execution = struct {
         return pin;
     }
     fn selectFiles(self: *Execution, text: types.TextQuery, root: corpus.Root, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, cancellation: @import("antfly_cancellation").CancellationToken) !?[]const [32]u8 {
-        if (root.collection == null or root.segment_files == null or root.serving_routes == null or root.inventory_version != 2 or root.term_directory.version != 2) return null;
+        if (root.collection == null or root.inventory_version < 2 or (root.inventory_version == 2 and (root.segment_files == null or root.serving_routes == null)) or root.term_directory.version != 2) return null;
         switch (text) {
             .match_none => return &.{},
             .term, .match, .phrase, .bool_query => {},
@@ -741,16 +743,17 @@ const Execution = struct {
         for (hits, keys) |hit, *key| key.* = hit.id;
         // Document ordinals have meaning in one text snapshot only. Composed
         // and vector results keep their existing physical hydration path.
-        var pin: ?search.PinnedTextSource = null;
-        defer if (pin) |*value| value.deinit();
+        var pin: ?*const search.PinnedTextSource = null;
         const one_text_source = (req.full_text != null and req.full_text_queries.len == 0) or (req.full_text == null and req.full_text_queries.len == 1);
         if (one_text_source and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.dense == null and req.sparse == null) {
             const bound = for (hits) |hit| {
                 if (hit.native_text_doc_id == null) break false;
             } else true;
-            if (bound) pin = try acquire(self, if (req.full_text_queries.len == 1) req.full_text_queries[0].index_name else req.primary_text_index_name orelse req.index_name);
+            if (bound) if (self.delivery_pin) |*ranked| {
+                pin = ranked;
+            };
         }
-        try self.hydrateTypedFromSource(a, hits, keys, if (pin) |*value| value else null);
+        try self.hydrateTypedFromSource(a, hits, keys, pin);
     }
     fn hydrateTypedFromSource(self: *Execution, a: A, hits: []types.SearchHit, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
         if (pin == null or pin.?.stored_projection_fields.len == 0) {
@@ -1047,6 +1050,18 @@ const Execution = struct {
         keep_arena = true;
         return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .complete_order = predicate.complete_order, .close = Ordered.close };
     }
+    fn acquireForRanking(raw: ?*anyopaque, name: ?[]const u8) !?search.PinnedTextSource {
+        const self = from(raw);
+        var pin = (try acquire(raw, name)) orelse return null;
+        errdefer pin.deinit();
+        if (self.typed_delivery) {
+            pin = try pin.share(self.result_allocator);
+            const retained = try pin.clone();
+            if (self.delivery_pin) |*previous| previous.deinit();
+            self.delivery_pin = retained;
+        }
+        return pin;
+    }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
         const previous_text = self.active_text;
@@ -1065,7 +1080,7 @@ const Execution = struct {
             self.predicate_exclusion_json = previous_exclusion;
             self.predicate_allow_partial = previous_allow_partial;
         }
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquireForRanking, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });

@@ -517,7 +517,7 @@ const Owner = struct {
         capability: *const Read,
         io: ?std.Io,
         pending: [4]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null),
-        directory_pins: [4]?local.serverless_query_lake_decoded_cache.Lease = @splat(null),
+        directory_pins: [4]?*WorkerPin = @splat(null),
         offsets: [4]?u64 = @splat(null),
         lengths: [4]u64 = @splat(0),
         recent_pages: [4]?u64 = @splat(null),
@@ -536,7 +536,22 @@ const Owner = struct {
             if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
             return false;
         }
-        fn warm(self: *@This(), pieces: []const Piece) anyerror!void {
+        const WorkerPin = struct {
+            lease: local.serverless_query_lake_decoded_cache.Lease,
+            released: std.atomic.Value(bool) = .init(false),
+            fn release(self: *@This()) void {
+                if (!self.released.swap(true, .acq_rel)) self.lease.release();
+            }
+            fn destroy(self: *@This()) void {
+                // cancel-before-start does not invoke the worker's defer.
+                self.release();
+                std.heap.page_allocator.destroy(self);
+            }
+        };
+        fn warm(self: *@This(), pieces: []const Piece, pin: ?*WorkerPin) anyerror!void {
+            // Navigation belongs to the worker, so completion releases the pin
+            // even when this segment is never visited by the query again.
+            defer if (pin) |lease| lease.release();
             try self.capability.check();
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             var cached = self.capability.cache;
@@ -557,7 +572,7 @@ const Owner = struct {
             for (&self.pending, &self.directory_pins) |*slot, *pin| if (slot.*) |*task| {
                 if (cancel) task.cancel(io) catch {} else task.await(io) catch {};
                 slot.* = null;
-                if (pin.*) |lease| lease.release();
+                if (pin.*) |owned| owned.destroy();
                 pin.* = null;
             };
             self.offsets = @splat(null);
@@ -575,7 +590,7 @@ const Owner = struct {
                     if (succeeded) self.rememberPage(offset.*.? / block_bytes);
                     slot.* = null;
                     offset.* = null;
-                    if (pin.*) |lease| lease.release();
+                    if (pin.*) |owned| owned.destroy();
                     pin.* = null;
                 }
             }
@@ -639,9 +654,13 @@ const Owner = struct {
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
                 if (slot == self.pending.len) return;
-                const worker_pin = if (pin) |owned| owned.lease.retain() else null;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces }) orelse {
-                    if (worker_pin) |owned| owned.release();
+                const worker_pin: ?*WorkerPin = if (pin) |owned| blk: {
+                    const worker = std.heap.page_allocator.create(WorkerPin) catch return;
+                    worker.* = .{ .lease = owned.lease.retain() };
+                    break :blk worker;
+                } else null;
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitIoTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces, worker_pin }) orelse {
+                    if (worker_pin) |owned| owned.destroy();
                     return;
                 };
                 self.directory_pins[slot] = worker_pin;
@@ -1676,10 +1695,19 @@ test "external lake admitted directories evict independently of the corpus heap 
             query_source.prefetch(0, encoded.len);
             const query: *Owner.Query = @ptrCast(@alignCast(query_source.ranges.ptr));
             var worker_pins: usize = 0;
-            for (query.directory_pins) |worker| worker_pins += @intFromBool(worker != null);
+            for (query.pending) |worker| worker_pins += @intFromBool(worker != null);
             try std.testing.expect(worker_pins != 0);
+            // Completion must release navigation even before the query joins
+            // or visits this segment again. The tiny descriptor remains until
+            // drain so canceled-before-start workers have an owner too.
+            for (&query.pending) |*slot| if (slot.*) |*task| {
+                var attempts: usize = 0;
+                while (!task.isComplete() and attempts < 5000) : (attempts += 1) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                try std.testing.expect(task.isComplete());
+            };
+            for (query.directory_pins) |worker| if (worker) |retained| try std.testing.expect(retained.released.load(.acquire));
             query.drain(false);
-            for (query.directory_pins) |worker| try std.testing.expect(worker == null);
+            for (query.pending) |worker| try std.testing.expect(worker == null);
         }
         if (i == 1) {
             // The first directory stays readable while a second gets an

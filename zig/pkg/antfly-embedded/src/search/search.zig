@@ -963,7 +963,9 @@ fn executeScoredPhraseFilter(
     if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
     var doc_offset: u32 = 0;
     for (snap.segments, 0..) |_, segment_idx| {
-        const segment = try snap.readSegment(segment_idx);
+        var selected_segment = try snap.leaseSegment(segment_idx);
+        defer selected_segment.deinit();
+        const segment = selected_segment.entry;
         const segment_offset = doc_offset;
         doc_offset += segment.reader.doc_count;
 
@@ -2421,7 +2423,9 @@ fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapsh
             if (request.diagnostics) |diag| diag.segments_pruned +|= 1;
             continue;
         }
-        const seg = try snap.readSegment(plan.segment_idx);
+        var selected_segment = try snap.leaseSegment(plan.segment_idx);
+        defer selected_segment.deinit();
+        const seg = selected_segment.entry;
         try collector.beginSegment(plan.doc_offset, seg.reader.doc_count);
         seg.beginAccess();
         defer seg.endAccess();
@@ -2567,7 +2571,9 @@ fn executeSimpleTextBoolWithProducers(
         if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
         var doc_offset: u32 = 0;
         for (snap.segments, 0..) |_, segment_idx| {
-            const seg = try snap.readSegment(segment_idx);
+            var selected_segment = try snap.leaseSegment(segment_idx);
+            defer selected_segment.deinit();
+            const seg = selected_segment.entry;
             const segment_doc_offset = doc_offset;
             doc_offset += seg.reader.doc_count;
 
@@ -3324,6 +3330,7 @@ const StreamingBoolBuilder = struct {
     diagnostics: ?*SearchDiagnostics = null,
     nodes: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty,
     readers: std.StringHashMapUnmanaged(?*inverted.ScopedInvertedIndexReader) = .empty,
+    segment_lease: ?index_mod.IndexSnapshot.SegmentLease = null,
     lookups: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(?inverted.LookupResult)) = .empty,
     fn deinit(self: *@This()) void {
         for (self.nodes.items) |node| {
@@ -3331,6 +3338,7 @@ const StreamingBoolBuilder = struct {
         }
         var readers = self.readers.valueIterator();
         while (readers.next()) |reader| if (reader.*) |value| value.deinit();
+        if (self.segment_lease) |*lease| lease.deinit();
     }
     fn openTerm(self: *@This(), value: *StreamingBoolNode) !void {
         const prepared = value.prepared_term.?;
@@ -3380,7 +3388,8 @@ const StreamingBoolBuilder = struct {
             entry.value_ptr.* = null;
             // Four 64 KiB hot slabs plus four concurrent fill slabs preserve the native I/O
             // grain while sharing cache storage between scoring lanes.
-            const bound = try self.snap.readSegment(self.snap.segmentOrdinal(self.segment));
+            if (self.segment.query_ordinal == null and self.segment_lease == null) self.segment_lease = try self.snap.leaseSegment(self.snap.segmentOrdinal(self.segment));
+            const bound = if (self.segment_lease) |lease| lease.entry else self.segment;
             const reader = (try bound.reader.invertedIndexScopedWithOptions(self.a, field, .{ .concurrent = self.shared_readers, .cache_bytes = if (self.shared_readers) 512 * 1024 else 256 * 1024, .cache_allocator = self.shared_cache_allocator })) orelse return null;
             const value = self.a.create(inverted.ScopedInvertedIndexReader) catch |err| {
                 var owned = reader;
@@ -3750,6 +3759,7 @@ const StreamingBoolPrepared = struct {
     locked: Locked,
     arena: std.heap.ArenaAllocator,
     builder: StreamingBoolBuilder,
+    segment_lease: index_mod.IndexSnapshot.SegmentLease,
     root: *StreamingBoolNode = undefined,
     upper: f32 = std.math.inf(f32),
 
@@ -3758,7 +3768,13 @@ const StreamingBoolPrepared = struct {
         self.budget = .{ .backing = cache.backing, .limit = cache.entry_bytes };
         self.locked = .{ .backing = self.budget.allocator() };
         self.arena = std.heap.ArenaAllocator.init(self.locked.allocator());
-        const segment = try cache.snap.readSegment(plan.segment_idx);
+        const segment_lease = cache.snap.leaseSegment(plan.segment_idx) catch |err| {
+            self.arena.deinit();
+            cache.backing.destroy(self);
+            return err;
+        };
+        self.segment_lease = segment_lease;
+        const segment = segment_lease.entry;
         self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
         segment.beginAccess();
         defer segment.endAccess();
@@ -3778,6 +3794,7 @@ const StreamingBoolPrepared = struct {
         self.builder.deinit();
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
+        self.segment_lease.deinit();
         self.budget.backing.destroy(self);
     }
 };
@@ -3881,7 +3898,9 @@ const StreamingBoolPreparedCache = struct {
         }
     }
     fn get(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !?Lease {
-        const segment = try self.snap.readSegment(plan.segment_idx);
+        var selected_segment = try self.snap.leaseSegment(plan.segment_idx);
+        defer selected_segment.deinit();
+        const segment = selected_segment.entry;
         if (segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
         try self.mutex.lock(self.io);
         while (true) {
@@ -4085,7 +4104,9 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
         }
     };
     // Bind payload authority only after both metadata ceilings survive.
-    const segment = try snap.readSegment(plan.segment_idx);
+    var selected_segment = try snap.leaseSegment(plan.segment_idx);
+    defer selected_segment.deinit();
+    const segment = selected_segment.entry;
     try collector.beginSegment(offset, segment.reader.doc_count);
     segment.beginAccess();
     defer segment.endAccess();
@@ -5718,7 +5739,10 @@ fn collectStatsGrouped(
     for (snap.segments, 0..) |_, seg_idx| {
         const local_ids = docs[candidates.offsets.?[seg_idx]..candidates.offsets.?[seg_idx + 1]];
         if (local_ids.len == 0) continue;
-        const seg = try snap.readSegment(seg_idx);
+        var selected_segment = try snap.leaseSegment(seg_idx);
+        defer selected_segment.deinit();
+        const seg = selected_segment.entry;
+        try reads.retainSegment(selected_segment);
         const reader = (try reads.get(&seg.reader, field)) orelse continue;
 
         // Selective aggregations probe only their candidates. Dense scans use
@@ -5764,7 +5788,10 @@ fn readF64ForDoc(
 ) !?f64 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = try snap.readSegment(resolved.seg_idx);
+    var selected_segment = try snap.leaseSegment(resolved.seg_idx);
+    defer selected_segment.deinit();
+    const seg = selected_segment.entry;
+    try reads.retainSegment(selected_segment);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     return readNumericAsF64(reader, resolved.local_id);
 }
@@ -5797,7 +5824,10 @@ fn readBytesForDoc(
     field: []const u8,
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = try snap.readSegment(resolved.seg_idx);
+    var selected_segment = try snap.leaseSegment(resolved.seg_idx);
+    defer selected_segment.deinit();
+    const seg = selected_segment.entry;
+    try reads.retainSegment(selected_segment);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .bytes_val) return null;
 
@@ -5814,7 +5844,10 @@ fn readTimestampForDoc(
 ) !?i128 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = try snap.readSegment(resolved.seg_idx);
+    var selected_segment = try snap.leaseSegment(resolved.seg_idx);
+    defer selected_segment.deinit();
+    const seg = selected_segment.entry;
+    try reads.retainSegment(selected_segment);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
@@ -5831,7 +5864,10 @@ fn readGeoPointForDoc(
 ) !?geo_mod.GeoPoint {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = try snap.readSegment(resolved.seg_idx);
+    var selected_segment = try snap.leaseSegment(resolved.seg_idx);
+    defer selected_segment.deinit();
+    const seg = selected_segment.entry;
+    try reads.retainSegment(selected_segment);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;

@@ -29,7 +29,7 @@ const Id = [32]u8;
 const max_candidates = 4096;
 
 pub fn select(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, query: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema) !?[]const Id {
-    if (root.collection == null or root.segment_files == null or root.serving_routes == null or root.inventory_version < 2 or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
+    if (root.collection == null or root.inventory_version < 2 or (root.inventory_version == 2 and (root.segment_files == null or root.serving_routes == null)) or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
     var budget: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();

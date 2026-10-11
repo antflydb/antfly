@@ -171,7 +171,10 @@ test "external lake overlapping text generations share every physical segment on
         try std.testing.expectEqual(@as(usize, 0), wire_directory.manifests.len);
         const directory_root = try native.text_directory.withManifests(ca, wire_directory, store, cached, .none);
         try std.testing.expectEqual(@as(usize, 0), directory_root.segments.len);
-        try std.testing.expect(directory_root.serving_inventory != null);
+        try std.testing.expect(directory_root.serving_inventory == null);
+        try std.testing.expect(directory_root.serving_routes == null);
+        try std.testing.expect(directory_root.segment_files == null);
+        try std.testing.expect(directory_root.directories.files != null);
         {
             const Cache = @import("lake_index_native_text_cache.zig").Cache;
             const Gate = struct {

@@ -584,6 +584,11 @@ pub const SegmentEntry = struct {
     query_base_reader: ?segment_mod.SegmentReader = null,
     query_source: ?SegmentSource = null,
     query_ordinal: ?usize = null,
+    // Guarded by the query facade's bound_mu. Legacy pointer readers remain
+    // pinned; lease readers can release their decoder/source between segments.
+    query_users: usize = 0,
+    query_stable: bool = false,
+    query_age: u64 = 0,
 
     pub fn typedMergeWorkingSetBytes(self: *const SegmentEntry) !u64 {
         const cached = self.shared.typed_merge_estimate.load(.acquire);
@@ -641,6 +646,9 @@ pub const SegmentEntry = struct {
         result.query_base_reader = null;
         result.query_source = null;
         result.query_ordinal = null;
+        result.query_users = 0;
+        result.query_stable = false;
+        result.query_age = 0;
         return result;
     }
 
@@ -970,11 +978,14 @@ pub const IndexSnapshot = struct {
     bound_mu: std.atomic.Mutex = .unlocked,
     bound_segments: std.AutoHashMapUnmanaged(usize, *SegmentEntry) = .empty,
     quiesced: bool = false,
+    bound_age: u64 = 0,
+    retiring_readers: usize = 0,
     /// Installed only on a query facade. Shared scoring caches retain values,
     /// never the caller's credentials, publication lease or read capability.
     text_statistics: ?TextStatistics = null,
     binding_flights: std.AutoHashMapUnmanaged(usize, *BindingFlight) = .empty,
     binding_allocator: ?@import("sql/parallel_scheduler.zig").LockedAllocator = null,
+    const idle_reader_limit = 4;
     const BindingFlight = struct {
         references: std.atomic.Value(usize) = .init(2), // map and constructor
         finished: std.atomic.Value(bool) = .init(false),
@@ -1003,7 +1014,65 @@ pub const IndexSnapshot = struct {
             if (flight.failure) |failure| return failure;
         }
     }
+    /// Compatibility borrow: the returned pointer is stable until snapshot
+    /// release. Streaming consumers should use a lease to bound visited readers.
     pub fn readSegment(self: *const IndexSnapshot, ordinal: usize) !*SegmentEntry {
+        return self.acquireSegment(ordinal, true);
+    }
+    pub const SegmentLease = struct {
+        snapshot: ?*IndexSnapshot,
+        entry: *SegmentEntry,
+        pub fn clone(self: @This()) !@This() {
+            const owner = self.snapshot orelse return self;
+            return owner.leaseSegment(self.entry.query_ordinal.?);
+        }
+        pub fn deinit(self: *@This()) void {
+            const owner = self.snapshot orelse return;
+            self.snapshot = null;
+            owner.releaseSegment(self.entry);
+            owner.release();
+        }
+    };
+    pub fn leaseSegment(self: *const IndexSnapshot, ordinal: usize) !SegmentLease {
+        const entry = try self.acquireSegment(ordinal, false);
+        return .{ .snapshot = if (entry.query_ordinal != null) @constCast(self).retain() else null, .entry = entry };
+    }
+    fn releaseSegment(self: *IndexSnapshot, entry: *SegmentEntry) void {
+        while (!self.bound_mu.tryLock()) spinOrYield();
+        std.debug.assert(entry.query_users != 0);
+        entry.query_users -= 1;
+        self.bound_age +%= 1;
+        entry.query_age = self.bound_age;
+        if (self.quiesced) {
+            self.bound_mu.unlock();
+            return;
+        }
+        var idle: usize = 0;
+        var victim: ?*SegmentEntry = null;
+        var entries = self.bound_segments.valueIterator();
+        while (entries.next()) |slot| {
+            const candidate = slot.*;
+            if (candidate.query_users != 0 or candidate.query_stable) continue;
+            idle += 1;
+            if (victim == null or candidate.query_age < victim.?.query_age) victim = candidate;
+        }
+        const retired = if (idle > idle_reader_limit) victim else null;
+        if (retired) |selected| {
+            _ = self.bound_segments.remove(selected.query_ordinal.?);
+            self.retiring_readers += 1;
+        }
+        self.bound_mu.unlock();
+        if (retired) |selected| {
+            // Closing joins speculative I/O outside the inventory lock. The
+            // retirement count makes quiescence join this detached owner too.
+            selected.releaseRef();
+            self.alloc.destroy(selected);
+            while (!self.bound_mu.tryLock()) spinOrYield();
+            self.retiring_readers -= 1;
+            self.bound_mu.unlock();
+        }
+    }
+    fn acquireSegment(self: *const IndexSnapshot, ordinal: usize, stable: bool) !*SegmentEntry {
         if (ordinal >= self.segments.len) return error.InvalidArgument;
         if (self.read_context_check) |check| try check(self.read_context.?);
         const context = self.read_context orelse return &self.segments[ordinal];
@@ -1015,6 +1084,7 @@ pub const IndexSnapshot = struct {
                 return error.Canceled;
             }
             if (mutable.bound_segments.get(ordinal)) |entry| {
+                if (stable) entry.query_stable = true else entry.query_users += 1;
                 mutable.bound_mu.unlock();
                 return entry;
             }
@@ -1226,6 +1296,11 @@ pub const IndexSnapshot = struct {
             flight.release(self.alloc);
             while (!self.bound_mu.tryLock()) spinOrYield();
         }
+        while (self.retiring_readers != 0) {
+            self.bound_mu.unlock();
+            spinOrYield();
+            while (!self.bound_mu.tryLock()) spinOrYield();
+        }
         self.bound_mu.unlock();
         // No constructor can publish after the fence. Join source workers
         // without making unrelated completed bindings wait on provider I/O.
@@ -1402,7 +1477,9 @@ pub const IndexSnapshot = struct {
         errdefer alloc.free(plans);
         var doc_offset: u32 = 0;
         for (self.segments, 0..) |_, segment_idx| {
-            const seg = try self.readSegment(segment_idx);
+            var segment_lease = try self.leaseSegment(segment_idx);
+            defer segment_lease.deinit();
+            const seg = segment_lease.entry;
             var upper_bound: f32 = std.math.inf(f32);
             if (use_segment_bound_planning) {
                 upper_bound = 0;
@@ -1479,7 +1556,9 @@ pub const IndexSnapshot = struct {
         if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
 
         for (plans) |plan| {
-            const seg = try self.readSegment(plan.segment_idx);
+            var segment_lease = try self.leaseSegment(plan.segment_idx);
+            defer segment_lease.deinit();
+            const seg = segment_lease.entry;
             // Strict inequality preserves deterministic tie-breaking: a
             // segment whose bound equals the threshold may still contain a
             // lower document ID at the cutoff.
@@ -1593,14 +1672,18 @@ pub const IndexSnapshot = struct {
     /// Native IDs belong to the supplied read scope, never the segment cache.
     pub fn storedIdScoped(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?[]const u8 {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        (try self.readSegment(resolved.seg_idx)).noteAccess();
-        return (try self.readSegment(resolved.seg_idx)).reader.storedIdScoped(alloc, resolved.local_id);
+        var segment_lease = try self.leaseSegment(resolved.seg_idx);
+        defer segment_lease.deinit();
+        segment_lease.entry.noteAccess();
+        return segment_lease.entry.reader.storedIdScoped(alloc, resolved.local_id);
     }
 
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        (try self.readSegment(resolved.seg_idx)).noteAccess();
-        return try (try self.readSegment(resolved.seg_idx)).reader.docOrdinal(resolved.local_id);
+        var segment_lease = try self.leaseSegment(resolved.seg_idx);
+        defer segment_lease.deinit();
+        segment_lease.entry.noteAccess();
+        return try segment_lease.entry.reader.docOrdinal(resolved.local_id);
     }
 
     /// Get and decompress a stored document by global doc ID into `alloc`.
@@ -1647,7 +1730,9 @@ pub const IndexSnapshot = struct {
 
         var doc_offset: u32 = 0;
         for (self.segments, 0..) |_, segment_idx| {
-            const seg = try self.readSegment(segment_idx);
+            var segment_lease = try self.leaseSegment(segment_idx);
+            defer segment_lease.deinit();
+            const seg = segment_lease.entry;
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
@@ -1814,7 +1899,9 @@ pub const IndexSnapshot = struct {
                 @memset(counts, 0);
                 var ordinal = lane;
                 while (ordinal < snapshot_ref.segments.len) : (ordinal += lanes) {
-                    const segment = try snapshot_ref.readSegment(ordinal);
+                    var segment_lease = try snapshot_ref.leaseSegment(ordinal);
+                    defer segment_lease.deinit();
+                    const segment = segment_lease.entry;
                     if (segment.query_source) |source| if (source == .ranges) {
                         if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
                     };
@@ -4582,6 +4669,35 @@ test "external lake explicit read capabilities bind only selected immutable segm
     try std.testing.expectEqual(@as(usize, 17), facade.segmentOrdinal(selected));
     try std.testing.expectEqual(@as(usize, 1), source.bindings);
     try std.testing.expectEqual(@as(usize, 1), facade.bound_segments.count());
+    // Active leases survive idle eviction; legacy pointer borrows stay stable.
+    var pinned = try facade.leaseSegment(0);
+    defer pinned.deinit();
+    for (1..32) |ordinal| {
+        var lease = try facade.leaseSegment(ordinal);
+        try std.testing.expectEqual(ordinal, facade.segmentOrdinal(lease.entry));
+        lease.deinit();
+        try std.testing.expect(facade.bound_segments.count() <= IndexSnapshot.idle_reader_limit + 2);
+        try std.testing.expect(facade.bound_segments.get(0) == pinned.entry);
+        try std.testing.expect(facade.bound_segments.get(17) == selected);
+    }
+    // An evicted reader rebinds rather than borrowing a dead source.
+    const before_rebind = source.bindings;
+    var rebound = try facade.leaseSegment(1);
+    rebound.deinit();
+    try std.testing.expectEqual(before_rebind + 1, source.bindings);
+    {
+        var typed_scope = segment_mod.TypedReadScope.init(a);
+        defer typed_scope.deinit();
+        for (0..32) |ordinal| {
+            var lease = try facade.leaseSegment(ordinal);
+            defer lease.deinit();
+            try typed_scope.retainSegment(lease);
+            try std.testing.expect((try typed_scope.get(&lease.entry.reader, "absent")) == null);
+            try std.testing.expect(typed_scope.entries.items.len <= 4);
+            try std.testing.expect(facade.bound_segments.count() <= IndexSnapshot.idle_reader_limit + 7);
+        }
+    }
+    try std.testing.expect(selected == try facade.readSegment(17));
     source.allowed = false;
     try std.testing.expectError(error.Forbidden, facade.readSegment(17));
     try std.testing.expectError(error.Forbidden, facade.termDocFreq(a, "body", "common"));

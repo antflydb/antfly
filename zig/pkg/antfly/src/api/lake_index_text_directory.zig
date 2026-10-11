@@ -41,6 +41,7 @@ pub const FileRecord = struct { file: state.File, manifest: Chunk };
 const SegmentRecord = struct {
     file: state.File,
     manifest: Chunk,
+    physical: ?Chunk = null,
     ordinal: u32,
     interval: Interval,
     route: corpus.SegmentRouting,
@@ -145,7 +146,7 @@ fn segmentRecords(a: A, group: corpus.FileGroup, manifest: Chunk) ![]const Segme
         const upper = try std.math.add(u32, lower, route.doc_count);
         var rows: std.ArrayList(corpus.physical.Block) = .empty;
         for (group.rows) |block| if (block.base < upper and @as(u64, block.base) + block.count > lower) try rows.append(a, block);
-        record.* = .{ .file = fileState(group.file), .manifest = manifest, .ordinal = @intCast(ordinal), .interval = .{ .lower = lower, .count = route.doc_count }, .route = route, .rows = rows.items };
+        record.* = .{ .file = fileState(group.file), .manifest = manifest, .physical = group.physical_manifest, .ordinal = @intCast(ordinal), .interval = .{ .lower = lower, .count = route.doc_count }, .route = route, .rows = rows.items };
         lower = upper;
     }
     if (lower != try corpus.physical.validate(group.rows)) return error.InvalidNativeLakeTextCorpus;
@@ -186,7 +187,15 @@ fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []c
 }
 fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     const start = key(id, 0);
-    var cursor = try tree.Cursor.init(a, storage, root, &start, null);
+    var upper = id;
+    var position: usize = upper.len;
+    while (position != 0) {
+        position -= 1;
+        upper[position] +%= 1;
+        if (upper[position] != 0) break;
+    }
+    const end: ?[]const u8 = if (position == 0 and upper[0] == 0) null else &upper;
+    var cursor = try tree.Cursor.init(a, storage, root, &start, end);
     defer cursor.deinit();
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(a);
@@ -261,6 +270,7 @@ pub fn withManifests(a: A, root: corpus.Root, store: stores.ArtifactStore, cache
 fn validateSegment(record: SegmentRecord, domain: Id) !void {
     try state.validate(&.{record.file}, domain);
     try validateRef(record.manifest, domain);
+    if (record.physical) |physical_ref| try validateRef(physical_ref, domain);
     try validateRef(record.route.ref, domain);
     try validateRef(record.route.descriptor orelse return error.InvalidNativeLakeTextCorpus, domain);
     if (record.route.summary) |summary| try summary.validate();
@@ -299,6 +309,85 @@ pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactS
         if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
         try validateSegment(record.*, root.domain);
     }
+    return assemble(a, root, records, true);
+}
+/// Full serving admission uses the same canonical segment records as selective
+/// admission. No second routing or admission tree is published for v3.
+pub fn loadAll(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation) !corpus.Root {
+    // Internal callers may carry an expanded catalog. Its references must
+    // agree with the authenticated canonical catalog; ordinary wire roots
+    // have no flat references and avoid this additional lookup entirely.
+    if (root.manifests.len != 0) {
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const files = try fileRecords(arena.allocator(), root, store, cached, token);
+        if (files.len != root.manifests.len) return error.InvalidNativeLakeTextCorpus;
+        for (files, root.manifests) |file, ref| {
+            if (file.manifest.byte_len != ref.byte_len or !std.mem.eql(u8, file.manifest.artifact_id, ref.artifact_id) or !std.mem.eql(u8, file.manifest.checksum, ref.checksum)) return error.InvalidNativeLakeTextCorpus;
+        }
+    }
+    var read: Reader = .{ .store = store, .cached = cached, .token = token };
+    read.init(root.domain);
+    var cursor = try tree.Cursor.init(scratch, read.pages.store(), root.directories.segments, "", null);
+    defer cursor.deinit();
+    var records: std.ArrayList(SegmentRecord) = .empty;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(scratch);
+    var id: ?Id = null;
+    while (try cursor.next()) |record| {
+        try read.check();
+        if (record.key.len != 36) return error.InvalidNativeLakeTextCorpus;
+        const current: Id = record.key[0..32].*;
+        if (id) |previous| if (!std.mem.eql(u8, &previous, &current)) {
+            try appendSegment(a, &records, root.domain, previous, bytes.items);
+            bytes.clearRetainingCapacity();
+        };
+        id = current;
+        if (std.mem.readInt(u32, record.key[32..36], .big) != bytes.items.len or record.value.len == 0 or record.value.len > chunk_bytes or record.value.len > corpus.max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+        try bytes.appendSlice(scratch, record.value);
+    }
+    if (id) |last| try appendSegment(a, &records, root.domain, last, bytes.items);
+    return assemble(a, root, records.items, false);
+}
+/// Stream the authenticated retained serving closure with one record decoded.
+/// Maintenance manifests are deliberately not required by the serving audit.
+pub fn walkSegments(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype) !void {
+    var read: Reader = .{ .store = store, .cached = null, .token = token };
+    read.init(root.domain);
+    var cursor = try tree.Cursor.init(a, read.pages.store(), root.directories.segments, "", null);
+    defer cursor.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var id: ?Id = null;
+    while (try cursor.next()) |record| {
+        try visitor.check();
+        if (record.key.len != 36) return error.InvalidNativeLakeTextCorpus;
+        const current: Id = record.key[0..32].*;
+        if (id) |previous| if (!std.mem.eql(u8, &previous, &current)) {
+            try visitSegment(a, root.domain, previous, bytes.items, visitor);
+            bytes.clearRetainingCapacity();
+        };
+        id = current;
+        if (std.mem.readInt(u32, record.key[32..36], .big) != bytes.items.len or record.value.len == 0 or record.value.len > chunk_bytes or record.value.len > corpus.max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+        try bytes.appendSlice(a, record.value);
+    }
+    if (id) |last| try visitSegment(a, root.domain, last, bytes.items, visitor);
+}
+fn visitSegment(a: A, domain: Id, id: Id, bytes: []const u8, visitor: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const record = try std.json.parseFromSliceLeaky(SegmentRecord, arena.allocator(), bytes, .{});
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateSegment(record, domain);
+    try visitor.record(record);
+}
+fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: Id, bytes: []const u8) !void {
+    const record = try std.json.parseFromSliceLeaky(SegmentRecord, a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateSegment(record, domain);
+    try records.append(a, record);
+}
+fn assemble(a: A, root: corpus.Root, records: []SegmentRecord, partial: bool) !corpus.Root {
     std.mem.sort(SegmentRecord, records, {}, struct {
         fn less(_: void, l: SegmentRecord, r: SegmentRecord) bool {
             // Match the complete paged file catalog's immutable order. Subset
@@ -342,7 +431,7 @@ pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactS
         first = end;
     }
     var view = root;
-    view.partial_inventory = true;
+    view.partial_inventory = partial;
     view.file_groups = groups.items;
     view.manifests = manifests.items;
     view.routing = routes.items;
