@@ -783,4 +783,9 @@ and reject a later duplicate without changing the rows. This is oracle evidence,
 not native/distributed original-case completion. The coordinator qualification
 also asserts that index retirement and legacy-shaped source writes preserve
 the activated occupancy floor instead of downgrading to the older mutation
-protocol; the current rerun remains pending.
+protocol. The corrected coordinator Debug gate passes all 29 tests with no
+skips or leaks; its optimized rerun remains pending. The mounted generated-FK
+campaign returned HTTP 501 before publication admission (one capability test
+passed, one integration test failed). Its response-diagnostic rerun is pending;
+this is an unresolved public-path qualification failure, not successful
+distributed activation. The mounted primary-key campaign is still live.
