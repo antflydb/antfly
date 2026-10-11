@@ -32,7 +32,8 @@ pub const envelope_version = 22;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
-pub const max_wire_bytes = @max(max_encoded_inputs + 32 * 1024, max_claim_wire_bytes);
+pub const max_control_wire_bytes = max_encoded_inputs + 32 * 1024;
+pub const max_wire_bytes = @max(max_control_wire_bytes, max_claim_wire_bytes);
 pub const Manifest = inputs.Prepared;
 
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
@@ -129,7 +130,7 @@ pub const Effect = union(enum) {
 
     pub fn wireLimit(self: Effect) usize {
         return switch (self) {
-            .control, .cancel_control => max_encoded_inputs + 32 * 1024,
+            .control, .cancel_control => max_control_wire_bytes,
             .claims => max_claim_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
@@ -406,7 +407,7 @@ pub const Prepared = struct {
     /// Serialize the large immutable prefix off-lock. Only the locally assigned
     /// sequence (at most 20 digits) is filled after transactional staging.
     pub fn preparePayload(self: *Prepared) !void {
-        try prepareNativePayload(self, "control", self.command, max_wire_bytes);
+        try prepareNativePayload(self, "control", self.command, max_control_wire_bytes);
     }
 
     pub fn finalizePayload(self: *Prepared, position: Native) ![]const u8 {
@@ -454,7 +455,7 @@ pub const PreparedCancellationControl = struct {
     }
     pub fn populateReceipt(_: *const PreparedCancellationControl, _: anytype, _: *CleanupOutcome) !void {}
     pub fn preparePayload(self: *PreparedCancellationControl) !void {
-        try prepareNativePayload(self, "cancel_control", self.control.command, max_wire_bytes);
+        try prepareNativePayload(self, "cancel_control", self.control.command, max_control_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedCancellationControl, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
@@ -562,6 +563,15 @@ pub const PreparedCleanup = struct {
 };
 
 fn prepareNativePayload(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
+    // This buffer has no I/O sink: Allocating's WriteFailed means allocation
+    // failure. Preserve OOM semantics for callers and exhaustive fault checks.
+    return prepareNativePayloadAllocating(prepared, member, body, maximum) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn prepareNativePayloadAllocating(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
     try prepared.validate();
     if (prepared.payload != null) return;
     var writer: std.Io.Writer.Allocating = .init(prepared.alloc);
