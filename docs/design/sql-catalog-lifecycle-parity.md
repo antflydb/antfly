@@ -2013,8 +2013,9 @@ candidate, eleven candidate/private-addition, four system/page and fourteen
 catalog tests with no skips, failures or leaks; overlapping selections are
 not added to SQL inventory credits. Metadata publication integration passes
 59/59 Debug build steps, seventeen publication tests and the decoder-floor
-test. The actual `embedded-capi-check` production gate passes 28/28 Debug
-build steps. Formatting, diff checks, the 822-source embedded dependency
+test. The public `embedded-capi-check` production gate passes 28/28 Debug
+build steps; this is not a private server storage-kernel qualification.
+Formatting, diff checks, the 822-source embedded dependency
 boundary, control-catalog freshness and original inventory integrity pass.
 The initial API-byte/native-schema fingerprint mismatch was fixed by checking
 the independently rebuilt native identity, not by weakening schema guards.
@@ -2051,7 +2052,7 @@ reopen and private-schema visibility. It also checks gap rollback, mixed ordinar
 effects/receipt rejection, unknown wire fields and exact primary retries. Final
 Debug qualification passes all 65 build steps across the candidate/page/catalog
 gates: eight candidate, eleven candidate/private-addition, five system/page and
-fourteen catalog tests, without skips, failures or leaks. Production
+fourteen catalog tests, without skips, failures or leaks. Public C-API production
 `embedded-capi-check` passes 28/28 Debug build steps. Apache dependency-boundary
 validation passes for 2028 sources and inventory integrity remains unchanged.
 ReleaseFast qualification also passes all 65 steps with the same selected
@@ -2076,7 +2077,8 @@ mirrors successful reservation and acquires the exclusive checkpoint barrier in
 the foreground apply acknowledgement callback, not merely the recovery callback;
 it verifies exact publication counts on duplicate retry. Final Debug
 qualification passes all 52 steps with the same artifact counts and no skips,
-failures or leaks; ReleaseFast qualification for that addition is in progress.
+failures or leaks. ReleaseFast qualification also passes all 52 steps with the
+same artifact counts and no skips, failures or leaks.
 This does not add a
 SQL disposition or justify enabling the public producer.
 
