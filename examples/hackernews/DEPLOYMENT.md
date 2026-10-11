@@ -1,8 +1,28 @@
-# Durable HN serving candidate
+# Hacker News: Antfly Cloud deployment and standalone qualification
 
-This candidate is not deployed or archive-qualified. Complete the regional
+The intended real deployment is an organization-owned Antfly Cloud instance.
+The standalone renderer below is an optional qualification tool, not the Cloud
+provisioning path. This candidate is not deployed or archive-qualified. Complete the regional
 public-API gates in `docs/plans/hackernews-deployment-qualification.md` before
 selecting serving resources or exposing `hn.antfly.io`.
+
+For the real deployment, merge the required runtime fixes and publish an immutable
+Antfly release containing them. Add that image to Colony's development runtime
+catalog as a manually selected candidate, provision an instance through Antfly
+Cloud, and configure historical/current tables and the saved source through its
+authenticated managed API. Verify tenant-scoped object-store credentials,
+publication, replacement recovery, cursors and search performance on that instance.
+A standalone binary benchmark does not qualify the Cloud control plane or proxy.
+A new Colony application release is needed only when its control-plane code changes.
+
+The [consolidated Colony storage proposal](https://github.com/antflydb/colony/pull/762)
+is disabled by default. Its 20 GiB claim is an unmeasured starting allocation for
+standalone catalog/checkpoint/cache state, not the archive or a Cloud requirement.
+Cloud owns its instance storage through Jobsaf/operator provisioning; do not attach
+the example claim or create a parallel standalone engine for the real deployment.
+The producer's persistent Antfly Lite state has separate ownership. Cloud tenant
+identity must be verified before granting bucket access; the example's
+`hackernews/hackernews` principal does not authorize a managed instance.
 
 `serve.py` exposes a search form and `/api/search`. Its three views resolve only
 `hn_archive`, `hn_current` and the saved overlay `hackernews`. Recent searches
@@ -38,7 +58,8 @@ serving recommendation. At the recorded rates, that engine allocation alone is
 about $433/month before credits, versus about $46/month for 1 CPU / 4 GiB. Neither
 smaller-profile latency nor a sustained serving budget is qualified yet.
 
-Infrastructure prerequisites belong in the Colony development Pulumi stack:
+For the optional standalone candidate, infrastructure prerequisites belong in the
+Colony development Pulumi stack:
 
 - A dedicated `us-central1` bucket with uniform access, public access prevention
   and no staging expiration lifecycle. Avoid `forceDestroy`; preserve generations
