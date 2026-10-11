@@ -2588,3 +2588,33 @@ It qualifies the listed component contracts, not authenticated distributed
 activation, optimized merged-head execution or the still-open public failed
 CREATE UNIQUE INDEX atomicity gate. The original SQL inventory is unchanged:
 478 implemented, 136 rejected, 73 superseded and 899 unresolved of 1,586 cases.
+
+### Bounded standby-local cancellation cleanup
+
+Qualification at `f0f3f24f48` passed all 101 build steps and 41 tests in Debug
+with no skips, failures or leaks (`antfly-relational-index-pages-test`,
+`native-index-owner-capi-test`, `antfly-storage-owner-source-test` filtered to
+`native index owner adapter`, and `relational-index-catalog-test`).
+
+The cancellation worker selects its admitted generation by point lookup rather
+than waiting behind unrelated public retirements. It shares the existing
+256-record/1-MiB/5-ms GC page engine and stages deletion and continuation in the
+same transaction as the exact cancellation, burned allocation and durable
+cleanup-admission checks. Ordinary maintenance conflict checks precede opening
+the writer. Drain is proved by cleanup admission; pages do not repeat the
+potentially large retained-transaction scan under apply-exclusive. The exact
+source fence remains active throughout cleanup.
+
+This derived-artifact operation respects read-only backends, portable-runtime
+gates, replication/snapshot/replay leases and catalog generation guards, but
+does not open ordinary standby write admission. The LSM regression denies
+ordinary and background writes, puts an unrelated retirement earlier in the
+queue, restarts between cleanup phases, and verifies that the unrelated queue
+entry, source clock, replay LSN and active epoch are preserved. Internal ABI
+operation `cancel_gc_page` and its leased-owner adapter return physical progress
+only; response ownership is allocated before committing any page.
+
+This is not automatic scheduling, authenticated cancellation dispatch, a final
+completion cut, global UNIQUE-claim/manifest/job retirement or epoch release.
+Those paths and their distributed fault evidence remain unfinished, the public
+producer stays disabled, and no original SQL case receives credit here.
