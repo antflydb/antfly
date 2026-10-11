@@ -86,7 +86,10 @@ class LiteralSourceOwnership(unittest.TestCase):
                 )
 
     def test_intent_collection_root_owns_storage_without_complete_db(self):
-        root = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/intent_collection_controls_test_root.zig"
+        root = (
+            measurement.ZIG_ROOT
+            / "pkg/antfly-embedded/src/intent_collection_controls_test_root.zig"
+        )
         physical_db = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/storage/db/db.zig"
         self.assertTrue(root.is_file())
         self.assertIsNone(measurement.literal_import_path(root, physical_db))
@@ -218,6 +221,7 @@ class BuildFailureEvidence(unittest.TestCase):
             label, rebuilt = expected[len(seen)]
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
+            self.assertIn("-Dstrip=true", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)

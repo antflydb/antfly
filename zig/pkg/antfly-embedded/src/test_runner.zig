@@ -362,6 +362,8 @@ fn recordMatchingIncludeFilters(name: []const u8, matched_filter_counts: []usize
 }
 
 fn matchesSingleFilter(name: []const u8, filter: []const u8) bool {
+    // Namespace ownership must not match suffixes such as retirement_index.
+    if (std.mem.startsWith(u8, filter, "^")) return std.mem.startsWith(u8, name, filter[1..]);
     const target = if (std.mem.indexOfScalar(u8, filter, '.') != null)
         name
     else

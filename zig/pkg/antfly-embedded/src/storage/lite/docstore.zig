@@ -30,6 +30,7 @@ pub const reclamation = @import("reclamation.zig");
 const maintenance = @import("../maintenance.zig");
 
 const Allocator = std.mem.Allocator;
+const ReadWorkspace = @import("read_workspace.zig").Workspace;
 const read_scratch = @import("../../segment_source.zig").Scratch;
 const bounded_cursor_test_documents: usize = 512;
 
@@ -767,6 +768,62 @@ test "lite reclamation counts retired inodes until pinned readers release" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite reclamation externally locked refresh defers debt to its maintenance owner" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reclamation-connection-refresh.aflite");
+    defer alloc.free(path);
+    const policy: reclamation.Options = .{ .enabled = false, .retirement_work_pages = 1 };
+    var initial = try Store.createWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+        .reclamation = policy,
+    });
+    initial.file.releaseWriterOwnership();
+    var lease = try native.lockWriterPathWithIo(alloc, std.testing.io, path);
+    defer lease.close();
+    {
+        defer initial.close();
+        for (0..32) |version| {
+            var value: [32]u8 = undefined;
+            var write = try initial.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", try std.fmt.bufPrint(&value, "version-{d}", .{version}));
+            try write.commit();
+        }
+        try std.testing.expect(try initial.file.retirementNeedsService());
+    }
+    for (0..3) |_| {
+        var probe = try native.NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        const checkpoint = probe.activeCheckpoint();
+        var connection = try Store.openWithOptions(alloc, path, .{
+            .io = std.testing.io,
+            .no_sync = true,
+            .externally_locked = true,
+            .reclamation = policy,
+        });
+        defer connection.close();
+        try std.testing.expect(std.meta.eql(checkpoint, connection.file.activeCheckpoint()));
+        var read = try connection.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("version-31", try read.get("doc"));
+    }
+    var owner = try Store.openWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+        .reclamation = policy,
+    });
+    defer owner.close();
+    const before = owner.file.activeCheckpoint().commit_sequence;
+    try owner.maintainOnce(false);
+    try std.testing.expect(owner.file.activeCheckpoint().commit_sequence > before);
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
+}
+
 test "lite reclamation writable reopen services debt and read only reopen does not" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1154,8 +1211,17 @@ pub const ArtifactLease = struct {
     }
 };
 
+var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
+
 pub const Store = struct {
+    score_cache_owner: u64 = 0,
     allocator: Allocator,
+    workspace_reclaimer: ?u64 = null,
+    metadata_pool: @import("metadata_pool.zig").MetadataPool = .{},
+    metadata_ready: std.atomic.Value(bool) = .init(false),
+    workspace_mutex: std.atomic.Mutex = .unlocked,
+    workspace_pending: [2]bool = .{ false, false },
+    workspaces: [2]?*ReadWorkspace = .{ null, null },
     file: native.NativeFile,
     read_generation: ?*ReadGeneration = null,
     // Admission and release never wait for the writer's disk I/O.
@@ -1231,6 +1297,7 @@ pub const Store = struct {
         else
             try native.NativeFile.openWithOptions(allocator, path, native_opts);
         var result: Store = .{
+            .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
             .allocator = allocator,
             .file = file,
             .read_only = opts.read_only,
@@ -1239,15 +1306,19 @@ pub const Store = struct {
             .maintenance_start_suppressed = true,
         };
         errdefer result.close();
-        // An owner may live for only one CLI invocation. Reopen services debt
-        // synchronously so repeated short sessions cannot starve reclamation.
+        // A standalone owner may live for only one CLI invocation, so it
+        // services debt on reopen. Externally locked connections instead have
+        // a lease-scoped maintenance owner: refreshing a cached generation
+        // must not reclaim pages and publish another checkpoint on every
+        // foreground handoff. That publication invalidates the other
+        // connections and makes their next calls repeat this work.
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
         if (!opts.read_only and opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
             _ = try result.vacuumWithCancel(null);
         }
-        if (!opts.read_only) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
+        if (!opts.read_only and !opts.externally_locked) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
         result.maintenance_start_suppressed = opts.externally_locked;
         return result;
     }
@@ -1284,6 +1355,7 @@ pub const Store = struct {
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
         return .{
+            .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
             .allocator = allocator,
             .file = file,
             .read_only = false,
@@ -1301,11 +1373,132 @@ pub const Store = struct {
         self.maintenance_started.store(false, .release);
     }
 
+    fn readMetadataAllocator(self: *Store) Allocator {
+        if (self.metadata_ready.load(.acquire)) return self.metadata_pool.allocator(self.allocator, self.resource_manager);
+        platform_sync.lockYielding(&self.workspace_mutex);
+        if (self.workspace_reclaimer == null) {
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch null;
+        }
+        if (self.resource_manager == null or self.workspace_reclaimer != null) self.metadata_ready.store(true, .release);
+        self.workspace_mutex.unlock();
+        return self.metadata_pool.allocator(self.allocator, self.resource_manager);
+    }
+
+    fn reclaimIdleWorkspaces(context: *anyopaque, target_bytes: u64) u64 {
+        const self: *Store = @ptrCast(@alignCast(context));
+        const metadata = self.metadata_pool.reclaimDetailed(target_bytes);
+        var freed = metadata.physical;
+        var reported = metadata.total();
+        if (reported != 0) if (resource_manager_mod.BudgetedAllocator.fromAllocator(self.allocator)) |budget| {
+            _ = budget.releaseUnusedCreditThreadSafe();
+        };
+        while (freed < target_bytes) {
+            if (!self.workspace_mutex.tryLock()) break;
+            const found: ?*ReadWorkspace = blk: {
+                for (&self.workspaces) |*slot| if (slot.*) |workspace| {
+                    if (workspace.busy) continue;
+                    slot.* = null;
+                    break :blk workspace;
+                };
+                break :blk null;
+            };
+            self.workspace_mutex.unlock();
+            const workspace = found orelse break;
+            const physical = workspace.live + @sizeOf(ReadWorkspace);
+            const bytes = if (workspace.budget) |*budget| budget.reservation.bytes +| @sizeOf(ReadWorkspace) else physical;
+            const backing_budget = resource_manager_mod.BudgetedAllocator.fromAllocator(workspace.backing);
+            workspace.destroy();
+            if (backing_budget) |budget| _ = budget.releaseUnusedCreditThreadSafe();
+            freed +|= physical;
+            reported +|= bytes;
+        }
+        return reported;
+    }
+
+    fn checkoutWorkspace(self: *Store, caller: Allocator) !?*ReadWorkspace {
+        const query_budget = resource_manager_mod.BudgetedAllocator.fromAllocator(caller);
+        if (query_budget == null and !(caller.ptr == self.allocator.ptr and caller.vtable == self.allocator.vtable)) return null;
+        platform_sync.lockYielding(&self.workspace_mutex);
+        if (self.workspace_reclaimer == null) {
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch {
+                self.workspace_mutex.unlock();
+                return null;
+            };
+        }
+        for (&self.workspaces, 0..) |*slot, index| {
+            if (slot.*) |workspace| {
+                if (workspace.busy) continue;
+                workspace.busy = true;
+                self.workspace_mutex.unlock();
+                // Admission may reclaim other idle slots. Never hold the pool
+                // lock during allocator, reservation, or arena operations.
+                workspace.begin(query_budget) catch |err| {
+                    platform_sync.lockYielding(&self.workspace_mutex);
+                    self.workspaces[index] = null;
+                    self.workspace_mutex.unlock();
+                    workspace.destroy();
+                    // Cached capacity must not make a smaller query fail.
+                    if (err == error.ResourceBudgetExceeded) return null;
+                    return err;
+                };
+                return workspace;
+            }
+            if (self.workspace_pending[index]) continue;
+            self.workspace_pending[index] = true;
+            self.workspace_mutex.unlock();
+            const workspace = ReadWorkspace.create(self.allocator, self.resource_manager) catch {
+                platform_sync.lockYielding(&self.workspace_mutex);
+                self.workspace_pending[index] = false;
+                self.workspace_mutex.unlock();
+                return null;
+            };
+            workspace.busy = true;
+            workspace.begin(query_budget) catch |err| {
+                workspace.destroy();
+                platform_sync.lockYielding(&self.workspace_mutex);
+                self.workspace_pending[index] = false;
+                self.workspace_mutex.unlock();
+                if (err == error.ResourceBudgetExceeded) return null;
+                return err;
+            };
+            platform_sync.lockYielding(&self.workspace_mutex);
+            self.workspace_pending[index] = false;
+            self.workspaces[index] = workspace;
+            self.workspace_mutex.unlock();
+            return workspace;
+        }
+        self.workspace_mutex.unlock();
+        // Concurrency beyond the two retained slots uses query-owned scratch.
+        return null;
+    }
+
+    fn returnWorkspace(self: *Store, workspace: *ReadWorkspace) void {
+        workspace.end();
+        const pressure = if (self.resource_manager) |manager| manager.pressureDecision(.lite_docstore_snapshot_cache).pressure == .hard else false;
+        platform_sync.lockYielding(&self.workspace_mutex);
+        if (pressure) {
+            for (&self.workspaces) |*slot| if (slot.* == workspace) {
+                slot.* = null;
+                break;
+            };
+        } else workspace.busy = false;
+        self.workspace_mutex.unlock();
+        if (pressure) workspace.destroy();
+    }
+
     pub fn close(self: *Store) void {
         if (self.artifact_registry) |registry| registry.detach();
         self.stopMaintenance();
+        if (self.workspace_reclaimer) |identity| self.resource_manager.?.unregisterReclaimer(identity);
         std.debug.assert(self.retired_generations == null);
         if (self.read_generation) |generation| std.debug.assert(generation.references == 0);
+        for (self.workspace_pending) |pending| std.debug.assert(!pending);
+        for (&self.workspaces) |*slot| if (slot.*) |workspace| {
+            std.debug.assert(!workspace.busy);
+            workspace.destroy();
+            slot.* = null;
+        };
+        self.metadata_pool.deinit();
         self.retireReadGeneration(0);
         self.artifact_marker_sweep.deinit(self.file.runtime());
         self.file.close();
@@ -1385,7 +1578,12 @@ pub const Store = struct {
         // transactions hold the inode lock, including streams between calls.
         if (generation.scoped_reader_lock and pin.kernel_reader) {
             if (generation.kernel_readers == 0) {
-                if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.FileBusy;
+                // Own publication is excluded by the store mutex during pin
+                // admission. A forked child can retain a completed writer's
+                // inode fence until exec/close, even after its parent closed
+                // the descriptor. Wait for that fence instead of failing an
+                // otherwise uncontended same-owner read.
+                try generation.file.file.lock(generation.file.runtime(), .shared);
             }
             generation.kernel_readers += 1;
         }
@@ -1445,12 +1643,12 @@ pub const Store = struct {
             generation.kernel_readers -= 1;
             if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
         }
-        self.allocator.destroy(pin);
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
         if (!generation.retired) self.reader_frontier.store(if (generation.first_pin) |first| first.sequence else std.math.maxInt(u64), .release);
         const reclaim = generation.references == 0 and generation.retired;
         self.read_mutex.unlock(io);
+        self.readMetadataAllocator().destroy(pin);
         if (reclaim) {
             // Only the last releaser owns this unreachable generation. Preserve
             // owner -> reader lock ordering for admission/accounting updates.
@@ -2615,6 +2813,10 @@ pub const Txn = struct {
     read_pin: ?*ReadPin = null,
     checkpoint: native.CheckpointSlot = .{},
 
+    pub fn metadataAllocator(self: *const Txn, fallback: Allocator) Allocator {
+        return if (self.store) |store| store.readMetadataAllocator() else fallback;
+    }
+
     pub fn openRead(store: *Store) !Txn {
         return try openReadWithPrefix(store, "");
     }
@@ -2634,17 +2836,29 @@ pub const Txn = struct {
         const io = store.file.runtime();
         if (control) |budget| try @import("../../common/bounded_mutex.zig").lockShared(&store.generation_lock, io, budget) else store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);
-        const pin = try store.allocator.create(ReadPin);
-        errdefer store.allocator.destroy(pin);
+        // Scoped inode pins share the complete native publication mutex.
+        // Keep it while waiting for the kernel fence, so an own writer cannot
+        // wait for read_mutex in its checkpoint observer behind that wait.
+        // Lifetime-owned readers already retain an inode fence and preserve
+        // admission during commit fsync.
+        const serialized_admission = store.file.externally_locked;
+        if (serialized_admission) {
+            if (control) |budget| try @import("../../common/bounded_mutex.zig").lockAtomic(&store.mutex, budget) else lockStore(store);
+        }
+        defer if (serialized_admission) store.mutex.unlock();
+        const pin = try store.readMetadataAllocator().create(ReadPin);
+        errdefer store.readMetadataAllocator().destroy(pin);
         if (control) |budget| try @import("../../common/bounded_mutex.zig").lock(&store.read_mutex, io, budget) else store.read_mutex.lockUncancelable(io);
         if (store.read_generation == null) {
             store.read_mutex.unlock(io);
-            if (control) |budget| try @import("../../common/bounded_mutex.zig").lockAtomic(&store.mutex, budget) else lockStore(store);
+            if (!serialized_admission) {
+                if (control) |budget| try @import("../../common/bounded_mutex.zig").lockAtomic(&store.mutex, budget) else lockStore(store);
+            }
             store.initializeReadGenerationAssumeLocked() catch |err| {
-                store.mutex.unlock();
+                if (!serialized_admission) store.mutex.unlock();
                 return err;
             };
-            store.mutex.unlock();
+            if (!serialized_admission) store.mutex.unlock();
             if (control) |budget| try @import("../../common/bounded_mutex.zig").lock(&store.read_mutex, io, budget) else store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
@@ -2675,8 +2889,8 @@ pub const Txn = struct {
         defer store.mutex.unlock();
 
         const checkpoint = store.file.activeCheckpoint();
-        const pin = if (store.file.header.indexed_reclamation) try store.allocator.create(ReadPin) else null;
-        errdefer if (pin) |owned| store.allocator.destroy(owned);
+        const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
+        errdefer if (pin) |owned| store.readMetadataAllocator().destroy(owned);
         if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
         const generation = if (pin) |owned| try store.pinReadGeneration(owned) else null;
         return .{
@@ -2704,8 +2918,8 @@ pub const Txn = struct {
         defer store.mutex.unlock();
 
         const checkpoint = store.file.activeCheckpoint();
-        const pin = if (store.file.header.indexed_reclamation) try store.allocator.create(ReadPin) else null;
-        errdefer if (pin) |owned| store.allocator.destroy(owned);
+        const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
+        errdefer if (pin) |owned| store.readMetadataAllocator().destroy(owned);
         if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
         const generation = if (pin) |owned| try store.pinReadGeneration(owned) else null;
         return .{
@@ -2794,15 +3008,83 @@ pub const Txn = struct {
 
     pub const ReadScope = struct {
         parent: *Txn,
-        scratch: read_scratch,
-        batch_scratch: read_scratch,
+        workspace: ?*ReadWorkspace = null,
+        scratch: @import("result_scratch.zig").Scratch,
+        fallback: ?*Fallback = null,
+        discard_workspace: bool = false,
+        const Fallback = struct {
+            batch: read_scratch,
+            native_state: native.DocumentBatchReadState,
+        };
+        fn fallbackState(self: *@This()) !*Fallback {
+            if (self.fallback) |state| return state;
+            const a = self.scratch.arena.preferred_allocator orelse self.scratch.arena.child_allocator;
+            const state = try a.create(Fallback);
+            state.* = .{ .batch = read_scratch.init(a, 256 * 1024), .native_state = .{ .allocator = a } };
+            self.fallback = state;
+            return state;
+        }
+
+        pub fn metadataAllocator(self: *const @This(), fallback: Allocator) Allocator {
+            // Opaque caller allocators keep their own accounting/failure policy.
+            if (self.workspace == null) return fallback;
+            return self.parent.metadataAllocator(fallback);
+        }
+        pub fn metadataResidentManager(self: *const @This()) ?*resource_manager_mod.ResourceManager {
+            const store = self.parent.store orelse return null;
+            return store.metadata_pool.residentManager();
+        }
+
+        pub fn preparedScorePlan(self: *@This()) ?*@import("../prepared_score_plan.zig").PreparedScorePlan {
+            return if (self.workspace) |w| &w.score_plan else null;
+        }
+
+        pub fn preparedScoreAllocator(self: *@This()) Allocator {
+            return self.workspace.?.optionalAllocator();
+        }
+
+        pub fn workingAllocator(self: *@This()) Allocator {
+            return if (self.workspace) |w| w.graph.allocator() else self.scratch.arena.preferred_allocator orelse self.scratch.arena.child_allocator;
+        }
+        fn batchScratch(self: *@This()) !*read_scratch {
+            return if (self.workspace) |w| &w.batch else &(try self.fallbackState()).batch;
+        }
+        fn resetBatchScratch(self: *@This()) void {
+            if (self.workspace) |w| w.resetBatch() else if (self.fallback) |state| state.batch.reset();
+        }
+        fn nativeState(self: *@This()) !*native.DocumentBatchReadState {
+            const state = if (self.workspace) |w| &w.native_state else &(try self.fallbackState()).native_state;
+            if (self.parent.store) |store| state.binding = .{
+                .owner = store.score_cache_owner,
+                .generation = if (self.parent.read_generation) |g| g.owner_generation else store.assessment_generation,
+            };
+            return state;
+        }
+
+        fn resultAllocator(self: *@This()) Allocator {
+            if (self.workspace) |w| if (self.scratch.arena.preferred_allocator == null) {
+                const backing = self.scratch.arena.child_allocator;
+                self.scratch.arena.preferred_allocator = backing;
+                self.scratch.arena.child_allocator = w.resultAllocator(backing);
+            };
+            return self.scratch.allocator();
+        }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-            return self.parent.getOwned(self.scratch.allocator(), key);
+            return self.parent.getOwned(self.resultAllocator(), key);
         }
 
         pub fn getInto(self: *@This(), key: []const u8, out: []u8) ![]const u8 {
-            return self.parent.getInto(key, out);
+            if (self.parent.prefix.len == 0) return self.parent.getInto(key, out);
+            defer self.resetBatchScratch();
+            const full = try std.mem.concat((try self.batchScratch()).allocator(), u8, &.{ self.parent.prefix, key });
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const value = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                if (value.len > out.len) return error.BufferTooSmall;
+                @memcpy(out[0..value.len], value);
+                return out[0..value.len];
+            }
+            return (try self.parent.readFile()).readDocumentInto(self.parent.checkpoint, full, out);
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -2823,14 +3105,140 @@ pub const Txn = struct {
             return self.readBatch(keys, buffers, values, control);
         }
 
+        pub fn visitManySortedScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
+            const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
+            self.visitScores(keys, sink) catch |err| {
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
+                return err;
+            };
+            if (self.workspace) |w| if (w.resolved_scores.recovered_optional_failure) {
+                w.resolved_scores.recovered_optional_failure = false;
+                w.allocation_failed = previous_failure;
+            };
+        }
+
+        /// Accept only this lease's owned plan, never an arbitrary sorted flag.
+        pub fn visitPreparedScores(self: *@This(), plan: *@import("../prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
+            if (self.preparedScorePlan() != plan or !plan.valid) return error.InvalidBatch;
+            const previous_failure = self.workspace.?.allocation_failed;
+            self.readPreparedScores(plan, sink) catch |err| {
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
+                return err;
+            };
+            const w = self.workspace.?;
+            if (w.resolved_scores.recovered_optional_failure) {
+                w.resolved_scores.recovered_optional_failure = false;
+                w.allocation_failed = previous_failure;
+            }
+        }
+
+        fn readPreparedScores(self: *@This(), plan: *@import("../prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
+            if (self.parent.pending_count != 0) return self.visitScores(plan.read_keys, sink);
+            defer self.resetBatchScratch();
+            const file = try self.parent.readFile();
+            return file.visitPreparedScoresAtCheckpointWithState((try self.batchScratch()).allocator(), self.parent.checkpoint, plan, self.parent.prefix, sink, try self.nativeState());
+        }
+
+        fn visitScores(self: *@This(), keys: []const []const u8, sink: anytype) !void {
+            const complete = comptime @TypeOf(sink) == backend_types.CompleteScoreSink;
+            var unique = true;
+            if (!complete) for (keys, 0..) |key, i| {
+                if (i == 0) continue;
+                switch (std.mem.order(u8, keys[i - 1], key)) {
+                    .gt => return error.InvalidBatch,
+                    .eq => unique = false,
+                    .lt => {},
+                }
+            };
+            if (unique and self.parent.prefix.len == 0 and self.parent.pending_count == 0) {
+                defer self.resetBatchScratch();
+                const file = try self.parent.readFile();
+                const a = (try self.batchScratch()).allocator();
+                const state = try self.nativeState();
+                if (complete) return file.visitCompleteScoresAtCheckpointWithState(a, self.parent.checkpoint, keys, sink, state);
+                return file.visitScoresAtCheckpointWithState(a, self.parent.checkpoint, keys, sink, state);
+            }
+            defer self.resetBatchScratch();
+            const temporary = (try self.batchScratch()).allocator();
+            const physical_keys = try temporary.alloc([]const u8, keys.len);
+            const positions = try temporary.alloc(usize, keys.len);
+            var namespace_bytes: usize = 0;
+            if (self.parent.prefix.len != 0) for (keys, 0..) |key, index| {
+                if (!complete and index != 0 and std.mem.eql(u8, keys[index - 1], key)) continue;
+                namespace_bytes = std.math.add(usize, namespace_bytes, self.parent.prefix.len) catch return error.InvalidBatch;
+                namespace_bytes = std.math.add(usize, namespace_bytes, key.len) catch return error.InvalidBatch;
+            };
+            const encoded = try temporary.alloc(u8, namespace_bytes);
+            var encoded_offset: usize = 0;
+            var count: usize = 0;
+            var i: usize = 0;
+            while (i < keys.len) {
+                var end = i + 1;
+                if (!complete) while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {};
+                const full = if (self.parent.prefix.len == 0) keys[i] else blk: {
+                    const begin = encoded_offset;
+                    @memcpy(encoded[encoded_offset..][0..self.parent.prefix.len], self.parent.prefix);
+                    encoded_offset += self.parent.prefix.len;
+                    @memcpy(encoded[encoded_offset..][0..keys[i].len], keys[i]);
+                    encoded_offset += keys[i].len;
+                    break :blk encoded[begin..encoded_offset];
+                };
+                if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |raw| {
+                        const score = try native.decodeScore(raw);
+                        for (i..end) |index| sink.write(sink.context, index, score);
+                    } else if (complete) {
+                        for (i..end) |index| sink.write(sink.context, index, null);
+                    }
+                } else {
+                    physical_keys[count] = full;
+                    positions[count] = i;
+                    count += 1;
+                }
+                i = end;
+            }
+            if (count == 0) return;
+            const Output = struct {
+                keys: []const []const u8,
+                positions: []const usize,
+                sink: @TypeOf(sink),
+                fn write(ctx: *anyopaque, index: usize, score: if (complete) ?f64 else f64) void {
+                    const out: *@This() = @ptrCast(@alignCast(ctx));
+                    const start = out.positions[index];
+                    var end = start + 1;
+                    if (!complete) while (end < out.keys.len and std.mem.eql(u8, out.keys[start], out.keys[end])) : (end += 1) {};
+                    for (start..end) |logical| out.sink.write(out.sink.context, logical, score);
+                }
+            };
+            var output = Output{ .keys = keys, .positions = positions[0..count], .sink = sink };
+            const file = try self.parent.readFile();
+            const state = try self.nativeState();
+            if (complete) return file.visitCompleteScoresAtCheckpointWithState(temporary, self.parent.checkpoint, physical_keys[0..count], .{ .context = &output, .write = Output.write }, state);
+            return file.visitScoresAtCheckpointWithState(temporary, self.parent.checkpoint, physical_keys[0..count], .{ .context = &output, .write = Output.write }, state);
+        }
+
+        pub fn getManySortedScores(self: *@This(), keys: []const []const u8, scores: []?f64) !void {
+            if (keys.len != scores.len) return error.InvalidBatch;
+            @memset(scores, null);
+            errdefer @memset(scores, null);
+            const Output = struct {
+                scores: []?f64,
+                fn write(ctx: *anyopaque, index: usize, score: f64) void {
+                    const out: *@This() = @ptrCast(@alignCast(ctx));
+                    out.scores[index] = score;
+                }
+            };
+            var output = Output{ .scores = scores };
+            return self.visitManySortedScores(keys, .{ .context = &output, .write = Output.write });
+        }
+
         fn readBatch(self: *@This(), keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, control: ?read_admission.Port) !void {
             if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
-            defer self.batch_scratch.reset();
-            const temporary = self.batch_scratch.allocator();
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             errdefer @memset(values, null);
             if (control) |budget| try budget.checkpoint();
+            if (keys.len == 0) return;
             for (keys, 0..) |key, i| {
                 if (control) |budget| try budget.checkpoint();
                 if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
@@ -2840,7 +3248,12 @@ pub const Txn = struct {
                 if (control) |budget| try budget.checkpoint();
                 if (i == 0 or !std.mem.eql(u8, keys[i - 1], key)) unique_count += 1;
             }
-            const alloc = self.scratch.allocator();
+            defer self.resetBatchScratch();
+            const temporary = (try self.batchScratch()).allocator();
+            const alloc = if (buffers == null) self.resultAllocator() else self.scratch.allocator();
+            if (unique_count == keys.len and self.parent.prefix.len == 0 and self.parent.pending_count == 0) {
+                return (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, keys, buffers, values, try self.nativeState());
+            }
             const pending_keys = try temporary.alloc([]const u8, unique_count);
             const positions = try temporary.alloc(usize, unique_count);
             const loaded = try temporary.alloc(?[]const u8, unique_count);
@@ -2873,7 +3286,7 @@ pub const Txn = struct {
                 i = end;
             }
             if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointWithScratchAndAdmission(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], control);
+            try (try self.parent.readFile()).getDocumentsAtCheckpointWithStateAndAdmission(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], try self.nativeState(), control);
             for (loaded[0..count], positions[0..count]) |value, position| {
                 if (control) |budget| try budget.checkpoint();
                 var end = position + 1;
@@ -2894,12 +3307,19 @@ pub const Txn = struct {
         /// Invalidates all previously returned values, retaining bounded scratch.
         pub fn reset(self: *@This()) void {
             self.scratch.reset();
-            self.batch_scratch.reset();
         }
 
         pub fn close(self: *@This()) void {
             self.scratch.deinit();
-            self.batch_scratch.deinit();
+            if (self.fallback) |state| {
+                state.native_state.deinit();
+                state.batch.deinit();
+                self.workingAllocator().destroy(state);
+            }
+            if (self.workspace) |w| {
+                if (self.discard_workspace) w.discardRetainedStorage();
+                self.parent.store.?.returnWorkspace(w);
+            }
             self.* = undefined;
         }
     };
@@ -2908,7 +3328,8 @@ pub const Txn = struct {
     /// Erased adapters retain the parent automatically. Scope results are
     /// owned copies, so subsequent pending mutations cannot invalidate them.
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
-        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024) };
+        const workspace = if (self.store) |store| try store.checkoutWorkspace(allocator) else null;
+        return .{ .parent = self, .workspace = workspace, .scratch = @import("result_scratch.zig").Scratch.init(allocator, 256 * 1024) };
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -4118,6 +4539,191 @@ test "lite native docstore persists replay lanes across reopen and truncation" {
         const stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &empty_ctx, EmptyContext.handle);
         try std.testing.expectEqual(@as(u64, 0), stats.matched_entries);
     }
+}
+
+test "lite externally locked artifact capture publishes under its generation lease" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-publication-admission.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    try store.file.putIndexCatalogRecord("index/run", "contents");
+    var source = try store.openArtifactSource("index/run");
+    defer source.close();
+    var bytes: [8]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("contents", &bytes);
+}
+
+test "lite externally locked read pins wait for catalog and document publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "publication-read-admission.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    var seed = try store.beginWrite();
+    try seed.put("doc", "before");
+    try seed.commit();
+    const Writer = struct {
+        store: *Store,
+        publishing: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument("doc", "after");
+            try file.putCatalogRecord("index-metadata", "after");
+            self.publishing.store(true, .release);
+            while (!self.release.load(.acquire))
+                file.runtime().sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        fn run(self: *@This()) void {
+            self.store.submitMutationWithDurability(self, apply, false) catch |err| {
+                self.failure = err;
+                self.publishing.store(true, .release);
+            };
+        }
+    };
+    const Reader = struct {
+        store: *Store,
+        started: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.read() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn read(self: *@This()) !void {
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("after", try txn.get("doc"));
+        }
+    };
+    var writer = Writer{ .store = &store };
+    const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&writer});
+    defer {
+        writer.release.store(true, .release);
+        writer_thread.join();
+    }
+    while (!writer.publishing.load(.acquire)) std.atomic.spinLoopHint();
+    if (writer.failure) |err| return err;
+    var reader = Reader{ .store = &store };
+    const reader_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        writer.release.store(true, .release);
+        reader_thread.join();
+    };
+    while (!reader.started.load(.acquire)) std.atomic.spinLoopHint();
+    // The writer retains its native reuse lock across this interval. A read
+    // arriving here must queue, not turn an internal collision into FileBusy.
+    try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    writer.release.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+    if (reader.failure) |err| return err;
+}
+
+test "lite externally locked read pins wait for fork-inherited publication fences" {
+    const os = @import("builtin").os.tag;
+    if (os != .macos and os != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "inherited-publication-fence.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{
+        .io = io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var seed = try store.beginWrite();
+    try seed.put("doc", "committed");
+    try seed.commit();
+    store.file.releaseWriterOwnership();
+
+    var pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+    const fence = try std.Io.Dir.cwd().openFile(io, path, .{
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    var parent_fence_open = true;
+    defer if (parent_fence_open) fence.close(io);
+    const child = std.c.fork();
+    if (child == 0) {
+        // Only async-signal-safe calls after fork: the child inherits the
+        // writer's open file description, just as a concurrent process spawn
+        // does until exec closes its CLOEXEC descriptors.
+        var byte: [1]u8 = undefined;
+        const received = std.c.read(pipe[0], &byte, 1);
+        _ = std.c.close(fence.handle);
+        std.c._exit(if (received == 1) 0 else 1);
+    }
+    try std.testing.expect(child > 0);
+    fence.close(io);
+    parent_fence_open = false;
+    var child_released = false;
+    defer {
+        if (!child_released) _ = std.c.write(pipe[1], "x", 1);
+        var status: c_int = undefined;
+        _ = std.c.waitpid(child, &status, 0);
+    }
+
+    const Reader = struct {
+        store: *Store,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.read() catch |err| {
+                self.failure = err;
+            };
+            self.finished.store(true, .release);
+        }
+        fn read(self: *@This()) !void {
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("committed", try txn.get("doc"));
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Reader.run, .{&reader});
+    defer {
+        if (!child_released) {
+            _ = std.c.write(pipe[1], "x", 1);
+            child_released = true;
+        }
+        thread.join();
+    }
+    while (!reader.started.load(.acquire)) std.atomic.spinLoopHint();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    // The parent has no exclusive descriptor left, but the child still
+    // fences the inode. Read admission must wait instead of returning busy.
+    try std.testing.expect(!reader.finished.load(.acquire));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(pipe[1], "x", 1));
+    child_released = true;
+    while (!reader.finished.load(.acquire)) std.atomic.spinLoopHint();
+    if (reader.failure) |err| return err;
 }
 
 test "lite native docstore reserves one writer until abort or commit" {
@@ -6246,4 +6852,1833 @@ pub fn qualifyControlledReadBatch(control: read_admission.Port, mode: enum { tra
         try std.testing.expectEqual(values[0].?.ptr, values[1].?.ptr);
         try std.testing.expectEqual(values[4].?.ptr, values[5].?.ptr);
     }
+}
+
+test "lite scoped native batch state reuses all working allocations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "batch-scratch-perf.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var store = try Store.createWithOptions(file_budget.allocator(), path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var requested: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, &requested, 0..) |*doc, *key, *node, *request, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        request.* = key;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var scope = try txn.openReadScope(budget.allocator());
+    defer scope.close();
+    var slots: [512][8]u8 = undefined;
+    var buffers: [512][]u8 = undefined;
+    for (&slots, &buffers) |*slot, *buffer| buffer.* = slot;
+    var values: [512]?[]const u8 = undefined;
+    const direct = @hasDecl(@TypeOf(scope), "getManySortedInto");
+    if (direct) try scope.getManySortedInto(&requested, &buffers, &values) else try scope.getManySorted(&requested, &values);
+    scope.reset();
+    for (0..4) |_| {
+        try scope.getManySortedInto(&requested, &buffers, &values);
+        scope.reset();
+    }
+    const alloc_before = budget.alloc_calls;
+    const file_alloc_before = file_budget.alloc_calls;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..2000) |_| {
+        if (direct) try scope.getManySortedInto(&requested, &buffers, &values) else try scope.getManySorted(&requested, &values);
+        for (values) |value| try std.testing.expectEqualSlices(u8, &score, value.?);
+        scope.reset();
+    }
+    const batch_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    const batch_allocs = budget.alloc_calls - alloc_before;
+    const retained = budget.live;
+    try std.testing.expectEqual(alloc_before, budget.alloc_calls);
+    try std.testing.expectEqual(file_alloc_before, file_budget.alloc_calls);
+    std.debug.print("REVIEW_TOTAL file_allocations={d} scope_allocations={d} batches=2000\n", .{ file_budget.alloc_calls - file_alloc_before, batch_allocs });
+    var columns: [512]?f64 = undefined;
+    const graph_started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var retained_entries: usize = 0;
+    for (0..500) |_| {
+        var query = try store.beginRead();
+        defer query.abort();
+        _ = try @import("../../graph/score_read.zig").populate(a, &query, &.{""}, &nodes, &.{&columns});
+        for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+        retained_entries += query.snapshot_reads.count();
+    }
+    const graph_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - graph_started;
+    std.debug.print("LITE_BATCH_SCRATCH_TIMING keys=512 batches=2000 direct={any} batch_ns={d} scratch_allocations={d} retained_bytes={d} graph_queries=500 graph_ns={d} graph_retained_entries={d}\n", .{ direct, batch_ns, batch_allocs, retained, graph_ns, retained_entries });
+}
+
+test "lite pooled graph reads reuse scratch across fresh queries and isolate scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pooled-graph.aflite");
+    defer a.free(path);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 7)), .little);
+    var key_bytes: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    for (&key_bytes, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const score_read = @import("../../graph/score_read.zig");
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..105) |i| {
+        var txn = try store.beginRead();
+        defer txn.abort();
+        const before = budget.alloc_calls;
+        _ = try score_read.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+        for (columns) |score| try std.testing.expectEqual(@as(?f64, 7), score);
+        if (i >= 5) try std.testing.expectEqual(before, budget.alloc_calls);
+        try std.testing.expectEqual(@as(usize, 0), txn.snapshot_reads.count());
+    }
+    std.debug.print("LITE_POOLED_GRAPH queries=100 keys=512 scratch_allocations=0 elapsed_ns={d}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var first = try txn.openReadScope(alloc);
+    defer first.close();
+    var second = try txn.openReadScope(alloc);
+    defer second.close();
+    var third = try txn.openReadScope(alloc);
+    defer third.close();
+    try std.testing.expect(first.workspace != null and second.workspace != null);
+    try std.testing.expect(first.workspace != second.workspace);
+    try std.testing.expect(third.workspace == null);
+    const retained = try first.get(docs[0].key);
+    var score: [1]?f64 = undefined;
+    try second.getManySortedScores(&.{docs[0].key}, &score);
+    second.reset();
+    try std.testing.expectEqualSlices(u8, &raw, retained);
+}
+
+test "lite pooled query budgets admit reuse and preserve unknown allocator limits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pooled-budget.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var budget = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer budget.deinit();
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    var scope = try txn.openReadScope(arena.allocator());
+    try std.testing.expect(scope.workspace != null);
+    const bytes = try scope.workingAllocator().alloc(u8, 4096);
+    @memset(bytes, 1);
+    try std.testing.expect(budget.live_bytes >= 4096);
+    scope.close();
+    try std.testing.expectEqual(@as(u64, 0), budget.reservation_floor);
+    try std.testing.expectEqual(@as(u64, 0), budget.live_bytes);
+    var first = try txn.openReadScope(budget.allocator());
+    var second = try txn.openReadScope(budget.allocator());
+    _ = try first.workingAllocator().alloc(u8, 1024);
+    _ = try second.workingAllocator().alloc(u8, 2048);
+    first.close();
+    try std.testing.expect(budget.live_bytes >= 2048);
+    second.close();
+    try std.testing.expectEqual(@as(u64, 0), budget.live_bytes);
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 1 };
+    var denied_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer denied_manager.deinit(a);
+    var denied = resource_manager_mod.BudgetedAllocator.init(&denied_manager, .dense_search_working_set, a, 1);
+    defer denied.deinit();
+    var small = try txn.openReadScope(denied.allocator());
+    try std.testing.expect(small.workspace == null);
+    const byte = try small.workingAllocator().alloc(u8, 1);
+    small.workingAllocator().free(byte);
+    small.close();
+    try std.testing.expectEqual(@as(u64, 0), denied.live_bytes);
+    try std.testing.expectEqual(@as(u64, 0), denied.reservation_floor);
+    var tiny = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    var limited = try txn.openReadScope(tiny.allocator());
+    defer limited.close();
+    try std.testing.expect(limited.workspace == null);
+    try std.testing.expectError(error.OutOfMemory, limited.workingAllocator().alloc(u8, 1));
+}
+
+test "lite fused scores validate overlays duplicates prefixes and malformed values" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "fused-score.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "p\x00a", .value = &raw }, .{ .key = "p\x00b", .value = "bad" }, .{ .key = "p\x00d", .value = &raw } });
+    var txn = try Txn.openWriteWithPrefix(&store, "p\x00");
+    defer txn.abort();
+    try txn.put("c", &raw);
+    try txn.delete("a");
+    var scope = try txn.openReadScope(a);
+    defer scope.close();
+    var scores: [3]?f64 = undefined;
+    try scope.getManySortedScores(&.{ "a", "c", "c" }, &scores);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 2, 2 }, &scores);
+    const Output = struct {
+        scores: []?f64,
+        fn write(ctx: *anyopaque, index: usize, score: f64) void {
+            const out: *@This() = @ptrCast(@alignCast(ctx));
+            out.scores[index] = score;
+        }
+    };
+    var output = Output{ .scores = &scores };
+    const sink = backend_types.ScoreSink{ .context = &output, .write = Output.write };
+    @memset(&scores, null);
+    try scope.visitManySortedScores(&.{ "a", "c", "c" }, sink);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 2, 2 }, &scores);
+    @memset(&scores, null);
+    try scope.visitManySortedScores(&.{ "c", "d", "d" }, sink);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2, 2 }, &scores);
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.visitManySortedScores(&.{ "b", "c", "c" }, sink));
+    try std.testing.expectError(error.InvalidBatch, scope.visitManySortedScores(&.{ "c", "b", "a" }, sink));
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.getManySortedScores(&.{ "b", "c", "c" }, &scores));
+    for (scores) |score| try std.testing.expect(score == null);
+    try std.testing.expectError(error.InvalidBatch, scope.getManySortedScores(&.{ "c", "b", "a" }, &scores));
+    std.mem.writeInt(u64, &raw, @bitCast(std.math.nan(f64)), .little);
+    try txn.put("c", &raw);
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.getManySortedScores(&.{ "a", "c", "c" }, &scores));
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.visitManySortedScores(&.{ "a", "c", "c" }, sink));
+}
+
+test "lite fused graph visitors preserve reordered rows duplicate columns and erased scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "graph-sink-fanout.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [4][8]u8 = undefined;
+    const numbers = [_]f64{ 2, 5, 3, 7 };
+    for (&raw, numbers) |*value, n| std.mem.writeInt(u64, value, @bitCast(n), .little);
+    try store.file.putDocumentBatch(&.{
+        .{ .key = "p/a\x00\x00", .value = &raw[0] },
+        .{ .key = "p/b\x00\x00", .value = &raw[1] },
+        .{ .key = "q/a\x00\x00", .value = &raw[2] },
+        .{ .key = "q/b\x00\x00", .value = &raw[3] },
+    });
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const Wrapped = struct {
+        inner: *Txn,
+        pub fn openReadScope(self: *@This(), alloc: Allocator) !backend_erased.ReadScope {
+            return backend_erased.readScopeFrom(alloc, try self.inner.openReadScope(alloc));
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var wrapped = Wrapped{ .inner = &txn };
+    var scores: [4][4]?f64 = undefined;
+    const columns = [_][]?f64{ &scores[0], &scores[1], &scores[2], &scores[3] };
+    _ = try @import("../../graph/score_read.zig").populate(a, &wrapped, &.{ "q/", "p/", "q/", null }, &.{ "b", "a", "b", "missing" }, &columns);
+    try std.testing.expectEqualSlices(?f64, &.{ 7, 3, 7, null }, &scores[0]);
+    try std.testing.expectEqualSlices(?f64, &.{ 5, 2, 5, null }, &scores[1]);
+    try std.testing.expectEqualSlices(?f64, &scores[0], &scores[2]);
+    for (scores[3]) |score| try std.testing.expect(score == null);
+    const buffer = store.workspaces[0].?.score_plan.storage.?.ptr;
+    _ = try @import("../../graph/score_read.zig").populate(a, &wrapped, &.{ "q/", "p/", "q/", null }, &.{ "a", "b", "missing", "a" }, &columns);
+    try std.testing.expectEqual(buffer, store.workspaces[0].?.score_plan.storage.?.ptr);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 7, null, 3 }, &scores[0]);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 5, null, 2 }, &scores[1]);
+    try std.testing.expectEqualSlices(?f64, &scores[0], &scores[2]);
+}
+
+test "lite pooled workspace pressure reclaims idle slots and skips live scopes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "workspace-pressure.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4 * 1024 * 1024 } });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var first = try txn.openReadScope(a);
+    var second = try txn.openReadScope(a);
+    defer second.close();
+    _ = try first.workingAllocator().alloc(u8, 4096);
+    _ = try second.workingAllocator().alloc(u8, 4096);
+    first.close();
+    const before = manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes;
+    try std.testing.expect(before > 0);
+    const freed = manager.reclaimForAllocation(.lite_docstore_snapshot_cache, 4 * 1024 * 1024);
+    try std.testing.expect(freed > 0);
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes < before);
+    try std.testing.expect(second.workspace.?.busy);
+    try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.lite_docstore_snapshot_cache, 4 * 1024 * 1024));
+}
+
+test "lite workspace failed allocation returns query credit" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const workspace = try Workspace.create(backing.allocator(), null);
+    defer workspace.destroy();
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    backing.limit = backing.live;
+    try std.testing.expectError(error.OutOfMemory, workspace.allocator().alloc(u8, 4096));
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+}
+
+test "lite workspace failed resize returns query credit" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").NoResizeAllocator{ .backing = a };
+    const workspace = try Workspace.create(backing.allocator(), null);
+    defer workspace.destroy();
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    const bytes = try workspace.allocator().alloc(u8, 32);
+    defer workspace.allocator().free(bytes);
+    try std.testing.expect(!workspace.allocator().resize(bytes, 64));
+    try std.testing.expectEqual(@as(u64, 32), query.live_bytes);
+}
+
+test "lite workspace residency is not charged twice to node budget" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    const workspace = try Workspace.create(a, &manager);
+    defer workspace.destroy();
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    const bytes = workspace.allocator().alloc(u8, 96 * 1024) catch |err| {
+        std.debug.print("REVIEW_DOUBLE_CHARGE physical={d} query_charged={d} node_limit=131072 requested=98304\n", .{ workspace.live, query.live_bytes });
+        return err;
+    };
+    defer workspace.allocator().free(bytes);
+}
+
+test "lite reclaiming budgeted store backing does not recurse" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lite_docstore_snapshot_cache, a, 1);
+    defer backing.deinit();
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaiming-backing.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(backing.threadSafeAllocator(), path, .{ .io = std.testing.io, .no_sync = true, .resource_manager = &manager, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    _ = try scope.workingAllocator().alloc(u8, 4096);
+    scope.close();
+    _ = backing.releaseUnusedCreditThreadSafe();
+    manager.memory.budget.hard_limit_bytes = manager.memory.used_bytes;
+    const bytes = try backing.threadSafeAllocator().alloc(u8, 4096);
+    defer backing.threadSafeAllocator().free(bytes);
+}
+
+test "lite prepared graph plans own inputs rebind outputs and resolve new snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-snapshot.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "p/a\x00\x00", .value = &raw }, .{ .key = "q/a\x00\x00", .value = &raw } });
+    var old = try store.beginRead();
+    defer old.abort();
+    var first: [2]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    _ = try reader.populate(a, &old, &.{"p/"}, &.{ "a", "a" }, &.{&first});
+    var key: [1]u8 = .{'a'};
+    var prefix: [2]u8 = .{ 'p', '/' };
+    var second: [2]?f64 = undefined;
+    _ = try reader.populate(a, &old, &.{&prefix}, &.{ &key, &key }, &.{&second});
+    key[0] = 'b';
+    prefix[0] = 'q';
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2 }, &second);
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("p/a\x00\x00", &raw);
+        try write.delete("q/a\x00\x00");
+        try write.commit();
+    }
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    _ = try reader.populate(a, &fresh, &.{"p/"}, &.{ "a", "a" }, &.{&second});
+    try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &second);
+    _ = try reader.populate(a, &old, &.{"p/"}, &.{ "a", "a" }, &.{&first});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2 }, &first);
+    _ = try reader.populate(a, &fresh, &.{"q/"}, &.{ "a", "b" }, &.{&second});
+    try std.testing.expectEqualSlices(?f64, &.{ null, null }, &second);
+}
+
+test "lite metadata pool bounds retained nodes survives overflow and reclaims" {
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.allocator(), null);
+    var nodes: [40][]u8 = undefined;
+    for (&nodes) |*node| node.* = try alloc.alloc(u8, 16);
+    for (nodes) |node| alloc.free(node);
+    try std.testing.expectEqual(@as(usize, 16), pool.idle_count);
+    const calls = backing.alloc_calls;
+    const bytes = try alloc.alloc(u8, 16);
+    try std.testing.expectEqual(calls, backing.alloc_calls);
+    try std.testing.expect(alloc.resize(bytes, 32));
+    alloc.free(bytes.ptr[0..32]);
+    const large = try alloc.alloc(u8, 2048);
+    try std.testing.expect(!alloc.resize(large, 16));
+    alloc.free(large);
+    try std.testing.expect(pool.reclaim(std.math.maxInt(u64)) > 0);
+    try std.testing.expectEqual(@as(usize, 0), backing.live);
+}
+
+test "lite resident admission combines borrowed and allocated query demand" {
+    const a = std.testing.allocator;
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 128 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 2);
+    defer query.deinit();
+    var borrowed = try query.borrowResidentScratch(96, &manager);
+    defer borrowed.release();
+    const bytes = try query.allocator().alloc(u8, 128);
+    defer query.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 224), query.live_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, borrowed.growTo(129));
+    borrowed.shrinkTo(32);
+    try std.testing.expectEqual(@as(u64, 160), query.live_bytes);
+    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+}
+
+test "lite prepared plan allocation failures preserve ownership and bounded fallback" {
+    const Plan = @import("../prepared_score_plan.zig").PreparedScorePlan;
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var plan = Plan{};
+            defer plan.deinit();
+            try std.testing.expect(try plan.prepare(a, &.{ "q/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            try std.testing.expectEqual(@as(usize, 2), plan.read_keys.len);
+            try std.testing.expect(plan.storage.?.len <= Plan.max_bytes);
+            const pointer = plan.storage.?.ptr;
+            try std.testing.expect(try plan.prepare(a, &.{ "q/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            try std.testing.expectEqual(pointer, plan.storage.?.ptr);
+            try std.testing.expect(try plan.prepare(a, &.{ "p/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            var huge: [5000][]const u8 = undefined;
+            @memset(&huge, "a");
+            try std.testing.expect(!try plan.prepare(a, &.{"p/"}, &huge));
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "lite prepared fresh raw and erased graph allocation measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    var reversed = nodes;
+    std.mem.reverse([]const u8, &reversed);
+    var shuffled = nodes;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().shuffle([]const u8, &shuffled);
+    inline for (.{ 0, 1, 2 }) |varying| {
+        inline for (.{ false, true }) |erased| {
+            for (0..5) |_| {
+                const raw = try store.beginRead();
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+            }
+            const before = file_budget.alloc_calls;
+            const cpu_before = std.posix.getrusage(0);
+            for (0..5000) |i| {
+                const requested_nodes = if (varying == 0 or i % 2 == 1) &nodes else if (varying == 1) &reversed else &shuffled;
+                const raw = try store.beginRead();
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, requested_nodes, &.{&columns});
+                for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const cpu_after = std.posix.getrusage(0);
+            const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+            std.debug.print("LITE_PREPARED_MEASURE erased={any} varying={any} queries=5000 keys=512 cpu_us={d} file_allocations={d} scope_bytes={d}\n", .{ erased, varying, cpu_us, file_budget.alloc_calls - before, @sizeOf(Txn.ReadScope) });
+            try std.testing.expectEqual(before, file_budget.alloc_calls);
+        }
+    }
+}
+
+test "lite metadata residency is budgeted and independent of query admission" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4096 } });
+    defer manager.deinit(a);
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(a, &manager);
+    const bytes = try alloc.alloc(u8, 32);
+    alloc.free(bytes);
+    try std.testing.expect(manager.snapshot().memory.used_bytes > 32);
+    try std.testing.expect(pool.residentManager() == &manager);
+    _ = pool.reclaim(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "lite borrowed admission cannot release copied credit or adopt physical ownership" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var first = try query.borrowResidentScratch(32, &manager);
+    var stale = first;
+    var second = try query.borrowResidentScratch(64, &manager);
+    defer second.release();
+    var observed: u64 = 0;
+    try std.testing.expectError(error.ResourceAccountingMismatch, manager.adoptReservationUsage(&first.reservation, .lite_docstore_snapshot_cache, &observed, 32));
+    try std.testing.expectEqual(@as(u64, 0), observed);
+    first.release();
+    stale.release();
+    try std.testing.expectEqual(@as(u64, 64), query.live_bytes);
+    try std.testing.expectEqual(@as(u64, 64), manager.sliceStats(.dense_search_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ReservationReleased, first.growTo(1));
+}
+
+test "lite workspace nested residency charges host memory once across slices" {
+    const a = std.testing.allocator;
+    for ([_]resource_manager_mod.Slice{ .lite_docstore_snapshot_cache, .dense_source_payload_state }) |slice| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+        defer manager.deinit(a);
+        var backing = resource_manager_mod.BudgetedAllocator.init(&manager, slice, a, 1);
+        defer backing.deinit();
+        const workspace = try ReadWorkspace.create(backing.threadSafeAllocator(), &manager);
+        defer workspace.destroy();
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        try workspace.begin(&query);
+        defer workspace.end();
+        const bytes = try workspace.allocator().alloc(u8, 96 * 1024);
+        defer workspace.allocator().free(bytes);
+        try std.testing.expectEqual(backing.reservation.bytes, manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, bytes.len), query.live_bytes);
+    }
+}
+
+test "lite metadata pool concurrent reuse and pressure release preserve ownership" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(a, &manager);
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(allocator: Allocator, result: *std.atomic.Value(bool)) void {
+            for (0..100) |_| {
+                const bytes = allocator.alloc(u8, 32) catch {
+                    result.store(true, .release);
+                    return;
+                };
+                @memset(bytes, 42);
+                if (bytes[31] != 42) result.store(true, .release);
+                allocator.free(bytes);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ alloc, &failed });
+        started += 1;
+    }
+    for (0..100) |_| _ = pool.reclaim(1024);
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.active);
+    try std.testing.expect(pool.idle_count <= 16);
+    _ = pool.reclaim(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "lite prepared plan buffer reuse on misses and recovery after allocation failure" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    var plan = @import("../prepared_score_plan.zig").PreparedScorePlan{};
+    defer plan.deinit();
+    try std.testing.expectError(error.OutOfMemory, plan.prepare(budget.allocator(), &.{"p/"}, &.{"a"}));
+    budget.limit = 65536;
+    try std.testing.expect(try plan.prepare(budget.allocator(), &.{"p/"}, &.{"a"}));
+    const before = budget.alloc_calls;
+    const ptr = plan.storage.?.ptr;
+    try std.testing.expect(try plan.prepare(budget.allocator(), &.{"q/"}, &.{"b"}));
+    try std.testing.expectEqual(before, budget.alloc_calls);
+    try std.testing.expectEqual(ptr, plan.storage.?.ptr);
+    try std.testing.expect(std.mem.startsWith(u8, plan.read_keys[0], "q/b"));
+}
+
+test "lite prepared plans preserve reads that fit a small query budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "plan-query-budget.aflite");
+    defer a.free(path);
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var keys: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&keys, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    for (0..3) |_| {
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        _ = try @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+        for (columns) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+        try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+    }
+}
+
+test "lite prepared plans sort overlapping prefixes and fan out shared keys" {
+    var plan = @import("../prepared_score_plan.zig").PreparedScorePlan{};
+    defer plan.deinit();
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{ "", "a" }, &.{ "b", "ab" }));
+    try std.testing.expectEqual(@as(usize, 3), plan.read_keys.len);
+    for (plan.read_keys[1..], plan.read_keys[0 .. plan.read_keys.len - 1]) |next, previous| {
+        try std.testing.expect(std.mem.order(u8, previous, next) == .lt);
+    }
+    var first: [2]?f64 = @splat(null);
+    var second: [2]?f64 = @splat(null);
+    var output = @import("../prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &first, &second } };
+    const sink = output.sink();
+    for (0..plan.read_keys.len) |i| sink.write(sink.context, i, @floatFromInt(i + 1));
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 2 }, &first);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 1 }, &second);
+}
+
+test "lite metadata nested backing pressure skips busy owners and retries after reclaim" {
+    const Pool = @import("metadata_pool.zig").MetadataPool;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var pool = Pool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.threadSafeAllocator(), &manager);
+    const Callback = struct {
+        fn reclaim(ctx: *anyopaque, bytes: u64) u64 {
+            const p: *Pool = @ptrCast(@alignCast(ctx));
+            return p.reclaim(bytes);
+        }
+    };
+    const registration = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &pool, Callback.reclaim);
+    defer manager.unregisterReclaimer(registration);
+    const first = try alloc.alloc(u8, 16);
+    const second = try alloc.alloc(u8, 16);
+    alloc.free(first);
+    alloc.free(second);
+    _ = backing.releaseUnusedCreditThreadSafe();
+    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+    // The child holds its allocator lock while the backing allocation asks
+    // the manager to reclaim the child's idle nodes. It must fail promptly.
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 2048));
+    try std.testing.expectEqual(@as(usize, 2), pool.idle_count);
+    try std.testing.expect(manager.reclaimForAllocation(.lsm_block_table_cache, 2048) > 0);
+    const bytes = try alloc.alloc(u8, 2048);
+    alloc.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "lite prepared logical cache credit is not physical reclaim progress" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.threadSafeAllocator(), &manager);
+    const node = try alloc.alloc(u8, 16);
+    const active = try alloc.alloc(u8, 16);
+    defer alloc.free(active);
+    alloc.free(node);
+    _ = backing.releaseUnusedCreditThreadSafe();
+    var second_budget = resource_manager_mod.BudgetedAllocator.init(&manager, .lite_docstore_snapshot_cache, a, 1);
+    defer second_budget.deinit();
+    const Other = struct {
+        budget: *resource_manager_mod.BudgetedAllocator,
+        bytes: ?[]u8,
+        fn reclaim(ctx: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const bytes = self.bytes orelse return 0;
+            self.budget.allocator().free(bytes);
+            self.bytes = null;
+            return bytes.len;
+        }
+    };
+    var other = Other{ .budget = &second_budget, .bytes = try second_budget.allocator().alloc(u8, 32 * 1024) };
+    defer if (other.bytes) |bytes| second_budget.allocator().free(bytes);
+    _ = second_budget.releaseUnusedCreditThreadSafe();
+    const First = struct {
+        fn reclaim(ctx: *anyopaque, bytes: u64) u64 {
+            const p: *@import("metadata_pool.zig").MetadataPool = @ptrCast(@alignCast(ctx));
+            const freed = p.reclaim(bytes);
+            if (freed != 0) if (resource_manager_mod.BudgetedAllocator.fromAllocator(p.backing.?)) |owner| {
+                _ = owner.releaseUnusedCreditThreadSafe();
+            };
+            return freed;
+        }
+    };
+    const first_id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &pool, First.reclaim);
+    defer manager.unregisterReclaimer(first_id);
+    const second_id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &other, Other.reclaim);
+    defer manager.unregisterReclaimer(second_id);
+    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+    const before = manager.snapshot().memory.used_bytes;
+    var request = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .dense_search_working_set, a, 1);
+    defer request.deinit();
+    const result = request.threadSafeAllocator().alloc(u8, 8192);
+    if (result) |bytes| request.threadSafeAllocator().free(bytes) else |_| {}
+    const after = manager.snapshot().memory.used_bytes;
+    std.debug.print("FRESH_RECLAIM request_ok={any} physical_freed={d} remaining_idle={any} requests={d}\n", .{ if (result) |_| true else |_| false, before - after, other.bytes != null, manager.reclaim_requests.load(.monotonic) });
+    _ = try result;
+    try std.testing.expect(other.bytes == null);
+    try std.testing.expect(before - after >= 8192);
+    _ = Other.reclaim(&other, 8192);
+    const bytes = try request.threadSafeAllocator().alloc(u8, 8192);
+    request.threadSafeAllocator().free(bytes);
+}
+
+test "lite prepared namespaced prepared fallback memory floor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var keys: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&keys, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    const PlainScope = struct {
+        inner: Txn.ReadScope,
+        pub fn close(self: *@This()) void {
+            self.inner.close();
+        }
+        pub fn reset(self: *@This()) void {
+            self.inner.reset();
+        }
+        pub fn getManySorted(self: *@This(), k: []const []const u8, values: []?[]const u8) !void {
+            return self.inner.getManySorted(k, values);
+        }
+        pub fn workingAllocator(self: *@This()) Allocator {
+            return self.inner.workingAllocator();
+        }
+        pub fn visitManySortedScores(self: *@This(), k: []const []const u8, sink: backend_types.ScoreSink) !void {
+            return self.inner.visitManySortedScores(k, sink);
+        }
+    };
+    const PlainTxn = struct {
+        inner: *Txn,
+        pub fn getManySorted(self: *@This(), k: []const []const u8, values: []?[]const u8) !void {
+            return self.inner.getManySorted(k, values);
+        }
+        pub fn openReadScope(self: *@This(), allocator: Allocator) !PlainScope {
+            return .{ .inner = try self.inner.openReadScope(allocator) };
+        }
+    };
+    var regressions: usize = 0;
+    for (24..81) |step| {
+        const limit = step * 2048;
+        var successes: [2]bool = undefined;
+        for (0..2) |mode| {
+            const name = try std.fmt.allocPrint(a, "ns-{d}-{d}.aflite", .{ limit, mode });
+            defer a.free(name);
+            const path = try testPath(a, tmp, name);
+            defer a.free(path);
+            var limits = resource_manager_mod.Options.defaultBudgets();
+            limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = limit };
+            var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+            defer manager.deinit(a);
+            var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+            defer store.close();
+            try store.file.putDocumentBatch(&docs);
+            var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+            defer query.deinit();
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var columns: [512]?f64 = undefined;
+            var plain = PlainTxn{ .inner = &txn };
+            const result = if (mode == 0) @import("../../graph/score_read.zig").populate(query.allocator(), &plain, &.{""}, &nodes, &.{&columns}) else @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+            successes[mode] = if (result) |_| true else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => false,
+                else => return err,
+            };
+            if (successes[mode]) for (columns) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+        }
+        if (successes[0] and !successes[1]) {
+            regressions += 1;
+            std.debug.print("FRESH_NS_FLOOR limit={d} baseline_ok=true prepared_ok=false\n", .{limit});
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), regressions);
+}
+
+test "lite prepared namespaced graph measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    var reversed = nodes;
+    std.mem.reverse([]const u8, &reversed);
+    var shuffled = nodes;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().shuffle([]const u8, &shuffled);
+    inline for (.{0}) |varying| {
+        inline for (.{ false, true }) |erased| {
+            for (0..5) |_| {
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+            }
+            const before = file_budget.alloc_calls;
+            const cpu_before = std.posix.getrusage(0);
+            for (0..5000) |i| {
+                const requested_nodes = if (varying == 0 or i % 2 == 1) &nodes else if (varying == 1) &reversed else &shuffled;
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, requested_nodes, &.{&columns});
+                for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const cpu_after = std.posix.getrusage(0);
+            const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+            std.debug.print("LITE_NAMESPACED_MEASURE erased={any} varying={any} queries=5000 keys=512 cpu_us={d} file_allocations={d} scope_bytes={d}\n", .{ erased, varying, cpu_us, file_budget.alloc_calls - before, @sizeOf(Txn.ReadScope) });
+            try std.testing.expectEqual(@as(usize, 0), file_budget.alloc_calls - before);
+        }
+    }
+}
+
+test "lite prepared resolved scores fence namespaces vacuum and reopened owners" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "resolved-generations.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    var store_open = true;
+    defer if (store_open) store.close();
+    const reader = @import("../../graph/score_read.zig");
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "p\x00a\x00\x00", .value = &raw }});
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "q\x00a\x00\x00", .value = &raw }});
+    var scores: [2]?f64 = undefined;
+    var old = try Txn.openReadWithPrefix(&store, "p\x00");
+    var old_open = true;
+    defer if (old_open) old.abort();
+    _ = try reader.populate(a, &old, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, null }, &scores);
+    {
+        var other = try Txn.openReadWithPrefix(&store, "q\x00");
+        defer other.abort();
+        _ = try reader.populate(a, &other, &.{""}, &.{ "a", "missing" }, &.{&scores});
+        try std.testing.expectEqualSlices(?f64, &.{ 9, null }, &scores);
+    }
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "p\x00");
+        errdefer write.abort();
+        try write.put("a\x00\x00", &raw);
+        try write.put("missing\x00\x00", &raw);
+        try write.commit();
+    }
+    _ = try store.vacuum();
+    {
+        var fresh = try Txn.openReadWithPrefix(&store, "p\x00");
+        defer fresh.abort();
+        _ = try reader.populate(a, &fresh, &.{""}, &.{ "a", "missing" }, &.{&scores});
+        try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &scores);
+    }
+    _ = try reader.populate(a, &old, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, null }, &scores);
+    old.abort();
+    old_open = false;
+    const owner = store.score_cache_owner;
+    store.close();
+    store_open = false;
+    store = try Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store_open = true;
+    try std.testing.expect(store.score_cache_owner != owner);
+    var reopened = try Txn.openReadWithPrefix(&store, "p\x00");
+    defer reopened.abort();
+    _ = try reader.populate(a, &reopened, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &scores);
+}
+
+test "lite prepared optional promotion preserves successful scratch" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-retention.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    for (8..65) |step| {
+        _ = Store.reclaimIdleWorkspaces(&store, std.math.maxInt(u64));
+        manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = step * 2048;
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        var successes: usize = 0;
+        const before = counter.alloc_calls;
+        var retained: usize = 0;
+        for (0..3) |_| {
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(query.allocator());
+            var scores: [512]?f64 = undefined;
+            const result = scope.getManySortedScores(&keys, &scores);
+            if (result) |_| {
+                successes += 1;
+                for (scores) |v| try std.testing.expectEqual(@as(?f64, 3), v);
+            } else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => {},
+                else => return err,
+            }
+            scope.close();
+            retained = if (store.workspaces[0]) |w| w.live else 0;
+        }
+        if (successes == 3) try std.testing.expect(retained != 0);
+        if (successes == 3 and step == 64) std.debug.print("REVIEW_RETENTION limit={d} successful={d} allocations={d} retained={d} denials={d}\n", .{ step * 2048, successes, counter.alloc_calls - before, retained, query.denial_generation });
+    }
+}
+
+test "lite prepared mixed document cache measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+
+    inline for (.{ 0, 1 }) |varying| {
+        inline for (.{false}) |erased| {
+            for (0..5) |_| {
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+                if (varying == 1) {
+                    var scope = try txn.openReadScope(alloc);
+                    defer scope.close();
+                    var buf: [8]u8 = undefined;
+                    var values: [1]?[]const u8 = undefined;
+                    try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buf}, &values);
+                }
+            }
+            const before = file_budget.alloc_calls;
+            const cpu_before = std.posix.getrusage(0);
+            for (0..5000) |i| {
+                const requested_nodes = &nodes;
+                _ = i;
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, requested_nodes, &.{&columns});
+                if (varying == 1) {
+                    var scope = try txn.openReadScope(alloc);
+                    defer scope.close();
+                    var buf: [8]u8 = undefined;
+                    var values: [1]?[]const u8 = undefined;
+                    try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buf}, &values);
+                    try std.testing.expectEqual(@as(usize, 8), values[0].?.len);
+                }
+                for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const cpu_after = std.posix.getrusage(0);
+            const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+            std.debug.print("REVIEW_MIXED_MEASURE erased={any} varying={any} queries=5000 keys=512 cpu_us={d} file_allocations={d} scope_bytes={d}\n", .{ erased, varying, cpu_us, file_budget.alloc_calls - before, @sizeOf(Txn.ReadScope) });
+            try std.testing.expectEqual(@as(usize, 0), file_budget.alloc_calls - before);
+        }
+    }
+}
+
+test "lite prepared one store reclaim frees physical workspace" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-one-reclaimer.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var store = try Store.createWithOptions(backing.threadSafeAllocator(), path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const metadata = store.readMetadataAllocator();
+    const node = try metadata.alloc(u8, 16);
+    const active = try metadata.alloc(u8, 16);
+    defer metadata.free(active);
+    metadata.free(node);
+    const w = try ReadWorkspace.create(store.allocator, &manager);
+    w.score_plan.backing = w.allocator();
+    w.score_plan.storage = try w.allocator().alloc(u8, 32 * 1024);
+    store.workspaces[0] = w;
+    _ = backing.releaseUnusedCreditThreadSafe();
+    const before = manager.snapshot().memory.used_bytes;
+    manager.memory.budget.hard_limit_bytes = before;
+    var request = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .dense_search_working_set, a, 1);
+    defer request.deinit();
+    const first = request.threadSafeAllocator().alloc(u8, 8192);
+    if (first) |bytes| request.threadSafeAllocator().free(bytes) else |_| {}
+    const after = manager.snapshot().memory.used_bytes;
+    std.debug.print("REVIEW_ONE_OWNER success={any} physical_freed={d} idle_workspace={any}\n", .{ if (first) |_| true else |_| false, before - after, store.workspaces[0] != null });
+    _ = try first;
+    try std.testing.expect(store.workspaces[0] == null);
+    _ = Store.reclaimIdleWorkspaces(&store, std.math.maxInt(u64));
+    const second = try request.threadSafeAllocator().alloc(u8, 8192);
+    request.threadSafeAllocator().free(second);
+}
+
+test "lite prepared mixed document cache evicts under tight scope budgets" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "mixed-pressure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var repeated: [1024][]const u8 = undefined;
+    for (keys, 0..) |key, i| {
+        repeated[2 * i] = key;
+        repeated[2 * i + 1] = key;
+    }
+    var storage: [1024][8]u8 = undefined;
+    var buffers: [1024][]u8 = undefined;
+    for (&buffers, &storage) |*out, *buf| out.* = buf;
+    var values: [1024]?[]const u8 = undefined;
+    var evictions: usize = 0;
+    for (40..161) |step| {
+        if (step % 8 != 0) continue;
+        var successes: [2]bool = undefined;
+        for (0..2) |mode| {
+            _ = Store.reclaimIdleWorkspaces(&store, std.math.maxInt(u64));
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = 0;
+            var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+            defer query.deinit();
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(query.allocator());
+            defer scope.close();
+            var scores: [512]?f64 = undefined;
+            try scope.getManySortedScores(&keys, &scores);
+            const w = scope.workspace.?;
+            try std.testing.expect(w.resolved_scores.storage != null);
+            if (mode == 0) w.resolved_scores.deinit(w.allocator());
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = step * 1024;
+            const result = scope.getManySortedInto(&repeated, &buffers, &values);
+            successes[mode] = if (result) |_| true else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => false,
+                else => return err,
+            };
+            if (successes[mode]) {
+                for (values) |value| try std.testing.expectEqualSlices(u8, &raw, value.?);
+                try std.testing.expect(!w.allocation_failed);
+                if (mode == 1 and w.resolved_scores.storage == null) evictions += 1;
+            }
+        }
+        if (successes[0]) try std.testing.expect(successes[1]);
+    }
+    try std.testing.expect(evictions > 0);
+}
+
+test "lite prepared small budget streaming reuses scratch after optional plan denial" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 48 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    for (0..10) |i| {
+        const before = file_budget.alloc_calls;
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        _ = try @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+        for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+        if (i >= 5) try std.testing.expectEqual(before, file_budget.alloc_calls);
+    }
+}
+
+test "lite prepared cached scores retry after page cache eviction" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-retention.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var buffer: [8]u8 = undefined;
+    for (keys) |key| _ = try txn.getInto(key, &buffer);
+    var scope = try txn.openReadScope(query.allocator());
+    defer scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    try std.testing.expect(w.native_state.window.bytes == null);
+    const file = try txn.readFile();
+    try std.testing.expect(file.page_cache.total_bytes > 0);
+
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
+    const Output = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        counts: [512]u8 = @splat(0),
+        scores: *[512]?f64,
+        first: bool = true,
+        fn write(ctx: *anyopaque, index: usize, score: f64) void {
+            const out: *@This() = @ptrCast(@alignCast(ctx));
+            out.counts[index] += 1;
+            out.scores[index] = score;
+            if (out.first) {
+                out.first = false;
+                out.manager.slices[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].budget.hard_limit_bytes = 1;
+            }
+        }
+    };
+    var output = Output{ .manager = &manager, .scores = &scores };
+    const result = scope.visitManySortedScores(&keys, .{ .context = &output, .write = Output.write });
+    try result;
+    for (output.counts) |count| try std.testing.expectEqual(@as(u8, 1), count);
+    try std.testing.expect(!w.allocation_failed);
+    try std.testing.expect(!scope.discard_workspace);
+    for (scores) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+    const before = counter.alloc_calls;
+    try scope.getManySortedScores(&keys, &scores);
+    try std.testing.expectEqual(before, counter.alloc_calls);
+}
+
+test "lite prepared point versus batch scope measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "point-review.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][11]u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    for (&docs, &key_storage, 0..) |*doc, *key, i| {
+        @memcpy(key[0..3], "ns\x00");
+        _ = try std.fmt.bufPrint(key[3..], "{d:0>8}", .{i});
+        doc.* = .{ .key = key, .value = "document" };
+    }
+    try store.file.putDocumentBatch(&docs);
+    inline for (.{ false, true }) |batch| {
+        for (0..5) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            var buffer: [8]u8 = undefined;
+            if (batch) {
+                var values: [1]?[]const u8 = undefined;
+                try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buffer}, &values);
+                try std.testing.expectEqualStrings("document", values[0].?);
+            } else try std.testing.expectEqualStrings("document", try scope.getInto(key_storage[0][3..], &buffer));
+        }
+        const before = counter.alloc_calls;
+        const cpu_before = std.posix.getrusage(0);
+        for (0..5000) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            var buffer: [8]u8 = undefined;
+            if (batch) {
+                var values: [1]?[]const u8 = undefined;
+                try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buffer}, &values);
+                try std.testing.expectEqualStrings("document", values[0].?);
+            } else try std.testing.expectEqualStrings("document", try scope.getInto(key_storage[0][3..], &buffer));
+        }
+        const cpu_after = std.posix.getrusage(0);
+        const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+        try std.testing.expectEqual(@as(usize, 0), counter.alloc_calls - before);
+        std.debug.print("POINT_REVIEW batch={any} cpu_us={d} allocations={d}\n", .{ batch, cpu_us, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared returned documents cache pressure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "mixed-pressure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var repeated: [1024][]const u8 = undefined;
+    for (keys, 0..) |key, i| {
+        repeated[2 * i] = key;
+        repeated[2 * i + 1] = key;
+    }
+    var storage: [1024][8]u8 = undefined;
+    var buffers: [1024][]u8 = undefined;
+    for (&buffers, &storage) |*out, *buf| out.* = buf;
+    var values: [1024]?[]const u8 = undefined;
+    var evictions: usize = 0;
+
+    for (40..161) |step| {
+        if (step % 8 != 0) continue;
+        var successes: [2]bool = undefined;
+        for (0..2) |mode| {
+            _ = Store.reclaimIdleWorkspaces(&store, std.math.maxInt(u64));
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = 0;
+            var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+            defer query.deinit();
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(query.allocator());
+            defer scope.close();
+            var scores: [512]?f64 = undefined;
+            try scope.getManySortedScores(&keys, &scores);
+            const w = scope.workspace.?;
+            try std.testing.expect(w.resolved_scores.storage != null);
+            if (mode == 0) w.resolved_scores.deinit(w.allocator());
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = step * 1024;
+            const result = scope.getManySorted(&repeated, &values);
+            successes[mode] = if (result) |_| true else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => false,
+                else => return err,
+            };
+            if (successes[mode]) {
+                for (values) |value| try std.testing.expectEqualSlices(u8, &raw, value.?);
+                try std.testing.expect(!w.allocation_failed);
+                if (mode == 1 and w.resolved_scores.storage == null) evictions += 1;
+            }
+        }
+        if (successes[0]) try std.testing.expect(successes[1]);
+    }
+    try std.testing.expect(evictions > 0);
+}
+
+test "lite prepared prefix permutation measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prefix-review.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [1024][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [1024]native.DocumentMutation = undefined;
+    var score: [2][8]u8 = undefined;
+    const prefixes = [_]?[]const u8{ "m1/", "m2/" };
+    for (&score, 0..) |*raw, column| std.mem.writeInt(u64, raw, @bitCast(@as(f64, @floatFromInt(column + 3))), .little);
+    for (prefixes, 0..) |prefix, column| {
+        for (0..512) |i| {
+            const key = &key_storage[column * 512 + i];
+            @memcpy(key[0..3], prefix.?);
+            const node = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+            key[11] = 0;
+            key[12] = 0;
+            if (column == 0) nodes[i] = node;
+            docs[column * 512 + i] = .{ .key = key, .value = &score[column] };
+        }
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [2][512]?f64 = undefined;
+    inline for (.{ false, true }) |varying| {
+        for (0..5) |_| {
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            _ = try @import("../../graph/score_read.zig").populate(alloc, &txn, &prefixes, &nodes, &.{ &columns[0], &columns[1] });
+        }
+        const before = counter.alloc_calls;
+        const cpu_before = std.posix.getrusage(0);
+        for (0..5000) |iteration| {
+            const swap = varying and iteration % 2 == 1;
+            const requested = if (swap) [_]?[]const u8{ prefixes[1], prefixes[0] } else prefixes;
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            _ = try @import("../../graph/score_read.zig").populate(alloc, &txn, &requested, &nodes, &.{ &columns[0], &columns[1] });
+            for (columns, 0..) |values, column| for (values) |value| try std.testing.expectEqual(@as(?f64, @floatFromInt(3 + (if (swap) 1 - column else column))), value);
+        }
+        const cpu_after = std.posix.getrusage(0);
+        const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+        try std.testing.expectEqual(@as(usize, 0), counter.alloc_calls - before);
+        std.debug.print("PREFIX_REVIEW varying={any} cpu_us={d} allocations={d}\n", .{ varying, cpu_us, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared result eviction preserves earlier values and accounting" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "result-lifetime.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const big = try a.alloc(u8, 32 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try store.file.putDocument("large", big);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    var scope_open = true;
+    defer if (scope_open) scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const earlier = try scope.get(keys[0]);
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    _ = query.releaseUnusedCredit();
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = query.live_bytes + 24 * 1024;
+    const returned = try scope.get("large");
+    try std.testing.expectEqualSlices(u8, big, returned);
+    try std.testing.expectEqualSlices(u8, &raw, earlier);
+    try std.testing.expect(w.resolved_scores.storage == null);
+    scope.close();
+    scope_open = false;
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+}
+
+test "lite prepared unavailable resize preserves optional cache" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "result-lifetime.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const big = try a.alloc(u8, 32 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try store.file.putDocument("large", big);
+    const query_backing = Allocator{ .ptr = a.ptr, .vtable = &.{ .alloc = a.vtable.alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = a.vtable.free } };
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, query_backing, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    var scope_open = true;
+    defer if (scope_open) scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const earlier = try scope.get(keys[0]);
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    const returned = try scope.get("large");
+    try std.testing.expectEqualSlices(u8, big, returned);
+    try std.testing.expectEqualSlices(u8, &raw, earlier);
+    try std.testing.expect(w.resolved_scores.storage != null);
+    scope.close();
+    scope_open = false;
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+}
+test "lite prepared minimum result growth preserves optional cache" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "result-lifetime.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const big = try a.alloc(u8, 32 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try store.file.putDocument("large", big);
+    const query_backing = Allocator{ .ptr = a.ptr, .vtable = &.{ .alloc = a.vtable.alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = a.vtable.free } };
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, query_backing, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    defer scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const w = scope.workspace.?;
+    const cache_bytes = w.resolved_scores.storage.?.len;
+    _ = query.releaseUnusedCredit();
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = query.live_bytes + 48;
+    const minimum = try query.allocator().alloc(u8, 40);
+    try std.testing.expect(w.resolved_scores.storage != null);
+    query.allocator().free(minimum);
+    _ = query.releaseUnusedCredit();
+    const returned = try scope.get(keys[0]);
+    try std.testing.expectEqualSlices(u8, &raw, returned);
+    try std.testing.expect(w.resolved_scores.storage != null);
+    try std.testing.expectEqual(cache_bytes, w.resolved_scores.storage.?.len);
+}
+
+test "lite prepared scope closes with LIFO query backing" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-lifo.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const small: [64]u8 = @splat('a');
+    const big: [256]u8 = @splat('b');
+    try store.file.putDocumentBatch(&.{ .{ .key = "a", .value = &small }, .{ .key = "b", .value = &big } });
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var buffer: [1024]u8 align(64) = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var completed: usize = 0;
+    for (0..16) |_| {
+        var scope = try txn.openReadScope(backing.allocator());
+        defer scope.close();
+        try std.testing.expect(scope.workspace == null);
+        const first = scope.get("a") catch |err| {
+            if (err == error.OutOfMemory) break else return err;
+        };
+        try std.testing.expectEqualSlices(u8, &small, first);
+        const second = scope.get("b") catch |err| {
+            if (err == error.OutOfMemory) break else return err;
+        };
+        try std.testing.expectEqualSlices(u8, &big, second);
+        completed += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 16), completed);
+    try std.testing.expectEqual(@as(usize, 0), backing.end_index);
+}
+
+test "lite prepared owned document batch measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "owned-batch-measure.aflite");
+    defer a.free(path);
+    inline for (.{ 2048, 8192, 65536 }) |size| {
+        var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        const alloc = counter.allocator();
+        var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+        defer store.close();
+        const count = 2 * 1024 * 1024 / size;
+        var payload: [size]u8 = @splat('v');
+        var key_storage: [count][8]u8 = undefined;
+        var keys: [count][]const u8 = undefined;
+        var docs: [count]native.DocumentMutation = undefined;
+        for (&key_storage, &keys, &docs, 0..) |*key, *out, *doc, i| {
+            std.mem.writeInt(u64, key, i, .big);
+            out.* = key;
+            doc.* = .{ .key = key, .value = &payload };
+        }
+        try store.file.putDocumentBatch(&docs);
+        var values: [count]?[]const u8 = undefined;
+        for (0..5) |_| {
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            try scope.getManySorted(&keys, &values);
+        }
+        const live_before = counter.live;
+        counter.peak = live_before;
+        const before = counter.alloc_calls;
+        const cpu_before = std.posix.getrusage(0);
+        for (0..50) |_| {
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            try scope.getManySorted(&keys, &values);
+            for (values) |value| try std.testing.expectEqualSlices(u8, &payload, value.?);
+            scope.reset();
+            try std.testing.expect(scope.scratch.arena.queryCapacity() <= 256 * 1024);
+        }
+        const cpu_after = std.posix.getrusage(0);
+        const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+        try std.testing.expectEqual(live_before, counter.live);
+        std.debug.print("LITE_OWNED_MEASURE size={d} documents={d} queries=50 cpu_us={d} allocations={d} peak_bytes={d}\n", .{ size, count, cpu_us, counter.alloc_calls - before, counter.peak - live_before });
+    }
+}
+
+test "lite prepared complete delivery overwrites missing deleted duplicate and permuted outputs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "complete-prepared.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "p/a\x00\x00", .value = &raw }, .{ .key = "ns\x00p/a\x00\x00", .value = &raw } });
+    const reader = @import("../../graph/score_read.zig");
+    inline for (.{ false, true }) |erased| {
+        inline for (.{ "", "ns\x00" }) |namespace| {
+            var txn = if (erased) try backend_erased.writeTxnFrom(a, try Txn.openWriteWithPrefix(&store, namespace)) else try Txn.openWriteWithPrefix(&store, namespace);
+            defer txn.abort();
+            var columns: [3][3]?f64 = undefined;
+            for (0..3) |_| {
+                for (&columns) |*column| @memset(column, 123);
+                _ = try reader.populate(a, &txn, &.{ "p/", null, "p/" }, &.{ "b", "a", "a" }, &.{ &columns[0], &columns[1], &columns[2] });
+                try std.testing.expectEqualSlices(?f64, &.{ null, 2, 2 }, &columns[0]);
+                try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &columns[1]);
+                try std.testing.expectEqualSlices(?f64, &columns[0], &columns[2]);
+            }
+            try txn.put("p/b\x00\x00", &raw);
+            try txn.delete("p/a\x00\x00");
+            for (&columns) |*column| @memset(column, 123);
+            _ = try reader.populate(a, &txn, &.{ null, "p/", "p/" }, &.{ "a", "b", "a" }, &.{ &columns[0], &columns[1], &columns[2] });
+            try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &columns[0]);
+            try std.testing.expectEqualSlices(?f64, &.{ null, 2, null }, &columns[1]);
+            try std.testing.expectEqualSlices(?f64, &columns[1], &columns[2]);
+            try txn.put("p/b\x00\x00", "invalid");
+            try std.testing.expectError(error.InvalidGraphMetricScore, reader.populate(a, &txn, &.{ null, "p/", "p/" }, &.{ "a", "b", "a" }, &.{ &columns[0], &columns[1], &columns[2] }));
+            for (columns) |column| try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &column);
+        }
+    }
+}
+
+test "lite prepared nested query arena releases result accounting" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "nested-result-budget.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .resource_manager = &manager, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const small: [64]u8 = @splat('a');
+    const big: [256]u8 = @splat('b');
+    try store.file.putDocumentBatch(&.{ .{ .key = "a", .value = &small }, .{ .key = "b", .value = &big } });
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    for (0..16) |_| {
+        var arena = std.heap.ArenaAllocator.init(query.allocator());
+        var scope = try txn.openReadScope(arena.allocator());
+        const first = try scope.get("a");
+        const second = try scope.get("b");
+        try std.testing.expectEqualSlices(u8, &small, first);
+        try std.testing.expectEqualSlices(u8, &big, second);
+        scope.close();
+        // Arena backing retains its own chunks until the query tears down.
+        arena.deinit();
+        try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+    }
+}
+
+test "lite prepared lazy fallback clears failures and avoids empty invalid batch allocation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lazy-fallback-error.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    try store.file.putDocument("doc", "value");
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var buffer: [0]u8 = .{};
+    var backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var scope = try txn.openReadScope(backing.allocator());
+    defer scope.close();
+    try std.testing.expect(scope.workspace == null);
+    try scope.getManySorted(&.{}, &.{});
+    try scope.getManySortedInto(&.{}, &.{}, &.{});
+    var invalid: [2]?[]const u8 = .{ "stale", "stale" };
+    try std.testing.expectError(error.InvalidBatch, scope.getManySorted(&.{ "b", "a" }, &invalid));
+    try std.testing.expectEqual(@as(?[]const u8, null), invalid[0]);
+    try std.testing.expectEqual(@as(?[]const u8, null), invalid[1]);
+    try std.testing.expect(scope.fallback == null);
+    var values: [1]?[]const u8 = .{"stale"};
+    try std.testing.expectError(error.OutOfMemory, scope.getManySorted(&.{"doc"}, &values));
+    try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
+    values[0] = "stale";
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.OutOfMemory, scope.getManySortedInto(&.{"doc"}, &.{&out}, &values));
+    try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
 }

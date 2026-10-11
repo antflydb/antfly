@@ -1732,6 +1732,23 @@ pub const OwnedBatch = struct {
     null_bitmaps: [][]u8,
 
     pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
+        var columns: OwnedColumns = .{ .row_count = self.row_refs.len, .columns = self.columns, .column_names = self.column_names, .decoded_columns = self.decoded_columns, .null_bitmaps = self.null_bitmaps };
+        columns.deinit(alloc);
+        alloc.free(self.row_refs);
+        self.* = undefined;
+    }
+};
+
+/// Decoded columns retain no row identities. Page cursors create identities
+/// once, after aligning columns, for their bounded output batches.
+pub const OwnedColumns = struct {
+    row_count: usize,
+    columns: []rowsource.ColumnVector,
+    column_names: [][]u8,
+    decoded_columns: []DecodedColumn,
+    null_bitmaps: [][]u8,
+
+    pub fn deinit(self: *OwnedColumns, alloc: Allocator) void {
         for (self.column_names) |name| alloc.free(name);
         alloc.free(self.column_names);
         for (self.decoded_columns) |*column| column.deinit(alloc);
@@ -1741,7 +1758,6 @@ pub const OwnedBatch = struct {
         }
         alloc.free(self.null_bitmaps);
         alloc.free(self.columns);
-        alloc.free(self.row_refs);
         self.* = undefined;
     }
 };
@@ -2075,11 +2091,19 @@ const PlainI64ModeRequest = union(enum) {
     from_inventory,
 };
 
+pub fn admitColumnMaterialization(raw_row_count: u64, projected_column_count: usize, limits: MaterializationLimits) !usize {
+    return admitMaterializationInternal(raw_row_count, projected_column_count, limits, false);
+}
+
 pub fn admitMaterialization(
     raw_row_count: u64,
     projected_column_count: usize,
     limits: MaterializationLimits,
 ) !usize {
+    return admitMaterializationInternal(raw_row_count, projected_column_count, limits, true);
+}
+
+fn admitMaterializationInternal(raw_row_count: u64, projected_column_count: usize, limits: MaterializationLimits, include_row_refs: bool) !usize {
     try limits.validate();
     if (projected_column_count == 0) return error.InvalidParquetRowGroupBatch;
     const row_count = std.math.cast(usize, raw_row_count) orelse return error.ParquetRowGroupTooLarge;
@@ -2088,7 +2112,7 @@ pub fn admitMaterialization(
         return error.ParquetRowGroupTooLarge;
     if (projected_cells > limits.max_projected_cells) return error.ParquetRowGroupTooLarge;
 
-    var estimated_bytes = std.math.mul(usize, row_count, @sizeOf(rowsource.RowRef)) catch
+    var estimated_bytes = std.math.mul(usize, row_count, if (include_row_refs) @sizeOf(rowsource.RowRef) else 0) catch
         return error.ParquetRowGroupTooLarge;
     const column_metadata_bytes = std.math.mul(
         usize,
@@ -2154,17 +2178,49 @@ fn buildPlainI64RowGroupBatchAlloc(
     if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
-    const row_group = file.row_groups[row_group_ordinal];
-    const row_count = try admitMaterialization(limits.page_row_count orelse row_group.row_count, projected_chunks.len, limits);
-    try preflightColumnChunks(projected_chunks, row_count, limits);
-    const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
-
-    const row_refs = try alloc.alloc(rowsource.RowRef, row_count);
+    _ = try admitMaterialization(limits.page_row_count orelse file.row_groups[row_group_ordinal].row_count, projected_chunks.len, limits);
+    var decoded = try buildPlainColumnsAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, mode_request, limits);
+    errdefer decoded.deinit(alloc);
+    const row_refs = try alloc.alloc(rowsource.RowRef, decoded.row_count);
     errdefer alloc.free(row_refs);
-    for (row_refs, 0..) |*row_ref, idx| {
-        row_ref.* = try rowsource_external.makeRowRef(binding, file_id, row_group_ordinal, idx);
-    }
+    const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
+    for (row_refs, 0..) |*row_ref, idx| row_ref.* = try rowsource_external.makeRowRef(binding, file_id, row_group_ordinal, idx);
+    const batch = rowsource.ColumnBatch{ .snapshot = binding.snapshot(), .row_refs = row_refs, .columns = decoded.columns };
+    try rowsource_bridge.validateBatchAgainstInventoryAlloc(alloc, inventory, batch);
+    return .{ .batch = batch, .row_refs = row_refs, .columns = decoded.columns, .column_names = decoded.column_names, .decoded_columns = decoded.decoded_columns, .null_bitmaps = decoded.null_bitmaps };
+}
 
+/// Column-only decoding preserves the same physical interpretation and limits;
+/// an aligned cursor supplies row identities for its output instead of retaining
+/// one complete row-reference array for every physical column page.
+pub fn buildSupportedColumnsAllocWithLimits(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    limits: MaterializationLimits,
+) !OwnedColumns {
+    return buildPlainColumnsAlloc(alloc, inventory, file_id, row_group_ordinal, projected_chunks, .from_inventory, limits);
+}
+
+fn buildPlainColumnsAlloc(
+    alloc: Allocator,
+    inventory: external_source.Inventory,
+    file_id: []const u8,
+    row_group_ordinal: u32,
+    projected_chunks: []const ColumnChunkInput,
+    mode_request: PlainI64ModeRequest,
+    limits: MaterializationLimits,
+) !OwnedColumns {
+    try inventory.validate();
+    if (projected_chunks.len == 0) return error.InvalidParquetRowGroupBatch;
+    const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
+    if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
+    const row_group = file.row_groups[row_group_ordinal];
+    if (limits.page_row_count) |count| if (count > row_group.row_count) return error.ExternalSourceRowOutOfBounds;
+    const row_count = try admitColumnMaterialization(limits.page_row_count orelse row_group.row_count, projected_chunks.len, limits);
+    try preflightColumnChunks(projected_chunks, row_count, limits);
     const columns = try alloc.alloc(rowsource.ColumnVector, projected_chunks.len);
     errdefer alloc.free(columns);
     const column_names = try alloc.alloc([]u8, projected_chunks.len);
@@ -2486,21 +2542,8 @@ fn buildPlainI64RowGroupBatchAlloc(
         };
     }
 
-    const batch = rowsource.ColumnBatch{
-        .snapshot = binding.snapshot(),
-        .row_refs = row_refs,
-        .columns = columns,
-    };
-    try rowsource_bridge.validateBatchAgainstInventoryAlloc(alloc, inventory, batch);
-
-    return .{
-        .batch = batch,
-        .row_refs = row_refs,
-        .columns = columns,
-        .column_names = column_names,
-        .decoded_columns = decoded_columns,
-        .null_bitmaps = null_bitmaps,
-    };
+    try rowsource.validateColumns(columns, row_count);
+    return .{ .row_count = row_count, .columns = columns, .column_names = column_names, .decoded_columns = decoded_columns, .null_bitmaps = null_bitmaps };
 }
 
 pub fn buildRequiredPlainI64RowGroupBatchFromObjectRangeReaderAlloc(
@@ -10375,5 +10418,69 @@ test "parquet persistent request reads park physical IO and preserve denied resu
         const pins = disk.state.entries.get(std.fs.path.basename(path)).?.pin_count;
         disk.state.mutex.unlock(disk.state.io);
         try std.testing.expectEqual(@as(usize, 0), pins);
+    }
+}
+
+test "parquet wide large pages retain columns without duplicate row identities" {
+    const a = std.testing.allocator;
+    const row_count = 145186;
+    const values = try a.alloc(i64, row_count);
+    defer a.free(values);
+    for (values, 0..) |*value, index| value.* = @intCast(index);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var chunks: [12]external_source.ColumnChunk = undefined;
+    var names: [12][]const u8 = undefined;
+    var name_buffers: [12][16]u8 = undefined;
+    for (&chunks, &names, &name_buffers, 0..) |*chunk, *name, *buffer, index| {
+        name.* = try std.fmt.bufPrint(buffer, "column_{d}", .{index});
+        const offset = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, values);
+        chunk.* = .{ .column_id = @constCast(name.*), .file_offset = offset, .compressed_len = bytes.items.len - offset, .uncompressed_len = bytes.items.len - offset, .physical_type = @constCast("int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = row_count, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = row_count, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const inputs = [_]ColumnChunkInput{.{ .column_id = names[0], .bytes = bytes.items[0..chunks[0].compressed_len] }};
+    const share = 32 * 1024 * 1024 / chunks.len;
+    // Complete batches still account for their physical row-reference arrays.
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share }));
+    // Decoded payload and structural allocations have independent 32 MiB limits.
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = share * 2 };
+    var decoded = try buildSupportedColumnsAllocWithLimits(budget.allocator(), inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share });
+    defer decoded.deinit(budget.allocator());
+    try std.testing.expect(budget.peak <= share * 2);
+    std.debug.print("Column page: rows={d} peak_bytes={d} per_column_budget={d}\n", .{ row_count, budget.peak, share * 2 });
+    try std.testing.expectEqual(@as(usize, row_count), decoded.row_count);
+    try std.testing.expectEqual(@as(i64, row_count - 1), try decoded.columns[0].integerAt(row_count - 1));
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedColumnsAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = 1024 }));
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    defer reader.drain(true);
+    for ([_]bool{ false, true }) |cached| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{ .max_input_bytes = 32 * 1024 * 1024, .max_decoded_bytes = 32 * 1024 * 1024, .max_struct_allocation_bytes = 32 * 1024 * 1024 });
+        defer cursor.deinit();
+        if (cached) cursor.shared_reader = &reader;
+        var position: usize = 0;
+        while (try cursor.next()) |batch| {
+            try batch.validate();
+            try std.testing.expect(batch.rowCount() <= 4096);
+            for (batch.row_refs, 0..) |ref, index| {
+                try std.testing.expectEqual(@as(u64, position + index), ref.external.row_ordinal);
+                for (batch.columns) |column| try std.testing.expectEqual(@as(i64, @intCast(position + index)), try column.integerAt(index));
+            }
+            position += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, row_count), position);
+        try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
     }
 }

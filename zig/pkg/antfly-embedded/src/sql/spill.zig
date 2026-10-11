@@ -74,6 +74,7 @@ pub const Manager = struct {
     directory_name: [43]u8 = undefined,
     sequence: u64 = 0,
     files: usize = 0,
+    peak_files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
     /// Legacy unscoped spill children pass through this gate. Serial spill I/O must
@@ -158,6 +159,11 @@ pub const Manager = struct {
         if (bytes > self.max_bytes -| self.live_bytes) return error.SqlProgramLimitExceeded;
         self.live_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.live_bytes);
+    }
+    pub fn admissionStats(self: *Manager) struct { peak_files: usize, peak_bytes: u64, max_bytes: u64 } {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .peak_files = self.peak_files, .peak_bytes = self.peak_bytes, .max_bytes = self.max_bytes };
     }
     fn releaseBytes(self: *Manager, bytes: u64) void {
         self.lock();
@@ -267,6 +273,7 @@ pub const Manager = struct {
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
         const file = try self.performOwnedFor(execution, createPrivateFile, .{ self.dir.?, self.io, text }, discardPrivateFile, .{self.io});
         self.files += 1;
+        self.peak_files = @max(self.peak_files, self.files);
         return .{ .manager = self, .file = file, .id = self.sequence, .execution = execution };
     }
     pub fn deinit(self: *Manager) void {
@@ -3782,20 +3789,21 @@ test "SQL fused sort cohorts reserve shared file capacity for merges" {
     var dummy: u8 = 0;
     var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
-    {
-        var sorts: [8]Sort = undefined;
-        for (&sorts) |*sort| {
+    for ([_]usize{ 4, 24 }) |run_limit| {
+        var storage: [8]Sort = undefined;
+        const sorts = storage[0..if (run_limit == 4) @as(usize, 8) else 2];
+        for (sorts) |*sort| {
             sort.* = Sort.init(a, &manager, &.{.{}}, 4096);
-            sort.run_limit = 4;
+            sort.run_limit = run_limit;
             sort.parallel_runs = false;
         }
-        defer for (&sorts) |*sort| sort.deinit();
-        for (0..512) |i| for (&sorts) |*sort| {
+        defer for (sorts) |*sort| sort.deinit();
+        for (0..512) |i| for (sorts) |*sort| {
             try sort.add(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(511 - i) })}, .ordinal = i });
         };
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        for (&sorts) |*sort| {
+        for (sorts) |*sort| {
             for (0..512) |i| {
                 _ = arena.reset(.retain_capacity);
                 const row = (try sort.next(arena.allocator())).?;

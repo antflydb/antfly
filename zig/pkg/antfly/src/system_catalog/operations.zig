@@ -603,7 +603,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .resolve_many => |request| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            const result = try store.resolveSystemCatalogIdentities(alloc, svc.metadata_group_id, request);
+            const result = try store.resolveSystemCatalogIdentitiesWithContext(alloc, svc.metadata_group_id, request, context);
             defer result.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
         },

@@ -168,11 +168,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "storage-kernel query request preserves final projection while raw retrieval defers it",
         .skip = &.{
-            "api.sql_catalog.test.SQL catalog ALTER submits native schema CAS without client generations",
-            "api.sql_catalog.test.SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
-            "api.sql_catalog.test.SQL catalog DDL schema validates through native public admission",
-            "api.sql_session_overlay.test.SQL session overlay merges pages and suppresses replaced and deleted rows",
-            "api.sql_session_overlay.test.SQL session overlay preserves JSON null independently of SQL NULL",
+            // Public API parity owns these complete SQL helper namespaces.
+            "api.sql_catalog.test.",
+            "api.sql_session_overlay.test.",
+            "storage.db.table_catalog.test.",
             "api.sql_execution.test.",
             "api.sql_pgwire.test.",
             "api.sql_schema_cache.test.",
@@ -323,11 +322,24 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
+        .source = "pkg/antfly/src/capi_test_root.zig",
+        .artifact = "test",
+        .selection = "issue1015",
+        .skip = &.{
+            // C ABI regressions borrow the implementation; storage owns its tests.
+            "storage.db.db.test.",
+            "storage.db.derived.catch_up_policy.test.",
+            "storage.db.derived.io_threaded_runtime.test.",
+        },
+    },
+    .{
         .source = "pkg/antfly-embedded/src/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{
             "common.cancellation.test.",
+            "runtime_callback_abi.test.",
+            "section.typed_doc_values.test.external lake",
             "storage.",
             "common.bounded_worker_lane.",
             "common.maintenance_scheduler.",
@@ -343,7 +355,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "lake",
         .skip = &.{
             "common.config.",
-            "index.",
+            "^index.",
             "introducer.",
             // Sidecar terminology does not make engine or segment contracts Lake-owned.
             "segment.test.",
@@ -655,6 +667,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "standalone runtime module compiles",
         .skip = &.{
             "common.config.test.",
+            "system_catalog.domain.test.external lake",
         },
     },
     .{

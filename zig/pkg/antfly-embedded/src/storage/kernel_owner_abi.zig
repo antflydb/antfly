@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 89;
+pub const abi_version: u32 = 90;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -622,6 +622,9 @@ pub const MetadataProjectionRequest = extern struct {
     arg0: u64 = 0,
     arg1: u64 = 0,
     key: BorrowedBytes = .{},
+    /// Borrowed for this synchronous projection call. Deadlines use the
+    /// platform monotonic clock after conversion by the importing facade.
+    control: ControlledJsonOperationRequest = .{},
 };
 
 pub const MetadataProjectionSignalKind = enum(u32) {

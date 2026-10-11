@@ -607,3 +607,32 @@ def test_issue_1057_not_null_preserves_default_and_empty_source(require_native, 
         database.sql("CREATE TABLE required_test (id TEXT PRIMARY KEY, note TEXT NOT NULL)")
         database.sql("INSERT INTO required_test (id) SELECT 'skip' WHERE false")
         assert database.sql("SELECT id FROM required_test")["rows"] == []
+
+
+def test_shared_storage_drop_respects_other_connection_streams(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as first, af.open(aflite_path, no_sync=True) as second:
+        first.sql("CREATE TABLE numbers (n BIGINT)")
+        first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
+        with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
+            with pytest.raises(SQLStateError) as blocked:
+                first.sql("DROP TABLE numbers")
+            assert blocked.value.sqlstate == "53300"
+            assert cursor.fetch()["result"]["rows"] == [["7"]]
+        first.sql("DROP TABLE numbers")
+        second.sql("CREATE TABLE numbers (n BIGINT)")
+        assert second.sql("SELECT n FROM numbers")["rows"] == []
+
+
+def test_shared_storage_cursor_survives_other_connection_close(require_native, aflite_path):
+    first = af.create(aflite_path, no_sync=True)
+    try:
+        first.sql("CREATE TABLE numbers (n BIGINT)")
+        first.sql("INSERT INTO numbers (_id,n) VALUES ('row',7)")
+        with af.open(aflite_path, no_sync=True) as second:
+            with closing(second.sql_cursor("SELECT n FROM numbers")) as cursor:
+                first.close()
+                assert cursor.fetch()["result"]["rows"] == [["7"]]
+            second.sql("INSERT INTO numbers (_id,n) VALUES ('next',8)")
+            assert second.sql("SELECT n FROM numbers ORDER BY n")["rows"] == [["7"], ["8"]]
+    finally:
+        first.close()

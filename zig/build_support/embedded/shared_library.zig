@@ -47,7 +47,13 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         .linkage = if (macho) .static else .dynamic,
         .name = if (macho) "antfly-capi-objects" else "antfly",
         .root_module = module,
-        .max_rss = 12 * 1024 * 1024 * 1024,
+        // ELF version scripts must also hide compiler-provided Debug UBSan
+        // symbols. Use the linker that applies the final export boundary to
+        // every linked object, including those runtime objects.
+        .use_lld = if (elf) true else null,
+        // Mach-O ReleaseSafe codegen measured 12.92 GB; match the C API
+        // test estimate so fresh builds can schedule the complete archive.
+        .max_rss = @as(usize, if (macho) 14 else 12) * 1024 * 1024 * 1024,
     });
     const binary = if (macho) blk: {
         module.pic = true;

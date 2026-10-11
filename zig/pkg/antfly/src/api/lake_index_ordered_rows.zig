@@ -380,6 +380,67 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     return root;
 }
 
+/// Prove the complete retained dependency graph before trusting file fingerprints.
+/// Copy-on-write updates can keep pages without reading them, and covering data
+/// lives outside the tree. Bound individual reads and the deduplication cache,
+/// not the total index size. Lease renewal and cancellation bound execution.
+pub fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    return validateReuseWithCache(a, backend, root, context, cancellation, 4096);
+}
+fn validateReuseWithCache(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation, cache_entries: usize) !void {
+    if (cache_entries == 0) return error.InvalidNativeLakeRowIndex;
+    const Validator = struct {
+        a: A,
+        store: stores.ArtifactStore,
+        domain: [32]u8,
+        context: local.serverless_query_lake_read_context.Context,
+        cancellation: Cancellation,
+        covers: std.AutoHashMapUnmanaged([52]u8, void) = .empty,
+        check_covers: bool = false,
+        cache_entries: usize,
+        remaining_reads: u64 = tree.max_page_bytes,
+        fn check(v: *@This()) !void {
+            try v.context.ensureActive();
+            try v.cancellation.check();
+        }
+        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+            try v.check();
+            // Each authenticated page is at most max_page_bytes and child
+            // heights strictly decrease. No archive-wide read quota is needed.
+            v.remaining_reads = tree.max_page_bytes;
+            return false;
+        }
+        pub fn visit(_: *@This(), _: tree.Ref) !void {}
+        pub fn visitRecord(v: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
+            if (!v.check_covers) return;
+            try v.context.ensureActive();
+            try v.cancellation.check();
+            const cover = try coverReference(v.a, v.domain, value) orelse return;
+            defer v.a.free(cover.block.artifact_id);
+            const identity = value[18..70].*;
+            if (v.covers.contains(identity)) return;
+            try v.check();
+            var metadata = try v.store.statWithCancellationUsingAllocator(v.a, cover.block.artifact_id, v.cancellation);
+            defer metadata.deinit(v.a);
+            if (metadata.byte_len != cover.block.byte_len or !std.mem.eql(u8, metadata.artifact_id, cover.block.artifact_id) or !std.mem.eql(u8, metadata.checksum, cover.block.checksum)) return error.ArtifactIntegrityMismatch;
+            if (v.covers.count() == v.cache_entries) v.covers.clearRetainingCapacity();
+            try v.covers.put(v.a, identity, {});
+        }
+        fn pages(v: *@This(), ref: ?tree.Ref, check_covers: bool) !void {
+            v.check_covers = check_covers;
+            var writes: u64 = 0;
+            var pages_store: page_store.PageStore = .{ .domain = v.domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
+            if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
+        }
+    };
+    var validator: Validator = .{ .a = a, .store = backend, .domain = root.domain, .context = context, .cancellation = cancellation, .cache_entries = cache_entries };
+    defer validator.covers.deinit(a);
+    try validator.pages(root.page, true);
+    try validator.pages(root.reverse, false);
+    try validator.pages(root.ties, false);
+    try validator.pages(root.predicates, false);
+}
+
 /// Caller retains the leased root and store capability through cursor close.
 /// A batch is owned by its caller, including all physical identity strings.
 /// Authenticated immutable metadata owned by a decoded-cache lease. Readers
@@ -1166,4 +1227,63 @@ test "external lake warm tie pagination distinct tuples retain sequential reads"
         try std.testing.expectEqual(@as(usize, count), page.len);
         for (page, 0..) |ref, i| try std.testing.expectEqual(@as(u64, if (reverse) count - i - 1 else i), ref.external.row_ordinal);
     }
+}
+
+test "external lake ordered reuse streams beyond a page budget with bounded cover cache" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("ordered-reuse-streaming");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 8 * 1024 * 1024);
+    defer sort.deinit();
+    const key = try ca.alloc(u8, 96 * 1024);
+    @memset(key, 'x');
+    const payload = try ca.alloc(u8, 64 * 1024);
+    @memset(payload, 'v');
+    const count = 20;
+    for (0..count) |n| {
+        std.mem.writeInt(u32, key[0..4], @intCast(n), .big);
+        @memcpy(key[key.len - 16 ..], &coordinate(0, .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = n }));
+        payload[0] = @intCast(n);
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.fromJson(.{ .string = payload })}, .ordinal = n });
+    }
+    const files: []const local.serverless_external_source_types.FileEntry = &.{.{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = count, .row_groups = &.{} }};
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files) };
+    const ref = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{"value"}, .none);
+    const root = try loadRoot(ca, store, ref, .none, null);
+    try std.testing.expect(count * key.len > tree.max_page_bytes);
+    try std.testing.expect(root.page.?.height > 0);
+    // A one-entry cache must evict cover identities, without limiting the
+    // number of blocks or total pages that a healthy root can retain.
+    try validateReuseWithCache(a, store, root, .{}, .none, 1);
+    const Deadline = struct {
+        remaining: usize = 10,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.remaining == 0) return error.DeadlineExceeded;
+            self.remaining -= 1;
+        }
+    };
+    var deadline: Deadline = .{};
+    try std.testing.expectError(error.DeadlineExceeded, validateReuseWithCache(a, store, root, .{ .checkpoint = .{ .ptr = &deadline, .check = Deadline.check } }, .none, 1));
+    var reader: Reader = undefined;
+    try reader.init(a, &store, root, root.fingerprint, "", null, .none);
+    defer reader.deinit();
+    const entries = try reader.nextEntries(ca, count);
+    try std.testing.expectEqual(@as(usize, count), entries.len);
+    try std.testing.expect(!std.mem.eql(u8, entries[0].cover.?.block.artifact_id, entries[count - 1].cover.?.block.artifact_id));
+    try store.delete(entries[count - 1].cover.?.block.artifact_id);
+    try std.testing.expectError(error.FileNotFound, validateReuseWithCache(a, store, root, .{}, .none, 1));
 }

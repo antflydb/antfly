@@ -83,8 +83,8 @@ test "concurrent matrix calls keep independent outputs" {
     var results: [8]bool = undefined;
     for (&results) |*result| group.async(runtime.io(), struct {
         fn run(ok: *bool) void {
-            const a = [_]f32{1} ** (64 * 128);
-            const b = [_]f32{1} ** (128 * 64);
+            const a: [64 * 128]f32 = @splat(1);
+            const b: [128 * 64]f32 = @splat(1);
             var out: [64 * 64]f32 = undefined;
             native.sgemmSync(64, 64, 128, 1, &a, &b, 0, &out);
             ok.* = true;
@@ -100,7 +100,7 @@ test "GEMM transpose variants preserve alpha beta and layout" {
     const b = [_]f32{7,8,9,10,11,12}; // 3 x 2
     const bt = [_]f32{7,9,11,8,10,12};
     const expected = [_]f32{29.5,32.5,70,77.5};
-    var out = [_]f32{2} ** 4;
+    var out: [4]f32 = @splat(2);
     native.sgemmSync(2,2,3,0.5,&a,&b,0.25,&out);
     for (out,expected) |actual,want| try std.testing.expectApproxEqAbs(want,actual,1e-5);
     out = .{2,2,2,2};
@@ -111,7 +111,7 @@ test "GEMM transpose variants preserve alpha beta and layout" {
     for (out,expected) |actual,want| try std.testing.expectApproxEqAbs(want,actual,1e-5);
 }
 test "empty reductions scale output without reading inputs" {
-    var out = [_]f32{4} ** 6;
+    var out: [6]f32 = @splat(4);
     native.sgemmSync(2,3,0,1,&.{},&.{},0.5,&out);
     for (out) |v| try std.testing.expectEqual(@as(f32,2),v);
     native.sgemmTransBSync(2,3,0,1,&.{},&.{},0.5,&out);
@@ -123,7 +123,7 @@ test "empty reductions scale output without reading inputs" {
 test "strided output preserves padding and empty reduction" {
     const a = [_]f32{ 1, -2, 3, 4, 5, -6 };
     const b = [_]f32{ 1, 2, 3, -4, 5, 6, 7, 8, -9 };
-    var out = [_]f32{17} ** 13;
+    var out: [13]f32 = @splat(17);
     try native.sgemmTransBStrided(null, 2, 3, 3, 0.5, &a, &b, 0.25, out[1..], 6);
     for (0..2) |row| for (0..3) |col| {
         var expected: f32 = 17 * 0.25;

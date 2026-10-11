@@ -35,8 +35,10 @@ class TestRunnerSelection(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         root = Path(cls.temp.name)
         source = root / "selection.zig"
+        (root / "retirement_selection.zig").write_text('test "borrowed anchor" {}\n')
         source.write_text(
             'const std = @import("std");\n'
+            'comptime { _ = @import("retirement_selection.zig"); }\n'
             'test "enrichment split" {}\ntest "enrichment merge" {}\ntest "unrelated anchor" {}\n'
             'test "enrichment logging" { std.log.debug("quiet debug", .{}); '
             'std.log.info("quiet info", .{}); std.log.warn("visible warning", .{}); }\n'
@@ -250,6 +252,23 @@ class TestRunnerSelection(unittest.TestCase):
         self.assertEqual(result.stderr.count("TEST\t"), 1)
         self.assertIn("enrichment split", result.stderr)
 
+    def test_namespace_prefix_does_not_exclude_suffix_module(self):
+        result = subprocess.run(
+            [
+                str(self.binary),
+                "--list-tests",
+                "--suite-filter",
+                "anchor",
+                "--skip-test-filter",
+                "^selection.",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("TEST\t"), 1)
+        self.assertIn("retirement_selection.test.borrowed anchor", result.stderr)
+
     def test_anchor_cannot_satisfy_caller_filter(self):
         result = self.run_selection("--test-filter", "anchor")
         self.assertNotEqual(result.returncode, 0)
@@ -292,6 +311,27 @@ class InferenceRunnerProgress(unittest.TestCase):
     test_progress_survives_captured_output_before_exit = (
         TestRunnerSelection.test_progress_survives_captured_output_before_exit
     )
+
+    def test_namespace_prefix_does_not_exclude_suffix_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "inventory.txt"
+            result = subprocess.run(
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "anchor",
+                    "--skip-test-filter",
+                    "^selection.",
+                ],
+                capture_output=True,
+                timeout=5,
+                env={**os.environ, "ANTFLY_INFERENCE_TEST_LIST_FILE": str(output)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(
+                output.read_text().splitlines(),
+                ["retirement_selection.test.borrowed anchor"],
+            )
 
     def test_inventory_preserves_selection_without_running_tests(self):
         with tempfile.TemporaryDirectory() as directory:
