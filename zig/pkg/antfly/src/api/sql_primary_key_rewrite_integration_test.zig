@@ -29,6 +29,34 @@ const test_helpers = @import("../public_test_helpers.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
+/// Wait on the same read-only ownership proof ALTER consumes, never retry an
+/// admitted mutation or manufacture a publication receipt in the fixture.
+fn waitRelationPublication(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, name: []const u8) !void {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
+    const lookup: domain.ResolveMany = .{
+        .relations = &.{.{ .database = "default", .namespace = "public", .name = name }},
+        .include_query_definitions = true,
+    };
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        const bytes = source.systemCatalog(alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
+            error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        var snapshot = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{});
+        defer snapshot.deinit();
+        try snapshot.value.validateRelations(lookup);
+        if (snapshot.value.relations[0] == null) return error.MissingSourceRelation;
+        return;
+    }
+    return error.CatalogPublicationNotReady;
+}
+
 fn basicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -354,6 +382,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
         var after_forbidden = try std.json.parseFromSlice(std.json.Value, alloc, after_forbidden_response.body, .{});
         defer after_forbidden.deinit();
         try std.testing.expectEqualStrings(before_id, (try field(after_forbidden.value, "table_id")).string);
+        try waitRelationPublication(alloc, io, &metadata, case.name);
         var admitted = try sql(alloc, transport, &rewrite_headers, metadata_uri, alter);
         defer admitted.deinit(alloc);
         if (admitted.status != 202 and admitted.status != 409) std.debug.print("PK ALTER table={s} status={d} body={s}\n", .{ case.name, admitted.status, admitted.body });

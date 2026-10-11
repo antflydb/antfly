@@ -647,9 +647,10 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
             // Explicit empty search indexes avoids building a full-text index
             // on every SQL table. SQL indexes are added through native DDL.
             const bound_schema = try server.bindForeignKeySchema(a, target, request.physical_name.?, create.schema_json, "", identity, context);
-            if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema) and
-                try @import("relational_witness_ddl.zig").needed(a, bound_schema, ""))
-                return error.ForeignKeyPartialSupportIndexRequired;
+            // Initial FK publication owns support-index parent before/after
+            // pairs atomically with the hidden child and name reservation.
+            // Do not reject MATCH PARTIAL here or publish parent support in
+            // a separate pre-admission mutation.
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
             var parsed = try tables.parseStoredCreateTableRequest(alloc, body);

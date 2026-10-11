@@ -789,3 +789,20 @@ campaign returned HTTP 501 before publication admission (one capability test
 passed, one integration test failed). Its response-diagnostic rerun is pending;
 this is an unresolved public-path qualification failure, not successful
 distributed activation. The mounted primary-key campaign is still live.
+
+The primary-key campaign subsequently reached its first ALTER before the new
+table's relation publication was ready. The server returned the explicit
+pre-admission `53300`/503 catalog-proof diagnostic, not a mutation receipt. The
+fixture now waits with a bounded read-only `resolve_many` ownership lookup,
+validating the same relation proof ALTER uses. It does not replay DDL or fake
+catalog activation. Its corrected mounted rerun remains pending.
+
+The SQL CREATE adapter also still rejected every MATCH PARTIAL FK before
+calling the shared initial-FK builder. That older guard is removed: the builder
+already computes support definitions against a settled parent cut, and begin
+owns all exact parent before/after pairs atomically with the hidden child and
+name reservation. SQL must use that protocol, not publish parents separately
+or keep the obsolete guard. The three-voter generated-FK campaign qualifies
+this path; the current corrected run remains pending. MATCH PARTIAL is an
+existing native extension, not a claim of PostgreSQL feature parity, and no
+original-case disposition changes follow from enabling this route.
