@@ -52,6 +52,9 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
     const binary = if (macho) blk: {
         module.pic = true;
         compile.bundle_compiler_rt = true;
+        // The external Mach-O linker cannot add Zig's C/ObjC sanitizer
+        // runtime. Own it in the final archive alongside compiler-rt.
+        compile.bundle_ubsan_rt = true;
         const linker = b.option([]const u8, "macos-linker", "Mach-O linker executable (ld on macOS, ld64.lld for cross builds)") orelse
             if (b.graph.host.result.os.tag == .macos) "/usr/bin/ld" else "ld64.lld";
         const run = command(b, "link-macho");

@@ -12,6 +12,20 @@ wheels = [
 ]
 
 [[package]]
+name = "antfly-embedded"
+version = "0.1.0"
+source = { editable = "../../../py/packages/embedded" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pyright", specifier = ">=1.1.410" },
+    { name = "pytest", specifier = ">=8.4.2" },
+    { name = "ruff", specifier = ">=0.13.0" },
+]
+
+[[package]]
 name = "antfly-zig-e2e"
 version = "0.1.0"
 source = { virtual = "." }
@@ -23,6 +37,7 @@ dependencies = [
 
 [package.optional-dependencies]
 iceberg = [
+    { name = "antfly-embedded" },
     { name = "fastavro" },
     { name = "pyiceberg", extra = ["sql-sqlite"] },
 ]
@@ -33,6 +48,7 @@ lake = [
 
 [package.metadata]
 requires-dist = [
+    { name = "antfly-embedded", marker = "extra == 'iceberg'", editable = "../../../py/packages/embedded" },
     { name = "fastavro", marker = "extra == 'iceberg'", specifier = ">=1.12,<2" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'lake'", specifier = ">=3.2" },
     { name = "pyarrow", marker = "extra == 'lake'", specifier = ">=18" },
