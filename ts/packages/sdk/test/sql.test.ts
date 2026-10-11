@@ -16,11 +16,13 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
 import type {
   RelationalScalarExpression,
-  SQLBuiltinType,
   SQLArrayColumnSchema,
   SQLArrayElementType,
+  SQLBuiltinType,
+  SQLColumn,
+  SQLNumericModifier,
+  SQLPreparedResponse,
 } from "../src/index.js";
-import type { SQLPreparedResponse, SQLColumn, SQLNumericModifier } from "../src/index.js";
 
 it("exports generated NUMERIC scalar and array result modifiers", () => {
   const modifier: SQLNumericModifier = { precision: 2, scale: -3 };

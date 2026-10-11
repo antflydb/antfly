@@ -177,13 +177,15 @@ function arrayLiteralBytes(input: unknown, location: string): number {
       }
       return;
     }
-    if (typeof value !== "object" || value === null) return fail();
+    if (typeof value !== "object" || value === null) {
+      fail();
+    }
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) fail();
     charge(2);
     let first = true;
     for (const key in value)
-      if (Object.prototype.hasOwnProperty.call(value, key)) {
+      if (hasOwn.call(value, key)) {
         if (!first) charge(1);
         first = false;
         text(key);
@@ -194,6 +196,9 @@ function arrayLiteralBytes(input: unknown, location: string): number {
   visit(input, 0);
   return bytes;
 }
+
+// Preserve the SDK target while safely handling objects with no prototype.
+const hasOwn = Object.prototype.hasOwnProperty;
 
 export function isRelationalExpressionType(value: unknown): value is RelationalExpressionType {
   return typeof value === "string" && typeNames.has(value);
@@ -257,7 +262,7 @@ export function validateRelationalExpression(
     }
     if (op === "cast" && node.sql_type === undefined)
       throw new TypeError(`${location}.sql_type is required for a numeric cast`);
-    if (Object.prototype.hasOwnProperty.call(node, "numeric_modifier")) {
+    if (hasOwn.call(node, "numeric_modifier")) {
       const modifier = node.numeric_modifier;
       if (
         (node.type !== "numeric" && node.type !== "sql_array") ||
@@ -272,8 +277,8 @@ export function validateRelationalExpression(
       const fields = modifier as Record<string, unknown>;
       if (
         Object.keys(fields).length !== 2 ||
-        !Object.prototype.hasOwnProperty.call(fields, "precision") ||
-        !Object.prototype.hasOwnProperty.call(fields, "scale") ||
+        !hasOwn.call(fields, "precision") ||
+        !hasOwn.call(fields, "scale") ||
         typeof fields.precision !== "number" ||
         !Number.isInteger(fields.precision) ||
         fields.precision < 1 ||
