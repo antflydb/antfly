@@ -103,6 +103,12 @@ pub const MetadataPool = struct {
         if (!retain) self.heap().destroy(node);
     }
     pub fn reclaim(self: *@This(), target: u64) u64 {
+        // A nested backing allocator may request reclamation while our own
+        // allocator is busy. Never reenter it through a blocking free.
+        const budget = if (self.budget) |*owner| owner else null;
+        if (budget) |owner| if (!owner.allocator_mutex.tryLock()) return 0;
+        defer if (budget) |owner| owner.allocator_mutex.unlock();
+        const a = if (budget) |owner| owner.allocator() else if (self.backing) |backing| backing else return 0;
         var freed: u64 = 0;
         while (freed < target) {
             if (!self.mutex.tryLock()) break;
@@ -113,10 +119,10 @@ pub const MetadataPool = struct {
             }
             self.mutex.unlock();
             const owned = node orelse break;
-            self.heap().destroy(owned);
+            a.destroy(owned);
             freed += @sizeOf(Node);
         }
-        if (self.budget) |*budget| freed +|= budget.releaseUnusedCreditThreadSafe();
+        if (budget) |owner| freed +|= owner.releaseUnusedCredit();
         return freed;
     }
     pub fn deinit(self: *@This()) void {

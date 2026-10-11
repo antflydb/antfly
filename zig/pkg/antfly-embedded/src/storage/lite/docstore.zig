@@ -6790,3 +6790,37 @@ test "lite prepared plans sort overlapping prefixes and fan out shared keys" {
     try std.testing.expectEqualSlices(?f64, &.{ 3, 2 }, &first);
     try std.testing.expectEqualSlices(?f64, &.{ 2, 1 }, &second);
 }
+
+test "lite metadata nested backing pressure skips busy owners and retries after reclaim" {
+    const Pool = @import("metadata_pool.zig").MetadataPool;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var pool = Pool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.threadSafeAllocator(), &manager);
+    const Callback = struct {
+        fn reclaim(ctx: *anyopaque, bytes: u64) u64 {
+            const p: *Pool = @ptrCast(@alignCast(ctx));
+            return p.reclaim(bytes);
+        }
+    };
+    const registration = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &pool, Callback.reclaim);
+    defer manager.unregisterReclaimer(registration);
+    const first = try alloc.alloc(u8, 16);
+    const second = try alloc.alloc(u8, 16);
+    alloc.free(first);
+    alloc.free(second);
+    _ = backing.releaseUnusedCreditThreadSafe();
+    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+    // The child holds its allocator lock while the backing allocation asks
+    // the manager to reclaim the child's idle nodes. It must fail promptly.
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 2048));
+    try std.testing.expectEqual(@as(usize, 2), pool.idle_count);
+    try std.testing.expect(manager.reclaimForAllocation(.lsm_block_table_cache, 2048) > 0);
+    const bytes = try alloc.alloc(u8, 2048);
+    alloc.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
