@@ -80,16 +80,62 @@ pub const OwnerDecision = struct {
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
 
+    /// Bind a fresh permission response to the receiver's independently parsed
+    /// request before acquiring storage. A response for another table, owner or
+    /// attempt is not interchangeable, even if it is otherwise well formed.
+    /// This is neither transport authentication nor a cancellation lease.
+    pub fn nativeExecutionIdentity(self: OwnerDecision, request: OwnerRequest) !native_control.Identity {
+        try request.validate();
+        if (self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
+            self.disposition != .execute) return error.InvalidGenerationPublication;
+        if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
+            !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
+        if (try ownerPermission(self.head, self.owner, request.operation) != .execute) return error.GenerationPublicationChanged;
+        return (self.dispatch orelse return error.InvalidGenerationPublication).nativeIdentity(self.owner.owner);
+    }
+
+    /// Use only a binding read from the physical owner's typed inspection, not
+    /// one supplied by the RPC caller. Hot controls require no manifest/schema
+    /// projection and never choose a physical index allocation. Storage still
+    /// CASes this binding against its durable job in the effect transaction.
+    pub fn nativeControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !native_control.Command {
+        const effect: local.storage_db_relational_index_owner_job.NativeEffect = switch (request.operation) {
+            .fence => .fenced,
+            .reserve => .reserved,
+            else => return error.InvalidGenerationPublication,
+        };
+        const identity = try self.nativeExecutionIdentity(request);
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        _ = try observed.encode();
+        if (observed.authority != .native or !std.mem.eql(u8, &observed.id, &identity.id) or
+            !std.mem.eql(u8, &observed.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &observed.owner_digest, &identity.owner_digest) or observed.ordinal != identity.ordinal or
+            !observed.fence.eql(try privateIndexFence(dispatch.id, dispatch.owner)) or
+            !std.mem.eql(u8, &observed.integrity_candidate, &self.head.candidate_digest) or
+            !std.mem.eql(u8, &observed.integrity_reserved, &self.head.reservation_digest) or
+            observed.physical_reserved.schema_version != dispatch.table_guard.owner.schema_version or
+            observed.physical_candidate.schema_version != dispatch.successor_schema_version) return error.PrivateIndexOwnerJobChanged;
+        var command: native_control.Command = .{ .effect = effect, .binding = observed };
+        // Command identity is the admitted preimage even on a reserved retry;
+        // do not rewrite or regress the phase of the durable observed job.
+        command.binding.phase = .fencing;
+        try command.validate();
+        return command;
+    }
+
     /// Convert an independently authenticated admission projection, not a
     /// caller-chosen physical binding. A fresh decision remains a permission
     /// observation, not a lease against later metadata cancellation.
     pub fn nativeAdmission(self: OwnerDecision) !native_control.Admission {
-        if (self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
-            self.disposition != .execute) return error.InvalidGenerationPublication;
-        if (try ownerPermission(self.head, self.owner, .fence) != .execute) return error.GenerationPublicationChanged;
+        const identity = try self.nativeExecutionIdentity(.{
+            .table_id = self.head.table_id,
+            .group_id = self.owner.owner.group_id,
+            .id = self.head.plan_id,
+            .operation = .fence,
+            .projection = .admission,
+        });
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         const inputs = self.inputs orelse return error.InvalidGenerationPublication;
-        const identity = try dispatch.nativeIdentity(self.owner.owner);
         try inputs.requireHead(self.head);
         if (inputs.namespace_id != dispatch.namespace_id or
             !std.mem.eql(u8, inputs.before.name, dispatch.table_name) or
@@ -991,6 +1037,105 @@ test "relational index publication native dispatch binds exact admitted fence an
         .inputs = inputs.value,
     };
     const admission = try decision.nativeAdmission();
+    const request: OwnerRequest = .{
+        .table_id = plan.before.table_id,
+        .group_id = native_owner[0].range.group_id,
+        .id = plan.id,
+        .operation = .fence,
+    };
+    // The hot permission projection needs no schema-sized inputs. Admission
+    // still requires them, but control/status dispatch must bind the request.
+    var permission = decision;
+    permission.inputs = null;
+    const execution_identity = try permission.nativeExecutionIdentity(request);
+    try std.testing.expectEqual(admission.id, execution_identity.id);
+    try std.testing.expectEqual(admission.owner_digest, execution_identity.owner_digest);
+    // This synthetic binding tests only projection conversion. It is not
+    // committed storage evidence and is never signed or sent as an ACK.
+    const binding: local.storage_db_relational_index_owner_job.Binding = .{
+        .id = admission.id,
+        .plan_digest = admission.plan_digest,
+        .owner_digest = admission.owner_digest,
+        .ordinal = admission.ordinal,
+        .authority = .native,
+        .fence = admission.fence,
+        .integrity_before = admission.fence.catalog_digest,
+        .integrity_reserved = admission.reservation_digest,
+        .integrity_candidate = admission.candidate_digest,
+        .schema_before = @splat(3),
+        .physical_before = null,
+        .physical_reserved = .{ .revision = 2, .schema_version = 1, .blob_digest = @splat(4) },
+        .physical_candidate = .{ .revision = 2, .schema_version = 2, .blob_digest = @splat(5) },
+        .index = .{ .generation = 2, .slot = 0 },
+        .inputs_digest = @splat(6),
+    };
+    const fence_control = try permission.nativeControl(request, binding);
+    try std.testing.expectEqual(.fenced, fence_control.effect);
+    try std.testing.expectEqualSlices(u8, &try binding.encode(), &try fence_control.binding.encode());
+    try std.testing.expect(fence_control.inputs_b64 == null);
+    const fenced = try progress.acknowledge(permission.head, permission.owner, permission.head.revision, .{
+        .owner = permission.owner.owner,
+        .action = .fenced,
+        .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 1 } },
+        .candidate_digest = permission.head.candidate_digest,
+        .reservation_digest = permission.head.reservation_digest,
+        .evidence_digest = @splat(9),
+    });
+    var reserving = permission;
+    reserving.head = fenced.head;
+    reserving.owner = fenced.owner;
+    var reserve_request = request;
+    reserve_request.operation = .reserve;
+    var already_reserved = binding;
+    already_reserved.phase = .reserved;
+    const reserve_control = try reserving.nativeControl(reserve_request, already_reserved);
+    try std.testing.expectEqual(.reserved, reserve_control.effect);
+    try std.testing.expectEqual(.fencing, reserve_control.binding.phase);
+    try std.testing.expectEqual(.reserved, already_reserved.phase);
+    try std.testing.expectEqualSlices(u8, &try binding.encode(), &try reserve_control.binding.encode());
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeControl(reserve_request, binding));
+    var changed_binding = binding;
+    changed_binding.owner_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    changed_binding = binding;
+    changed_binding.fence.admission_epoch += 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    changed_binding = binding;
+    changed_binding.integrity_candidate[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    changed_binding = binding;
+    changed_binding.integrity_reserved[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    changed_binding = binding;
+    changed_binding.authority = .raft;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    changed_binding = binding;
+    changed_binding.physical_reserved.schema_version += 1;
+    changed_binding.physical_candidate.schema_version += 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.nativeControl(request, changed_binding));
+    var unsupported = request;
+    unsupported.operation = .cancel;
+    try std.testing.expectError(error.InvalidGenerationPublication, permission.nativeControl(unsupported, binding));
+    var wrong_request = request;
+    wrong_request.table_id += 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeExecutionIdentity(wrong_request));
+    wrong_request = request;
+    wrong_request.group_id += 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeExecutionIdentity(wrong_request));
+    wrong_request = request;
+    wrong_request.id[0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeExecutionIdentity(wrong_request));
+    wrong_request = request;
+    wrong_request.operation = .reserve;
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeExecutionIdentity(wrong_request));
+    permission.disposition = .acknowledged;
+    try std.testing.expectError(error.InvalidGenerationPublication, permission.nativeExecutionIdentity(request));
+    permission = decision;
+    permission.metadata_group_id = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, permission.nativeExecutionIdentity(request));
+    permission = decision;
+    permission.metadata_incarnation = @splat(0);
+    try std.testing.expectError(error.InvalidGenerationPublication, permission.nativeExecutionIdentity(request));
     try std.testing.expectEqual(plan.id, admission.id);
     try std.testing.expectEqual(prepared.head.plan_digest, admission.plan_digest);
     try std.testing.expectEqual(prepared.owners[0].owner.fence_digest, admission.owner_digest);

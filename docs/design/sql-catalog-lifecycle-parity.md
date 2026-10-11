@@ -2250,3 +2250,21 @@ without another JSON parse; their negative assertions pass in this run.
 Optimized qualification remains pending. Authenticated RPC execution,
 root-attested ACKs and the later lifecycle phases remain required; public
 publication and the original SQL inventory remain unchanged.
+
+### Request-bound native owner controls (in qualification)
+
+The permission conversion now binds the independently parsed receiver request
+to the exact table, owner group, publication ID and permitted phase before any
+owner acquisition. Hot control conversion needs no admission inputs. It accepts
+only fence/reserve operations and a binding obtained from typed physical-owner
+inspection, checks its complete canonical fence and both admitted catalog
+fingerprints, and retains the owner's physical allocation unchanged. Reserved
+retries use the admitted command preimage without regressing durable job state.
+Storage still verifies/CASes the actual binding; neither this conversion nor a
+fresh metadata observation is authentication or a cancellation lease.
+
+Focused assertions cover substituted request identities, wrong phases,
+acknowledged responses, invalid metadata identity, altered durable bindings and
+reserved retries. These are projection tests, not signed or committed owner
+evidence. Execution qualification is pending. The public producer, failed-build
+atomicity gate and SQL inventory remain unchanged.
