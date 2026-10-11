@@ -353,7 +353,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
                 try summaries.appendSlice(ca, group.summaries);
                 try segments.appendSlice(ca, group.segments);
-                file_manifests[file_ordinal] = try publishFileManifest(a, ca, store, group.*, cancellation);
+                file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
                 continue;
             }
             const first_segment = segments.items.len;
@@ -363,9 +363,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
-            const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
+            const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
             defer rows.deinit(a);
-            while (try rows.next(a)) |batch| {
+            while (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) |batch| {
                 for (batch.row_refs, 0..) |ref, row| {
                     try provider.context.ensureActive();
                     try cancellation.check();
@@ -390,26 +390,26 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
                     if (builder.batch().docs.len != before) {
                         if (ref != .external) return error.InvalidNativeLakeTextCorpus;
-                        try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
+                        ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
-            try ordinals.flush();
+            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
+            ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
             group.summaries = try ca.dupe(?statistics.Ref, summaries.items[first_segment..]);
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
-            file_manifests[file_ordinal] = try publishFileManifest(a, ca, store, group.*, cancellation);
-            global_statistics = try updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation);
+            file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
+            global_statistics = updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation) catch |err| return buildFailure(err, "file_statistics", file_ordinal, segments.items.len);
             // This non-serving checkpoint has internally consistent file/DF
             // roots, including retained old files awaiting replacement.
             if (provider.progress != null) {
@@ -471,22 +471,23 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
     defer a.free(encoded);
     return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+    const encoded = mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", file_ordinal, segments.items.len);
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {
         try cancellation.check();
         if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
-        const ref = try @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation);
-        try summaries.append(out, try statistics.publishSegment(a, store, bytes, cancellation));
+        const ref = @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
+        const summary = statistics.publishSegment(a, store, bytes, cancellation) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
+        try summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 }
@@ -509,3 +510,8 @@ const StatisticsCheckpoint = struct {
         try self.cancellation.check();
     }
 };
+
+fn buildFailure(err: anyerror, stage: []const u8, file_ordinal: usize, completed_segments: usize) anyerror {
+    if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake text construction deferred stage={s} file_index={d} completed_segments={d} err={s}", .{ stage, file_ordinal, completed_segments, @errorName(err) });
+    return err;
+}

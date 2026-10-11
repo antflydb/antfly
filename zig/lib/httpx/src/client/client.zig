@@ -6479,3 +6479,71 @@ test "client body replay preserves method safety after truncation" {
         }
     }
 }
+
+test "HTTPS client uploads large immutable packs without truncation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const port = try reserveEphemeralPort(io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    const script =
+        \\import socket, ssl, sys
+        \\context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        \\context.load_cert_chain('cert.pem', 'key.pem')
+        \\listener = socket.socket()
+        \\listener.bind(('127.0.0.1', int(sys.argv[1])))
+        \\listener.listen()
+        \\raw, _ = listener.accept()
+        \\with context.wrap_socket(raw, server_side=True) as connection:
+        \\    connection.settimeout(3)
+        \\    for _ in range(3):
+        \\        data = b''
+        \\        while b'\r\n\r\n' not in data:
+        \\            chunk = connection.recv(4096)
+        \\            if not chunk:
+        \\                raise RuntimeError('Truncated request headers')
+        \\            data += chunk
+        \\        headers, body = data.split(b'\r\n\r\n', 1)
+        \\        length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
+        \\        while len(body) < length:
+        \\            chunk = connection.recv(min(65536, length-len(body)))
+        \\            if not chunk:
+        \\                raise RuntimeError('Truncated request body')
+        \\            body += chunk
+        \\        assert body == b'*' * length
+        \\        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
+        \\listener.close()
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(Io.Duration.fromMilliseconds(1000), .awake);
+    const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
+    defer allocator.free(url);
+    var client = Client.initWithConfig(allocator, io, .{
+        .keep_alive = true,
+        .verify_ssl = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+    });
+    defer client.deinit();
+    for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
+        const body = try allocator.alloc(u8, size);
+        defer allocator.free(body);
+        @memset(body, '*');
+        var response = try client.post(url, .{ .body = body });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings("ok", response.body orelse "");
+    }
+}
