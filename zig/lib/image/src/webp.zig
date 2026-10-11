@@ -514,7 +514,7 @@ const Vp8MacroblockGrid = struct {
     height: u32,
 };
 
-const Vp8FramePlanes = struct {
+pub const Vp8FramePlanes = struct {
     y: []u8,
     u: []u8,
     v: []u8,
@@ -1126,13 +1126,13 @@ fn vp8ApplyLoopFilter(planes: *Vp8FramePlanes, syntax: Vp8FirstPartitionSyntax, 
     }
 }
 
-fn assembleVp8KeyframeRgba(
+fn assembleVp8KeyframePlanes(
     alloc: Allocator,
     frame: Vp8FrameHeader,
     control: Vp8KeyframeControl,
     token_partitions: []const []const u8,
     luma4_probs: *const Vp8Luma4Probs,
-) !DecodedImage {
+) !Vp8FramePlanes {
     if (frame.horizontal_scale != 0 or frame.vertical_scale != 0) return error.UnsupportedWebpFormat;
     if (control.syntax.color_space) return error.UnsupportedWebpFormat;
     if (token_partitions.len != control.syntax.token_partition_count) return error.WebpDecodeFailed;
@@ -1205,9 +1205,36 @@ fn assembleVp8KeyframeRgba(
     }
 
     try vp8ApplyLoopFilter(&planes, control.syntax, filter_infos, grid);
-    const decoded = try vp8PlanesToRgbaAlloc(alloc, planes);
-    planes.deinit(alloc);
-    return decoded;
+    return planes;
+}
+
+fn assembleVp8KeyframeRgba(
+    alloc: Allocator,
+    frame: Vp8FrameHeader,
+    control: Vp8KeyframeControl,
+    token_partitions: []const []const u8,
+    luma4_probs: *const Vp8Luma4Probs,
+) !DecodedImage {
+    var planes = try assembleVp8KeyframePlanes(alloc, frame, control, token_partitions, luma4_probs);
+    defer planes.deinit(alloc);
+    return vp8PlanesToRgbaAlloc(alloc, planes);
+}
+
+/// Raw VP8 displayed keyframes, without a WebP/RIFF envelope or RGB conversion.
+/// Reference-dependent interframes are explicitly unsupported. The caller may
+/// impose a counting allocator to bound padded planes and entropy workspace.
+pub fn decodeVp8KeyframePlanesLimited(alloc: Allocator, payload: []const u8, limits: DecodeLimits) !Vp8FramePlanes {
+    if (payload.len < 3) return error.WebpDecodeFailed;
+    if (payload[0] & 1 != 0) return error.UnsupportedVp8Interframe;
+    const frame = try parseVp8FrameHeader(payload);
+    if (frame.version > 3 or !frame.show_frame) return error.UnsupportedWebpFormat;
+    try limits.validate(frame.width, frame.height);
+    const first_partition_size: usize = @intCast(frame.first_partition_size);
+    if (first_partition_size > payload.len - vp8_keyframe_header_len) return error.WebpDecodeFailed;
+    const control = try parseVp8KeyframeControl(payload[vp8_keyframe_header_len..][0..first_partition_size]);
+    const partitions = try parseVp8PartitionInfo(alloc, payload, control.syntax.token_partition_count);
+    defer alloc.free(partitions.token_partitions);
+    return assembleVp8KeyframePlanes(alloc, frame, control, partitions.token_partitions, &vp8_default_luma4_probs);
 }
 
 fn assembleVp8KeyframeDefaultRgba(

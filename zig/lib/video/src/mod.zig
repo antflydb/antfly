@@ -1,8 +1,23 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub const vp8 = @import("vp8.zig");
 pub const software = @import("software.zig");
 pub const h264_dynamic = @import("h264_dynamic.zig");
 pub const h264 = @import("h264.zig");
+pub const h264_sparse = @import("h264_sparse.zig");
 pub const mjpeg_metal = @import("mjpeg_metal.zig");
 pub const mjpeg = @import("mjpeg.zig");
 pub const capabilities = @import("capabilities.zig");
@@ -15,6 +30,8 @@ pub const apple_jobs = @import("apple_jobs.zig");
 pub const sampling = @import("sampling.zig");
 test {
     _ = avc;
+    _ = vp8;
+    _ = h264_sparse;
     _ = @import("h264_test.zig");
     _ = @import("h264_fuzz_test.zig");
     _ = @import("mjpeg_test.zig");

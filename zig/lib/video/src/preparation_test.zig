@@ -1,13 +1,86 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const media = @import("antfly_media");
 const apple = @import("backends/apple.zig");
 const prep = @import("preparation.zig");
 extern fn av_test_device_create() ?*anyopaque;
 extern fn av_test_device_destroy(*anyopaque) void;
+extern fn av_test_p010_surface_create([*]const u8, u32, u32, c_int) ?*anyopaque;
 const clip = @embedFile("../testdata/prepare-sdr.mp4");
 const a = std.testing.allocator;
+test "video Metal P010 CVPixelBuffer imports preserve ten-bit samples and ownership" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try prep.Metal.init(device);
+    defer metal.deinit();
+    const width = 32;
+    const height = 24;
+    var bytes: [width * height * 3]u8 = undefined;
+    for (0..bytes.len / 2) |index| {
+        // Independent right-aligned reference below includes clipping extremes
+        // and values between the eight-bit grid, with non-neutral chroma.
+        const value: u16 = @intCast((index * 37 + 13) % 1024);
+        std.mem.writeInt(u16, bytes[index * 2 ..][0..2], value << 6, .little);
+    }
+    var aligned = bytes;
+    for (0..aligned.len / 2) |index| {
+        const value = std.mem.readInt(u16, aligned[index * 2 ..][0..2], .little) >> 6;
+        std.mem.writeInt(u16, aligned[index * 2 ..][0..2], value, .little);
+    }
+    for ([_]bool{ false, true }) |full| for (std.enums.values(prep.Rotation)) |rotation| {
+        const pixel = av_test_p010_surface_create(&bytes, width, height, @intFromBool(full)) orelse return error.SurfaceMappingFailed;
+        var surface = apple.Surface.fromBorrowed(pixel) catch |err| {
+            av_test_surface_destroy(pixel);
+            return err;
+        };
+        av_test_surface_destroy(pixel);
+        var surface_live = true;
+        defer if (surface_live) surface.deinit();
+        const options = prep.Options{ .width = 48, .height = 48, .matrix = if (full) .bt601 else .bt709, .rotation = rotation };
+        const reference_host = prep.HostSurface{ .width = width, .height = height, .bit_depth = 10, .format = if (full) .nv12_full else .nv12_video, .planes = .{
+            .{ .bytes = aligned[0 .. width * height * 2], .stride = width * 2, .width = width, .height = height },
+            .{ .bytes = aligned[width * height * 2 ..], .stride = width * 2, .width = width / 2, .height = height / 2 },
+        } };
+        const expected = try prep.referenceHost(a, reference_host, options, .{});
+        defer a.free(expected);
+        const mapped = try prep.reference(a, &surface, options, .{});
+        defer a.free(mapped);
+        try std.testing.expectEqualSlices(f32, expected, mapped);
+        var staged = blk: {
+            var mapping = try surface.map();
+            defer mapping.deinit();
+            break :blk try metal.submitHost(a, .{ .width = width, .height = height, .format = surface.format, .bit_depth = 10, .planes = mapping.planes }, options, .{});
+        };
+        defer staged.deinit();
+        var result = try metal.submit(a, &surface, options, .{});
+        defer result.deinit();
+        surface.deinit();
+        surface_live = false;
+        try result.wait(std.testing.io, .{});
+        const actual = try result.readback(a);
+        defer a.free(actual);
+        for (actual, expected) |got, want| try std.testing.expectApproxEqAbs(want, got, 2.0 / 255.0 + 1e-6);
+        try staged.wait(std.testing.io, .{});
+        const staged_values = try staged.readback(a);
+        defer a.free(staged_values);
+        for (staged_values, expected) |got, want| try std.testing.expectApproxEqAbs(want, got, 2.0 / 255.0 + 1e-6);
+    };
+}
 test "video Metal quantized bicubic patch preparation matches CPU with rotation and color policies" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
@@ -21,19 +94,21 @@ test "video Metal quantized bicubic patch preparation matches CPU with rotation 
     defer batch.deinit();
     inline for (std.meta.tags(prep.Rotation)) |rotation| {
         inline for (std.meta.tags(prep.Matrix)) |matrix| {
-            const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .rotation = rotation };
-            const expected = try prep.reference(a, &batch.frames[0].surface, options, .{});
-            defer a.free(expected);
-            var result = try metal.submit(a, &batch.frames[0].surface, options, .{});
-            defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 0), result.rgba_staging_bytes);
-            try result.wait(std.testing.io, .{});
-            _ = try result.buffer();
-            const actual = try result.readback(a);
-            defer a.free(actual);
-            try std.testing.expectEqual(expected.len, actual.len);
-            try std.testing.expectEqual(@as(usize, 2), result.geometry.soft_tokens);
-            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2.0 / 255.0 + 1e-6);
+            inline for (std.meta.tags(prep.RgbRounding)) |rounding| {
+                const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .rotation = rotation, .rgb_rounding = rounding };
+                const expected = try prep.reference(a, &batch.frames[0].surface, options, .{});
+                defer a.free(expected);
+                var result = try metal.submit(a, &batch.frames[0].surface, options, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 0), result.rgba_staging_bytes);
+                try result.wait(std.testing.io, .{});
+                _ = try result.buffer();
+                const actual = try result.readback(a);
+                defer a.free(actual);
+                try std.testing.expectEqual(expected.len, actual.len);
+                try std.testing.expectEqual(@as(usize, 2), result.geometry.soft_tokens);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2.0 / 255.0 + 1e-6);
+            }
         }
     }
 }

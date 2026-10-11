@@ -250,3 +250,10 @@ changes with predicted P-skip samples, plus non-IDR intra geometry epochs. Hashe
 are checked against known samples and independent canonical IDR FFmpeg decodes;
 the combined non-IDR transition streams are explicitly qualified extensions,
 not claimed to be conforming SPS activation within one coded video sequence.
+
+
+`vp8-keyframes.webm` contains three generated 48×32 displayed VP8 keyframes.
+`vp8-keyframes.yuv` is independent FFmpeg-decoded planar YUV420 for exact decoder
+comparison. `vp8-keyframes.json` records generation/decoding commands, tool
+version, byte sizes and SHA-256 hashes. These generated fixtures contain no
+third-party media and qualify no VP8 interframe tools.

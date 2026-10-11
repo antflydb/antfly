@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "apple_video.h"
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -138,12 +151,15 @@ int32_t av_metal_import(void *cache, void *pixel, void **out) {
     if (!cache || !pixel || CVPixelBufferGetPlaneCount(pixel) != 2) return paramErr;
     OSType format = CVPixelBufferGetPixelFormatType(pixel);
     if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-        format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) return paramErr;
+        format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        format != kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange &&
+        format != kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) return paramErr;
+    const bool high = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
     AVImport *p = calloc(1, sizeof(*p)); if (!p) return memFullErr;
     p->pixel = CVPixelBufferRetain(pixel);
     for (size_t i = 0; i < 2; ++i) {
         CVReturn status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
-            ((AVMetal *)cache)->cache, pixel, NULL, i ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm,
+            ((AVMetal *)cache)->cache, pixel, NULL, high ? (i ? MTLPixelFormatRG16Unorm : MTLPixelFormatR16Unorm) : (i ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm),
             CVPixelBufferGetWidthOfPlane(pixel, i), CVPixelBufferGetHeightOfPlane(pixel, i), i, &p->planes[i]);
         if (status) { av_metal_import_release(p); return status; }
     }

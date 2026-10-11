@@ -58,9 +58,26 @@ def verify_reference(directory):
             raise ValueError(
                 f"reference implementation differs from pinned commit: {relative}"
             )
+    verify_checkpoint(directory)
+
+
+def verify_checkpoint(directory):
+    """Verify consumed artifacts without importing PyTorch on native hosts."""
     receipt = json.loads((directory / "embeddinggemma2_receipt.json").read_text())
     if receipt["revision"] != REVISION or receipt["model"] != MODEL:
         raise ValueError("reference checkpoint is not the pinned official revision")
+    required = {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+        "model.safetensors",
+        "config_sentence_transformers.json",
+        "1_Pooling/config.json",
+    }
+    names = [entry["path"] for entry in receipt["files"]]
+    if len(names) != len(set(names)) or not required.issubset(names):
+        raise ValueError("incomplete checkpoint receipt")
     for entry in receipt["files"]:
         relative = Path(entry["path"])
         if relative.is_absolute() or ".." in relative.parts:

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const media = @import("antfly_media");
 const video = @import("mod.zig");
@@ -253,13 +266,13 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
     defer metal.deinit();
     const width = 80;
     const height = 64;
-    for ([_]u8{ 8, 10, 14 }) |depth| {
-        for ([_]u8{ 1, 2, 3 }) |chroma| {
+    for ([_]u8{ 8, 10, 12, 14 }) |depth| {
+        for ([_]u8{ 0, 1, 2, 3 }) |chroma| {
             const sample_bytes: usize = if (depth == 8) 1 else 2;
-            const cw: usize = if (chroma == 3) width else width / 2;
-            const ch: usize = if (chroma == 1) height / 2 else height;
+            const cw: usize = if (chroma == 0) 0 else if (chroma == 3) width else width / 2;
+            const ch: usize = if (chroma == 0) 0 else if (chroma == 1) height / 2 else height;
             const ys = width * sample_bytes + 8;
-            const uvs = cw * 2 * sample_bytes + 8;
+            const uvs = if (chroma == 0) 0 else cw * 2 * sample_bytes + 8;
             const y = try a.alloc(u8, ys * height);
             defer a.free(y);
             const uv = try a.alloc(u8, uvs * ch);
@@ -274,8 +287,8 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
                 const value: u16 = @intCast((row * 23 + x * 61 + 53) % (@as(usize, 1) << @as(u4, @intCast(depth))));
                 if (depth == 8) uv[row * uvs + x] = @intCast(value) else std.mem.writeInt(u16, uv[row * uvs + x * 2 ..][0..2], value, .little);
             };
-            for (std.enums.values(video.preparation.Rotation)) |rotation| for ([_]bool{ false, true }) |full| {
-                const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = if (full) .bt601 else .bt709, .centered = full };
+            for (std.enums.values(video.preparation.RgbRounding)) |rounding| for (std.enums.values(video.preparation.Rotation)) |rotation| for ([_]bool{ false, true }) |full| {
+                const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = if (full) .bt601 else .bt709, .centered = full, .rgb_rounding = rounding };
                 const host = video.preparation.HostSurface{ .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .format = if (full) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = y, .width = width, .height = height, .stride = ys }, .{ .bytes = uv, .width = cw, .height = ch, .stride = uvs } } };
                 const expected = try video.preparation.referenceHost(a, host, options, .{});
                 defer a.free(expected);
@@ -283,19 +296,19 @@ test "video Metal native depth and chroma preparation owns planes and matches CP
                 defer result.deinit();
                 try std.testing.expectEqual(y.len + uv.len, result.native_staging_bytes);
                 const native_y = av_test_native_texture(device, y.ptr, width, height, ys, depth, 1) orelse return error.MetalPreparationUnavailable;
-                const native_uv = av_test_native_texture(device, uv.ptr, @intCast(cw), @intCast(ch), uvs, depth, 2) orelse {
+                const native_uv = if (chroma == 0) @as(?*anyopaque, null) else av_test_native_texture(device, uv.ptr, @intCast(cw), @intCast(ch), uvs, depth, 2) orelse {
                     av_test_native_texture_destroy(native_y);
                     return error.MetalPreparationUnavailable;
                 };
                 var direct = metal.submitNative(a, .{ .y = native_y, .uv = native_uv, .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .full_range = full }, options, .{}) catch |err| {
                     av_test_native_texture_destroy(native_y);
-                    av_test_native_texture_destroy(native_uv);
+                    if (native_uv) |texture| av_test_native_texture_destroy(texture);
                     return err;
                 };
                 defer direct.deinit();
                 // The submitted command retains both producer textures.
                 av_test_native_texture_destroy(native_y);
-                av_test_native_texture_destroy(native_uv);
+                if (native_uv) |texture| av_test_native_texture_destroy(texture);
                 try std.testing.expectEqual(@as(usize, 0), direct.native_staging_bytes);
                 if (rotation == .clockwise270 and full) {
                     // Both submissions must own their source independently of

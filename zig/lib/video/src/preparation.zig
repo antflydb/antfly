@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const media = @import("antfly_media");
 const image = @import("antfly_image").processing;
@@ -10,7 +23,7 @@ extern fn av_preparer_destroy(*anyopaque) void;
 extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
 extern fn av_coefficients_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
-extern fn av_prepare_native_submit(*anyopaque, *anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_native_submit(*anyopaque, *anyopaque, ?*anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
@@ -23,6 +36,7 @@ extern fn av_prepared_destroy(*anyopaque) void;
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709 };
+pub const RgbRounding = enum(u32) { nearest, q13_components };
 pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
     width: u32,
@@ -30,6 +44,9 @@ pub const Options = struct {
     /// Required explicit SDR color matrix; range comes from the NV12 surface.
     matrix: Matrix,
     rotation: Rotation = .none,
+    /// Q13 separately floors Y/U/V products, then rounds the RGB sum.
+    /// This pins the 8-bit reference policy independently of host SIMD dispatch.
+    rgb_rounding: RgbRounding = .nearest,
     /// Rescale to [0,1], then center for HF vision patch linear inputs if requested.
     centered: bool = true,
     /// Torchvision rounds intermediate RGB8 stages; Pillow truncates them.
@@ -79,15 +96,16 @@ fn sourcePoint(x: usize, y: usize, width: usize, height: usize, rotation: Rotati
 fn hostSample(bytes: []const u8, offset: usize, bit_depth: u8) u16 {
     return if (bit_depth == 8) bytes[offset] else std.mem.readInt(u16, bytes[offset..][0..2], .little);
 }
-fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8) [3]u8 {
+fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8, rounding: RgbRounding) [3]u8 {
     const bytes: usize = if (bit_depth == 8) 1 else 2;
     const scale: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(bit_depth - 8)));
-    var luma: f32 = @as(f32, @floatFromInt(hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth))) / scale;
+    var luma: f32 = @as(f32, @floatFromInt((hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth) >> format.sampleShift()))) / scale;
     const sub_x: usize = if (chroma_format == 3) 1 else 2;
     const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
-    var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv, bit_depth))) / scale - 128;
-    var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv + bytes, bit_depth))) / scale - 128;
-    if (format == .nv12_video) {
+    var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv, bit_depth) >> format.sampleShift()))) / scale - 128;
+    var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv + bytes, bit_depth) >> format.sampleShift()))) / scale - 128;
+    if (rounding == .q13_components and bit_depth == 8) return rgbQ13(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
+    if (!format.fullRange()) {
         luma = (luma - 16) * (255.0 / 219.0);
         u *= 255.0 / 224.0;
         v *= 255.0 / 224.0;
@@ -106,6 +124,23 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     for (&output, values) |*out, value| out.* = @intFromFloat(std.math.clamp(@floor(value + 0.5), 0, 255));
     return output;
 }
+// Coefficients are independently quantized from the BT.601/BT.709 matrix
+// and range expansion. Signed shifts deliberately floor each component.
+fn rgbQ13(y: i32, u: i32, v: i32, full: bool, matrix: Matrix) [3]u8 {
+    const coefficients: [4]i32 = if (matrix == .bt709)
+        (if (full) .{ 12901, -1534, -3835, 15201 } else .{ 14686, -1747, -4366, 17305 })
+    else
+        (if (full) .{ 11485, -2819, -5850, 14516 } else .{ 13075, -3209, -6660, 16525 });
+    const luma = ((y - @as(i32, if (full) 0 else 16)) * @as(i32, if (full) 8192 else 9539)) >> 12;
+    const values = [3]i32{
+        (luma + ((v * coefficients[0]) >> 12) + 1) >> 1,
+        (luma + ((u * coefficients[1]) >> 12) + ((v * coefficients[2]) >> 12) + 1) >> 1,
+        (luma + ((u * coefficients[3]) >> 12) + 1) >> 1,
+    };
+    var out: [3]u8 = undefined;
+    for (&out, values) |*channel, value| channel.* = @intCast(std.math.clamp(value, 0, 255));
+    return out;
+}
 /// Reference path deliberately materializes host RGB. Production Metal path
 /// imports NV12 and keeps both resize passes and patch packing on device.
 pub const HostSurface = struct {
@@ -118,6 +153,7 @@ pub const HostSurface = struct {
     planes: [2]apple.Plane,
     pub fn validate(self: HostSurface) !void {
         if (self.bit_depth < 8 or self.bit_depth > 14 or self.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+        if (self.format.sampleShift() != 0 and (self.bit_depth != 10 or self.chroma_format != 1)) return error.UnsupportedSurfaceFormat;
         if (self.width == 0 or self.height == 0) return error.InvalidVideoGeometry;
         if (self.width > 16_384 or self.height > 16_384) return error.ResourceLimitExceeded;
         for (self.planes, 0..) |plane, i| {
@@ -138,7 +174,7 @@ pub fn reference(allocator: std.mem.Allocator, surface: *const apple.Surface, op
     _ = try geometry(surface.width, surface.height, options);
     var mapping = try surface.map();
     defer mapping.deinit();
-    return referenceHost(allocator, .{ .width = surface.width, .height = surface.height, .format = surface.format, .planes = mapping.planes }, options, control);
+    return referenceHost(allocator, .{ .width = surface.width, .height = surface.height, .format = surface.format, .bit_depth = surface.format.bitDepth(), .planes = mapping.planes }, options, control);
 }
 /// Portable borrowed NV12 boundary. Plane storage must survive the synchronous
 /// call. No Apple framework or native device is needed for the reference path.
@@ -155,7 +191,7 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
         try control.check();
         for (0..width) |x| {
             const point = sourcePoint(x, y, host.width, host.height, options.rotation);
-            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format));
+            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding));
         }
     }
     return prepareRgb(allocator, bytes, width, height, g, options, control);
@@ -310,7 +346,7 @@ pub const Metal = struct {
         defer scope.deinit();
         const g = try geometry(surface.width, surface.height, options);
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered), 8, 1 };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift() };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -320,20 +356,23 @@ pub const Metal = struct {
     /// command retains textures until completion, without pixel readback/copy.
     pub const NativeSurface = struct {
         y: *anyopaque,
-        uv: *anyopaque,
+        /// Absent for monochrome; required for chroma formats 1 through 3.
+        uv: ?*anyopaque = null,
         width: u32,
         height: u32,
         bit_depth: u8,
+        sample_shift: u4 = 0,
         chroma_format: u8,
         full_range: bool = false,
     };
     pub fn submitNative(self: *Metal, allocator: std.mem.Allocator, surface: NativeSurface, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
-        if (surface.bit_depth < 8 or surface.bit_depth > 14 or surface.chroma_format < 1 or surface.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+        if (surface.bit_depth < 8 or surface.bit_depth > 14 or surface.chroma_format > 3 or (surface.uv == null) != (surface.chroma_format == 0)) return error.UnsupportedSurfaceFormat;
+        if (surface.sample_shift > 16 - surface.bit_depth or (surface.bit_depth == 8 and surface.sample_shift != 0)) return error.UnsupportedSurfaceFormat;
         const g = try geometry(surface.width, surface.height, options);
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -344,12 +383,11 @@ pub const Metal = struct {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
         try surface.validate();
-        if (surface.chroma_format == 0) return error.UnsupportedSurfaceFormat;
         const g = try geometry(surface.width, surface.height, options);
         const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift() };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
@@ -367,7 +405,7 @@ pub const Metal = struct {
         if (bytes.len != size) return error.InvalidVideoGeometry;
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1 };
+        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0 };
         var out: ?*anyopaque = null;
         if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
@@ -427,3 +465,25 @@ pub const Prepared = struct {
         self.* = undefined;
     }
 };
+
+test "video Q13 RGB conversion matches independent reference across matrices ranges and clipping" {
+    var y: [256]u8 = undefined;
+    var uv: [128]u8 = undefined;
+    for (&y, 0..) |*v, i| v.* = @intCast((i * 37 + 11) % 256);
+    for (&uv, 0..) |*v, i| v.* = @intCast((i * 61 + 7) % 256);
+    const planes = [2]apple.Plane{
+        .{ .bytes = &y, .width = 16, .height = 16, .stride = 16 },
+        .{ .bytes = &uv, .width = 8, .height = 8, .stride = 16 },
+    };
+    const expected = @embedFile("../testdata/rgb-q13-reference.bin");
+    var offset: usize = 0;
+    for ([_]Matrix{ .bt601, .bt709 }) |matrix| {
+        for ([_]apple.Format{ .nv12_video, .nv12_full }) |format| {
+            for (0..16) |row| for (0..16) |col| {
+                const actual = rgb(planes, col, row, format, matrix, 8, 1, .q13_components);
+                try std.testing.expectEqualSlices(u8, expected[offset..][0..3], &actual);
+                offset += 3;
+            };
+        }
+    }
+}

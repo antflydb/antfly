@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Portable, conservative static-avc1 dependency planning. Sync hints alone
 //! never authorize a nonzero start: the sample's VCL NALs must be IDR slices.
 const std = @import("std");
@@ -8,6 +21,10 @@ const avc = @import("avc.zig");
 pub const Mode = enum { from_start, verified_idr };
 pub const Options = struct {
     mode: Mode = .verified_idr,
+    /// Software AVC profiles; the decoder still validates full picture syntax.
+    portable_config: bool = false,
+    /// Split adjacent IDR runs before exceeding a decoder's dependency bound.
+    max_run_packets: usize = std.math.maxInt(usize),
     max_selections: usize = 64,
     max_decode_packets: usize = 500_000,
     max_probe_candidates: usize = 256,
@@ -88,7 +105,7 @@ const Builder = struct {
                     var lease = try self.reader.readPacket(index);
                     errdefer lease.deinit();
                     self.probe_bytes += size;
-                    if (try avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes)) {
+                    if (try (if (self.options.portable_config) avc.isPortableIdr(lease.bytes, self.reader.track.nal_length_bytes) else avc.isIdr(lease.bytes, self.reader.track.nal_length_bytes))) {
                         try self.anchors.append(self.allocator, .{ .index = index, .payload = lease });
                         return index;
                     }
@@ -104,7 +121,7 @@ const Builder = struct {
 pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection: []const usize, options: Options) !Plan {
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
-    try avc.validateConfig(reader.track.avcc);
+    if (options.portable_config) try avc.validatePortableConfig(reader.track.avcc) else try avc.validateConfig(reader.track.avcc);
     if (selection.len == 0 or selection.len > options.max_selections) return error.ResourceLimitExceeded;
     for (selection, 0..) |index, i| {
         if (index >= reader.packets.len) return error.InvalidPacketIndex;
@@ -126,9 +143,10 @@ pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection
     for (sorted) |index| {
         try reader.input.control.check();
         const first = try builder.start(index);
+        if (index - first + 1 > options.max_run_packets) return error.ResourceLimitExceeded;
         if (runs.items.len != 0) {
             const last = &runs.items[runs.items.len - 1];
-            if (first <= last.last or first - last.last - 1 <= options.merge_gap_packets) {
+            if ((first <= last.last or first - last.last - 1 <= options.merge_gap_packets) and index - last.first + 1 <= options.max_run_packets) {
                 last.last = index;
                 continue;
             }

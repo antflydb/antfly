@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Ordered, bounded video frames using the pinned EmbeddingGemma 2 processor.
 const std = @import("std");
 const media = @import("antfly_media");
@@ -69,7 +82,7 @@ fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h
         };
     }
     const g = projector.embeddingGemma2VideoGeometry(width, height);
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .torchvision = true };
+    return .{ .width = g.width, .height = g.height, .matrix = matrix, .torchvision = true, .rgb_rounding = .q13_components };
 }
 
 // Model sampling assumes one progressive access-unit picture per MP4 sample.
@@ -167,7 +180,7 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
         defer batch.deinit();
     } else {
         // Decode references once for the whole selection, never once per frame.
-        if (configurations) |session| _ = try session.decodeSelected(selected, &capture, Capture.publish) else _ = try video.h264.decodeSelected(a, &reader, selected, .{}, &capture, Capture.publish);
+        if (configurations) |session| _ = try session.decodeSelected(selected, &capture, Capture.publish) else _ = try video.h264_sparse.decodeSelected(a, &reader, selected, .{ .max_total_packets = 8192 }, &capture, Capture.publish);
     }
     // Callbacks arrive in decode order; compact in presentation slot order.
     var count: usize = 0;
@@ -236,7 +249,7 @@ const Capture = struct {
     }
     fn publishApple(raw: *anyopaque, frame: *const video.apple.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
-        try self.validateRange(frame.surface.format == .nv12_full);
+        try self.validateRange(frame.surface.format.fullRange());
         const options = try policySignal(self.track, frame.surface.width, frame.surface.height, self.signal);
         // Duplicate logical samples must receive the same projection.
         const first = std.mem.indexOfScalar(usize, self.selected, frame.decode_index) orelse return error.InvalidPacketIndex;

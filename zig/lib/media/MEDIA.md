@@ -374,3 +374,59 @@ normalization and HTTP dimensions. This qualifies the tested RGB decoder policie
 and model integration; it does not extend container or codec scope. See the
 [pretrained receipt](../video/testdata/video-pretrained-validation.md) and
 [reproducible fixtures](../../../tools/embeddinggemma2/testdata/video/README.md).
+
+## Live initialization epochs
+
+`live_mp4.Ingest.reconfigure(identity, initialization)` accepts a new initialization
+at an explicit transport discontinuity. Drain or discard pending media first;
+otherwise it returns `PendingMediaSegment`. The replacement moov, track, AVC
+configuration and fragment defaults are validated before publication. Failed
+validation, cancellation, admission or allocation leaves the current initialization
+and timeline in place. Existing segments and packet leases retain independent,
+immutable snapshots.
+
+A successful replacement increments `Segment.epoch` and resets decode timestamps
+and codec identity together. Consumers must reset decoder state at the epoch
+boundary. Segment ordinals, ingested bytes and shared admission remain cumulative;
+`max_reconfigurations` bounds repeated initialization changes. Inline initialization
+boxes inside pending media still require the transport to signal the boundary.
+The native HTTP HLS reader below signals these boundaries using map and
+discontinuity changes. DASH transport remains separate work.
+
+The media suite covers a real changed SPS/96×48 initialization, invalid replacement
+rollback, replay after discontinuity, outstanding old leases and allocation failures.
+
+
+## HLS fMP4 playlist parsing
+
+`hls.parse` implements a bounded fMP4 media-playlist subset of
+[RFC 8216](https://www.rfc-editor.org/rfc/rfc8216.html). Parsed strings borrow the
+manifest; the owned segment array preserves media/discontinuity sequence numbers,
+map changes, explicit and same-object implicit byte ranges, duration and EOF.
+Input bytes, URI lengths and segment counts have independent limits. Allocation
+failures release the parsed array. Master, I-frame, encrypted and low-latency
+playlists fail explicitly; this does not expose MPEG-TS decoding.
+
+`http_stream.Adapter(httpx)` performs native HTTP/HTTPS reads using a borrowed
+`lib/httpx` client. Client default headers provide authentication. All resolved
+references remain on the configured origin; redirects, ambient cookies and hidden
+retries are disabled. Exact byte-range responses require HTTP 206 and matching
+`Content-Range`. Request counts, body size, cumulative transport work, cancellation
+and shared host-memory admission apply to initialization, playlists and media.
+Failed requests retain their work charge. Response storage remains reserved until
+its owned copy has replaced the HTTP response.
+
+`hls_live.Reader(httpx)` owns bounded playlist snapshots, reloads explicitly and
+returns immutable `live_mp4.Segment` objects. Changed maps or discontinuity sequence
+numbers establish new configuration epochs, requiring the consumer to reset its
+decoder. Outstanding packet leases survive these changes. Overlapping playlist
+entries must stay immutable; a sliding window that skips unconsumed media fails
+with `MediaStreamGap`. Retrying a failed media fetch preserves initialized state;
+retrying a failed snapshot commit does not download or append that media twice.
+`reloadAfterSeconds` supplies a polling delay to the caller's scheduler.
+
+`zig build test-media-http` tests authenticated reads, exact ranges, redirect
+refusal and a complete reload/configuration transition against a local HTTP
+server using the production client. The portable suite additionally injects
+allocation failures across both epochs. Encrypted, MPEG-TS, master-selection,
+low-latency HLS and DASH support remain open.

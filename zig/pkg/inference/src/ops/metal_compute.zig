@@ -283,10 +283,15 @@ fn shouldUploadFloat32ShapeToMetal(data_len: usize, shape: []const i32) bool {
 }
 
 fn embeddingTableRows(shape: []const i64, dim: usize) !usize {
-    if (shape.len != 1 and shape.len != 2) return error.InvalidTensorShape;
-    const rows = if (shape.len == 1) 1 else std.math.cast(usize, shape[0]) orelse return error.InvalidTensorShape;
+    if (shape.len == 0) return error.InvalidTensorShape;
+    var rows: usize = 1;
+    for (shape[0 .. shape.len - 1]) |axis| {
+        const extent = std.math.cast(usize, axis) orelse return error.InvalidTensorShape;
+        if (extent == 0) return error.InvalidTensorShape;
+        rows = std.math.mul(usize, rows, extent) catch return error.InvalidTensorShape;
+    }
     const cols = std.math.cast(usize, shape[shape.len - 1]) orelse return error.InvalidTensorShape;
-    if (rows == 0 or cols != dim) return error.InvalidTensorShape;
+    if (cols == 0 or cols != dim) return error.InvalidTensorShape;
     return rows;
 }
 
@@ -14566,9 +14571,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
+        if (ids.len != total or dim == 0) return error.InvalidTensorShape;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
         const quantized_storage = weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage;
+        const packed_dtype: ?tensor_mod.DType = if (quantized_storage) |storage| switch (storage.tensor_type) {
+            .known => |kind| switch (kind) {
+                .BF16 => .bf16,
+                .F16 => .f16,
+                .F32 => .f32,
+                else => null,
+            },
+            else => null,
+        } else null;
         const rows: usize = if (quantized_storage) |storage|
             try native_compute_mod.quantizedEmbeddingRows(storage, dim)
         else blk: {
@@ -14577,7 +14592,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
 
         if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
-            var weight_mt = try self.ownedMetalTensorFromCt(weight);
+            // Position tables have multiple leading axes. Flatten a local
+            // retained view; model-owned handles and pins stay unchanged.
+            var source = try self.ownedMetalTensorFromCt(weight);
+            defer source.deinit();
+            const matrix_shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
+            var weight_mt = try source.retainedView(0, source.deviceByteLen(), &matrix_shape);
             defer weight_mt.deinit();
             // A host-visible table is cached on the device keyed by its host
             // address, which only model storage keeps stable; an activation's
@@ -14594,6 +14614,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         if (quantized_storage) |storage| {
+            if (!disableRuntimeEmbeddingLookup() and packed_dtype == .bf16) {
+                if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(self.provider_impl, storage.raw_bytes, if (storage.raw_mmap_backed) storage.raw_mmap_source_bytes else null, ids, total, dim, rows)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+            }
+            if (!disableRuntimeEmbeddingLookup() and packed_dtype == .f16) {
+                if (try metal_runtime.decoderRuntimeNativeF16EmbeddingLookup(self.provider_impl, storage.raw_bytes, if (storage.raw_mmap_backed) storage.raw_mmap_source_bytes else null, ids, total, dim, rows)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+            }
             if (!disableRuntimeEmbeddingLookup()) {
                 if (try metal_runtime.decoderRuntimeQuantEmbeddingLookup(self.provider_impl, storage, ids, total, dim, 1.0)) |tensor| {
                     return self.ctFromOwnedMetalTensor(tensor);
@@ -14634,8 +14660,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         errdefer self.allocator.free(out);
         if (quantized_storage) |storage| {
             for (0..total) |i| {
+                if (ids[i] < 0) return error.InvalidTensorShape;
                 const idx: usize = @intCast(ids[i]);
                 if (idx >= rows) return error.InvalidTensorShape;
+                if (packed_dtype) |dtype| {
+                    try copyNativeDenseRowToF32(storage.raw_bytes, dtype, idx, rows, dim, out[i * dim .. (i + 1) * dim]);
+                    continue;
+                }
                 if (weight_buf.lazy_entry) |entry| {
                     if (entry.host_loaded) |*loaded| {
                         if (loaded.tensor.shape.len == 2 and
@@ -14651,6 +14682,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         } else {
             for (0..total) |i| {
+                if (ids[i] < 0) return error.InvalidTensorShape;
                 const idx: usize = @intCast(ids[i]);
                 if (idx >= rows) return error.InvalidTensorShape;
                 if (weight_buf.native_dense_bytes) |bytes| {

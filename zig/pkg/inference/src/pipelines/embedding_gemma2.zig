@@ -92,6 +92,17 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     defer cb.free(input);
     const output = try encoder.forwardEmbeddingsCT(cb, a, cfg, input, mask, 1, count);
     defer cb.free(output);
+    if (cb.kind() == .metal) {
+        const op = cb.vtable.maskedMeanRows orelse return error.EmbeddingGemma2OperationUnavailable;
+        const pooled = (try op(cb.ptr, output, mask, 768, options.dimensions)) orelse return error.EmbeddingGemma2OperationUnavailable;
+        defer cb.free(pooled);
+        const values = try cb.toFloat32(pooled, a);
+        defer a.free(values);
+        const vector = try scoring.centroid(a, &.{values}, options.dimensions);
+        errdefer a.free(vector);
+        try effective.check();
+        return .{ .vector = vector, .input_tokens = count };
+    }
     const values = try cb.toFloat32(output, a);
     defer a.free(values);
     const vectors = try poolBatch(a, values, mask, 1, count, options.dimensions);

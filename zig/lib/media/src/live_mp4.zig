@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Incremental fMP4 with automatic moof/mdat segment framing. Emitted readers own immutable
 //! init+segment snapshots, so later input cannot invalidate packet leases.
 const std = @import("std");
@@ -11,6 +24,7 @@ pub const Options = struct {
     stream: stream.Options = .{},
     index: mp4.Limits = .{},
     max_segments: usize = 100_000,
+    max_reconfigurations: usize = 1024,
     max_identity_bytes: usize = 4096,
     max_ingested_bytes: u64 = 1024 * 1024 * 1024,
 };
@@ -18,6 +32,8 @@ pub const Segment = struct {
     backing: *stream.Snapshot,
     reader: mp4.Reader,
     ordinal: usize,
+    /// Decoder/timestamp state must be reset when this changes.
+    epoch: usize,
     identity: []u8,
     identity_reservation: admission.Token,
     pub fn deinit(self: *Segment) void {
@@ -51,6 +67,7 @@ pub const Ingest = struct {
     identity: ?Identity = null,
     next_decode_time: ?i64 = null,
     segments: usize = 0,
+    epoch: usize = 0,
     ingested_bytes: u64 = 0,
     ended: bool = false,
     scan_cursor: usize = 0,
@@ -61,6 +78,7 @@ pub const Ingest = struct {
         if (identity.len > options.max_identity_bytes) return error.ResourceLimitExceeded;
         var cursor: usize = 0;
         var movie = false;
+        var track_identity: ?Identity = null;
         var boxes: usize = 0;
         while (cursor < initialization.len) {
             try options.stream.control.check();
@@ -71,6 +89,7 @@ pub const Ingest = struct {
             if (box.typ == iso.fourcc("moov")) {
                 if (movie) return error.MalformedMedia;
                 movie = true;
+                track_identity = Identity.from(try mp4.fragmentedInitialization(box.payload, options.index, options.stream.control));
             }
             if (box.typ == iso.fourcc("moof") or box.typ == iso.fourcc("mdat")) return error.UnsupportedContainer;
         }
@@ -79,7 +98,29 @@ pub const Ingest = struct {
         const snapshot = try stream.Snapshot.copy(allocator, identity, &.{initialization}, options.stream);
         errdefer snapshot.deinit();
         const reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{}) else admission.Token{};
-        return .{ .allocator = allocator, .initialization = snapshot, .pending_reservation = reservation, .options = options, .ingested_bytes = initialization.len };
+        return .{ .allocator = allocator, .initialization = snapshot, .pending_reservation = reservation, .options = options, .identity = track_identity, .ingested_bytes = initialization.len };
+    }
+    /// Publish a new initialization at an explicit transport discontinuity.
+    /// Drain or discard pending media first. Old segments keep their snapshots.
+    /// Timeline and codec identity reset together; lifetime byte/segment budgets
+    /// remain cumulative, including bytes in every replacement initialization.
+    pub fn reconfigure(self: *Ingest, identity: []const u8, initialization: []const u8) !void {
+        try self.options.stream.control.check();
+        if (self.pending.items.len != 0) return error.PendingMediaSegment;
+        if (self.epoch >= self.options.max_reconfigurations or initialization.len > self.options.max_ingested_bytes -| self.ingested_bytes) return error.ResourceLimitExceeded;
+        var replacement = try Ingest.init(self.allocator, identity, initialization, self.options);
+        // Keep replacement validation/allocation transactional. Its unused
+        // pending reservation is released while the existing one is retained.
+        defer replacement.pending_reservation.deinit();
+        const previous = self.initialization;
+        self.initialization = replacement.initialization;
+        self.ingested_bytes += initialization.len;
+        self.epoch += 1;
+        self.identity = replacement.identity;
+        self.next_decode_time = null;
+        self.ended = false;
+        self.resetScan();
+        previous.deinit();
     }
     /// Partial network reads may be supplied in any chunk size. Drain nextSegment
     /// after arrivals; no transport segment envelope is needed.
@@ -201,7 +242,7 @@ pub const Ingest = struct {
         std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[prefix..]);
         self.pending.items.len = remaining;
         self.resetScan();
-        return .{ .backing = snapshot, .reader = reader, .ordinal = ordinal, .identity = owned_identity, .identity_reservation = identity_reservation };
+        return .{ .backing = snapshot, .reader = reader, .ordinal = ordinal, .epoch = self.epoch, .identity = owned_identity, .identity_reservation = identity_reservation };
     }
     fn resetScan(self: *Ingest) void {
         self.scan_cursor = 0;
@@ -413,4 +454,91 @@ test "live MP4 automatic framing validates partial extended headers and EOF size
         try std.testing.expect(framed.reader.packets.len > 0);
         try std.testing.expect((try ingest.nextSegment(true)) == null);
     }
+}
+
+test "live MP4 reconfiguration is transactional and preserves outstanding old epoch leases" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/fragmented.mp4");
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        const box = try iso.readBox(bytes, cursor);
+        if (box.typ == iso.fourcc("moof")) break;
+        cursor = box.end;
+    }
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, initialization: []const u8, media_bytes: []const u8) !void {
+            var ingest = try Ingest.init(allocator, "live", initialization, .{ .max_reconfigurations = 1 });
+            defer ingest.deinit();
+            try ingest.push(media_bytes);
+            try std.testing.expectError(error.PendingMediaSegment, ingest.reconfigure("changed", initialization));
+            var first = try ingest.finishSegment();
+            defer first.deinit();
+            var lease = try first.reader.readPacket(0);
+            defer lease.deinit();
+            const expected = try allocator.dupe(u8, lease.bytes);
+            defer allocator.free(expected);
+            const previous = ingest.initialization;
+            const ingested = ingest.ingested_bytes;
+            try std.testing.expectError(error.MissingMovieMetadata, ingest.reconfigure("invalid", &.{}));
+            try std.testing.expectEqual(previous, ingest.initialization);
+            try std.testing.expectEqual(ingested, ingest.ingested_bytes);
+            try std.testing.expectEqual(@as(usize, 0), ingest.epoch);
+            try ingest.reconfigure("changed", initialization);
+            try std.testing.expectEqual(@as(usize, 1), ingest.epoch);
+            try std.testing.expectEqual(ingested + initialization.len, ingest.ingested_bytes);
+            try std.testing.expectError(error.ResourceLimitExceeded, ingest.reconfigure("again", initialization));
+            // Replaying the old DTS is valid only after the explicit discontinuity.
+            try ingest.push(media_bytes);
+            var second = try ingest.finishSegment();
+            defer second.deinit();
+            try std.testing.expectEqual(@as(usize, 0), first.epoch);
+            try std.testing.expectEqual(@as(usize, 1), second.epoch);
+            try std.testing.expectEqual(@as(usize, 1), second.ordinal);
+            try std.testing.expectEqualSlices(u8, expected, lease.bytes);
+        }
+    };
+    try Harness.run(a, bytes[0..cursor], bytes[cursor..]);
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ bytes[0..cursor], bytes[cursor..] });
+}
+
+test "live MP4 reconfiguration accepts new SPS and geometry at an explicit epoch boundary" {
+    const a = std.testing.allocator;
+    const original = @embedFile("../testdata/fragmented.mp4");
+    const changed = @embedFile("../testdata/live-reconfigure.mp4");
+    const Split = struct {
+        fn initialization(bytes: []const u8) !usize {
+            var cursor: usize = 0;
+            while (cursor < bytes.len) {
+                const box = try iso.readBox(bytes, cursor);
+                if (box.typ == iso.fourcc("moof")) return cursor;
+                cursor = box.end;
+            }
+            return error.MissingMovieMetadata;
+        }
+    };
+    const original_split = try Split.initialization(original);
+    const changed_split = try Split.initialization(changed);
+    var ingest = try Ingest.init(a, "same-live-source", original[0..original_split], .{});
+    defer ingest.deinit();
+    try ingest.push(original[original_split..]);
+    var first = try ingest.finishSegment();
+    defer first.deinit();
+    var lease = try first.reader.readPacket(0);
+    defer lease.deinit();
+    const previous_hash = Identity.from(first.reader.track).config;
+    const malformed = try a.dupe(u8, changed[0..changed_split]);
+    defer a.free(malformed);
+    const avcc_type = std.mem.indexOf(u8, malformed, "avcC") orelse return error.TestUnexpectedResult;
+    malformed[avcc_type + 4] = 0; // Invalid AVC configuration version.
+    try std.testing.expectError(error.MalformedMedia, ingest.reconfigure("same-live-source", malformed));
+    try std.testing.expectEqual(@as(usize, 0), ingest.epoch);
+    try ingest.reconfigure("same-live-source", changed[0..changed_split]);
+    try ingest.push(changed[changed_split..]);
+    var second = try ingest.finishSegment();
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 96), second.reader.track.width);
+    try std.testing.expectEqual(@as(u16, 48), second.reader.track.height);
+    try std.testing.expect(!std.mem.eql(u8, &previous_hash, &Identity.from(second.reader.track).config));
+    try std.testing.expectEqual(@as(usize, 1), second.epoch);
+    try std.testing.expectEqualSlices(u8, first.backing.bytes[@intCast(first.reader.packets[0].offset)..][0..lease.bytes.len], lease.bytes);
 }

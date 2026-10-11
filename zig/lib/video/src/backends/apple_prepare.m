@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "apple_video.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -94,15 +107,26 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         AVPreparer *p = (__bridge AVPreparer *)handle;
         AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
+        if (params[8] < 8 || params[8] > 14 || params[11] > 16 - params[8] || (params[8] == 8 && params[11] != 0)) return -1;
         id<MTLTexture> y = nil, uv = nil;
         if (nativeY) {
-            if (!nativeUV || params[8] < 8 || params[8] > 14 || params[9] < 1 || params[9] > 3) return -1;
+            if (params[8] < 8 || params[8] > 14 || params[9] > 3 || ((nativeUV == nil) != (params[9] == 0))) return -1;
             MTLPixelFormat yf = params[8] == 8 ? MTLPixelFormatR8Uint : MTLPixelFormatR16Uint;
             MTLPixelFormat uvf = params[8] == 8 ? MTLPixelFormatRG8Uint : MTLPixelFormatRG16Uint;
-            if (nativeY.device != p.device || nativeUV.device != p.device || nativeY.textureType != MTLTextureType2D || nativeUV.textureType != MTLTextureType2D ||
-                nativeY.pixelFormat != yf || nativeUV.pixelFormat != uvf || nativeY.width != params[0] || nativeY.height != params[1] ||
-                nativeUV.width != (params[0] + (params[9] == 3 ? 0 : 1)) / (params[9] == 3 ? 1 : 2) ||
-                nativeUV.height != (params[1] + (params[9] == 1 ? 1 : 0)) / (params[9] == 1 ? 2 : 1)) return -1;
+            if (nativeY.device != p.device || nativeY.textureType != MTLTextureType2D ||
+                nativeY.pixelFormat != yf || nativeY.width != params[0] || nativeY.height != params[1]) return -1;
+            if (params[9] != 0) {
+                if (nativeUV.device != p.device || nativeUV.textureType != MTLTextureType2D || nativeUV.pixelFormat != uvf ||
+                    nativeUV.width != (params[0] + (params[9] == 3 ? 0 : 1)) / (params[9] == 3 ? 1 : 2) ||
+                    nativeUV.height != (params[1] + (params[9] == 1 ? 1 : 0)) / (params[9] == 1 ? 2 : 1)) return -1;
+            } else {
+                // Bind a valid resource for Metal validation; the monochrome
+                // shader branch never reads it or invents a chroma plane.
+                MTLTextureDescriptor *dummy = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:uvf width:1 height:1 mipmapped:NO];
+                dummy.storageMode = MTLStorageModePrivate; dummy.usage = MTLTextureUsageShaderRead;
+                nativeUV = [p.device newTextureWithDescriptor:dummy];
+                if (!nativeUV) return -1;
+            }
             result.nativeY = y = nativeY; result.nativeUV = uv = nativeUV;
         } else if (rgba) {
             if (rgba_size != (size_t)params[0] * params[1] * 4) return -1;
@@ -126,12 +150,12 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         [encoder setComputePipelineState:nativeY ? p.horizontalNative : (rgba ? p.horizontalRGBA : p.horizontal)];
         if (rgba) [encoder setBuffer:result.rgba offset:0 atIndex:4];
         else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; }
-        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:40 atIndex:1];
+        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:48 atIndex:1];
         [encoder setBuffer:c.xb offset:0 atIndex:2]; [encoder setBuffer:c.xw offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
-        [encoder setBytes:params length:40 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
+        [encoder setBytes:params length:48 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }
@@ -181,16 +205,16 @@ int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
-        if (!yb || !uvb || params[8] < 8 || params[8] > 14 || params[9] < 1 || params[9] > 3) return -1;
+        if (!yb || (params[9] != 0 && !uvb) || params[8] < 8 || params[8] > 14 || params[9] > 3) return -1;
         NSUInteger cw = (params[0] + (params[9] == 3 ? 0 : 1)) / (params[9] == 3 ? 1 : 2);
         NSUInteger ch = (params[1] + (params[9] == 1 ? 1 : 0)) / (params[9] == 1 ? 2 : 1);
         MTLTextureDescriptor *yd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:params[8] == 8 ? MTLPixelFormatR8Uint : MTLPixelFormatR16Uint width:params[0] height:params[1] mipmapped:NO];
         MTLTextureDescriptor *uvd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:params[8] == 8 ? MTLPixelFormatRG8Uint : MTLPixelFormatRG16Uint width:cw height:ch mipmapped:NO];
         yd.storageMode = uvd.storageMode = MTLStorageModeShared; yd.usage = uvd.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> y = [p.device newTextureWithDescriptor:yd], uv = [p.device newTextureWithDescriptor:uvd];
-        if (!y || !uv) return -1;
+        id<MTLTexture> y = [p.device newTextureWithDescriptor:yd], uv = params[9] == 0 ? nil : [p.device newTextureWithDescriptor:uvd];
+        if (!y || (params[9] != 0 && !uv)) return -1;
         [y replaceRegion:MTLRegionMake2D(0, 0, params[0], params[1]) mipmapLevel:0 withBytes:yb bytesPerRow:ys];
-        [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];
+        if (params[9] != 0) [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];
         return prepare(handle, NULL, NULL, 0, params, coefficients, out, y, uv);
     }
 }

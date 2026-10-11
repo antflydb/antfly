@@ -10950,6 +10950,8 @@ pub const Node = struct {
             if (admission_manifest.embedding_style != .embedding_gemma2) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ordered content groups require an EmbeddingGemma 2 model" });
             if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
             return self.createGroupedEmbedding(ctx, model_path, &admission_manifest, executor_contract, request, borrowed_attachments, media_admission.byte_cap, execution_control) catch |err| {
+                if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+                if (err == error.MemoryBudgetExceeded) return inferenceFailureResponse(ctx, err);
                 if (err == error.EmbeddingIdentityMismatch) return ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = "embedding assets or recipe differ from the pinned index identity" });
                 if (isRemoteContentRequestError(err)) return remoteContentErrorResponse(ctx, err);
                 if (isDenseEmbedRequestAbort(err)) return inferenceFailureResponse(ctx, err);

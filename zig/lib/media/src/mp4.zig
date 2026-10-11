@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Bounded static and fragmented MP4 packet indexes. No codec decoding.
 const std = @import("std");
 const iso = @import("isobmff.zig");
@@ -165,6 +178,21 @@ pub const Reader = struct {
         }
     }
 };
+
+/// Validate a moov payload for fragmented video before any media arrives.
+/// The returned track borrows the payload; callers must retain its storage.
+pub fn fragmentedInitialization(movie: []const u8, limits: Limits, control: source.Control) !Track {
+    try control.check();
+    if (movie.len > limits.max_metadata_bytes) return error.ResourceLimitExceeded;
+    var parser = Parser{ .limits = limits, .control = control };
+    const tables = try parser.movie(movie);
+    if (tables.defaults == null) return error.UnsupportedContainer;
+    if (tables.sizes.len < 12 or u32be(tables.sizes[8..12]) != 0) return error.UnsupportedHybridMp4;
+    var track = tables.track orelse return error.UnsupportedVideoCodec;
+    track.edit = try parseEdit(tables.elst, parser.movie_scale, track.timescale);
+    track.decode_preroll_ticks = try decodePreroll(tables.ctts);
+    return track;
+}
 
 const Parser = struct {
     limits: Limits,

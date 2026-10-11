@@ -270,13 +270,29 @@ reader teardown, allocation failures and cancellation/retry are tested. Linux
 compiles the portable APIs; WASI executes portable planner/host tests. These
 counts establish reduced work, not end-to-end latency or retrieval parity.
 
-Still pending: expand pretrained video/application retrieval qualification beyond
-the six reference cases, and implement batched resident vision/projector execution,
-direct device-token backbone inputs, and device pooling/normalization. Qualify
+Reference preservation now compares six real H.264/MJPEG documents and four
+unlabelled queries against pinned PyTorch CPU/MPS, native CPU and Metal, with
+actual Linux ARM64 execution. All recorded rankings and top-k sets match. This
+qualifies preserving the reference, not application usefulness. The 52-second
+clip also qualifies all 1253 software-decoded integer planes and upstream
+32-frame reference sampling. See `lib/video/testdata/video-retrieval-validation.md`.
+
+Still pending: implement batched resident vision/projector execution,
+direct device-token backbone inputs and final device normalization. Vision spatial
+pooling and active-token sequence mean pooling already execute on Metal. Qualify
 resident model execution on the delivered software-decode → Metal and
 VideoToolbox → Metal preparation routes. Extend the delivered decode/preparation
 queue to overlap resident vision execution, with atomic admission across
 concurrent source/surface/model reservations and any persistent token cache.
+For device sequence assembly, give the frame capture owned projected tensors
+indexed by presentation slot, sharing repeated selections. Concatenate scaled
+text embeddings and projected media tensors, then gather the final ordered rows
+using bounded integer indices. This avoids downloading text embeddings or video
+soft tokens to overlay them. Keep CPU and mixed image/audio fallbacks explicit,
+and retain tensors through submission completion and cancellation. Qualify the
+sequence before adding geometry-compatible vision batching; batch boundaries
+must preserve independent spatial attention and frame positions.
+
 Tune seek-gap thresholds from measured backend/source latency. Establish a
 synchronized full-pipeline baseline against official pinned PyTorch MPS using
 equivalent sampling and dtype.
@@ -402,3 +418,65 @@ Non-IDR compatible SPS transitions, fresh intra geometry epochs, cross-packet A/
 partition gathering and automatic moof/mdat media framing are delivered. Remaining
 work includes broader mixed-tool corpus qualification, hardware P010 import,
 VP-family decoding, CUDA/NVDEC and fully resident model execution/parity.
+
+
+### Reference-preservation follow-up (2026-10-09)
+
+The reference harness checks complete vectors, cosine scores, non-tied rank
+inversions, exact rankings and top-k overlap. It pins corpus bytes, original
+checkpoint receipts, upstream source and binary identities; failure reports retain
+measurements. Native campaigns exercise bounded concurrency and peer-disconnect
+retry. A successful retry does not prove cancellation completion. Completed
+PyTorch MPS timings synchronize final readback; HTTP native timings include
+transport, decoding and preparation. Owned-server memory samples include supervised
+worker descendants and explicitly exclude unmapped GPU-private allocations.
+Historical parent-only RSS results are labelled and cannot establish pipeline peak.
+
+The real-clip gate found a preparation arithmetic defect, rather than a decoder or
+model weight defect: separate Q13 component rounding is now explicit CPU/Metal
+policy in the video model recipe. Its recipe identity is bumped so previously
+indexed vectors cannot silently mix with newly generated ones.
+
+Live fMP4 accepts validated transactional initialization changes through
+`Ingest.reconfigure`. Configuration epochs retain old snapshots/leases and require
+a decoder/timeline reset; lifetime work and reconfiguration counts remain bounded.
+HTTP transport, HLS playlists and DASH manifests remain implementation work.
+
+VP8/VP9/AV1 runtime decoding must remain pure Zig, per the user's clarified
+constraint. Optional libvpx/dav1d adapters are outside this plan. Each codec needs
+real conformance vectors, independent differential decode, mutation/fuzz campaigns
+and bounded request/resource behavior before inference exposure.
+
+
+The native HTTP fMP4 HLS library now implements authenticated same-origin fetches,
+exact byte ranges, bounded explicit reloads, immutable overlapping playlist
+entries, initialization/discontinuity epochs and retry ownership. Production
+`lib/httpx` localhost tests qualify this path; master selection, encryption,
+low-latency HLS and DASH remain open. Pure Zig VP8 displayed-keyframe decoding
+reuses `lib/image` and returns native YUV planes with byte-exact independent
+fixtures, shared admission and allocation-failure coverage. VP8 interframes,
+VP9/AV1 and WebM model integration remain implementation work.
+
+
+The subsequent resident Metal Q/K/V normalization, vision RoPE and spatial
+pooling changes pass pinned pretrained cases and real-clip retrieval. Sparse CPU
+and Metal both preserve pinned long-clip vectors/scores. Native-depth monochrome
+Metal surfaces and actual CoreVideo P010 import/staging now have CPU parity and
+producer-lifetime tests. Surface coverage does not imply hardware High10 decoding
+or HDR qualification. Batched vision, device composition/backbone inputs and
+final normalization remain open, as do whole-pipeline overlap and broader codecs.
+
+
+A manual Linux qualification workflow now runs local PyTorch and native routes
+on the same machine, verifies pinned checkpoint/source receipts and uploads
+reports, server logs and tool versions. It has been linted but not dispatched;
+existing actual Linux receipts remain distinct from this CI configuration.
+
+
+Video patch projection and learned-position addition now remain on Metal too.
+The position table uses a local flattened row view that preserves model ownership;
+selected packed BF16/F16 rows use native kernels. Device/model-owned F32 and packed
+BF16 fixtures pass with unchanged weight shapes and no intermediate host-mirror
+downloads. The rebuilt production route passes all six pretrained cases and the
+real-clip score/ranking/top-k gates. Frame/projector batching, final projected-token
+composition and final normalization still need implementation.

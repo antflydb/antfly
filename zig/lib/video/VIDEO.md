@@ -7,7 +7,9 @@ use native decode/CPU preparation or VideoToolbox/Metal preparation and the merg
 native/Metal vision and text encoders. Completed Metal patch buffers enter inference
 directly; existing projector/token composition host boundaries remain. Six pretrained
 F32 video cases qualify native CPU and Metal numerical parity under the declared
-RGB decoder policy; resident vision/backbone optimization remains open. See the
+RGB decoder policy. A real-clip reference-preservation campaign also executes on
+macOS CPU/Metal and actual Linux ARM64; resident vision/backbone optimization
+remains open. See the
 [pretrained validation receipt](testdata/video-pretrained-validation.md).
 
 Related documents:
@@ -217,8 +219,10 @@ of eight selections (six unique outputs), with CPU/Metal value comparisons,
 depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
 allocation-failure campaigns. Portable planner tests execute on WASI; Linux
 compiles the planner, window reuse and CPU preparation without Apple dependencies.
-The expanded Linux H.264 subset below is implemented; remaining profile tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
-resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
+The expanded Linux H.264 subset below is implemented. The model code from
+PR #1014 is merged, and the integration/reference-preservation receipts below
+qualify the delivered CPU/Metal subset. CUDA/NVDEC and the remaining residency
+and codec gates are tracked in the implementation plan.
 
 ## Implemented portable MJPEG lane
 
@@ -794,12 +798,15 @@ follow the merged model pipeline, including the 8192-token total bound.
 Native CPU uses portable MJPEG/H.264. Metal uses verified-IDR VideoToolbox for
 eligible static H.264, direct CoreVideo preparation and a retained external MTLBuffer
 handoff on the runtime's device. Portable H.264 and MJPEG may instead stage native
-planes or RGBA into Metal; monochrome uses CPU preparation. A producer fence completes
+planes or RGBA into Metal. The model accepts the qualified progressive SDR
+subset; broader monochrome/display sampling remains a library capability. A producer fence completes
 before the imported CT enters inference. Producer ownership is released after CT
 retention and before inference pooling/reuse; cancellation and failure release both.
-The model admission covers request preprocessing and workspace before decode. Existing
-vision position addition, spatial pooling, projected token composition and text pooling
-still include host boundaries; this adapter does not claim an entirely resident model.
+The model admission covers request preprocessing and workspace before decode.
+Video patch projection, learned-position addition, Q/K/V normalization, vision
+RoPE, spatial pooling and active-token sequence mean pooling execute on Metal.
+Projected token composition/backbone inputs and final vector normalization retain
+host boundaries; this adapter does not claim an entirely resident model.
 
 The HTTP grouped form accepts `media` or binary `attachment` with `video/mp4` or
 `video/quicktime`; existing Go/Python/TypeScript media contracts carry these MIME bytes.
@@ -827,3 +834,83 @@ Model FPS sampling currently requires progressive one-picture-per-sample AVC
 (Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
 transport remain library capabilities; the model adapter rejects them until a
 logical-picture index qualifies their frame-count/FPS semantics.
+
+
+## Real-clip reference preservation and RGB recipe
+
+The six-document Sintel corpus supplies independently decoded H.264/MJPEG clips
+and four unlabelled text queries. The qualification harness compares every
+embedding coordinate, cosine score, complete ranking and top-k set with pinned
+PyTorch F32. This measures Antfly's preservation of the upstream model; relevance
+and usefulness for a customer's database remain customer evaluation concerns.
+The dated [retrieval and pipeline receipt](testdata/video-retrieval-validation.md)
+records actual Linux execution, completed CPU/MPS/Metal timings, load/retry
+behavior, and the exact scope of memory observations.
+
+Real colored H.264 inputs exposed a one-byte conversion difference between the
+old float/nearest RGB conversion and the pinned FFmpeg ARM Q13 conversion. It
+changed two non-tied rankings. The model adapter now explicitly selects
+`RgbRounding.q13_components`: floor each signed Q13 color component before final
+rounding. CPU and Metal share independently implemented arithmetic; the generic
+preparation API still defaults to `nearest`. Four independently generated
+matrix/range golden cases qualify all byte values produced by the fixture.
+Native decoder planes already matched FFmpeg; no native pixels were substituted
+into the reference and no comparison tolerance was relaxed.
+
+This changes the video recipe to `embeddinggemma2-f32-mean-v2-q13-video` and the
+pretrained model identity to
+`ba4732081640dc8db20c48eb87ca17da5bb5bc4fe21b32b584d126e83f61bb8f`.
+Previously indexed video vectors need the normal identity-aware re-embedding
+migration. Qualification covers the recorded widths, SDR metadata, FFmpeg version
+and reference decode policy; it does not promise byte-identical output from every
+platform's FFmpeg SIMD dispatch or arbitrary display/HDR inputs.
+
+Static software AVC selections now use `h264_sparse.decodeSelected`, with
+verified IDR runs bounded to the software decoder's dependency packet limit and
+a separate aggregate packet-work bound. Callback slots preserve the original
+presentation order and duplicate selections. An overlong GOP fails its bound;
+container sync flags alone never authorize a seek. Dynamic parameter-set sessions
+retain their existing route. The model uses at most 8192 submitted software
+packets per clip, 32 selected pictures and the existing decoder allocation cap.
+
+Codec implementations remain pure Zig. VP8/VP9/AV1 decoding is still an explicit
+open implementation and conformance gate, without libvpx/dav1d runtime adapters.
+
+
+## Portable VP8 keyframe entry point
+
+`vp8.decodeFrame` reads a displayed keyframe from the existing WebM index and
+returns owned padded 8-bit YUV 4:2:0 planes. It shares the pure Zig VP8 entropy,
+intra prediction, transforms and loop filters with `lib/image`, through a raw
+packet API; it requires no RIFF wrapping, RGB conversion or external decoder.
+The coded frame tag is checked independently of the container sync hint.
+Reference-dependent interframes fail with `UnsupportedVp8Interframe`; this is
+not general VP8 video playback or model WebM integration. VP9 and AV1 decoding
+remain open.
+
+Packet, pixel and live allocation limits apply before/during decoding. A shared
+admission token reserves decoder workspace, then shrinks to the owned output
+planes after scratch release. The frame keeps that token until destruction.
+Tests compare three keyframes byte-for-byte against independent FFmpeg YUV,
+inject allocation failures and deny concurrent capacity while a frame is held.
+Fixture commands and hashes are in `testdata/vp8-keyframes.json`. Further codec
+work follows the [VP8 decoding guide](https://www.rfc-editor.org/rfc/rfc6386.html).
+
+
+### Monochrome and P010 Metal surfaces
+
+`Metal.submitHost` and `submitNative` support monochrome at 8 through 14 bits.
+A monochrome native surface supplies `uv = null`; shader conversion uses neutral
+chroma without reading a fabricated image plane. A tiny bound resource satisfies
+Metal validation. The command owns it until completion/release.
+
+`apple.Surface` also imports uncompressed CoreVideo `x420`/`xf20` P010 buffers.
+Their 10-bit samples occupy the most significant bits of 16-bit storage;
+`Format.bitDepth`, `sampleShift` and `fullRange` preserve that contract in CPU
+mapping, host staging and direct CoreVideo/Metal import. Native integer textures
+may specify `NativeSurface.sample_shift` explicitly, with validated depth/storage
+bounds. The high-depth color conversion retains existing SDR policies. Tests
+compare both host and device paths to right-aligned CPU samples, cover rotations
+and ranges, and release producer buffers/textures before GPU completion.
+Compressed CoreVideo formats and HDR tone mapping remain unsupported. This does
+not change VideoToolbox codec/profile qualification.

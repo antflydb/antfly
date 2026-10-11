@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const media = @import("antfly_media");
 const avc = @import("../avc.zig");
@@ -25,7 +38,21 @@ extern fn av_metal_import(*anyopaque, *anyopaque, *?*anyopaque) i32;
 extern fn av_metal_plane_texture(*anyopaque, usize) ?*anyopaque;
 extern fn av_metal_import_release(*anyopaque) void;
 
-pub const Format = enum(u32) { nv12_video = 0x34323076, nv12_full = 0x34323066 };
+pub const Format = enum(u32) {
+    nv12_video = 0x34323076,
+    nv12_full = 0x34323066,
+    p010_video = 0x78343230,
+    p010_full = 0x78663230,
+    pub fn fullRange(self: Format) bool {
+        return self == .nv12_full or self == .p010_full;
+    }
+    pub fn bitDepth(self: Format) u8 {
+        return if (self == .p010_video or self == .p010_full) 10 else 8;
+    }
+    pub fn sampleShift(self: Format) u4 {
+        return if (self.bitDepth() == 10) 6 else 0;
+    }
+};
 /// Move-only owned retain. Not locked for CPU access until map() is called.
 pub const Surface = struct {
     handle: *anyopaque,
@@ -60,7 +87,7 @@ pub const Surface = struct {
             var height: usize = 0;
             const bytes = av_surface_plane(self.handle, i, &stride, &width, &height) orelse return error.UnsupportedSurfaceFormat;
             const size = std.math.mul(usize, stride, height) catch return error.ResourceLimitExceeded;
-            const row = std.math.mul(usize, width, if (i == 0) @as(usize, 1) else 2) catch return error.ResourceLimitExceeded;
+            const row = std.math.mul(usize, width, (if (i == 0) @as(usize, 1) else 2) * (if (self.format.bitDepth() == 8) @as(usize, 1) else 2)) catch return error.ResourceLimitExceeded;
             if (stride < row) return error.UnsupportedSurfaceFormat;
             p.* = .{ .bytes = bytes[0..size], .stride = stride, .width = width, .height = height };
         }

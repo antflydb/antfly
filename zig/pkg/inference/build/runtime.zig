@@ -519,12 +519,15 @@ pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
 }
 
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+    const compile_memory_mb = b.option(usize, "inference-compile-memory-mb", "Declared standalone inference compiler memory bound in MiB") orelse
+        @as(usize, if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024);
+    if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
         // The F32 Metal ReleaseFast CLI measured 12.7 GiB during compilation.
         // Match the inference-test headroom so the scheduler admits this
         // measured build rather than rejecting its completed artifact.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = std.math.mul(usize, compile_memory_mb, 1024 * 1024) catch @panic("inference compiler memory bound overflows"),
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,

@@ -819,3 +819,16 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
 LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
 ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+
+## Sintel retrieval qualification media
+
+The clips in `tools/embeddinggemma2/testdata/retrieval/` and
+`tools/embeddinggemma2/testdata/retrieval-long/` are derived from the Sintel
+trailer, copyright Blender Foundation, https://durian.blender.org/, under
+Creative Commons Attribution 3.0 Unported:
+https://creativecommons.org/licenses/by/3.0/.
+
+The qualification copies are resized, excerpted where specified, and re-encoded
+as H.264 or MJPEG. Their READMEs and corpus manifests record the original source,
+attribution, excerpt boundaries, modifications, encoding commands and hashes.
+These are test inputs; checkpoint weights are not included.
