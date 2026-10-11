@@ -140,6 +140,7 @@ pub const Repository = struct {
         const bridge: TokenBridge = .{ .token = cancellation };
         var result = self.store.opened.client.getObject(self.store.opened.bucket, try self.key(a, request, namespace), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
+            std.log.warn("retained native manifest lookup failed err={s} table={d} shard={d} range={d} expires={d}", .{ @errorName(err), namespace.table_id, namespace.shard_id, namespace.range_id, request.expires_ms });
             return switch (err) {
                 error.NotFound, error.ObjectNotFound, error.FileNotFound => error.CatalogGenerationChanged,
                 else => err,
@@ -529,9 +530,12 @@ pub const Repository = struct {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var store = self.store.artifactStore();
         store.allocator = a;
-        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| switch (err) {
-            error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
-            else => err,
+        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| {
+            std.log.warn("retained native chunk read failed err={s} bytes={d}", .{ @errorName(err), ref.byte_len });
+            return switch (err) {
+                error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
+                else => err,
+            };
         };
     }
     fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
@@ -654,7 +658,8 @@ test "external lake native repository opens retained vector storage after local 
     defer a.free(root);
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
     var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .table_storage = .{ .dense_embeddings = .vector_store } });
-    defer db.close();
+    var db_open = true;
+    defer if (db_open) db.close();
     try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1,\"body\":\"retained original\"}" }} });
     const id: [64]u8 = @splat('f');
@@ -662,8 +667,25 @@ test "external lake native repository opens retained vector storage after local 
     {
         var retained = try db.openQueryCut(request, .none);
         defer retained.close();
+        const prior = (try retained.get(a, "doc")).?;
+        defer a.free(prior);
+        var initial_matches = try retained.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
+        defer initial_matches.deinit();
+        try std.testing.expectEqual(@as(u32, 1), initial_matches.total_hits);
     }
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2,\"body\":\"replacement\"}" }} });
+    db.close();
+    db_open = false;
+    db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .table_storage = .{ .dense_embeddings = .vector_store } });
+    db_open = true;
+    request.create = false;
+    {
+        var restarted = try db.openQueryCut(request, .none);
+        defer restarted.close();
+        const before_loss = (try restarted.get(a, "doc")).?;
+        defer a.free(before_loss);
+        try std.testing.expect(std.mem.indexOf(u8, before_loss, "\"amount\":1") != null);
+    }
     const pinned = try cut.pathAlloc(a, root, &id);
     defer a.free(pinned);
     try std.Io.Dir.cwd().deleteTree(io, pinned);
