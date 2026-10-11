@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 
 
-def candidate(bucket, image):
+def candidate(bucket, image, *, foundation_exists=False):
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):
         raise ValueError("Expected a GCS bucket name")
     if not re.fullmatch(r"[a-zA-Z0-9./_:-]+@sha256:[a-f0-9]{64}", image):
@@ -246,6 +246,13 @@ def candidate(bucket, image):
             }
         }
     }
+    if foundation_exists:
+        resources = [
+            resource
+            for resource in resources
+            if resource["kind"]
+            not in {"Namespace", "ServiceAccount", "PersistentVolumeClaim"}
+        ]
     return {"apiVersion": "v1", "kind": "List", "items": resources}, archive, source
 
 
@@ -254,8 +261,15 @@ def main():
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--foundation-exists",
+        action="store_true",
+        help="Use the namespace, service account and retained claim owned by Colony",
+    )
     args = parser.parse_args()
-    manifest, archive, source = candidate(args.bucket, args.image)
+    manifest, archive, source = candidate(
+        args.bucket, args.image, foundation_exists=args.foundation_exists
+    )
     args.output.mkdir(parents=True, exist_ok=False)
     for name, value in (
         ("kubernetes.json", manifest),

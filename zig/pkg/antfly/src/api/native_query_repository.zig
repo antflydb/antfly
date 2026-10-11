@@ -539,7 +539,10 @@ pub const Repository = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const manifest = try checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace);
+        const manifest = checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace) catch |err| {
+            std.log.warn("retained native manifest validation failed err={s}", .{@errorName(err)});
+            return err;
+        };
         const expected_domain = try self.domain(a, namespace);
         // Publication may reuse the adjacent warmer epoch (one additional
         // hour) beyond its ordinary two-window chunk horizon.
@@ -635,6 +638,45 @@ test "external lake native repository setup round trips protocol-specific connec
     try std.testing.expectEqualStrings("fixture", recovered.connections.get("amazon").?.external_io.?.credentials.access_key_id.?);
     try std.testing.expectEqualStrings("yes", recovered.connections.get("http").?.external_io.?.headers.get("X-Fixture").?);
     try std.testing.expectEqualStrings("/tmp/fixture", recovered.connections.get("files").?.external_io.?.root.?);
+}
+
+test "external lake native repository opens retained vector storage after local cache loss" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cut-vector-read");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .manual, .filesystem_io = io });
+    defer runtime.deinit();
+    runtime.ptr().query_cut_repository = repository.capability();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    var db = try local.storage_db_db.DB.open(a, root, .{ .backend_runtime = runtime.ptr(), .identity_namespace = namespace, .table_storage = .{ .dense_embeddings = .vector_store } });
+    defer db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":1,\"body\":\"retained original\"}" }} });
+    const id: [64]u8 = @splat('f');
+    var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    {
+        var retained = try db.openQueryCut(request, .none);
+        defer retained.close();
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"amount\":2,\"body\":\"replacement\"}" }} });
+    const pinned = try cut.pathAlloc(a, root, &id);
+    defer a.free(pinned);
+    try std.Io.Dir.cwd().deleteTree(io, pinned);
+    request.create = false;
+    var remote = try db.openQueryCut(request, .none);
+    defer remote.close();
+    const original = (try remote.get(a, "doc")).?;
+    defer a.free(original);
+    try std.testing.expect(std.mem.indexOf(u8, original, "\"amount\":1") != null);
+    var matches = try remote.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
+    defer matches.deinit();
+    try std.testing.expectEqual(@as(u32, 1), matches.total_hits);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pinned, .{}));
 }
 
 test "external lake native repository reuses immutable extents and collects expired generations" {

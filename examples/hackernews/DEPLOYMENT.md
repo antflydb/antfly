@@ -19,12 +19,13 @@ Render an offline candidate using an actual immutable image digest:
 
 ```sh
 python examples/hackernews/deployment.py \
-  --bucket antfly-hackernews-dev-01 \
+  --bucket antfly-hackernews-antfly-dev-01 \
   --image YOUR_REGISTRY_IMAGE@sha256:YOUR_IMAGE_DIGEST \
+  --foundation-exists \
   --output /private/tmp/hackernews-serving
 
 uv run --project examples/hackernews python examples/hackernews/configure_catalog.py \
-  --warehouse gs://antfly-hackernews-dev-01/current \
+  --warehouse gs://antfly-hackernews-antfly-dev-01/current \
   --source-connection hn-current --table-id hn-current --mode managed \
   > /private/tmp/hackernews-serving/current-table.json
 ```
@@ -47,7 +48,8 @@ Infrastructure prerequisites belong in the Colony development Pulumi stack:
   connection prefixes separately bind archive reads, current writes and derived
   artifacts. Use refreshable default credentials, never an injected bearer token
   or downloaded service-account key.
-- Persistent catalog/shard/cache state on a 20 GiB `standard-rwo` claim. The
+- Persistent catalog/shard/cache state on Colony's protected 20 GiB
+  `hackernews-state` claim and `hackernews-retain-development` class. The
   single replica uses `Recreate` so two owners cannot write the same local state.
   This supports replacement-pod mounting; it is not high availability. Do not use
   Spot until replacement-owner recovery is actually qualified.
@@ -57,6 +59,8 @@ Infrastructure prerequisites belong in the Colony development Pulumi stack:
 
 The renderer creates no bucket, IAM binding, PVC, ingress, DNS record or pod.
 Infrastructure changes must follow Colony's current-preview approval procedure.
+With `--foundation-exists`, rendered resources omit the namespace, service
+account and PVC, so application deployment does not take over Pulumi ownership.
 No long-lived service should depend on the expiring import bucket or ephemeral
 qualification catalog.
 

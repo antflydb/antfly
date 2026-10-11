@@ -55,6 +55,89 @@ class BudgetReconciliationTest(unittest.TestCase):
             ],
         }
 
+    def closed_evidence(self):
+        return {
+            "project": self.config["project"],
+            "kind": "reviewed_closed_pod_compute_bound",
+            "runs": [
+                {
+                    "run_id": "failed",
+                    "admitted_pod": {
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "hn-failed",
+                            "uid": "owned-uid",
+                            "creationTimestamp": "2020-01-01T00:00:00Z",
+                        },
+                        "spec": {
+                            "activeDeadlineSeconds": 3400,
+                            "restartPolicy": "Never",
+                            "containers": [
+                                {
+                                    "resources": {
+                                        "requests": {
+                                            "cpu": "8",
+                                            "memory": "48Gi",
+                                            "ephemeral-storage": "10Gi",
+                                        }
+                                    }
+                                }
+                            ],
+                        },
+                    },
+                    "cleanup": {
+                        "pod": "hn-failed",
+                        "pod_uid": "owned-uid",
+                        "created": True,
+                        "deleted": True,
+                        "observed_absent_at_utc": "2020-01-01T01:00:00Z",
+                    },
+                }
+            ],
+        }
+
+    def apply_bound(self, evidence):
+        self.evidence_path.write_text(json.dumps(evidence))
+        return budget.bound_closed_pods(self.ledger, self.evidence_path)
+
+    def test_closed_bound_keeps_noncompute_and_actual_billing_supersedes_it(self):
+        result = self.apply_bound(self.closed_evidence())
+        self.assertFalse(result["posted_billing"])
+        self.assertAlmostEqual(result["exposure_usd"], 56.187338)
+        self.assertTrue(self.apply_bound(self.closed_evidence())["already_applied"])
+        original = json.loads(self.ledger.read_text())
+        self.assertEqual(original["runs"], self.original["runs"])
+        self.assertEqual(original["budget"], self.original["budget"])
+        # Even an unexpected actual overrun must replace the estimate.
+        self.evidence["runs"][0]["gross_compute_usd"] = 30
+        self.assertAlmostEqual(self.apply()["exposure_usd"], 85)
+
+    def test_closed_bound_rejects_wrong_owner_active_pod_and_unaccounted_storage(self):
+        evidence = self.closed_evidence()
+        cases = []
+        wrong = deepcopy(evidence)
+        wrong["runs"][0]["cleanup"]["pod_uid"] = "replacement-uid"
+        cases.append(wrong)
+        active = deepcopy(evidence)
+        active["runs"][0]["cleanup"]["deleted"] = False
+        cases.append(active)
+        long = deepcopy(evidence)
+        long["runs"][0]["admitted_pod"]["spec"]["activeDeadlineSeconds"] = 100000
+        cases.append(long)
+        persistent = deepcopy(evidence)
+        persistent["runs"][0]["admitted_pod"]["spec"]["volumes"] = [
+            {"persistentVolumeClaim": {"claimName": "state"}}
+        ]
+        cases.append(persistent)
+        sidecar = deepcopy(evidence)
+        sidecar["runs"][0]["admitted_pod"]["spec"]["containers"].append({})
+        cases.append(sidecar)
+        before = self.ledger.read_bytes()
+        for invalid in cases:
+            with self.subTest(evidence=invalid), self.assertRaises(ValueError):
+                self.apply_bound(invalid)
+            self.assertEqual(before, self.ledger.read_bytes())
+
     def apply(self):
         self.evidence_path.write_text(json.dumps(self.evidence))
         return budget.reconcile(self.ledger, self.evidence_path)

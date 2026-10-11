@@ -1,0 +1,128 @@
+{
+  "project": "antfly-dev-01",
+  "kind": "reviewed_closed_pod_compute_bound",
+  "runs": [
+    {
+      "run_id": "hn-poc/archive-qualification/245412afa2ca4b7c8f247128d5c7e047",
+      "admitted_pod": {
+        "kind": "Pod",
+        "metadata": {
+          "name": "hackernews-benchmark-472a66302d5d",
+          "uid": "293a66ad-b3cd-427f-9c26-f650c008e619",
+          "creationTimestamp": "2026-10-11T20:12:49Z"
+        },
+        "spec": {
+          "activeDeadlineSeconds": 3400,
+          "terminationGracePeriodSeconds": 30,
+          "restartPolicy": "Never",
+          "containers": [
+            {
+              "command": [
+                "python3",
+                "-c",
+                "import time; time.sleep(3400)"
+              ],
+              "image": "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9",
+              "imagePullPolicy": "IfNotPresent",
+              "name": "benchmark",
+              "resources": {
+                "limits": {
+                  "cpu": "8",
+                  "ephemeral-storage": "10Gi",
+                  "memory": "48Gi"
+                },
+                "requests": {
+                  "cpu": "8",
+                  "ephemeral-storage": "10Gi",
+                  "memory": "48Gi"
+                }
+              },
+              "securityContext": {
+                "capabilities": {
+                  "drop": [
+                    "NET_RAW"
+                  ]
+                }
+              },
+              "terminationMessagePath": "/dev/termination-log",
+              "terminationMessagePolicy": "File"
+            }
+          ]
+        }
+      },
+      "cleanup": {
+        "pod": "hackernews-benchmark-472a66302d5d",
+        "created": true,
+        "deleted": true,
+        "pod_uid": "293a66ad-b3cd-427f-9c26-f650c008e619",
+        "observed_absent_at_utc": "2026-10-11T20:33:06.075886+00:00"
+      },
+      "provenance": {
+        "worker_sha256": "1679f02dcb76b9506965db7a835a0945c43467e81dc80865ec500666edd75696",
+        "original_cleanup_sha256": "51050c5abdd73d774dc7fa0c3c2930ba8d92e00a742f0bf0d8ccc9d624ac09ca",
+        "absence_rechecked_at_utc": "2026-10-11T21:52:01.642231+00:00"
+      }
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/19607f37986740e0a3e127ae4da556f7",
+      "admitted_pod": {
+        "kind": "Pod",
+        "metadata": {
+          "name": "hackernews-benchmark-ec6b230499a3",
+          "uid": "2f34ead7-2afc-4568-b22a-4197989edf2d",
+          "creationTimestamp": "2026-10-11T21:38:06Z"
+        },
+        "spec": {
+          "activeDeadlineSeconds": 3400,
+          "terminationGracePeriodSeconds": 30,
+          "restartPolicy": "Never",
+          "containers": [
+            {
+              "command": [
+                "python3",
+                "-c",
+                "import time; time.sleep(3400)"
+              ],
+              "image": "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9",
+              "imagePullPolicy": "IfNotPresent",
+              "name": "benchmark",
+              "resources": {
+                "limits": {
+                  "cpu": "8",
+                  "ephemeral-storage": "10Gi",
+                  "memory": "48Gi"
+                },
+                "requests": {
+                  "cpu": "8",
+                  "ephemeral-storage": "10Gi",
+                  "memory": "48Gi"
+                }
+              },
+              "securityContext": {
+                "capabilities": {
+                  "drop": [
+                    "NET_RAW"
+                  ]
+                }
+              },
+              "terminationMessagePath": "/dev/termination-log",
+              "terminationMessagePolicy": "File"
+            }
+          ]
+        }
+      },
+      "cleanup": {
+        "pod": "hackernews-benchmark-ec6b230499a3",
+        "created": true,
+        "deleted": true,
+        "pod_uid": "2f34ead7-2afc-4568-b22a-4197989edf2d",
+        "observed_absent_at_utc": "2026-10-11T21:39:47.654593+00:00"
+      },
+      "provenance": {
+        "worker_sha256": "2f702b169a0ed9bd093fd8a87e70f639a636ea7cfbe3c4e33fbe25f5d3ca83fa",
+        "original_cleanup_sha256": "429dfdf43492ca456418019cfabbc446958e386a76d6f4506cc2e784354af53e",
+        "absence_rechecked_at_utc": "2026-10-11T21:52:01.643312+00:00"
+      }
+    }
+  ]
+}

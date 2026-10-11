@@ -94,6 +94,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
     if (isCommonField(field)) return true;
     return switch (kind) {
         .full_text => std.mem.eql(u8, field, "mem_only") or
+            std.mem.eql(u8, field, "store_source") or
             std.mem.eql(u8, field, "field") or
             std.mem.eql(u8, field, "artifact_name") or
             std.mem.eql(u8, field, "sources"),
@@ -381,7 +382,7 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "sources")) return value == .array;
 
     return switch (kind) {
-        .full_text => if (std.mem.eql(u8, field, "mem_only"))
+        .full_text => if (std.mem.eql(u8, field, "mem_only") or std.mem.eql(u8, field, "store_source"))
             isBool(value)
         else if (std.mem.eql(u8, field, "field") or std.mem.eql(u8, field, "artifact_name"))
             isNonEmptyString(value)

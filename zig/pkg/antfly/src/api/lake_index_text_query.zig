@@ -1621,12 +1621,15 @@ test "external lake stored highlights read authenticated native source without P
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } }});
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } },
+        .{ .column_id = "label", .field_id = 2, .converted_type = 0, .values = &.{ "returned metadata", "other metadata" } },
+    });
     defer a.free(data);
     var put = try client.putObject("antfly", "part.parquet", data, .{});
     put.deinit(a);
     const schema_json = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"label":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
     , .{directory.path()});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
@@ -1682,6 +1685,9 @@ test "external lake stored highlights read authenticated native source without P
     var parsed = try std.json.parseFromSlice(std.json.Value, a, values[0].?, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("a needle in the haystack", parsed.value.object.get("body").?.string);
+    // Selecting only body for indexing must not discard projected metadata.
+    // The Parquet object is already gone, so this is durable source coverage.
+    try std.testing.expectEqualStrings("returned metadata", parsed.value.object.get("label").?.string);
     const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
     owner.highlight_queries = &.{.{ .query = query, .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" }};
     var result: types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1, .graph_results = &.{} };

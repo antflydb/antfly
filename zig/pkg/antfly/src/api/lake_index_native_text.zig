@@ -48,7 +48,9 @@ pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []
     const original = state.recipe(table, config);
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("native-lake-text-stored-source-v1");
+    // v2 stores the complete declared relational row even when `field`
+    // selects only one searchable text field. v1 retained only that field.
+    hash.update("native-lake-text-stored-source-v2");
     hash.update(&original);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -287,7 +289,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const store_source = try storesSource(config);
         const selected_field: ?[]const u8 = if (config.object.get("field")) |field| if (field == .string) field.string else null else null;
         var binding = want.binding;
-        if (selected_field == null) {
+        if (selected_field == null or store_source) {
             const paths = try ca.alloc([]const u8, runtime.relational_columns.len);
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;

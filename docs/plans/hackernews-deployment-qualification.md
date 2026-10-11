@@ -372,10 +372,39 @@ passed.
 
 Cold search received 55,652,318 network bytes with the stored-source projection
 disabled. The next profile explicitly enables `store_source` on the archive text
-index, permitting highlights to read indexed text while other selected columns
-still use the authoritative source. This increases sidecar storage and must be
+index, retaining the complete declared relational row while indexing only body.
+Both highlights and returned HN metadata can use the authenticated sidecar. The
+v2 stored-source recipe fences older body-only projections without changing
+source-free recipe identity or the segment format. This increases sidecar storage and must be
 measured; it is not yet a qualified latency improvement. The serving candidate
 uses the same policy.
+
+The next [registration probe](../../examples/hackernews/publication-registration-20261011.json)
+stopped before publication because the public full-text allow-list omitted
+`store_source`. Its pod was deleted and its artifact prefix was empty. Public
+create-table/create-index admission and response projection now preserve the
+boolean option. The regression also rejects non-boolean values. A native stored
+source test deletes the Parquet object and verifies body plus returned metadata
+remain available from the authenticated segment. These are local contract
+checks, not regional latency measurements.
+
+The latest billing export still omits today's two pods. The
+[closed-pod evidence](../../examples/hackernews/archive-compute-bounds-20261011.json)
+replaces their excess compute reservations with two full hours each at their
+admitted resources, preserving $10 per run for pending noncompute. This is an
+explicit upper estimate, not posted spend. Exposure is $113.301782 before another
+attempt; a new $20 reservation fits the unchanged $150 ceiling. Original run
+history and allowances remain, and posted gross billing supersedes these bounds,
+including an overrun. The failed registration attempt measured no search latency.
+
+Colony's separate storage preparation provides a dedicated protected bucket,
+one exact Workload Identity principal and retained catalog disk. The application
+renderer can omit these Pulumi-owned prerequisites with `--foundation-exists`.
+An approved current infrastructure preview, credential-refresh/replacement-pod
+qualification and the actual archive gate are still required before public
+serving. A full-archive attempt must budget GCS operations and retain partial
+catalog/checkpoint state; do not multiply a one-file timing into a proven bound
+or discard an interrupted build's catalog after its pod deadline.
 
 The composed history/current check failed with `unsupported_exact_sort` on a
 numeric native-table key filter. Exact native filter lowering now translates
