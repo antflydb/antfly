@@ -2054,12 +2054,31 @@ gates: eight candidate, eleven candidate/private-addition, five system/page and
 fourteen catalog tests, without skips, failures or leaks. Production
 `embedded-capi-check` passes 28/28 Debug build steps. Apache dependency-boundary
 validation passes for 2028 sources and inventory integrity remains unchanged.
-ReleaseFast qualification is still in progress; existing component gates alone
-do not prove distributed activation. The first
+ReleaseFast qualification also passes all 65 steps with the same selected
+artifact counts and no skips, failures or leaks. These gates do not prove
+distributed activation. The first
 integration compilation exposed an obsolete Zig reflection API, now corrected
 to the repository's field-name interface. The first execution also corrected a
 fixture to use the public schema/validator setter rather than weakening its
 native schema guard. No SQL inventory credits are claimed.
+
+The native owner integration fixture forces synchronous publication failure
+after durable fencing, checks
+that pending replication exposes no receipt, and reopens the LSM owner before
+recovering the exact saved frame/native cut. The fixture also checks that a
+checkpoint can acquire an exclusive mutation barrier during acknowledgement and
+that the recovered duplicate reconstructs its original proof without allocating
+another cut. This restart/recovery campaign passes all 52 Debug build steps,
+with five system/page and eleven candidate/private-addition tests and no skips,
+failures or leaks. The first fixture compilation's callback-helper shadowing was
+corrected without changing assertions. A strengthened campaign additionally
+mirrors successful reservation and acquires the exclusive checkpoint barrier in
+the foreground apply acknowledgement callback, not merely the recovery callback;
+it verifies exact publication counts on duplicate retry. Final Debug
+qualification passes all 52 steps with the same artifact counts and no skips,
+failures or leaks; ReleaseFast qualification for that addition is in progress.
+This does not add a
+SQL disposition or justify enabling the public producer.
 
 Still required: authenticated C-ABI/RPC receivers with independent live metadata
 permission, envelope capability admission, actual Raft effect identities, worker

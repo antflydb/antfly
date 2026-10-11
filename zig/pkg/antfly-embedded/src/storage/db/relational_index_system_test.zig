@@ -50,9 +50,11 @@ test "relational index build pages native owner control preserves committed cuts
         attempts: usize = 0,
         completed: usize = 0,
         barrier: *Barrier,
+        lsn: u64 = 2,
 
-        fn next(_: *anyopaque) u64 {
-            return 2;
+        fn next(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.lsn;
         }
         fn identity(_: *anyopaque) contract.Publisher.Identity {
             return .{ .table_id = 101, .shard_id = 11, .timeline_id = 1, .epoch = 1 };
@@ -63,7 +65,7 @@ test "relational index build pages native owner control preserves committed cuts
         fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, _: @import("doc_identity.zig").Namespace) !u64 {
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
             try std.testing.expectEqual(outboxes.Kind.restore_batch, kind);
-            try std.testing.expectEqual(@as(u64, 2), pending.from_lsn);
+            try std.testing.expectEqual(self.lsn, pending.from_lsn);
             if (self.payload) |previous| {
                 try std.testing.expectEqualSlices(u8, previous, pending.payload);
             } else self.payload = try alloc.dupe(u8, pending.payload);
@@ -80,7 +82,7 @@ test "relational index build pages native owner control preserves committed cuts
             capture.release();
             self.completed += 1;
         }
-        fn mirror(self: *@This()) contract.AsyncBatchMirror {
+        fn asMirror(self: *@This()) contract.AsyncBatchMirror {
             return .{
                 .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } },
                 .mutation_barrier = self.barrier,
@@ -141,7 +143,15 @@ test "relational index build pages native owner control preserves committed cuts
             try primary.prepareNativeIndexOwnerControl(.{ .effect = effect, .binding = binding });
         defer control.deinit();
         try control.preparePayload();
-        if (effect == .fenced) primary.local_execution.replication_async_batch_mirror = publisher.mirror();
+        if (effect == .reserved) {
+            // A distinct effect has its own transport LSN and payload. Its
+            // successful foreground ACK exercises lease release in apply,
+            // rather than only during the explicit recovery call below.
+            alloc.free(publisher.payload.?);
+            publisher.payload = null;
+            publisher.lsn = 3;
+        }
+        if (effect != .admitted) primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
         const outcome = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
         try std.testing.expect(!outcome.duplicate);
         if (effect == .fenced) {
@@ -160,15 +170,20 @@ test "relational index build pages native owner control preserves committed cuts
             try std.testing.expect(!outcome.replication_pending);
             try std.testing.expect(outcome.error_name == null);
             try std.testing.expectEqual(effect != .admitted, outcome.receipt != null);
+            if (effect == .reserved) {
+                try std.testing.expectEqual(@as(usize, 3), publisher.attempts);
+                try std.testing.expectEqual(@as(usize, 2), publisher.completed);
+            }
         }
         const payload = try control.finalizePayload(outcome.position);
+        if (effect == .reserved) try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
         if (effect == .fenced) {
             try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
             primary.local_execution.replication_async_batch_mirror = null;
             primary.close();
             primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
             publisher.fail = false;
-            primary.local_execution.replication_async_batch_mirror = publisher.mirror();
+            primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
             try primary.flushDurableReplicationOutboxes();
             try std.testing.expectEqual(@as(usize, 2), publisher.attempts);
             try std.testing.expectEqual(@as(usize, 1), publisher.completed);
@@ -206,6 +221,10 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expect(primary_retry.duplicate);
         try std.testing.expectEqual(outcome.position, primary_retry.position);
         try std.testing.expectEqual(effect != .admitted, primary_retry.receipt != null);
+        if (effect == .reserved) {
+            try std.testing.expectEqual(@as(usize, 3), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 2), publisher.completed);
+        }
         try std.testing.expectEqual(@as(u64, ordinal + 1), try standby.replicationAppliedSequence());
         var txn = try standby.core.store.beginReadTxn();
         defer txn.abort();
