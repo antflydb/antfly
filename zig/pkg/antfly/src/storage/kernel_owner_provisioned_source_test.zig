@@ -31,6 +31,71 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "native index owner adapter inspects cold native ownership and rejects foreign namespaces" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Catalog = struct {
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_incarnation = "61616161616161616161616161616161".*, .metrics = .{} },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 101,
+                    .name = "items",
+                    .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}",
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7501, .table_id = 101, .range_id = 7501, .start_key = "", .end_key = null }}),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    var catalog = Catalog{};
+    const identity: local.storage_db_relational_index_owner_control.Identity = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .namespace = .{ .table_id = 101, .shard_id = 7501, .range_id = 7501 },
+        .owner_group_id = 7501,
+    };
+    // Repeat from a fully closed source: neither the decoded status nor the
+    // native mode proof may depend on a retained process-local job or lease.
+    for (0..2) |_| {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        defer owners.deinit();
+        var state = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
+        defer state.deinit();
+        try std.testing.expect(state.value == null);
+        var foreign = identity;
+        foreign.namespace.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerState(alloc, 7501, "items", foreign, .{}));
+        var after_rejection = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
+        defer after_rejection.deinit();
+        try std.testing.expect(after_rejection.value == null);
+    }
+}
+
 test "cold warmup reopens transient owners without disturbing resident siblings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

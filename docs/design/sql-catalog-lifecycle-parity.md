@@ -2173,5 +2173,9 @@ caller must independently authenticate and fetch publication permission; actual
 storage execution continues to validate native authority and durable job state.
 The focused source test requires canceled, expired and foreign-group requests
 to reject before touching an uninitialized catalog/owner, and rejects empty
-admission inputs before acquisition. Production-linked source qualification is
-in progress. This does not activate public publication or change SQL credits.
+admission inputs before acquisition. The production-linked Debug source gate
+passes all 48 build steps. A second test uses a real cold provisioned native
+owner, rejects a foreign namespace without damaging subsequent inspection,
+then closes and reopens the whole source on the same LSM root. Both focused
+tests pass with no skips, failures or leaks. Optimized qualification remains
+pending. This does not activate public publication or change SQL credits.
