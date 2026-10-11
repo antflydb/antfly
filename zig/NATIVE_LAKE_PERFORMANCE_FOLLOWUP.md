@@ -2020,3 +2020,28 @@ publication still enumerates file identities to find the changed set, and
 maintenance may expand complete manifests. The page-reuse regression measures
 changed-path writes and reader retention; archive-scale cold/warm latency,
 provider bytes, RSS, and skewed-join measurements remain separate qualification.
+
+Qualification after merging `origin/main` through `2afbdd306c` (Zig 0.17.0,
+Debug):
+
+- All 328 lake integration tests pass (135 shared SQL/lake, 193 API), with no
+  allocator leaks. The 52 focused ranking tests pass; the optimized-only
+  benchmark is skipped in Debug. The production `antfly` CLI builds.
+- The original public VALUES COUNT join returns HTTP 200 with `4`; COUNT/SUM
+  and the residual row execution reference agree.
+- The 2,048-descriptor COW regression writes 80 initial pages and 12 pages
+  after one descriptor replacement, verifies the old reader, and performs no
+  writes for an unchanged publication.
+- Formatting, Python lint, license headers, the Apache product dependency
+  boundary (2,022 source files), and diff checks pass.
+- All 11 selected public E2Es pass across the final affected runs: independent
+  Iceberg commits/schema IDs/deletes/restart, fragmented text hierarchy in both
+  formats, remote text/highlights/cursors, incremental generations, the wide
+  typed join and plain COUNT regression, both ordered-index hydration modes,
+  both signed timestamp modes, and metadata predicates above 100,000 rows.
+- The 100,003-row predicate fixture exceeded its former 300-second publication
+  setup deadline twice, including an isolated run. Samples identified the
+  unchanged ordered-index spill and reverse-coordinate publication paths. With
+  a bounded 600-second setup window, the isolated full fixture passes in
+  419 seconds. Its row count and predicate/restart assertions are unchanged;
+  the test does not establish a bulk-publication latency improvement.

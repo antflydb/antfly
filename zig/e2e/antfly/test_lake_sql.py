@@ -1079,11 +1079,7 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
         assert next(i for i in listed if i["config"]["name"] == "amount_idx")["status"][
             "readiness"
         ]["queryable"]
-        version = (
-            resource["config"]["schema_version"]
-            if "schema_version" in resource["config"]
-            else None
-        )
+        version = resource["config"].get("schema_version", None)
         primary = call(
             "POST",
             "/tables/lake_ordered/rows/query",
@@ -1121,20 +1117,22 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
             )["rows"]
             == expected
         )
-        with psycopg.connect(
-            host="127.0.0.1",
-            port=server.pgwire_port,
-            user="admin",
-            password=AUTH_BOOTSTRAP_PASSWORD,
-            dbname="default",
-            sslmode="disable",
-            autocommit=True,
-        ) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount"
-                )
-                assert cursor.fetchall() == [(base + 17, 12)]
+        with (
+            psycopg.connect(
+                host="127.0.0.1",
+                port=server.pgwire_port,
+                user="admin",
+                password=AUTH_BOOTSTRAP_PASSWORD,
+                dbname="default",
+                sslmode="disable",
+                autocommit=True,
+            ) as connection,
+            connection.cursor() as cursor,
+        ):
+            cursor.execute(
+                f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount"
+            )
+            assert cursor.fetchall() == [(base + 17, 12)]
 
         def check_filtered_limits():
             # OFFSET crosses an indexed value boundary; covered-column
@@ -2778,7 +2776,10 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 },
             },
         )
-        deadline = time.monotonic() + 300
+        # This fixture builds several ordered indexes over more than 100,000
+        # rows. Allow bounded Debug publication setup before checking indexed
+        # query semantics; this is not a publication-latency benchmark.
+        deadline = time.monotonic() + 600
         while True:
             resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
             if resource["status"]["readiness"]["queryable"]:
@@ -3208,7 +3209,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             + query(point)["hits"]["hits"]
         )
         assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [
-            sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]
+            min(zeros, key=lambda h: h["_id"])["_source"]["amount"]
         ], tied
         assert tied["profile"]["sort"]["candidate_source"] == "ordered_lake_index", tied
         assert tied["profile"]["sort"]["candidate_count"] <= 4, tied
@@ -3846,11 +3847,15 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
         # protocol as a query containing multiple aggregate expressions.
         assert call(
             "/sql",
-            {"statement": "SELECT COUNT(*) FROM wide_join l JOIN wide_join r ON l.k=r.k"},
+            {
+                "statement": "SELECT COUNT(*) FROM wide_join l JOIN wide_join r ON l.k=r.k"
+            },
         )["rows"] == [[str(2 * count)]]
         assert call(
             "/sql",
-            {"statement": "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k"},
+            {
+                "statement": "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k"
+            },
         )["rows"] == [["4"]]
         # Each source row has exactly two matches. Python integer arithmetic
         # supplies an independent reference for every reducer and orientation.
