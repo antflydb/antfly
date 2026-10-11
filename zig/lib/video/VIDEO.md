@@ -1091,3 +1091,42 @@ are separate receipts; cross-compilation does not establish actual Linux runtime
 qualification. The existing Linux qualification workflow runs these portable
 tests. Broad real-world conformance/fuzzing and realistic performance remain
 qualification work, rather than implied by the source port.
+
+
+### WebM logical-picture replay for model input
+
+`webm_pictures.index` reconstructs the bounded coded stream and retains only
+visible-picture timing and geometry. Hidden VP8/VP9/AV1 reference pictures update
+state without becoming sampling candidates. Multiple visible outputs from one
+packet have independent logical IDs; they retain the packet timestamp rather
+than receiving an invented frame clock. Presentation ordering is stable at equal
+PTS. Sampling uses the pinned average-FPS policy with a 32-frame uniform cap.
+The declared Segment Duration takes precedence over rounded packet PTS. Without
+a declared duration, an absent final duration uses the last positive presentation
+step; a stream with
+no inferable rate uses capped index sampling.
+
+`webm_pictures.walk` replays dependencies once up to the final selected logical
+picture. Selected frames borrow independently owned native-depth surfaces for
+the callback. The model sends these through the existing CPU preparation or
+Metal preparation/projection queue, preserving frame batching and duplicate
+projection reuse. Indexing and replay each limit coded work to 8192 packets and
+visible metadata to 65536 pictures; no full decoded clip is retained. This
+initial implementation decodes twice and is a target for measured seek/index
+optimization.
+
+The inference HTTP contract accepts `video/webm` for EmbeddingGemma 2 ordered
+groups. MP4/MOV processing retains its prior path and sampling behavior. The
+current WebM track parser has no display/SAR/Colour model metadata contract;
+qualification below is for generated default-display SDR fixtures. Broader WebM
+display metadata support and pretrained qualification remain separate gates.
+
+
+The [WebM qualification receipt](testdata/webm-validation/README.md) records
+pretrained CPU/Metal and actual Linux ARM64 parity over five clips and three
+queries, including real VP9/AV1 Sintel derivatives. Eight vectors agree within
+`1e-6`; all rankings/top-k sets match. Current full video gates pass 141 tests on
+macOS with actual Metal (two skips) and 120 on Linux ARM64 (23 platform skips).
+Bounded H.264/VP9/AV1 coverage-guided campaigns total over 608000 runs without
+failure. This establishes the documented corpus/format subset and reference
+preservation, rather than arbitrary codec conformance or end-user relevance.

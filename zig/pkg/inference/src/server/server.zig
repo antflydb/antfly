@@ -23369,6 +23369,7 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_document, "application/pdf" },
         .{ accepts_video, "video/mp4" },
         .{ accepts_video, "video/quicktime" },
+        .{ accepts_video, "video/webm" },
     }) |mime| {
         if (!mime[0]) continue;
         if (mime_index > 0) try buf.append(allocator, ',');
@@ -31691,7 +31692,7 @@ fn appendDenseEmbedBinary(
         return;
     }
 
-    if (std.ascii.eqlIgnoreCase(mime_type, "video/mp4") or std.ascii.eqlIgnoreCase(mime_type, "video/quicktime")) {
+    if (std.ascii.eqlIgnoreCase(mime_type, "video/mp4") or std.ascii.eqlIgnoreCase(mime_type, "video/quicktime") or std.ascii.eqlIgnoreCase(mime_type, "video/webm")) {
         if (!parsed.allow_video or manifest.embedding_style != .embedding_gemma2 or !model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportVideoInput;
         try parsed.videos.append(allocator, .{ .index = index, .bytes = bytes, .mime_type = mime_type, .owned = owned });
         return;
@@ -31878,7 +31879,7 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.MediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
         error.InvalidMediaBase64 => "invalid base64 media data",
         error.MediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
-        error.UnsupportedMediaMimeType => "unsupported media MIME type; video groups accept video/mp4 or video/quicktime",
+        error.UnsupportedMediaMimeType => "unsupported media MIME type; video groups accept video/mp4, video/quicktime or video/webm",
         error.ModelDoesNotSupportVideoInput => "video requires an ordered EmbeddingGemma 2 content group",
         error.ModelDoesNotSupportTextInput => "model does not support text input",
         error.ModelDoesNotSupportImageInput => "model does not support image input",
@@ -31907,6 +31908,8 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         error.UnsupportedVideoDisplay,
         error.UnsupportedVideoColor,
         error.MalformedVideoPacket,
+        error.InvalidVideoData,
+        error.WebpDecodeFailed,
         error.MalformedVideoConfig,
         error.MissingVideoReference,
         error.UnsupportedDynamicGeometry,
@@ -36194,8 +36197,11 @@ test "embeddinggemma2 video MIME is accepted only inside family ordered groups" 
     var other = manifest;
     other.embedding_style = .qwen3_embedding;
     try std.testing.expectError(error.ModelDoesNotSupportVideoInput, appendDenseEmbedBinary(a, &other, &parsed, "mp4", "video/mp4", 0, false));
-    try std.testing.expectError(error.UnsupportedMediaMimeType, appendDenseEmbedBinary(a, &manifest, &parsed, "webm", "video/webm", 0, false));
+    try appendDenseEmbedBinary(a, &manifest, &parsed, "webm", "video/webm", 0, false);
+    try std.testing.expectEqual(@as(usize, 2), parsed.videos.items.len);
     try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.UnsupportedVideoColor).status);
+    try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.InvalidVideoData).status);
+    try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.WebpDecodeFailed).status);
 }
 
 test "embeddinggemma2 ordered video parser keeps borrowed attachment and caption order" {

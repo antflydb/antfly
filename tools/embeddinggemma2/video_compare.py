@@ -207,7 +207,17 @@ def decoded(path, processor):
         )["streams"][0]
         count = info.get("nb_read_frames")
     count = int(count)
-    duration = float(info["duration"])
+    duration_value = info.get("duration")
+    if duration_value in (None, "N/A"):
+        # Matroska commonly declares duration on the Segment, not the track.
+        container = json.loads(
+            subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_format", "-of", "json", str(path)],
+                timeout=120,
+            )
+        )
+        duration_value = container["format"]["duration"]
+    duration = float(duration_value)
     width, height = int(info["width"]), int(info["height"])
     if not (
         0 < count <= 20000
@@ -505,6 +515,8 @@ def native(args, data, result):
                                     "type": "media",
                                     "mime_type": "video/quicktime"
                                     if row["path"].endswith(".mov")
+                                    else "video/webm"
+                                    if row["path"].endswith(".webm")
                                     else "video/mp4",
                                     "data": base64.b64encode(
                                         Path(row["path"]).read_bytes()

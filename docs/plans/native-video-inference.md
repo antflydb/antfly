@@ -601,3 +601,28 @@ workflow receipt. Broader real-world codec conformance, coverage-guided fuzzing,
 AV1 additional profiles/layer policies and measured throughput remain explicit
 qualification work. See `src/codecs/PORTING.md` for the maintained-source contract
 and `testdata/vpx-av1/README.md` for reproducible reference fixtures.
+
+
+### Remaining non-CUDA execution scope (2026-10-11)
+
+The next implementation connects native WebM VP8/VP9/AV1 reconstruction to model
+sampling and CPU/Metal projection. Logical decoder-output indexing, bounded
+replay and HTTP MIME support are implemented. Pretrained CPU/Metal and actual
+Linux ARM64 parity pass across eight vectors and three exact retrieval rankings;
+current receipts are in `zig/lib/video/testdata/webm-validation`. Full completion additionally requires all of:
+
+- Broader real-world differential streams, sustained coverage-guided fuzzing and
+  corruption recovery.
+- AV1 additional profiles, 12-bit, monochrome, 4:2:2/4:4:4, Annex B and scalable
+  layer policies with independently decoded fixtures.
+- Realistic codec benchmarks, measured portable SIMD and reduced retained
+  reference copying.
+- Actual Linux execution of current codec and pretrained model paths.
+- H.264 logical field/partition indexing, model timestamp policies and long-video
+  windows, plus broader WebM display/Colour qualification.
+- Final resident device normalization and scheduling across requests.
+- DASH inherited templates/BaseURL, multiple periods/representations and broader
+  live/HLS coverage.
+
+CUDA remains outside this execution scope. Passing one implementation gate does
+not close the other items or establish general codec conformance.

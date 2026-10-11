@@ -502,3 +502,18 @@ retain that packet's timestamp; this does not invent a logical-picture timeline
 or add model WebM ingestion. See [VIDEO.md](../video/VIDEO.md) and the
 [maintained port contract](../video/src/codecs/PORTING.md) for support and failure
 semantics.
+
+
+WebM model consumers must distinguish coded packets from displayed pictures.
+The native video module supplies `webm_pictures` to index decoder outputs and
+replay selected logical pictures. Container invisibility and codec hidden
+reference updates do not contribute to model frame counts; a single packet can
+produce multiple pictures. PTS stays in nanoseconds and equal timestamps retain
+stable decoder-output order. Container indexing alone is not evidence of
+pretrained model parity.
+
+WebM `Reader.duration_seconds` preserves the optional declared Segment Duration
+scaled by TimestampScale. It is validated for finite positive values after the
+entire Info element is read, so element ordering does not affect scaling.
+Sampling consumers should prefer this value over rounded block timestamp tails.
+See the [Matroska element specification](https://www.matroska.org/technical/elements.html).

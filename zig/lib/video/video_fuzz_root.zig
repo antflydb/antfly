@@ -15,4 +15,5 @@
 
 test {
     _ = @import("src/h264_fuzz_test.zig");
+    _ = @import("src/codecs/fuzz_test.zig");
 }

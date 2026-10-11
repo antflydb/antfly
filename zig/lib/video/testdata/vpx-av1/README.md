@@ -44,3 +44,11 @@ receipts: 14/14 focused Debug tests, 136/138 ReleaseSafe video tests with two
 platform skips, actual decoded-frame CPU/Metal preparation parity, and Linux
 x86_64/ARM64 compile/link checks. Its referenced logs distinguish executed
 tests from cross-compilation.
+
+
+`vp9-sintel.webm` and `av1-sintel.webm` are 192x128 derivatives of the pinned
+Sintel scene-1 excerpt. Sintel © Blender Foundation / durian.blender.org,
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Retain this attribution.
+`real-streams.json` records source provenance, commands and all 96 displayed
+picture hashes from independent FFmpeg decoders. Regenerate offline with
+`tools/embeddinggemma2/generate_webm_real.py`; native builds never invoke it.

@@ -105,6 +105,9 @@ pub const Reader = struct {
     packets: []Packet,
     cues: []Cue,
     timestamp_scale_ns: u64,
+    /// Declared Segment Duration, scaled after TimestampScale is known. Preserve
+    /// fractional precision for FPS sampling rather than infer rounded block PTS.
+    duration_seconds: ?f64 = null,
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
         var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limits.max_index_bytes }) else @import("admission.zig").Token{};
         errdefer index_reservation.deinit();
@@ -132,6 +135,7 @@ pub const Reader = struct {
         var metadata: ?source.Lease = null;
         errdefer if (metadata) |*lease| lease.deinit();
         var scale: u64 = 1_000_000;
+        var duration_ticks: ?f64 = null;
         var info_seen = false;
         cursor = segment.payload;
         while (cursor < segment.end) {
@@ -150,10 +154,20 @@ pub const Reader = struct {
                     const value = try scan.header(nested, child.end);
                     nested = value.end;
                     if (value.id == 0x2ad7b1) scale = try scan.uint(value);
+                    if (value.id == 0x4489) {
+                        if (duration_ticks != null) return error.MalformedMedia;
+                        var lease = try input.read(value.payload, @intCast(value.end - value.payload));
+                        defer lease.deinit();
+                        const duration = try ebml.readFloat(lease.bytes);
+                        if (!std.math.isFinite(duration) or duration <= 0) return error.UnsupportedTimeline;
+                        duration_ticks = duration;
+                    }
                 }
             }
         }
         if (scale == 0 or scale > std.math.maxInt(i64)) return error.UnsupportedTimeline;
+        const duration_seconds: ?f64 = if (duration_ticks) |duration| duration * @as(f64, @floatFromInt(scale)) / 1e9 else null;
+        if (duration_seconds) |duration| if (!std.math.isFinite(duration) or duration <= 0 or duration >= @as(f64, @floatFromInt(std.math.maxInt(i64))) / 1e9) return error.TimestampOverflow;
         const track = try parseTracks((metadata orelse return error.UnsupportedVideoCodec).bytes, limits, input.control);
         var packets: std.ArrayList(Packet) = .empty;
         errdefer packets.deinit(allocator);
@@ -218,7 +232,7 @@ pub const Reader = struct {
         for (cues.items, 0..) |cue, i| if (i != 0 and cue.pts == cues.items[i - 1].pts) return error.MalformedMedia;
         const owned_cues = try cues.toOwnedSlice(allocator);
         errdefer allocator.free(owned_cues);
-        return .{ .cues = owned_cues, .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale };
+        return .{ .cues = owned_cues, .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = try packets.toOwnedSlice(allocator), .timestamp_scale_ns = scale, .duration_seconds = duration_seconds };
     }
     pub fn deinit(self: *Reader) void {
         self.allocator.free(self.packets);

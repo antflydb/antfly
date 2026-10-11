@@ -293,3 +293,41 @@ test "VP9 AV1 native-depth decoded frames preserve CPU Metal preparation parity"
         for (expected, actual) |e, v| try std.testing.expectApproxEqAbs(e, v, 0.000001);
     }
 }
+
+test "VP9 AV1 real Sintel WebM pictures match independent reference hashes" {
+    const a = std.testing.allocator;
+    const Stream = struct { name: []const u8, codec: decoder.Codec, sha256: []const u8, width: u32, height: u32, frame_sha256: [][]const u8 };
+    const Report = struct { streams: []Stream };
+    const parsed = try std.json.parseFromSlice(Report, a, @embedFile("../../testdata/vpx-av1/real-streams.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    inline for (.{ "vp9-sintel", "av1-sintel" }) |name| {
+        const bytes = @embedFile("../../testdata/vpx-av1/" ++ name ++ ".webm");
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = name };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        const golden = for (parsed.value.streams) |stream| {
+            if (std.mem.eql(u8, stream.name, name)) break stream;
+        } else return error.MissingGoldenStream;
+        var file_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &file_hash, .{});
+        var expected: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected, golden.sha256);
+        try std.testing.expectEqualSlices(u8, &expected, &file_hash);
+        const session = try decoder.Session.create(a, golden.codec, .{});
+        defer session.destroy();
+        var displayed: usize = 0;
+        for (reader.packets, 0..) |_, id| {
+            var batch = try session.decodeWebmPacket(&reader, id);
+            defer batch.deinit();
+            for (batch.frames) |frame| {
+                try std.testing.expect(displayed < golden.frame_sha256.len);
+                try std.testing.expectEqual(golden.width, frame.width);
+                try std.testing.expectEqual(golden.height, frame.height);
+                _ = try std.fmt.hexToBytes(&expected, golden.frame_sha256[displayed]);
+                try std.testing.expectEqualSlices(u8, &expected, &hashFrame(frame));
+                displayed += 1;
+            }
+        }
+        try std.testing.expectEqual(golden.frame_sha256.len, displayed);
+    }
+}

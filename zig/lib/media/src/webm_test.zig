@@ -205,3 +205,37 @@ test "webm unknown-size consecutive Clusters terminate at sibling headers" {
     try std.testing.expectEqual(@as(usize, 0), reader.cues.len);
     for (reader.cues) |cue| try std.testing.expectEqual(cue.packet_index, try reader.seek(cue.pts));
 }
+
+test "webm Segment Duration scales after Info parsing and rejects nonfinite values" {
+    const duration_at = std.mem.indexOf(u8, clip, "\x44\x89\x88").?;
+    const scale_at = std.mem.indexOf(u8, clip, "\x2a\xd7\xb1\x83").?;
+    const changed = try a.dupe(u8, clip);
+    defer a.free(changed);
+    var src = source.Source{ .allocator = a, .identity = "duration", .storage = .{ .borrowed = changed } };
+    for ([_]f64{ 0, -1, std.math.inf(f64), std.math.nan(f64) }) |bad| {
+        std.mem.writeInt(u64, changed[duration_at + 3 ..][0..8], @bitCast(bad), .big);
+        try std.testing.expectError(error.UnsupportedTimeline, webm.Reader.init(a, &src, .{}));
+        try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+    }
+    @memcpy(changed, clip);
+    // Move Duration ahead of TimestampScale without changing any byte offsets
+    // after Info. A non-default scale must apply even when declared afterwards.
+    try std.testing.expect(scale_at + 7 <= duration_at);
+    var reordered: std.ArrayList(u8) = .empty;
+    defer reordered.deinit(a);
+    try reordered.appendSlice(a, clip[0..scale_at]);
+    try reordered.appendSlice(a, clip[duration_at .. duration_at + 11]);
+    try reordered.appendSlice(a, clip[scale_at + 7 .. duration_at]);
+    try reordered.appendSlice(a, clip[scale_at .. scale_at + 7]);
+    try reordered.appendSlice(a, clip[duration_at + 11 ..]);
+    const new_scale_at = duration_at + 4;
+    reordered.items[new_scale_at + 4] = 0x1e;
+    reordered.items[new_scale_at + 5] = 0x84;
+    reordered.items[new_scale_at + 6] = 0x80; // 2,000,000 ns
+    src.storage = .{ .borrowed = reordered.items };
+    var reader = try webm.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const ticks: f64 = @bitCast(std.mem.readInt(u64, clip[duration_at + 3 ..][0..8], .big));
+    try std.testing.expectEqual(@as(u64, 2_000_000), reader.timestamp_scale_ns);
+    try std.testing.expectEqual(@as(?f64, ticks * 0.002), reader.duration_seconds);
+}

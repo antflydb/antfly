@@ -58,12 +58,13 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
     const tests = b.addTest(.{ .use_llvm = b.option(bool, "video-test-llvm", "Use LLVM for video tests"), .root_module = module, .filters = if (filter) |value| &.{value} else &.{} });
     b.step("test-video", "Run video selection, decode, surface and preparation tests").dependOn(&b.addRunArtifact(tests).step);
     b.step("check-video", "Compile video tests without executing them").dependOn(&tests.step);
+    b.step("install-video-tests", "Install portable qualification tests for execution on another host").dependOn(&b.addInstallArtifact(tests, .{ .dest_sub_path = "video-tests" }).step);
     const fuzz_module = b.createModule(.{ .root_source_file = root.path(b, "video_fuzz_root.zig"), .target = target, .optimize = optimize });
     fuzz_module.addImport("antfly_media", b.createModule(.{ .root_source_file = root.path(b, "../media/src/mod.zig"), .target = target, .optimize = optimize }));
     fuzz_module.addImport("antfly_image", b.createModule(.{ .root_source_file = root.path(b, "../image/src/mod.zig"), .target = target, .optimize = optimize }));
     const fuzz_filter = b.option([]const u8, "video-fuzz-filter", "Run fuzz targets matching substring");
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_module, .use_llvm = true, .filters = if (fuzz_filter) |value| &.{value} else &.{} });
-    b.step("fuzz-video", "Run portable H.264 coverage-guided fuzz targets without platform shims").dependOn(&b.addRunArtifact(fuzz_tests).step);
+    b.step("fuzz-video", "Run portable H.264/VP9/AV1 coverage-guided fuzz targets without platform shims").dependOn(&b.addRunArtifact(fuzz_tests).step);
     addImportCheck(b, root, target, optimize);
     const qualification_module = b.createModule(.{ .root_source_file = root.path(b, "video_qualification_root.zig"), .target = target, .optimize = optimize });
     configure(b, qualification_module, root, target, null);

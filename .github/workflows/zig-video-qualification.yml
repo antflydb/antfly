@@ -54,7 +54,7 @@ jobs:
           python -m unittest discover -s tools/embeddinggemma2 -p 'test_*.py'
       - name: Build native inference
         working-directory: zig/pkg/inference
-        run: zig build -Dmetal=false -Dcuda=false -Doptimize=ReleaseSafe -Dinference-compile-memory-mb=6144 -j1 --prefix ../../../.benchmark-results/video-linux/install --summary all
+        run: zig build -Dmetal=false -Dcuda=false -Doptimize=ReleaseSafe -Dinference-compile-memory-mb=8192 -j1 --prefix ../../../.benchmark-results/video-linux/install --summary all
       - name: Acquire pinned checkpoint
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -65,6 +65,26 @@ jobs:
             --binary .benchmark-results/video-linux/install/bin/antfly-inference \
             --backend native --model-dir .benchmark-assets/video-linux/model \
             --verify-capacity-retry --verify-decode-retry --output .benchmark-results/video-linux/pretrained.json
+      - name: Qualify pretrained WebM codecs and request recovery
+        run: |
+          python tools/embeddinggemma2/video_compare.py --backend cpu \
+            --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --warmups 0 --iterations 1 \
+            --output .benchmark-results/video-linux/webm-pytorch-cpu.json
+          python tools/embeddinggemma2/video_compare.py --backend native \
+            --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --reference .benchmark-results/video-linux/webm-pytorch-cpu.json \
+            --warmups 0 --iterations 1 \
+            --output .benchmark-results/video-linux/webm-native-cpu.json
+          python tools/embeddinggemma2/video_webm_errors.py --backend native \
+            --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --reference .benchmark-results/video-linux/webm-pytorch-cpu.json \
+            --output .benchmark-results/video-linux/webm-request-recovery.json
       - name: Qualify positive pretrained display and HDR rendering
         run: |
           python tools/embeddinggemma2/video_render_qualification.py \

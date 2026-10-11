@@ -125,10 +125,32 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h2
     return null;
 }
 
+fn isWebm(bytes: []const u8) bool {
+    return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3");
+}
+fn webmTrack(track: media.webm.Track) !media.mp4.Track {
+    // Codec-independent display policy; codec reconstruction remains in WebM.
+    return .{ .codec = .avc, .id = 1, .timescale = 1_000_000_000, .width = std.math.cast(u16, track.width) orelse return error.ResourceLimitExceeded, .height = std.math.cast(u16, track.height) orelse return error.ResourceLimitExceeded, .avcc = &.{}, .nal_length_bytes = 0, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
+}
+
 /// Conservative decoded-pixel charge used before admitted HTTP model execution.
 pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = std.heap.page_allocator, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    if (isWebm(bytes)) {
+        var reader = try media.webm.Reader.init(std.heap.page_allocator, &source, .{});
+        defer reader.deinit();
+        var index = try video.webm_pictures.index(std.heap.page_allocator, &reader, .{ .decoder = .{ .control = source.control } });
+        defer index.deinit();
+        const selected = try index.select();
+        defer std.heap.page_allocator.free(selected);
+        var pixels: u64 = 0;
+        for (selected) |id| {
+            const picture = index.pictures[id];
+            pixels = try std.math.add(u64, pixels, try std.math.mul(u64, picture.width, picture.height));
+        }
+        return pixels;
+    }
     var reader = try media.mp4.Reader.init(std.heap.page_allocator, &source, .{});
     defer reader.deinit();
     // AVC combines VUI and container declarations in parameterSession below.
@@ -154,11 +176,17 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    var reader = try media.mp4.Reader.init(a, &source, .{});
-    defer reader.deinit();
-    const selected = try select(a, &reader);
+    const webm = isWebm(bytes);
+    var webm_reader: media.webm.Reader = undefined;
+    var reader: media.mp4.Reader = undefined;
+    if (webm) webm_reader = try media.webm.Reader.init(a, &source, .{}) else reader = try media.mp4.Reader.init(a, &source, .{});
+    defer if (webm) webm_reader.deinit() else reader.deinit();
+    var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control } }) else null;
+    defer if (webm_index) |*index| index.deinit();
+    const selected = if (webm_index) |index| try index.select() else try select(a, &reader);
     defer a.free(selected);
-    const configurations = try parameterSession(a, &reader);
+    const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
+    const configurations = if (webm) null else try parameterSession(a, &reader);
     defer if (configurations) |session| session.deinit();
     const frame_tokens = try a.alloc(usize, selected.len);
     errdefer a.free(frame_tokens);
@@ -166,7 +194,7 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else selected.len * 140 * 512);
     defer a.free(output);
     var signal = video.h264.Color{};
-    if (reader.track.codec == .avc and !reader.track.inband_parameter_sets) {
+    if (!webm and reader.track.codec == .avc and !reader.track.inband_parameter_sets) {
         const cfg = try video.h264.configParse(a, reader.track.avcc);
         defer cfg.groups.deinit(a);
         signal = cfg.color;
@@ -182,7 +210,7 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
         a.free(tensors);
     };
     if (resident) |tensors| @memset(tensors, null);
-    var capture = Capture{ .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = reader.track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var capture = Capture{ .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -197,7 +225,11 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
         scheduler.queue.close(capture.io.?);
         thread.join();
     };
-    const decode_error: ?anyerror = if (decodeSelection(a, &reader, selected, configurations, &capture)) |_| null else |err| err;
+    const decoded = if (webm)
+        video.webm_pictures.walk(a, &webm_reader, .{ .decoder = .{ .control = source.control } }, selected, &capture, Capture.publishWebm)
+    else
+        decodeSelection(a, &reader, selected, configurations, &capture);
+    const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
     if (decode_error != null) scheduler.aborted.store(true, .release);
     if (projection_thread) |thread| {
         scheduler.queue.close(capture.io.?);
@@ -491,6 +523,25 @@ const Capture = struct {
         const c = self.track.color_info;
         if (c.len >= 11 and std.mem.eql(u8, c[0..4], "nclx") and (c[10] & 128 != 0) != full) return error.UnsupportedVideoColor;
     }
+    fn publishWebm(raw: *anyopaque, id: usize, frame: *const video.codecs.Frame) !void {
+        const self: *Capture = @ptrCast(@alignCast(raw));
+        const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
+        if (self.copyDuplicate(slot)) return;
+        const color = frame.color;
+        const signal = video.h264.Color{
+            .primaries = if (color.primaries == 2) null else color.primaries,
+            .transfer = if (color.transfer == 2) null else color.transfer,
+            .matrix = if (color.matrix == 2) null else color.matrix,
+        };
+        const options = try policySignal(self.track, frame.width, frame.height, signal);
+        if (self.metal) |metal| {
+            const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
+            return self.projectGpu(slot, prepared, options);
+        }
+        const patches = try video.preparation.referenceHost(self.a, frame.host(), options, self.control);
+        defer self.a.free(patches);
+        try self.project(slot, patches, options);
+    }
     fn publishApple(raw: *anyopaque, frame: *const video.apple.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
         try self.validateRange(frame.surface.format.fullRange());
@@ -628,4 +679,22 @@ test "embeddinggemma2 video HDR rendering requires consistent gamut and transfer
     try std.testing.expectEqual(video.preparation.ToneMapping.hlg_reinhard_100, (try policy(track, 640, 480)).tone_mapping);
     track.color_info = "nclx\x00\x02\x00\x10\x00\x09\x00";
     try std.testing.expectError(error.UnsupportedVideoColor, policy(track, 640, 480));
+}
+
+test "embeddinggemma2 video WebM inspection uses decoded visible picture sampling" {
+    const a = std.testing.allocator;
+    inline for (.{ "vp8.webm", "vp9.webm", "av1.webm" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = name };
+        var reader = try media.webm.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var pictures = try video.webm_pictures.index(a, &reader, .{});
+        defer pictures.deinit();
+        const selected = try pictures.select();
+        defer a.free(selected);
+        var expected: u64 = 0;
+        for (selected) |id| expected += @as(u64, pictures.pictures[id].width) * pictures.pictures[id].height;
+        try std.testing.expectEqual(expected, try inspectPixels(bytes, .{ .io = std.testing.io }));
+        try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
+    }
 }

@@ -723,23 +723,25 @@ records the initial diagnostic failure and its final passing regression.
 
 ## Video groups
 
-Submit MP4 or MOV as a `media` part in an ordered group, for example:
+Submit MP4, MOV or WebM as a `media` part in an ordered group, for example:
 
 ```json
 {"model":"embeddinggemma2","input":[{"content":[{"type":"text","text":"Describe the action"},{"type":"media","data":"<base64 MP4>","mime_type":"video/mp4"}]}]}
 ```
 
 The existing SDK media types accept these MIME bytes. Binary attachment envelopes
-can carry `video/mp4` or `video/quicktime` without base64 expansion. A group returns
+can carry `video/mp4`, `video/quicktime` or `video/webm` without base64 expansion. A group returns
 one joint embedding for its ordered text and selected frames. Audio must be an
 explicit separate part. Frames sample at 1 FPS with a uniform 32-frame cap over the
 whole clip, up to 140 soft tokens each; total wrappers, media and text must fit 8192.
-Video-only groups do not add a text task prefix. Flat video and WebM decoding are
-unsupported. Native CPU uses pure Zig H.264/MJPEG; Metal prefers VideoToolbox for
+Video-only groups do not add a text task prefix. Flat video inputs are unsupported.
+Native CPU uses pure Zig H.264/MJPEG and VP8/VP9/AV1; Metal prefers VideoToolbox for
 eligible static H.264 and consumes completed Metal prepared patch buffers directly.
-Existing vision/projector host boundaries remain. The current model display policy
-requires square pixels, no rotation and supported SDR color metadata (BT.601 default
-when absent); declared VUI/container matrix or range conflicts fail explicitly.
+Video preparation overlaps batched resident Metal vision/projector execution.
+Orthogonal MP4 rotation and SAR use direct resizing; explicit supported PQ/HLG
+signals use the qualified display/HDR recipe. Declared VUI/container matrix or
+range conflicts fail explicitly. WebM currently qualifies default-display SDR
+fixtures; broader WebM display/Colour metadata remains an open gate.
 Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
 parity, including ordered mixed groups, repeated frames and HTTP dimensions.
 JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
@@ -750,3 +752,20 @@ Model FPS sampling currently requires progressive one-picture-per-sample AVC
 (Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
 transport remain library capabilities; the model adapter rejects them until a
 logical-picture index qualifies their frame-count/FPS semantics.
+
+
+WebM model sampling uses visible decoder outputs rather than packet count. Hidden
+reference frames remain dependencies, and VP9 superframe outputs have individual
+logical IDs. Indexing stores metadata, then replay decodes once up to the last
+selected picture and reuses the existing CPU/Metal projection batching. Each
+pass allows at most 8192 coded packets and 65536 visible picture entries; the
+model selects at most 32 pictures. This bounds memory without retaining a whole
+decoded clip. Equal PTS retain output order; no per-picture timestamps are invented.
+
+
+[Pretrained WebM qualification](../../zig/lib/video/testdata/webm-validation/README.md)
+compares eight vectors and three retrieval rankings against pinned PyTorch.
+Native CPU, Metal and actually executed Linux ARM64 preserve all rankings and
+top-k sets, with maximum coordinate error below `1e-6`. This includes two
+attributed real VP9/AV1 clips. WebM duration comes from the declared Segment
+Duration when present, preserving pinned FPS sampling at rounded PTS boundaries.

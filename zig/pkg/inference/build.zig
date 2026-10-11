@@ -1525,7 +1525,11 @@ pub fn build(b: *std.Build) void {
     video_model_root.link_libc = runtime_config.backend.link_libc;
     const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR" } });
     b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
-    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&b.addRunArtifact(video_model_tests).step);
+    const run_video_model_tests = b.addRunArtifact(video_model_tests);
+    // Device availability and producer/consumer lifetimes must be checked on
+    // each qualification run, even when the executable itself is cached.
+    run_video_model_tests.has_side_effects = true;
+    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&run_video_model_tests.step);
     const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = bge_benchmark.tests;
