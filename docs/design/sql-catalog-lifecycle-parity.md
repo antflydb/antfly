@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `77a276cd53`.
+at `1258e8cfcb` (through #1080).
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -2684,3 +2684,53 @@ steps and 64 targeted test executions with zero skips, failures or leaks.
 The catalog/candidate contracts at `16637b7ba6` also passed all 43 ReleaseFast
 build steps and 28 test executions. These qualify retained claim scope and its
 current integration, not distributed claim creation, retirement or activation.
+
+### Generation-owned claim inventory and local retirement
+
+Private reservation now stages a generation registration alongside both catalog
+allocation burns. Its digest binds the complete reserved owner binding and exact
+generation. Missing registration is corruption, not an inferred empty inventory.
+Prepared claim batches own their bytes, cap admission at 128 claims/1 MiB and
+recheck the durable job, cancellation fence, registration, claim postimages and
+inventory hashes in the committing transaction. Exact duplicates are idempotent;
+conflicting owners fail before staging writes.
+
+The inventory orders generation before routing and tuple hashes. Local cleanup
+therefore seeks only the selected generation and deletes paired claims and
+inventory entries in bounded 256-record/1-MiB/5-ms pages. Aborted pages retain
+both sides; committed deletions are the durable continuation. Unexpected FK
+references or action jobs reject the page rather than being discarded. The
+registration and canceled binding remain after local emptiness.
+
+Internal owner operation `cancel_claim_gc_page` shares the physical-GC lease,
+read-only/runtime, maintenance-conflict and allocation-before-commit boundaries.
+It neither opens ordinary standby writes nor advances the source clock/replay
+LSN. Inspection distinguishes physical artifacts and claim inventory retirement;
+the receiver performs at most one cleanup page per step and reports local
+retirement only after both independent facts are true.
+
+Transfer validation pins the private generation once per source transaction,
+checks each private claim's inventory hash and rejects unpublished FK companions.
+Action-job identity is copied before companion reads can invalidate borrowed
+bytes. Ordinary cohort restore still reconstructs destination claims from primary
+rows; these helpers do not authorize adoption of source private jobs.
+
+Qualification at `7af8f82535` passed all 127 Debug build steps and 90 targeted
+executions: two transfer/handoff, forty-four portable backup, twenty-one
+publication, one decoder floor, thirteen candidate, three leased-source and six
+compiled-owner C-API tests. Cold-restart follow-up `a32af637cd` passed all 52
+Debug steps and fifteen transfer/candidate executions. The WAL-backed profile
+closes and reopens the owner after cleanup admission and after aborted and
+committed pages; it verifies unchanged source clock, retained binding, independent
+generation preservation and final local emptiness. Both completed runs have zero
+skips, failures or leaks. The source-boundary audit covers 2,034 files; the control
+catalog and diff checks pass. Exact merged-head qualification is still required.
+No original-case credit is claimed by these overlapping component selections.
+
+Still required before public activation: ordered authenticated private claim
+production on the actual hash owners, complete frozen-cohort retirement proofs,
+native restore/adoption completeness, final durable cancellation cut, immutable
+input/job retirement and separate coordinated epoch release. Local emptiness is
+not a signed owner acknowledgement and cannot substitute for distributed fault
+qualification. The public failed-UNIQUE-build atomicity gate remains open, and
+the original inventory remains 478 / 136 / 73 / 899.
