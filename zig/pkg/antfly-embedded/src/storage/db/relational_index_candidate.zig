@@ -880,8 +880,32 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const large_claim: integrity.Claim = .{ .tuple = try std.fmt.bufPrint(&buffer, "large-{d}", .{ordinal}), .parent_table = "articles", .parent_key = large[0 .. 600 * 1024], .schema_version = binding.physical_candidate.schema_version };
             var batch = try claims.Prepared.init(a, &txn, binding, &.{large_claim});
             defer batch.deinit();
-            try std.testing.expectEqual(@as(usize, 1), (try batch.stageOrdered(&txn, null)).claims_added);
+            const extra: integrity.Claim = .{ .tuple = "overlapping-new-member", .parent_table = "articles", .parent_key = "extra", .schema_version = binding.physical_candidate.schema_version };
+            // Both preparations observe the large member as absent. The
+            // second apply must accept its identical concurrent creation,
+            // retain that earlier cut and stamp only its own new member.
+            var overlapping: ?claims.Prepared = if (ordinal == 0) try claims.Prepared.init(a, &txn, binding, &.{ large_claim, second, extra }) else null;
+            defer if (overlapping) |*value| value.deinit();
+            const original = try batch.stageOrdered(&txn, null);
+            try std.testing.expectEqual(@as(usize, 1), original.claims_added);
             try txn.commit();
+            if (overlapping) |*value| {
+                var next = try store.beginWriteTxn();
+                errdefer next.abort();
+                const result = try value.stageOrdered(&next, null);
+                try std.testing.expect(!result.duplicate);
+                try std.testing.expectEqual(@as(usize, 1), result.claims_added);
+                try std.testing.expectEqual(original.position.sequence + 1, result.position.sequence);
+                try next.commit();
+                var probe = try store.beginReadTxn();
+                defer probe.abort();
+                const earlier = try batch.stageOrdered(&probe, original.position);
+                const later = try value.stageOrdered(&probe, result.position);
+                try std.testing.expect(earlier.duplicate and later.duplicate);
+                try std.testing.expectEqual(original.position, earlier.position);
+                try std.testing.expectEqual(result.position, later.position);
+                try std.testing.expectEqual(result.position.sequence, (try @import("../source_authority.zig").load(&probe)).?.sequence);
+            }
         }
         var read = try store.beginReadTxn();
         defer read.abort();
@@ -1065,7 +1089,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             try std.testing.expectEqualSlices(u8, &try reserved_binding.encode(), &try (try jobs.load(&read)).?.encode());
         }
     }
-    try std.testing.expectEqual(@as(usize, 4 + 2 * claims.max_claims), collected);
+    try std.testing.expectEqual(@as(usize, 5 + 2 * claims.max_claims), collected);
     try std.testing.expect(gc_pages >= 2);
     var read = try store.beginReadTxn();
     defer read.abort();
