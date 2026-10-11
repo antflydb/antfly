@@ -2478,3 +2478,25 @@ fixed, but these new integration tests are not yet green evidence. Authenticated
 delivery, intent-aware capability barriers, cleanup/release and distributed
 fault qualification remain open. Public production remains disabled; no SQL
 inventory case is credited by this component work.
+
+### Fixed-header cancellation receiver (qualification pending)
+
+The native receiver can now request cancellation permission independently from
+metadata and persist one owner-local intent. The permission projection binds
+table, group, plan, owner, exact source fence and admitted fingerprints without
+fetching or compiling a schema manifest, including on a never-visited owner.
+The receiver validates the returned intent identity and native namespace; an
+intent result, even when mirrored, is distinct from metadata's full canceled
+receipt. A committed pending result is retained if request cancellation follows
+the storage boundary. This helper is not mounted as an authenticated RPC and
+does not enable the public producer.
+
+Synthetic receiver tests cover fixed permission without admission/inspection,
+duplicate retry, pending publication, cancellation after commit, foreign result
+identity, wrong group/table and stale metadata phase. They are sequencing tests,
+not physical durability or distributed authority evidence, and qualification is
+pending. Metadata decoder floor 36 and runtime-status V19 are not substitutes
+for intent-aware compiled-owner execution and standby-envelope readiness. Those
+rollout barriers, cleanup/release, actual enrolled-root attestation and the
+public failed-build atomicity gate remain unfinished. Original SQL dispositions
+remain unchanged.

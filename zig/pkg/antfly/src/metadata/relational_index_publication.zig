@@ -127,6 +127,29 @@ pub const OwnerDecision = struct {
         return command;
     }
 
+    /// Cancel a never-visited owner without loading schema-sized inputs. This
+    /// is permission to persist intent, not proof of cleanup or a canceled ACK.
+    pub fn nativeCancellationIntent(self: OwnerDecision) !native_control.Admission {
+        const identity = try self.nativeExecutionIdentity(.{
+            .table_id = self.head.table_id,
+            .group_id = self.owner.owner.group_id,
+            .id = self.head.plan_id,
+            .operation = .cancel,
+        });
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        const intent: native_control.Admission = .{
+            .id = identity.id,
+            .plan_digest = identity.plan_digest,
+            .owner_digest = identity.owner_digest,
+            .ordinal = identity.ordinal,
+            .fence = try privateIndexFence(dispatch.id, dispatch.owner),
+            .candidate_digest = self.head.candidate_digest,
+            .reservation_digest = self.head.reservation_digest,
+        };
+        try intent.validate();
+        return intent;
+    }
+
     /// Convert an independently authenticated admission projection, not a
     /// caller-chosen physical binding. A fresh decision remains a permission
     /// observation, not a lease against later metadata cancellation.
@@ -1120,6 +1143,14 @@ test "relational index publication native dispatch binds exact admitted fence an
     var unsupported = request;
     unsupported.operation = .cancel;
     try std.testing.expectError(error.InvalidGenerationPublication, permission.nativeControl(unsupported, binding));
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeCancellationIntent());
+    var cancel_permission = permission;
+    cancel_permission.head = try permission.head.cancel(permission.head.revision, .requested);
+    const intent = try cancel_permission.nativeCancellationIntent();
+    try std.testing.expect(intent.eql(admission));
+    try std.testing.expect(cancel_permission.inputs == null);
+    cancel_permission.disposition = .acknowledged;
+    try std.testing.expectError(error.InvalidGenerationPublication, cancel_permission.nativeCancellationIntent());
     var wrong_request = request;
     wrong_request.table_id += 1;
     try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeExecutionIdentity(wrong_request));
