@@ -344,8 +344,11 @@ def main() -> None:
             (
                 "read coordination",
                 "api/table_reads.zig",
-                {"antfly-runtime-distributed"},
-                (ARCHIVES - {"antfly-runtime-distributed"})
+                # A retained multi-range cut leases its DB generations inside
+                # the physical owner and reuses the canonical read merger.
+                # Both owners must therefore invalidate this shared source.
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-runtime-distributed", "antfly-storage-kernel"})
                 | {"storage-owner-tests", "storage-owner-enrichment-tests"},
             ),
             (
@@ -421,6 +424,10 @@ def main() -> None:
                 "build",
                 "check-storage-compilation",
                 "-Doptimize=debug",
+                # Ownership and cache invalidation depend on Debug code and
+                # imports, not debug symbols. Retaining symbols across source
+                # mutations fills the PVC and forces repeated cold rebuilds.
+                "-Dstrip=true",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Donnx=false",

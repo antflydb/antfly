@@ -1994,7 +1994,7 @@ paths:
         '202':
           description: Durable WAL acceptance; retry the same transaction after an ambiguous response.
             Native text search can compose a bounded accepted-WAL overlay before catalog/index publication;
-            SQL reads follow committed snapshots.
+            SQL defaults to committed snapshots and can opt into accepted visibility with read_requirements.
           content:
             application/json:
               schema:
@@ -2002,6 +2002,8 @@ paths:
                 properties:
                   state:
                     type: string
+                  read_receipt:
+                    $ref: '#/components/schemas/ReadReceipt'
                   wal_lsn:
                     type: integer
                     format: uint64
@@ -7463,6 +7465,10 @@ paths:
                 $ref: '#/components/schemas/SavedQuerySource'
         '202':
           description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
@@ -12800,6 +12806,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
         parameters:
           type: array
           maxItems: 1024
@@ -13066,6 +13074,10 @@ components:
     SQLRequest:
       type: object
       additionalProperties: false
+      not:
+        required:
+          - read_requirements
+          - lake_visibility
       required:
         - statement
       description: >
@@ -13085,17 +13097,19 @@ components:
 
         memory, and encoded results to a 16 MiB allocation budget.
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
         lake_visibility:
+          deprecated: true
           type: string
           enum:
             - committed
             - accepted
-          default: committed
           description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over
             the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions
             inside a transaction retain the first accepted read cut for each table, including across savepoint
-            rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution
-            are not supported.
+            rollback. Cuts expire after one hour. Serializable write transactions over external sources
+            are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
         statement:
           type: string
           minLength: 1
@@ -22276,6 +22290,51 @@ components:
               maxItems: 64
               items:
                 type: string
+    ReadReceipt:
+      type: object
+      additionalProperties: false
+      description: Opaque write receipt returned by ingestion. Pass it back unchanged to require a read
+        including that write; it is a minimum freshness frontier, not an exact snapshot.
+      required:
+        - table_id
+        - object_generation
+        - wal_lsn
+      properties:
+        table_id:
+          type: integer
+          format: uint64
+        object_generation:
+          type: integer
+          format: uint64
+        wal_lsn:
+          type: integer
+          format: uint64
+    ReadRequirements:
+      type: object
+      additionalProperties: false
+      description: Freshness requirements for writable Iceberg reads. Search supports accepted and published
+        (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility
+        modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction
+        snapshot never advances to satisfy a newer receipt.
+      properties:
+        visibility:
+          type: string
+          enum:
+            - accepted
+            - committed
+            - published
+          description: Accepted includes durable WAL writes; committed reads an Iceberg commit; published
+            reads the search index generation. These are distinct visibility stages.
+        after_write:
+          $ref: '#/components/schemas/ReadReceipt'
+        wait_ms:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 60000
+          description: Readiness wait budget within the query or statement timeout. Defaults to 5000 ms
+            when requirements are supplied; zero fails immediately if coverage is unavailable.
     LakeReadReceipt:
       type: object
       additionalProperties: false
@@ -22318,6 +22377,9 @@ components:
       type: object
       not:
         anyOf:
+          - required:
+              - read_requirements
+              - lake_read
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -22483,7 +22545,10 @@ components:
                   - required:
                       - remote_snapshot
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
         lake_read:
+          deprecated: true
           $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string

@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["torch>=2.6,<3", "transformers>=4.51,<5", "safetensors>=0.5", "numpy>=2"]
+# ///
+
 """Three-question browser smoke oracle, using the same upstream model as PR #815.
 
 Pass an already-downloaded upstream model directory and common.py pinned at

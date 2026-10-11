@@ -163,10 +163,9 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     try cancellation.check();
     var current = try catalog.parse(a, table.lake_index_catalog_json);
     defer current.deinit();
-    if (!reuse) {
-        current.value.published = null;
-        current.value.checkpoint = null;
-    }
+    const reuse_published = reuse and (if (current.value.checkpoint) |saved| saved.reuse_published else true);
+    if (!reuse_published) current.value.published = null;
+    if (!reuse) current.value.checkpoint = null;
     const attempt = current.value.pending orelse return error.LakeIndexPublicationFenceChanged;
     const started = try clock.now_ms(clock.ptr);
     if (started < attempt.started_at_ms or started >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
@@ -241,7 +240,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         if (!present) try candidate_list.append(na, declaration);
     }
     const candidates = candidate_list.items;
-    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);

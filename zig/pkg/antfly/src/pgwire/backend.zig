@@ -62,6 +62,10 @@ pub const Request = struct {
     setting_epoch: ?u64 = null,
     /// Connection-owned, identity-fenced setting values for this statement.
     lake_visibility: @import("session_commands.zig").LakeVisibility = .committed,
+    read_requirements: @import("session_commands.zig").ReadRequirements = .{},
+    /// Borrowed only during admission; streaming owners capture the deadline
+    /// before returning so later statements can reuse the connection budget.
+    read_receipt_budget: ?*@import("antfly_local_sources").sql_read_requirements.WaitBudget = null,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
 
     pub fn check(self: Request) !void {

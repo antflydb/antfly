@@ -92,6 +92,9 @@ pub const Publication = struct {
     /// Zero denotes legacy consumers without renewable reader authority.
     /// Older strict decoders reject this field and fall back to source scans.
     reader_protocol: u16 = 0,
+    /// Recovery checkpoints exclude the unavailable serving publication from
+    /// subsequent attempts while retaining its authority until replacement.
+    reuse_published: bool = true,
     store_locator: ?StoreLocator = null,
     namespace: ?Digest = null,
     generation: u64,
@@ -109,9 +112,9 @@ pub const Publication = struct {
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory });
         } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations });
         }
     }
     pub fn validate(self: Publication) !void {
@@ -291,7 +294,9 @@ fn part(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 /// invalidate an immutable index built for the same target schema.
 pub fn desiredFingerprint(table: anytype) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("native-lake-index-definition-v9");
+    // v10 rebuilds aggregate publications with the same physical SQL width
+    // identity used by scalar binding (including default integer/float widths).
+    hash.update("native-lake-index-definition-v10");
     var id: [8]u8 = undefined;
     std.mem.writeInt(u64, &id, table.table_id, .little);
     hash.update(&id);

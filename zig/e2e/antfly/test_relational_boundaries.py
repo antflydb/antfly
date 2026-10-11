@@ -50,6 +50,9 @@ def test_relational_fk_binding_preserves_exact_schema_defaults(auth_api, with_fk
         ["9007199254740993.0", "9223372036854775807e0", "-9223372036854775808.0"]
     ):
         schema = _schema("parents") if with_fk else _schema()
+        if not with_fk:
+            # Unique constraints own namespace-wide backing index names.
+            schema["unique_constraints"][0]["name"] = f"children_{case}_pk"
         schema["document_schemas"]["row"]["schema"]["properties"]["extra"] = {
             "type": "integer",
             "default": "EXACT_NUMBER",
@@ -90,6 +93,8 @@ def test_relational_exact_numbers_across_mutation_and_session(auth_api, coordina
         schema = _schema()
         if not coordinated:
             schema.pop("unique_constraints")
+        else:
+            schema["unique_constraints"][0]["name"] = f"{table}_pk"
         api.post(f"/tables/{table}", {"schema": schema})
         if coordinated:
             _ready(api, table)

@@ -179,7 +179,10 @@ class BuildFailureEvidence(unittest.TestCase):
         expected = (
             ("cold", set()),
             ("warm", set()),
-            ("read coordination", {"antfly-runtime-distributed"}),
+            (
+                "read coordination",
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+            ),
             ("write coordination", {"antfly-runtime-distributed"}),
             ("physical DB", {"antfly-storage-kernel"}),
             ("physical local query", {"antfly-storage-kernel"}),
@@ -205,6 +208,7 @@ class BuildFailureEvidence(unittest.TestCase):
             label, rebuilt = expected[len(seen)]
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
+            self.assertIn("-Dstrip=true", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)

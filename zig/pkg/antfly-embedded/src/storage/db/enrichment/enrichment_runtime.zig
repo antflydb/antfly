@@ -32453,7 +32453,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
                         defer closure.deinit();
                     }
                 };
-                try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan.plan() });
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan.plan() });
             }
         }
         try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);

@@ -1178,7 +1178,7 @@ pub const MetadataHttpClient = struct {
                 error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
             426 => error.TableTopologyProtocolUpgradeRequired,
-            503 => error.NotLeader,
+            503 => if (std.mem.eql(u8, response.body, "CatalogPublicationProofPending")) error.CatalogPublicationProofPending else error.NotLeader,
             else => error.RemoteUnavailable,
         };
         const group = responseHeader(response, "x-antfly-catalog-metadata-group") orelse return error.MetadataIncarnationUnavailable;
@@ -4467,6 +4467,7 @@ test "system catalog direct read carries identity and deadline without a discove
     const Executor = struct {
         calls: usize = 0,
         valid_identity: bool = true,
+        unavailable_body: ?[]const u8 = null,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -4477,7 +4478,7 @@ test "system catalog direct read carries identity and deadline without a discove
             const headers = try a.alloc(http_common.Header, 2);
             headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
             headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, if (self.valid_identity) "11111111111111111111111111111111" else "invalid") };
-            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+            return .{ .status = if (self.unavailable_body == null) 200 else 503, .headers = headers, .body = try a.dupe(u8, self.unavailable_body orelse "null") };
         }
     };
     var executor = Executor{};
@@ -4493,6 +4494,11 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.unavailable_body = "CatalogPublicationProofPending";
+    try std.testing.expectError(error.CatalogPublicationProofPending, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.unavailable_body = "NotLeader";
+    try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
 test "store-root enrollment status is a body-bound admin read and preserves absent identity" {

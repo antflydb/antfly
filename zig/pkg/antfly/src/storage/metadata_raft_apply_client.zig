@@ -400,8 +400,33 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(?system_catalog.ResolvedTable, alloc, group_id, .{ .catalog_resolve_identity = target });
     }
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
-        const result = try self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+        return self.resolveSystemCatalogIdentitiesWithContext(alloc, group_id, request, .{});
+    }
+
+    pub fn resolveSystemCatalogIdentitiesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
+        try context.ensureActive();
+        const deadline = (@import("antfly_local_sources").api_routing_budget.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        const Callback = struct {
+            fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                return @intFromBool(token.isCancelled());
+            }
+        };
+        const bytes = try std.json.Stringify.valueAlloc(alloc, contract.CatalogProjectionRequest{ .catalog_resolve_many = request }, .{});
+        defer alloc.free(bytes);
+        const result = try self.projectionWithAllocator(system_catalog.ResolvedMany, alloc, .{
+            .kind = .system_catalog,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+            .control = .{
+                .execution_deadline_ns = deadline orelse 0,
+                .has_execution_deadline = @intFromBool(deadline != null),
+                .cancellation_ctx = @ptrCast(@constCast(&context.cancellation)),
+                .cancellation_fn = Callback.cancelled,
+            },
+        });
         errdefer result.deinit(alloc);
+        try context.ensureActive();
         try result.validateRelations(request);
         return result;
     }

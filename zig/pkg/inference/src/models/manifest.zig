@@ -22,7 +22,7 @@ const std = @import("std");
 const Dir = std.Io.Dir;
 const bert = @import("bert.zig");
 const deberta = @import("deberta.zig");
-const modern_bert = @import("../architectures/modern_bert.zig");
+const modern_bert = @import("../architectures/modern_bert_config.zig");
 const gpt = @import("gpt.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
@@ -739,9 +739,12 @@ pub const ModelManifest = struct {
 
     pub fn hasIncompleteFlorence2GgufBundle(self: *const ModelManifest) bool {
         if (!self.isFlorence2GgufBundle()) return false;
+        // The authenticated variant declares the reader contract. Execution
+        // consumes the configuration, tokenizer and preprocessor below;
+        // model_manifest.json is optional metadata, including for older
+        // managed receipts that did not publish it as an artifact.
         return self.gguf_path == null or
             self.config_path == null or
-            self.model_manifest_path == null or
             self.tokenizer_json_path == null or
             self.tokenizer_config_path == null or
             self.preprocessor_config_path == null;
@@ -1845,7 +1848,7 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
-    if (@import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch)) {
+    if (@import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch)) {
         if (manifest.model_type != .embedder or manifest.embedding_style != .embedding_gemma2 or
             manifest.pooling != .mean or !manifest.normalize) return error.InvalidEmbeddingTaskProfile;
         // Architecture evidence fixes the primary role even when secondary
@@ -2762,8 +2765,8 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
         }
     }
     if (obj.get("model_type")) |mt| {
-        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
-            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+        if (mt == .string and @import("../architectures/embedding_gemma2_config.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2_config.zig").parseConfig(allocator, json_bytes);
             if (manifest.model_manifest_declarations.embedding_style and manifest.embedding_style != .embedding_gemma2) return error.InvalidEmbeddingTaskProfile;
             manifest.embedding_style = .embedding_gemma2;
             manifest.model_type = .embedder;
@@ -2871,8 +2874,8 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     }
 
     if (obj.get("model_type")) |mt| {
-        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
-            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+        if (mt == .string and @import("../architectures/embedding_gemma2_config.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2_config.zig").parseConfig(allocator, json_bytes);
             manifest.model_type = .embedder;
             manifest.embedding_style = .embedding_gemma2;
             manifest.hidden_size = 768;
@@ -4180,7 +4183,7 @@ fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id
 fn canSkipEmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir_path: []const u8, tokenizer_json: []const u8) bool {
     if (manifest.model_type != .embedder) return false;
     const gemma2 = manifest.embedding_style == .embedding_gemma2 and
-        @import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch);
+        @import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch);
     const qwen3 = manifest.model_manifest_declarations.model_type and
         manifest.model_manifest_declarations.embedding_style and manifest.embedding_style == .qwen3_embedding;
     if (!gemma2 and !qwen3) return false;
@@ -6565,6 +6568,48 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     try expectCanonicalPath(allocator, q4_path, manifest.gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "managed Florence variants do not require unreceipted declaration metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = .{
+        .{ "config.json", "{\"model_type\":\"florence2\"}" },
+        .{ "tokenizer.json", "{}" },
+        .{ "tokenizer_config.json", "{}" },
+        .{ "preprocessor_config.json", "{}" },
+        .{ "model.gguf", "GGUFstub" },
+        .{ "antfly_inference_variants.json", "{\"family\":\"florence_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"format\":\"Q4_K\",\"model\":\"model.gguf\"}]}" },
+    };
+    var artifacts: [files.len]managed_receipt.ArtifactReceipt = undefined;
+    inline for (files, 0..) |file, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+        artifacts[index] = .{ .path = file[0], .size = file[1].len };
+    }
+    // An unrelated, uncommitted declaration must neither be required nor
+    // alter the reader role authenticated by the variant publication.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "invalid unreceipted metadata" });
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 1, .artifacts = &artifacts }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var manifest = try loadFromDir(a, path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expect(manifest.model_manifest_path == null);
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expect(!listing.hasIncompleteFlorence2GgufBundle());
+    // The consumed preprocessing sidecar remains required.
+    const preprocessor = manifest.preprocessor_config_path;
+    manifest.preprocessor_config_path = null;
+    try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
+    manifest.preprocessor_config_path = preprocessor;
 }
 
 test "manifest ignores stale florence2 variants with missing gguf files" {

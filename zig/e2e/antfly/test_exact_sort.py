@@ -246,6 +246,7 @@ def test_public_exact_sort_declares_native_coverage_and_shorthand_fields_are_act
             "limit": 2,
             "order_by": [{"field": "size"}],
             "search_after": first_numeric_hit["_sort"],
+            "remote_snapshot": first_numeric_page["responses"][0]["remote_snapshot"],
         },
     )
     assert _hit_ids(second_numeric_page) == ["b", "c"]

@@ -787,7 +787,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_config_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "common config", "external lake native artifact collection config validates bounded operator controls" },
+        .filters = &.{"common.config.test."},
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -6504,11 +6504,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_rewrite_staging_test.",
             "storage.db.relational_rewrite_program.",
             "storage.db.relational_row_transform_test.",
+            "storage.db.relational_row_transform.",
+            "storage.db.relational_index_cover.",
             "storage.db.source_pin.",
             "storage.db.source_pin_gc.",
             "storage.db.source_publication_job.",
             "storage.db.mod.",
             "storage.db.native_backup.",
+            "storage.db.native_query_cut.",
+            "storage.db.native_query_cut_contract.",
+            "storage.db.native_query_remote_storage.",
+            "storage.db.native_query_warming.",
             "storage.db.snapshot_staging.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",

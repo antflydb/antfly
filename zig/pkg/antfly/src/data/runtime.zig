@@ -27635,7 +27635,7 @@ const RemoteMetadataSource = struct {
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
-                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogPublicationProofPending, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
                                 !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
@@ -34011,7 +34011,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34134,7 +34134,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34188,7 +34188,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34254,7 +34254,7 @@ fn consumerTests() type {
                     .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                     .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .nothing,
                     .listener_cfg = undefined,
                 };
@@ -34747,7 +34747,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34962,7 +34962,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
                 .backend_runtime = backend_runtime.ptr(),
@@ -35832,7 +35832,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(1),
                 .backend_runtime = runtime.ptr(),
                 .listener_cfg = undefined,
@@ -37471,13 +37471,25 @@ fn consumerTests() type {
 
             // A durable size rejection must not wedge the shard behind the rejected
             // entry (or prevent the coordinator's later abort from applying).
+            // Admission is durable table policy, independent of the worker's
+            // preparation-memory budget. Keep each value within the wire limit,
+            // while exceeding the logical cap with distinct prepared intents.
             const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
             defer alloc.free(payload);
             @memset(payload, 'x');
             const oversized_json = try std.json.Stringify.valueAlloc(alloc, .{ .title = payload }, .{});
             defer alloc.free(oversized_json);
+            var oversized_arena = std.heap.ArenaAllocator.init(alloc);
+            defer oversized_arena.deinit();
+            const fixture_alloc = oversized_arena.allocator();
+            const admission_bytes = @import("antfly_local_sources").storage_db_table_catalog.default_transaction_admission_bytes;
+            const oversized_writes = try fixture_alloc.alloc(std.meta.Child(@FieldType(antfly.db.types.BatchRequest, "writes")), @intCast(admission_bytes / payload.len + 1));
+            for (oversized_writes, 0..) |*write, i| write.* = .{
+                .key = try std.fmt.allocPrint(fixture_alloc, "doc:oversized:{d}", .{i}),
+                .value = oversized_json,
+            };
             const oversized = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{
-                .writes = &.{.{ .key = "doc:oversized", .value = oversized_json }},
+                .writes = oversized_writes,
                 .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
             }, if (descriptor) |*value| value.view() else null);
             defer alloc.free(oversized);
@@ -37494,6 +37506,7 @@ fn consumerTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_limit, &.{});
             try std.testing.expectEqual(@as(u64, 12), apply_sm.appliedIndex(group_id));
             const rejected = apply_sm.takeApplyOutcome(group_id, 10).?;
+            try std.testing.expectEqual(.failed, std.meta.activeTag(rejected));
             try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
@@ -39985,7 +39998,7 @@ fn consumerTests() type {
                 .read_source = undefined,
                 .write_source = undefined,
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -46475,7 +46488,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -46826,7 +46839,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -47631,7 +47644,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -47737,7 +47750,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -48073,7 +48086,7 @@ fn implementationTests() type {
                         antfly.public_api.table_catalog.emptyCatalogSource(),
                     ),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .limited(8),
                     .work_cost_port = .{ .ptr = &attempts, .charge_fn = Attempts.charge },
                     .listener_cfg = undefined,
@@ -48300,7 +48313,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = remote_metadata.statusSource(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .backend_runtime = backend_runtime.ptr(),
                 .listener_cfg = undefined,
@@ -49030,7 +49043,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .work_cost_port = adapter.iface(),
                 .listener_cfg = undefined,
@@ -56208,7 +56221,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };

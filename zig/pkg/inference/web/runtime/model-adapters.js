@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Internal adapters use configuration contracts, never repository/display names.
+// Task/capability strings are Antfly's existing model metadata vocabulary.
+
 const limits = Object.freeze({ maxInputs: 1, maxTextBytes: 256 * 1024, maxRequestBytes: 512 * 1024, maxSchemaBytes: 64 * 1024 });
 const trainedKinds = Object.freeze(['choice', 'score', 'predicate']);
 const adapters = [

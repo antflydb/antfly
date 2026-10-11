@@ -309,7 +309,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
                 self.lose_discard_reply = false;
                 return error.MetadataMutationOutcomeUnknown;
             }
-            if (self.cancel_checkpoint) {
+            if (self.cancel_checkpoint and before.value.generation == after.value.generation) {
                 var saved = try catalog.parse(std.testing.allocator, bytes);
                 defer saved.deinit();
                 if (saved.value.checkpoint != null) {
@@ -543,13 +543,28 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         a.free(mock.owned.?);
         mock.owned = forced_catalog;
         mock.table.lake_index_catalog_json = forced_catalog;
+        // Stop after recovery commits its first healthy file. Re-admission
+        // must resume that checkpoint without probing the unavailable serving
+        // publication or clearing completed work a second time.
+        mock.cancel_checkpoint = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+        var interrupted = try catalog.parse(a, mock.table.lake_index_catalog_json);
+        defer interrupted.deinit();
+        try std.testing.expect(!interrupted.value.checkpoint.?.reuse_published);
+        try @import("lake_index_directory.zig").hydrateLazy(interrupted.arena.allocator(), artifacts, &interrupted.value.checkpoint.?, .none, null);
+        const saved_root = try @import("lake_index_native_text.zig").loadRoot(interrupted.arena.allocator(), artifacts, interrupted.value.checkpoint.?.declarations[0].artifact, .none, null);
+        try std.testing.expectEqual(@as(usize, 1), saved_root.file_groups.len);
+        const prior_discards = mock.discards;
+        mock.now += options.lease_ms;
         try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+        try std.testing.expectEqual(prior_discards, mock.discards);
         var repaired_publication = try catalog.parse(a, mock.table.lake_index_catalog_json);
         defer repaired_publication.deinit();
-        try std.testing.expectEqual(@as(u64, 8), repaired_publication.value.published.?.generation);
+        try std.testing.expectEqual(@as(u64, 9), repaired_publication.value.published.?.generation);
         try std.testing.expect(repaired_publication.value.pending == null and repaired_publication.value.failure == null);
         try @import("lake_index_directory.zig").hydrateLazy(repaired_publication.arena.allocator(), artifacts, &repaired_publication.value.published.?, .none, null);
         const repaired_root = try @import("lake_index_native_text.zig").loadRoot(repaired_publication.arena.allocator(), artifacts, repaired_publication.value.published.?.declarations[0].artifact, .none, null);
+        try std.testing.expectEqualStrings(saved_root.file_groups[0].segments[0].artifact_id, repaired_root.file_groups[0].segments[0].artifact_id);
         var repaired_writer = try @import("lake_index_native_text.zig").loadWriter(a, artifacts, repaired_root, .none, null, null);
         defer repaired_writer.deinit();
         const repaired_snapshot = repaired_writer.acquireSnapshot();

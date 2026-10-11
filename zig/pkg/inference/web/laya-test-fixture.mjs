@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Tiny deterministic checkpoint exercises the real streamed WASM adapter.
+
 export function layaFixture(extra = {}, precision = 'fp32', vocabSize = 32) {
   const h = 64, f = 96, vocab = ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]', 'state', 'question', 'choice', 'score', 'noul', ':', 'input', 'yes', 'no', 'false', 'true', 'low', 'medium', 'high', 'search', 'fetch', 'none'];
   const config = { model_type: 'modernbert', hidden_size: h, num_hidden_layers: 2, num_attention_heads: 2, intermediate_size: f, vocab_size: vocabSize, max_position_embeddings: 512, local_attention: 8, global_attn_every_n_layers: 2, layer_norm_eps: 1e-5, pad_token_id: 0, cls_token_id: 2, sep_token_id: 3, laya: { head_layers: 1, max_len: 512, head_max_len: 192, mask_token: '[MASK]', ...extra } };

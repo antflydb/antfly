@@ -47,11 +47,18 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         .linkage = if (macho) .static else .dynamic,
         .name = if (macho) "antfly-capi-objects" else "antfly",
         .root_module = module,
+        // ELF version scripts must also hide compiler-provided Debug UBSan
+        // symbols. Use the linker that applies the final export boundary to
+        // every linked object, including those runtime objects.
+        .use_lld = if (elf) true else null,
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const binary = if (macho) blk: {
         module.pic = true;
         compile.bundle_compiler_rt = true;
+        // The external Mach-O linker cannot add Zig's C/ObjC sanitizer
+        // runtime. Own it in the final archive alongside compiler-rt.
+        compile.bundle_ubsan_rt = true;
         const linker = b.option([]const u8, "macos-linker", "Mach-O linker executable (ld on macOS, ld64.lld for cross builds)") orelse
             if (b.graph.host.result.os.tag == .macos) "/usr/bin/ld" else "ld64.lld";
         const run = command(b, "link-macho");

@@ -8565,7 +8565,7 @@ test "warm Qwen admission copy releases its pin and permits single-model recover
     model.manifest.embedding_profile.query.prefix = try allocator.dupe(u8, "Instruct: retrieve\nQuery: ");
     model.manifest.inputs = try allocator.alloc([]const u8, 1);
     model.manifest.inputs[0] = try allocator.dupe(u8, "text");
-    var inference = try manager.publishLoadedModel(model, true, null);
+    var inference = try manager.publishLoadedModel(model, true, null, null);
     defer inference.release();
 
     var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
