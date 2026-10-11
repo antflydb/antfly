@@ -77,11 +77,22 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     defer if (heartbeat_active) heartbeat.cancel(io);
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
     const build_alloc = working.allocator();
-    var handle = store.artifactStore();
-    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |build_error| {
+    var artifact_reads = @import("lake_index_artifact_recovery.zig").Reads.init(store.artifactStore());
+    var handle = artifact_reads.store();
+    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot, .save_checkpoint = Renewal.saveCheckpoint, .discard_checkpoint = Renewal.discardCheckpoint }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |reported_error| {
         heartbeat.cancel(io);
         heartbeat_active = false;
         if (lease.terminal_error) |err| return err;
+        const build_error = if (reported_error == error.LakeIndexArtifactUnavailable) artifact_reads.cause() orelse reported_error else reported_error;
+        // Only derived-artifact failures invalidate saved work. A source read
+        // may also return FileNotFound; its checkpoint remains resumable.
+        if (reported_error == error.LakeIndexArtifactUnavailable or reported_error == error.ArtifactIntegrityMismatch) {
+            try context.ensureActive();
+            try cancellation.check();
+            var saved = try catalog.parse(a, lease.record.lake_index_catalog_json);
+            defer saved.deinit();
+            if (saved.value.checkpoint != null) try Renewal.discardCheckpoint(&lease);
+        }
         const failure_time = clock.now_ms(clock.ptr) catch return build_error;
         var admitted = try catalog.parse(a, lease.record.lake_index_catalog_json);
         defer admitted.deinit();
@@ -269,6 +280,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         cancel_checkpoint: bool = false,
         lose_discard_reply: bool = false,
         discards: usize = 0,
+        remove_source_on_admission: ?*local.storage_object_storage.ObjectStorage = null,
         fn replace(raw: *anyopaque, expected: local.common_topology_records.TableRecord, replacement: local.common_topology_records.TableRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!std.mem.eql(u8, expected.lake_index_catalog_json, self.table.lake_index_catalog_json)) return error.TableGenerationChanged;
@@ -289,6 +301,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             self.table = replacement;
             self.table.lake_index_catalog_json = bytes;
             self.commits += 1;
+            if (self.remove_source_on_admission) |source_client| if (after.value.pending != null and after.value.generation == before.value.generation + 1) {
+                self.remove_source_on_admission = null;
+                try source_client.deleteObject("antfly", "part2.parquet", .{});
+            };
             if (discarded and self.lose_discard_reply) {
                 self.lose_discard_reply = false;
                 return error.MetadataMutationOutcomeUnknown;
@@ -379,23 +395,35 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     // Historical metadata can outlive its derived checkpoint. Recovery must
     // discard it durably, preserving serving roots and the admitted lease.
     const checkpoint_directory = partial.value.checkpoint.?.directory.?;
-    const checkpoint_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, resumed_artifacts, .{ .artifact_id = checkpoint_directory.artifact_id, .checksum = checkpoint_directory.checksum, .byte_len = checkpoint_directory.byte_len }, .none, null);
-    defer a.free(checkpoint_bytes);
     const serving_catalog = try a.dupe(u8, mock.table.lake_index_catalog_json);
     defer a.free(serving_catalog);
     const stores = @import("../serverless/artifacts/store.zig");
     var checkpoint_store = store.artifactStore();
     checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(checkpoint_directory.artifact_id);
-    for ([_]enum { missing, corrupt, ambiguous }{ .missing, .corrupt, .ambiguous }) |mode| {
+    for ([_]enum { missing, corrupt, ambiguous, root, manifest, statistics, ambiguous_root, source }{ .missing, .corrupt, .ambiguous, .root, .manifest, .statistics, .ambiguous_root, .source }) |mode| {
         var restored = partial.value;
-        if (mode == .corrupt) restored.checkpoint.?.directory.?.byte_len += 1 else try checkpoint_store.delete(checkpoint_directory.artifact_id);
+        const child = mode == .root or mode == .manifest or mode == .statistics or mode == .ambiguous_root;
+        const target: @import("lake_index_aggregate_artifact.zig").ChunkRef = switch (mode) {
+            .root, .ambiguous_root => .{ .artifact_id = first_text.artifact.artifact_id, .checksum = first_text.artifact.checksum, .byte_len = first_text.artifact.byte_len },
+            .manifest => partial_root.manifests[0],
+            .statistics => stats: {
+                const ref = partial_root.term_statistics.?;
+                const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(partial_root.domain, ref);
+                break :stats .{ .artifact_id = try partial.arena.allocator().dupe(u8, &id), .checksum = try partial.arena.allocator().dupe(u8, &std.fmt.bytesToHex(&ref.digest, .lower)), .byte_len = ref.bytes };
+            },
+            else => .{ .artifact_id = checkpoint_directory.artifact_id, .checksum = checkpoint_directory.checksum, .byte_len = checkpoint_directory.byte_len },
+        };
+        const target_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, resumed_artifacts, target, .none, null);
+        defer a.free(target_bytes);
+        if (mode == .corrupt) restored.checkpoint.?.directory.?.byte_len += 1 else if (mode != .source) try checkpoint_store.delete(target.artifact_id);
+        checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(checkpoint_directory.artifact_id);
         const historical_checkpoint = try catalog.encode(a, restored);
         a.free(mock.owned.?);
         mock.owned = historical_checkpoint;
         mock.table.lake_index_catalog_json = historical_checkpoint;
         mock.now += options.lease_ms;
         const prior_discards = mock.discards;
-        if (mode == .ambiguous) {
+        if (mode == .ambiguous or mode == .ambiguous_root) {
             mock.lose_discard_reply = true;
             try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
             var stopped = try catalog.parse(a, mock.table.lake_index_catalog_json);
@@ -406,17 +434,37 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             try std.testing.expectEqual(@as(u64, 4), stopped.value.generation);
             mock.now += options.lease_ms;
         }
+        if (mode == .source) {
+            mock.remove_source_on_admission = &client;
+            try std.testing.expectError(error.FileNotFound, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+            var source_failed = try catalog.parse(a, mock.table.lake_index_catalog_json);
+            defer source_failed.deinit();
+            try std.testing.expect(source_failed.value.checkpoint != null);
+            try std.testing.expectEqual(prior_discards, mock.discards);
+            var restored_source = try client.putObject("antfly", "part2.parquet", data, .{});
+            defer restored_source.deinit(a);
+            mock.now += options.retry_ms;
+        }
+        if (child and mode != .ambiguous_root) {
+            try std.testing.expectError(error.FileNotFound, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+            var failed_child = try catalog.parse(a, mock.table.lake_index_catalog_json);
+            defer failed_child.deinit();
+            try std.testing.expect(failed_child.value.checkpoint == null and failed_child.value.failure != null);
+            try std.testing.expectEqual(@as(u64, 2), failed_child.value.published.?.generation);
+            mock.now += options.retry_ms;
+        }
         try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
-        try std.testing.expectEqual(prior_discards + 1, mock.discards);
+        try std.testing.expectEqual(prior_discards + @as(usize, if (mode == .source) 0 else 1), mock.discards);
         var rebuilt = try catalog.parse(a, mock.table.lake_index_catalog_json);
         defer rebuilt.deinit();
         try std.testing.expect(rebuilt.value.pending == null and rebuilt.value.checkpoint == null);
         try @import("lake_index_directory.zig").hydrateLazy(rebuilt.arena.allocator(), resumed_artifacts, &rebuilt.value.published.?, .none, null);
         const rebuilt_root = try @import("lake_index_native_text.zig").loadRoot(rebuilt.arena.allocator(), resumed_artifacts, rebuilt.value.published.?.declarations[0].artifact, .none, null);
         try std.testing.expectEqual(@as(usize, 2), rebuilt_root.file_groups.len);
-        var repaired = try checkpoint_store.putWithCancellation(checkpoint_bytes, .none);
+        checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(target.artifact_id);
+        var repaired = try checkpoint_store.putWithCancellation(target_bytes, .none);
         defer repaired.deinit(a);
-        try std.testing.expectEqualStrings(checkpoint_directory.artifact_id, repaired.artifact_id);
+        try std.testing.expectEqualStrings(target.artifact_id, repaired.artifact_id);
     }
     a.free(mock.owned.?);
     mock.owned = try a.dupe(u8, serving_catalog);

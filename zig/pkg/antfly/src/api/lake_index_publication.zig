@@ -94,20 +94,38 @@ const BuildProgress = struct {
     clock: Clock,
     lease: Lease,
     saved: catalog.Publication,
-    declarations: std.ArrayList(local.serverless_segment_sidecar_manifest.DeclaredArtifact) = .empty,
+    declarations: std.ArrayList(std.json.Parsed(local.serverless_segment_sidecar_manifest.DeclaredArtifact)) = .empty,
+    fn deinit(self: *BuildProgress) void {
+        for (self.declarations.items) |*declaration| declaration.deinit();
+        self.declarations.deinit(self.a);
+    }
+    fn remember(self: *BuildProgress, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        // Each current declaration owns a reclaimable region, independently
+        // of builder/file arenas and of declarations it replaces.
+        const bytes = try std.json.Stringify.valueAlloc(self.a, declaration, .{});
+        defer self.a.free(bytes);
+        var owned = try std.json.parseFromSlice(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.a, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        const slot = for (self.declarations.items, 0..) |old, index| {
+            if (std.mem.eql(u8, old.value.name, owned.value.name)) break index;
+        } else null;
+        if (slot) |index| {
+            self.declarations.items[index].deinit();
+            self.declarations.items[index] = owned;
+        } else try self.declarations.append(self.a, owned);
+    }
     fn save(raw: *anyopaque, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.cancellation.check();
-        // Deep ownership survives each bounded builder/file arena.
-        const bytes = try std.json.Stringify.valueAlloc(self.a, declaration, .{});
-        const owned = try std.json.parseFromSliceLeaky(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.a, bytes, .{ .allocate = .alloc_always });
-        const slot = for (self.declarations.items, 0..) |old, index| {
-            if (std.mem.eql(u8, old.name, owned.name)) break index;
-        } else null;
-        if (slot) |index| self.declarations.items[index] = owned else try self.declarations.append(self.a, owned);
-        self.saved.directory = try @import("lake_index_directory.zig").publish(self.a, self.store, self.declarations.items, self.cancellation);
-        self.saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
-        try self.lease.save_checkpoint.?(self.lease.ptr, self.saved);
+        try self.remember(declaration);
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const declarations = try scratch.allocator().alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.declarations.items.len);
+        for (declarations, self.declarations.items) |*value, owned| value.* = owned.value;
+        var saved = self.saved;
+        saved.directory = try @import("lake_index_directory.zig").publish(scratch.allocator(), self.store, declarations, self.cancellation);
+        saved.published_at_ms = try self.clock.now_ms(self.clock.ptr);
+        try self.lease.save_checkpoint.?(self.lease.ptr, saved);
     }
 };
 pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease) ![]u8 {
@@ -145,7 +163,7 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     if (current.value.published) |*previous| {
         if (std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) {
             @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, previous, cancellation, null) catch |err| switch (err) {
-                error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => reusable_directory = false,
+                error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch, error.LakeIndexArtifactUnavailable => reusable_directory = false,
                 else => return err,
             };
         }
@@ -169,7 +187,7 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     if (current.value.checkpoint) |*saved| {
         if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) {
             @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, saved, cancellation, null) catch |err| switch (err) {
-                error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => {
+                error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch, error.LakeIndexArtifactUnavailable => {
                     // A restored catalog may reference collected derived work.
                     // Clear authority before rebuilding; transient reads and
                     // ambiguous CAS outcomes must still stop this attempt.
@@ -192,9 +210,10 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
         if (!present) try candidate_list.append(na, declaration);
     }
     const candidates = candidate_list.items;
-    var progress: BuildProgress = .{ .a = na, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
-        if (current.value.checkpoint) |saved| try progress.declarations.appendSlice(na, saved.declarations);
+        if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
         provider.progress = .{ .ptr = &progress, .save = BuildProgress.save };
     };
     const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
@@ -321,6 +340,32 @@ test "external lake native publication builds scoped text artifacts and fences e
     var parsed = try catalog.parse(a, published_bytes);
     defer parsed.deinit();
     try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), artifact_store, &parsed.value.published.?, .none, null);
+    // Replacing the same current declaration must not retain save history.
+    // Before bounded ownership this exhausted 1 MiB after 116 saves.
+    const Checkpoints = struct {
+        count: usize = 0,
+        fn save(raw: *anyopaque, saved: catalog.Publication) !void {
+            try saved.validate();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var checkpoint_budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+    {
+        var checkpoint_store = artifact_store;
+        checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(parsed.value.published.?.directory.?.artifact_id);
+        var checkpoint_saved = parsed.value.published.?;
+        checkpoint_saved.declarations = &.{};
+        checkpoint_saved.directory = null;
+        var checkpoints: Checkpoints = .{};
+        var progress: BuildProgress = .{ .a = checkpoint_budget.allocator(), .store = &checkpoint_store, .cancellation = .none, .clock = clock, .lease = .{ .ptr = &checkpoints, .snapshot = undefined, .save_checkpoint = Checkpoints.save }, .saved = checkpoint_saved };
+        defer progress.deinit();
+        for (0..1000) |_| try BuildProgress.save(&progress, parsed.value.published.?.declarations[0]);
+        try std.testing.expectEqual(@as(usize, 1000), checkpoints.count);
+        try std.testing.expectEqual(@as(usize, 1), progress.declarations.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), checkpoint_budget.live);
+
     const publication = parsed.value.published.?;
     try std.testing.expect(parsed.value.pending == null);
     try std.testing.expect(publication.declarations.len > 0);
