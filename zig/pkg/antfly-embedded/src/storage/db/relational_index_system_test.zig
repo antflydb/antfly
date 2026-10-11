@@ -146,6 +146,9 @@ test "relational index build pages native owner control preserves committed cuts
     };
     try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationAdmission(db_mod.DB.NativeIndexOwnerAdmission.fromBinding(binding), candidate.inputs.bytes));
     try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationControl(.{ .effect = .fenced, .binding = binding }));
+    const untouched = try primary.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(.native, untouched.source.kind);
+    try std.testing.expect(untouched.intent == null and untouched.binding == null and untouched.cleanup == null);
     for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
         var control = if (effect == .admitted)
             try primary.prepareNativeIndexOwnerControl(prepared.command)
@@ -320,6 +323,12 @@ test "relational index build pages native owner control preserves committed cuts
     const canceled = try cancel_primary.applyPreparedNativeIndexOwnerCancellation(&pending_cancel, null);
     try std.testing.expect(canceled.replication_pending);
     try std.testing.expect(!canceled.duplicate);
+    const intent_status = try cancel_primary.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(canceled.position, intent_status.intent.?.position);
+    try std.testing.expect(intent_status.binding == null and intent_status.admitted == null);
+    var foreign_identity = receipt_identity;
+    foreign_identity.id[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, cancel_primary.nativeIndexOwnerCancellationState(foreign_identity));
     try std.testing.expectEqualStrings("TestPublicationUnavailable", canceled.error_name.?);
     {
         var read = try cancel_primary.core.store.beginReadTxn();
@@ -441,6 +450,15 @@ test "relational index build pages native owner control preserves committed cuts
         follower.close();
         follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
         try std.testing.expectEqual(progress_record.lsn, try follower.replicationAppliedSequence());
+        const status = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+        try std.testing.expectEqual(@as(u64, 2 + ordinal), status.source.sequence);
+        try std.testing.expectEqual(canceled.position, status.intent.?.position);
+        try std.testing.expectEqual(@as(u64, 2), status.admitted.?.sequence);
+        try std.testing.expectEqual(ordinal >= 1, status.fenced != null);
+        try std.testing.expectEqual(ordinal >= 2, status.reserved != null);
+        if (status.fenced) |cut| try std.testing.expectEqual(@as(u64, 3), cut.sequence);
+        if (status.reserved) |cut| try std.testing.expectEqual(@as(u64, 4), cut.sequence);
+        try std.testing.expect(status.cleanup == null and !status.artifacts_retired);
     }
     alloc.free(cancel_publisher.payload.?);
     cancel_publisher.payload = null;
@@ -480,6 +498,9 @@ test "relational index build pages native owner control preserves committed cuts
     follower.close();
     follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
     try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
+    const queued = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expectEqual(@as(u64, 5), queued.cleanup.?.sequence);
+    try std.testing.expect(!queued.artifacts_retired);
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
@@ -526,6 +547,10 @@ test "relational index build pages native owner control preserves committed cuts
     const duplicate_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
     try std.testing.expect(!duplicate_page.advanced);
     try std.testing.expect(duplicate_page.artifacts_retired);
+    const retired_status = try follower.nativeIndexOwnerCancellationState(receipt_identity);
+    try std.testing.expect(retired_status.artifacts_retired);
+    try std.testing.expect(retired_status.binding != null);
+    try std.testing.expectEqual(@as(u64, 5), retired_status.source.sequence);
     try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
     try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
     {

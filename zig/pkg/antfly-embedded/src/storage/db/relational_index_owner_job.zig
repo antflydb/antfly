@@ -279,6 +279,93 @@ pub fn inspectNative(txn: anytype, expected: anytype) !?Binding {
     return binding;
 }
 
+/// One coherent, bounded inspection for cancellation dispatch. These cuts are
+/// progress facts, never publication receipts. No manifest or schema compiler
+/// is needed to choose the next effect after restart.
+pub const CancellationState = struct {
+    // An untouched native source legitimately has clock zero, unlike a cut.
+    source: source_authority.State,
+    intent: ?cancellation.Record = null,
+    binding: ?Binding = null,
+    admitted: ?positions.Native = null,
+    fenced: ?positions.Native = null,
+    reserved: ?positions.Native = null,
+    cleanup: ?positions.Native = null,
+    artifacts_retired: bool = false,
+
+    /// Validate a decoded inspection before dispatching another owner effect.
+    /// Structural validity is not metadata permission or root attestation.
+    pub fn validate(self: CancellationState, expected: anytype) !void {
+        try expected.validate();
+        if (self.source.kind != .native or !std.mem.eql(u8, &self.source.namespace, &@import("online_source_contract.zig").namespaceBytes(expected.namespace)))
+            return error.OnlineSourceScopeChanged;
+        if (self.intent) |record| {
+            try record.intent.validate();
+            try requireCancellationIdentity(record.intent, expected);
+        }
+        for ([_]?positions.Native{ if (self.intent) |record| record.position else null, self.admitted, self.fenced, self.reserved, self.cleanup }) |maybe| {
+            if (maybe) |cut| {
+                try cut.validate();
+                if (!cut.namespace.eql(expected.namespace) or cut.sequence > self.source.sequence) return error.InvalidPrivateIndexCancellation;
+            }
+        }
+        if (self.binding) |binding| {
+            _ = try binding.encode();
+            if (binding.authority != .native or self.admitted == null) return error.InvalidPrivateIndexCancellation;
+            try requireCancellationIdentity(cancellation.Intent.fromBinding(binding), expected);
+            if (self.intent) |record| if (!record.intent.eql(cancellation.Intent.fromBinding(binding))) return error.PrivateIndexOwnerJobChanged;
+            if ((binding.phase == .reserved) != (self.reserved != null)) return error.InvalidPrivateIndexCancellation;
+        } else if (self.admitted != null or self.fenced != null or self.reserved != null or self.cleanup != null)
+            return error.InvalidPrivateIndexCancellation;
+        if (self.fenced) |cut| if (self.admitted == null or cut.sequence <= self.admitted.?.sequence) return error.InvalidPrivateIndexCancellation;
+        if (self.reserved) |cut| if (self.fenced == null or cut.sequence <= self.fenced.?.sequence) return error.InvalidPrivateIndexCancellation;
+        if (self.cleanup) |cut| {
+            if (self.intent == null or self.reserved == null or cut.sequence <= self.intent.?.position.sequence or cut.sequence <= self.reserved.?.sequence)
+                return error.InvalidPrivateIndexCancellation;
+        }
+        if (self.artifacts_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
+    }
+};
+
+fn requireCancellationIdentity(intent: cancellation.Intent, expected: anytype) !void {
+    if (!std.mem.eql(u8, &intent.id, &expected.id) or
+        !std.mem.eql(u8, &intent.plan_digest, &expected.plan_digest) or
+        !std.mem.eql(u8, &intent.owner_digest, &expected.owner_digest) or
+        intent.ordinal != expected.ordinal or !intent.fence.namespace.eql(expected.namespace) or
+        intent.fence.owner_group_id != expected.owner_group_id) return error.PrivateIndexOwnerJobChanged;
+}
+
+pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
+    const binding = try inspectNative(txn, expected);
+    try cancellation.verifyRecovery(txn, binding);
+    const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
+    var result: CancellationState = .{
+        .source = authority,
+        .intent = try cancellation.pending(txn),
+        .binding = binding,
+    };
+    if (result.intent) |record| {
+        try requireCancellationIdentity(record.intent, expected);
+    }
+    if (binding) |current| {
+        result.admitted = try nativeEffectPosition(txn, current, .admitted);
+        result.fenced = try nativeEffectPosition(txn, current, .fenced);
+        result.reserved = try nativeEffectPosition(txn, current, .reserved);
+    }
+    if (try loadCancellationCleanup(txn, binding)) |record| {
+        const current = binding orelse return error.InvalidPrivateIndexCancellation;
+        result.cleanup = record.position;
+        if (requireCancellationArtifactsRetired(txn, current)) |_| {
+            result.artifacts_retired = true;
+        } else |err| switch (err) {
+            error.PrivateIndexCancellationPending => {},
+            else => return err,
+        }
+    }
+    try result.validate(expected);
+    return result;
+}
+
 /// Shared by live page admission, receipt production and cold recovery. Read
 /// the clock once, then validate only the three fixed slots; never scan history.
 fn requireNativeCuts(txn: anytype, job: Binding) !void {
