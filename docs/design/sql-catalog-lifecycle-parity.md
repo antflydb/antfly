@@ -2023,3 +2023,47 @@ it does not yet implement the ordered DB/C-ABI/RPC entry point or its atomic
 standby outbox/frame, independently attested public admission, global UNIQUE
 claims, terminal cleanup, publication/cancellation or distributed fault gates.
 The public producer stays disabled and original SQL dispositions stay unchanged.
+
+### Native owner DB execution and standby replay (in qualification)
+
+Private owner controls now have a typed prepared DB boundary for admission,
+drained fencing and reservation. Candidate compilation, immutable schema-view
+ownership, durable manifest loading and large-envelope serialization happen
+outside apply admission. Transactional staging assigns the actual native cut;
+only its bounded decimal sequence is appended to the prepared envelope inside
+the lock. The existing durable batch outbox, rather than a parallel replication
+system, carries the committed effect. Publication failure reports committed
+pending replication without fabricating a receipt or implying rollback.
+
+Standby envelope 22 carries a private command and its original native position.
+It is not a public `BatchRequest` field. Strict wire decoding rejects unknown
+root fields, mixed ordinary effects and alternate receipt domains. Typed ingress
+validates the same isolation invariant. Native position and standby transport LSN
+commit together. Replay checks the authoritative transport sequence before
+preparation, after preparation errors, and again in the serialized write
+transaction: a newer delivery must never be overwritten by a stale prepared
+command. The transaction-local sequence reader consumes borrowed bytes before
+another point read can reuse their storage.
+
+A new LSM integration campaign directly exercises this DB boundary, wire
+encoding/decoding, standby ingress, duplicate delivery, stale prepared replay,
+reopen and private-schema visibility. It also checks gap rollback, mixed ordinary
+effects/receipt rejection, unknown wire fields and exact primary retries. Final
+Debug qualification passes all 65 build steps across the candidate/page/catalog
+gates: eight candidate, eleven candidate/private-addition, five system/page and
+fourteen catalog tests, without skips, failures or leaks. Production
+`embedded-capi-check` passes 28/28 Debug build steps. Apache dependency-boundary
+validation passes for 2028 sources and inventory integrity remains unchanged.
+ReleaseFast qualification is still in progress; existing component gates alone
+do not prove distributed activation. The first
+integration compilation exposed an obsolete Zig reflection API, now corrected
+to the repository's field-name interface. The first execution also corrected a
+fixture to use the public schema/validator setter rather than weakening its
+native schema guard. No SQL inventory credits are claimed.
+
+Still required: authenticated C-ABI/RPC receivers with independent live metadata
+permission, envelope capability admission, actual Raft effect identities, worker
+dispatch/ACK integration, global UNIQUE claims, terminal cancellation/publication
+and cleanup, and distributed fault qualification. The public producer remains
+disabled until those requirements and the public failed-build atomicity gate are
+proved, not merely because the private component campaign passes.

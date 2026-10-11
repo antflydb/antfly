@@ -253,6 +253,10 @@ fn requireNativeCut(txn: anytype, binding: Binding, action: NativeEffect) !Nativ
     return (try readNativeCut(txn, binding, action)) orelse return error.InvalidPrivateIndexNativeReceipt;
 }
 
+pub fn nativeEffectPosition(txn: anytype, binding: Binding, action: NativeEffect) !?positions.Native {
+    return if (try readNativeCut(txn, binding, action)) |cut| cut.position else null;
+}
+
 /// Shared by live page admission, receipt production and cold recovery. Read
 /// the clock once, then validate only the three fixed slots; never scan history.
 fn requireNativeCuts(txn: anytype, job: Binding) !void {

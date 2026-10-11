@@ -184,6 +184,7 @@ test {
 
 const change_journal_mod = @import("derived/change_journal.zig");
 const replication_effects_mod = @import("replication_effects.zig");
+const native_index_control = @import("relational_index_owner_control.zig");
 
 const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
@@ -7838,6 +7839,21 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        if (mutation.index_owner_control) |frame| {
+            try frame.validate();
+            if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
+            try replication_effects_mod.validateIndexOwnerPayload(.{ .schema_version = native_index_control.envelope_version, .request = mutation.request, .index_owner_control = frame });
+            if (try self.replicationMutationAlreadyApplied(sequence)) return;
+            var prepared = self.prepareNativeIndexOwnerControl(frame.command) catch |err| {
+                // Another replay may retire the inputs/schema while preparation
+                // runs off-lock. A committed transport receipt is authoritative.
+                if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                return err;
+            };
+            defer prepared.deinit();
+            _ = try self.applyPreparedNativeIndexOwnerControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+            return;
+        }
         var request = mutation.request;
         var options: BatchExecutionOptions = .{
             .validate_range_ownership = false,
@@ -7855,6 +7871,128 @@ pub const DB = struct {
             .none => request.sync_level = .write,
         }
         try self.batchInternal(request, null, options);
+    }
+
+    pub const NativeIndexOwnerAdmission = native_index_control.Admission;
+    pub const NativeIndexOwnerCommand = native_index_control.Command;
+    pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
+    pub const NativeIndexOwnerOutcome = native_index_control.Outcome;
+
+    pub fn prepareNativeIndexOwnerAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerControl {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return native_index_control.Prepared.admission(self.alloc, view, &txn, header, manifest);
+    }
+
+    pub fn prepareNativeIndexOwnerControl(self: *DB, command: NativeIndexOwnerCommand) !PreparedNativeIndexOwnerControl {
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return native_index_control.Prepared.control(self.alloc, view, &txn, command);
+    }
+
+    const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
+
+    /// Private owner execution. Metadata authorization belongs to the receiving
+    /// server, not to a caller-set flag. The replay capability is supplied only
+    /// by committed standby ingress, never by ordinary batch decoding.
+    pub fn applyPreparedNativeIndexOwnerControl(self: *DB, prepared: *PreparedNativeIndexOwnerControl, replay: ?NativeIndexReplay) !NativeIndexOwnerOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try prepared.command.validate();
+        const jobs = @import("relational_index_owner_job.zig");
+        const binding = prepared.command.binding;
+        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        if (replay) |value| {
+            if (value.lsn == 0) return error.InvalidControlReceiptPosition;
+            try (native_index_control.Frame{ .command = prepared.command, .position = value.position }).validate();
+        }
+        var replication_mutation = if (replay == null) self.acquireReplicationMutationShared() else null;
+        defer if (replication_mutation) |*lease| lease.release();
+        const mirrored = replay == null and self.local_execution.replication_async_batch_mirror != null;
+        if (replay == null) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+            if (self.local_execution.replication_async_metadata_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
+            if (mirrored) try prepared.preparePayload();
+        }
+        var outcome: NativeIndexOwnerOutcome = undefined;
+        {
+            var mutation = self.core.snapshot_admission.acquireMutation();
+            defer mutation.release();
+            var replay_mutation = try self.acquireSnapshotReplayMutation();
+            defer replay_mutation.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (replay == null) try self.enforceReplicationWriteGate();
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            if (replay) |value| {
+                // Recheck in the same serialized transaction as the effect.
+                // The off-lock fast path cannot prevent a newer replay from
+                // committing while this command is being prepared.
+                const current = try apply_receipts.readReplicationAppliedSequenceTxn(&txn);
+                if (current >= value.lsn) {
+                    txn.abort();
+                    return .{ .binding = binding, .position = value.position, .duplicate = true };
+                }
+            }
+            const forwarded: ?@import("receipt_position.zig").Native = if (replay) |value| value.position else null;
+            const duplicate = (try jobs.nativeEffectPosition(&txn, binding, prepared.command.effect)) != null;
+            switch (prepared.command.effect) {
+                .admitted => {
+                    const artifacts = if (prepared.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+                    _ = try jobs.stageBeginWithReplay(&txn, binding, &artifacts.candidate.inputs, forwarded);
+                },
+                .fenced => {
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    _ = try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, forwarded);
+                },
+                .reserved => {
+                    const artifacts = if (prepared.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    _ = try jobs.stageReservationWithReplay(&txn, &manager, binding, &artifacts.candidate, &artifacts.addition, forwarded);
+                },
+            }
+            const position = (try jobs.nativeEffectPosition(&txn, binding, prepared.command.effect)) orelse return error.InvalidPrivateIndexNativeReceipt;
+            if (replay) |value| {
+                var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
+                try txn.put(marker.key, marker.value);
+            }
+            if (mirrored and !duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(position));
+            try txn.commit();
+            outcome = .{ .binding = binding, .position = position, .duplicate = duplicate };
+        }
+        // Snapshot/commit barriers must not be held across publication or an
+        // acknowledgement wait. A committed outbox remains an explicit pending
+        // result, not an ambiguous rollback-looking API error.
+        if (replication_mutation) |*lease| lease.release();
+        replication_mutation = null;
+        if (mirrored) self.flushDurableReplicationOutboxes() catch |err| {
+            outcome.replication_pending = true;
+            outcome.error_name = @errorName(err);
+            self.scheduleDurableReplicationOutboxRecovery();
+            return outcome;
+        };
+        if (replay == null and prepared.command.effect != .admitted) {
+            var txn = self.core.store.beginReadTxn() catch |err| {
+                outcome.error_name = @errorName(err);
+                return outcome;
+            };
+            defer txn.abort();
+            outcome.receipt = jobs.nativeReceipt(&txn, binding, prepared.command.effect) catch |err| {
+                outcome.error_name = @errorName(err);
+                return outcome;
+            };
+        }
+        return outcome;
     }
 
     /// Reconcile an ordered source inventory before applying its mutation.
