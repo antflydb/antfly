@@ -14242,6 +14242,34 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    // Receipts must be checked even when a native cursor, constant result or
+    // streaming plan would otherwise bypass the lake reader.
+    for ([_][]const u8{ "SELECT id FROM usage_records WHERE _id = 'a'", "SELECT SUM(amount) FROM usage_records", "SELECT u.id FROM usage_records u JOIN usage_records v ON u.id = v.id", "SELECT 1" }) |statement| {
+        var compiled_receipt = try @import("antfly_local_sources").sql_compiler.compile(alloc, statement, .{});
+        defer compiled_receipt.deinit();
+        var receipt_identity: ?@import("http_server.zig").AuthenticatedIdentity = null;
+        var receipt_adapter: @import("sql_execution.zig").Adapter = .{ .server = &server, .identity = &receipt_identity, .context = .{}, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 999, .object_generation = 9, .wal_lsn = 999999 }, .wait_ms = 0 } };
+        try std.testing.expectError(error.ReadReceiptGenerationMismatch, receipt_adapter.execute(alloc, &compiled_receipt, &.{}, .{}, null));
+        try std.testing.expectError(error.ReadReceiptGenerationMismatch, @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, receipt_adapter.backend(), &compiled_receipt, &.{}, .{}));
+        var receipt_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer receipt_request.deinit();
+        const receipt_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement, .read_requirements = receipt_adapter.read_requirements }, .{});
+        defer alloc.free(receipt_body);
+        receipt_request.body = receipt_body;
+        var receipt_ctx = httpx.Context.init(alloc, std.testing.io, &receipt_request);
+        defer receipt_ctx.deinit();
+        var receipt_response = try handler.executeSQL(&receipt_ctx);
+        defer receipt_response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), receipt_response.status.code);
+        var receipt_diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, receipt_response.body.?, .{});
+        defer receipt_diagnostic.deinit();
+        try std.testing.expectEqualStrings("22023", receipt_diagnostic.value.code);
+        if (compiled_receipt.statement.select.table != null) {
+            receipt_adapter.read_requirements.after_write.?.table_id = 7;
+            try std.testing.expectError(error.UnsupportedReadVisibility, receipt_adapter.execute(alloc, &compiled_receipt, &.{}, .{}, null));
+        }
+    }
+
     const reference_cases = [_][]const u8{
         "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
         "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",

@@ -268,6 +268,23 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     var committed_result = try committed.execute(a, &compiled, &.{}, .{}, null);
     defer committed_result.deinit();
     try std.testing.expectEqualStrings("1", committed_result.output.rows[0][0].string);
+    // An already covered receipt must not succeed after its positive polling
+    // budget expires while the provider performs readiness checkpoints.
+    const SlowCheckpoint = struct {
+        fn canceled(_: *const anyopaque) bool {
+            std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            return false;
+        }
+    };
+    var checkpoint_state: u8 = 0;
+    committed.context.cancellation = .{ .ptr = &checkpoint_state, .is_cancelled_fn = SlowCheckpoint.canceled };
+    committed.read_requirements.wait_ms = 1;
+    try std.testing.expectError(error.ReadRequirementNotReady, committed.execute(a, &compiled, &.{}, .{}, null));
+    committed.context = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, committed.execute(a, &compiled, &.{}, .{}, null));
+    var canceled = std.atomic.Value(bool).init(true);
+    committed.context = .{ .cancellation = @import("antfly_local_sources").api_operation.CancellationToken.fromAtomic(&canceled) };
+    try std.testing.expectError(error.Canceled, committed.execute(a, &compiled, &.{}, .{}, null));
     var joined = try local.sql_compiler.compile(a, "SELECT SUM(e.amount) FROM events e JOIN events f ON e.amount = f.amount", .{});
     defer joined.deinit();
     var joined_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id };
