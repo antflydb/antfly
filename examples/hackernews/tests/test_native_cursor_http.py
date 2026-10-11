@@ -158,7 +158,7 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             try:
                 call("GET", "/tables")
                 return
-            except (URLError, HTTPError):
+            except (URLError, HTTPError, ConnectionError):
                 time.sleep(0.1)
         pytest.fail("daemon did not start")
 

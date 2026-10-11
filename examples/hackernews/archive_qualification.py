@@ -210,6 +210,10 @@ def assess(regional, config):
                 failures.append(
                     f"{label}: missing correctness checks {sorted(missing)}"
                 )
+            if bool(report.get("store_source")) != bool(config.get("store_source")):
+                failures.append(
+                    f"{label}: stored-source policy differs from configured profile"
+                )
             samples = report["warm_samples_ms"]
             if len(samples) < config["repeats"]:
                 failures.append(f"{label}: insufficient warm samples")

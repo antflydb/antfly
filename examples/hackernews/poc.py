@@ -840,6 +840,7 @@ def main():
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
             "cache_files": len(cache_files),
             "cache_bytes": sum(p.stat().st_size for p in cache_files),
+            "store_source": args.store_source,
             "source": f"gs://{args.bucket}/{args.prefix}/archive",
             "artifacts": f"gs://{args.bucket}/{artifact_prefix}/indexes",
             "sql_count": count,
@@ -908,6 +909,7 @@ def main():
             ("restart_ms", "after_restart_ms"),
             ("io_profiles", "io_profiles"),
             ("ready_seconds", "ready_seconds"),
+            ("build_profile", "build_profile"),
             ("filter_results", "metadata_filters"),
             ("count", "sql_count"),
         ):

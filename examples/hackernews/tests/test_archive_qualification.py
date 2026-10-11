@@ -94,6 +94,13 @@ class ArchiveQualificationTest(unittest.TestCase):
         self.regional["runs"]["indexed"][0]["warm_samples_ms"] = [100]
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
 
+    def test_stored_source_policy_must_match_the_configured_profile(self):
+        self.config["store_source"] = True
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["store_source"] = True
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
+
     def test_deep_cursor_workload_cannot_silently_change(self):
         self.config["cursor_term"] = "AI"
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])

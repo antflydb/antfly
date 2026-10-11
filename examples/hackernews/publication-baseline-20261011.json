@@ -70,5 +70,7 @@
       "source_preserved": true
     }
   },
-  "passed": false
+  "passed": false,
+  "build_peak_rss_bytes": 283549696,
+  "registration_seconds": 4.5
 }

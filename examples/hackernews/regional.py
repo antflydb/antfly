@@ -46,6 +46,8 @@ def compare_runs(reports):
             "cursor_depth", {}
         ).get("term"):
             raise ValueError("Cursor workload differs between runs")
+        if report.get("store_source", False) != reference.get("store_source", False):
+            raise ValueError("Stored-source policy differs between runs")
         for field in ("source", "row_count", "query", "concurrency"):
             if report[field] != reference[field]:
                 raise ValueError(f"Benchmark {field} differs between runs")

@@ -67,6 +67,12 @@ class ComparativeResultsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Workload coverage differs"):
             regional.compare_runs([self.report, other])
 
+    def test_stored_source_policies_cannot_be_compared_as_one_profile(self):
+        other = deepcopy(self.report)
+        other["store_source"] = True
+        with self.assertRaisesRegex(ValueError, "Stored-source policy"):
+            regional.compare_runs([self.report, other])
+
     def test_cursor_workload_must_match_between_comparisons(self):
         other = deepcopy(self.report)
         other["cursor_depth"] = {"term": "the"}
