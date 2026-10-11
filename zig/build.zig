@@ -564,12 +564,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_lib_image_tests = image_tests.run_lib_image_tests;
     const run_png_tests = image_tests.run_png_tests;
+    const run_jpeg_tests = image_tests.run_jpeg_tests;
     const run_jpeg2000_decode_tests = image_tests.run_jpeg2000_decode_tests;
+    b.step("lib-image-jpeg-test", "Run direct JPEG decoder tests").dependOn(&run_jpeg_tests.step);
     b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
     b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
     const image_test_step = b.step("lib-image-test", "Run shared image tests");
     image_test_step.dependOn(&run_lib_image_tests.step);
     image_test_step.dependOn(&run_png_tests.step);
+    image_test_step.dependOn(&run_jpeg_tests.step);
     image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_tests = pdf_build.addTests(b, .{

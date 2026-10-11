@@ -193,8 +193,8 @@ The scan remains CPU-preparation bound: about 36.6–36.7 ms before roughly 0.18
 of GPU painting. Its new GPU total is slightly slower than the old GPU path,
 which retained a main reader across passes; the new path prepares a bounded
 private reader each wave. It remains slightly faster than CPU rendering in this
-sample. A codec/preparation profile is needed before attributing that cost more
-precisely. The result does not establish an all-device PDF decoder.
+sample. That campaign did not isolate codec costs; the preparation follow-up below
+profiles them. The result does not establish an all-device PDF decoder.
 
 Four GPU tests passed, covering unsupported content, distinct batched pages,
 fractional origins, tile-boundary clipping/paint order, and buffer reuse/clearing.
@@ -210,6 +210,76 @@ are under `.benchmark-results/gemma4-pdf-render-2026-10-11/`.
 For a render-only comparison, run the benchmark with `--scope render`, identical
 PDF/DPI/dimension/worker arguments, and `--renderer cpu` or `--renderer gpu`.
 Model loading is unnecessary for that scope.
+
+## JPEG preparation follow-up
+
+A three-second macOS `sample` profile of the real W3C scan attributes the
+remaining preparation cost to the shared CPU JPEG decoder, including canonical
+Huffman symbol decoding and block reconstruction. The Metal painter is already
+below one millisecond; moving more paint work onto the GPU does not address
+that codec cost.
+
+The shared decoder now builds a 256-entry, eight-bit prefix table per canonical
+Huffman table. Codes of at most eight bits decode in one lookup; longer codes and
+short tails retain canonical bitwise decoding. Coefficient loops borrow those tables:
+the compiler otherwise copies the expanded 850-byte table per symbol, as confirmed
+in the initial candidate's ARM64 assembly. The public by-value API remains available
+for compatibility. Lookahead preserves stuffed bytes,
+pending restart markers and available tail bits rather than requiring eight bits
+at a scan boundary. Each table adds 512 bytes; decoder working sets remain bounded
+by the existing per-component table count. This changes CPU JPEG preparation in
+both the normal PDF renderer and the benchmark GPU path. It introduces no decoded
+page cache or alternative image quality setting.
+
+Direct JPEG tests now participate in `lib-image-test` and can also run through
+`zig build lib-image-jpeg-test`. Previously, importing the image module did not
+discover those codec tests. Wiring them in exposed stale color tests: two old
+baseline calls lacked the current scaling/color options, one DeviceCMYK expectation
+used JPEG display inversion, and a component-ID test used a grayscale fixture and
+changed frame selectors without changing scan selectors. The failures reproduced
+with the original decoder; correcting the tests leaves color conversion unchanged.
+
+The prefix test compares all 65,536 sixteen-bit reservoirs against an independent
+bitwise decoder, including eight- and sixteen-bit codes and unused prefixes.
+Boundary tests cover short scan tails, JPEG byte stuffing and pending restart
+markers. An independent old/new decoder comparison on the real scan verifies
+byte-for-byte RGBA output at full resolution and maximum dimensions 1536, 768
+and 384. The temporary comparison harness, saved binary, profiler output and raw
+measurements live under `.benchmark-results/gemma4-pdf-preparation-borrowed-2026-10-11/`.
+
+The final paired render campaign uses the saved `5d3f01e4a7` binary, 20 measured
+waves after two warmups, 144 DPI, maximum dimension 1536, four workers, and both
+variant orders. All GPU-selected pixels match the CPU output exactly.
+Concurrent development activity remains a limitation; these are local observations.
+
+| GPU render case | Baseline p50 | Final p50 | Wall-time reduction |
+| --- | --- | --- | --- |
+| Mixed four-page wave | 49.0–53.7 ms | 43.5–45.9 ms | 11–15% in paired orders |
+| Real W3C scan | 47.7–53.4 ms | 40.6–41.9 ms | 12–24% in paired orders |
+| Four copies of the real scan, independent readers | 58.3–59.5 ms | 45.9–50.0 ms | 16–21% in paired orders |
+
+The four-scan batch measures concurrent preparation of the same real document,
+not four different scan layouts. CPU controls vary with machine load and show
+smaller or inconsistent gains; the table does not establish a general GPU-versus-CPU
+speedup. An isolated old/new JPEG ABBA comparison (20 fresh decodes per variant)
+observes about a 9% decode reduction in both orders: 40.8–44.5 ms before versus
+37.1–40.5 ms after. It also verifies exact old/new pixels at all four resolutions.
+
+All 172 direct JPEG tests pass in ReleaseSafe, along with the shared image,
+PNG and JPEG 2000 suites. Four actual Metal renderer tests pass in ReleaseFast.
+[The preparation results report](gemma4-pdf-preparation-performance.json) records
+binary/input/source hashes, individual paired render cases, isolated decode timing,
+end-to-end observations, validation and measurement limits.
+
+The final embedding comparison keeps GPU rendering and the resident model handoff
+identical across binaries, runs baseline/candidate and then candidate/baseline,
+and uses two warmups plus three measured four-page waves per process. The candidate
+p50 is 8.76 s versus 10.58 s in the first order, then 10.64 s versus 9.86 s in the
+reverse order. Vision-stage observations vary with the process timing, while
+rendering accounts for well under 1% of total wall time. These observations do
+not establish an overall PDF embedding speedup. All final vectors match the earlier
+serial CPU-render/host-handoff reference at cosine >= 0.9999999999992, and all
+GPU-selected page pixel comparisons remain exact.
 
 ## Next decision
 
