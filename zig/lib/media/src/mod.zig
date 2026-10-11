@@ -22,6 +22,8 @@ pub const remote = @import("remote.zig");
 pub const admission = @import("admission.zig");
 pub const live_mp4 = @import("live_mp4.zig");
 pub const http_stream = @import("http_stream.zig");
+pub const dash = @import("dash.zig");
+pub const dash_live = @import("dash_live.zig");
 pub const hls_live = @import("hls_live.zig");
 pub const hls = @import("hls.zig");
 pub const stream = @import("stream.zig");
@@ -36,6 +38,8 @@ test {
     _ = stream;
     _ = live_mp4;
     _ = hls;
+    _ = dash;
+    _ = dash_live;
     _ = http_stream;
     _ = hls_live;
     _ = admission;

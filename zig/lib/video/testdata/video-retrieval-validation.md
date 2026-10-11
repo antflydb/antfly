@@ -173,11 +173,11 @@ VideoToolbox High10 decoder or HDR tone mapping.
 
 ## Remaining gates
 
-Batched resident vision/projector execution, device token composition/backbone
-inputs and final normalization, overlapped full-pipeline scheduling, qualified
-logical field/partition indexing, VFR/display/HDR policies, broader HLS and DASH
-ingestion, VP8 interframes and pure Zig VP9/AV1
-decoding remain open. Native HTTP fMP4 HLS ingestion and pure Zig VP8 displayed
+Batched resident vision/projector execution, final device normalization, qualified
+logical field/partition indexing and model VFR/display/HDR policies, broader HLS
+and DASH ingestion, VP8 interframes and pure Zig VP9/AV1 decoding remain open.
+Device video token composition/backbone inputs and bounded decode/preparation/
+projection overlap are delivered by the continuation below. Native HTTP fMP4 HLS ingestion and pure Zig VP8 displayed
 keyframes now have separately bounded and tested library entry points; they do
 not qualify model WebM inputs or complete streaming protocol/codec coverage.
 Further device helper changes must pass pretrained and real-clip gates after
@@ -193,3 +193,38 @@ revision, verifies the checkpoint receipt and retains tool versions and reports.
 Its FFmpeg package/version is recorded independently. Model acquisition may use
 the caller's repository `HF_TOKEN` secret. The workflow was linted locally but
 has not been dispatched; it adds repeatability, not a new Linux execution receipt.
+
+
+## Device composition and projection scheduling continuation
+
+`composition-gates.json` binds the final production binary and source hashes.
+`metal-composition-unit.json` and its log qualify mixed-media concat/gather values
+and zero intermediate host-mirror downloads on actual Metal; that helper binary
+predates subsequent scheduling edits and is not a full-pipeline receipt.
+
+The final binary passes all six pinned cases, token usage, HTTP 128 dimensions,
+503/capacity retry and a corrupted second selected MJPEG frame followed by a valid
+retry on both Metal and native CPU. Maximum coordinate errors are 2.76e-7 and
+4.77e-7 respectively (`metal-pretrained-composition.json`,
+`native-pretrained-composition.json`). Preparation destruction now fences pending
+GPU work before releasing its resource/admission owner. The bounded inference
+allocator serializes accounting across producer and projection worker.
+
+`metal-real-composition.json` preserves all ten vectors, four exact rankings and
+all top-k sets against pinned PyTorch CPU, with maximum score error 3.46e-7.
+Concurrent/sustained requests and disconnect/retry pass. The short H.264 warm
+median is 1.064 seconds across three samples; sampled server-plus-worker RSS peaks
+at 2,303,279,104 bytes. These shared-host measurements do not isolate a speedup.
+
+`long-metal-composition.json` passes the complete 52-second clip's vector/score,
+retry and sustained gates. Its first document request completes in 15.127 seconds
+(one sample, no warmup), retry in 30.719 seconds and sustained request in 14.711
+seconds; sampled server-plus-worker RSS peaks at 2,352,824,320 bytes. The single
+candidate corpus has trivial rankings. Peer disconnect/retry still does not
+expose cancellation completion. RSS excludes unmapped GPU private memory and
+can count shared mappings twice. No fresh Linux pretrained run is claimed.
+
+Portable logical-picture duration sampling, orthogonal display/SAR geometry and
+static DASH SegmentList ingestion have their own library tests; they do not
+broaden the default model policy or qualify VP-family decoding. Batching,
+VP8 interframes, VP9/AV1 and broader DASH addressing/live scheduling remain open.

@@ -391,7 +391,7 @@ boundary. Segment ordinals, ingested bytes and shared admission remain cumulativ
 `max_reconfigurations` bounds repeated initialization changes. Inline initialization
 boxes inside pending media still require the transport to signal the boundary.
 The native HTTP HLS reader below signals these boundaries using map and
-discontinuity changes. DASH transport remains separate work.
+discontinuity changes. The DASH SegmentList adapter reuses the same transport; broader DASH addressing and availability scheduling remain separate work.
 
 The media suite covers a real changed SPS/96×48 initialization, invalid replacement
 rollback, replay after discontinuity, outstanding old leases and allocation failures.
@@ -429,4 +429,24 @@ retrying a failed snapshot commit does not download or append that media twice.
 refusal and a complete reload/configuration transition against a local HTTP
 server using the production client. The portable suite additionally injects
 allocation failures across both epochs. Encrypted, MPEG-TS, master-selection,
-low-latency HLS and DASH support remain open.
+low-latency HLS and broader DASH support remain open.
+
+
+## DASH explicit segment ingestion
+
+`dash.parse` accepts bounded static XML MPDs with one MP4 video representation
+and an explicit `SegmentList`. It preserves `startNumber`, duration/timescale,
+initialization URI and inclusive byte ranges, converting them to the shared
+fMP4 segment contract. Strings borrow the MPD; owned segment arrays release on
+all allocation failures. XML external entities, DTDs, processing instructions,
+DRM, alternate adaptations/representations and unsupported addressing/timing
+attributes fail explicitly. This is a declared subset of
+[DASH addressing](https://dashif.org/Guidelines-TimingModel/), not a complete MPD
+implementation: `SegmentTemplate`, `SegmentTimeline`, `BaseURL`, dynamic
+availability clocks, MPD Patch and DRM remain open.
+
+`dash_live.Reader(httpx)` reuses authenticated origin-pinned HTTP, exact ranges,
+shared admission, transactional snapshot reload and retry-safe fMP4 ingestion.
+It returns owned segments and packet leases. A production HTTP fixture verifies
+MPD → initialization → fragment ingestion with authentication on every request.
+It is a library API; grouped model requests still accept owned MP4/MOV bytes.

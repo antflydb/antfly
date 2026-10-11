@@ -90,5 +90,29 @@
   "long-metal-positions.json": {
     "artifact_sha256": "368b51b179b92b855ef6b7d08b09205ccd9402b39d6d61ef2e565bd9dfd9f57f",
     "original_report_sha256": "368b51b179b92b855ef6b7d08b09205ccd9402b39d6d61ef2e565bd9dfd9f57f"
+  },
+  "metal-pretrained-composition.json": {
+    "artifact_sha256": "f7e70b69170a1ec4c59ddc83474525754d99f5d15ad7b785203b899cb198819e",
+    "original_report_sha256": "f7e70b69170a1ec4c59ddc83474525754d99f5d15ad7b785203b899cb198819e"
+  },
+  "native-pretrained-composition.json": {
+    "artifact_sha256": "e2a88a2a7ebed29107864d3ae369d09759740b2734ddf091eef1b2cc471f5261",
+    "original_report_sha256": "e2a88a2a7ebed29107864d3ae369d09759740b2734ddf091eef1b2cc471f5261"
+  },
+  "metal-real-composition.json": {
+    "artifact_sha256": "3d7cdabd67f74e06c6733b902c92876dcb99049c9bee4e3f1d6fb72e5b9e6605",
+    "original_report_sha256": "3d7cdabd67f74e06c6733b902c92876dcb99049c9bee4e3f1d6fb72e5b9e6605"
+  },
+  "long-metal-composition.json": {
+    "artifact_sha256": "181ce7f813d82a516f18a22ad6671cce0d1bad273019688168d703b90df0d8d5",
+    "original_report_sha256": "181ce7f813d82a516f18a22ad6671cce0d1bad273019688168d703b90df0d8d5"
+  },
+  "metal-composition-unit.json": {
+    "artifact_sha256": "66bd28bc78bbfb52f947b4aa2e5aa2a1eddb9a3fa83f4005f606d27ae8aac2c6",
+    "original_report_sha256": "66bd28bc78bbfb52f947b4aa2e5aa2a1eddb9a3fa83f4005f606d27ae8aac2c6"
+  },
+  "composition-gates.json": {
+    "artifact_sha256": "af8d5a1d95e9790f1d2a94c08fd09fbd53397616361f00a8476ef9f7dca4f05c",
+    "original_report_sha256": "af8d5a1d95e9790f1d2a94c08fd09fbd53397616361f00a8476ef9f7dca4f05c"
   }
 }

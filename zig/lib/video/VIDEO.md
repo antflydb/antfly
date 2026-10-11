@@ -5,7 +5,7 @@ benchmarks and the qualified pure Zig H.264 subset are implemented. Latest main
 (PR #1014) is merged as of 2026-10-09. EmbeddingGemma 2 ordered video groups now
 use native decode/CPU preparation or VideoToolbox/Metal preparation and the merged
 native/Metal vision and text encoders. Completed Metal patch buffers enter inference
-directly; existing projector/token composition host boundaries remain. Six pretrained
+directly; Metal video projection, token composition and backbone input remain on the device. Final vector normalization retains a host boundary. Six pretrained
 F32 video cases qualify native CPU and Metal numerical parity under the declared
 RGB decoder policy. A real-clip reference-preservation campaign also executes on
 macOS CPU/Metal and actual Linux ARM64; resident vision/backbone optimization
@@ -805,8 +805,9 @@ retention and before inference pooling/reuse; cancellation and failure release b
 The model admission covers request preprocessing and workspace before decode.
 Video patch projection, learned-position addition, Q/K/V normalization, vision
 RoPE, spatial pooling and active-token sequence mean pooling execute on Metal.
-Projected token composition/backbone inputs and final vector normalization retain
-host boundaries; this adapter does not claim an entirely resident model.
+Projected video tokens are composed with text and other media using device
+concatenation and typed row gathering, and enter the backbone directly. Final
+vector normalization retains a host boundary; this adapter does not claim an entirely resident model.
 
 The HTTP grouped form accepts `media` or binary `attachment` with `video/mp4` or
 `video/quicktime`; existing Go/Python/TypeScript media contracts carry these MIME bytes.
@@ -914,3 +915,52 @@ compare both host and device paths to right-aligned CPU samples, cover rotations
 and ranges, and release producer buffers/textures before GPU completion.
 Compressed CoreVideo formats and HDR tone mapping remain unsupported. This does
 not change VideoToolbox codec/profile qualification.
+
+
+## Resident token composition and overlapped projection
+
+The video projector exposes an owned tensor result. Metal captures retain one
+projection per unique selected packet and compose repeated frames in presentation
+order without soft-token readback. Ordered text/image/audio/video composition
+validates marker counts and IDs, scales text on device, concatenates projected
+media rows, and gathers the final sequence using bounded i32 row indices. Existing
+host image/audio projections can upload into that table. The final device tensor
+enters the joint language backbone; CPU and raster-batch APIs preserve their
+existing host contracts. A real Metal test compares mixed composition with the
+host reference and asserts zero additional host-mirror downloads.
+
+A request-local worker exclusively owns projection/backend operations while the
+producer decodes and submits subsequent preparations. Two preparations can queue
+behind one executing projection; the producer can additionally hold one prepared
+submission while blocked. Admission reserves three additional 128 MiB preparation
+slots before any decode. Duplicates reuse the owner projection; all presentation
+slots are populated after joining the worker. Failure closes the queue, wakes a
+blocked producer, drains GPU leases and joins before backend/allocator teardown.
+This implements decode/preparation/projection overlap, not batched vision
+attention or concurrent backbone execution. Pretrained and sustained-load gates
+must qualify every rebuilt production binary; helper results alone are insufficient.
+
+`sampling.presentation` accepts logical picture IDs and timestamp durations,
+selects the most recent active picture at each cadence, and exposes explicit
+skip/hold-gap and collapse/preserve-repeat policies. It handles reordered metadata,
+VFR and windows beginning inside a picture. Callers must supply logical pictures;
+it does not itself derive them from PAFF/partition packets. The pinned model's
+existing index/FPS sampling policy remains separate.
+
+`display.layout` explicitly chooses coded pixels or presentation geometry.
+Presentation mode handles orthogonal quarter-turn matrices, translations and
+non-square pixel aspect ratios with bounded square-pixel dimensions. Perspective,
+shear, reflection and arbitrary rotations fail. Preparation already handles these
+rotations; this geometry API does not qualify HDR tone mapping or broaden the
+model adapter's default unrotated square-pixel SDR policy.
+
+Still open: batched frame-independent vision/projector execution, final device
+normalization, logical field/partition indexing in the model adapter, model-level
+VFR/display/HDR qualification, VP8 interframes, and pure Zig VP9/AV1 decoding.
+
+
+The rebuilt production CPU and Metal routes pass all six pretrained cases,
+128-dimensional output, admission retry and corrupted-frame cleanup/retry. Fresh
+Metal short/long-clip campaigns preserve pinned PyTorch vectors and scores;
+the short corpus preserves all four exact rankings/top-k sets. See the
+[composition and scheduling receipts](testdata/video-retrieval-validation.md#device-composition-and-projection-scheduling-continuation).

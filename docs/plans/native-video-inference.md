@@ -478,5 +478,31 @@ The position table uses a local flattened row view that preserves model ownershi
 selected packed BF16/F16 rows use native kernels. Device/model-owned F32 and packed
 BF16 fixtures pass with unchanged weight shapes and no intermediate host-mirror
 downloads. The rebuilt production route passes all six pretrained cases and the
-real-clip score/ranking/top-k gates. Frame/projector batching, final projected-token
-composition and final normalization still need implementation.
+real-clip score/ranking/top-k gates. Frame/projector batching and final normalization still need implementation;
+projected-token composition is delivered by the continuation below.
+
+
+### Resident composition and scheduling continuation
+
+Implemented owned video projection tensors and Metal composition of the ordered
+text/media sequence, with repeated sampled-frame reuse and direct joint-backbone
+inputs. A device mixed-media regression verifies host-reference values without
+intermediate tensor downloads. A bounded worker overlaps selected-frame decoding
+and preparation with projection; two queue slots, one executing projection and one
+producer-held submission have explicit teardown and an additional admitted
+384 MiB preparation ceiling. CPU/raster-batch host contracts remain supported.
+
+Portable APIs now expose duration-based logical-picture sampling with explicit
+gap/repeat policies and orthogonal display/SAR geometry. These do not broaden the
+pinned model processor policy or establish field/partition indexing automatically.
+Native authenticated DASH ingestion now supports static single-representation
+fMP4 `SegmentList` MPDs, with ranges and clocks, through the shared HTTP/live
+fragment state machine. Templates/timelines, dynamic availability, representation
+selection and other DASH extensions remain work.
+
+Next required implementation: frame-independent batched vision/projector
+execution, device final normalization, qualified model display/VFR/logical-picture
+policies, broader DASH addressing/live timing, VP8 interframes and pure Zig VP9/AV1
+reconstruction. No VP-family interframe decoder is advertised by the new transport
+or sampling APIs. New end-to-end receipts must bind the rebuilt binary and full
+vectors; existing receipts continue to qualify their own earlier binaries.

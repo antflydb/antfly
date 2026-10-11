@@ -30,6 +30,11 @@ fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
 /// bounded request; the caller's scheduler waits between reloads. next() returns
 /// an independently owned immutable segment; epochs require a decoder reset.
 pub fn Reader(comptime http: type) type {
+    return ReaderWithManifest(http, hls);
+}
+
+/// Shared authenticated fMP4 transport/epoch/retry state machine.
+pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) type {
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
@@ -61,7 +66,7 @@ pub fn Reader(comptime http: type) type {
             try self.transport.control.check();
             var body = try self.transport.fetch(self.url, self.url, null, self.options.playlist.max_bytes);
             errdefer body.deinit();
-            var parsed = try hls.parse(self.allocator, body.bytes, self.options.playlist);
+            var parsed = try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
             errdefer parsed.deinit();
             if (self.playlist) |previous| {
                 if (parsed.target_duration_seconds != previous.target_duration_seconds) return error.SourceVersionChanged;

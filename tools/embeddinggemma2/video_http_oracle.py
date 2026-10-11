@@ -114,6 +114,53 @@ def run(args):
                         truncated, [x / denominator for x in vector[:128]]
                     )
                     report["http_128_dimensions"] = "pass"
+                if args.verify_decode_retry and case["name"] == "mjpeg_video":
+                    # This verified fixture contains one JPEG SOI per container
+                    # sample. Break the second selected picture after a valid
+                    # first preparation can have entered the projection queue.
+                    broken = bytearray(
+                        (args.oracle.parent / case["videos"][0]).read_bytes()
+                    )
+                    starts = [
+                        i
+                        for i in range(len(broken) - 1)
+                        if broken[i : i + 2] == b"\xff\xd8"
+                    ]
+                    asset = next(
+                        item
+                        for item in oracle["assets"]
+                        if item["path"] == case["videos"][0]
+                    )
+                    selected = case["selected_frames"][0]
+                    if (
+                        len(starts) != asset["frames"]
+                        or len(selected) < 2
+                        or selected[1] <= selected[0]
+                    ):
+                        raise ValueError(
+                            "decode retry requires the pinned progressive MJPEG fixture"
+                        )
+                    position = starts[selected[1]]
+                    broken[position : position + 2] = b"\x00\x00"
+                    broken_content = [
+                        dict(content[0], data=base64.b64encode(broken).decode())
+                    ]
+                    malformed = dict(body, input=[dict(content=broken_content)])
+                    try:
+                        compare.post(url + "/ai/v1", "/embed", malformed)
+                    except urllib.error.HTTPError as error:
+                        if error.code != 400:
+                            raise AssertionError(
+                                "a malformed decoded frame must return HTTP 400"
+                            ) from error
+                        report["decode_failure"] = video_compare.failure_details(error)
+                    else:
+                        raise AssertionError("corrupted selected JPEG was accepted")
+                    retry = compare.post(url + "/ai/v1", "/embed", body)
+                    report["decode_failure_retry"] = compare.assert_agreement(
+                        retry["data"][0]["embedding"], case["embedding"]
+                    )
+                    report["decode_failure_frame"] = selected[1]
                 compare.publish(args.output, report)
                 print(case["name"], elapsed, flush=True)
         report["scope"] = (
@@ -161,7 +208,14 @@ def main():
         action="store_true",
         help="Inject one execution admission denial and require HTTP 503/Retry-After before retrying the pinned case",
     )
+    p.add_argument(
+        "--verify-decode-retry",
+        action="store_true",
+        help="Corrupt the second selected MJPEG frame, require HTTP 400 and verify a clean retry",
+    )
     args = p.parse_args()
+    if args.verify_decode_retry and args.case not in (None, "mjpeg_video"):
+        p.error("--verify-decode-retry requires the MJPEG case")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     run(args)
 

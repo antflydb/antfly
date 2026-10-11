@@ -189,7 +189,14 @@ int32_t av_prepared_copy(void *p, float *out, size_t count) {
     if (av_prepared_poll(p) != 1 || count > result.output.length / sizeof(float)) return -1;
     memcpy(out, result.output.contents, count * sizeof(float)); return 0;
 }
-void av_prepared_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
+void av_prepared_destroy(void *p) {
+    if (p) {
+        AVPrepared *result = (__bridge_transfer AVPrepared *)p;
+        // Destruction fences even abandoned/canceled jobs. Their admission
+        // must not be released while the command still owns staging/resources.
+        [result.command waitUntilCompleted];
+    }
+}
 
 double av_prepared_gpu_seconds(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;

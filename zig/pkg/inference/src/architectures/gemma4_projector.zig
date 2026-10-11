@@ -367,7 +367,16 @@ pub fn encodeEmbeddingGemma2VideoPatches(cb: *const ComputeBackend, allocator: s
 }
 
 /// Device tensors can enter the patch projection without a prepared-pixel readback.
-pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: @import("../ops/ops.zig").CT, width: u32, height: u32) !EncodedImage {
+pub const EncodedDeviceImage = struct { tensor: CT, tokens: usize };
+
+pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32) !EncodedImage {
+    const result = try encodeEmbeddingGemma2VideoTensorResident(cb, allocator, input, width, height);
+    defer cb.free(result.tensor);
+    return .{ .embeddings = try cb.toFloat32(result.tensor, allocator), .tokens = result.tokens };
+}
+
+/// Returns an owned projected tensor without a Metal soft-token readback.
+pub fn encodeEmbeddingGemma2VideoTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: @import("../ops/ops.zig").CT, width: u32, height: u32) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
@@ -383,11 +392,14 @@ pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: st
         const positions = try store.weightCt("v.position_embd.weight");
         defer cb.free(positions);
         const positioned = try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
-        return encodePositionedTensor(cb, allocator, &store, cfg, positioned, g);
+        return encodePositionedTensorResident(cb, allocator, &store, cfg, positioned, g);
     }
     const data = try cb.toFloat32(projected, allocator);
     defer allocator.free(data);
-    return encodePositionedPatches(cb, allocator, &store, cfg, data, g);
+    const positioned = try addPositionEmbeddings(allocator, &store, cfg, data, g);
+    defer allocator.free(positioned);
+    const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
+    return encodePositionedTensorResident(cb, allocator, &store, cfg, hidden, g);
 }
 
 /// One image marker pair plus the tokenizer's BOS/EOS tokens.
@@ -1272,6 +1284,13 @@ fn encodePositionedPatches(cb: *const ComputeBackend, allocator: std.mem.Allocat
 
 /// Takes ownership of the positioned patch tensor, including on error.
 fn encodePositionedTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry) !EncodedImage {
+    const result = try encodePositionedTensorResident(cb, allocator, store, cfg, positioned, geometry);
+    defer cb.free(result.tensor);
+    return .{ .embeddings = try cb.toFloat32(result.tensor, allocator), .tokens = result.tokens };
+}
+
+/// Takes ownership of positioned; returns an independently owned projection.
+fn encodePositionedTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry) !EncodedDeviceImage {
     var hidden = positioned;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
@@ -1308,11 +1327,11 @@ fn encodePositionedTensor(cb: *const ComputeBackend, allocator: std.mem.Allocato
     const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed_pooled, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
-    defer cb.free(projected);
+    errdefer cb.free(projected);
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
-        .embeddings = try cb.toFloat32(projected, allocator),
+        .tensor = projected,
         .tokens = geometry.tokenCount(),
     };
 }

@@ -460,6 +460,8 @@ pub const Prepared = struct {
         if (av_prepared_copy(self.handle, values.ptr, values.len) != 0) return error.MetalPreparationNotReady;
         return values;
     }
+    /// Fences an outstanding command before releasing resources, including on
+    /// cancellation, so the owner can safely release its admission afterwards.
     pub fn deinit(self: *Prepared) void {
         if (supported) av_prepared_destroy(self.handle);
         self.* = undefined;

@@ -34,7 +34,8 @@ pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
 pub const Options = struct { task_type: []const u8 = "RETRIEVAL_DOCUMENT", dimensions: usize = 768 };
 pub const Result = struct { vector: []f32, input_tokens: usize };
 
-const SoftTokens = struct { id: i64, embeddings: []f32, tokens: usize };
+const CT = @import("../ops/ops.zig").CT;
+const SoftTokens = struct { id: i64, embeddings: []f32, tokens: usize, tensor: ?CT = null };
 
 /// Keep live workspace accounting independent of the platform allocator. On
 /// macOS libc reuses large CPU buffers instead of remapping them per operation.
@@ -58,8 +59,10 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     const cfg = factory.getEmbeddingGemma2Config(session) orelse return error.UnsupportedEmbeddingGemma2Backend;
     try validateGroup(group, options);
     var input_bytes: usize = 0;
+    var has_video = false;
     for (group.content) |part| {
         input_bytes = std.math.add(usize, input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
+        has_video = has_video or part == .video;
         switch (part) {
             .text => {},
             .image, .raster, .video => if (!cfg.vision) return error.NoVisionSession,
@@ -70,7 +73,9 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     try effective.check();
     // Reserve the maximum encoder sequence and a bounded media preprocessing
     // working set before decoding or allocating any projected soft tokens.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) 768 * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    // Metal video also charges three 128 MiB preparation slots: two queued
+    // and the producer submission that can block behind them.
+    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 1152) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
@@ -81,15 +86,14 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     defer prepared.deinit(a);
     const count = prepared.ids.len;
     const mask = prepared.mask;
-    const embeddings = prepared.embeddings orelse {
+    if (prepared.embeddings == null and prepared.tensor == null) {
         const vector = try preparedText(cb, a, cfg, prepared.ids, mask, options.dimensions);
         errdefer a.free(vector);
         try effective.check();
         return .{ .vector = vector, .input_tokens = count };
-    };
-    const host = try cb.fromFloat32Shape(embeddings, &.{ @intCast(count), 512 });
-    const input = try cb.ensureDeviceResidentOwned(host);
-    defer cb.free(input);
+    }
+    const input = prepared.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(prepared.embeddings.?, &.{ @intCast(count), 512 }));
+    defer if (prepared.tensor == null) cb.free(input);
     const output = try encoder.forwardEmbeddingsCT(cb, a, cfg, input, mask, 1, count);
     defer cb.free(output);
     if (cb.kind() == .metal) {
@@ -116,11 +120,14 @@ const PreparedGroup = struct {
     ids: []i64,
     mask: []i64,
     embeddings: ?[]f32,
+    tensor: ?CT = null,
+    backend: ?*const ComputeBackend = null,
 
     fn deinit(self: PreparedGroup, a: std.mem.Allocator) void {
         a.free(self.ids);
         a.free(self.mask);
         if (self.embeddings) |embeddings| a.free(embeddings);
+        if (self.tensor) |tensor| self.backend.?.free(tensor);
     }
 };
 
@@ -143,7 +150,10 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
     }
     var media = std.ArrayListUnmanaged(SoftTokens).empty;
     defer {
-        for (media.items) |item| a.free(item.embeddings);
+        for (media.items) |item| {
+            a.free(item.embeddings);
+            if (item.tensor) |tensor| cb.free(tensor);
+        }
         media.deinit(a);
     }
     var media_tokens: usize = 0;
@@ -156,8 +166,12 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
                 const encoded = try @import("embedding_gemma2_video.zig").encode(a, cb, bytes, effective);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
-                errdefer if (owned) a.free(encoded.embeddings);
-                const count_video = encoded.embeddings.len / 512;
+                errdefer if (owned) {
+                    a.free(encoded.embeddings);
+                    if (encoded.tensor) |tensor| cb.free(tensor);
+                };
+                var count_video: usize = 0;
+                for (encoded.frame_tokens) |frame_count| count_video += frame_count;
                 media_tokens = std.math.add(usize, media_tokens, count_video) catch return error.EmbeddingInputTooLong;
                 if (media_tokens > 8192) return error.EmbeddingInputTooLong;
                 // Tokenize with the validated image placeholder, then rewrite its
@@ -168,7 +182,7 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
                     for (0..count_frame) |_| try rendered.appendSlice(a, "<|image|>");
                     try rendered.appendSlice(a, "<image|>");
                 }
-                try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video });
+                try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video, .tensor = encoded.tensor });
                 owned = false;
             },
             .image, .audio, .raster => {
@@ -213,11 +227,63 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
     defer cb.free(ew);
     const raw = try cb.embeddingLookup(ew, ids, count, 512);
     defer cb.free(raw);
+    // Raster batching retains its existing host packing contract. Groups with
+    // resident video tokens compose the entire ordered sequence on the device.
+    for (media.items) |item| if (item.tensor != null) {
+        const composed = try composeDeviceTokens(a, cb, raw, ids, media.items);
+        return .{ .ids = ids, .mask = mask, .embeddings = null, .tensor = composed, .backend = cb };
+    };
     const embeddings = try cb.toFloat32(raw, a);
     errdefer a.free(embeddings);
     for (embeddings) |*value| value.* *= @sqrt(@as(f32, 512));
     try overlayMedia(ids, embeddings, media.items);
     return .{ .ids = ids, .mask = mask, .embeddings = embeddings };
+}
+
+/// Validates marker ordering and builds rows into [text; media], rewriting video
+/// IDs only after the original tokenizer IDs have been looked up.
+fn compositionRows(a: std.mem.Allocator, ids: []i64, media: []const SoftTokens) ![]i32 {
+    const rows = try a.alloc(i32, ids.len);
+    errdefer a.free(rows);
+    var media_index: usize = 0;
+    var soft_index: usize = 0;
+    var offset = ids.len;
+    for (ids, 0..) |id, row| {
+        rows[row] = std.math.cast(i32, row) orelse return error.InvalidTensorShape;
+        if (id != 258880 and id != 258881) continue;
+        if (media_index >= media.len) return error.InvalidEmbeddingGroup;
+        const item = media[media_index];
+        if (item.tokens == 0 or id != (if (item.id == 258884) @as(i64, 258880) else item.id)) return error.InvalidEmbeddingGroup;
+        rows[row] = std.math.cast(i32, offset + soft_index) orelse return error.InvalidTensorShape;
+        if (item.id == 258884) ids[row] = 258884;
+        soft_index += 1;
+        if (soft_index == item.tokens) {
+            offset += item.tokens;
+            soft_index = 0;
+            media_index += 1;
+        }
+    }
+    if (media_index != media.len or soft_index != 0) return error.InvalidEmbeddingGroup;
+    return rows;
+}
+
+fn composeDeviceTokens(a: std.mem.Allocator, cb: *const ComputeBackend, text: CT, ids: []i64, media: []const SoftTokens) !CT {
+    const rows = try compositionRows(a, ids, media);
+    defer a.free(rows);
+    var table = (try cb.multiplyScalar(text, @sqrt(@as(f32, 512)))) orelse return error.EmbeddingGemma2OperationUnavailable;
+    defer cb.free(table);
+    var count = ids.len;
+    for (media) |item| {
+        const tensor = item.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(item.embeddings, &.{ @intCast(item.tokens), 512 }));
+        defer if (item.tensor == null) cb.free(tensor);
+        const next = try cb.primConcatPrim(table, tensor, 0, &.{ @intCast(count), 512 }, &.{ @intCast(item.tokens), 512 });
+        cb.free(table);
+        table = next;
+        count += item.tokens;
+    }
+    const indices = (try cb.fromInt32Shape(rows, &.{@intCast(rows.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+    defer cb.free(indices);
+    return cb.primGather(table, indices, 0, &.{ @intCast(count), 512 });
 }
 
 fn overlayMedia(ids: []i64, embeddings: []f32, media: []const SoftTokens) !void {
@@ -556,4 +622,77 @@ test "embeddinggemma2 video rows preserve image audio and frame ordering" {
 
 test {
     _ = @import("embedding_gemma2_video.zig");
+}
+
+test "embeddinggemma2 device composition rows preserve mixed media and reject partial markers" {
+    const a = std.testing.allocator;
+    var ids = [_]i64{ 2, 258880, 258880, 3, 258881, 258880, 258880 };
+    const media = [_]SoftTokens{
+        .{ .id = 258880, .embeddings = &.{}, .tokens = 2 },
+        .{ .id = 258881, .embeddings = &.{}, .tokens = 1 },
+        .{ .id = 258884, .embeddings = &.{}, .tokens = 2 },
+    };
+    const rows = try compositionRows(a, &ids, &media);
+    defer a.free(rows);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 7, 8, 3, 9, 10, 11 }, rows);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 258880, 258880, 3, 258881, 258884, 258884 }, &ids);
+    var partial = [_]i64{258880};
+    try std.testing.expectError(error.InvalidEmbeddingGroup, compositionRows(a, &partial, media[0..1]));
+    var wrong = [_]i64{258881};
+    try std.testing.expectError(error.InvalidEmbeddingGroup, compositionRows(a, &wrong, media[0..1]));
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var sequence = [_]i64{ 2, 258880 };
+            const mapped = try compositionRows(allocator, &sequence, &.{.{ .id = 258884, .tokens = 1, .embeddings = &.{} }});
+            defer allocator.free(mapped);
+        }
+    }.run, .{});
+}
+
+test "embeddinggemma2 Metal device composition preserves ordered tokens without downloads" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const metal = @import("../ops/metal_compute.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try metal.MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    const text_values = try a.alloc(f32, 6 * 512);
+    defer a.free(text_values);
+    for (text_values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 29)) * 0.01;
+    var image: [512]f32 = @splat(0.25);
+    var audio: [512]f32 = @splat(-0.5);
+    var video: [2 * 512]f32 = undefined;
+    @memset(video[0..512], 0.75);
+    @memset(video[512..], -0.125);
+    const text = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(text_values, &.{ 6, 512 }));
+    defer cb.free(text);
+    const projected = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&video, &.{ 2, 512 }));
+    defer cb.free(projected);
+    const media = [_]SoftTokens{
+        .{ .id = 258880, .tokens = 1, .embeddings = &image },
+        .{ .id = 258884, .tokens = 2, .embeddings = &video, .tensor = projected },
+        .{ .id = 258881, .tokens = 1, .embeddings = &audio },
+    };
+    var ids = [_]i64{ 2, 258880, 258880, 258880, 258881, 3 };
+    const expected = try a.dupe(f32, text_values);
+    defer a.free(expected);
+    for (expected) |*value| value.* *= @sqrt(@as(f32, 512));
+    var expected_ids = ids;
+    try overlayMedia(&expected_ids, expected, &media);
+    const before = cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes;
+    const result = try composeDeviceTokens(a, &cb, text, &ids, &media);
+    defer cb.free(result);
+    try std.testing.expectEqual(before, cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes);
+    try std.testing.expectEqualSlices(i64, &expected_ids, &ids);
+    const actual = try cb.toFloat32(result, a);
+    defer a.free(actual);
+    for (actual, expected) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-6);
 }

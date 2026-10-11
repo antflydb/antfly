@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const media = @import("antfly_media");
 pub const Overflow = enum { uniform, truncate };
@@ -98,4 +111,62 @@ test "native timestamp selection respects reordered PTS, gaps and half-open inte
     const selected = try timestamps(std.testing.allocator, &packets, .{ .start = 0, .end = 3 }, 1, 3, .{});
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, selected);
+}
+
+/// Logical picture metadata, independent of packet/slice/field transport. The
+/// decoder/indexer supplies one entry for each displayed picture.
+pub const Picture = struct { id: usize, pts: i64, duration: u64 };
+pub const GapPolicy = enum { skip, hold_previous };
+pub const PresentationOptions = struct {
+    step: u64,
+    max_output: usize = 4096,
+    gaps: GapPolicy = .skip,
+    preserve_repeats: bool = false,
+};
+
+/// Samples pictures active at each timestamp, including one starting before the
+/// window. Unlike timestamps(), this never selects a future frame across a gap.
+/// Unsorted input and overlapping durations are valid; the most recent active
+/// picture wins, with stable input order resolving equal timestamps.
+pub fn presentation(allocator: std.mem.Allocator, pictures: []const Picture, interval: Interval, options: PresentationOptions, control: media.source.Control) ![]usize {
+    if (interval.end <= interval.start or options.step == 0 or options.max_output == 0) return error.InvalidSamplingPolicy;
+    const span: u128 = @intCast(@as(i128, interval.end) - interval.start);
+    if ((span + options.step - 1) / options.step > options.max_output) return error.ResourceLimitExceeded;
+    for (pictures) |picture| if (picture.duration == 0) return error.InvalidSamplingMetadata;
+    var output: std.ArrayList(usize) = .empty;
+    errdefer output.deinit(allocator);
+    var target: i128 = interval.start;
+    while (target < interval.end) : (target += options.step) {
+        try control.check();
+        var active: ?usize = null;
+        var previous: ?usize = null;
+        for (pictures, 0..) |picture, i| {
+            if (i % 256 == 0) try control.check();
+            if (picture.pts > target) continue;
+            if (previous == null or picture.pts > pictures[previous.?].pts) previous = i;
+            if (target >= @as(i128, picture.pts) + picture.duration) continue;
+            if (active == null or picture.pts > pictures[active.?].pts) active = i;
+        }
+        const chosen = active orelse if (options.gaps == .hold_previous) previous orelse continue else continue;
+        const id = pictures[chosen].id;
+        if (options.preserve_repeats or output.items.len == 0 or output.items[output.items.len - 1] != id) try output.append(allocator, id);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+test "presentation sampling handles VFR gaps overlapping pictures and repeated cadence" {
+    const a = std.testing.allocator;
+    const pictures = [_]Picture{
+        .{ .id = 12, .pts = 8, .duration = 2 },
+        .{ .id = 10, .pts = 0, .duration = 4 },
+        .{ .id = 11, .pts = 2, .duration = 1 },
+    };
+    const skipped = try presentation(a, &pictures, .{ .start = 1, .end = 10 }, .{ .step = 1 }, .{});
+    defer a.free(skipped);
+    try std.testing.expectEqualSlices(usize, &.{ 10, 11, 10, 12 }, skipped);
+    const held = try presentation(a, &pictures, .{ .start = 1, .end = 10 }, .{ .step = 1, .gaps = .hold_previous, .preserve_repeats = true }, .{});
+    defer a.free(held);
+    try std.testing.expectEqualSlices(usize, &.{ 10, 11, 10, 11, 11, 11, 11, 12, 12 }, held);
+    try std.testing.expectError(error.ResourceLimitExceeded, presentation(a, &pictures, .{ .start = std.math.minInt(i64), .end = std.math.maxInt(i64) }, .{ .step = 1 }, .{}));
+    try std.testing.expectError(error.InvalidSamplingMetadata, presentation(a, &.{.{ .id = 0, .pts = 0, .duration = 0 }}, .{ .start = 0, .end = 1 }, .{ .step = 1 }, .{}));
 }

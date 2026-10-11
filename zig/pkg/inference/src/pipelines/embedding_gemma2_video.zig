@@ -18,15 +18,19 @@ const std = @import("std");
 const media = @import("antfly_media");
 const video = @import("antfly_video");
 const projector = @import("../architectures/gemma4_projector.zig");
+const CT = @import("../ops/ops.zig").CT;
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const build_options = @import("build_options");
 const MetalCompute = @import("../ops/metal_compute.zig").MetalCompute;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Encoded = struct {
     embeddings: []f32,
+    tensor: ?CT = null,
+    backend: ?*const ComputeBackend = null,
     frame_tokens: []usize,
     pub fn deinit(self: Encoded, a: std.mem.Allocator) void {
         a.free(self.embeddings);
+        if (self.tensor) |tensor| self.backend.?.free(tensor);
         a.free(self.frame_tokens);
     }
 };
@@ -145,7 +149,7 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     const frame_tokens = try a.alloc(usize, selected.len);
     errdefer a.free(frame_tokens);
     @memset(frame_tokens, 0);
-    const output = try a.alloc(f32, selected.len * 140 * 512);
+    const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else selected.len * 140 * 512);
     defer a.free(output);
     var signal = video.h264.Color{};
     if (reader.track.codec == .avc and !reader.track.inband_parameter_sets) {
@@ -158,29 +162,51 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
         if (cb.kind() == .metal) preparer = try video.preparation.Metal.init(try MetalCompute.videoDevice(cb));
     }
     defer if (preparer) |*value| value.deinit();
-    var capture = Capture{ .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = reader.track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
-    if (reader.track.codec == .mjpeg) {
-        for (selected, 0..) |index, slot| {
-            try source.control.check();
-            if (capture.copyDuplicate(slot)) continue;
-            var frame = try video.mjpeg.decodeFrame(a, &reader, index, .{});
-            defer frame.deinit();
-            const options = try policy(reader.track, frame.width, frame.height);
-            if (capture.metal) |metal| {
-                const prepared = try metal.submitRgba(a, frame.rgba, frame.width, frame.height, options, source.control);
-                try capture.projectGpu(slot, prepared, options);
-                continue;
-            }
-            const patches = try video.preparation.referenceRgba(a, frame.rgba, frame.width, frame.height, options, source.control);
-            defer a.free(patches);
-            try capture.project(slot, patches, options);
+    const resident = if (cb.kind() == .metal) try a.alloc(?CT, selected.len) else null;
+    defer if (resident) |tensors| {
+        for (tensors) |tensor| if (tensor) |value| cb.free(value);
+        a.free(tensors);
+    };
+    if (resident) |tensors| @memset(tensors, null);
+    var capture = Capture{ .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = reader.track, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var jobs: [2]ProjectionJob = undefined;
+    var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
+    var projection_thread: ?std.Thread = null;
+    if (resident != null) {
+        if (capture.io == null) return error.MissingVideoIo;
+        capture.scheduler = &scheduler;
+        projection_thread = try std.Thread.spawn(.{}, ProjectionScheduler.run, .{&scheduler});
+    }
+    defer if (projection_thread) |thread| {
+        scheduler.aborted.store(true, .release);
+        scheduler.queue.close(capture.io.?);
+        thread.join();
+    };
+    const decode_error: ?anyerror = if (decodeSelection(a, &reader, selected, configurations, &capture)) |_| null else |err| err;
+    if (decode_error != null) scheduler.aborted.store(true, .release);
+    if (projection_thread) |thread| {
+        scheduler.queue.close(capture.io.?);
+        thread.join();
+        projection_thread = null;
+        if (scheduler.failure) |err| return err;
+    }
+    if (decode_error) |err| return err;
+    if (resident) |tensors| {
+        // Each unique packet owns exactly one projection. Presentation duplicates
+        // refer to that projection and are appended in sampling order.
+        const first = std.mem.indexOfScalar(usize, selected, selected[0]).?;
+        var combined = try cb.ensureDeviceResidentOwned(try cb.primReshape(tensors[first] orelse return error.InvalidTensorShape, &.{ @intCast(frame_tokens[0]), 512 }));
+        errdefer cb.free(combined);
+        var rows = frame_tokens[0];
+        for (selected[1..], 1..) |index, slot| {
+            const owner = std.mem.indexOfScalar(usize, selected, index).?;
+            if (frame_tokens[slot] == 0) return error.InvalidTensorShape;
+            const next = try cb.primConcatPrim(combined, tensors[owner] orelse return error.InvalidTensorShape, 0, &.{ @intCast(rows), 512 }, &.{ @intCast(frame_tokens[slot]), 512 });
+            cb.free(combined);
+            combined = next;
+            rows += frame_tokens[slot];
         }
-    } else if (capture.metal != null and !reader.track.inband_parameter_sets and compatibleApple(reader.track.avcc)) {
-        var batch = try video.apple.decodeTo(a, &reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = &capture, .accept = Capture.publishApple });
-        defer batch.deinit();
-    } else {
-        // Decode references once for the whole selection, never once per frame.
-        if (configurations) |session| _ = try session.decodeSelected(selected, &capture, Capture.publish) else _ = try video.h264_sparse.decodeSelected(a, &reader, selected, .{ .max_total_packets = 8192 }, &capture, Capture.publish);
+        return .{ .embeddings = try a.alloc(f32, 0), .tensor = combined, .backend = cb, .frame_tokens = frame_tokens };
     }
     // Callbacks arrive in decode order; compact in presentation slot order.
     var count: usize = 0;
@@ -192,31 +218,101 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     }
     return .{ .embeddings = try a.dupe(f32, output[0..count]), .frame_tokens = frame_tokens };
 }
+fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
+    const control = reader.input.control;
+    if (reader.track.codec == .mjpeg) {
+        for (selected, 0..) |index, slot| {
+            try control.check();
+            if (capture.copyDuplicate(slot)) continue;
+            var frame = try video.mjpeg.decodeFrame(a, reader, index, .{});
+            defer frame.deinit();
+            const options = try policy(reader.track, frame.width, frame.height);
+            if (capture.metal) |metal| {
+                const prepared = try metal.submitRgba(a, frame.rgba, frame.width, frame.height, options, control);
+                try capture.projectGpu(slot, prepared, options);
+                continue;
+            }
+            const patches = try video.preparation.referenceRgba(a, frame.rgba, frame.width, frame.height, options, control);
+            defer a.free(patches);
+            try capture.project(slot, patches, options);
+        }
+    } else if (capture.metal != null and !reader.track.inband_parameter_sets and compatibleApple(reader.track.avcc)) {
+        var batch = try video.apple.decodeTo(a, reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = capture, .accept = Capture.publishApple });
+        defer batch.deinit();
+    } else {
+        // Decode references once for the whole selection, never once per frame.
+        if (configurations) |session| _ = try session.decodeSelected(selected, capture, Capture.publish) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publish);
+    }
+}
+
 fn compatibleApple(avcc: []const u8) bool {
     video.avc.validateConfig(avcc) catch return false;
     return true;
 }
+const ProjectionJob = struct { slot: usize, prepared: video.preparation.Prepared, options: video.preparation.Options };
+
+/// Two queued preparations plus one executing projection. The producer owns
+/// decoding/preparation; this worker exclusively owns model backend operations.
+/// Closing on failure wakes blocked producers; every queued GPU lease is drained.
+const ProjectionScheduler = struct {
+    queue: std.Io.Queue(ProjectionJob),
+    capture: *Capture,
+    aborted: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    fn run(self: *ProjectionScheduler) void {
+        const capture = self.capture;
+        const io = capture.io.?;
+        while (true) {
+            var job = self.queue.getOneUncancelable(io) catch break;
+            if (self.aborted.load(.acquire) or self.failure != null) {
+                job.prepared.deinit();
+                continue;
+            }
+            capture.projectGpuNow(job.slot, job.prepared, job.options) catch |err| {
+                self.failure = err;
+                self.queue.close(io);
+                continue;
+            };
+            for (capture.selected, 0..) |index, slot| if (index == capture.selected[job.slot]) {
+                capture.frame_tokens[slot] = capture.frame_tokens[job.slot];
+            };
+        }
+    }
+};
+
 const Capture = struct {
     a: std.mem.Allocator,
     cb: *const ComputeBackend,
     track: media.mp4.Track,
     control: media.source.Control,
     output: []f32,
+    resident: ?[]?CT = null,
     frame_tokens: []usize,
     selected: []const usize,
     signal: video.h264.Color = .{},
     metal: ?*video.preparation.Metal = null,
     io: ?std.Io = null,
+    scheduler: ?*ProjectionScheduler = null,
+    claimed: [32]bool = @splat(false),
     fn copyDuplicate(self: *Capture, slot: usize) bool {
         const first = std.mem.indexOfScalar(usize, self.selected, self.selected[slot]).?;
+        if (self.scheduler != null) return self.claimed[first];
         if (self.frame_tokens[first] == 0) return false;
         const n = self.frame_tokens[first] * 512;
-        if (first != slot) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
+        if (self.resident == null and first != slot) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
         self.frame_tokens[slot] = self.frame_tokens[first];
         return true;
     }
     fn project(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
         try self.control.check();
+        if (self.resident) |tensors| {
+            const input = try self.cb.fromFloat32Shape(patches, &.{ @intCast(patches.len / 768), 768 });
+            defer self.cb.free(input);
+            const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
+            tensors[slot] = encoded.tensor;
+            self.frame_tokens[slot] = encoded.tokens;
+            return;
+        }
         const encoded = try projector.encodeEmbeddingGemma2VideoPatches(self.cb, self.a, patches, options.width, options.height);
         defer self.a.free(encoded.embeddings);
         try self.save(slot, encoded);
@@ -227,6 +323,18 @@ const Capture = struct {
         self.frame_tokens[slot] = encoded.tokens;
     }
     fn projectGpu(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options) !void {
+        if (self.scheduler) |scheduler| {
+            const owner = std.mem.indexOfScalar(usize, self.selected, self.selected[slot]).?;
+            var prepared = value;
+            errdefer prepared.deinit();
+            try self.control.check();
+            try scheduler.queue.putOneUncancelable(self.io.?, .{ .slot = owner, .prepared = prepared, .options = options });
+            self.claimed[owner] = true;
+            return;
+        }
+        return self.projectGpuNow(slot, value, options);
+    }
+    fn projectGpuNow(self: *Capture, slot: usize, value: video.preparation.Prepared, options: video.preparation.Options) !void {
         var prepared = value;
         var live = true;
         defer if (live) prepared.deinit();
@@ -238,9 +346,16 @@ const Capture = struct {
             // Give sole ownership to inference before runtime reuse can occur.
             prepared.deinit();
             live = false;
-            const encoded = try projector.encodeEmbeddingGemma2VideoTensor(self.cb, self.a, input, options.width, options.height);
-            defer self.a.free(encoded.embeddings);
-            try self.save(slot, encoded);
+            const encoded = try projector.encodeEmbeddingGemma2VideoTensorResident(self.cb, self.a, input, options.width, options.height);
+            if (self.resident) |tensors| {
+                tensors[slot] = encoded.tensor;
+                self.frame_tokens[slot] = encoded.tokens;
+            } else {
+                defer self.cb.free(encoded.tensor);
+                const embeddings = try self.cb.toFloat32(encoded.tensor, self.a);
+                defer self.a.free(embeddings);
+                try self.save(slot, .{ .embeddings = embeddings, .tokens = encoded.tokens });
+            }
         } else return error.UnsupportedVideoBackend;
     }
     fn validateRange(self: *const Capture, full: bool) !void {
@@ -253,12 +368,13 @@ const Capture = struct {
         const options = try policySignal(self.track, frame.surface.width, frame.surface.height, self.signal);
         // Duplicate logical samples must receive the same projection.
         const first = std.mem.indexOfScalar(usize, self.selected, frame.decode_index) orelse return error.InvalidPacketIndex;
-        if (self.frame_tokens[first] != 0) return;
+        if (self.copyDuplicate(first)) return;
         const prepared = try self.metal.?.submit(self.a, &frame.surface, options, self.control);
         try self.projectGpu(first, prepared, options);
+        if (self.scheduler != null) return;
         const n = self.frame_tokens[first] * 512;
         for (self.selected, 0..) |index, slot| if (index == frame.decode_index and slot != first) {
-            @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
+            if (self.resident == null) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
             self.frame_tokens[slot] = self.frame_tokens[first];
         };
     }
@@ -268,10 +384,8 @@ const Capture = struct {
         try self.validateRange(frame.full_range);
         const options = try policySignal(self.track, frame.width, frame.height, frame.color);
         if (self.metal) |metal| {
-            if (frame.chroma_format != 0) {
-                const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
-                return self.projectGpu(slot, prepared, options);
-            }
+            const prepared = try metal.submitHost(self.a, frame.host(), options, self.control);
+            return self.projectGpu(slot, prepared, options);
         }
         const patches = try video.preparation.referenceHost(self.a, frame.host(), options, self.control);
         defer self.a.free(patches);
