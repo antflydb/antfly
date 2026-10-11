@@ -2178,8 +2178,9 @@ admission inputs before acquisition. The production-linked Debug source gate
 passes all 48 build steps. A second test uses a real cold provisioned native
 owner, rejects a foreign namespace without damaging subsequent inspection,
 then closes and reopens the whole source on the same LSM root. Both focused
-tests pass with no skips, failures or leaks. Optimized qualification remains
-pending. This does not activate public publication or change SQL credits.
+tests pass with no skips, failures or leaks. The optimized adapter gate also
+passes all 48 steps and both tests with no skips, failures or leaks. This does
+not activate public publication or change SQL credits.
 
 ### Committed native index receipt recovery (in qualification)
 
@@ -2242,6 +2243,10 @@ still compiles against its actual immutable catalog and checks both admitted
 fingerprints before committing. Tests compare the packed bytes with the
 independently prepared candidate manifest, exercise allocation-failure cleanup,
 and reject substituted epochs, namespaces, successor inputs and plan identity.
-Metadata publication qualification is in progress. Authenticated RPC execution,
+The final metadata publication Debug gate passes all 59 steps, including one
+authorization test and eighteen publication tests, with no skips, failures or
+leaks. Review added predecessor-schema hash and exact successor-version checks
+without another JSON parse; their negative assertions pass in this run.
+Optimized qualification remains pending. Authenticated RPC execution,
 root-attested ACKs and the later lifecycle phases remain required; public
 publication and the original SQL inventory remain unchanged.
