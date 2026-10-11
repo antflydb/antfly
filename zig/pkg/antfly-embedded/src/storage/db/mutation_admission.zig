@@ -67,9 +67,13 @@ pub fn acquireReplicationMutationSharedScoped(
             pub fn checkpoint(self: *@This()) !void {
                 try checkLifetime(self.original);
             }
+            pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+                return null;
+            }
         };
         var check: Check = .{ .original = controls };
-        return try enclosing.borrowControlled(&check);
+        if (enclosing.held) return try enclosing.borrowControlled(&check);
+        return try enclosing.borrowPhaseControlled(owner.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo, &check);
     }
     if (controls) |original| {
         const Adapter = struct {

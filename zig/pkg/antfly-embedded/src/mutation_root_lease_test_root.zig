@@ -458,3 +458,99 @@ test "mutation root lease phase reentry retains original rejection and rolls bac
     try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
     try root.retirePhase();
 }
+
+test "mutation root lease scoped admission owns only the phase it opens" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: Apply = .{ .io = std.testing.io } } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    var barrier: Barrier = .{};
+    var root = Barrier.RootSharedLease.initRetired(&barrier);
+    defer root.release();
+    var owner: Owner = .{ .barrier = &barrier };
+    for (0..2) |_| {
+        var guard = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+        try std.testing.expect(guard.phase_owner and root.held);
+        var nested = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+        try std.testing.expect(!nested.phase_owner);
+        const worker = try std.Thread.spawn(.{}, Barrier.SharedLease.release, .{&nested});
+        worker.join();
+        try std.testing.expect(root.held);
+        try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+        guard.release();
+        try std.testing.expect(!root.held);
+        try std.testing.expect(root.barrier == &barrier);
+        var capture = barrier.tryAcquireExclusive() orelse return error.ScopedPhaseBlockedCapture;
+        capture.release();
+    }
+    // An already-held caller owns retirement; a local guard only borrows it.
+    var held = root.borrowPhase();
+    var borrowed = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+    borrowed.release();
+    try std.testing.expect(root.held and held.phase_owner);
+    held.release();
+    try std.testing.expect(!root.held);
+}
+
+test "mutation root lease scoped phase original rejection rolls back every acquisition check" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: Apply = .{ .io = std.testing.io } } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    const Original = struct {
+        calls: usize = 0,
+        reject_at: usize,
+        failure: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == self.reject_at) return self.failure;
+        }
+    };
+    var barrier: Barrier = .{};
+    var root = Barrier.RootSharedLease.initRetired(&barrier);
+    defer root.release();
+    var owner: Owner = .{ .barrier = &barrier };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.Forbidden, error.SchedulerClosed }) |failure| {
+        for (1..5) |reject_at| {
+            var original: Original = .{ .reject_at = reject_at, .failure = failure };
+            const controls: Apply.Acquisition = .{ .lifetime = .{ .context = &original, .check_fn = Original.check } };
+            try std.testing.expectError(failure, admission.acquireReplicationMutationSharedScoped(&owner, controls, &root));
+            try std.testing.expectEqual(reject_at, original.calls);
+            try std.testing.expect(!root.held);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+            var capture = barrier.tryAcquireExclusive() orelse return error.RejectedScopedPhaseBlockedCapture;
+            capture.release();
+        }
+    }
+    var healthy = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+    healthy.release();
+    try std.testing.expect(!root.held);
+}
+
+test "mutation root lease mandatory phase remains independent of another legacy operation" {
+    var barrier: Barrier = .{};
+    var root = Barrier.RootSharedLease.initRetired(&barrier);
+    defer root.release();
+    var other = barrier.acquireShared();
+    var phase = root.borrowPhase();
+    try std.testing.expectEqual(@as(usize, 2), barrier.reader_count);
+    phase.release();
+    try std.testing.expect(!root.held);
+    try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
+    other.release();
+    var capture = barrier.tryAcquireExclusive() orelse return error.MandatoryPhaseBlockedCapture;
+    capture.release();
+}

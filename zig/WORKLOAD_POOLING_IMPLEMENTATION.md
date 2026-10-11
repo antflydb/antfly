@@ -2721,3 +2721,25 @@ post-grant rejection with physical reader rollback and healthy reuse. These are
 root primitive checks. Production callers still need explicit phase adoption,
 complete service-holder migration and actual DB/consumer validation before CPU
 lending or defaults can be enabled.
+
+### Scoped mutation phase ownership
+
+An invocation may initialize a stable mutation root in its retired state. Scoped
+admission and durable recovery open a physical phase using the original lifetime
+controls. The guard that opens that phase owns its retirement; nested guards only
+borrow and cannot retire an already-held caller phase. Releasing the opening guard
+after all borrowers physically join drops the reader while preserving the root
+identity for later cleanup. Entry, post-grant and borrow rejection roll back both
+the reader and borrow count. Mandatory self/context helpers can open retired roots
+without inheriting another operation's legacy thread-local reader.
+
+Durable recovery releases its locally owned phase after append and transition
+release, before remote completion. The recovery consumer check verifies actual
+joined capture during completion, final fencing rejection, and uncertain reply
+preservation. Eleven mutation-root and fourteen recovery checks pass natively.
+Full consumer/DB validation remains queued. Production outer entries still need
+complete invocation root propagation through resident DB helpers before switching
+to fresh roots by default; the dedicated recovery receiver cannot replace resident
+DB semantics and maintenance. This change does not enable service-holder CPU
+lending or qualify pooling defaults. Enclosing owners must continue to serialize
+phase transitions and physically join borrowers before releasing the opening guard.

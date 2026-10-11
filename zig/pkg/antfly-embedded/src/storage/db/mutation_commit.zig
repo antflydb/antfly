@@ -183,7 +183,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const barrier = self.replicationMutationBarrier() orelse return null;
             if (@import("mutation_admission.zig").receiverMutationRoot(self)) |root| {
                 std.debug.assert(root.barrier == barrier);
-                return root.borrow();
+                return root.borrowPhase();
             }
             return barrier.acquireShared();
         }

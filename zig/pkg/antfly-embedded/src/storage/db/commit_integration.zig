@@ -189,7 +189,10 @@ pub fn recoverDurableOutbox(
         }
         if (context.mutation_root) |root| {
             if (root.barrier != barrier) return error.InvalidArgument;
-            break :blk try root.borrowControlled(&lifetime);
+            break :blk if (root.held)
+                try root.borrowControlled(&lifetime)
+            else
+                try root.borrowPhaseControlled(context.io orelse return error.MissingBackendRuntimeIo, &lifetime);
         }
         break :blk if (context.admission != null)
             try barrier.acquireSharedControlled(context.io orelse return error.MissingBackendRuntimeIo, &lifetime)
@@ -689,4 +692,23 @@ test "durable outbox storage recovery rejects another mutation root before publi
     try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
     try std.testing.expectEqual(@as(usize, 1), other.reader_count);
+}
+
+test "durable outbox storage recovery retires its scoped root phase before remote completion" {
+    for (0..3) |case| {
+        var barrier: MutationBarrier = .{};
+        var root = MutationBarrier.RootSharedLease.initRetired(&barrier);
+        defer root.release();
+        var publisher: TestPublisher = .{ .barrier = &barrier, .fenced = case == 1, .fail_completion = case == 2 };
+        const context: RecoveryContext = .{ .mutation_root = &root, .io = std.testing.io, .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+        const result = recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay);
+        if (case == 1) try std.testing.expectError(error.PrimaryFenced, result) else if (case == 2) try std.testing.expectError(error.CommitCompletionPending, result) else try result;
+        try std.testing.expect(publisher.recovered and publisher.completed and publisher.captured);
+        try std.testing.expect(!root.held);
+        try std.testing.expect(root.barrier == &barrier);
+        try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        var capture = barrier.tryAcquireExclusive() orelse return error.ScopedRecoveryLeakedMutationReader;
+        capture.release();
+    }
 }

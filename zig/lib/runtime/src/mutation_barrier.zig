@@ -43,12 +43,19 @@ pub const MutationBarrier = struct {
         barrier: *MutationBarrier,
         nested: bool = false,
         root: ?*RootSharedLease = null,
+        /// This guard opened the local physical phase and retires it after all
+        /// nested borrowers have physically joined and released.
+        phase_owner: bool = false,
 
         pub fn release(self: *@This()) void {
             if (self.root) |root| {
                 std.debug.assert(root.barrier == self.barrier);
                 const previous = root.borrowers.fetchSub(1, .acq_rel);
                 std.debug.assert(previous > 0);
+                if (self.phase_owner) {
+                    std.debug.assert(previous == 1);
+                    root.retirePhase() catch unreachable;
+                }
                 self.* = undefined;
                 return;
             }
@@ -73,6 +80,37 @@ pub const MutationBarrier = struct {
         /// Phase transitions belong to the enclosing owner, after physical
         /// borrower joins. They must not race new borrow attempts.
         held: bool = true,
+
+        /// Stable invocation identity without a physical reader. The enclosing
+        /// owner serializes phase entry and joins borrowers before retirement.
+        pub fn initRetired(barrier: *MutationBarrier) @This() {
+            return .{ .barrier = barrier, .held = false };
+        }
+
+        /// Open a local phase if necessary. Borrowing an already-held caller
+        /// phase never transfers ownership of its physical reader.
+        pub fn borrowPhaseControlled(self: *@This(), io: std.Io, controls: anytype) !SharedLease {
+            const opened = !self.held;
+            if (opened) try self.reenterPhaseControlled(io, controls);
+            errdefer if (opened) self.retirePhase() catch unreachable;
+            var lease = try self.borrowControlled(controls);
+            lease.phase_owner = opened;
+            return lease;
+        }
+
+        /// Mandatory legacy helpers retain their existing noncancelable wait.
+        /// A retired root enters independently of unrelated thread-local leases.
+        pub fn borrowPhase(self: *@This()) SharedLease {
+            const opened = !self.held;
+            if (opened) {
+                std.debug.assert(self.borrowers.load(.acquire) == 0);
+                self.barrier.lockShared();
+                self.held = true;
+            }
+            var lease = self.borrow();
+            lease.phase_owner = opened;
+            return lease;
+        }
 
         /// The root must stay at a stable address until every borrower has
         /// physically joined and released. Borrowing never enters reader_gate.

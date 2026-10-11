@@ -48754,7 +48754,7 @@ fn acquireReplicationMutationSharedContext(ctx: *const BatchExecutionContext) ?M
     const barrier = replicationMutationBarrierFromContext(ctx) orelse return null;
     if (ctx.mutation_root) |root| {
         std.debug.assert(root.barrier == barrier);
-        return root.borrow();
+        return root.borrowPhase();
     }
     return barrier.acquireShared();
 }
