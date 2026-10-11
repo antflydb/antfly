@@ -2133,6 +2133,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-storage-test", "Run all Lite storage tests without unrelated imported suites").dependOn(&addFilteredTestRunArtifact(b, lite_storage_tests).step);
+    const lite_cold_record_tests = b.addTest(.{
+        .name = "lite-cold-record-retirement-tests",
+        .root_module = lite_native_test_mod,
+        .filters = &.{"lite cold record windows coalesce only proven runs and authenticate every page"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lite_cold_record_tests = addFilteredTestRunArtifact(b, lite_cold_record_tests);
+    run_lite_cold_record_tests.addArg("--require-no-skips");
+    b.step("lite-cold-record-retirement-test", "Verify cold read windows retire independently of retained result batches")
+        .dependOn(&run_lite_cold_record_tests.step);
     const lite_allocator_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{ "lite allocator v4", "lite reclamation", "lite group commit", "lite online vacuum" },

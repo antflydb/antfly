@@ -17190,7 +17190,10 @@ test "lite cold record windows coalesce only proven runs and authenticate every 
         try std.testing.expectEqualSlices(u8, &payload, doc.value);
     }
     // Sixteen result batches must retain values, not sixteen read windows.
-    var result_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    // Compare identical arena growth, independent of whether the backing
+    // allocator can resize or remap either arena at its particular address.
+    var stable_result_backing = @import("test_allocator.zig").NoResizeAllocator{ .backing = a };
+    var result_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = stable_result_backing.allocator() };
     var results = std.heap.ArenaAllocator.init(result_budget.allocator());
     defer results.deinit();
     for (0..16) |_| {
@@ -17198,7 +17201,7 @@ test "lite cold record windows coalesce only proven runs and authenticate every 
         try file.getDocumentsAtCheckpointAlloc(results.allocator(), checkpoint, &requested, &retained);
         for (retained[0..64]) |value| try std.testing.expectEqualSlices(u8, &payload, value.?);
     }
-    var control = std.heap.ArenaAllocator.init(a);
+    var control = std.heap.ArenaAllocator.init(stable_result_backing.allocator());
     defer control.deinit();
     for (0..16 * 64) |_| _ = try control.allocator().dupe(u8, &payload);
     try std.testing.expectEqual(control.queryCapacity(), results.queryCapacity());

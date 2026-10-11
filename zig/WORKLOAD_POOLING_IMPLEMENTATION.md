@@ -2,7 +2,7 @@
 
 Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
-`design/default-workload-pooling`.
+`codex/workload-scheduling` (PR #849).
 
 ## Implemented scope
 
