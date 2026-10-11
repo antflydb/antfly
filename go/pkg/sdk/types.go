@@ -43,6 +43,9 @@ import (
 
 // Re-export commonly used types from oapi package
 type (
+	ReadReceipt                 = oapi.ReadReceipt
+	ReadRequirements            = oapi.ReadRequirements
+	ReadRequirementsVisibility  = oapi.ReadRequirementsVisibility
 	SQLRequest                  = oapi.SQLRequest
 	SQLPrepareRequest           = oapi.SQLPrepareRequest
 	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
@@ -1061,4 +1064,20 @@ func ValidateToolName(name ChatToolName) error {
 		return nil
 	}
 	return fmt.Errorf("unknown tool name %q; valid tools: %v", name, allToolNames)
+}
+
+const (
+	ReadRequirementsVisibilityAccepted  = oapi.ReadRequirementsVisibilityAccepted
+	ReadRequirementsVisibilityCommitted = oapi.ReadRequirementsVisibilityCommitted
+	ReadRequirementsVisibilityPublished = oapi.ReadRequirementsVisibilityPublished
+)
+
+// ReadAfterWrite requires a query or SQL read to include an ingestion receipt.
+// An omitted wait uses the server's default; passing zero requests an immediate check.
+func ReadAfterWrite(receipt ReadReceipt, waitMs ...uint32) ReadRequirements {
+	result := ReadRequirements{Visibility: oapi.ReadRequirementsVisibilityAccepted, AfterWrite: receipt}
+	if len(waitMs) > 0 {
+		result.WaitMs = &waitMs[0]
+	}
+	return result
 }

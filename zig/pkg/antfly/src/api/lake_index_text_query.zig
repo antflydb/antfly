@@ -103,9 +103,15 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (cut.pending.changes.len != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
     }
     if (published_only or retained != null) {
-        const base_id = publication.base_source.external_iceberg.snapshot_id;
         source_schema.binding.write_policy = .read_only;
-        source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
+        // A retained search cut can belong to any external format. Parquet
+        // identities pin an object inventory rather than an Iceberg snapshot.
+        source_schema.binding.snapshot_mode = switch (publication.base_source) {
+            .external_parquet => |base| .{ .object_version_digest = base.snapshot_id },
+            .external_iceberg => |base| if (std.mem.startsWith(u8, base.snapshot_id, "empty:")) .current else .{ .snapshot_id = base.snapshot_id },
+            .external_lance => |base| .{ .snapshot_id = base.snapshot_id },
+            else => return error.ExternalLakeSnapshotMismatch,
+        };
     }
     if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
         const catalog = local.serverless_external_source_mod.lake_catalog;

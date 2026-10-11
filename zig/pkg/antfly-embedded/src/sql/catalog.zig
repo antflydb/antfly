@@ -566,6 +566,12 @@ pub const Backend = struct {
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,
+    /// Validate execution policy against the complete binding before choosing
+    /// a cursor or fallback. Child plans inherit the already validated policy.
+    execution_binding_validator: ?struct {
+        ptr: *anyopaque,
+        validate: *const fn (*anyopaque, std.mem.Allocator, @import("describe.zig").BoundStatement) anyerror!void,
+    } = null,
     /// mutate retains predicate-only entries in the same atomic commit.
     predicate_only_mutations: bool = false,
     /// Statement capture range proofs are retained with the subsequent

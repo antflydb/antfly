@@ -70,7 +70,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (request.action == .changes) {
         const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
-        return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
+        return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .read_receipt = @import("antfly_local_sources").sql_read_requirements.Receipt{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = lsn }, .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
     }
     if (request.action == .reconcile) {
         var result = try configured.executeLakeCatalogAlloc(a, source.binding, options, lake_context, .load);

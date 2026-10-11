@@ -69,11 +69,15 @@ pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
 pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8, reset_local: []const u8 };
 pub const LakeVisibility = enum { committed, accepted };
+pub const ReadRequirements = @import("antfly_local_sources").sql_read_requirements.Requirements;
+pub const ReadRequirementsSetting = union(enum) { show, reset, set: struct { local: bool, value: ReadRequirements } };
 pub const LakeVisibilitySetting = union(enum) { show, reset, set: struct { local: bool, value: LakeVisibility } };
 pub const FormattingSetting = struct { kind: @import("formatting.zig").Setting, action: enum { show, set, reset }, local: bool = false };
 pub const Setting = union(enum) {
     formatting: FormattingSetting,
     lake_visibility: LakeVisibilitySetting,
+    read_visibility: LakeVisibilitySetting,
+    read_requirements: ReadRequirementsSetting,
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
     application_name: ApplicationNameSetting,
@@ -86,6 +90,8 @@ pub const Setting = union(enum) {
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try readRequirementsSetting(alloc, input)) |value| return .{ .read_requirements = value };
+    if (try visibilitySetting(alloc, input, "antfly.read_visibility")) |value| return .{ .read_visibility = value };
     if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
     if (try formattingSetting(alloc, input)) |value| return .{ .formatting = value };
     if (try searchPathSetting(alloc, input)) |value| return .{ .search_path = value };
@@ -776,6 +782,10 @@ test "pgwire SQL session command parser preserves scalar spans and quoted names"
 
 /// Connection-owned execution policy, independent of custom catalog settings.
 pub fn lakeVisibilitySetting(alloc: std.mem.Allocator, input: []const u8) !?LakeVisibilitySetting {
+    return visibilitySetting(alloc, input, "antfly.lake_visibility");
+}
+
+fn visibilitySetting(alloc: std.mem.Allocator, input: []const u8, expected_name: []const u8) !?LakeVisibilitySetting {
     var p: Parser = .{ .alloc = alloc, .input = input };
     const verb = p.word() catch return null;
     const setting = std.ascii.eqlIgnoreCase(verb, "set");
@@ -788,7 +798,7 @@ pub fn lakeVisibilitySetting(alloc: std.mem.Allocator, input: []const u8) !?Lake
     if (!setting or (!local and !std.ascii.eqlIgnoreCase(modifier, "session"))) p.pos = saved;
     const name = p.settingName() catch |err| return if (err == error.OutOfMemory) err else null;
     defer alloc.free(name);
-    if (!std.mem.eql(u8, name, "antfly.lake_visibility")) return null;
+    if (!std.mem.eql(u8, name, expected_name)) return null;
     if (!setting) {
         try p.finish();
         return if (showing) .show else .reset;
@@ -800,6 +810,35 @@ pub fn lakeVisibilitySetting(alloc: std.mem.Allocator, input: []const u8) !?Lake
     defer if (quoted) alloc.free(value);
     try p.finish();
     const selected: LakeVisibility = if (std.ascii.eqlIgnoreCase(value, "accepted")) .accepted else if (std.ascii.eqlIgnoreCase(value, "committed") or (!quoted and std.ascii.eqlIgnoreCase(value, "default"))) .committed else return error.InvalidParameter;
+    return .{ .set = .{ .local = local, .value = selected } };
+}
+
+pub fn readRequirementsSetting(alloc: std.mem.Allocator, input: []const u8) !?ReadRequirementsSetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const setting = std.ascii.eqlIgnoreCase(verb, "set");
+    const showing = std.ascii.eqlIgnoreCase(verb, "show");
+    const resetting = std.ascii.eqlIgnoreCase(verb, "reset");
+    if (!setting and !showing and !resetting) return null;
+    const saved = p.pos;
+    const modifier = p.word() catch return null;
+    const local = setting and std.ascii.eqlIgnoreCase(modifier, "local");
+    if (!setting or (!local and !std.ascii.eqlIgnoreCase(modifier, "session"))) p.pos = saved;
+    const name = p.settingName() catch |err| return if (err == error.OutOfMemory) err else null;
+    defer alloc.free(name);
+    if (!std.mem.eql(u8, name, "antfly.read_requirements")) return null;
+    if (!setting) {
+        try p.finish();
+        return if (showing) .show else .reset;
+    }
+    if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+    try p.space();
+    const quoted = p.pos < input.len and input[p.pos] == '\'';
+    const value = if (quoted) try p.quoted('\'') else try p.word();
+    defer if (quoted) alloc.free(value);
+    try p.finish();
+    const selected: ReadRequirements = if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) .{} else std.json.parseFromSliceLeaky(ReadRequirements, alloc, value, .{}) catch return error.InvalidParameter;
+    try selected.validate(.sql);
     return .{ .set = .{ .local = local, .value = selected } };
 }
 
@@ -884,4 +923,18 @@ test "pgwire formatting SET comments separate tokens and preserve command bounda
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "pgwire canonical read settings parse receipts and reject unsupported visibility" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(LakeVisibility.accepted, (try settingCommand(a, "SET LOCAL ANTFLY.READ_VISIBILITY = accepted")).?.read_visibility.set.value);
+    const read = (try settingCommand(a, "SET LOCAL antfly.read_requirements = '{\"visibility\":\"accepted\",\"after_write\":{\"table_id\":2,\"object_generation\":3,\"wal_lsn\":10},\"wait_ms\":0}'")).?.read_requirements.set;
+    try std.testing.expect(read.local);
+    try std.testing.expectEqual(@as(u64, 10), read.value.after_write.?.wal_lsn);
+    try std.testing.expectEqual(@as(?u32, 0), read.value.wait_ms);
+    try std.testing.expectError(error.UnsupportedReadVisibility, settingCommand(a, "SET antfly.read_requirements = '{\"visibility\":\"published\"}'"));
+    try std.testing.expectError(error.InvalidReadRequirements, settingCommand(a, "SET antfly.read_requirements = '{\"wait_ms\":60001}'"));
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.read_requirements = '{\"through\":{}}'"));
 }
