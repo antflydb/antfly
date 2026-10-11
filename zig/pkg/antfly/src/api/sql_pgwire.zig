@@ -378,14 +378,14 @@ test "pgwire native array page delivery preserves dimensions NULLs and exact int
             const sources = @import("antfly_local_sources");
             const array = (try sources.sql_array_text.decodeLeaky(alloc, .int64, "[-1:1]={9007199254740993,NULL,7}", .{})).value;
             const values = [_]sources.sql_scalar.Datum{.{ .array = &array, .sql_null = false }};
-            var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+            var page: Pull.BatchPage = .{
                 .arena = std.heap.ArenaAllocator.init(a),
                 .columns = &.{.{ .name = "a", .type = .array, .element_type = .int64 }},
                 .values = .{ .rows = &.{&values} },
                 .exhausted = true,
-            } };
-            defer owner.page.deinit();
-            const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
+            };
+            defer page.deinit();
+            const cell = try OwnedRead.PageOwner.pageCell(&page, alloc, 0, 0);
             try std.testing.expect(!cell.sql_null);
             const decoded = try sources.sql_array_wire.decodeLeaky(alloc, .int64, cell.value, .{});
             var work: sources.sql_array_value.Budget = .{};
@@ -710,20 +710,25 @@ const OwnedRead = struct {
         read: *OwnedRead,
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const value = try self.page.values.cell(alloc, row, column);
+            return pageCell(&self.page, alloc, row, column);
+        }
+        // Cell conversion borrows only the page. Retained cursor lifetime
+        // belongs to PageOwner and is exercised by the release callback.
+        fn pageCell(page: *const Pull.BatchPage, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
+            const value = try page.values.cell(alloc, row, column);
             if (value.array) |array| {
-                const definition = self.page.columns[column];
+                const definition = page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
                 return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
             }
             if (value.numeric) |number| {
-                const definition = self.page.columns[column];
+                const definition = page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
                 const exact = @import("antfly_local_sources").sql_numeric_value;
                 var context: exact.Context = .{ .alloc = alloc };
                 return .{ .value = .{ .string = try exact.format(&context, number.*) }, .sql_null = false };
             }
-            return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
+            return .{ .value = if (!value.sql_null and page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
         }
     };
 

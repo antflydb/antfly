@@ -724,6 +724,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-sql-stateless-completion-test", "Run stateless SQL native handoff, original fences and response ownership contracts")
         .dependOn(&addFilteredTestRunArtifact(b, sql_stateless_completion_tests).step);
 
+    const pgwire_array_page_tests = b.addTest(.{
+        .name = "pgwire-array-page-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{"pgwire native array page delivery"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const pgwire_array_page_run = addFilteredTestRunArtifact(b, pgwire_array_page_tests);
+    pgwire_array_page_run.addArg("--require-no-skips");
+    b.step("antfly-pgwire-array-page-test", "Verify native pgwire array page conversion and allocation-failure cleanup")
+        .dependOn(&pgwire_array_page_run.step);
+
     const pgwire_retirement_tests = b.addTest(.{
         .name = "pgwire-retirement-tests",
         .root_module = options.api_http_runtime_test_mod,

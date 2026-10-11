@@ -2764,3 +2764,15 @@ root/recovery helper passes do not qualify this new DB regression or all product
 generic instantiations. Other nested resident helpers still need call-graph
 propagation before ordinary outer entries can default to independent roots.
 Whole service-holder CPU lending and pooling defaults remain incomplete.
+
+### Pgwire array page fixture compilation
+
+Cumulative integration exposed the native array conversion fixture constructing a
+PageOwner without its mandatory retained-read pointer. Conversion now has a
+page-only helper used by the production cell callback and the allocation-failure
+fixture. The fixture no longer invents cursor lifetime ownership to test pure page
+conversion. A focused 3 GiB pgwire array page gate runs the actual conversion case
+and strict no-skip runner independently of the full pgwire service gate. Native
+focused validation passes, including exact integers, NULLs, array dimensions and
+allocation-failure cleanup. Full portal lifetime and service/session regressions
+remain required by the inherited pgwire integration gate.
