@@ -71,6 +71,22 @@ def main():
     )
     failed = False
     try:
+        # First SQL immediately after the fixture observes HTTP readiness: no
+        # publication retry loop may hide a cold-start readiness regression.
+        import psycopg
+
+        with psycopg.connect(
+            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
+            autocommit=True,
+        ) as conn:
+            conn.execute("CREATE TABLE ready_immediately (id TEXT PRIMARY KEY)")
+        server.restart()
+        with psycopg.connect(
+            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
+            autocommit=True,
+        ) as conn:
+            conn.execute("CREATE INDEX ready_after_restart ON ready_immediately(id)")
+        print("cold-start and restart DDL without retries: PASS", flush=True)
         run_clients(
             f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
             args.drivers,

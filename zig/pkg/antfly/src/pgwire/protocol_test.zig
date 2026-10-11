@@ -19,6 +19,8 @@ const backend = @import("backend.zig");
 
 const Mock = struct {
     describes: usize = 0,
+    catalog_rebind: bool = false,
+    cached_shape_change: bool = false,
     executions: usize = 0,
     lake_log: [32]@import("session_commands.zig").LakeVisibility = undefined,
     lake_count: usize = 0,
@@ -120,7 +122,7 @@ const Mock = struct {
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
-        self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
+        self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
         return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream, .detach = detachStream, .validate = validateStream };
     }
     fn detachStream(raw: *anyopaque) void {
@@ -180,6 +182,7 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
         try request.check();
+        if (self.cached_shape_change and self.describes > 1) return .{ .columns = &.{.{ .name = "n", .type = .string }}, .parameter_types = &.{.integer} };
         if (self.array_parameters) {
             if (request.parameter_descriptors.len != 0 and request.parameter_descriptors[0].kind != null) try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
             return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{.array}, .parameter_descriptors = &.{.{ .kind = .array, .element_type = .int64 }} };
@@ -190,7 +193,7 @@ const Mock = struct {
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
-        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
+        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -218,7 +221,7 @@ const Mock = struct {
             .release => "RELEASE",
         }, .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (self.expected_execute_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
-        self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
+        self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, if (self.catalog_rebind) "current-catalog-binding" else "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
         while (self.blocked) {
             request.check() catch |err| {
@@ -1550,7 +1553,7 @@ test "pgwire original prepared DDL defers execution and preserves pending receip
         var mock = Mock{ .ddl_pending = true, .expected_execute_statement = case.statement };
         var output = try run(&mock, input.written(), .{});
         defer output.deinit();
-        try std.testing.expectEqual(@as(usize, 1), mock.describes);
+        try std.testing.expectEqual(@as(usize, 2), mock.describes);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
         const observed = try tags(std.testing.allocator, output.written());
         defer std.testing.allocator.free(observed);
@@ -1783,7 +1786,7 @@ test "pgwire SQL prepare execute deallocate share connection ownership with wire
     var mock = Mock{};
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 2), mock.describes);
+    try std.testing.expectEqual(@as(usize, 4), mock.describes);
     try std.testing.expectEqual(@as(usize, 3), mock.executions);
     try std.testing.expect(mock.saw_statement_unchanged);
     try std.testing.expect(mock.saw_binding_guard);
@@ -1835,7 +1838,7 @@ test "pgwire original prepared CTE INSERT defers mutation until execute" {
     var mock: Mock = .{ .expected_execute_statement = original[separator + " AS ".len ..], .expected_result_tag = "INSERT 0 2" };
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 1), mock.describes);
+    try std.testing.expectEqual(@as(usize, 2), mock.describes);
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(mock.saw_binding_guard);
     const observed = try tags(alloc, output.written());
@@ -1870,7 +1873,7 @@ test "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE" {
         var mock: Mock = .{ .expected_execute_statement = original[separator + " AS ".len ..], .expected_result_tag = case.tag };
         var output = try run(&mock, input.written(), .{});
         defer output.deinit();
-        try std.testing.expectEqual(@as(usize, 1), mock.describes);
+        try std.testing.expectEqual(@as(usize, 2), mock.describes);
         try std.testing.expectEqual(@as(usize, 1), mock.executions);
         try std.testing.expect(mock.saw_binding_guard);
         const observed = try tags(alloc, output.written());
@@ -1901,7 +1904,7 @@ test "pgwire extended typed bind describes without execution and resumes once" {
     var mock = Mock{};
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
-    try std.testing.expectEqual(@as(usize, 1), mock.describes);
+    try std.testing.expectEqual(@as(usize, 4), mock.describes);
     try std.testing.expectEqual(@as(usize, 1), mock.executions);
     try std.testing.expect(mock.saw_statement_unchanged);
     try std.testing.expect(mock.saw_binding_guard);
@@ -2251,4 +2254,35 @@ test "pgwire driver comment-only ping returns EmptyQueryResponse without backend
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "I"));
     try std.testing.expectEqual(@as(usize, 0), mock.executions);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "E"));
+}
+
+test "pgwire cached plans rebind before execution and reject changed row contracts before admission" {
+    for ([_]bool{ false, true }) |sql_prepare| {
+        for ([_]bool{ false, true }) |shape_change| {
+            var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer input.deinit();
+            try startup(&input.writer);
+            if (sql_prepare) {
+                try frame(&input.writer, 'Q', "PREPARE cached(bigint) AS SELECT $1\x00");
+                try frame(&input.writer, 'Q', "EXECUTE cached(7)\x00");
+            } else {
+                try parse(&input.writer, "cached", "SELECT $1", true);
+                try bind(&input.writer, "portal", "cached", 7);
+                try execute(&input.writer, "portal", 0);
+                try frame(&input.writer, 'S', "");
+            }
+            try frame(&input.writer, 'X', "");
+            var mock = Mock{ .catalog_rebind = true, .cached_shape_change = shape_change };
+            var output = try run(&mock, input.written(), .{});
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, if (shape_change) 0 else 1), mock.executions);
+            if (shape_change) {
+                try std.testing.expect(std.mem.indexOf(u8, output.written(), "0A000") != null);
+                try std.testing.expect(std.mem.indexOf(u8, output.written(), "cached plan must not change result type") != null);
+            } else {
+                try std.testing.expect(mock.saw_binding_guard);
+                try std.testing.expect(std.mem.indexOf(u8, output.written(), "SERROR") == null);
+            }
+        }
+    }
 }
