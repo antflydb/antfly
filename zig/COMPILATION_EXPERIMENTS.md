@@ -5034,6 +5034,143 @@ Append future results here or in a linked PR note using this schema:
 | Throughput or latency delta | |
 | Result | keep / revise / reject |
 
+## 2026-10-11: cold native Darwin release archive
+
+Measured commit `773daba39a14669e95327e5ea9943249c280d639` (production
+sources based on main `77a276cd5349850961919abf23b3ce1f8dd1f0db`) on
+`stinkbug`: ARM64 macOS 26.3.1, 36 GiB RAM, 14 CPUs, Zig 0.17.0 and the
+installed Command Line Tools macOS 26.5 SDK. This is a native build, not
+the Linux-hosted Darwin cross-build with its pinned SDK. Other builds ran
+alongside this experiment; it is not an idle-host performance baseline.
+
+Ran the production packaging script with fresh dedicated local/global
+caches, `aarch64-macos`, `fast`, stripping, Metal and system BLAS enabled,
+and production default jobs. The host-derived admission budget was
+30,923,764,531 bytes (28.8 GiB). The exact-command sampler retained RSS,
+CPU clocks, compiler response files, a Darwin stack sample and host
+contention observations. Local evidence is retained under
+`.local-test-results/darwin-release-cold-evidence/`; compiler caches are
+not required to read the copied response files.
+
+The archive completed successfully: **73/73 build steps**, **3,136.06 s
+wall time (52m16s)**, 3,150.79 s user CPU and 73.53 s system CPU. That is
+about **1.03 CPU cores on average**. `/usr/bin/time -l` reported a largest
+descendant maximum RSS of 9,448,030,208 bytes (8.80 GiB); the five-second
+compiler sampler observed an aggregate peak of 8.30 GiB. Sampling can
+miss peaks and shared pages can be counted more than once.
+
+Zig's rounded unit summaries were:
+
+| Compilation unit | Wall time | MaxRSS |
+|---|---:|---:|
+| Server storage kernel | 13m | 8G |
+| Public C API objects | 10m | 8G |
+| Server API kernel | 7m | 9G |
+| Server inference | 6m | 7G |
+| Server distributed | 5m | 4G |
+| Embedded inference | 4m | 4G |
+| Serverless | 2m | 3G |
+| CLI | 1m | 1G |
+| Embedded enrichment | 23s | 722M |
+| Server enrichment compute | 23s | 859M |
+| Executable | 4s | 1G |
+
+The API stack sample attributed 7,119 of 7,202 main-thread samples to
+LLVM's function pass manager, including 6,988 machine-function-pass
+samples and 2,469 SelectionDAG instruction-selection samples. The CPU
+timeline also showed substantial units consuming approximately one core.
+This supports LLVM machine-code generation as a major cost, rather than
+a hung build. Conservative admission claims (storage 28 GiB, API 24 GiB,
+inference 20 GiB and distributed 18 GiB) serialize these units within the
+28.8 GiB budget. Separately compiled server and public C API products add
+work: inference exports are compiled for both products, and physical
+storage has separate product owners. Reuse must preserve the Apache
+public-library boundary; linking the server storage archive into that
+library is not a valid shortcut.
+
+The executable was 174,115,224 bytes, the public library 69,178,784 bytes
+(65.97 MiB), and the release archive 101,913,787 bytes. The public library
+passed its 108-function export boundary and both executable and shared
+library consumer link tests. Its size exceeds the existing 60 MiB Darwin
+diagnostic budget. A separate `strip -x` probe saved only 68,360 bytes;
+the original library contained 56,134,044 bytes of `__text`, so leftover
+local symbols do not explain the excess. The size guard remains unchanged.
+This native result does not establish the pinned-SDK cross-build's size.
+
+**Result: keep the admission and diagnostic fixes; do not claim a speedup.**
+Removing the arbitrary 20 GiB Darwin cap makes the production reservations
+admissible. Retain those reservations until matched profiles qualify lower
+claims for the intended build configuration. The next performance work
+needs matched native/cross profiles and attribution of retained library
+code, followed by configuration-specific admission or compiled-core reuse
+with a coarse ABI. No runtime backend, optimization or size budget was
+changed to hide the findings.
+
+Main `84a00809990b228258737cdb59746ff4101fc959` was subsequently merged into
+the PR without conflicts. Its newer Lite implementation is **not measured
+by this experiment**. Local graph gates, packaging/tooling tests and
+consumer tests validate the relevant changes; a new cold profile would
+be needed for a performance comparison against that revision.
+
+## 2026-10-11: native Darwin retained-code attribution
+
+Relinked the retained archives from the preceding experiment with the
+same SDK, ARM64 architecture, deployment target 15.0, frameworks, public
+export roots and dead stripping, adding only a linker map. The relink
+reproduced the original **69,178,784-byte** library size. This avoids
+mistaking distances between the stripped library's sparse surviving
+symbols for individual function sizes.
+
+The map's `__text` atoms attribute 34,481,724 bytes to the public C API
+object, 19,356,368 to native inference, 1,529,068 to native enrichment,
+and 735,116 to Metal's Objective-C object. These are machine-code bytes,
+not complete archive or product sizes. Storage-prefixed functions total
+18,130,708 text bytes; specialized stable sorts total 4,124,664. Two
+`batchInternalPrepared` specializations alone occupy 1,925,824 and
+1,825,464 bytes. The source instantiates this generic mutation code for
+both resident DB and recovery execution receivers; combining them would
+require preserving their state ownership and recovery-specific behavior.
+Inference includes the native kernels and model pipelines required by
+the public product. Shared dependency names also recur across owners,
+but identical names do not establish identical code or interchangeable
+state.
+
+The apparent 2,621,440-byte Metal allocation-record array belongs to
+zero-fill `__bss`; it does not account for those bytes on disk. Likewise,
+the 262,144-byte per-owner signal stacks are thread-local zero-fill, not
+an artifact-size saving available by deleting initialized data. This is
+why subsequent attribution must distinguish text, file-backed data and
+zero-fill sections.
+
+**Result: retain linker maps; no speculative runtime rewrite or budget
+increase.** Native Mach-O links now emit `libantfly.map` beside the cached
+library as a tracked build output, retained by the diagnostic workflow's
+work-directory upload. It is not installed in release archives. A native
+regression verifies that the map is emitted while exact exports and
+executable/shared-library consumer linkage remain valid. The 60 MiB
+cross-build guard is unchanged; neither attribution nor the preceding
+native build establishes that the pinned-SDK CI library passes it.
+
+The latest completed main CI run (`38163110166`, main `84a0080999`)
+also exposed a stale control-source catalog and a Debug ELF C API link
+that selected the self-hosted backend with LLD. The catalog was
+regenerated from physical-source reachability, and the ELF C API helper
+now explicitly selects LLVM alongside its required LLD export linker.
+A minimal Linux-musl Debug build through that production helper passes
+and verifies its exact dynamic export boundary. This checks the backend
+failure directly; it is not a substitute for the full Linux E2E suite.
+
+## 2026-10-11: approved public-library budget adjustment
+
+After reviewing the native 65.97 MiB measurement and retained-code
+attribution above, the user explicitly approved raising the Darwin
+diagnostic library budget from 60 MiB to **80 MiB (83,886,080 bytes)**.
+The guard still rejects libraries at or above the limit. This accepts
+headroom for the current storage and inference product; it does not
+change compilation, runtime behavior, or the preceding measurements.
+Linker maps remain available for subsequent growth investigations. The
+earlier experiment decisions describe the budget before this approval.
+
 ## Definition of done
 
 This compilation architecture work is complete when:

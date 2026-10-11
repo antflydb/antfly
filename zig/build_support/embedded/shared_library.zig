@@ -51,6 +51,9 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         // symbols. Use the linker that applies the final export boundary to
         // every linked object, including those runtime objects.
         .use_lld = if (elf) true else null,
+        // Zig's Debug self-hosted backend cannot link through LLD. Keep the
+        // code generator compatible with the required ELF export linker.
+        .use_llvm = if (elf) true else null,
         // Mach-O ReleaseSafe codegen measured 12.92 GB; match the C API
         // test estimate so fresh builds can schedule the complete archive.
         .max_rss = @as(usize, if (macho) 14 else 12) * 1024 * 1024 * 1024,
@@ -73,6 +76,10 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         run.addFileArg(compile.getEmittedBin());
         run.addArg("--output");
         const output = run.addOutputFileArg("libantfly.dylib");
+        // Retain atom sizes and archive owners alongside the cached binary.
+        // Release archives contain only the library, not this diagnostic map.
+        run.addArg("--map");
+        _ = run.addOutputFileArg("libantfly.map");
         run.addArg("--");
         var visited: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
         var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);

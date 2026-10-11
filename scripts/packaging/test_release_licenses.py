@@ -65,7 +65,8 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
                 "inference = Path.cwd().name == 'inference'\n"
-                "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + ('lib/libantfly.dylib', 'include/antfly.h')\n"
+                "library = 'lib/libantfly.dylib' if '-Dtarget=aarch64-macos' in args else 'lib/libantfly.so'\n"
+                "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + (library, 'include/antfly.h')\n"
                 "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
@@ -78,13 +79,14 @@ class ReleaseLicenseTests(unittest.TestCase):
                 'for shell in bash zsh fish; do echo fixture > "$1/antfly.$shell"; done\n'
             )
             completions.chmod(0o755)
-            for product, steps, license_name in (
-                ("embedded", ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("lite", ["lite"], "LICENSES/Apache-2.0.txt"),
-                ("inference", [], "LICENSES/Apache-2.0.txt"),
-                ("server", ["antfly", "capi"], "LICENSE"),
+            for product, target, steps, license_name in (
+                ("embedded", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
+                ("lite", "aarch64-macos", ["lite"], "LICENSES/Apache-2.0.txt"),
+                ("inference", "aarch64-macos", [], "LICENSES/Apache-2.0.txt"),
+                ("server", "aarch64-macos", ["antfly", "capi"], "LICENSE"),
+                ("server", "aarch64-linux-musl", ["antfly", "capi"], "LICENSE"),
             ):
-                with self.subTest(product=product):
+                with self.subTest(product=product, target=target):
                     subprocess.run(
                         [
                             "bash",
@@ -96,7 +98,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                             "--version",
                             "test",
                             "--target",
-                            "aarch64-macos",
+                            target,
                             "--archive-name",
                             product + ".tar.gz",
                             "--out-dir",
@@ -122,6 +124,14 @@ class ReleaseLicenseTests(unittest.TestCase):
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args
                     )
+                    if target == "aarch64-macos":
+                        self.assertNotIn("--max-rss-cap", args)
+                    else:
+                        self.assertEqual(
+                            args[args.index("--max-rss-cap") + 1], str(20 * 1024**3)
+                        )
+                    self.assertIn("--summary", args)
+                    self.assertEqual(args[args.index("--summary") + 1], "all")
                     if product == "embedded":
                         inference_args = json.loads(
                             (root / "zig/pkg/inference/build-args.json").read_text()
@@ -152,7 +162,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                         for name in (
                             "./scripts/apache_engine_files.txt",
                             "./scripts/embedded_asset_licenses.json",
-                            "./lib/libantfly.dylib",
+                            "./lib/libantfly.dylib"
+                            if target == "aarch64-macos"
+                            else "./lib/libantfly.so",
                             "./lib/pkgconfig/libantfly.pc",
                             "./include/antfly.h",
                         ):
