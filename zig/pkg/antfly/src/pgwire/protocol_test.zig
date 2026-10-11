@@ -22,6 +22,7 @@ const Mock = struct {
     executions: usize = 0,
     lake_log: [32]@import("session_commands.zig").LakeVisibility = undefined,
     lake_count: usize = 0,
+    read_log: [64]@import("session_commands.zig").ReadRequirements = undefined,
     authentications: usize = 0,
     disconnects: usize = 0,
     releases: usize = 0,
@@ -115,6 +116,7 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        self.read_log[self.lake_count] = request.read_requirements;
         self.lake_log[self.lake_count] = request.lake_visibility;
         self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
@@ -199,6 +201,7 @@ const Mock = struct {
         self.observed_setting_epoch = request.setting_epoch;
         self.executions += 1;
         if (std.mem.startsWith(u8, request.statement, "SELECT")) {
+            self.read_log[self.lake_count] = request.read_requirements;
             self.lake_log[self.lake_count] = request.lake_visibility;
             self.lake_count += 1;
         }
@@ -2251,4 +2254,46 @@ test "pgwire driver comment-only ping returns EmptyQueryResponse without backend
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "I"));
     try std.testing.expectEqual(@as(usize, 0), mock.executions);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "E"));
+}
+
+test "pgwire read requirements retain receipts across savepoints and prepared streaming execution" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET antfly.read_requirements = '{\"visibility\":\"accepted\",\"after_write\":{\"table_id\":2,\"object_generation\":3,\"wal_lsn\":10},\"wait_ms\":0}'\x00",
+        "SELECT n FROM t\x00",
+        "BEGIN\x00",
+        "SAVEPOINT saved\x00",
+        "SET LOCAL antfly.read_requirements = '{\"visibility\":\"committed\",\"wait_ms\":100}'\x00",
+        "SELECT n FROM t\x00",
+        "ROLLBACK TO saved\x00",
+        "SELECT n FROM t\x00",
+        "COMMIT\x00",
+        "SHOW antfly.read_requirements\x00",
+        "SHOW antfly.read_visibility\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "pinned", "SELECT n FROM t", false);
+    try bind(&input.writer, "portal", "pinned", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'Q', "RESET ALL\x00");
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'X', "");
+    for ([_]usize{ 0, 5 }) |stream_rows| {
+        var mock: Mock = .{ .stream_rows = stream_rows };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+        try std.testing.expectEqual(@as(usize, 5), mock.lake_count);
+        for ([_]usize{ 0, 2, 3 }) |i| {
+            try std.testing.expectEqual(@as(u64, 10), mock.read_log[i].after_write.?.wal_lsn);
+            try std.testing.expectEqual(@as(?u32, 0), mock.read_log[i].wait_ms);
+        }
+        try std.testing.expect(mock.read_log[1].after_write == null);
+        try std.testing.expectEqual(@as(?u32, 100), mock.read_log[1].wait_ms);
+        try std.testing.expect(mock.read_log[4].after_write == null);
+        try std.testing.expect(mock.read_log[4].visibility == null);
+    }
 }

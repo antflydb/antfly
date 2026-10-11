@@ -154,6 +154,8 @@ export interface WriteOptions {
 }
 
 // SQL types. Integer result values are exact decimal strings.
+export type ReadReceipt = components["schemas"]["ReadReceipt"];
+export type ReadRequirements = components["schemas"]["ReadRequirements"];
 export type SQLRequest = components["schemas"]["SQLRequest"];
 export type SQLConnectionOpenRequest = components["schemas"]["SQLConnectionOpenRequest"];
 export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse"];
@@ -720,3 +722,16 @@ export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogR
 export type ChatGPTAccount = components["schemas"]["ChatGPTAccount"];
 export type ChatGPTBegin = components["schemas"]["ChatGPTBegin"];
 export type ChatGPTOutcome = components["schemas"]["ChatGPTOutcome"];
+
+/** Require a query or SQL read to include an ingestion write receipt. */
+export function readAfterWrite(receipt: ReadReceipt, waitMs = 5000): ReadRequirements {
+  return {
+    visibility: "accepted",
+    after_write: {
+      table_id: receipt.table_id,
+      object_generation: receipt.object_generation,
+      wal_lsn: receipt.wal_lsn,
+    },
+    wait_ms: waitMs,
+  };
+}

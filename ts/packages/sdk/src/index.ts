@@ -378,6 +378,8 @@ export type {
   QueryResult,
   QueryScoreDetails,
   QueryStrategy,
+  ReadReceipt,
+  ReadRequirements,
   RelationalColumnExpression,
   RelationalConstraintConflictReason,
   RelationalConstraintRangeStatus,
@@ -506,6 +508,7 @@ export {
   queryHitsTotalValue,
   queryResultHitsTotal,
   queryResultTotalHits,
+  readAfterWrite,
 } from "./types.js";
 
 // Default export for convenience

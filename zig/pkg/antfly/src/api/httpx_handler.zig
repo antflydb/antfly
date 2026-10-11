@@ -5930,7 +5930,8 @@ pub const AntflyApiHandler = struct {
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
         const Input = struct {
-            lake_visibility: enum { committed, accepted } = .committed,
+            read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null,
+            lake_visibility: ?enum { committed, accepted } = null,
             statement: ?[]const u8 = null,
             parameters: ?[]const std.json.Value = null,
             database: ?[]const u8 = null,
@@ -5946,6 +5947,10 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (request.read_requirements != null and request.lake_visibility != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read_requirements and lake_visibility are mutually exclusive" });
+        const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
+        read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
+        if (mode == .prepare and (request.read_requirements != null or request.lake_visibility != null)) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read requirements belong to execution, not preparation" });
         const statement = request.statement orelse "";
         if (mode == .prepare and statement.len > @import("sql_prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
         if (mode == .statement or mode == .prepare) {
@@ -5991,10 +5996,7 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .lake_visibility = switch (request.lake_visibility) {
-                .committed => .committed,
-                .accepted => .accepted,
-            }, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted or request.lake_visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -12784,6 +12786,10 @@ test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
     try std.testing.expectEqual(@as(?usize, null), transport.router.bodySizeLimit(.POST, "/db/v1/query"));
     const cases = [_]struct { body: []const u8, status: u16, state: []const u8 }{
         .{ .body = "{}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{},\"lake_visibility\":\"accepted\"}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"visibility\":\"published\"}}", .status = 501, .state = "0A000" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"wait_ms\":60001}}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"visibility\":\"accepted\",\"wait_ms\":0}}", .status = 503, .state = "53300" },
         .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"limit\":0}", .status = 400, .state = "22023" },
         .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"session_id\":\"opaque\"}", .status = 400, .state = "22023" },
         .{ .body = "{\"statement\":\"BEGIN\"}", .status = 501, .state = "0A000" },
