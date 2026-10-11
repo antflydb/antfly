@@ -23,7 +23,7 @@ pub const max_key_bytes_per_read = 1024 * 1024;
 pub const Stats = struct { keys: usize = 0, batches: usize = 0 };
 
 pub fn populate(
-    alloc: std.mem.Allocator,
+    caller_alloc: std.mem.Allocator,
     txn: anytype,
     prefixes: []const ?[]const u8,
     nodes: []const []const u8,
@@ -32,9 +32,76 @@ pub fn populate(
     std.debug.assert(prefixes.len == columns.len);
     for (columns) |column| {
         std.debug.assert(column.len == nodes.len);
-        @memset(column, null);
     }
+    errdefer for (columns) |column| @memset(column, null);
     if (nodes.len == 0) return .{};
+    var has_prefix = false;
+    for (prefixes) |prefix| if (prefix != null) {
+        has_prefix = true;
+        break;
+    };
+    if (!has_prefix) {
+        for (columns) |column| @memset(column, null);
+        return .{};
+    }
+    const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
+    const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(caller_alloc))).error_union.payload else void;
+    // Probe-only wrappers expose the method but cannot open a pinned scope.
+    // Keep their existing batched view, and propagate allocation/storage errors.
+    var scope: ?Scope = if (scoped) txn.openReadScope(caller_alloc) catch |err|
+        (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
+    defer if (scoped) {
+        if (scope) |*active| active.close();
+    };
+    if (comptime scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
+        if (scope) |*active| {
+            const supported = if (comptime @hasDecl(Scope, "supportsScoreVisitor")) active.supportsScoreVisitor() else true;
+            if (supported) if (active.preparedScorePlan()) |plan| {
+                const prepared = plan.prepare(active.preparedScoreAllocator(), prefixes, nodes) catch false;
+                if (prepared) prepared_read: {
+                    var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+                    const complete = if (comptime @hasDecl(Scope, "visitPreparedScores"))
+                        (if (comptime @hasDecl(Scope, "supportsPreparedScores")) active.supportsPreparedScores() else true)
+                    else
+                        false;
+                    if (complete) {
+                        for (columns, prefixes) |column, prefix| if (prefix == null) {
+                            @memset(column, null);
+                        };
+                    } else {
+                        for (columns) |column| @memset(column, null);
+                    }
+                    const read = if (comptime @hasDecl(Scope, "visitPreparedScores"))
+                        (if (complete) active.visitPreparedScores(plan, output.completeSink()) else active.visitManySortedScores(plan.read_keys, output.sink()))
+                    else
+                        active.visitManySortedScores(plan.read_keys, output.sink());
+                    read catch |err| switch (@as(anyerror, err)) {
+                        error.OutOfMemory, error.ResourceBudgetExceeded => {
+                            // Prepared ownership must not raise the minimum
+                            // memory needed by the streaming read path.
+                            plan.deinit();
+                            // A failed read may leave scratch capacity in this
+                            // scope. Close it before admitting the streaming retry.
+                            active.close();
+                            scope = null;
+                            scope = try txn.openReadScope(caller_alloc);
+                            for (columns) |column| @memset(column, null);
+                            break :prepared_read;
+                        },
+                        else => return err,
+                    };
+                    return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1 };
+                } else {
+                    // Plan construction itself can fail after partial work.
+                    active.close();
+                    scope = null;
+                    scope = try txn.openReadScope(caller_alloc);
+                }
+            };
+        }
+    }
+    for (columns) |column| @memset(column, null);
+    const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
     defer alloc.free(physical);
     var physical_count: usize = 0;
@@ -90,24 +157,21 @@ pub fn populate(
     const batch_capacity = @min(total, max_keys_per_read);
     const read_keys = try alloc.alloc([]const u8, batch_capacity);
     defer alloc.free(read_keys);
-    const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
-    const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(alloc))).error_union.payload else void;
-    // Probe-only wrappers expose the method but cannot open a pinned scope.
-    // Keep their existing batched view, and propagate allocation/storage errors.
-    var scope: ?Scope = if (scoped) txn.openReadScope(alloc) catch |err|
-        (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
-    defer if (scoped) {
-        if (scope) |*active| active.close();
-    };
     const direct = comptime if (scoped) @hasDecl(Scope, "getManySortedInto") else false;
-    const use_buffers = direct and scope != null;
+    const visitor_direct = comptime if (scoped) @hasDecl(Scope, "visitManySortedScores") else false;
+    const use_visitor = visitor_direct and scope != null and (if (comptime scoped and @hasDecl(Scope, "supportsScoreVisitor")) scope.?.supportsScoreVisitor() else true);
+    const score_direct = comptime if (scoped) @hasDecl(Scope, "getManySortedScores") else false;
+    const use_scores = !use_visitor and score_direct and scope != null and (if (comptime scoped and @hasDecl(Scope, "supportsDirectScores")) scope.?.supportsDirectScores() else true);
+    const decoded_scores: []?f64 = if (use_scores) try alloc.alloc(?f64, batch_capacity) else &.{};
+    defer if (use_scores) alloc.free(decoded_scores);
+    const use_buffers = !use_visitor and !use_scores and direct and scope != null and (if (comptime scoped and @hasDecl(Scope, "supportsDirectBatchInto")) scope.?.supportsDirectBatchInto() else true);
     const score_buffers: [][8]u8 = if (use_buffers) try alloc.alloc([8]u8, batch_capacity) else &.{};
     defer if (use_buffers) alloc.free(score_buffers);
     const output_buffers: [][]u8 = if (use_buffers) try alloc.alloc([]u8, batch_capacity) else &.{};
     defer if (use_buffers) alloc.free(output_buffers);
     for (score_buffers, output_buffers) |*buffer, *out| out.* = buffer;
-    const read_values = try alloc.alloc(?[]const u8, batch_capacity);
-    defer alloc.free(read_values);
+    const read_values: []?[]const u8 = if (!use_visitor and !use_scores) try alloc.alloc(?[]const u8, batch_capacity) else &.{};
+    defer if (!use_visitor and !use_scores) alloc.free(read_values);
     var key_bytes = std.ArrayListUnmanaged(u8).empty;
     defer key_bytes.deinit(alloc);
     var stats = Stats{ .keys = total };
@@ -135,22 +199,44 @@ pub fn populate(
             try keys.appendEncodedComponent(&key_bytes, alloc, nodes[unique[flat % unique_count]]);
             key.* = key_bytes.items[start..];
         }
-        @memset(read_values[0..len], null);
-        if (scoped and scope != null) {
-            if (direct) {
-                scope.?.getManySortedInto(read_keys[0..len], output_buffers[0..len], read_values[0..len]) catch |err| switch (err) {
-                    error.BufferTooSmall => return error.InvalidGraphMetricScore,
-                    else => return err,
-                };
-            } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
-        } else try txn.getManySorted(read_keys[0..len], read_values[0..len]);
-        for (read_values[0..len], 0..) |maybe_raw, i| {
-            const raw = maybe_raw orelse continue;
-            if (raw.len != 8) return error.InvalidGraphMetricScore;
-            const score: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .little));
-            if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
-            const flat = offset + i;
-            columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+        if (visitor_direct and use_visitor) {
+            const Output = struct {
+                columns: []const []?f64,
+                owners: []const usize,
+                unique: []const usize,
+                offset: usize,
+                fn write(ctx: *anyopaque, index: usize, score: f64) void {
+                    const out: *@This() = @ptrCast(@alignCast(ctx));
+                    const flat = out.offset + index;
+                    out.columns[out.owners[flat / out.unique.len]][out.unique[flat % out.unique.len]] = score;
+                }
+            };
+            var output = Output{ .columns = columns, .owners = owners[0..owner_count], .unique = unique, .offset = offset };
+            try scope.?.visitManySortedScores(read_keys[0..len], .{ .context = &output, .write = Output.write });
+        } else if (score_direct and use_scores) {
+            try scope.?.getManySortedScores(read_keys[0..len], decoded_scores[0..len]);
+            for (decoded_scores[0..len], 0..) |score, i| {
+                const flat = offset + i;
+                columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+            }
+        } else {
+            @memset(read_values[0..len], null);
+            if (scoped and scope != null) {
+                if (direct) {
+                    if (use_buffers) scope.?.getManySortedInto(read_keys[0..len], output_buffers[0..len], read_values[0..len]) catch |err| switch (@as(anyerror, err)) {
+                        error.BufferTooSmall => return error.InvalidGraphMetricScore,
+                        else => return err,
+                    } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
+                } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
+            } else try txn.getManySorted(read_keys[0..len], read_values[0..len]);
+            for (read_values[0..len], 0..) |maybe_raw, i| {
+                const raw = maybe_raw orelse continue;
+                if (raw.len != 8) return error.InvalidGraphMetricScore;
+                const score: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .little));
+                if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
+                const flat = offset + i;
+                columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+            }
         }
         if (scoped and @hasDecl(Scope, "reset")) {
             if (scope) |*active| {
@@ -340,4 +426,66 @@ test "graph metric physical score reads preserve probe-only and legacy scope fal
     var legacy = Legacy{};
     _ = try populate(std.testing.allocator, &legacy, &.{"p/"}, &.{ "b", "a" }, &.{&scores});
     try std.testing.expectEqualSlices(?f64, &.{ 4, 4 }, &scores);
+}
+
+test "graph metric physical score reads respect erased direct capability" {
+    const erased = @import("../storage/backend_erased.zig");
+    const Borrowed = struct {
+        raw: [8]u8 = @bitCast(@as(f64, 7)),
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return &self.raw;
+        }
+        pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+            for (values) |*value| value.* = &self.raw;
+        }
+        pub fn reset(_: *@This()) void {}
+        pub fn close(_: *@This()) void {}
+    };
+    const Txn = struct {
+        pub fn openReadScope(_: *@This(), a: std.mem.Allocator) !erased.ReadScope {
+            return erased.readScopeFrom(a, Borrowed{});
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var txn = Txn{};
+    var scope = try txn.openReadScope(std.testing.allocator);
+    defer scope.close();
+    try std.testing.expect(!scope.supportsDirectBatchInto());
+    var columns: [2]?f64 = undefined;
+    _ = try populate(std.testing.allocator, &txn, &.{"p/"}, &.{ "a", "b" }, &.{&columns});
+    try std.testing.expectEqualSlices(?f64, &.{ 7, 7 }, &columns);
+    // Presence of the method is insufficient: a copying adapter may expose it.
+    const DirectOffTxn = struct {
+        const Scope = struct {
+            borrowed: Borrowed = .{},
+            pub fn supportsDirectBatchInto(_: *const @This()) bool {
+                return false;
+            }
+            pub fn getManySorted(self: *@This(), keys_: []const []const u8, values: []?[]const u8) !void {
+                return self.borrowed.getManySorted(keys_, values);
+            }
+            pub fn getManySortedInto(_: *@This(), _: []const []const u8, _: []const []u8, _: []?[]const u8) !void {
+                return error.TestUnexpectedResult;
+            }
+            pub fn reset(_: *@This()) void {}
+            pub fn close(_: *@This()) void {}
+        };
+        pub fn openReadScope(_: *@This(), _: std.mem.Allocator) !Scope {
+            return .{};
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var direct_off = DirectOffTxn{};
+    _ = try populate(std.testing.allocator, &direct_off, &.{"p/"}, &.{ "a", "b" }, &.{&columns});
+    try std.testing.expectEqualSlices(?f64, &.{ 7, 7 }, &columns);
+    // The public portable API still copies into caller buffers when requested.
+    var slots: [2][8]u8 = undefined;
+    var copied: [2]?[]const u8 = undefined;
+    try scope.getManySortedInto(&.{ "a", "b" }, &.{ &slots[0], &slots[1] }, &copied);
+    try scope.reset();
+    for (copied, &slots) |value, *slot| try std.testing.expectEqual(slot.ptr, value.?.ptr);
 }
