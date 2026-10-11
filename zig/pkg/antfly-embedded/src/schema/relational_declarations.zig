@@ -21,6 +21,28 @@ const schema = @import("table_schema_impl.zig");
 const native = @import("../storage/schema.zig");
 const catalog = @import("../storage/db/relational_integrity_catalog.zig");
 
+/// Coverage is explicit in durable plans; legacy entries retain their identity.
+pub const CatalogCoverage = enum { legacy, checks_v1 };
+
+pub fn compileCatalog(alloc: std.mem.Allocator, parsed: schema.TableSchema, table_id: u64, previous: ?[]const u8) !catalog.Update {
+    return compileCatalogWithCoverage(alloc, parsed, table_id, previous, .checks_v1);
+}
+
+pub fn compileCatalogWithCoverage(alloc: std.mem.Allocator, parsed: schema.TableSchema, table_id: u64, previous: ?[]const u8, coverage: CatalogCoverage) !catalog.Update {
+    const schema_api = @import("mod.zig");
+    const native_schema = native;
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer native_schema.freeSchema(alloc, runtime);
+    const bytes = try native_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    const definitions = try definitionFingerprints(alloc, parsed, runtime);
+    defer freeDefinitions(alloc, definitions);
+    const checks_digest = if (coverage == .checks_v1) try checksFingerprint(alloc, parsed) else @as([32]u8, @splat(0));
+    return catalog.prepareWithChecks(alloc, previous, try catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions, checks_digest);
+}
+
 /// Compile only CHECKs, using the exact layout/compiler used by the owner
 /// validator. No row parsing or full property/regex validator is needed.
 pub fn checksFingerprint(alloc: std.mem.Allocator, public: schema.TableSchema) ![32]u8 {

@@ -6072,6 +6072,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&run_index_publication_progress_tests.step);
     db_test_step.dependOn(&run_index_publication_progress_tests.step);
     unit_test_step.dependOn(&run_index_publication_progress_tests.step);
+    const native_index_candidate_mod = makeLmdbModule(b, "pkg/antfly-embedded/src/relational_index_candidate_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    antfly_imports.configureEmbedded(b, native_index_candidate_mod, true);
+    antfly_imports.storage_boundary.configureSources(native_index_candidate_mod, false, false);
+    const native_index_candidate_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index candidate", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const native_index_candidate_run = addFilteredTestRunArtifact(b, native_index_candidate_tests);
+    b.step("relational-index-candidate-test", "Verify native private UNIQUE candidate compilation without server dependencies")
+        .dependOn(&native_index_candidate_run.step);
+    db_test_step.dependOn(&native_index_candidate_run.step);
+    unit_test_step.dependOn(&native_index_candidate_run.step);
+    const native_index_catalog_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{ "relational index catalog", "relational index private addition" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("relational-index-catalog-test", "Verify native ordered catalog allocation, recovery and private reservation contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, native_index_catalog_tests).step);
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },

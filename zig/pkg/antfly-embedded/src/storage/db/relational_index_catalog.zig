@@ -407,6 +407,53 @@ pub fn bindWritePlan(alloc: Allocator, view: registry.SchemaView, loaded: *const
     return try plans.View.init(alloc, view, definitions);
 }
 
+/// Unpublished ordered-index addition. Reservation advances only the durable
+/// physical allocation clock; active definitions and schema stay unchanged.
+/// The owner must independently fence/drain and stage this with its integrity
+/// allocation, job binding and outbox, then refresh the active snapshot head
+/// under the same apply barrier after commit. This is not publication authority.
+pub const PrivateAddition = struct {
+    reservation: Prepared,
+    candidate: Prepared,
+    plan: plans.View,
+    index: native.RelationalIndexId,
+
+    pub fn deinit(self: *PrivateAddition) void {
+        self.plan.release();
+        self.candidate.deinit();
+        self.reservation.deinit();
+        self.* = undefined;
+    }
+
+    pub fn init(alloc: Allocator, before: registry.SchemaView, after: registry.SchemaView, previous: ?*const Loaded, definitions: []const native.RelationalIndexDefinition, name: []const u8) !PrivateAddition {
+        if (after.version() != (std.math.add(u32, before.version(), 1) catch return error.InvalidPrivateRelationalIndexAddition)) return error.InvalidPrivateRelationalIndexAddition;
+        const old_entries = if (previous) |loaded| loaded.entries() else &.{};
+        if (definitions.len != old_entries.len + 1) return error.InvalidPrivateRelationalIndexAddition;
+        for (old_entries) |entry| if (std.mem.eql(u8, entry.definition.name, name)) return error.InvalidPrivateRelationalIndexAddition;
+        const active_definitions = try alloc.alloc(native.RelationalIndexDefinition, old_entries.len);
+        defer alloc.free(active_definitions);
+        for (old_entries, active_definitions) |entry, *definition| definition.* = entry.definition;
+        var reservation = try Prepared.init(alloc, before, previous, active_definitions);
+        errdefer reservation.deinit();
+        if (previous) |loaded| if (!reservation.head.eql(loaded.head)) return error.RelationalIndexCatalogSchemaMismatch;
+        var active = try decode(alloc, reservation.head, reservation.blob);
+        defer active.deinit();
+        var candidate = try Prepared.init(alloc, after, &active, definitions);
+        errdefer candidate.deinit();
+        var next = try decode(alloc, candidate.head, candidate.blob);
+        defer next.deinit();
+        const addition = next.find(name) orelse return error.InvalidPrivateRelationalIndexAddition;
+        if (candidate.retired.len != 0 or addition.generation != candidate.head.revision or
+            candidate.head.revision <= reservation.head.revision) return error.InvalidPrivateRelationalIndexAddition;
+        // Burn the candidate ID without selecting its blob/schema. Cancellation
+        // must retain this head revision; subsequent attempts allocate above it.
+        reservation.head.revision = candidate.head.revision;
+        candidate.expected = reservation.head;
+        const plan = try bindWritePlan(alloc, after, &next);
+        return .{ .reservation = reservation, .candidate = candidate, .plan = plan, .index = addition.id() };
+    }
+};
+
 pub const PreparedPublication = struct {
     owner: *Controller,
     metadata: Prepared,
@@ -733,6 +780,173 @@ const test_definitions = [_]native.RelationalIndexDefinition{
     .{ .name = "b_label", .owner_kind = .table, .owner_name = native.relational_table_index_owner_name, .access_method = .ordered_tuple, .unique = true, .include_columns = &.{"id"}, .keys = &.{.{ .column = "label", .direction = .desc, .nulls = .last, .collation = "ci" }}, .where = &.{.{ .field = "label", .op = .is_not_null }} },
 };
 
+fn testPrivateAdditionTransaction(comptime Backend: type) !void {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "private-index" });
+    defer runtime.deinit();
+    var store = try DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    _ = try schema.saveSchema(&store, a, test_schema);
+    var before_registry = try registry.Registry.initCloned(a, std.testing.io, test_schema);
+    defer before_registry.deinit();
+    var before = before_registry.acquire().?;
+    defer before.release();
+    var next_schema = test_schema;
+    next_schema.version += 1;
+    var after_registry = try registry.Registry.initCloned(a, std.testing.io, next_schema);
+    defer after_registry.deinit();
+    var after = after_registry.acquire().?;
+    defer after.release();
+    // Routed UNIQUE claims are a separate integrity-catalog responsibility.
+    // Keep the legacy native unique flag unsupported by ordinary write plans.
+    var definitions = test_definitions;
+    definitions[1].unique = false;
+    {
+        var bootstrap = try PrivateAddition.init(a, before, after, null, definitions[1..], "b_label");
+        defer bootstrap.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try bootstrap.reservation.stage(&txn));
+        var active = (try load(a, &txn)).?;
+        defer active.deinit();
+        try std.testing.expectEqual(@as(usize, 0), active.entries().len);
+        try std.testing.expectEqual(before.version(), active.head.schema_version);
+    }
+    var initial = try Prepared.init(a, before, null, test_definitions[0..1]);
+    defer initial.deinit();
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try initial.stage(&txn);
+        try txn.commit();
+    }
+    var old = try decode(a, initial.head, initial.blob);
+    defer old.deinit();
+    try std.testing.expectError(error.InvalidPrivateRelationalIndexAddition, PrivateAddition.init(a, before, before, &old, &definitions, "b_label"));
+    try std.testing.expectError(error.InvalidPrivateRelationalIndexAddition, PrivateAddition.init(a, before, after, &old, definitions[0..1], "b_label"));
+    var altered = definitions;
+    altered[0].keys = &.{.{ .column = "label" }};
+    try std.testing.expectError(error.InvalidPrivateRelationalIndexAddition, PrivateAddition.init(a, before, after, &old, &altered, "b_label"));
+    var first = try PrivateAddition.init(a, before, after, &old, &definitions, "b_label");
+    defer first.deinit();
+    var stale = try PrivateAddition.init(a, before, after, &old, &definitions, "b_label");
+    defer stale.deinit();
+    const outbox = "\x00\x00__metadata__:private_index_test_outbox";
+    {
+        // Reservation and caller-owned outbox disappear together on abort.
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try first.reservation.stage(&txn));
+        try txn.put(outbox, "pending");
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(initial.head.eql(try Head.decode(try txn.get(head_key))));
+        try std.testing.expectError(error.NotFound, txn.get(outbox));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try first.reservation.stage(&txn));
+        try std.testing.expect(!try first.reservation.stage(&txn));
+        try txn.put(outbox, "reserved");
+        try txn.commit();
+    }
+    var reserved = blk: {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        break :blk (try load(a, &txn)).?;
+    };
+    defer reserved.deinit();
+    try std.testing.expect(reserved.find("b_label") == null);
+    try std.testing.expectEqual(before.version(), reserved.head.schema_version);
+    try std.testing.expectEqual(initial.head.revision + 1, reserved.head.revision);
+    try std.testing.expectEqual(old.find("a_id").?.id().mapKey(), reserved.find("a_id").?.id().mapKey());
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.RelationalIndexCatalogSchemaMismatch, first.candidate.stage(&txn));
+    }
+    // Cancellation keeps the allocation head; a retry gets disjoint tuple IDs.
+    var retry = try PrivateAddition.init(a, before, after, &reserved, &definitions, "b_label");
+    defer retry.deinit();
+    try std.testing.expect(retry.index.generation > first.index.generation);
+    try std.testing.expectEqual(retry.index.mapKey(), retry.plan.boundIndexes()[1].id().mapKey());
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retry.reservation.stage(&txn);
+        try txn.commit();
+    }
+    const after_bytes = try schema.serializeSchema(a, after.tableSchema().*);
+    defer a.free(after_bytes);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        // The second burn is a genuinely different predecessor. Identical
+        // catalog bytes are only a replay, never independent job authority.
+        try std.testing.expectError(error.PreparedGenerationChanged, stale.reservation.stage(&txn));
+        try txn.put(schema.schema_key, after_bytes);
+        try std.testing.expectError(error.PreparedGenerationChanged, first.candidate.stage(&txn));
+    }
+    {
+        // Component-only installation CAS: real owner execution additionally
+        // requires authenticated validation and a metadata publication decision.
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(schema.schema_key, after_bytes);
+        try std.testing.expect(try retry.candidate.stage(&txn));
+        try txn.commit();
+    }
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    var published = (try load(a, &txn)).?;
+    defer published.deinit();
+    try std.testing.expectEqual(after.version(), published.head.schema_version);
+    try std.testing.expectEqual(retry.index.mapKey(), published.find("b_label").?.id().mapKey());
+    try std.testing.expectEqual(old.find("a_id").?.id().mapKey(), published.find("a_id").?.id().mapKey());
+}
+
+test "relational index private addition burns physical IDs without publishing and preserves atomic CAS on memory and LSM" {
+    try testPrivateAdditionTransaction(@import("../mem_backend.zig").Backend);
+    try testPrivateAdditionTransaction(@import("../lsm_backend.zig").Backend);
+}
+
+fn testPrivateAdditionAllocations(alloc: Allocator, before: registry.SchemaView, after: registry.SchemaView, old: *const Loaded) !void {
+    var definitions = test_definitions;
+    definitions[1].unique = false;
+    var addition = try PrivateAddition.init(alloc, before, after, old, &definitions, "b_label");
+    defer addition.deinit();
+    try std.testing.expect(old.head.eql(addition.reservation.expected.?));
+    try std.testing.expect(addition.reservation.head.eql(addition.candidate.expected.?));
+    try std.testing.expectEqual(addition.candidate.head.revision, addition.index.generation);
+    try std.testing.expectEqual(after.version(), addition.plan.schemaView().version());
+}
+
+test "relational index private addition cleans every allocation failure" {
+    const alloc = std.testing.allocator;
+    var before_registry = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    defer before_registry.deinit();
+    var before = before_registry.acquire().?;
+    defer before.release();
+    var next_schema = test_schema;
+    next_schema.version += 1;
+    var after_registry = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    defer after_registry.deinit();
+    var after = after_registry.acquire().?;
+    defer after.release();
+    var prepared = try Prepared.init(alloc, before, null, test_definitions[0..1]);
+    defer prepared.deinit();
+    var old = try decode(alloc, prepared.head, prepared.blob);
+    defer old.deinit();
+    try testPrivateAdditionAllocations(alloc, before, after, &old);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testPrivateAdditionAllocations, .{ before, after, &old });
+}
+
 fn testCodecAllocations(alloc: Allocator) !void {
     var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
     defer schemas.deinit();
@@ -757,7 +971,7 @@ fn testCodecAllocations(alloc: Allocator) !void {
 
 test "relational index catalog preserves full definitions and cleans every allocation failure" {
     try testCodecAllocations(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCodecAllocations, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCodecAllocations, .{});
 }
 
 test "relational index catalog definitions exclude mutable generation progress" {

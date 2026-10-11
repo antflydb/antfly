@@ -1466,3 +1466,62 @@ tests, zero skips/failures/leaks. The expanded recovery campaign covers 24 fault
 variants. Formatting, diff and control-source catalog freshness checks pass.
 These scoped results do not establish native owner support, public UNIQUE
 atomicity or completion of any additional SQL inventory case.
+
+### Shared native candidate compilation and physical allocation
+
+Private index candidate validation now lives in the native storage layer.
+Metadata uses a thin alias to the same implementation. CHECK-aware/legacy
+catalog compilation and bounded structural JSON equality are also shared;
+coverage tags and serialized identities retain their prior semantics. A
+standalone native test root directly imports the compiler without server
+metadata imports. The candidate gate is included in the storage/unit aggregates.
+The four original candidate cases moved with the implementation; an additional
+ownership test frees all request input buffers before inspecting and preparing
+publication from the resulting catalogs. Running them in two contexts is not
+two sets of SQL inventory credits.
+
+`relational_index_catalog.PrivateAddition` prepares an owned, unpublished
+physical plan and two catalog stages. Reservation preserves the old schema,
+definition blob and existing tuple IDs, but advances the durable head revision
+past the new candidate's physical generation. The candidate installation stage
+CASes against that exact reserved head. A canceled attempt retains the head
+revision, so a retry cannot reuse its tuple IDs even if cleanup is delayed.
+This uses the existing catalog format rather than a separate allocation service.
+First-index bootstrap reserves an empty active catalog, not a prematurely
+visible candidate definition.
+
+Preparation rejects an invalid schema epoch, a missing/extra addition, or a
+change/removal of existing physical bindings. It retains the candidate schema
+view and executable plan independently of request memory. Legacy native UNIQUE
+descriptor flags remain unsupported by ordinary write plans; SQL uniqueness is
+still the separate routed integrity-rule responsibility. No guard was relaxed
+to bind private tuples.
+
+Real memory/LSM transaction tests cover reservation/outbox abort, exact replay,
+unchanged public definitions and schema, first-index bootstrap, canceled retry
+generation nonreuse, stale reservation/installation rejection and component-only
+installation from the reserved predecessor. Equal catalog bytes are replay,
+not authenticated job ownership: the future owner operation must independently
+check its durable job/fence before staging both integrity and physical burns,
+the job record and outbox in one transaction. It must refresh the active runtime
+snapshot head after commit under the same apply barrier. This preparation API
+does not enable private execution or grant public publication authority.
+
+Remaining native work includes the durable fenced owner binding/receipts,
+private projected-page execution, distributed UNIQUE claims, authenticated
+metadata decisions, bounded cancellation cleanup and the public SQL producer.
+The known failed regular UNIQUE-build atomicity regression remains open.
+
+Qualification passes all six focused gates in Debug and ReleaseFast: seven
+native candidate/private-addition tests, thirteen native catalog tests, five
+metadata candidate tests, six FK tests, ten publication tests plus one decoder
+floor test, and fifty namespace/recovery tests. Each run completed 92 build
+steps with zero skips, failures or leaks. Shared cases execute in multiple gates;
+these are not additional SQL inventory credits or a full-suite qualification.
+
+The private-addition test exhaustively exercises allocation failures. A
+pre-existing catalog allocation campaign was nondeterministic in ReleaseFast
+because allocator remapping changed allocation counts. It now uses the existing
+platform stable allocation-failure helper, as the adjacent publication campaign
+already does. Successful normal-allocator coverage, OOM propagation and leak
+assertions remain intact; no test was skipped or weakened.

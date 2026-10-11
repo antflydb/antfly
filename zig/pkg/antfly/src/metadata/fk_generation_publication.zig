@@ -29,7 +29,7 @@ pub const max_owners = 4096;
 pub const max_constraints = 128;
 pub const max_bytes = 2 * 1024 * 1024;
 /// Explicit in durable plans/commands: never reinterpret legacy Raft entries.
-pub const CatalogCoverage = enum { legacy, checks_v1 };
+pub const CatalogCoverage = @import("antfly_local_sources").schema_relational_declarations.CatalogCoverage;
 
 fn writeCoverageFields(value: anytype, writer: anytype) !void {
     try writer.beginObject();
@@ -1310,25 +1310,8 @@ fn foreignParent(foreign: anytype, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn compileCatalog(alloc: std.mem.Allocator, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, table_id: u64, previous: ?[]const u8) !integrity_catalog.Update {
-    return compileCatalogWithCoverage(alloc, parsed, table_id, previous, .checks_v1);
-}
-
-pub fn compileCatalogWithCoverage(alloc: std.mem.Allocator, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, table_id: u64, previous: ?[]const u8, coverage: CatalogCoverage) !integrity_catalog.Update {
-    const schema_api = @import("antfly_local_sources").schema_mod;
-    const native_schema = @import("antfly_local_sources").storage_schema;
-    const declarations = @import("antfly_local_sources").schema_relational_declarations;
-    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer native_schema.freeSchema(alloc, runtime);
-    const bytes = try native_schema.serializeSchema(alloc, runtime);
-    defer alloc.free(bytes);
-    var digest: Digest = undefined;
-    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
-    const definitions = try declarations.definitionFingerprints(alloc, parsed, runtime);
-    defer declarations.freeDefinitions(alloc, definitions);
-    const checks_digest = if (coverage == .checks_v1) try declarations.checksFingerprint(alloc, parsed) else @as(Digest, @splat(0));
-    return integrity_catalog.prepareWithChecks(alloc, previous, try integrity_catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions, checks_digest);
-}
+pub const compileCatalog = @import("antfly_local_sources").schema_relational_declarations.compileCatalog;
+pub const compileCatalogWithCoverage = @import("antfly_local_sources").schema_relational_declarations.compileCatalogWithCoverage;
 
 /// Canonical helper for the API plan builder. Names in the returned slice are
 /// owned by `alloc`; a request arena can release them with the full plan.
