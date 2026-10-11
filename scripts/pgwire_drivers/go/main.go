@@ -45,6 +45,23 @@ func main() {
 			panic(got)
 		}
 	}
+	cached, err := pool.Acquire(ctx)
+	check(err)
+	_, err = cached.Exec(ctx, "CREATE TABLE cached_pgx (id TEXT PRIMARY KEY, n BIGINT)")
+	check(err)
+	_, err = cached.Exec(ctx, "INSERT INTO cached_pgx (id, n) VALUES ('a', 1)")
+	check(err)
+	query := "SELECT n FROM cached_pgx WHERE id = $1"
+	check(cached.QueryRow(ctx, query, "a").Scan(&n))
+	for _, ddl := range []string{"ALTER TABLE cached_pgx ADD COLUMN note TEXT", "CREATE INDEX cached_pgx_n ON cached_pgx(n)"} {
+		_, err = pool.Exec(ctx, ddl)
+		check(err)
+		check(cached.QueryRow(ctx, query, "a").Scan(&n))
+		if n != 1 {
+			panic(n)
+		}
+	}
+	cached.Release()
 	tx, err := pool.Begin(ctx)
 	check(err)
 	check(tx.QueryRow(ctx, "SELECT 1").Scan(&n))
@@ -63,6 +80,25 @@ func main() {
 	check(stmt.QueryRowContext(ctx, int64(42)).Scan(&n))
 	if n != 42 {
 		panic(n)
+	}
+	ddlconn, err := db.Conn(ctx)
+	check(err)
+	defer ddlconn.Close()
+	_, err = ddlconn.ExecContext(ctx, "CREATE TABLE cached_stdlib (id TEXT PRIMARY KEY, n BIGINT)")
+	check(err)
+	_, err = ddlconn.ExecContext(ctx, "INSERT INTO cached_stdlib (id, n) VALUES ('a', 1)")
+	check(err)
+	migrationStmt, err := db.PrepareContext(ctx, "SELECT n FROM cached_stdlib WHERE id = $1")
+	check(err)
+	defer migrationStmt.Close()
+	check(migrationStmt.QueryRowContext(ctx, "a").Scan(&n))
+	for _, ddl := range []string{"ALTER TABLE cached_stdlib ADD COLUMN note TEXT", "CREATE INDEX cached_stdlib_n ON cached_stdlib(n)"} {
+		_, err = ddlconn.ExecContext(ctx, ddl)
+		check(err)
+		check(migrationStmt.QueryRowContext(ctx, "a").Scan(&n))
+		if n != 1 {
+			panic(n)
+		}
 	}
 	sqltx, err := db.BeginTx(ctx, nil)
 	check(err)

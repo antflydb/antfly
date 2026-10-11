@@ -3521,6 +3521,34 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
+    /// Bootstrap the same durable publication protocol used by background rounds
+    /// before any public listener can admit work. No readiness sleep or synthetic
+    /// authority: restart must publish the current persisted source cut as well.
+    fn awaitInitialRelationPublication(self: *LocalStandaloneMetadata, io: std.Io, cancellation: antfly.common.runtime_lifecycle.CancellationToken) !void {
+        if (!self.standaloneRelationPublicationSupported()) return;
+        const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
+        while (true) {
+            try cancellation.check();
+            try self.reconcileRelations();
+            const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
+            if (work.published_epoch) |published| {
+                if (work.root != null and work.epoch != null and published.eql(work.epoch.?)) return;
+            }
+            // Bounded pages and the control cadence make total publication
+            // time proportional to catalog size. Keep waiting through healthy
+            // progress and transient resource pressure; only a terminal error
+            // for this exact source epoch should fail startup.
+            if (work.current) |state| if (work.epoch) |epoch| {
+                if (state.epoch.eql(epoch)) switch (state.failure) {
+                    .none => {},
+                    .name_conflict => return error.CatalogAlreadyExists,
+                    .source_limit => return error.CatalogCommandTooLarge,
+                };
+            };
+            try io.sleep(.fromMilliseconds(20), .awake);
+        }
+    }
+
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
@@ -5347,6 +5375,10 @@ pub fn runFromIterator(
     defer if (user_manager) |*users| {
         users.personal_grant_revoker = null;
     };
+
+    // Root adoption and startup migrations above can change the catalog source.
+    // Publish their final cut before DataServer can initialize any API listener.
+    try local_metadata.awaitInitialRelationPublication(setup_io.io(), termination_signals.token());
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
@@ -15036,4 +15068,67 @@ test "system catalog standalone relation coordinator names-only cuts do not requ
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "second" } });
     try metadata.reloadLifecycleProjectionLocked();
     try std.testing.expectError(error.CatalogGenerationChanged, metadata.resolveAllocationNamesLocked(alloc, .{}, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = cut.relation_epoch }));
+}
+
+test "system catalog standalone relation coordinator startup publishes empty and persisted cuts before admission" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        const targets = [_]system_catalog.RelationTarget{.{ .name = "startup_idx" }};
+        const resolved = try metadata.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets });
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolved.relations[0] == null);
+        const table: antfly.metadata.TableRecord = .{
+            .table_id = 7,
+            .name = "persisted",
+            .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"startup_idx\",\"keys\":[{\"column\":\"id\"}]}]}",
+            .indexes_json = "{}",
+        };
+        try metadata.lifecycle_store.?.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = table });
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    try reopened.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+    const targets = [_]system_catalog.RelationTarget{.{ .name = "startup_idx" }};
+    const resolved = try reopened.lifecycle_store.?.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, .{ .relations = &targets });
+    defer resolved.deinit(alloc);
+    try std.testing.expect(resolved.relations[0] != null);
+    // Cancellation remains effective even when a live root already exists.
+    cancellation.cancel();
+    try std.testing.expectError(error.Cancelled, reopened.awaitInitialRelationPublication(std.testing.io, cancellation.token()));
+}
+
+test "system catalog standalone relation coordinator startup surfaces terminal source errors" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const store = metadata.lifecycle_store.?;
+    for (7..9) |id| try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = .{ .table_id = id, .name = "duplicate" } });
+    var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+    cancellation.cancel();
+    const before = try store.standaloneRevision();
+    try std.testing.expectError(error.Cancelled, metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token()));
+    try std.testing.expectEqual(before, try store.standaloneRevision());
+    cancellation.cancelled.store(false, .release);
+    try std.testing.expectError(error.CatalogAlreadyExists, metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token()));
+    const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
+    try std.testing.expect(work.published_epoch == null);
+    try std.testing.expectEqual(.name_conflict, work.current.?.failure);
 }

@@ -22,6 +22,60 @@ import uuid
 import psycopg
 
 
+def exercise_sql_cached_plans(conn):
+    # Use a connection with no driver-managed cache: psycopg DEALLOCATE ALL on
+    # ALTER would otherwise also remove this manually managed SQL statement.
+    with psycopg.ClientCursor(conn) as cursor:
+        cursor.execute(
+            "CREATE TABLE cached_sql (id TEXT PRIMARY KEY, n BIGINT NOT NULL)"
+        )
+        cursor.execute("INSERT INTO cached_sql (id, n) VALUES ('a', 1)")
+        cursor.execute(
+            "PREPARE cached_sql_plan AS SELECT id, n FROM cached_sql WHERE n = $1"
+        )
+        cursor.execute("EXECUTE cached_sql_plan(1)")
+        assert cursor.fetchone() == ("a", 1)
+        cursor.execute("ALTER TABLE cached_sql ADD COLUMN note TEXT")
+        cursor.execute("EXECUTE cached_sql_plan(1)")
+        assert cursor.fetchone() == ("a", 1)
+        cursor.execute("CREATE INDEX cached_sql_n ON cached_sql(n)")
+        cursor.execute("EXECUTE cached_sql_plan(1)")
+        assert cursor.fetchone() == ("a", 1)
+        cursor.execute("PREPARE cached_star AS SELECT * FROM cached_sql")
+        cursor.execute("EXECUTE cached_star")
+        assert cursor.fetchone() == ("a", 1, None)
+        cursor.execute("ALTER TABLE cached_sql ADD COLUMN extra TEXT")
+        try:
+            cursor.execute("EXECUTE cached_star")
+        except psycopg.Error as exc:
+            assert exc.sqlstate == "0A000", exc
+            assert "cached plan must not change result type" in str(exc)
+        else:
+            raise AssertionError("changed cached result shape was accepted")
+    print("SQL PREPARE survives migrations: PASS", flush=True)
+
+
+def exercise_cached_plans(conn, migrator):
+    conn.execute("CREATE TABLE cached_python (id TEXT PRIMARY KEY, n BIGINT NOT NULL)")
+    conn.execute("INSERT INTO cached_python (id, n) VALUES ('a', 1)")
+    query = "SELECT id, n FROM cached_python WHERE n = %s"
+    assert conn.execute(query, (1,), prepare=True).fetchone() == ("a", 1)
+    migrator.execute("ALTER TABLE cached_python ADD COLUMN note TEXT")
+    assert conn.execute(query, (1,), prepare=True).fetchone() == ("a", 1)
+    migrator.execute("CREATE INDEX cached_python_n ON cached_python(n)")
+    assert conn.execute(query, (1,), prepare=True).fetchone() == ("a", 1)
+    # Rebinding writes is pre-admission; each EXECUTE still performs one write.
+    conn.execute(
+        "UPDATE cached_python SET n = n + %s WHERE id = %s", (1, "a"), prepare=True
+    )
+    migrator.execute("ALTER TABLE cached_python ADD COLUMN another TEXT")
+    conn.execute(
+        "UPDATE cached_python SET n = n + %s WHERE id = %s", (1, "a"), prepare=True
+    )
+    assert conn.execute("SELECT n FROM cached_python").fetchone() == (3,)
+    print("psycopg cached plans survive migrations: PASS", flush=True)
+
+
 def exercise_ddl(conn):
     prefix = "ddl_" + uuid.uuid4().hex[:12]
 
