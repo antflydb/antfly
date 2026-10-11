@@ -524,9 +524,17 @@ pub const Owner = struct {
     }
 
     pub fn nativeIndexOwnerAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .admit);
+    }
+
+    pub fn nativeIndexOwnerCancellationAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        return self.nativeIndexOwnerAdmissionImpl(table_name, header_json, manifest, .cancel_admit);
+    }
+
+    fn nativeIndexOwnerAdmissionImpl(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8, operation: abi.NativeIndexOwnerOperation) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
-            .operation = .admit,
+            .operation = operation,
             .table_name = .fromSlice(table_name),
             .request_json = .fromSlice(header_json),
             .manifest = .fromSlice(manifest),
@@ -585,7 +593,7 @@ pub const Owner = struct {
     }
 
     pub fn nativeIndexOwnerControlJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, command_json: []const u8) !Response {
-        if (operation != .fence and operation != .reserve) return error.InvalidArgument;
+        if (operation != .fence and operation != .reserve and operation != .cancel_fence and operation != .cancel_reserve) return error.InvalidArgument;
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
             .operation = operation,

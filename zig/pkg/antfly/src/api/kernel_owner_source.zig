@@ -91,6 +91,8 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.admitCanceledNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
+        try std.testing.expectError(expected, source.applyCanceledNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, source.nativeIndexOwnerState(std.testing.allocator, 8, "rows", identity, .{}));
     try std.testing.expectError(error.InvalidPrivateIndexInputs, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "", .{}));
@@ -3756,6 +3758,31 @@ pub const ProvisionedKernelOwnerSource = struct {
         manifest: []const u8,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(native_index_control.Outcome) {
+        return self.admitNativeIndexOwnerImpl(alloc, group_id, table_name, admission, manifest, context, false);
+    }
+
+    pub fn admitCanceledNativeIndexOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        admission: native_index_control.Admission,
+        manifest: []const u8,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupOutcome) {
+        return self.admitNativeIndexOwnerImpl(alloc, group_id, table_name, admission, manifest, context, true);
+    }
+
+    fn admitNativeIndexOwnerImpl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        admission: native_index_control.Admission,
+        manifest: []const u8,
+        context: request_operation.RequestContext,
+        comptime canceling: bool,
+    ) !std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome) {
         try context.ensureActive();
         if (manifest.len == 0 or manifest.len > native_index_control.Prepared.max_manifest_bytes)
             return error.InvalidPrivateIndexInputs;
@@ -3771,11 +3798,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         const encoded = try std.json.Stringify.valueAlloc(alloc, admission, .{});
         defer alloc.free(encoded);
         try context.ensureActive();
-        var response = try lease.owner().nativeIndexOwnerAdmissionJson(table_name, encoded, manifest);
+        var response = if (canceling)
+            try lease.owner().nativeIndexOwnerCancellationAdmissionJson(table_name, encoded, manifest)
+        else
+            try lease.owner().nativeIndexOwnerAdmissionJson(table_name, encoded, manifest);
         defer response.deinit();
         // A committed pending outcome must survive cancellation observed after
         // the ABI returns. Do not turn durable success into a retry-looking error.
-        return std.json.parseFromSlice(native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        return std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     pub fn applyNativeIndexOwnerControl(
@@ -3786,11 +3816,34 @@ pub const ProvisionedKernelOwnerSource = struct {
         command: native_index_control.Command,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(native_index_control.Outcome) {
+        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, false);
+    }
+
+    pub fn applyCanceledNativeIndexOwnerControl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupOutcome) {
+        return self.applyNativeIndexOwnerControlImpl(alloc, group_id, table_name, command, context, true);
+    }
+
+    fn applyNativeIndexOwnerControlImpl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.Command,
+        context: request_operation.RequestContext,
+        comptime canceling: bool,
+    ) !std.json.Parsed(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome) {
         try context.ensureActive();
         try command.validate();
         const operation: abi.NativeIndexOwnerOperation = switch (command.effect) {
-            .fenced => .fence,
-            .reserved => .reserve,
+            .fenced => if (canceling) .cancel_fence else .fence,
+            .reserved => if (canceling) .cancel_reserve else .reserve,
             else => return error.InvalidPrivateIndexOwnerJob,
         };
         var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
@@ -3807,7 +3860,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().nativeIndexOwnerControlJson(table_name, operation, encoded);
         defer response.deinit();
-        return std.json.parseFromSlice(native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        return std.json.parseFromSlice(if (canceling) native_index_control.CleanupOutcome else native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     pub fn applyFkGenerationNative(
