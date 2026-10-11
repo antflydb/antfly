@@ -347,3 +347,10 @@ under the unchanged $150 ceiling. No pending storage/networking hold was refunde
 The broad cursor query is recorded separately as `the`; a physical count of the
 unchanged one-file source found only 854 bodies mentioning `database`, so the
 primary relevance query cannot qualify the intended cursor depth by itself.
+
+The follow-up profile enables `qualify_composed_sources`. It inserts two native
+current rows under a numeric `hn_id` key and verifies union, replacement overlay,
+saved-source lookup and retained source cursors after mutations and daemon
+restart, against the unchanged historical Parquet source. This is a qualification
+assertion, not measured evidence until the actual public-API run passes. It does
+not establish a running Firebase feed, replacement-pod recovery or serving SLO.

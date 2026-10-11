@@ -54,5 +54,6 @@
     "cursor_p95_ms": 2000
   },
   "cursor_pages": 40,
-  "cursor_term": "the"
+  "cursor_term": "the",
+  "qualify_composed_sources": true
 }

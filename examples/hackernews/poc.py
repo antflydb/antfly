@@ -72,6 +72,125 @@ def wait_for_index(
         sleep(min(1, max(0, deadline - now())))
 
 
+def qualify_composed_sources(call, query, selected_source):
+    """Exercise historical/current visibility and retain a mutable source cursor."""
+    current, history = "hn_current_poc", "hn_archive_poc"
+    if current not in json.dumps(call("GET", "/tables")):
+        call(
+            "POST",
+            "/tables/" + current,
+            {
+                "schema": {
+                    "default_type": "row",
+                    "document_schemas": {
+                        "row": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    **{
+                                        name: {
+                                            "type": "integer",
+                                            "x-antfly-field": {
+                                                "type": "numeric",
+                                                "sortable": True,
+                                            },
+                                        }
+                                        for name in ("hn_id", "created_at", "points")
+                                    },
+                                    **{
+                                        name: {"type": "string"}
+                                        for name in (
+                                            "body",
+                                            "title",
+                                            "author",
+                                            "item_type",
+                                        )
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text"}},
+            },
+        )
+    selected, extra = selected_source["hn_id"], 2147483647
+    assert selected != extra
+    documents = {
+        str(key): dict(
+            selected_source,
+            hn_id=key,
+            body="antfly qualification replacement",
+            title=title,
+        )
+        for key, title in (
+            (selected, "HN qualification replacement"),
+            (extra, "HN qualification current"),
+        )
+    }
+    call(
+        "POST",
+        f"/tables/{current}/batch",
+        {"inserts": documents, "sync_level": "full_index"},
+    )
+    selected_filter = {"term": {"path": "/hn_id", "value": selected}}
+    union = dict(
+        query,
+        source={"union": [{"table": history}, {"table": current}]},
+        source_ranking="rrf",
+        filter_query=selected_filter,
+    )
+    historical = call("POST", "/query", union)["hits"]["hits"]
+    assert len(historical) == 1 and historical[0]["_source"]["hn_id"] == selected
+    overlay = {
+        "overlay": {
+            "base": {"table": history},
+            "changes": {"table": current},
+            "key": ["hn_id"],
+        }
+    }
+    suppressed = call("POST", "/query", dict(union, source=overlay))
+    assert not suppressed["hits"]["hits"], suppressed
+    if "hackernews_poc" not in json.dumps(call("GET", "/sources")):
+        call("POST", "/sources/hackernews_poc", {"source": overlay})
+    composed = dict(
+        query,
+        source={"saved": "hackernews_poc"},
+        source_ranking="rrf",
+        full_text_search={"match": "antfly", "field": "body"},
+        filter_query={
+            "bool": {
+                "should": [
+                    {"term": {"path": "/hn_id", "value": key}}
+                    for key in (selected, extra)
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+        limit=2,
+    )
+    all_hits = call("POST", "/query", composed)["hits"]["hits"]
+    assert {hit["_source"]["hn_id"] for hit in all_hits} == {selected, extra}, all_hits
+    first = call("POST", "/query", dict(composed, limit=1))
+    continuation = dict(composed, source_cursor=first["next_source_cursor"])
+    second = call("POST", "/query", continuation)["hits"]["hits"]
+    assert len(second) == 1 and second[0]["_id"] != first["hits"]["hits"][0]["_id"]
+    expected = [(hit["_id"], hit["_source"]["title"], hit["_score"]) for hit in second]
+    for document in documents.values():
+        document["title"] = "HN qualification updated after cursor capture"
+    call(
+        "POST",
+        f"/tables/{current}/batch",
+        {"inserts": documents, "sync_level": "full_index"},
+    )
+    fresh = call("POST", "/query", composed)["hits"]["hits"]
+    assert len(fresh) == 2 and all(
+        hit["_source"]["title"] == "HN qualification updated after cursor capture"
+        for hit in fresh
+    ), fresh
+    return continuation, expected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
@@ -99,6 +218,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--cursor-pages", type=int, default=0)
+    parser.add_argument("--qualify-composed-sources", action="store_true")
     parser.add_argument(
         "--cursor-term", help="Separate broad query for deep cursor coverage"
     )
@@ -625,8 +745,26 @@ def main():
         )
         empty, _ = timed_query(no_match, "empty_filter")
         assert not empty["hits"]["hits"], "Out-of-sample date range returned hits"
+        composed_cursor = None
+        composed_verified = []
+        if args.qualify_composed_sources:
+            phase = "composed_sources"
+            composed_cursor, composed_expected = qualify_composed_sources(
+                call, query, hits[0]["_source"]
+            )
         stop()
         start()
+        if composed_cursor is not None:
+            retained = call("POST", "/query", composed_cursor)["hits"]["hits"]
+            assert [
+                (hit["_id"], hit["_source"]["title"], hit["_score"]) for hit in retained
+            ] == composed_expected, retained
+            composed_verified = [
+                "union_history",
+                "overlay_nonmatching_suppression",
+                "saved_current_visibility",
+                "mutable_composed_cursor_restart",
+            ]
         reopened, restart_ms = timed_query(query, "restart")
         assert [(h["_id"], h["_score"]) for h in reopened["hits"]["hits"]] == [
             (h["_id"], h["_score"]) for h in hits
@@ -674,6 +812,7 @@ def main():
             "metadata_filters": filter_results,
             "workloads": workload_results,
             "cursor_depth": cursor_depth,
+            "composed_sources": {"verified": composed_verified},
             "io_profiles": io_profiles,
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
             "cache_files": len(cache_files),

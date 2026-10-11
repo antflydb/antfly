@@ -101,6 +101,20 @@ class ArchiveQualificationTest(unittest.TestCase):
             report["cursor_depth"]["term"] = "the"
         self.assertTrue(archive.assess(self.regional, self.config)["passed"])
 
+    def test_composed_coverage_is_required_when_enabled(self):
+        self.config["qualify_composed_sources"] = True
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["composed_sources"] = {
+                "verified": [
+                    "union_history",
+                    "overlay_nonmatching_suppression",
+                    "saved_current_visibility",
+                    "mutable_composed_cursor_restart",
+                ]
+            }
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
+
     def test_registration_is_part_of_the_initial_publication_gate(self):
         self.regional["runs"]["indexed"][0]["registration_seconds"] = 3000
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])

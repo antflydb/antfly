@@ -759,3 +759,10 @@ roughly 854 bodies containing `database`, insufficient for the 4,097-hit gate.
 Relevance and shallow pagination still use the primary query. Deep pages and their
 restart continuation use the broad query's own retained snapshot. Reports record
 the cursor term and comparisons reject differing cursor workloads.
+
+The follow-up also requires real public-API checks across historical and current
+tables: union visibility, suppression of a historical match by a nonmatching
+current replacement, saved-source visibility, and replay of a captured composed
+cursor after current rows change and the daemon restarts. These are separate
+correctness requirements; a successful single-table search cannot substitute
+for them. The current rows are synthetic qualification data, not a live HN feed.

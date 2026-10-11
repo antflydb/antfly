@@ -253,6 +253,15 @@ def assess(regional, config):
                         f"{label}: workload {term} exceeds sample/latency gate"
                     )
             cursor_depth = report.get("cursor_depth", {})
+            if config.get("qualify_composed_sources") and not {
+                "union_history",
+                "overlay_nonmatching_suppression",
+                "saved_current_visibility",
+                "mutable_composed_cursor_restart",
+            }.issubset(report.get("composed_sources", {}).get("verified", [])):
+                failures.append(
+                    f"{label}: historical/current composition coverage missing"
+                )
             if (
                 config.get("cursor_term")
                 and cursor_depth.get("term") != config["cursor_term"]
@@ -347,6 +356,8 @@ def main():
     ):
         command.extend(["--" + flag, str(config[key])])
     command.extend(["--cursor-pages", str(config["cursor_pages"])])
+    if config.get("qualify_composed_sources"):
+        command.append("--qualify-composed-sources")
     if config.get("cursor_term"):
         command.extend(["--cursor-term", config["cursor_term"]])
     command.extend(
