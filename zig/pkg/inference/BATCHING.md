@@ -335,6 +335,131 @@ executors. Native cross-request support is not inferred merely from sharing a
 model family or provider. Observed native results and coalesced groups are
 separate broker metrics; a compatibility fallback is not called a native batch.
 
+## GPU residency for media embeddings
+
+The target is a bounded streaming pipeline whose intermediate numeric tensors
+stay on the inference device. Residency lasts for an admitted batch, rather
+than retaining an ingestion corpus in VRAM. Compressed inputs, parsing, request
+metadata and final vectors may remain on the host. Device ownership must extend
+through preprocessing and the encoder; uploading an intermediate only to export
+it again at the next layout or pooling operation defeats the intended benefit.
+
+### Transfer boundaries
+
+| Input | Initial boundary | Subsequent device work |
+| --- | --- | --- |
+| Image | CPU decode and resize/crop, then upload model-sized pixels | Patch packing, token assembly, attention, pooling and projection |
+| PDF page raster | Borrow rendered pixels and reuse image preprocessing | Same vision path as an image; avoid PNG encode/decode between rendering and inference |
+| PDF text | Extract and tokenize on CPU | Text encoder; do not rasterize text merely to obtain embeddings |
+| Audio | CPU codec decode; current implementation also prepares features on CPU | Target: upload PCM once, then resample, STFT, mel/log normalization and encode |
+
+GPU preprocessing is a throughput option, not an unconditional latency win.
+A 4000 x 3000 RGB u8 image is 36 MB; a 224 x 224 RGB f32 tensor is 602,112 bytes.
+Uploading the former to resize on GPU can lose to CPU resizing followed by a
+small upload. GPU-assisted decode from compressed bytes changes this tradeoff.
+Small batches can also lose to launch overhead, and preprocessing shares GPU
+compute and memory bandwidth with inference. Unified-memory Metal devices have
+a different transfer cost, but host exports still force materialization and
+synchronization.
+
+NVIDIA's [nvJPEG](https://docs.nvidia.com/cuda/nvjpeg/) offers hybrid and
+hardware-assisted JPEG decoding; availability depends on the GPU and encoded
+image. [nvImageCodec](https://docs.nvidia.com/cuda/nvimagecodec/codec_options.html)
+provides codec-specific accelerated and CPU backends. Neither makes every media
+format entirely GPU-only. For audio, GPU signal processing is feasible separately
+from codec decoding; for example, [DALI mel filtering](https://docs.nvidia.com/deeplearning/dali/main-user-guide/docs/operations/nvidia.dali.fn.mel_filter_bank.html)
+supports CPU and GPU execution. These are possible implementation references,
+not new runtime dependencies in the first phase.
+
+### Implemented first phase: CLIP eager vision residency
+
+`architectures/clip.zig` exposes `visionEncoderForwardTensor`, which borrows
+normalized F32 NCHW pixels as a backend tensor and returns an owned embedding tensor
+on the same backend. The caller owns the input and frees the output with
+`ComputeBackend.free`. It uses existing reshape, transpose, row concatenation,
+row gather and embedding lookup operations for:
+
+- NCHW-to-patch packing;
+- inserting each image's CLS token and adding position embeddings;
+- token/head layout conversion around bidirectional attention;
+- gathering CLS rows before visual projection.
+
+The existing host-facing forward automatically uses this path on CUDA and
+Metal when these operations are available, exporting only the final embedding.
+Metal explicitly stages model-sized pixels into device storage because its
+ordinary F32 constructor may return a host-backed handle. CPU callers retain
+contiguous host patch extraction. Backends without the
+required operations retain compatibility assembly/layout/pooling paths; the
+explicit tensor entry point reports unsupported capability instead of silently
+exporting activations. Dense Metal patch weights use the backend's row reshape; static quantized
+patch-weight conversion remains a separate weight-materialization concern. Backend-internal compatibility fallbacks
+must still be considered when profiling residency.
+
+This phase does not change codec decoding, model-specific resize/crop semantics,
+CPU audio feature extraction, the CLAP audio encoder's host intermediates, or the
+graph-runtime vision entry point. It benefits image and PDF raster inputs that
+resolve to the eager CLIP encoder. Other vision architectures need their own
+resident handoff and qualification; this is not a claim that all multimodal
+models now run a fully resident pipeline.
+
+The regression fixture runs a complete small vision encoder with attention and
+projection at batch sizes 1, 2 and 4, compares it with the host compatibility
+path, and compares batched rows with independent forwards. Its tensor entry
+point runs with backend host exports disabled to catch intermediate readbacks.
+Hardware fixtures check Metal device-to-host accesses/download bytes and CUDA
+D2H byte counters before exporting final vectors; Metal inputs are explicitly
+device-backed. The tests also cover absent optional projection, unsupported
+capabilities, execution failures, ownership cleanup and reuse after failure.
+These are correctness and ownership checks, not hardware throughput measurements.
+
+Validation on 2026-10-11: the resident fixture passes on the local Metal GPU at
+batches 1/2/4 with no device-to-host access during the forward. The CUDA-enabled
+Linux test binary cross-compiles; CUDA hardware execution remains unqualified.
+Reproduce from `zig/pkg/inference/` with Zig 0.17:
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=clip
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='clip resident'
+```
+
+Run the CUDA parity fixture on a CUDA host with `-Dcuda=true -Dmetal=false`;
+keep the hardware failure visible rather than treating a missing device as a
+successful qualification.
+
+### Further implementation and measurement
+
+1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,
+   synchronization and peak host/device bytes separately. Measure end-to-end
+   items/s and p50/p95 latency against the CPU preprocessing baseline.
+2. Reuse bounded pinned-host/device slabs, streams and scratch. Overlap preparation
+   and transfer of batch N+1 with encoding batch N using explicit completion
+   events. Cancellation must drain in-flight work before buffer reuse, and every
+   buffer must remain charged to existing admission until its last consumer ends.
+3. Add model-exact GPU resize/crop/normalize and layout packing. Choose the upload
+   boundary using source size and measured costs; keep CPU fallback for unsupported
+   formats and small workloads. Preserve interpolation, antialiasing, color,
+   scaling and crop semantics and qualify final embedding similarity.
+4. Add optional compressed-image GPU-assisted decode for qualified CUDA hardware.
+   Keep the codec implementation behind the existing image boundary; CPU formats
+   must continue to work. PDF rendering remains CPU initially, with borrowed
+   rasters rather than a compressed round trip.
+5. Add resident PCM-to-features and resident CLAP/other audio encoder boundaries.
+   Qualify resampling, channel mixing, windows, FFT, filterbanks, log floors,
+   padding and long-clip fusion against each model's existing processor.
+
+The microbatch broker remains responsible for cross-request grouping and indexed
+results. Bucket images by resolved dimensions/patch count and audio by feature
+length to bound padding. Device bytes, decoded pixels, audio windows and scratch
+must limit batches alongside item count. Every overlapped buffer counts against
+the working-memory ceiling, including both batches in a double buffer. Preserve
+per-item decode errors, original input indexes and caller cancellation; do not
+retry a failed model batch merely to recover residency.
+
+Qualify batches 1/4/16/32 where admission permits, mixed resolutions and audio
+lengths, cold and warm execution, and saturated GPU workloads. Enable additional
+GPU preprocessing by default only when end-to-end evidence shows a benefit on
+the qualified backend. A faster preprocessing kernel alone is insufficient.
+
 ## Synchronous generation batch endpoint
 
 Generative LLM batching should start with a synchronous `/generate/batch`

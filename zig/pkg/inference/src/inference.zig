@@ -209,6 +209,7 @@ test {
     _ = @import("graph/seeded_training_test.zig");
     _ = @import("architectures/gliner/boundary_graph_test.zig");
     _ = architectures.clipclap_format;
+    _ = @import("architectures/clip.zig");
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
     _ = architectures.qwen3vl_projector;
