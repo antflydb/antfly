@@ -22,11 +22,13 @@ const Session = @import("../backends/session.zig").Session;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const scoring = @import("antfly_decisions").scoring;
-pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, raster: @import("antfly_image").BorrowedRasterAttachment };
+pub const SampledVideo = struct { bytes: []const u8, sampling: @import("embedding_gemma2_video.zig").Sampling };
+pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
         .raster => |raster| raster.bytes,
+        .sampled_video => |value| value.bytes,
         inline else => |bytes| bytes,
     };
 }
@@ -62,10 +64,10 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     var has_video = false;
     for (group.content) |part| {
         input_bytes = std.math.add(usize, input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
-        has_video = has_video or part == .video;
+        has_video = has_video or part == .video or part == .sampled_video;
         switch (part) {
             .text => {},
-            .image, .raster, .video => if (!cfg.vision) return error.NoVisionSession,
+            .image, .raster, .video, .sampled_video => if (!cfg.vision) return error.NoVisionSession,
             .audio => if (!cfg.audio) return error.NoAudioSession,
         }
     }
@@ -162,8 +164,10 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
         if (index > 0) try rendered.append(a, '\n');
         switch (part) {
             .text => |text| try rendered.appendSlice(a, text),
-            .video => |bytes| {
-                const encoded = try @import("embedding_gemma2_video.zig").encode(a, cb, bytes, effective);
+            inline .video, .sampled_video => |payload| {
+                const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
+                const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
+                const encoded = try @import("embedding_gemma2_video.zig").encodeWithSampling(a, cb, bytes, effective, sampling);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {
@@ -484,6 +488,7 @@ pub fn validateGroup(group: Group, options: Options) !void {
     var raster_bytes: usize = 0;
     for (group.content) |part| {
         const value = partBytes(part);
+        if (part == .sampled_video and part.sampled_video.sampling == .timestamps) try part.sampled_video.sampling.timestamps.validate();
         if (part == .raster) {
             try part.raster.validate();
             try @import("image.zig").DecodeLimits.inference_default.validate(part.raster.width, part.raster.height);

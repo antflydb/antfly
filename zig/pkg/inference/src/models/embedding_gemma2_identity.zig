@@ -19,7 +19,7 @@ const std = @import("std");
 const file = @import("../util/c_file.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const receipt = @import("../registry/managed_receipt.zig");
-pub const recipe = "embeddinggemma2-f32-mean-v3-display-hdr";
+pub const recipe = "embeddinggemma2-f32-mean-v4-logical-timestamps";
 const sidecars = [_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "processor_config.json", "config_sentence_transformers.json", "1_Pooling/config.json" };
 pub const Snapshot = struct { digest: [64]u8, signature: [32]u8 };
 

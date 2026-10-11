@@ -35,6 +35,58 @@ class VideoRetrievalContracts(unittest.TestCase):
             "rankings": {"q": ["a", "b", "c"]},
         }
 
+    def test_timestamp_oracle_uses_rational_pts_and_stable_ties(self):
+        frames = [{"best_effort_timestamp": pts} for pts in (3003, 0, 2002, 1001, 2002)]
+        self.assertEqual(
+            video.timestamp_selection(
+                frames,
+                "1/30000",
+                {
+                    "policy": "timestamps",
+                    "step_ns": 33_366_667,
+                },
+            ),
+            [1, 2, 0],
+        )
+        self.assertEqual(
+            video.timestamp_selection(
+                frames,
+                "1/30000",
+                {
+                    "policy": "timestamps",
+                    "step_ns": 50_000_000,
+                    "end_ns": 100_100_000,
+                },
+            ),
+            [1, 2],
+        )
+
+    def test_timestamp_oracle_caps_long_windows_and_rejects_bad_policies(self):
+        frames = [{"best_effort_timestamp": i, "duration": 1} for i in range(100)]
+        selected = video.timestamp_selection(frames, "1/1", {"policy": "timestamps"})
+        self.assertEqual((len(selected), selected[0], selected[-1]), (32, 0, 99))
+        self.assertEqual(
+            video.timestamp_selection(
+                frames,
+                "1/1",
+                {
+                    "policy": "timestamps",
+                    "start_ns": 60_000_000_000,
+                    "end_ns": 90_000_000_000,
+                },
+            ),
+            list(range(60, 90)),
+        )
+        for policy in (
+            {"policy": "timestamps", "step_ns": 0},
+            {"policy": "timestamps", "max_frames": True},
+            {"policy": "timestamps", "end_ns": 0},
+            {"policy": "timestamps", "start_ns": 101_000_000_000},
+            {"policy": "timestamps", "unknown": 1},
+        ):
+            with self.assertRaises(ValueError):
+                video.timestamp_selection(frames, "1/1", policy)
+
     def test_memory_counts_supervised_workers_and_excludes_unrelated_processes(self):
         records = {1: (0, 8), 2: (1, 1500), 3: (2, 100), 4: (0, 9999)}
         self.assertEqual(video.process_tree_rss(1, records), 1608)

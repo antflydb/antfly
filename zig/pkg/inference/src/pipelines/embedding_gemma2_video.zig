@@ -37,7 +37,34 @@ pub const Encoded = struct {
 
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
+pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy };
 pub fn select(a: std.mem.Allocator, reader: *const media.mp4.Reader) ![]usize {
+    return selectWithSampling(a, reader, .reference);
+}
+pub fn selectWithSampling(a: std.mem.Allocator, reader: *const media.mp4.Reader, sampling: Sampling) ![]usize {
+    if (reader.track.codec == .avc) {
+        const cfg = try video.h264.configParse(a, reader.track.avcc);
+        defer cfg.groups.deinit(a);
+        if (reader.track.inband_parameter_sets or !cfg.frame_only or cfg.profile == 88 or cfg.separate_planes) {
+            // Index completed assemblies rather than transport members.
+            var mutable = reader.*;
+            var logical = try video.h264_pictures.index(a, &mutable, .{});
+            defer logical.deinit();
+            if (sampling == .reference) return logical.select();
+            const metadata = try a.alloc(video.sampling.TimedPicture, logical.pictures.len);
+            defer a.free(metadata);
+            for (logical.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
+            const selected = try video.sampling.cappedTimestamps(a, metadata, logical.timescale, sampling.timestamps, reader.input.control);
+            for (selected) |*id| id.* = logical.pictures[id.*].first_packet;
+            return selected;
+        }
+    }
+    if (sampling == .timestamps) {
+        const metadata = try a.alloc(video.sampling.TimedPicture, reader.packets.len);
+        defer a.free(metadata);
+        for (reader.packets, metadata) |packet, *item| item.* = .{ .pts = packet.pts, .duration = packet.duration };
+        return video.sampling.cappedTimestamps(a, metadata, reader.track.timescale, sampling.timestamps, reader.input.control);
+    }
     if (reader.packets.len == 0 or reader.track.timescale == 0) return error.EmptyVideo;
     const order = try a.alloc(usize, reader.packets.len);
     defer a.free(order);
@@ -102,25 +129,18 @@ fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h
     return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = .q13_components };
 }
 
-// Model sampling assumes one progressive access-unit picture per MP4 sample.
-// Field/partition transport packets need a logical-picture index before FPS parity.
-fn validateFrameConfig(cfg: video.h264.Config) !void {
-    if (!cfg.frame_only or cfg.profile == 88) return error.UnsupportedVideoProfile;
-}
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
     if (reader.track.codec != .avc) return null;
     if (reader.track.inband_parameter_sets) {
         const session = try video.h264_dynamic.Session.init(a, reader, .{});
         errdefer session.deinit();
         for (session.entries.items) |entry| {
-            try validateFrameConfig(entry.config);
             _ = try policySignal(reader.track, @intCast(entry.config.width), @intCast(entry.config.height), entry.config.color);
         }
         return session;
     }
     const cfg = try video.h264.configParse(a, reader.track.avcc);
     defer cfg.groups.deinit(a);
-    try validateFrameConfig(cfg);
     _ = try policySignal(reader.track, @intCast(cfg.width), @intCast(cfg.height), cfg.color);
     return null;
 }
@@ -135,6 +155,9 @@ fn webmTrack(track: media.webm.Track) !media.mp4.Track {
 
 /// Conservative decoded-pixel charge used before admitted HTTP model execution.
 pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
+    return inspectPixelsWithSampling(bytes, control, .reference);
+}
+pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: Sampling) !u64 {
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = std.heap.page_allocator, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (isWebm(bytes)) {
@@ -142,7 +165,7 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
         defer reader.deinit();
         var index = try video.webm_pictures.index(std.heap.page_allocator, &reader, .{ .decoder = .{ .control = source.control } });
         defer index.deinit();
-        const selected = try index.select();
+        const selected = try selectWebm(std.heap.page_allocator, index, sampling, source.control);
         defer std.heap.page_allocator.free(selected);
         var pixels: u64 = 0;
         for (selected) |id| {
@@ -155,7 +178,7 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     defer reader.deinit();
     // AVC combines VUI and container declarations in parameterSession below.
     if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
-    const selected = try select(std.heap.page_allocator, &reader);
+    const selected = try selectWithSampling(std.heap.page_allocator, &reader, sampling);
     defer std.heap.page_allocator.free(selected);
     const configurations = try parameterSession(std.heap.page_allocator, &reader);
     defer if (configurations) |session| session.deinit();
@@ -172,7 +195,17 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     return pixels;
 }
 
+fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
+    if (sampling == .reference) return index.select();
+    const metadata = try a.alloc(video.sampling.TimedPicture, index.pictures.len);
+    defer a.free(metadata);
+    for (index.pictures, metadata) |picture, *item| item.* = .{ .pts = picture.pts, .duration = picture.duration };
+    return video.sampling.cappedTimestamps(a, metadata, 1_000_000_000, sampling.timestamps, control);
+}
 pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control) !Encoded {
+    return encodeWithSampling(a, cb, bytes, control, .reference);
+}
+pub fn encodeWithSampling(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -183,7 +216,7 @@ pub fn encode(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8
     defer if (webm) webm_reader.deinit() else reader.deinit();
     var webm_index: ?video.webm_pictures.Index = if (webm) try video.webm_pictures.index(a, &webm_reader, .{ .decoder = .{ .control = source.control } }) else null;
     defer if (webm_index) |*index| index.deinit();
-    const selected = if (webm_index) |index| try index.select() else try select(a, &reader);
+    const selected = if (webm_index) |index| try selectWebm(a, index, sampling, source.control) else try selectWithSampling(a, &reader, sampling);
     defer a.free(selected);
     const track = if (webm) try webmTrack(webm_reader.track) else reader.track;
     const configurations = if (webm) null else try parameterSession(a, &reader);
@@ -295,7 +328,9 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
 
 fn compatibleApple(avcc: []const u8) bool {
     video.avc.validateConfig(avcc) catch return false;
-    return true;
+    const cfg = video.h264.configParse(std.heap.page_allocator, avcc) catch return false;
+    defer cfg.groups.deinit(std.heap.page_allocator);
+    return cfg.frame_only and cfg.profile != 88 and !cfg.separate_planes;
 }
 const ProjectionJob = struct { slot: usize, prepared: video.preparation.Prepared, options: video.preparation.Options };
 
@@ -696,5 +731,27 @@ test "embeddinggemma2 video WebM inspection uses decoded visible picture samplin
         for (selected) |id| expected += @as(u64, pictures.pictures[id].width) * pictures.pictures[id].height;
         try std.testing.expectEqual(expected, try inspectPixels(bytes, .{ .io = std.testing.io }));
         try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
+    }
+}
+
+test "embeddinggemma2 video logical field partition selection and timestamp windows" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-paff-adaptive-packets-8-1", "h264-jm-partitions" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name ++ ".mp4");
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var logical = try video.h264_pictures.index(a, &reader, .{});
+        defer logical.deinit();
+        const expected = try logical.select();
+        defer a.free(expected);
+        const selected = try select(a, &reader);
+        defer a.free(selected);
+        try std.testing.expectEqualSlices(usize, expected, selected);
+        try std.testing.expect(try inspectPixels(bytes, .{}) > 0);
+        const native = try selectWithSampling(a, &reader, .{ .timestamps = .{ .max_frames = 1 } });
+        defer a.free(native);
+        try std.testing.expectEqual(@as(usize, 1), native.len);
+        try std.testing.expect(try inspectPixelsWithSampling(bytes, .{}, .{ .timestamps = .{ .max_frames = 1 } }) > 0);
     }
 }

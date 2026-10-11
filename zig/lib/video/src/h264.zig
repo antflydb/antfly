@@ -34,6 +34,7 @@ pub const Options = struct {
     max_parameter_packets: usize = 4096,
     max_parameter_bytes: usize = 4 * 1024 * 1024,
     max_configurations: usize = 256,
+    picture_observer: ?PictureObserver = null,
 };
 pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
 pub const Config = struct {
@@ -93,6 +94,21 @@ pub const Config = struct {
         result.scaling.eight[1] = self.scaling.eight[@as(usize, plane) * 2 + 1];
         return result;
     }
+};
+/// Completed presentation picture metadata; no decoded pixel ownership escapes.
+pub const Picture = struct {
+    first_packet: usize,
+    pts: i64,
+    duration: u32,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    chroma_format: u8,
+    independent_plane: ?u2 = null,
+};
+pub const PictureObserver = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, Picture) anyerror!void,
 };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
@@ -1440,6 +1456,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                     };
                     const members = if (partition_span.partitioned) partition_span.members.items else &.{packet_index};
                     for (members) |member| {
+                        workspace.first_packet = @min(workspace.first_packet, member);
                         const part = reader.packets[member];
                         const part_end = std.math.add(i64, part.pts, part.duration) catch return error.TimestampOverflow;
                         const first_part = workspace.pts == null;
@@ -1499,6 +1516,11 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
             }
             for (workspace.metadata) |m| field_macroblocks += @intFromBool(m.field);
             const selected = workspace.wanted();
+            if (options.picture_observer) |observer| {
+                const pts = workspace.pts.?;
+                const duration = std.math.cast(u32, std.math.sub(i64, workspace.end, pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
+                try observer.accept(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = pts, .duration = duration, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null });
+            }
             if (selected) {
                 output_packet.pts = workspace.pts.?;
                 output_packet.duration = std.math.cast(u32, std.math.sub(i64, workspace.end, output_packet.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;

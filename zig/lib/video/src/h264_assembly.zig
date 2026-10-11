@@ -40,6 +40,7 @@ pub fn Workspace(comptime Sample: type, comptime Header: type) type {
         slices: usize = 0,
         pts: ?i64 = null,
         end: i64 = 0,
+        first_packet: usize = std.math.maxInt(usize),
         pub fn init(allocator: std.mem.Allocator, pixels: usize, sub: usize, groups: usize, selections: usize) !Self {
             const chroma_pixels = if (sub == 0) @as(usize, 0) else pixels / sub;
             const planar = try allocator.alloc(Sample, pixels + 2 * chroma_pixels);
@@ -81,6 +82,7 @@ pub fn Workspace(comptime Sample: type, comptime Header: type) type {
             self.slices = 0;
             self.pts = null;
             self.end = 0;
+            self.first_packet = std.math.maxInt(usize);
         }
         pub fn releaseSnapshot(self: *Self, allocator: std.mem.Allocator) void {
             if (self.snapshot) |snapshot| {

@@ -613,16 +613,34 @@ current receipts are in `zig/lib/video/testdata/webm-validation`. Full completio
 
 - Broader real-world differential streams, sustained coverage-guided fuzzing and
   corruption recovery.
-- AV1 additional profiles, 12-bit, monochrome, 4:2:2/4:4:4, Annex B and scalable
-  layer policies with independently decoded fixtures.
+- Broader pretrained model qualification of expanded AV1 depth/chroma/layer
+  policies. The native format, Annex B and operating-point implementations have
+  independent AOM fixtures and actual Linux ARM64 execution receipts.
 - Realistic codec benchmarks, measured portable SIMD and reduced retained
   reference copying.
 - Actual Linux execution of current codec and pretrained model paths.
-- H.264 logical field/partition indexing, model timestamp policies and long-video
-  windows, plus broader WebM display/Colour qualification.
+- Broader WebM display/Colour qualification and decoded/projected frame reuse
+  across model window groups. Logical AVC indexing and explicit model timestamp
+  windows are implemented; their current qualification is recorded below.
 - Final resident device normalization and scheduling across requests.
 - DASH inherited templates/BaseURL, multiple periods/representations and broader
   live/HLS coverage.
 
 CUDA remains outside this execution scope. Passing one implementation gate does
 not close the other items or establish general codec conformance.
+
+
+### Logical model timeline continuation (2026-10-11)
+
+Completed AVC assemblies now supply logical sampling metadata for fields,
+partitions, separate planes and changing SPS/PPS epochs. The model adapter offers
+an explicit rational timestamp policy with bounded uniform/truncated selection,
+exclusive window endpoints and separate embeddings through separate input groups.
+Reference average-FPS/index behavior remains the default; the embedding recipe
+identity advances to v4. The portable route serves field/partition inputs on CPU
+and Metal. The independent qualification tool selects from FFprobe picture PTS
+and feeds selected pixels to pinned PyTorch without resampling. The campaign
+covers VFR, PAFF, VP9/AV1 timestamps and separate intervals of a 52-second clip;
+see `tools/embeddinggemma2/testdata/sampling`. This does not close device final
+normalization, whole-pipeline scheduling, cross-group reuse, streaming inheritance
+or the broader codec/performance qualification items above.

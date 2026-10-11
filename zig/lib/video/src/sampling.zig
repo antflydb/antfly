@@ -84,6 +84,108 @@ pub fn timestamps(allocator: std.mem.Allocator, packets: []const media.mp4.Packe
     return output.toOwnedSlice(allocator);
 }
 
+/// Native presentation policy v1. Times are nanoseconds relative to the first
+/// logical presentation picture; end is exclusive. A window is one such interval.
+pub const TimestampPolicy = struct {
+    start_ns: i64 = 0,
+    end_ns: ?i64 = null,
+    step_ns: u64 = 1_000_000_000,
+    max_frames: usize = 32,
+    overflow: Overflow = .uniform,
+    pub fn validate(self: TimestampPolicy) !void {
+        if (self.start_ns < 0 or self.step_ns == 0 or self.max_frames == 0 or self.max_frames > 32 or (self.end_ns != null and self.end_ns.? <= self.start_ns)) return error.InvalidSamplingPolicy;
+    }
+};
+pub const TimedPicture = struct { pts: i64, duration: ?u64 };
+/// Select logical IDs with exact rational time comparisons. A sparse VFR source
+/// can map multiple targets to one picture; duplicates are omitted. Uniform caps
+/// span the entire interval without allocating every target of a long video.
+pub fn cappedTimestamps(a: std.mem.Allocator, pictures: []const TimedPicture, timescale: u32, policy: TimestampPolicy, control: media.source.Control) ![]usize {
+    try policy.validate();
+    if (pictures.len == 0 or timescale == 0) return error.EmptyVideo;
+    var first = pictures[0].pts;
+    var last: i128 = pictures[0].pts;
+    var latest = pictures[0].pts;
+    for (pictures, 0..) |picture, i| {
+        if (i % 256 == 0) try control.check();
+        first = @min(first, picture.pts);
+        latest = @max(latest, picture.pts);
+        last = @max(last, @as(i128, picture.pts) + (picture.duration orelse 0));
+    }
+    // Matroska may omit BlockDuration. Infer only the trailing picture's
+    // duration from the preceding distinct presentation timestamp, matching the
+    // indexed video timeline. Never fabricate a rate for a single unknown frame.
+    var previous: ?i64 = null;
+    var unknown_tail = false;
+    for (pictures, 0..) |picture, i| {
+        if (i % 256 == 0) try control.check();
+        if (picture.pts < latest and (previous == null or picture.pts > previous.?)) previous = picture.pts;
+        if (picture.pts == latest and picture.duration == null) unknown_tail = true;
+    }
+    if (unknown_tail and previous != null) last = @max(last, @as(i128, latest) + (@as(i128, latest) - previous.?));
+    const inferred = @divFloor((last - first) * 1_000_000_000 + timescale - 1, timescale);
+    const end: i128 = policy.end_ns orelse (std.math.cast(i64, inferred) orelse return error.TimestampOverflow);
+    if (end <= policy.start_ns) return error.EmptyVideoWindow;
+    const candidates: u128 = @intCast(@divFloor(end - policy.start_ns + policy.step_ns - 1, policy.step_ns));
+    const count: usize = @intCast(@min(candidates, policy.max_frames));
+    var output: std.ArrayList(usize) = .empty;
+    errdefer output.deinit(a);
+    for (0..count) |i| {
+        try control.check();
+        const ordinal: u128 = if (policy.overflow == .uniform and count > 1 and candidates > count) @as(u128, i) * (candidates - 1) / (count - 1) else i;
+        const target: i128 = policy.start_ns + @as(i128, @intCast(ordinal * policy.step_ns));
+        var chosen: ?usize = null;
+        for (pictures, 0..) |picture, id| {
+            if (id % 256 == 0) try control.check();
+            const time = (@as(i128, picture.pts) - first) * 1_000_000_000;
+            if (time < target * timescale or time >= end * timescale) continue;
+            if (chosen == null or picture.pts < pictures[chosen.?].pts) chosen = id;
+        }
+        if (chosen) |id| if (output.items.len == 0 or output.items[output.items.len - 1] != id) try output.append(a, id);
+    }
+    if (output.items.len == 0) return error.EmptyVideoWindow;
+    return output.toOwnedSlice(a);
+}
+
+test "presentation policy samples logical VFR windows and uniformly caps long videos" {
+    const a = std.testing.allocator;
+    const pictures = [_]TimedPicture{ .{ .pts = 100, .duration = 10 }, .{ .pts = 105, .duration = 5 }, .{ .pts = 140, .duration = 10 }, .{ .pts = 150, .duration = 10 } };
+    const selected = try cappedTimestamps(a, &pictures, 10, .{ .start_ns = 500_000_000, .end_ns = 5_000_000_000 }, .{});
+    defer a.free(selected);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, selected);
+    var long: [100]TimedPicture = undefined;
+    for (&long, 0..) |*picture, i| picture.* = .{ .pts = @intCast(i), .duration = 1 };
+    const capped = try cappedTimestamps(a, &long, 1, .{}, .{});
+    defer a.free(capped);
+    try std.testing.expectEqual(@as(usize, 32), capped.len);
+    try std.testing.expectEqual(@as(usize, 0), capped[0]);
+    try std.testing.expectEqual(@as(usize, 99), capped[31]);
+    const window = try cappedTimestamps(a, &long, 1, .{ .start_ns = 60_000_000_000, .end_ns = 90_000_000_000 }, .{});
+    defer a.free(window);
+    try std.testing.expectEqual(@as(usize, 60), window[0]);
+    try std.testing.expectEqual(@as(usize, 89), window[29]);
+    try std.testing.expectError(error.InvalidSamplingPolicy, cappedTimestamps(a, &long, 1, .{ .step_ns = 0 }, .{}));
+    try std.testing.expectError(error.EmptyVideoWindow, cappedTimestamps(a, &long, 1, .{ .start_ns = 101_000_000_000 }, .{}));
+}
+
+test "timestamp windows infer unknown trailing duration and keep exact rational boundaries" {
+    const a = std.testing.allocator;
+    // Unsorted decode order, tied PTS, and absent WebM block durations.
+    const pictures = [_]TimedPicture{ .{ .pts = 3003, .duration = null }, .{ .pts = 0, .duration = null }, .{ .pts = 2002, .duration = null }, .{ .pts = 1001, .duration = null }, .{ .pts = 2002, .duration = null } };
+    const selected = try cappedTimestamps(a, &pictures, 30000, .{ .step_ns = 33_366_667 }, .{});
+    defer a.free(selected);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 0 }, selected);
+    // End is exclusive even when it lands exactly on a timestamp.
+    const excluded = try cappedTimestamps(a, &pictures, 30000, .{ .end_ns = 100_100_000, .step_ns = 50_000_000 }, .{});
+    defer a.free(excluded);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, excluded);
+    const lone = [_]TimedPicture{.{ .pts = 5, .duration = null }};
+    try std.testing.expectError(error.EmptyVideoWindow, cappedTimestamps(a, &lone, 1, .{}, .{}));
+    const bounded = try cappedTimestamps(a, &lone, 1, .{ .end_ns = 1 }, .{});
+    defer a.free(bounded);
+    try std.testing.expectEqualSlices(usize, &.{0}, bounded);
+}
+
 test "sampling uniform cap spans the video rather than its first 32 seconds" {
     const a = std.testing.allocator;
     const frames = try embeddingGemma2(a, .{ .total_frames = 1800, .fps = 30, .duration_seconds = 60 }, .{});

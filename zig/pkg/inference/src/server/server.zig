@@ -31826,11 +31826,13 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
             has_image = true;
             pixels += try raster.pixels();
         },
-        .video => |bytes| {
+        inline .video, .sampled_video => |payload| {
+            const bytes = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.bytes else payload;
+            const sampling: @import("../pipelines/embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.sampling else .reference;
             media_parts += 1;
             media_bytes += bytes.len;
             has_image = true;
-            pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixels(bytes, control);
+            pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling);
         },
         .audio => |bytes| {
             media_parts += 1;
@@ -31839,6 +31841,31 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
         },
     };
     try validateInferenceExecutorInvocation(contract, .{ .item_count = count, .text_bytes_per_item = text_bytes, .encoded_media_bytes = media_bytes, .decoded_pixels = pixels, .media_parts_per_item = media_parts, .has_text = has_text, .has_image = has_image, .has_audio = has_audio });
+}
+
+fn parseVideoSampling(value: std.json.Value) !@import("../pipelines/embedding_gemma2_video.zig").Sampling {
+    if (value != .object) return error.InvalidSamplingPolicy;
+    const mode = value.object.get("policy") orelse return error.InvalidSamplingPolicy;
+    if (mode != .string) return error.InvalidSamplingPolicy;
+    if (std.mem.eql(u8, mode.string, "reference")) {
+        if (value.object.count() != 1) return error.InvalidSamplingPolicy;
+        return .reference;
+    }
+    if (!std.mem.eql(u8, mode.string, "timestamps")) return error.InvalidSamplingPolicy;
+    var policy = @import("antfly_video").sampling.TimestampPolicy{};
+    for (value.object.keys()) |key| {
+        if (std.mem.eql(u8, key, "policy")) continue;
+        const field = value.object.get(key).?;
+        if (std.mem.eql(u8, key, "overflow")) {
+            if (field != .string) return error.InvalidSamplingPolicy;
+            policy.overflow = if (std.mem.eql(u8, field.string, "uniform")) .uniform else if (std.mem.eql(u8, field.string, "truncate")) .truncate else return error.InvalidSamplingPolicy;
+            continue;
+        }
+        if (field != .integer or field.integer < 0) return error.InvalidSamplingPolicy;
+        if (std.mem.eql(u8, key, "start_ns")) policy.start_ns = field.integer else if (std.mem.eql(u8, key, "end_ns")) policy.end_ns = field.integer else if (std.mem.eql(u8, key, "step_ns")) policy.step_ns = @intCast(field.integer) else if (std.mem.eql(u8, key, "max_frames")) policy.max_frames = std.math.cast(usize, field.integer) orelse return error.InvalidSamplingPolicy else return error.InvalidSamplingPolicy;
+    }
+    try policy.validate();
+    return .{ .timestamps = policy };
 }
 
 fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest, raw: std.json.Value, retained: *ParsedDenseEmbedInputs, budget: *RequestMediaBudget, context: InferenceDownloadRequestContext, attachments: []const httpx.attachment_envelope.Attachment) !@import("../pipelines/embedding_gemma2.zig").Group {
@@ -31861,6 +31888,13 @@ fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manif
         const videos = retained.videos.items.len;
         try appendDenseEmbedInput(self, a, manifest, retained, part, 0, budget, context, attachments);
         if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = retained.audio.items[audio].bytes } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
+        if (part == .object) if (part.object.get("sampling")) |value| {
+            if (dest.* != .video) return error.InvalidSamplingPolicy;
+            // Read the original payload before assigning the new union tag.
+            const bytes = dest.video;
+            const sampling = try parseVideoSampling(value);
+            dest.* = .{ .sampled_video = .{ .bytes = bytes, .sampling = sampling } };
+        };
     }
     return .{ .title = title, .content = parts };
 }
@@ -31921,6 +31955,8 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         error.UnsupportedDynamicVideoConfig,
         error.EmptyVideo,
         error.EmptyVideoTrack,
+        error.InvalidSamplingPolicy,
+        error.EmptyVideoWindow,
         error.InvalidSamplingMetadata,
         error.SamplingOverflow,
         error.TimestampOverflow,
@@ -36226,4 +36262,25 @@ test "embeddinggemma2 ordered video parser keeps borrowed attachment and caption
     try std.testing.expect(!retained.videos.items[0].owned and !retained.allow_video);
     try @import("../pipelines/embedding_gemma2.zig").validateGroup(group, .{});
     try std.testing.expect((try @import("../pipelines/embedding_gemma2_video.zig").inspectPixels(clip, .{})) > 0);
+    const sampled_raw = try std.json.parseFromSlice(std.json.Value, alloc, "{\"content\":[{\"type\":\"attachment\",\"attachment_index\":0,\"sampling\":{\"policy\":\"timestamps\",\"max_frames\":1}}]}", .{});
+    defer sampled_raw.deinit();
+    const sampled = try parseEmbeddingGroup(&node, alloc, &manifest, sampled_raw.value, &retained, &budget, .{ .io = std.testing.io }, &.{.{ .mime_type = "video/quicktime", .data = clip }});
+    try std.testing.expect(sampled.content[0] == .sampled_video);
+    try std.testing.expectEqual(@as([]const u8, clip).ptr, sampled.content[0].sampled_video.bytes.ptr);
+    try std.testing.expectEqual(@as(usize, 1), sampled.content[0].sampled_video.sampling.timestamps.max_frames);
+    try @import("../pipelines/embedding_gemma2.zig").validateGroup(sampled, .{});
+}
+
+test "embeddinggemma2 video timestamp policy parser rejects ambiguity and malformed windows" {
+    const a = std.testing.allocator;
+    const valid = try std.json.parseFromSlice(std.json.Value, a, "{\"policy\":\"timestamps\",\"start_ns\":1000000000,\"end_ns\":90000000000,\"max_frames\":16}", .{});
+    defer valid.deinit();
+    const policy = try parseVideoSampling(valid.value);
+    try std.testing.expectEqual(@as(i64, 1000000000), policy.timestamps.start_ns);
+    try std.testing.expectEqual(@as(usize, 16), policy.timestamps.max_frames);
+    for ([_][]const u8{ "{}", "{\"policy\":\"reference\",\"step_ns\":1}", "{\"policy\":\"timestamps\",\"step_ns\":0}", "{\"policy\":\"timestamps\",\"start_ns\":2,\"end_ns\":1}", "{\"policy\":\"timestamps\",\"max_frames\":33}", "{\"policy\":\"timestamps\",\"unknown\":1}" }) |json| {
+        const bad = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidSamplingPolicy, parseVideoSampling(bad.value));
+    }
 }

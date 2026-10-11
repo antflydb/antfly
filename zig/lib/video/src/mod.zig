@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const h264_pictures = @import("h264_pictures.zig");
 pub const webm_pictures = @import("webm_pictures.zig");
 pub const codecs = @import("codecs/decoder.zig");
 pub const vp8 = @import("vp8.zig");
@@ -35,6 +36,7 @@ pub const sampling = @import("sampling.zig");
 test {
     _ = @import("codecs/test.zig");
     _ = webm_pictures;
+    _ = h264_pictures;
     _ = avc;
     _ = vp8;
     _ = h264_sparse;

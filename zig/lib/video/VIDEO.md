@@ -831,10 +831,10 @@ exact scope, errors and remaining application-level qualification.
 See the [dated integration validation](testdata/video-model-integration-validation.md)
 for executed checks, cross-platform compilation and retained qualification limits.
 
-Model FPS sampling currently requires progressive one-picture-per-sample AVC
-(Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
-transport remain library capabilities; the model adapter rejects them until a
-logical-picture index qualifies their frame-count/FPS semantics.
+The model adapter now obtains completed logical AVC pictures for PAFF/MBAFF,
+Extended-profile partition transport, separate planes and configuration epochs.
+See the logical-picture and explicit-window policy below; transport members no
+longer contribute separate frames to model sampling.
 
 
 ## Real-clip reference preservation and RGB recipe
@@ -1147,3 +1147,51 @@ macOS with actual Metal (two skips) and 120 on Linux ARM64 (23 platform skips).
 Bounded H.264/VP9/AV1 coverage-guided campaigns total over 608000 runs without
 failure. This establishes the documented corpus/format subset and reference
 preservation, rather than arbitrary codec conformance or end-user relevance.
+
+
+## Logical AVC pictures and explicit model windows (2026-10-11)
+
+`h264_pictures.index` observes completed native decoder assemblies, including
+complementary PAFF fields, slices or data partitions spread across packets and
+in-band configuration epochs. It records presentation timestamps, assembly spans,
+geometry/depth/chroma and the first transport member, rather than retaining an
+entire decoded clip. Separate-colour-plane passes are joined and require all
+three matching planes. Replay selectors identify the completed assembly. Bounds
+cover transport packets, logical pictures and existing decode workspace; control
+checks and shared decode admission remain active. Static progressive AVC retains
+its packet-index fast path.
+
+Model `Sampling.reference` preserves the pinned processor's average-FPS/index
+policy over logical presentation pictures. `Sampling.timestamps` is an explicit
+native policy: nanoseconds relative to the first logical PTS, exclusive end,
+earliest picture at or after each target, stable ties and omitted duplicate IDs.
+All comparisons use rational integer timestamps. The default step is one second,
+with at most 32 frames. `overflow=uniform` spans the requested interval;
+`truncate` keeps its first targets. When end is omitted, picture durations define
+the tail; an unknown final WebM block duration uses the preceding distinct PTS
+step. A lone picture without a duration requires an explicit end. Empty windows
+and malformed policies fail. This policy is distinct from HF index sampling.
+
+HTTP ordered video parts accept an optional object:
+
+```json
+{"sampling":{"policy":"timestamps","start_ns":20000000000,"end_ns":40000000000,"step_ns":1000000000,"max_frames":16,"overflow":"uniform"}}
+```
+
+Omitting `sampling`, or supplying only `{"policy":"reference"}`, selects the
+reference policy. Unknown keys, non-integer times, invalid bounds and sampling on
+non-video content are rejected. Native callers use `Part.sampled_video`. Supply
+multiple input groups containing distinct intervals to receive separate window
+embeddings. A group still produces one joint embedding across its ordered media
+parts; windows across groups do not yet share decoded/projected frame storage.
+The video adapter applies this policy to MP4/MOV and WebM logical indexes, charges
+selected geometry during HTTP preflight, and uses portable AVC for field/partition
+transport on CPU and Metal. These inputs do not use the progressive Apple route.
+
+The recipe advances to `embeddinggemma2-f32-mean-v4-logical-timestamps`. Consumers
+must respect the changed identity when storing or comparing embeddings; existing
+receipts retain the identity of the binary they qualified. Qualification inputs
+and reproducible commands are in
+[the sampling corpus](../../../tools/embeddinggemma2/testdata/sampling/README.md).
+General mixed-tool conformance and broader display/Colour qualification remain
+separate requirements.

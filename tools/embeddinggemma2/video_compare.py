@@ -24,6 +24,8 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+from bisect import bisect_left
+from fractions import Fraction
 import hashlib
 import http.client
 import json
@@ -175,10 +177,80 @@ def rank_agreement(actual, expected, top_k, tolerance):
     }
 
 
-def decoded(path, processor):
+def timestamp_selection(frames, time_base, sampling):
+    """Independent exact-time oracle over FFprobe presentation pictures.
+
+    Sort once and binary-search target timestamps; native code scans bounded
+    metadata. No indexes or timing values are obtained from native inference.
+    """
+    allowed = {"policy", "start_ns", "end_ns", "step_ns", "max_frames", "overflow"}
+    if not isinstance(sampling, dict) or set(sampling) - allowed:
+        raise ValueError("invalid timestamp sampling object")
+    if sampling.get("policy") != "timestamps":
+        raise ValueError("expected timestamp policy")
+    start = sampling.get("start_ns", 0)
+    end = sampling.get("end_ns")
+    step = sampling.get("step_ns", 1_000_000_000)
+    cap = sampling.get("max_frames", 32)
+    overflow = sampling.get("overflow", "uniform")
+    if (
+        any(type(value) is not int for value in (start, step, cap))
+        or (end is not None and type(end) is not int)
+        or any(value > 2**63 - 1 for value in (start, step, cap))
+        or (end is not None and end > 2**63 - 1)
+        or start < 0
+        or step <= 0
+        or not 1 <= cap <= 32
+        or (end is not None and end <= start)
+        or overflow not in ("uniform", "truncate")
+    ):
+        raise ValueError("invalid timestamp sampling bounds")
+    scale = Fraction(time_base) * 1_000_000_000
+    if scale <= 0 or not frames:
+        raise ValueError("empty or invalid presentation timeline")
+    ordered = sorted(
+        (int(frame["best_effort_timestamp"]), index)
+        for index, frame in enumerate(frames)
+    )
+    origin, latest = ordered[0][0], ordered[-1][0]
+    times = [(pts - origin) * scale for pts, _ in ordered]
+    if end is None:
+        ends = []
+        previous = next((pts for pts, _ in reversed(ordered) if pts < latest), None)
+        for pts, index in ordered:
+            duration = frames[index].get("duration", frames[index].get("pkt_duration"))
+            if duration in (None, "N/A"):
+                duration = (
+                    latest - previous if pts == latest and previous is not None else 0
+                )
+            ends.append((pts - origin + int(duration)) * scale)
+        tail = max(ends)
+        end = -(-tail.numerator // tail.denominator)
+    if end <= start:
+        raise ValueError("empty timestamp window")
+    candidates = (end - start + step - 1) // step
+    count = min(candidates, cap)
+    selected = []
+    for i in range(count):
+        ordinal = (
+            i * (candidates - 1) // (count - 1)
+            if overflow == "uniform" and candidates > count > 1
+            else i
+        )
+        position = bisect_left(times, start + ordinal * step)
+        if position < len(times) and times[position] < end:
+            index = ordered[position][1]
+            if not selected or selected[-1] != index:
+                selected.append(index)
+    if not selected:
+        raise ValueError("empty timestamp window")
+    return selected
+
+
+def decoded(path, processor, sampling=None):
     """Stream independent RGB decoding and retain only upstream-selected frames.
 
-    Metadata and selected indices come from pinned HF code, not native sampling.
+    Default selection uses pinned HF; explicit windows use independent timestamps.
     FFmpeg/Pillow are qualification tools, never native runtime dependencies.
     """
     import numpy as np
@@ -192,21 +264,16 @@ def decoded(path, processor):
         "error",
         "-select_streams",
         "v:0",
+        "-count_frames",
         "-show_streams",
         "-of",
         "json",
         str(path),
     ]
     info = json.loads(subprocess.check_output(command, timeout=120))["streams"][0]
-    count = info.get("nb_frames")
-    if count is None or count == "N/A":
-        info = json.loads(
-            subprocess.check_output(
-                [*command[:1], "-count_frames", *command[1:]], timeout=120
-            )
-        )["streams"][0]
-        count = info.get("nb_read_frames")
-    count = int(count)
+    # Container nb_frames counts transport samples, including individual PAFF
+    # fields. The reference processor requires completed presentation pictures.
+    count = int(info["nb_read_frames"])
     duration_value = info.get("duration")
     if duration_value in (None, "N/A"):
         # Matroska commonly declares duration on the Segment, not the track.
@@ -235,12 +302,42 @@ def decoded(path, processor):
         width=width,
         height=height,
     )
-    selected = processor.sample_frames(
-        metadata,
-        fps=processor.fps,
-        max_frames=processor.max_frames,
-        overflow_strategy=processor.overflow_strategy,
-    ).tolist()
+    timestamp_evidence = None
+    if sampling is None or sampling == {"policy": "reference"}:
+        selected = processor.sample_frames(
+            metadata,
+            fps=processor.fps,
+            max_frames=processor.max_frames,
+            overflow_strategy=processor.overflow_strategy,
+        ).tolist()
+    else:
+        frames = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=best_effort_timestamp,duration,pkt_duration",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                timeout=120,
+            )
+        )["frames"]
+        count = len(frames)
+        metadata.total_num_frames = count
+        metadata.fps = count / duration
+        selected = timestamp_selection(frames, info["time_base"], sampling)
+        timestamp_evidence = {
+            "sampling": sampling,
+            "time_base": info["time_base"],
+            "presentation_frames": frames,
+        }
     if not selected or len(selected) * width * height * 3 > 128 * 1024 * 1024:
         raise ValueError("reference selected RGB exceeds bounds")
     pictures = {}
@@ -328,6 +425,7 @@ def decoded(path, processor):
             selected_frames=selected,
             duration=duration,
             retained_rgb_bytes=pixels.nbytes,
+            timestamp_evidence=timestamp_evidence,
         ),
     )
 
@@ -526,6 +624,8 @@ def native(args, data, result):
                         }
                     ]
                 }
+            if "sampling" in row:
+                body["input"][0]["content"][0]["sampling"] = row["sampling"]
             body["model"] = args.model_dir.name
             bodies[row["id"]] = body
             samples = []
@@ -637,7 +737,7 @@ def pytorch(args, data, result):
                     )
                 else:
                     pixels, metadata, policy = decoded(
-                        row["path"], processor.video_processor
+                        row["path"], processor.video_processor, row.get("sampling")
                     )
                     inputs = processor(
                         text=["<|video|>"],

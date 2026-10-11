@@ -520,3 +520,17 @@ scaled by TimestampScale. It is validated for finite positive values after the
 entire Info element is read, so element ordering does not affect scaling.
 Sampling consumers should prefer this value over rounded block timestamp tails.
 See the [Matroska element specification](https://www.matroska.org/technical/elements.html).
+
+
+## Logical AVC model timelines and explicit windows (2026-10-11)
+
+MP4 packet identities remain transport identities. Video consumers now use
+`video.h264_pictures` to obtain completed field/partition picture metadata and
+map model selections back to transport selectors. The index handles native
+configuration epochs and joins separate-colour-plane metadata; it does not
+change MP4 parsing or claim one packet equals one displayed picture. WebM uses
+its existing decoder-output logical index. HTTP video parts can independently
+choose reference index/FPS sampling or explicit rational timestamp windows;
+container duration and caller interval semantics remain distinct.
+See [VIDEO.md](../video/VIDEO.md#logical-avc-pictures-and-explicit-model-windows-2026-10-11)
+for bounds, endpoint behavior, recipe identity and window embedding semantics.

@@ -1,0 +1,166 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Logical AVC presentation metadata, obtained from completed decoder assemblies.
+const std = @import("std");
+const media = @import("antfly_media");
+const h264 = @import("h264.zig");
+const dynamic = @import("h264_dynamic.zig");
+const sampling = @import("sampling.zig");
+pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 8192, decode: h264.Options = .{ .max_dependency_packets = 8192, .max_parameter_packets = 8192 } };
+pub const Index = struct {
+    allocator: std.mem.Allocator,
+    pictures: []h264.Picture,
+    timescale: u32,
+    pub fn deinit(self: *Index) void {
+        self.allocator.free(self.pictures);
+        self.* = undefined;
+    }
+    /// Return transport selectors for logical pictures in presentation order.
+    /// The first member selects the complete field/partition assembly on replay.
+    pub fn select(self: Index) ![]usize {
+        if (self.pictures.len == 0 or self.timescale == 0) return error.EmptyVideo;
+        const order = try self.allocator.alloc(usize, self.pictures.len);
+        defer self.allocator.free(order);
+        for (order, 0..) |*id, i| id.* = i;
+        const Less = struct {
+            fn less(pictures: []const h264.Picture, l: usize, r: usize) bool {
+                return pictures[l].pts < pictures[r].pts or (pictures[l].pts == pictures[r].pts and pictures[l].first_packet < pictures[r].first_packet);
+            }
+        };
+        std.mem.sort(usize, order, @as([]const h264.Picture, self.pictures), Less.less);
+        const first = self.pictures[order[0]].pts;
+        const last = self.pictures[order[order.len - 1]];
+        const span = @as(i128, last.pts) + last.duration - first;
+        if (span <= 0) return error.InvalidSamplingMetadata;
+        const seconds = @as(f64, @floatFromInt(span)) / @as(f64, @floatFromInt(self.timescale));
+        const selected = try sampling.embeddingGemma2(self.allocator, .{ .total_frames = order.len, .fps = @as(f64, @floatFromInt(order.len)) / seconds, .duration_seconds = seconds }, .{});
+        for (selected) |*id| id.* = self.pictures[order[id.*]].first_packet;
+        return selected;
+    }
+};
+const Collector = struct {
+    allocator: std.mem.Allocator,
+    pictures: std.ArrayList(h264.Picture) = .empty,
+    planes: std.ArrayList(u8) = .empty,
+    limit: usize,
+    fn accept(raw: *anyopaque, picture: h264.Picture) !void {
+        const self: *Collector = @ptrCast(@alignCast(raw));
+        if (picture.independent_plane) |plane| {
+            const mask = @as(u8, 1) << @intCast(plane);
+            for (self.pictures.items, self.planes.items, 0..) |existing, seen, i| {
+                if (existing.first_packet != picture.first_packet) continue;
+                if (seen & mask != 0 or existing.pts != picture.pts or existing.duration != picture.duration or existing.width != picture.width or existing.height != picture.height or existing.bit_depth != picture.bit_depth) return error.MixedVideoPictures;
+                self.planes.items[i] |= mask;
+                return;
+            }
+        }
+        if (self.pictures.items.len >= self.limit) return error.ResourceLimitExceeded;
+        var result = picture;
+        if (picture.independent_plane != null) result.chroma_format = 3;
+        result.independent_plane = null;
+        try self.pictures.append(self.allocator, result);
+        try self.planes.append(self.allocator, if (picture.independent_plane) |plane| @as(u8, 1) << @intCast(plane) else 0);
+    }
+};
+fn codedEnds(reader: *media.mp4.Reader, begin: usize, end: usize, max_packet: usize) !?[2]usize {
+    var first: ?usize = null;
+    var last: usize = 0;
+    for (begin..end) |i| {
+        try reader.input.control.check();
+        if (reader.packets[i].size > max_packet) return error.ResourceLimitExceeded;
+        var packet = try reader.readPacket(i);
+        defer packet.deinit();
+        try @import("avc.zig").validatePortablePacket(packet.bytes, reader.track.nal_length_bytes);
+        var at: usize = 0;
+        while (at < packet.bytes.len) {
+            var size: usize = 0;
+            for (packet.bytes[at..][0..reader.track.nal_length_bytes]) |byte| size = (size << 8) | byte;
+            at += reader.track.nal_length_bytes;
+            const kind = packet.bytes[at] & 31;
+            if (kind == 1 or kind == 2 or kind == 5) {
+                if (first == null) first = i;
+                last = i;
+            }
+            at += size;
+        }
+    }
+    return if (first) |packet_index| .{ packet_index, last } else null;
+}
+fn discard(_: *anyopaque, _: usize, _: *const h264.Frame) !void {}
+pub fn index(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !Index {
+    if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
+    if (reader.packets.len == 0) return error.EmptyVideo;
+    if (reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
+    var collector = Collector{ .allocator = a, .limit = options.max_pictures };
+    defer collector.pictures.deinit(a);
+    defer collector.planes.deinit(a);
+    var decode = options.decode;
+    decode.picture_observer = .{ .context = &collector, .accept = Collector.accept };
+    if (reader.track.inband_parameter_sets) {
+        const session = try dynamic.Session.init(a, reader, decode);
+        defer session.deinit();
+        var selectors: std.ArrayList(usize) = .empty;
+        defer selectors.deinit(a);
+        for (session.epochs.items) |epoch| if (try codedEnds(reader, epoch.start, epoch.end, decode.max_packet_bytes)) |ends| {
+            try selectors.appendSlice(a, &ends);
+        };
+        if (selectors.items.len == 0) return error.EmptyVideo;
+        _ = try session.decodeSelected(selectors.items, &collector, discard);
+    } else {
+        const ends = try codedEnds(reader, 0, reader.packets.len, decode.max_packet_bytes) orelse return error.EmptyVideo;
+        _ = try h264.decodeSelected(a, reader, &ends, decode, &collector, discard);
+    }
+    for (collector.planes.items) |mask| if (mask != 0 and mask != 7) return error.IncompleteVideoPicture;
+    return .{ .allocator = a, .pictures = try collector.pictures.toOwnedSlice(a), .timescale = reader.track.timescale };
+}
+
+test "AVC logical picture index counts field pairs partitions and configuration epochs" {
+    const a = std.testing.allocator;
+    inline for (.{ "h264-paff-adaptive-packets-8-1", "h264-paff-interleaved-fragments-10-2", "h264-jm-partitions", "h264-dynamic-geometry", "h264-jm-separate" }) |name| {
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var pictures = try index(a, &reader, .{});
+        defer pictures.deinit();
+        try std.testing.expect(pictures.pictures.len > 0);
+        if (std.mem.eql(u8, name, "h264-jm-partitions") or std.mem.eql(u8, name, "h264-jm-separate")) try std.testing.expectEqual(@as(usize, 4), pictures.pictures.len);
+        if (std.mem.eql(u8, name, "h264-dynamic-geometry")) {
+            try std.testing.expectEqual(@as(usize, 3), pictures.pictures.len);
+            try std.testing.expectEqual(@as(u32, 64), pictures.pictures[0].width);
+            try std.testing.expectEqual(@as(u32, 96), pictures.pictures[1].width);
+            try std.testing.expectEqual(@as(u32, 80), pictures.pictures[2].width);
+        }
+        if (std.mem.startsWith(u8, name, "h264-paff")) try std.testing.expect(pictures.pictures.len < reader.packets.len);
+        const selected = try pictures.select();
+        defer a.free(selected);
+        for (selected) |packet| try std.testing.expect(packet < reader.packets.len);
+    }
+}
+
+test "AVC logical index bounds callback metadata and releases shared decode admission" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .identity = "logical-admission", .admission_pool = &pool, .storage = .{ .borrowed = @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const before = pool.snapshot().host_bytes;
+    try std.testing.expectError(error.ResourceLimitExceeded, index(a, &reader, .{ .max_pictures = 0 }));
+    try std.testing.expectEqual(before, pool.snapshot().host_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, index(a, &reader, .{ .max_packets = 0 }));
+    var pictures = try index(a, &reader, .{});
+    defer pictures.deinit();
+    try std.testing.expectEqual(before, pool.snapshot().host_bytes);
+}
