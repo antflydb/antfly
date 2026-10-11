@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Independently compiled private candidate for regular CREATE UNIQUE INDEX.
 //! This validates an index-only schema delta, not publication authority. The
@@ -192,20 +204,25 @@ const test_after =
     \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
 ;
 
-fn testOwnerJobAdmission(comptime Backend: type) !void {
+fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void {
     const a = std.testing.allocator;
     const jobs = @import("relational_index_owner_job.zig");
     const physical = @import("relational_index_catalog.zig");
     const registry = @import("schema_registry.zig");
     const topology = @import("relational_integrity_topology.zig");
     const DocStore = @import("../docstore.zig").DocStore;
-    var before = try schema_api.parseValidatedTableSchema(a, test_before);
+    const existing_declaration = "{\"name\":\"id_idx\",\"keys\":[{\"column\":\"id\"}]}";
+    const before_json = if (existing) try std.mem.replaceOwned(u8, a, test_before, "\"version\":1", "\"version\":1,\"relational_indexes\":[" ++ existing_declaration ++ "]") else try a.dupe(u8, test_before);
+    defer a.free(before_json);
+    const after_json = if (existing) try std.mem.replaceOwned(u8, a, test_after, "\"relational_indexes\":[", "\"relational_indexes\":[" ++ existing_declaration ++ ",") else try a.dupe(u8, test_after);
+    defer a.free(after_json);
+    var before = try schema_api.parseValidatedTableSchema(a, before_json);
     defer before.deinit(a);
-    var after = try schema_api.parseValidatedTableSchema(a, test_after);
+    var after = try schema_api.parseValidatedTableSchema(a, after_json);
     defer after.deinit(a);
     var prior = try compiler.compileCatalog(a, before, 101, null);
     defer prior.deinit();
-    var candidate = try Candidate.prepare(a, 101, test_before, test_after, prior.value, "email_idx");
+    var candidate = try Candidate.prepare(a, 101, before_json, after_json, prior.value, "email_idx");
     defer candidate.deinit();
     const before_schema = try schema_api.deriveRuntimeTableSchema(a, before);
     defer native_schema.freeSchema(a, before_schema);
@@ -221,16 +238,22 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
     defer after_view.release();
     var declaration_arena = std.heap.ArenaAllocator.init(a);
     defer declaration_arena.deinit();
+    var initial: ?physical.Prepared = if (existing) try physical.Prepared.init(a, before_view, null, (try before.relationalIndexDefinitions(declaration_arena.allocator())).?) else null;
+    defer if (initial) |*value| value.deinit();
+    var initial_loaded: ?physical.Loaded = if (initial) |value| try physical.decode(a, value.head, value.blob) else null;
+    defer if (initial_loaded) |*value| value.deinit();
     const definitions = (try after.relationalIndexDefinitions(declaration_arena.allocator())).?;
-    var private_addition = try physical.PrivateAddition.init(a, before_view, after_view, null, definitions, "email_idx");
+    var private_addition = try physical.PrivateAddition.init(a, before_view, after_view, if (initial_loaded) |*value| value else null, definitions, "email_idx");
     defer private_addition.deinit();
     var hash: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(prior.value, &hash, .{});
     const fence: topology.Fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .catalog_digest = hash };
     const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &private_addition);
-    var substituted_definitions = try declaration_arena.allocator().dupe(native_index.RelationalIndexDefinition, definitions);
-    substituted_definitions[0].keys = &.{.{ .column = "id" }};
-    var substituted = try physical.PrivateAddition.init(a, before_view, after_view, null, substituted_definitions, "email_idx");
+    const substituted_definitions = try declaration_arena.allocator().dupe(native_index.RelationalIndexDefinition, definitions);
+    for (substituted_definitions) |*definition| if (std.mem.eql(u8, definition.name, "email_idx")) {
+        definition.keys = &.{.{ .column = "id" }};
+    };
+    var substituted = try physical.PrivateAddition.init(a, before_view, after_view, if (initial_loaded) |*value| value else null, substituted_definitions, "email_idx");
     defer substituted.deinit();
     try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &substituted));
     const encoded = try binding.encode();
@@ -249,6 +272,7 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(catalog.key, prior.value);
+        if (initial) |*value| _ = try value.stage(&txn);
         var namespace_bytes: [24]u8 = undefined;
         @import("doc_identity.zig").encodeNamespace(&namespace_bytes, fence.namespace);
         try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &namespace_bytes);
@@ -299,9 +323,12 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.stageReservation(&txn, &manager, foreign, &candidate, &private_addition));
         try std.testing.expectEqual(jobs.Phase.fencing, (try jobs.load(&txn)).?.phase);
         try std.testing.expectEqualSlices(u8, prior.value, try txn.get(catalog.key));
-        try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
+        if (initial) |value| {
+            try std.testing.expect((try physical.Head.decode(try txn.get(physical.head_key))).eql(value.head));
+        } else try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
     }
     try manager.resolveIntents(@splat(9), .aborted, 2);
+    try testOwnerRecovery(a, &store, before_view, binding, false);
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
@@ -336,7 +363,9 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         errdefer txn.abort();
         try std.testing.expectEqual(jobs.Phase.fencing, (try jobs.load(&txn)).?.phase);
         try std.testing.expectEqualSlices(u8, prior.value, try txn.get(catalog.key));
-        try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
+        if (initial) |value| {
+            try std.testing.expect((try physical.Head.decode(try txn.get(physical.head_key))).eql(value.head));
+        } else try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
         try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
         try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
@@ -349,16 +378,110 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         try std.testing.expectEqualSlices(u8, candidate.reservation.value, try txn.get(catalog.key));
         var active = (try physical.load(a, &txn)).?;
         defer active.deinit();
-        try std.testing.expectEqual(@as(usize, 0), active.entries().len);
+        try std.testing.expectEqual(@as(usize, @intFromBool(existing)), active.entries().len);
         try std.testing.expectEqual(before_view.version(), active.head.schema_version);
         var recovered = try jobs.reopenPhysical(a, &txn, before_view, after_view, "email_idx");
         defer recovered.deinit();
         try std.testing.expectEqual(binding.index.mapKey(), recovered.index.mapKey());
-        try std.testing.expect(recovered.reservation.expected == null);
+        try std.testing.expectEqual(existing, recovered.reservation.expected != null);
         try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &recovered));
         try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.key));
     }
+    try testOwnerRecovery(a, &store, before_view, binding, true);
     try testPrivateBuildPages(a, &store, before_view, binding, &private_addition);
+    try testOwnerRecovery(a, &store, before_view, binding, true);
+}
+
+fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, before: @import("schema_registry.zig").SchemaView, binding: @import("relational_index_owner_job.zig").Binding, reserved: bool) !void {
+    const owner = @import("relational_index_owner_job.zig");
+    const physical = @import("relational_index_catalog.zig");
+    const pages = @import("relational_index_jobs.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    var snapshot = try physical.Controller.loadSnapshot(a, store, before);
+    defer if (snapshot) |*value| value.deinit();
+    try std.testing.expectEqual(reserved or binding.physical_before != null, snapshot != null);
+    if (snapshot) |value| try std.testing.expectEqual(@as(usize, @intFromBool(binding.physical_before != null)), value.plan.boundIndexes().len);
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, testOwnerRecoveryAllocations, .{&txn});
+    }
+    const Fault = enum { missing_job, missing_fence, namespace, integrity, schema, completed, progress_owner, progress_phase, candidate_missing, candidate_corrupt };
+    for (std.enums.values(Fault)) |fault| {
+        if (!reserved and (fault == .candidate_missing or fault == .candidate_corrupt)) continue;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const ca = scratch.allocator();
+        const progress_key = pages.progressKey(binding.index);
+        const blob_key = physical.blobKey(binding.physical_candidate.blob_digest);
+        const target: []const u8 = switch (fault) {
+            .missing_job => owner.key,
+            .missing_fence => topology.fence_key,
+            .namespace => &@import("../internal_keys.zig").identity_namespace_key,
+            .integrity => catalog.key,
+            .schema => native_schema.schema_key,
+            .completed => topology.receipt_key,
+            .progress_owner, .progress_phase => &progress_key,
+            .candidate_missing, .candidate_corrupt => &blob_key,
+        };
+        const previous = store.get(ca, target) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const actual_owner = blk: {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            break :blk try pages.ownership(&txn);
+        };
+        var namespace_bytes: [24]u8 = undefined;
+        var namespace = binding.fence.namespace;
+        namespace.range_id += 1;
+        @import("doc_identity.zig").encodeNamespace(&namespace_bytes, namespace);
+        const fence_bytes = try binding.fence.encode();
+        const value: ?[]const u8 = switch (fault) {
+            .missing_job, .missing_fence, .candidate_missing => null,
+            .namespace => &namespace_bytes,
+            .integrity, .schema, .candidate_corrupt => "corrupt",
+            .completed => &fence_bytes,
+            .progress_owner, .progress_phase => try (pages.Progress{
+                .id = binding.index,
+                .owner = if (fault == .progress_phase) actual_owner else @splat(0),
+                .comparison = @splat(0),
+                .phase = if (fault == .progress_phase) .forward else .primary,
+            }).encode(ca),
+        };
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            if (value) |bytes| try txn.put(target, bytes) else try txn.delete(target);
+            try txn.commit();
+        }
+        const expected: anyerror = switch (fault) {
+            .missing_job => error.PrivateIndexJobRequired,
+            .missing_fence => error.IntegrityTopologyFenceMissing,
+            .namespace => error.IdentityNamespaceMismatch,
+            .integrity => error.IntegrityCatalogChanged,
+            .schema => error.RelationalIndexCatalogSchemaMismatch,
+            .completed => error.PrivateIndexPublicationRequired,
+            .progress_owner, .progress_phase => error.InvalidRelationalIndexProgress,
+            .candidate_missing => error.MissingRelationalIndexDefinitions,
+            .candidate_corrupt => error.InvalidRelationalIndexCatalog,
+        };
+        try std.testing.expectError(expected, physical.Controller.loadSnapshot(a, store, before));
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            if (previous) |bytes| try txn.put(target, bytes) else try txn.delete(target);
+            try txn.commit();
+        }
+    }
+}
+
+fn testOwnerRecoveryAllocations(a: Allocator, txn: *@import("../docstore.zig").DocStore.Txn) !void {
+    const physical = @import("relational_index_catalog.zig");
+    var active = try physical.load(a, txn);
+    defer if (active) |*value| value.deinit();
+    try @import("relational_index_owner_job.zig").verifyRecovery(a, txn, if (active) |*value| value else null);
 }
 
 fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocStore, before: @import("schema_registry.zig").SchemaView, binding: @import("relational_index_owner_job.zig").Binding, addition_plan: *const @import("relational_index_catalog.zig").PrivateAddition) !void {
@@ -527,16 +650,18 @@ fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocSto
     }
     var active = (try physical.load(a, &txn)).?;
     defer active.deinit();
-    try std.testing.expectEqual(@as(usize, 0), active.entries().len);
+    try std.testing.expectEqual(addition_plan.plan.boundIndexes().len - 1, active.entries().len);
     try std.testing.expectEqual(before.version(), active.head.schema_version);
     var published = core.relational_indexes.acquire().?;
     defer published.deinit();
-    try std.testing.expectEqual(@as(usize, 0), published.plan.boundIndexes().len);
+    try std.testing.expectEqual(addition_plan.plan.boundIndexes().len - 1, published.plan.boundIndexes().len);
 }
 
 test "relational index candidate owner binding fences drains and reserves both catalogs atomically on memory and LSM" {
-    try testOwnerJobAdmission(@import("../mem_backend.zig").Backend);
-    try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend);
+    inline for (.{ false, true }) |existing| {
+        try testOwnerJobAdmission(@import("../mem_backend.zig").Backend, existing);
+        try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend, existing);
+    }
 }
 
 test "relational index candidate preserves CHECK coverage and reserves without public schema change" {

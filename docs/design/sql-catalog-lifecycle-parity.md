@@ -1683,3 +1683,48 @@ These overlapping component executions are not additional SQL disposition
 credits. The earlier seven-gate campaign passed in both modes before the final
 localized single-pass changes; it is not claimed as a full-suite rerun of this
 checkpoint.
+
+### Phase-aware native private-job recovery
+
+The shared physical snapshot loader now verifies retained private jobs in the
+same read transaction before binding or publishing its public execution plan.
+Startup, runtime catalog refresh and restore preparation use this boundary.
+An index-build fence without its job, or a job without its exact fence and
+durable namespace, fails closed. A generic completion receipt cannot silently
+release a private build.
+
+Fencing jobs require the original integrity catalog, schema and optional
+physical predecessor; reserved jobs require the allocation-burned catalogs and
+the retained canonical candidate blob. Recovery proves that the candidate adds
+exactly its bound generation while preserving every old physical ID, comparison
+identity and declaration. It validates private progress ownership and the
+primary-only construction phase without scanning primary rows or rebuilding
+historical schema registries. Parsing is bounded by the existing catalog limits
+and occurs only at the cold snapshot-loading boundary, not per row or page.
+
+Memory/LSM campaigns exercise bootstrap and already-indexed owners, before
+reservation, before the first page and after physical completion. Snapshot-load
+faults cover missing jobs/fences, namespace replacement, corrupt catalogs,
+generic completion, foreign/non-primary progress and missing/corrupt candidate
+definitions. Exhaustive allocation-failure checks cover the cold verifier.
+These are local structural recovery guarantees, not authenticated metadata
+decisions, native receipt verification or distributed activation evidence. The
+public failed-UNIQUE-build atomicity case remains open and inventory dispositions
+are unchanged.
+
+The PR's failing license-boundary workflow was reproduced locally: eleven new
+files had incomplete or wrong-package notices. The repository normalizer now
+applies its existing package rules to those files, without adding exceptions or
+weakening traversal. Header validation and the full Apache product boundary
+(2,026 source files) pass, as do all 55 boundary/header/provenance/asset unit
+tests. Server-owned modules remain ELv2; shared embedded implementations carry
+the required Apache notices.
+
+Final normalized-source qualification passes in Debug and ReleaseFast:
+`antfly-relational-index-pages-test`, `antfly-relational-index-candidate-test`
+and `relational-index-catalog-test`, with 65/65 build steps in each mode. Each
+executes four public regressions, nine native candidate/job tests, six metadata
+candidate tests and fourteen catalog tests, with zero failures, skips or leaks.
+These component selections overlap and are not new SQL case credits or a
+full-suite qualification. Formatting, diff and control-catalog freshness checks
+also pass; latest fetched `origin/main` remains included.

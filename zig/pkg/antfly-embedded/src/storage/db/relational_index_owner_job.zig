@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Native owner-local private index admission. These transaction primitives do
 //! not authenticate metadata, commit, emit receipts, or enable a public producer.
@@ -181,6 +193,71 @@ pub fn requireReserved(txn: anytype, binding: Binding) !void {
     if (!std.mem.eql(u8, &digest(raw), &binding.integrity_reserved)) return error.IntegrityCatalogChanged;
     const physical = try physical_catalog.Head.decode(try txn.get(physical_catalog.head_key));
     if (!physical.eql(binding.physical_reserved)) return error.PreparedGenerationChanged;
+}
+
+/// Cold startup/restore validation in the SAME snapshot as the public catalog.
+/// Structural recovery is not metadata authentication or permission to publish.
+/// Work is bounded by catalog size, never the number of primary rows.
+pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const physical_catalog.Loaded) !void {
+    const binding = try load(txn);
+    const fence = if (try optional(txn, topology.fence_key)) |bytes| try topology.Fence.decode(bytes) else null;
+    if (binding == null) {
+        if (fence) |value| if (value.role == .index_build) return error.PrivateIndexJobRequired;
+        return;
+    }
+    const job = binding.?;
+    try requireNamespace(txn, job);
+    if (fence == null) return error.IntegrityTopologyFenceMissing;
+    if (!fence.?.eql(job.fence)) return error.IntegrityTopologyChanged;
+    if (try topology.completed(txn)) |completed| {
+        if (completed.admission_epoch >= job.fence.admission_epoch) return error.PrivateIndexPublicationRequired;
+    }
+    const schema_bytes = (try optional(txn, schema.schema_key)) orelse return error.RelationalIndexCatalogSchemaMismatch;
+    if (!std.mem.eql(u8, &digest(schema_bytes), &job.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+    const integrity = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+    const expected_integrity = if (job.phase == .fencing) job.integrity_before else job.integrity_reserved;
+    if (!std.mem.eql(u8, &digest(integrity), &expected_integrity)) return error.IntegrityCatalogChanged;
+    switch (job.phase) {
+        .fencing => {
+            if (job.physical_before) |before| {
+                if (active == null or !active.?.head.eql(before)) return error.PreparedGenerationChanged;
+            } else if (active != null) return error.PreparedGenerationChanged;
+        },
+        .reserved => {
+            const current = active orelse return error.PreparedGenerationChanged;
+            if (!current.head.eql(job.physical_reserved)) return error.PreparedGenerationChanged;
+            const blob = (try optional(txn, &physical_catalog.blobKey(job.physical_candidate.blob_digest))) orelse return error.MissingRelationalIndexDefinitions;
+            var candidate = try physical_catalog.decode(alloc, job.physical_candidate, blob);
+            defer candidate.deinit();
+            if (candidate.entries().len != current.entries().len + 1) return error.PrivateIndexOwnerJobChanged;
+            var old_offset: usize = 0;
+            var found = false;
+            for (candidate.entries()) |entry| {
+                if (entry.id().mapKey() == job.index.mapKey()) {
+                    if (found) return error.PrivateIndexOwnerJobChanged;
+                    found = true;
+                    continue;
+                }
+                if (old_offset >= current.entries().len) return error.PrivateIndexOwnerJobChanged;
+                const previous = current.entries()[old_offset];
+                if (entry.generation >= job.physical_reserved.revision or
+                    entry.id().mapKey() != previous.id().mapKey() or
+                    !std.meta.eql(entry.comparison, previous.comparison) or
+                    !std.mem.eql(u8, &try @import("../relational_index.zig").definitionDigest(entry.definition), &try @import("../relational_index.zig").definitionDigest(previous.definition))) return error.PrivateIndexOwnerJobChanged;
+                old_offset += 1;
+            }
+            if (!found or old_offset != current.entries().len) return error.PrivateIndexOwnerJobChanged;
+        },
+    }
+    const pages = @import("relational_index_jobs.zig");
+    // Decode borrowed progress last: another store read may invalidate it.
+    const owner = try pages.ownership(txn);
+    if (try optional(txn, &pages.progressKey(job.index))) |bytes| {
+        if (job.phase == .fencing) return error.InvalidRelationalIndexProgress;
+        const progress = try pages.Progress.decode(bytes);
+        if (progress.id.mapKey() != job.index.mapKey() or progress.phase != .primary or
+            !std.mem.eql(u8, &progress.owner, &owner)) return error.InvalidRelationalIndexProgress;
+    }
 }
 
 /// Cold owner recovery retains the originally absent/existing predecessor from

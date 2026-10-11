@@ -573,11 +573,12 @@ pub const Controller = struct {
     pub fn loadSnapshot(alloc: Allocator, store: *docstore.DocStore, view: ?registry.SchemaView) !?WriteSnapshot {
         var txn = try store.beginReadTxn();
         defer txn.abort();
-        if (try load(alloc, &txn)) |value| {
-            var loaded = value;
-            defer loaded.deinit();
+        var loaded = try load(alloc, &txn);
+        defer if (loaded) |*value| value.deinit();
+        try @import("relational_index_owner_job.zig").verifyRecovery(alloc, &txn, if (loaded) |*value| value else null);
+        if (loaded) |*value| {
             const pinned = view orelse return error.RelationalIndexCatalogSchemaMismatch;
-            return .{ .head = loaded.head, .plan = try bindWritePlan(alloc, pinned, &loaded) };
+            return .{ .head = value.head, .plan = try bindWritePlan(alloc, pinned, value) };
         }
         return null;
     }
