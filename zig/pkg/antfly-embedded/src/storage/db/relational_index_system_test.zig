@@ -40,6 +40,54 @@ test "relational index build pages native owner control preserves committed cuts
     const jobs = @import("relational_index_owner_job.zig");
     const effects = @import("replication_effects.zig");
     const authority = @import("../source_authority.zig");
+    const contract = @import("replication_contract.zig");
+    const outboxes = @import("durable_outbox.zig");
+    const outbox_store = @import("durable_outbox_store.zig");
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Publisher = struct {
+        fail: bool = true,
+        payload: ?[]u8 = null,
+        attempts: usize = 0,
+        completed: usize = 0,
+        barrier: *Barrier,
+
+        fn next(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 101, .shard_id = 11, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: outboxes.Kind, _: []const u8, _: @import("doc_identity.zig").Namespace) !u64 {
+            return error.UnexpectedNonDurablePublication;
+        }
+        fn recover(mirror: contract.AsyncEffectMirror, kind: outboxes.Kind, pending: outboxes.DurableReplicationOutbox, _: @import("doc_identity.zig").Namespace) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            try std.testing.expectEqual(outboxes.Kind.restore_batch, kind);
+            try std.testing.expectEqual(@as(u64, 2), pending.from_lsn);
+            if (self.payload) |previous| {
+                try std.testing.expectEqualSlices(u8, previous, pending.payload);
+            } else self.payload = try alloc.dupe(u8, pending.payload);
+            self.attempts += 1;
+            if (self.fail) return error.TestPublicationUnavailable;
+            return pending.from_lsn;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(mirror: contract.AsyncEffectMirror, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
+            // Checkpoint capture must not be blocked by a lease held while
+            // waiting for standby acknowledgement.
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
+            capture.release();
+            self.completed += 1;
+        }
+        fn mirror(self: *@This()) contract.AsyncBatchMirror {
+            return .{
+                .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } },
+                .mutation_barrier = self.barrier,
+                .requirements = .{ .synchronous = true, .durable_outbox = true, .preflight = true },
+            };
+        }
+    };
     const before =
         \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
     ;
@@ -58,6 +106,11 @@ test "relational index build pages native owner control preserves committed cuts
     };
     var primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
     defer primary.close();
+    var barrier: Barrier = .{};
+    var publisher: Publisher = .{ .barrier = &barrier };
+    defer if (publisher.payload) |bytes| alloc.free(bytes);
+    // The borrowed publisher must be detached before its fixture is destroyed.
+    defer primary.local_execution.replication_async_batch_mirror = null;
     var standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
     defer standby.close();
     var parsed = try api.parseValidatedTableSchema(alloc, before);
@@ -88,12 +141,46 @@ test "relational index build pages native owner control preserves committed cuts
             try primary.prepareNativeIndexOwnerControl(.{ .effect = effect, .binding = binding });
         defer control.deinit();
         try control.preparePayload();
+        if (effect == .fenced) primary.local_execution.replication_async_batch_mirror = publisher.mirror();
         const outcome = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
         try std.testing.expect(!outcome.duplicate);
-        try std.testing.expect(!outcome.replication_pending);
-        try std.testing.expect(outcome.error_name == null);
-        try std.testing.expectEqual(effect != .admitted, outcome.receipt != null);
+        if (effect == .fenced) {
+            try std.testing.expect(outcome.replication_pending);
+            try std.testing.expectEqualStrings("TestPublicationUnavailable", outcome.error_name.?);
+            try std.testing.expect(outcome.receipt == null);
+            try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 0), publisher.completed);
+            var pending = try outbox_store.readPending(alloc, primary.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
+        } else {
+            try std.testing.expect(!outcome.replication_pending);
+            try std.testing.expect(outcome.error_name == null);
+            try std.testing.expectEqual(effect != .admitted, outcome.receipt != null);
+        }
         const payload = try control.finalizePayload(outcome.position);
+        if (effect == .fenced) {
+            try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
+            primary.local_execution.replication_async_batch_mirror = null;
+            primary.close();
+            primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+            publisher.fail = false;
+            primary.local_execution.replication_async_batch_mirror = publisher.mirror();
+            try primary.flushDurableReplicationOutboxes();
+            try std.testing.expectEqual(@as(usize, 2), publisher.attempts);
+            try std.testing.expectEqual(@as(usize, 1), publisher.completed);
+            var pending = try outbox_store.readPending(alloc, primary.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expect(pending.isEmpty());
+            primary.local_execution.replication_async_batch_mirror = null;
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&txn)).?.sequence);
+            try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
+        }
         const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = ordinal + 1, .previous_lsn = ordinal, .payload = payload };
         var decoded = try effects.decodeBatchMutationRequest(alloc, record);
         defer decoded.deinit();
@@ -118,6 +205,7 @@ test "relational index build pages native owner control preserves committed cuts
         const primary_retry = try primary.applyPreparedNativeIndexOwnerControl(&control, null);
         try std.testing.expect(primary_retry.duplicate);
         try std.testing.expectEqual(outcome.position, primary_retry.position);
+        try std.testing.expectEqual(effect != .admitted, primary_retry.receipt != null);
         try std.testing.expectEqual(@as(u64, ordinal + 1), try standby.replicationAppliedSequence());
         var txn = try standby.core.store.beginReadTxn();
         defer txn.abort();
