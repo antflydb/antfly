@@ -16,6 +16,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Receives validated finite scores while native record storage is borrowed.
+/// Missing and deleted keys emit no value. A failure may leave partial output.
+pub const ScoreSink = struct {
+    context: *anyopaque,
+    write: *const fn (*anyopaque, usize, f64) void,
+};
+
+/// Exactly one delivery per physical key, including null for absent/deleted
+/// records. On failure output may be partial; callers own error cleanup.
+pub const CompleteScoreSink = struct {
+    context: *anyopaque,
+    write: *const fn (*anyopaque, usize, ?f64) void,
+};
+
 /// Shared durability expectations that higher layers can reason about without
 /// depending on backend-specific flags like LMDB's no_sync/no_meta_sync.
 pub const Durability = enum {
