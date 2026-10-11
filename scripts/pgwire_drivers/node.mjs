@@ -23,6 +23,14 @@ try {
   for (const [name, value] of [['DateStyle', 'ISO, MDY'], ['TimeZone', 'UTC'], ['extra_float_digits', '3']]) {
     assert.equal(Object.values((await client.query('SHOW ' + name)).rows[0])[0], value);
   }
+  await client.query('CREATE TABLE cached_node (id TEXT PRIMARY KEY, n BIGINT)');
+  await client.query("INSERT INTO cached_node (id, n) VALUES ('a', 1)");
+  const cached = {name: 'migration', text: 'SELECT n FROM cached_node WHERE id = $1', values: ['a']};
+  assert.equal((await client.query(cached)).rows[0].n, '1');
+  await client.query('ALTER TABLE cached_node ADD COLUMN note TEXT');
+  assert.equal((await client.query(cached)).rows[0].n, '1');
+  await client.query('CREATE INDEX cached_node_n ON cached_node(n)');
+  assert.equal((await client.query(cached)).rows[0].n, '1');
   await client.query('BEGIN');
   await client.query('SELECT 1');
   await client.query('COMMIT');
