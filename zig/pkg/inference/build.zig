@@ -1107,6 +1107,20 @@ pub fn build(b: *std.Build) void {
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
 
+    const gemma4_image_bench = b.addExecutable(.{
+        .name = "antfly-gemma4-image-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_image.zig"), .target = target, .optimize = optimize }),
+    });
+    gemma4_image_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_image_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(gemma4_image_bench.root_module);
+    gemma4_image_bench.root_module.link_libc = true;
+    const install_gemma4_image_bench = b.addInstallArtifact(gemma4_image_bench, .{});
+    b.step("build-gemma4-image-bench", "Build the synchronized Gemma4 image benchmark").dependOn(&install_gemma4_image_bench.step);
+    const run_gemma4_image_bench = b.addRunArtifact(gemma4_image_bench);
+    run_gemma4_image_bench.addPassthruArgs();
+    b.step("bench-gemma4-image", "Benchmark Gemma4 vision and image embeddings").dependOn(&run_gemma4_image_bench.step);
+
     const embeddinggemma2_attention_check = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-attention-check",
         .root_module = b.createModule(.{

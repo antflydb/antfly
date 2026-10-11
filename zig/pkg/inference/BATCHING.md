@@ -447,8 +447,8 @@ CPU decode, resize, initial pixel/patch preparation and the direct projector's
 first patch norm remain on the host. Providers missing the relevant RoPE or
 pooling operations retain their host compatibility paths.
 
-This change covers vision projector activation boundaries. It does not add
-cross-image batching or GPU codec/resize kernels. Scalar clipping already has a
+This phase covers vision projector activation boundaries. The later cross-image
+batching phase below extends it; GPU codec/resize kernels remain separate work. Scalar clipping already has a
 device path; vector clipping compatibility and opt-in diagnostic stage dumps
 can still export tensors. Static weight materialization, including HF position
 tables, is a separate transfer concern. The public projected image/audio structs
@@ -550,6 +550,101 @@ zig build test -Donnx=false -Dmetal=true -Dtest-filter='media residency'
 zig build test -Donnx=false -Dmetal=true -Dtest-filter=clap -Dtest-filter=gemma4 -Dtest-filter=ocr -Dtest-filter=CTC -Dtest-filter=qwen -Dtest-filter=Qwen
 zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='media residency'
 ```
+
+### Gemma 4 cross-image batches and measurement
+
+Same-grid images can now share patch projection, encoder blocks, spatial
+pooling and final projection. `encodePreparedEmbeddingGemma2Images` borrows
+normalized pixels and returns owned, image-ordered projected arrays. Rows are
+flattened in image/patch order for matrix operations; SDPA receives separate
+batch and sequence dimensions. Both spatial rotary axes restart for each image.
+Pooling gathers include the image offset, and learned position offsets repeat
+per image. The GGUF projector's multi-image entry also uses bounded cohorts;
+its direct unified projector batches patch norm/projection and positional work.
+
+Cohorts contain contiguous images with identical target grids, with no padding
+or reordering inside vision attention. Different grids, image-count limits,
+patch-token limits and scratch limits split cohorts. `ImageBatchOptions` defaults
+to four images, 10,080 patch tokens and 768 MiB of estimated scratch. The
+estimate includes dense attention scores plus widened activation intermediates;
+it is a conservative admission bound, not an exact provider peak. A singleton
+that exceeds a supplied bound returns `ImageBatchBudgetExceeded` before GPU work.
+Prepared geometry and pixel lengths are checked before allocation. APIs support
+an explicit ceiling of eight images; this does not make eight the serving default.
+
+EmbeddingGemma2's encoded-image and borrowed-PDF-raster paths now use vision
+batches before their existing embedding-encoder cohorts of up to four rows.
+CPU decode/resize and final token-array export/prompt upload remain. Raster
+admission reserves the estimated vision cohort scratch in addition to existing
+encoder workspace, capped at 2 GiB for accelerators and 512 MiB for CPU. Encoded
+images reserve host preprocessing before decoding, retain only encoded sources
+and normalized pixels while queued, then compose the run reservation under the
+model execution lock. GPU reservations are acquired after the lock, so queued
+requests do not occupy vision scratch. Native execution can split
+vision into smaller cohorts while still batching the downstream encoder. Indexed
+codec/validation failures retain original error slots; backend, memory and
+cancellation failures propagate. This phase adds no cross-request queue or
+batching delay. Existing server broker cohorts can use the new vision batching;
+client concurrency is measured separately from model batches.
+
+The new `bench-gemma4-image` executable loads a real HF EmbeddingGemma2 checkpoint
+once and supports three synchronized scopes: `projector` starts from prepared
+normalized pixels; `image` includes encoded-image decode/resize; `embedding`
+includes decode/RGBA packing, the production raster pipeline, tokenization,
+embedding encoding and vector readback. For repeated benchmark inputs the last
+scope decodes once into a shared borrowed raster, matching a PDF renderer's
+ownership boundary. File reads and model load stay outside the warm interval.
+Session-load time is reported separately. Measure a cold first forward in its own
+process with `--warmups 0 --iterations 1`; do not mix it into warm percentiles. `--batching off` executes singleton
+forwards; `on` requests bounded cohorts. Reported batch count is distinct from
+`max_projector_batch`, since the memory limit may split an offline request.
+Embedding scope uses the production ceiling of four regardless of requested
+batch size. Its projector batch counter is unavailable; it is reported as null.
+
+Reports include raw samples, p50/p95 batch latency, images/sec, final outputs,
+bounded host peak and Metal device-owned peak, runtime memory snapshots, host
+download bytes and device readback calls. Transfer/workspace counters are
+available for direct projector/image scopes; embedding scope's internally owned
+workspaces are not attributed by those counters. Runtime memory includes
+retained pools/model slots and is not equivalent to transient activation peak.
+Upload bytes and a complete synchronization count need provider instrumentation;
+device readback calls and runtime frame submissions are useful existing evidence.
+Disable intermediate stage dumps and timing diagnostics for measured campaigns.
+
+```sh
+cd zig/pkg/inference
+zig build build-gemma4-image-bench -Donnx=false -Dmetal=true -Doptimize=fast
+zig build bench-gemma4-image -Donnx=false -Dmetal=true -Doptimize=fast -- \
+  --model /path/to/embeddinggemma-2 --image /path/to/page.png \
+  --scope projector --batch 4 --batching on --warmups 10 --iterations 100 \
+  --output /tmp/gemma4-image.json
+cd ../../..
+python3 tools/embeddinggemma2/image_campaign.py \
+  --baseline /path/to/frozen-baseline --candidate /path/to/frozen-candidate \
+  --model-dir /path/to/embeddinggemma-2 --image /path/to/photo.jpg \
+  --image /path/to/page.png --output-dir /tmp/gemma4-image-campaign
+python3 tools/embeddinggemma2/image_campaign.py \
+  --url http://127.0.0.1:8090/ai/v1 --http-model embeddinggemma-2 \
+  --image /path/to/photo.jpg --output-dir /tmp/gemma4-image-concurrency
+```
+
+The campaign driver alternates baseline/candidate order, records binary,
+checkpoint/config and input hashes, checks output shape/finiteness/cosine, and
+keeps raw artifacts. `--baseline-singletons` compares each batch with singleton
+throughput and reports amortized per-image batch latency explicitly; this is not
+the latency of an individual queued request. Use `--baseline-batching on` to
+compare an older PDF path with its downstream encoder batching preserved. HTTP mode sends one image per request at concurrency
+1/2/4/8 and reports successful throughput, latency, errors and serial-vector
+parity; overload errors are retained rather than retried invisibly. Run on the
+same otherwise-idle GPU, pin backend/weights/quantization and keep binaries
+immutable. Use 10 warmups and at least 100 samples for latency distributions;
+report cold startup separately. Photos, rectangular grids and document pages
+must be compared by actual patch/projected-token counts. Residency and batching
+are separate A/B comparisons: pre-residency vs resident singleton, then resident
+singleton vs same-grid batches. Synthetic native/Metal fixtures cover distinct
+images at batches 1/2/4/8, mixed-grid splits, order, budget rejection and isolation.
+Metal fixtures assert only the final projected output downloads. CUDA fixtures
+cross-compile; executing them needs CUDA hardware.
 
 ### Further implementation and measurement
 

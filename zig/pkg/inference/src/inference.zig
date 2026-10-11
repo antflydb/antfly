@@ -220,6 +220,7 @@ test {
     _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("pipelines/embedding_gemma2.zig");
     _ = @import("embedding_trace.zig");
     _ = @import("pipelines/qwen_embedding_batch.zig");
     _ = @import("server/model_manager.zig");

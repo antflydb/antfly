@@ -42,6 +42,8 @@ pub const ProjectedImages = struct {
     embeddings: []f32,
     tokens_per_image: []usize,
     hidden_size: usize,
+    batches_executed: usize = 0,
+    max_batch_executed: usize = 0,
 
     pub fn deinit(self: *ProjectedImages) void {
         self.allocator.free(self.embeddings);
@@ -116,7 +118,7 @@ const AudioConfig = struct {
     }
 };
 
-const Geometry = struct {
+pub const Geometry = struct {
     width: usize,
     height: usize,
     grid_x: usize,
@@ -124,7 +126,7 @@ const Geometry = struct {
     pooled_x: usize,
     pooled_y: usize,
 
-    fn tokenCount(self: Geometry) usize {
+    pub fn tokenCount(self: Geometry) usize {
         return self.pooled_x * self.pooled_y;
     }
 };
@@ -498,18 +500,39 @@ fn encodeProjectedImagesWithWeights(
     var tokens_per_image = std.ArrayListUnmanaged(usize).empty;
     errdefer tokens_per_image.deinit(allocator);
 
-    for (images) |image_bytes| {
-        const encoded = try encodeSingleImage(cb, allocator, store, cfg, image_bytes);
-        defer allocator.free(encoded.embeddings);
-        try all_embeddings.appendSlice(allocator, encoded.embeddings);
-        try tokens_per_image.append(allocator, encoded.tokens);
+    var batches_executed: usize = 0;
+    var max_batch_executed: usize = 0;
+    var start: usize = 0;
+    while (start < images.len) {
+        const count = @min(images.len - start, 4);
+        var prepared: [4]PreparedImage = undefined;
+        var initialized: usize = 0;
+        defer for (prepared[0..initialized]) |item| item.deinit();
+        for (images[start..][0..count], prepared[0..count]) |bytes, *item| {
+            try cb.checkExecutionControl();
+            const decoded = try image.decode(allocator, bytes);
+            defer decoded.deinit(allocator);
+            item.* = try prepareImageView(allocator, store, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 });
+            initialized += 1;
+        }
+        var projected = try encodePreparedImagesWithWeights(cb, allocator, store, cfg, prepared[0..initialized], .{});
+        defer projected.deinit();
+        try all_embeddings.appendSlice(allocator, projected.embeddings);
+        try tokens_per_image.appendSlice(allocator, projected.tokens_per_image);
+        batches_executed += projected.batches_executed;
+        max_batch_executed = @max(max_batch_executed, projected.max_batch_executed);
+        start += count;
     }
 
+    const lengths = try tokens_per_image.toOwnedSlice(allocator);
+    errdefer allocator.free(lengths);
     return .{
         .allocator = allocator,
         .embeddings = try all_embeddings.toOwnedSlice(allocator),
-        .tokens_per_image = try tokens_per_image.toOwnedSlice(allocator),
+        .tokens_per_image = lengths,
         .hidden_size = cfg.text_hidden,
+        .batches_executed = batches_executed,
+        .max_batch_executed = max_batch_executed,
     };
 }
 
@@ -1300,6 +1323,21 @@ fn encodeSingleImageView(
     cfg: Config,
     decoded: image.ImageU8,
 ) !EncodedImage {
+    var prepared = try prepareImageView(allocator, store, cfg, decoded);
+    defer prepared.deinit();
+    return encodePreparedImage(cb, allocator, store, cfg, prepared);
+}
+
+pub const PreparedImage = struct {
+    allocator: std.mem.Allocator,
+    pixels: []f32,
+    geometry: Geometry,
+    pub fn deinit(self: PreparedImage) void {
+        self.allocator.free(self.pixels);
+    }
+};
+
+fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8) !PreparedImage {
     const geometry = targetGeometry(cfg, decoded.width, decoded.height);
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(
         allocator,
@@ -1311,20 +1349,161 @@ fn encodeSingleImageView(
         1.0 / 255.0,
         if (store.gguf == null) .torchvision_bicubic else .bilinear,
     );
-    defer allocator.free(pixel_values);
+    return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
+}
 
-    var hidden = try patchEmbedTensor(cb, allocator, store, cfg, pixel_values, geometry);
+pub fn prepareEmbeddingGemma2Image(allocator: std.mem.Allocator, bytes: []const u8) !PreparedImage {
+    const decoded = try image.decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+    const cfg = embeddingGemma2ImageConfig();
+    const geometry = targetGeometry(cfg, decoded.width, decoded.height);
+    return .{ .allocator = allocator, .geometry = geometry, .pixels = try image.preprocessImageViewRectScaledWithResample(allocator, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 }, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .torchvision_bicubic) };
+}
+
+/// Bound the supplied image cohort; no queue or cross-request wait is added.
+pub const ImageBatchOptions = struct {
+    max_batch: usize = 4,
+    max_patch_tokens: usize = 10080,
+    max_scratch_bytes: usize = 768 * 1024 * 1024,
+    pub fn validate(self: ImageBatchOptions) !void {
+        if (self.max_batch == 0 or self.max_batch > 8 or self.max_patch_tokens == 0 or self.max_scratch_bytes == 0) return error.InvalidImageBatch;
+    }
+};
+
+fn validatePreparedImage(cfg: Config, prepared: PreparedImage) !void {
+    const g = prepared.geometry;
+    if (g.grid_x == 0 or g.grid_y == 0 or cfg.patch_size == 0 or cfg.spatial_merge_size == 0 or (cfg.position_embeddings_per_axis != 0 and (g.grid_x > cfg.position_embeddings_per_axis or g.grid_y > cfg.position_embeddings_per_axis))) return error.InvalidImageBatch;
+    const patches = std.math.mul(usize, g.grid_x, g.grid_y) catch return error.InvalidImageBatch;
+    if (patches > cfg.maxPatchCount() or g.grid_x % cfg.spatial_merge_size != 0 or g.grid_y % cfg.spatial_merge_size != 0 or g.width != g.grid_x * cfg.patch_size or g.height != g.grid_y * cfg.patch_size or g.pooled_x != g.grid_x / cfg.spatial_merge_size or g.pooled_y != g.grid_y / cfg.spatial_merge_size) return error.InvalidImageBatch;
+    const area = std.math.mul(usize, g.width, g.height) catch return error.InvalidImageBatch;
+    if (prepared.pixels.len != (std.math.mul(usize, area, 3) catch return error.InvalidImageBatch)) return error.InvalidImageBatch;
+}
+
+fn imageScratchBytes(cfg: Config, patches: usize) !usize {
+    const attention = std.math.mul(usize, std.math.mul(usize, patches, patches) catch return error.InvalidImageBatch, cfg.head_count) catch return error.InvalidImageBatch;
+    const activations_count = std.math.mul(usize, patches, (std.math.add(usize, std.math.mul(usize, cfg.vision_hidden, 12) catch return error.InvalidImageBatch, std.math.mul(usize, cfg.intermediate_size, 3) catch return error.InvalidImageBatch) catch return error.InvalidImageBatch)) catch return error.InvalidImageBatch;
+    return std.math.mul(usize, std.math.add(usize, attention, activations_count) catch return error.InvalidImageBatch, 4) catch return error.InvalidImageBatch;
+}
+
+pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRasterAttachment, limit: usize) !usize {
+    const cfg = embeddingGemma2ImageConfig();
+    var sum: usize = 0;
+    for (rasters) |raster| {
+        try raster.validate();
+        try image.DecodeLimits.inference_default.validate(raster.width, raster.height);
+        const geometry = targetGeometry(cfg, raster.width, raster.height);
+        const scratch = try imageScratchBytes(cfg, geometry.grid_x * geometry.grid_y);
+        if (scratch > limit) return error.ImageBatchBudgetExceeded;
+        sum = std.math.add(usize, sum, scratch) catch return error.InvalidImageBatch;
+    }
+    return @min(sum, limit);
+}
+
+fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !usize {
+    try options.validate();
+    if (prepared.len == 0) return 0;
+    for (prepared) |item| try validatePreparedImage(cfg, item);
+    const g = prepared[0].geometry;
+    const patches = std.math.mul(usize, g.grid_x, g.grid_y) catch return error.InvalidImageBatch;
+    if (patches == 0) return error.InvalidImageBatch;
+    // Conservative dense-attention and activation estimate; providers may use
+    // less scratch, but a larger batch must fit this bound before execution.
+    const scratch = try imageScratchBytes(cfg, patches);
+    const capacity = @min(options.max_batch, @min(options.max_patch_tokens / patches, options.max_scratch_bytes / @max(scratch, 1)));
+    if (capacity == 0) return error.ImageBatchBudgetExceeded;
+    var count: usize = 0;
+    for (prepared[0..@min(prepared.len, capacity)]) |item| {
+        if (!std.meta.eql(g, item.geometry)) break;
+        count += 1;
+    }
+    return count;
+}
+
+fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ProjectedImages {
+    try options.validate();
+    var embeddings = std.ArrayList(f32).empty;
+    errdefer embeddings.deinit(allocator);
+    const lengths = try allocator.alloc(usize, prepared.len);
+    errdefer allocator.free(lengths);
+    var offset: usize = 0;
+    var batches: usize = 0;
+    var maximum: usize = 0;
+    while (offset < prepared.len) {
+        try cb.checkExecutionControl();
+        const count = try imageBatchCount(cfg, prepared[offset..], options);
+        const result = try encodePreparedImageBatch(cb, allocator, store, cfg, prepared[offset..][0..count]);
+        defer allocator.free(result.embeddings);
+        try embeddings.appendSlice(allocator, result.embeddings);
+        @memset(lengths[offset..][0..count], result.tokens);
+        offset += count;
+        batches += 1;
+        maximum = @max(maximum, count);
+    }
+    return .{ .allocator = allocator, .embeddings = try embeddings.toOwnedSlice(allocator), .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
+}
+
+pub fn encodePreparedEmbeddingGemma2Images(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ProjectedImages {
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodePreparedImagesWithWeights(cb, allocator, &weights, embeddingGemma2ImageConfig(), prepared, options);
+}
+
+pub fn encodeEmbeddingGemma2Rasters(cb: *const ComputeBackend, allocator: std.mem.Allocator, rasters: []const antfly_image.BorrowedRasterAttachment, options: ImageBatchOptions) !ProjectedImages {
+    try options.validate();
+    // Bound preprocessing as well as GPU scratch: larger callers split their
+    // request into cohorts before entering this API.
+    if (rasters.len > 8) return error.InvalidImageBatch;
+    const prepared = try allocator.alloc(PreparedImage, rasters.len);
+    defer allocator.free(prepared);
+    var initialized: usize = 0;
+    defer for (prepared[0..initialized]) |item| item.deinit();
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    for (rasters, prepared) |raster, *item| {
+        try cb.checkExecutionControl();
+        const view = try raster.imageView();
+        try image.DecodeLimits.inference_default.validate(view.width, view.height);
+        item.* = try prepareImageView(allocator, &weights, embeddingGemma2ImageConfig(), view);
+        initialized += 1;
+    }
+    return encodePreparedImagesWithWeights(cb, allocator, &weights, embeddingGemma2ImageConfig(), prepared, options);
+}
+
+pub fn encodePreparedEmbeddingGemma2Image(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: PreparedImage) !EncodedImage {
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodePreparedImage(cb, allocator, &weights, embeddingGemma2ImageConfig(), prepared);
+}
+
+fn encodePreparedImage(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: PreparedImage) !EncodedImage {
+    return encodePreparedImageBatch(cb, allocator, store, cfg, &.{prepared});
+}
+
+fn encodePreparedImageBatch(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !EncodedImage {
+    if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
+    for (prepared) |item| try validatePreparedImage(cfg, item);
+    if (cfg.direct_unified) return encodePreparedUnifiedBatch(cb, allocator, store, cfg, prepared);
+    const batch = prepared.len;
+    const geometry = prepared[0].geometry;
+    const pixel_count = geometry.width * geometry.height * 3;
+    const pixel_values = try allocator.alloc(f32, batch * pixel_count);
+    defer allocator.free(pixel_values);
+    for (prepared, 0..) |item, b| {
+        if (!std.meta.eql(geometry, item.geometry) or item.pixels.len != pixel_count) return error.IncompatibleImageBatch;
+        @memcpy(pixel_values[b * pixel_count ..][0..pixel_count], item.pixels);
+    }
+    var hidden = try patchEmbedBatchTensor(cb, allocator, store, cfg, pixel_values, geometry, batch);
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
     {
-        const next = try addPositionEmbeddingsTensor(cb, allocator, store, cfg, hidden, geometry);
+        const next = try addPositionEmbeddingsBatchTensor(cb, allocator, store, cfg, hidden, geometry, batch);
         cb.free(hidden);
         hidden = next;
     }
 
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
-        const next = try encoderBlock(cb, allocator, store, cfg, hidden, geometry, layer);
+        const next = try encoderBlockBatch(cb, allocator, store, cfg, hidden, geometry, layer, batch);
         cb.free(hidden);
         hidden = next;
         store.releaseCompletedNativeLayer();
@@ -1334,18 +1513,18 @@ fn encodeSingleImageView(
         }
     }
 
-    const pooled_ct = try averagePoolSpatialTensor(cb, allocator, hidden, cfg, geometry);
+    const pooled_ct = try averagePoolSpatialBatchTensor(cb, allocator, hidden, cfg, geometry, batch);
     defer cb.free(pooled_ct);
     cb.free(hidden);
     hidden_live = false;
     const standardized = try standardizeSpatialTensor(cb, allocator, store, pooled_ct, cfg);
     defer cb.free(standardized);
-    const normed_pooled = try rmsNormNoScaleCt(cb, allocator, standardized, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed_pooled = try rmsNormNoScaleCt(cb, allocator, standardized, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed_pooled);
 
     const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
-    const projected = try cb.linearNoBias(normed_pooled, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+    const projected = try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projected);
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
@@ -1365,45 +1544,47 @@ fn encodeUnifiedDirectImage(
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
-    const geometry = targetGeometry(cfg, decoded.width, decoded.height);
-    const pixel_values = try image.preprocessDecodedRectScaledWithResample(
-        allocator,
-        decoded,
-        @intCast(geometry.width),
-        @intCast(geometry.height),
-        cfg.image_mean,
-        cfg.image_std,
-        1.0 / 255.0,
-        if (store.gguf == null) .torchvision_bicubic else .bilinear,
-    );
-    defer allocator.free(pixel_values);
+    const prepared = try prepareImageView(allocator, store, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 });
+    defer prepared.deinit();
+    return encodePreparedUnifiedBatch(cb, allocator, store, cfg, &.{prepared});
+}
 
-    const patches = try extractDirectImagePatches(allocator, pixel_values, cfg, geometry);
+fn encodePreparedUnifiedBatch(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !EncodedImage {
+    const batch = prepared.len;
+    const geometry = prepared[0].geometry;
+    const stride = geometry.tokenCount() * cfg.patch_size * cfg.patch_size * 3;
+    const patches = try allocator.alloc(f32, batch * stride);
     defer allocator.free(patches);
-    try applyLayerNormFromTensors(allocator, store, patches, geometry.tokenCount(), cfg.patch_size * cfg.patch_size * 3, "v.patch_norm.1", 1e-5);
+    for (prepared, 0..) |item, b| {
+        if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
+        const row = try extractDirectImagePatches(allocator, item.pixels, cfg, geometry);
+        defer allocator.free(row);
+        @memcpy(patches[b * stride ..][0..stride], row);
+    }
+    try applyLayerNormFromTensors(allocator, store, patches, batch * geometry.tokenCount(), cfg.patch_size * cfg.patch_size * 3, "v.patch_norm.1", 1e-5);
 
     const patch_dim = cfg.patch_size * cfg.patch_size * 3;
-    const patch_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(patch_dim) };
+    const patch_shape = [_]i32{ @intCast(batch * geometry.tokenCount()), @intCast(patch_dim) };
     const patch_ct = try deviceResidentFromFloat32(cb, patches, &patch_shape);
     defer cb.free(patch_ct);
     const patch_w = try store.linearCt("v.patch_embd.weight", patch_dim, cfg.vision_hidden);
     defer cb.free(patch_w);
-    const patch_projected = try cb.linearNoBias(patch_ct, patch_w, geometry.tokenCount(), patch_dim, cfg.vision_hidden);
+    const patch_projected = try cb.linearNoBias(patch_ct, patch_w, batch * geometry.tokenCount(), patch_dim, cfg.vision_hidden);
     defer cb.free(patch_projected);
 
-    const biased = try addVisionBiasTensor(cb, store, patch_projected, "v.patch_embd.bias", geometry.tokenCount(), cfg.vision_hidden);
+    const biased = try addVisionBiasTensor(cb, store, patch_projected, "v.patch_embd.bias", batch * geometry.tokenCount(), cfg.vision_hidden);
     defer cb.free(biased);
-    const normed_patch = try layerNormVisionTensor(cb, allocator, store, biased, geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.2");
+    const normed_patch = try layerNormVisionTensor(cb, allocator, store, biased, batch * geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.2");
     defer cb.free(normed_patch);
-    const positioned = try addPositionEmbeddingsTensor(cb, allocator, store, cfg, normed_patch, geometry);
+    const positioned = try addPositionEmbeddingsBatchTensor(cb, allocator, store, cfg, normed_patch, geometry, batch);
     defer cb.free(positioned);
-    const hidden_ct = try layerNormVisionTensor(cb, allocator, store, positioned, geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.3");
+    const hidden_ct = try layerNormVisionTensor(cb, allocator, store, positioned, batch * geometry.tokenCount(), cfg.vision_hidden, "v.patch_norm.3");
     defer cb.free(hidden_ct);
-    const normed = try rmsNormNoScaleCt(cb, allocator, hidden_ct, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed = try rmsNormNoScaleCt(cb, allocator, hidden_ct, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
     const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
-    const projected = try cb.linearNoBias(normed, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+    const projected = try cb.linearNoBias(normed, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projected);
 
     return .{
@@ -2762,13 +2943,18 @@ fn floorToMultiple(value: usize, multiple: usize) usize {
     return (value / multiple) * multiple;
 }
 
-fn patchEmbedTensor(
+fn patchEmbedTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, pixel_values: []const f32, geometry: Geometry) !CT {
+    return patchEmbedBatchTensor(cb, allocator, store, cfg, pixel_values, geometry, 1);
+}
+
+fn patchEmbedBatchTensor(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
     cfg: Config,
     pixel_values: []const f32,
     geometry: Geometry,
+    batch: usize,
 ) !CT {
     const scaled_pixels = try allocator.dupe(f32, pixel_values);
     defer allocator.free(scaled_pixels);
@@ -2778,12 +2964,12 @@ fn patchEmbedTensor(
         // HF's patch linear flattens [patch_y, patch_x, channel]. GGUF's
         // convolution uses [channel, patch_y, patch_x]; preserve the source
         // layout instead of reinterpreting a same-size matrix.
-        const patch_count = geometry.grid_x * geometry.grid_y;
+        const patch_count = batch * geometry.grid_x * geometry.grid_y;
         const patch_dim = cfg.patch_size * cfg.patch_size * 3;
         const pixels = try allocator.alloc(f32, patch_count * patch_dim);
         defer allocator.free(pixels);
-        for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |c| {
-            pixels[((gy * geometry.grid_x + gx) * patch_dim) + (py * cfg.patch_size + px) * 3 + c] = scaled_pixels[c * geometry.height * geometry.width + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
+        for (0..batch) |b| for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |c| {
+            pixels[((b * geometry.grid_y * geometry.grid_x + gy * geometry.grid_x + gx) * patch_dim) + (py * cfg.patch_size + px) * 3 + c] = scaled_pixels[(b * 3 + c) * geometry.height * geometry.width + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
         };
         try embeddingGemma2Stage(allocator, "image_patches", pixels);
         const input = try deviceResidentFromFloat32(cb, pixels, &.{ @intCast(patch_count), @intCast(patch_dim) });
@@ -2803,7 +2989,7 @@ fn patchEmbedTensor(
     const bias_ct = try cb.fromFloat32Shape(zero_bias, &bias_shape);
     defer cb.free(bias_ct);
 
-    const pixel_shape = [_]i32{ 1, 3, @intCast(geometry.height), @intCast(geometry.width) };
+    const pixel_shape = [_]i32{ @intCast(batch), 3, @intCast(geometry.height), @intCast(geometry.width) };
     const pixels_ct = try deviceResidentFromFloat32(cb, scaled_pixels, &pixel_shape);
     defer cb.free(pixels_ct);
 
@@ -2811,7 +2997,7 @@ fn patchEmbedTensor(
         pixels_ct,
         patch_w,
         bias_ct,
-        1,
+        batch,
         3,
         cfg.vision_hidden,
         geometry.height,
@@ -2829,18 +3015,20 @@ fn patchEmbedTensor(
     if (cb.vtable.reshapeOp == null or cb.vtable.transposeOp == null) {
         const data = try cb.toFloat32(conv, allocator);
         defer allocator.free(data);
-        if (data.len != cfg.vision_hidden * patch_count) return error.InvalidPatchEmbeddingShape;
+        if (data.len != batch * cfg.vision_hidden * patch_count) return error.InvalidPatchEmbeddingShape;
         const embedded = try allocator.alloc(f32, data.len);
         defer allocator.free(embedded);
-        for (0..cfg.vision_hidden) |channel| for (0..patch_count) |patch| {
-            embedded[patch * cfg.vision_hidden + channel] = data[channel * patch_count + patch];
+        for (0..batch) |b| for (0..cfg.vision_hidden) |channel| for (0..patch_count) |patch| {
+            embedded[(b * patch_count + patch) * cfg.vision_hidden + channel] = data[(b * cfg.vision_hidden + channel) * patch_count + patch];
         };
-        return cb.fromFloat32Shape(embedded, &.{ @intCast(patch_count), @intCast(cfg.vision_hidden) });
+        return cb.fromFloat32Shape(embedded, &.{ @intCast(batch * patch_count), @intCast(cfg.vision_hidden) });
     }
-    const layout = [_]i64{ @intCast(cfg.vision_hidden), @intCast(patch_count) };
+    const layout = [_]i64{ @intCast(batch), @intCast(cfg.vision_hidden), @intCast(patch_count) };
     const rows = try cb.primReshape(conv, &layout);
     defer cb.free(rows);
-    return cb.primTranspose(rows, &.{ 1, 0 }, &layout);
+    const transposed = try cb.primTranspose(rows, &.{ 0, 2, 1 }, &layout);
+    defer cb.free(transposed);
+    return cb.primReshape(transposed, &.{ @intCast(batch * patch_count), @intCast(cfg.vision_hidden) });
 }
 
 fn addPositionEmbeddings(
@@ -2972,7 +3160,11 @@ test "gemma4 12b real mmproj optional projector smoke" {
     }
 }
 
-fn encoderBlock(
+fn encoderBlock(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, input: CT, geometry: Geometry, layer: usize) !CT {
+    return encoderBlockBatch(cb, allocator, store, cfg, input, geometry, layer, 1);
+}
+
+fn encoderBlockBatch(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
@@ -2980,8 +3172,9 @@ fn encoderBlock(
     input: CT,
     geometry: Geometry,
     layer: usize,
+    batch: usize,
 ) !CT {
-    const total = geometry.grid_x * geometry.grid_y;
+    const total = batch * geometry.grid_x * geometry.grid_y;
     var buf: [128]u8 = undefined;
 
     const ln1 = try store.weightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
@@ -2989,7 +3182,7 @@ fn encoderBlock(
     const normed1 = try cb.rmsNorm(input, ln1, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed1);
 
-    const attn = try selfAttention(cb, allocator, store, cfg, normed1, geometry, layer, &buf);
+    const attn = try selfAttentionBatch(cb, allocator, store, cfg, normed1, geometry, layer, &buf, batch);
     defer cb.free(attn);
     const attn_post = try store.weightCt(try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
     defer cb.free(attn_post);
@@ -3015,7 +3208,7 @@ fn encoderBlock(
     return res2;
 }
 
-fn selfAttention(
+fn selfAttentionBatch(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     store: *ProjectorWeights,
@@ -3024,8 +3217,10 @@ fn selfAttention(
     geometry: Geometry,
     layer: usize,
     buf: *[128]u8,
+    batch: usize,
 ) !CT {
-    const total = geometry.grid_x * geometry.grid_y;
+    const sequence = geometry.grid_x * geometry.grid_y;
+    const total = batch * sequence;
     const head_dim = cfg.vision_hidden / cfg.head_count;
 
     var q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
@@ -3059,7 +3254,7 @@ fn selfAttention(
     const mask = try allocator.alloc(i64, total);
     defer allocator.free(mask);
     @memset(mask, 1);
-    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, 1, total, cfg.head_count, head_dim);
+    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, batch, sequence, cfg.head_count, head_dim);
     defer cb.free(attn);
 
     return linearNoBiasMaybeClipped(cb, allocator, store, attn, try fmt(buf, "v.blk.{d}.attn_out", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
@@ -3094,7 +3289,7 @@ fn rmsNormHeadChunksAnd2dRope(
         defer allocator.free(positions);
         for (0..rows) |row| {
             positions[row] = @intCast(row % geometry.grid_x);
-            positions[rows + row] = @intCast(row / geometry.grid_x);
+            positions[rows + row] = @intCast((row / geometry.grid_x) % geometry.grid_y);
         }
         const rotated = try cb.visionRope(flat, rows, head_dim, rope_theta, positions) orelse return error.UnsupportedResidentGemma4Vision;
         defer cb.free(rotated);
@@ -3164,7 +3359,7 @@ fn apply2dRope(
 
     for (0..rows) |token| {
         const x: f32 = @floatFromInt(token % geometry.grid_x);
-        const y: f32 = @floatFromInt(token / geometry.grid_x);
+        const y: f32 = @floatFromInt((token / geometry.grid_x) % geometry.grid_y);
         const positions = [2]f32{ x, y };
         for (0..heads) |head| {
             const base = token * hidden + head * head_dim;
@@ -3216,11 +3411,17 @@ fn feedForward(
 // Position tables are static weights; construct the per-image offsets on the
 // host without exporting patch activations.
 fn addPositionEmbeddingsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, input: CT, geometry: Geometry) !CT {
-    const positions = try allocator.alloc(f32, geometry.grid_x * geometry.grid_y * cfg.vision_hidden);
+    return addPositionEmbeddingsBatchTensor(cb, allocator, store, cfg, input, geometry, 1);
+}
+
+fn addPositionEmbeddingsBatchTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, input: CT, geometry: Geometry, batch: usize) !CT {
+    const stride = geometry.grid_x * geometry.grid_y * cfg.vision_hidden;
+    const positions = try allocator.alloc(f32, batch * stride);
     defer allocator.free(positions);
-    @memset(positions, 0);
-    try addPositionEmbeddingsInPlace(allocator, store, cfg, positions, geometry);
-    const offsets = try deviceResidentFromFloat32(cb, positions, &.{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) });
+    @memset(positions[0..stride], 0);
+    try addPositionEmbeddingsInPlace(allocator, store, cfg, positions[0..stride], geometry);
+    for (1..batch) |b| @memcpy(positions[b * stride ..][0..stride], positions[0..stride]);
+    const offsets = try deviceResidentFromFloat32(cb, positions, &.{ @intCast(batch * geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) });
     defer cb.free(offsets);
     return cb.add(input, offsets);
 }
@@ -3247,22 +3448,32 @@ fn layerNormVisionTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator
 }
 
 fn averagePoolSpatialTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, cfg: Config, geometry: Geometry) !CT {
+    return averagePoolSpatialBatchTensor(cb, allocator, input, cfg, geometry, 1);
+}
+
+fn averagePoolSpatialBatchTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, cfg: Config, geometry: Geometry, batch: usize) !CT {
     if (cb.vtable.takeRows == null or cb.vtable.multiplyScalar == null) {
         const data = try cb.toFloat32(input, allocator);
         defer allocator.free(data);
-        const pooled = try averagePoolSpatial(allocator, data, cfg, geometry);
+        const pooled = try allocator.alloc(f32, batch * geometry.tokenCount() * cfg.vision_hidden);
         defer allocator.free(pooled);
-        return cb.fromFloat32Shape(pooled, &.{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) });
+        const stride = geometry.grid_x * geometry.grid_y * cfg.vision_hidden;
+        for (0..batch) |image_index| {
+            const rows = try averagePoolSpatial(allocator, data[image_index * stride ..][0..stride], cfg, geometry);
+            defer allocator.free(rows);
+            @memcpy(pooled[image_index * rows.len ..][0..rows.len], rows);
+        }
+        return cb.fromFloat32Shape(pooled, &.{ @intCast(batch * geometry.tokenCount()), @intCast(cfg.vision_hidden) });
     }
-    const indices = try allocator.alloc(u32, geometry.tokenCount());
+    const indices = try allocator.alloc(u32, batch * geometry.tokenCount());
     defer allocator.free(indices);
     var sum: ?CT = null;
     defer if (sum) |tensor| cb.free(tensor);
     for (0..cfg.spatial_merge_size) |dy| for (0..cfg.spatial_merge_size) |dx| {
-        for (0..geometry.pooled_y) |py| for (0..geometry.pooled_x) |px| {
-            indices[py * geometry.pooled_x + px] = @intCast((py * cfg.spatial_merge_size + dy) * geometry.grid_x + px * cfg.spatial_merge_size + dx);
+        for (0..batch) |b| for (0..geometry.pooled_y) |py| for (0..geometry.pooled_x) |px| {
+            indices[b * geometry.tokenCount() + py * geometry.pooled_x + px] = @intCast(b * geometry.grid_x * geometry.grid_y + (py * cfg.spatial_merge_size + dy) * geometry.grid_x + px * cfg.spatial_merge_size + dx);
         };
-        const rows = try cb.takeRows(input, indices, geometry.tokenCount(), cfg.vision_hidden) orelse return error.UnsupportedResidentGemma4Vision;
+        const rows = try cb.takeRows(input, indices, batch * geometry.tokenCount(), cfg.vision_hidden) orelse return error.UnsupportedResidentGemma4Vision;
         if (sum) |previous| {
             defer cb.free(rows);
             const next = try cb.add(previous, rows);
@@ -4180,4 +4391,94 @@ test "media residency gemma4 audio log-mel Metal parity" {
 test "media residency gemma4 audio log-mel CUDA parity" {
     const fixture = @import("../ops/media_residency_test.zig");
     try fixture.onCuda(fixture.noWeights, checkGemma4AudioFeaturesResidency);
+}
+
+fn populateGemma4BatchWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try populateGemma4VisionTestWeights(store);
+    const a = store.allocator;
+    const projection = try @import("embedding_gemma2_media_weights.zig").name(a, "mm.input_projection.weight");
+    defer a.free(projection);
+    try fixture.putWeight(store, projection, &.{ 8, 16 }, null);
+    for (0..2) |layer| {
+        for ([_][]const u8{ "ln1", "ln2", "attn_post_norm", "ffn_post_norm", "attn_q_norm", "attn_k_norm", "attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down" }) |suffix| {
+            const source = try std.fmt.allocPrint(a, "v.blk.{d}.{s}.weight", .{ layer, suffix });
+            defer a.free(source);
+            const mapped = try @import("embedding_gemma2_media_weights.zig").name(a, source);
+            defer a.free(mapped);
+            const head_norm = std.mem.eql(u8, suffix, "attn_q_norm") or std.mem.eql(u8, suffix, "attn_k_norm");
+            const norm = std.mem.indexOf(u8, suffix, "norm") != null or std.mem.startsWith(u8, suffix, "ln");
+            const shape: []const i64 = if (head_norm) &.{8} else if (norm) &.{16} else if (std.mem.eql(u8, suffix, "ffn_down")) &.{ 16, 32 } else if (std.mem.startsWith(u8, suffix, "ffn_")) &.{ 32, 16 } else &.{ 16, 16 };
+            try fixture.putWeight(store, mapped, shape, if (norm) @as(f32, 1.0) else null);
+        }
+    }
+}
+
+fn checkGemma4ImageBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cfg = Config{ .text_hidden = 8, .vision_hidden = 16, .intermediate_size = 32, .block_count = 2, .head_count = 2, .image_size = 0, .patch_size = 2, .layer_norm_eps = 1e-6, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .position_embeddings_per_axis = 6, .spatial_merge_size = 2 };
+    const geometry = Geometry{ .width = 12, .height = 8, .grid_x = 6, .grid_y = 4, .pooled_x = 3, .pooled_y = 2 };
+    var pixels: [8][288]f32 = undefined;
+    var prepared: [8]PreparedImage = undefined;
+    for (&pixels, &prepared, 0..) |*row, *item, b| {
+        for (row, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 13 + b * 19) % 97)) / 97;
+        item.* = .{ .allocator = a, .pixels = row, .geometry = geometry };
+    }
+    var weights = ProjectorWeights.initHuggingFace(&cb, a);
+    defer weights.deinit();
+    var ref_weights = ProjectorWeights.initHuggingFace(&reference, a);
+    defer ref_weights.deinit();
+    const stride = geometry.tokenCount() * cfg.text_hidden;
+    for ([_]usize{ 1, 2, 4, 8 }) |batch| {
+        const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        var actual = try encodePreparedImagesWithWeights(&cb, a, &weights, cfg, prepared[0..batch], .{ .max_batch = batch });
+        const after = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+        if (cb.kind() == .metal) {
+            try std.testing.expectEqual(@as(u64, @intCast(actual.embeddings.len * 4)), after.downloads - before.downloads);
+            try std.testing.expectEqual(@as(u64, 1), after.accesses - before.accesses);
+        }
+        // CUDA's explicitly uploaded static position table is materialized
+        // once per cohort; activation transfers are only the final output.
+        if (cb.kind() == .cuda) try std.testing.expectEqual(@as(u64, @intCast(actual.embeddings.len * 4 + 192 * 4)), after.cuda_bytes - before.cuda_bytes);
+        defer actual.deinit();
+        try std.testing.expectEqual(batch, actual.max_batch_executed);
+        try std.testing.expectEqual(@as(usize, 1), actual.batches_executed);
+        for (prepared[0..batch], actual.tokens_per_image, 0..) |item, length, b| {
+            const expected = try encodePreparedImage(&reference, a, &ref_weights, cfg, item);
+            defer a.free(expected.embeddings);
+            try std.testing.expectEqual(expected.tokens, length);
+            for (actual.embeddings[b * stride ..][0..stride], expected.embeddings) |v, e| try std.testing.expectApproxEqAbs(e, v, 2e-4);
+        }
+    }
+    // Equal token counts do not make rectangular grids compatible. Preserve
+    // order across differently shaped cohorts and a singleton tail.
+    prepared[2].geometry = .{ .width = 8, .height = 12, .grid_x = 4, .grid_y = 6, .pooled_x = 2, .pooled_y = 3 };
+    var mixed = try encodePreparedImagesWithWeights(&cb, a, &weights, cfg, prepared[0..5], .{});
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), mixed.batches_executed);
+    for (prepared[0..5], 0..) |item, b| {
+        const expected = try encodePreparedImage(&reference, a, &ref_weights, cfg, item);
+        defer a.free(expected.embeddings);
+        for (mixed.embeddings[b * stride ..][0..stride], expected.embeddings) |v, e| try std.testing.expectApproxEqAbs(e, v, 2e-4);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try imageBatchCount(cfg, prepared[0..2], .{ .max_patch_tokens = 24 }));
+    try std.testing.expectError(error.ImageBatchBudgetExceeded, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_scratch_bytes = 1 }));
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_batch = 0 }));
+    try std.testing.expectError(error.IncompatibleImageBatch, encodePreparedImageBatch(&cb, a, &weights, cfg, prepared[1..3]));
+    var invalid = prepared[0];
+    invalid.geometry.grid_x = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{invalid}, .{}));
+}
+
+test "gemma4 image batching native parity and isolation" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onNative(populateGemma4BatchWeights, checkGemma4ImageBatch);
+}
+test "gemma4 image batching Metal parity and isolation" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(populateGemma4BatchWeights, checkGemma4ImageBatch);
+}
+test "gemma4 image batching CUDA parity and isolation" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(populateGemma4BatchWeights, checkGemma4ImageBatch);
 }
