@@ -66,12 +66,20 @@ test "SQL statement read admission calls native capture once without write autho
             try std.testing.expectEqual(.read_index, consistency);
             return self.failure;
         }
+        fn guarded(raw: *anyopaque, _: std.mem.Allocator, scan_request: reads.RelationalStatementScan) !reads.RelationalStatementSnapshot.GuardedRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captures += 1;
+            try std.testing.expectEqualStrings("physical", scan_request.table);
+            try std.testing.expect(scan_request.opts.include_range_proofs);
+            return self.failure;
+        }
     };
     for ([_]struct { failure: anyerror, expected: anyerror }{
         .{ .failure = error.GroupLeaderUnavailable, .expected = error.SqlStatementReadUnavailable },
         .{ .failure = error.ReadUnavailable, .expected = error.SqlStatementReadUnavailable },
         .{ .failure = error.InvalidSqlBackendResponse, .expected = error.InvalidSqlBackendResponse },
         .{ .failure = error.SqlMutationOutcomeUnknown, .expected = error.SqlMutationOutcomeUnknown },
+        .{ .failure = error.SqlRangeTrackingRequired, .expected = error.SqlRangeTrackingRequired },
     }) |case| {
         var fake: Fake = .{ .failure = case.failure };
         var server: http_server.ApiHttpServer = undefined;
@@ -86,6 +94,15 @@ test "SQL statement read admission calls native capture once without write autho
         fake.captures = 0;
         try std.testing.expectError(case.expected, Adapter.openNativeScan(&adapter, std.testing.allocator, table, .{ .fields = &.{}, .limit = 2 }));
         try std.testing.expectEqual(@as(usize, 1), fake.captures);
+        fake.captures = 0;
+        var observed: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
+        var snapshot: reads.RelationalStatementSnapshot = .{ .ptr = &fake, .vtable = &.{ .open = undefined, .open_guarded = Fake.guarded, .close = undefined } };
+        adapter.dynamic_snapshot = &snapshot;
+        adapter.dynamic_table = "physical";
+        adapter.range_reads = &observed;
+        try std.testing.expectError(case.expected, Adapter.openStatement(&adapter, std.testing.allocator, &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 2 } }}));
+        try std.testing.expectEqual(@as(usize, 1), fake.captures);
+        try std.testing.expectEqual(@as(usize, 0), observed.tables.len);
     }
 }
 
@@ -1453,7 +1470,7 @@ pub const Adapter = struct {
             query.primary_order = true;
             const scan_request = try self.prepareScan(temporary, request.table, query);
             const guarded = snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |err| blk: {
-                if (err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return err;
+                if (err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return statementReadAdmissionError(err);
                 // Activate the capability before any row or absence has been
                 // observed, then replace the stale cut. Once a view exists we
                 // must never silently mix two cuts within one SQL statement.
@@ -1463,7 +1480,7 @@ pub const Adapter = struct {
                 const replacement = reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |read_err| return statementReadAdmissionError(read_err);
                 snapshot.deinit();
                 snapshot.* = replacement;
-                break :blk try snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts });
+                break :blk snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |read_err| return statementReadAdmissionError(read_err);
             };
             defer {
                 for (guarded.owner_proofs) |owner| alloc.free(owner.proofs);
