@@ -166,7 +166,10 @@ test "external lake overlapping text generations share every physical segment on
     {
         const native = @import("lake_index_native_text.zig");
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &read_cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
-        const directory_root = try native.loadRootDirectory(ca, store, declaration.artifact, .none, cached);
+        const wire_directory = try native.loadRootDirectory(ca, store, declaration.artifact, .none, cached);
+        try std.testing.expectEqual(@as(u8, 3), wire_directory.inventory_version);
+        try std.testing.expectEqual(@as(usize, 0), wire_directory.manifests.len);
+        const directory_root = try native.text_directory.withManifests(ca, wire_directory, store, cached, .none);
         try std.testing.expectEqual(@as(usize, 0), directory_root.segments.len);
         try std.testing.expect(directory_root.serving_inventory != null);
         {
@@ -253,14 +256,14 @@ test "external lake overlapping text generations share every physical segment on
             try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none));
             try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
             try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
-            try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{try stores.sha256DigestFromChecksum(directory_root.manifests[0].checksum)}));
+            try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{native.term_directory.identity(full.file_groups[0].segments[0].artifact_id)}));
             try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
             try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
         }
         {
             var owner: @import("lake_index_native_text_cache.zig").Cache = .{};
             defer owner.deinit();
-            const chosen = [_][32]u8{try stores.sha256DigestFromChecksum(directory_root.manifests[1].checksum)};
+            const chosen = [_][32]u8{native.term_directory.identity(full.file_groups[1].segments[0].artifact_id)};
             var selected = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &chosen);
             defer selected.deinit();
             var complete = try owner.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
@@ -284,7 +287,7 @@ test "external lake overlapping text generations share every physical segment on
             try std.testing.expectEqual(@as(usize, 1), result.hits.len);
             try std.testing.expectEqual(oracle.hits[0].score, result.hits[0].score);
             // A different file subset gets its own corpus and statistics facade.
-            const other = [_][32]u8{try stores.sha256DigestFromChecksum(directory_root.manifests[2].checksum)};
+            const other = [_][32]u8{native.term_directory.identity(full.file_groups[2].segments[0].artifact_id)};
             var different = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &other);
             defer different.deinit();
             try std.testing.expect(different.snapshot.inventory_owner != selected.snapshot.inventory_owner);
@@ -320,8 +323,8 @@ test "external lake overlapping text generations share every physical segment on
             try std.testing.expectEqual(full.segments.len, paged.root.segments.len);
             try std.testing.expectEqual(@as(usize, 0), paged.manifests.len);
             // Cold compact admission never touches missing detailed manifests.
-            // Only selecting a segment requires its full descriptor; a failed
-            // admission must not install a broken reader in the query facade.
+            // Binding and hydration use independent per-segment and physical
+            // descriptors, so missing maintenance manifests do not affect reads.
             var selective_cache: @import("lake_index_native_text_cache.zig").Cache = .{};
             defer selective_cache.deinit();
             var selective = try selective_cache.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, fresh, fresh.context, .none);
@@ -331,8 +334,8 @@ test "external lake overlapping text generations share every physical segment on
                 try std.testing.expect(segment.reader.deferred != null);
                 try std.testing.expect(segment.reader.native == null);
             }
-            try std.testing.expectError(error.FileNotFound, selective.snapshot.readSegment(0));
-            try std.testing.expectEqual(@as(usize, 0), selective.snapshot.bound_segments.count());
+            try std.testing.expectEqual(@as(u32, 1), (try selective.snapshot.readSegment(0)).reader.doc_count);
+            try std.testing.expectEqual(@as(usize, 1), selective.snapshot.bound_segments.count());
             for (full.segments, paged.root.segments) |expected, actual| try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
         }
         {
@@ -362,15 +365,19 @@ test "external lake overlapping text generations share every physical segment on
             // attempt. Physical reader reuse must route through the current
             // generation, whose reader lease retains that exact object.
             const scope = try stores.UploadScope.forPublication(directory_root.domain, 55, std.testing.io);
-            const original = directory_root.manifests[0];
+            const admitted = try native.admitServingInventory(ca, a, directory_root, store, cached, .none);
+            defer admitted.deinit();
+            const original = admitted.root.routing[0][0].descriptor.?;
             const manifest_bytes = try store.getAlloc(original.artifact_id);
             defer a.free(manifest_bytes);
             var reissued = try store.putScoped(scope, manifest_bytes, .none);
             defer reissued.deinit(a);
-            var alias_root = directory_root;
-            const refs = try ca.dupe(@import("lake_index_aggregate_artifact.zig").ChunkRef, directory_root.manifests);
-            refs[0] = .{ .artifact_id = reissued.artifact_id, .checksum = reissued.checksum, .byte_len = reissued.byte_len };
-            alias_root.manifests = refs;
+            var alias_root = admitted.root;
+            const routes = try ca.dupe([]const native.SegmentRouting, admitted.root.routing);
+            const first_routes = try ca.dupe(native.SegmentRouting, routes[0]);
+            first_routes[0].descriptor = .{ .artifact_id = reissued.artifact_id, .checksum = reissued.checksum, .byte_len = reissued.byte_len };
+            routes[0] = first_routes;
+            alias_root.routing = routes;
             const root_bytes = try std.json.Stringify.valueAlloc(ca, alias_root, .{});
             var uploaded_root = try store.putScoped(scope, root_bytes, .none);
             defer uploaded_root.deinit(a);

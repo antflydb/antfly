@@ -186,7 +186,7 @@ pub const Cache = struct {
             corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
         else
             corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
-            if (err == error.OutOfMemory and self.inventory_budget.isExhausted()) return error.NativeLakeTextCacheBusy;
+            if (err == error.OutOfMemory and (self.inventory_budget.isExhausted() or metadata_budget.isExhausted())) return error.NativeLakeTextCacheBusy;
             return err;
         };
         defer inventory.deinit();
@@ -477,6 +477,13 @@ const Entry = struct {
         };
         if (root.routing.len != 0) for (root.routing, root.manifests) |routes, manifest| {
             for (routes, 0..) |route, ordinal| try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len }, .ordinal = ordinal });
+        };
+        // Exact per-segment descriptors belong to this generation, including
+        // when its immutable physical reader is shared with another corpus.
+        for (root.routing) |routes| for (routes) |route| if (route.descriptor) |descriptor| {
+            const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, descriptor.artifact_id), .checksum = try a.dupe(u8, descriptor.checksum), .byte_len = descriptor.byte_len };
+            try self.descriptors.put(a, try a.dupe(u8, route.ref.artifact_id), .{ .manifest = ref, .ordinal = 0 });
+            try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = ref, .ordinal = 0 });
         };
         for (root.file_groups) |group| if (group.admissions.len != 0) {
             for (group.segments, group.admissions) |ref, metadata| try admission_by_id.put(self.allocator, ref.artifact_id, metadata);

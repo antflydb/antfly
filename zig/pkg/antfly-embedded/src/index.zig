@@ -1208,6 +1208,13 @@ pub const IndexSnapshot = struct {
     /// A retained snapshot pins immutable data, not the opening query's
     /// authority. Stop capability-bound work before releasing that authority.
     pub fn quiesceReadContext(self: *IndexSnapshot) void {
+        // A plain pin shares the writer's physical snapshot. Only a facade
+        // owns query authority and may fence reads when that query closes.
+        if (self.read_context == null) return;
+        self.quiesceOwnedSources();
+    }
+
+    fn quiesceOwnedSources(self: *IndexSnapshot) void {
         while (!self.bound_mu.tryLock()) spinOrYield();
         self.quiesced = true;
         while (self.binding_flights.count() != 0) {
@@ -1244,7 +1251,7 @@ pub const IndexSnapshot = struct {
     /// Free everything this snapshot owns and destroy it. Only valid once
     /// the refcount has reached zero.
     fn freeFinal(self: *IndexSnapshot) void {
-        self.quiesceReadContext();
+        self.quiesceOwnedSources();
         const alloc = self.alloc;
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
@@ -4755,4 +4762,30 @@ fn sealedCollectionScenario(a: Allocator) !void {
 test "external lake sealed collection statistics own names and isolate unchanged physical generations under OOM" {
     try sealedCollectionScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sealedCollectionScenario, .{});
+}
+
+test "external lake closing shared physical pins preserves concurrent and subsequent scoring" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegment(a, &.{.{ .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const first = writer.acquireSnapshot();
+    const concurrent = writer.acquireSnapshot();
+    defer concurrent.release();
+    const before = try first.search(a, "body", &.{"hello"}, 10);
+    defer a.free(before.hits);
+    try std.testing.expectEqual(@as(usize, 2), before.hits.len);
+    first.quiesceReadContext();
+    first.release();
+    const during = try concurrent.search(a, "body", &.{"hello"}, 10);
+    defer a.free(during.hits);
+    try std.testing.expectEqualDeep(before, during);
+    const subsequent = writer.acquireSnapshot();
+    defer subsequent.release();
+    const after = try subsequent.search(a, "body", &.{"hello"}, 10);
+    defer a.free(after.hits);
+    try std.testing.expectEqualDeep(before, after);
 }

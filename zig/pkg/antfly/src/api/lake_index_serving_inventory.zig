@@ -27,26 +27,29 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Ref = corpus.statistics.Ref;
 const Chunk = artifacts.ChunkRef;
 const chunk_bytes = 16 * 1024;
-const FileRouting = struct { file: @import("lake_index_native_state.zig").File, segments: []const corpus.SegmentRouting };
+const FileRouting = struct { file: @import("lake_index_native_state.zig").File, segments: []const corpus.SegmentRouting, physical: ?Chunk = null };
 pub const Roots = struct { full: ?Ref, routes: ?Ref, segments: ?Ref = null };
 
-fn encode(a: A, group: corpus.FileGroup, compact: bool) ![]u8 {
-    if (!compact) return std.json.Stringify.valueAlloc(a, group, .{});
+pub fn compactRoutes(a: A, group: corpus.FileGroup) ![]const corpus.SegmentRouting {
     if (group.admissions.len != group.segments.len or group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
     const segments = try a.alloc(corpus.SegmentRouting, group.segments.len);
-    for (segments, group.segments, group.summaries, group.admissions) |*out, ref, summary, metadata| {
+    for (segments, group.segments, group.summaries, group.admissions, 0..) |*out, ref, summary, metadata, i| {
         const fields = try a.alloc(corpus.SegmentRouting.Field, metadata.fields.len);
         for (fields, metadata.fields) |*field, source| {
             var mask: u16 = 0;
             for (source.sections) |section| mask |= @as(u16, 1) << @as(u4, @intCast(@backingInt(section.kind)));
             field.* = .{ .name = source.name, .stats = source.stats, .section_mask = mask };
         }
-        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields };
+        out.* = .{ .ref = ref, .summary = summary, .bytes = metadata.bytes, .doc_count = metadata.doc_count, .fields = fields, .descriptor = if (group.descriptors.len == group.segments.len) group.descriptors[i] else null };
     }
+    return segments;
+}
+fn encode(a: A, group: corpus.FileGroup, compact: bool) ![]u8 {
+    if (!compact) return std.json.Stringify.valueAlloc(a, group, .{});
     var file = group.file;
     file.docs = &.{};
     file.count = 0;
-    return std.json.Stringify.valueAlloc(a, FileRouting{ .file = file, .segments = segments }, .{});
+    return std.json.Stringify.valueAlloc(a, FileRouting{ .file = file, .segments = try compactRoutes(a, group), .physical = group.physical_manifest }, .{});
 }
 fn key(ref: Chunk, offset: usize) ![36]u8 {
     var result: [36]u8 = undefined;
@@ -124,7 +127,7 @@ pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGr
 }
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, prior: ?corpus.Root, cancellation: Cancellation) !Roots {
     const old = prior orelse return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true), .segments = try segmentFiles(a, storage, groups, refs) };
-    if (old.inventory_version != 2 or old.manifests.len != old.file_groups.len) return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true), .segments = try segmentFiles(a, storage, groups, refs) };
+    if (old.inventory_version < 2 or old.manifests.len != old.file_groups.len) return .{ .full = try build(a, storage, groups, refs, false), .routes = try build(a, storage, groups, refs, true), .segments = try segmentFiles(a, storage, groups, refs) };
     var before: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer before.deinit(a);
     var after: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
@@ -309,7 +312,7 @@ fn append(a: A, directory: corpus.Root, groups: []corpus.FileGroup, routes: [][]
                 if (field.stats) |stats| if (stats.doc_count > segment.doc_count) return error.InvalidNativeLakeTextCorpus;
             }
         }
-        groups[index] = .{ .file = route.file, .segments = refs, .summaries = summaries };
+        groups[index] = .{ .file = route.file, .segments = refs, .summaries = summaries, .physical_manifest = route.physical };
         routes[index] = route.segments;
         try groups[index].validate(directory.domain);
     }

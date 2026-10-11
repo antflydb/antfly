@@ -2119,3 +2119,67 @@ Debug):
   caches, and transitions back to the complete physical collection.
 - Formatting, Python syntax, license headers, both source-boundary audits, and
   diff checks pass. A final fetch confirms the merged main revision is current.
+
+### Paged maintenance and precise segment admission
+
+The follow-up to the shared snapshot lifecycle review merges main through
+`84a0080999`. Closing an ordinary physical snapshot pin now releases that pin
+without fencing the writer's shared snapshot. Query-owned read facades still
+fence new bindings and join outstanding source work before releasing their
+capabilities. Final snapshot destruction quiesces owned sources in both cases.
+The regression covers concurrent pins and subsequent scoring without a writer
+publication between queries.
+
+Text corpus inventory version 3 stores a compact file catalog and exact segment
+routes in authenticated copy-on-write page trees. The root carries the file
+count and tree roots instead of an archive-sized manifest array. File identity
+lookup seeks directly to its manifest reference. Snapshot refresh compares the
+compact file states with the provider's pinned inventory, loads full maintenance
+manifests only for changed or removed files, and applies their statistics,
+collection totals, manifest routes and segment routes as deltas. Provider
+inventory comparison remains proportional to the number of physical files;
+unchanged files require no detailed manifest decode. Older inventories retain
+compatibility readers and upgrade on their next publication.
+
+Necessary-term selection retains exact immutable segment IDs. It no longer
+widens a selective segment proof to every native segment in a Parquet file.
+Selected segment routes contain their original file ordinal intervals and the
+physical block references overlapping those intervals. Mapping predicates,
+hydrated rows and native ordinals preserves gaps between selected segments and
+deleted physical rows. Collection N, global DF and field-length totals still
+belong to the complete pinned snapshot, so pruning does not change BM25 scores.
+Optional proof budgets continue to fall back to full inventory admission.
+
+Each segment's detailed admission descriptor is an independent immutable
+artifact. Physical row metadata is independently admitted from section
+navigation, so binding or hydrating a winner never needs the file's combined
+maintenance manifest. The corpus cache routes shared physical readers through
+the current generation's descriptor references. Reader-safe GC marks both paged
+directories, expands the compact file catalog within its read budget, and retains
+segment and physical descriptors through their maintenance manifests.
+
+Resident join/group reduction now consumes borrowed hash matches directly into
+the same typed reducer used by partitioned joins. Compact pair payloads are not
+cloned into delivery pages before being merged. The reducer owns its existing
+bounded spill fallback. When final groups retain all join keys, already distinct
+compact results keep the streaming path instead of paying for another hash
+reduction.
+
+Validation includes the shared-pin lifecycle regression, direct lookup and
+copy-on-write work counts over 2,048 file records, refresh with an unchanged
+manifest deliberately unavailable, exact admission with unrelated descriptors
+and payloads unavailable, sparse physical ordinal round trips, descriptor
+reissue/generation isolation, and GC traversal of paged catalogs. Real Parquet
+and PyIceberg E2Es exercise both fragmented files and multiple native segments
+inside one physical file, including metadata filters and cold restart. Fixture
+and page-count results do not substitute for representative archive-scale
+latency, provider request counts, RSS or join-skew benchmarks.
+
+Final qualification on Zig 0.17.0 Debug passes all 337 lake checks (138 shared,
+199 API) without allocator leaks and builds the production CLI. Eight selected
+real-file E2Es pass: fragmented files and multi-segment files in both Parquet and
+Iceberg, independent Iceberg snapshot/schema/delete transitions, global remote
+text scoring and cursors, incremental artifact reuse, and the wide typed join.
+The 2,048-file catalog initially writes 64 pages; replacing one file changes
+three pages and reads five, while two identity lookups read four pages. Formatting,
+Python syntax, license headers, source boundaries, and diff checks pass.

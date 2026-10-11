@@ -123,7 +123,82 @@ pub const Identities = struct {
         lower: u32,
         upper: u32,
         rows: []const corpus.physical.Block,
+        intervals: []const Mapping = &.{},
         manifest: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+        const Mapping = struct { file_lower: u32, lower: u32, upper: u32 };
+        fn localOrdinal(self: @This(), ordinal_value: u32) ?u32 {
+            if (self.intervals.len == 0) return if (ordinal_value < self.upper - self.lower) self.lower + ordinal_value else null;
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const interval = self.intervals[mid];
+                if (@as(u64, interval.file_lower) + interval.upper - interval.lower <= ordinal_value) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.intervals.len or ordinal_value < self.intervals[lo].file_lower) return null;
+            return self.intervals[lo].lower + ordinal_value - self.intervals[lo].file_lower;
+        }
+        fn original(self: @This(), ordinal_value: u32) !u32 {
+            if (ordinal_value < self.lower or ordinal_value >= self.upper) return error.InvalidNativeLakeTextCorpus;
+            if (self.intervals.len == 0) return ordinal_value - self.lower;
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.intervals[mid].upper <= ordinal_value) lo = mid + 1 else hi = mid;
+            }
+            if (lo == self.intervals.len) return error.InvalidNativeLakeTextCorpus;
+            const interval = self.intervals[lo];
+            return interval.file_lower + ordinal_value - interval.lower;
+        }
+        fn addRange(self: @This(), result: *Bitmap, lower: u32, upper: u64) !void {
+            if (self.intervals.len == 0) return result.addRange(try std.math.add(u32, self.lower, lower), @as(u64, self.lower) + upper);
+            for (self.intervals) |interval| {
+                const start = @max(lower, interval.file_lower);
+                const end = @min(upper, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                if (start < end) try result.addRange(interval.lower + start - interval.file_lower, @as(u64, interval.lower) + end - interval.file_lower);
+            }
+        }
+        fn addBitmap(self: @This(), a: A, result: *Bitmap, bitmap: *const Bitmap) !void {
+            if (self.intervals.len == 0) {
+                var shifted = try bitmap.addOffset(self.lower);
+                defer shifted.deinit();
+                return result.orWith(&shifted);
+            }
+            for (self.intervals) |interval| {
+                var ranks = try bitmap.sliceRebased(a, interval.file_lower, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                defer ranks.deinit();
+                var shifted = try ranks.addOffset(interval.lower);
+                defer shifted.deinit();
+                try result.orWith(&shifted);
+            }
+        }
+        /// Invert only one physical block at a time, including sparse segment
+        /// intervals. A broad file must not create a file-sized bitmap copy.
+        fn fileRanks(self: @This(), a: A, selected: *const Bitmap, lower: u32, upper: u64) !Bitmap {
+            if (self.intervals.len == 0) return selected.sliceRebased(a, try std.math.add(u32, self.lower, lower), @as(u64, self.lower) + upper);
+            var result = Bitmap.init(a);
+            errdefer result.deinit();
+            var lo: usize = 0;
+            var hi = self.intervals.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const interval = self.intervals[mid];
+                if (@as(u64, interval.file_lower) + interval.upper - interval.lower <= lower) lo = mid + 1 else hi = mid;
+            }
+            for (self.intervals[lo..]) |interval| {
+                if (interval.file_lower >= upper) break;
+                const start = @max(lower, interval.file_lower);
+                const end = @min(upper, @as(u64, interval.file_lower) + interval.upper - interval.lower);
+                if (start >= end) continue;
+                var ranks = try selected.sliceRebased(a, interval.lower + start - interval.file_lower, @as(u64, interval.lower) + end - interval.file_lower);
+                defer ranks.deinit();
+                var shifted = try ranks.addOffset(start - lower);
+                defer shifted.deinit();
+                try result.orWith(&shifted);
+            }
+            return result;
+        }
         fn blocks(self: @This(), cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, file_id: []const u8) ![]const corpus.physical.Block {
             const ref = self.manifest orelse return self.rows;
             const held = try cache.file(store, cached, ref);
@@ -151,15 +226,23 @@ pub const Identities = struct {
             if (segment > snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
             const entry = try result.files.getOrPut(a, try a.dupe(u8, group.file.id));
             if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
-            if (root.routing.len == 0 and try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
+            if (group.selected.len == 0 and root.routing.len == 0 and try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
             const physical_rows = try a.dupe(corpus.physical.Block, group.rows);
             for (physical_rows) |*block| if (block.bitmap) |*ref| {
                 ref.artifact_id = try a.dupe(u8, ref.artifact_id);
                 ref.checksum = try a.dupe(u8, ref.checksum);
             };
             entry.value_ptr.* = .{ .lower = offsets[start], .upper = offsets[segment], .rows = physical_rows };
-            if (root.routing.len != 0) {
-                const ref = root.manifests[group_index];
+            if (group.selected.len != 0) {
+                if (group.selected.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+                const intervals = try a.alloc(Span.Mapping, group.selected.len);
+                for (intervals, group.selected, 0..) |*interval, source, index| {
+                    if (source.count != offsets[start + index + 1] - offsets[start + index]) return error.InvalidNativeLakeTextCorpus;
+                    interval.* = .{ .file_lower = source.lower, .lower = offsets[start + index], .upper = offsets[start + index + 1] };
+                }
+                entry.value_ptr.intervals = intervals;
+            } else if (root.routing.len != 0) {
+                const ref = group.physical_manifest orelse root.manifests[group_index];
                 entry.value_ptr.manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, ref.artifact_id), .checksum = try a.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
             }
             spans[group_index] = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
@@ -179,18 +262,18 @@ pub const Identities = struct {
         const blocks = try file.blocks(cache, store, cached, selected.file);
         const index = corpus.physical.find(blocks, selected.group, selected.base) orelse return;
         const block = blocks[index];
-        const base = try std.math.add(u32, file.lower, block.base);
+        const base = block.base;
         switch (selected.selection) {
             .interval => |span| {
                 if (block.bitmap != null) {
                     const live = try liveRows(a, cache, store, cached, block);
                     const lower: u32 = @intCast(live.rank(span.lower));
                     const upper: u32 = @intCast(live.rank(span.lower + span.count));
-                    try result.addRange(try std.math.add(u32, base, lower), @as(u64, base) + upper);
+                    try file.addRange(result, try std.math.add(u32, base, lower), @as(u64, base) + upper);
                 } else {
                     const lower = @max(span.lower, block.lower);
                     const upper = @min(span.lower + span.count, block.lower + block.count);
-                    if (upper > lower) try result.addRange(try std.math.add(u32, base, lower - block.lower), @as(u64, base) + upper - block.lower);
+                    if (upper > lower) try file.addRange(result, try std.math.add(u32, base, lower - block.lower), @as(u64, base) + upper - block.lower);
                 }
             },
             .bitmap => |bitmap| {
@@ -200,7 +283,7 @@ pub const Identities = struct {
                     const live = try liveRows(a, cache, store, cached, block);
                     intersection.andWith(live);
                     var iterator = intersection.iterator();
-                    while (iterator.next()) |row| try result.add(try std.math.add(u32, base, @intCast(live.rank(row))));
+                    while (iterator.next()) |row| if (file.localOrdinal(try std.math.add(u32, base, @intCast(live.rank(row))))) |ordinal_value| try result.add(ordinal_value);
                 } else {
                     var extent = Bitmap.init(temporary);
                     defer extent.deinit();
@@ -208,7 +291,7 @@ pub const Identities = struct {
                     intersection.andWith(&extent);
                     var shifted = try intersection.addOffset(base -% block.lower);
                     defer shifted.deinit();
-                    try result.orWith(&shifted);
+                    try file.addBitmap(temporary, result, &shifted);
                 }
             },
         }
@@ -233,7 +316,7 @@ pub const Identities = struct {
             if (low < block.lower or low - block.lower >= block.count) return null;
             break :blk low - block.lower;
         };
-        return try std.math.add(u32, span.lower, try std.math.add(u32, block.base, rank));
+        return span.localOrdinal(try std.math.add(u32, block.base, rank));
     }
     /// Binary searches keep native-to-physical lookup logarithmic in files and
     /// physical blocks. Delete holes use the same authenticated rank directory.
@@ -248,7 +331,7 @@ pub const Identities = struct {
         const file = self.spans[lo];
         const blocks = try file.span.blocks(cache, store, cached, file.file);
         if (ordinal_value < file.span.lower) return error.InvalidNativeLakeTextCorpus;
-        const relative = ordinal_value - file.span.lower;
+        const relative = try file.span.original(ordinal_value);
         lo = 0;
         hi = blocks.len;
         while (lo < hi) {
@@ -278,11 +361,11 @@ pub const Identities = struct {
             const span = file.value_ptr.*;
             if (selected.rangeCardinality(span.lower, span.upper) == 0) continue;
             for (try span.blocks(&cache, store, cached, file.key_ptr.*)) |block| {
-                const lower = try std.math.add(u32, span.lower, block.base);
+                const lower = block.base;
                 const upper = @as(u64, lower) + block.count;
-                if (selected.rangeCardinality(lower, upper) == 0) continue;
-                var ranks = try selected.sliceRebased(a, lower, upper);
+                var ranks = try span.fileRanks(a, selected, lower, upper);
                 defer ranks.deinit();
+                if (ranks.cardinality() == 0) continue;
                 var physical = if (block.bitmap != null) blk: {
                     const live = try liveRows(a, &cache, store, cached, block);
                     if (ranks.cardinality() == block.count) break :blk try live.clone(a);
@@ -1387,4 +1470,38 @@ test "external lake live row cache evicts within fixed backing storage and prepa
         try std.testing.expectError(error.InvalidNativeLakeTextCorpus, cache.load(fixed.allocator(), store, cached, block));
     }
     try std.testing.expectEqual(backing.len, fixed.end_index);
+}
+
+test "external lake selected segment predicates map ranges and bitmaps across file ordinal gaps" {
+    const a = std.testing.allocator;
+    const span: Identities.Span = .{ .lower = 0, .upper = 4, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .count = 6, .lower = 10 }}, .intervals = &.{ .{ .file_lower = 0, .lower = 0, .upper = 1 }, .{ .file_lower = 3, .lower = 1, .upper = 4 } } };
+    var identities: Identities = .{ .offsets = &.{ 0, 1, 4 }, .partial_inventory = true };
+    defer identities.files.deinit(a);
+    try identities.files.put(a, "part", span);
+    var result = Bitmap.init(a);
+    defer result.deinit();
+    var cache: LiveRowsCache = .{};
+    defer cache.deinit(a);
+    // No artifact access is necessary for contiguous physical rows.
+    const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = undefined;
+    try identities.addBlock(a, a, &cache, store, cached, .{ .file = "part", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 11, .count = 4 } } }, &result);
+    try std.testing.expectEqual(@as(u64, 2), result.cardinality());
+    try std.testing.expect(result.contains(1) and result.contains(2));
+    result.deinit();
+    result = Bitmap.init(a);
+    var physical = Bitmap.init(a);
+    defer physical.deinit();
+    for ([_]u32{ 10, 12, 13, 15 }) |row| try physical.add(row);
+    try identities.addBlock(a, a, &cache, store, cached, .{ .file = "part", .group = 0, .base = 0, .selection = .{ .bitmap = physical } }, &result);
+    try std.testing.expectEqual(@as(u64, 3), result.cardinality());
+    try std.testing.expect(result.contains(0) and result.contains(1) and result.contains(3));
+    var inverted = try span.fileRanks(a, &result, 0, 6);
+    defer inverted.deinit();
+    try std.testing.expectEqual(@as(u64, 3), inverted.cardinality());
+    try std.testing.expect(inverted.contains(0) and inverted.contains(3) and inverted.contains(5));
+    var block = try span.fileRanks(a, &result, 2, 5);
+    defer block.deinit();
+    try std.testing.expectEqual(@as(u64, 1), block.cardinality());
+    try std.testing.expect(block.contains(1));
 }

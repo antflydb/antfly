@@ -712,27 +712,29 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
 
 
 @pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+@pytest.mark.parametrize("layout", ["files", "segments"])
 def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
-    tmp_path, source_format
+    tmp_path, source_format, layout
 ):
-    """Seventeen physical files force hierarchical and parallel text planning."""
+    """Exercise file pruning and precise native segments inside one real file."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / source_format
-    expected = {3 * 256, 11 * 256, 16 * 256}
+    parts, rows = (17, 256) if layout == "files" else (1, 196609)
+    expected = {3 * 256, 11 * 256, 16 * 256} if layout == "files" else {0, 65536, 196608}
     batches = [
         pa.table(
             {
-                "amount": range(part * 256, (part + 1) * 256),
+                "amount": range(part * rows, (part + 1) * rows),
                 "body": [
                     "common phrase quasar"
-                    if part * 256 + row in expected
+                    if part * rows + row in expected
                     else "common phrase"
-                    for row in range(256)
+                    for row in range(rows)
                 ],
             }
         )
-        for part in range(17)
+        for part in range(parts)
     ]
     if source_format == "iceberg":
         pytest.importorskip("fastavro")
@@ -756,7 +758,7 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
         )
         for batch in batches:
             table.append(batch)
-        assert len(table.inspect.files()) == 17
+        assert len(table.inspect.files()) == parts
         _export_table(table, root)
     else:
         objects = root / "buckets" / "antfly" / "objects"
@@ -843,10 +845,10 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     "disjuncts": [rare, {"term": "x" * 262112, "field": "body"}]
                 },
                 "fields": ["amount"],
-                "limit": 1,
+                "limit": 10,
             },
         )["hits"]["hits"]
-        assert len(large) == 1 and large[0]["_source"]["amount"] in expected
+        assert large == query(rare)
         baseline = None
         for restart in (False, False, True):
             if restart:
@@ -856,6 +858,20 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 assert {hit["_source"]["amount"] for hit in hits} == expected
                 assert all(hit["_score"] > 0 for hit in hits)
             hits = query(nested)
+            filtered = call(
+                "POST", "/tables/fragmented/query",
+                {"full_text_search": nested, "fields": ["amount"], "limit": 10,
+                 "filter_query": {"range": {"path": "/amount", "gte": max(expected)}}},
+            )["hits"]["hits"]
+            assert [hit["_source"]["amount"] for hit in filtered] == [max(expected)]
+            highlighted = call(
+                "POST", "/tables/fragmented/query",
+                {"full_text_search": nested, "fields": ["amount"], "limit": 10,
+                 "highlight": {"fields": ["body"]}},
+            )["hits"]["hits"]
+            assert {hit["_source"]["amount"] for hit in highlighted} == expected
+            assert all(hit["_highlights"]["body"] and "body" not in hit["_source"]
+                       for hit in highlighted)
             top = call(
                 "POST",
                 "/tables/fragmented/query",

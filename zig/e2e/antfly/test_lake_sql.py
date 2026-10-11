@@ -2194,12 +2194,15 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             return results
 
         def native_roots():
-            roots = []
-            manifests = {}
+            roots, manifests, pages = [], {}, {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
+                begin = payload.find(b"AFGPT003")
+                if begin >= 0:
+                    encoded = payload[begin:]
+                    pages[hashlib.sha256(encoded).digest()] = encoded
                 for prefix in (b'{"version":', b'{"file":'):
                     begin = payload.find(prefix)
                     if begin < 0:
@@ -2210,21 +2213,72 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if "file" in document and "segments" in document:
-                        manifests[hashlib.sha256(encoded).hexdigest()] = document
+                        manifests[hashlib.sha256(encoded).hexdigest()] = (document, len(encoded))
                     elif "file_groups" in document or "file_states" in document:
                         roots.append(document)
-            # Resolve authenticated per-file text manifests into the same
-            # logical directory used for incremental artifact reuse assertions.
+
+            def records(ref, domain):
+                page = pages[bytes(ref["digest"])]
+                assert len(page) == ref["bytes"]
+                assert page[:8] == b"AFGPT003" and page[8] == ref["height"]
+                assert page[24:56] == bytes(domain)
+                assert struct.unpack_from("<Q", page, 16)[0] == ref["records"]
+                count = struct.unpack_from("<I", page, 12)[0]
+                offset = 56 + struct.unpack_from("<H", page, 10)[0]
+                for _ in range(count):
+                    key_size, value_size = struct.unpack_from("<II", page, offset)
+                    offset += 8
+                    key = page[offset:offset + key_size]
+                    offset += key_size
+                    value = page[offset:offset + value_size]
+                    offset += value_size
+                    assert len(key) == key_size and len(value) == value_size
+                    if ref["height"]:
+                        child = {
+                            "digest": list(value[:32]),
+                            "bytes": struct.unpack_from("<I", value, 32)[0],
+                            "height": value[36],
+                            "records": struct.unpack_from("<Q", value, 37)[0],
+                        }
+                        assert child["height"] + 1 == ref["height"]
+                        yield from records(child, domain)
+                    else:
+                        yield key, value
+                assert offset == len(page)
+
+            def manifest(ref):
+                group, size = manifests[ref["checksum"].removeprefix("sha256:")]
+                assert size == ref["byte_len"]
+                return group
+
+            # Resolve both legacy arrays and authenticated paged catalogs.
+            # Detailed segment descriptors are not maintenance file manifests.
             for document in roots:
-                if document.get("manifests"):
-                    groups = [
-                        manifests[ref["checksum"].removeprefix("sha256:")]
-                        for ref in document["manifests"]
-                    ]
-                    document["file_groups"] = groups
-                    document["segments"] = [
-                        segment for group in groups for segment in group["segments"]
-                    ]
+                if document.get("inventory_version") == 3:
+                    chunks = {}
+                    file_root = document["directories"]["files"]
+                    for key, value in records(file_root, document["domain"]) if file_root else ():
+                        assert len(key) == 36
+                        chunk = chunks.setdefault(key[:32], bytearray())
+                        assert int.from_bytes(key[32:], "big") == len(chunk)
+                        chunk.extend(value)
+                    groups = []
+                    for identity, encoded in chunks.items():
+                        file = json.loads(encoded)
+                        assert hashlib.sha256(file["file"]["id"].encode()).digest() == identity
+                        group = manifest(file["manifest"])
+                        assert group["file"]["id"] == file["file"]["id"]
+                        assert group["file"]["digest"] == file["file"]["digest"]
+                        groups.append(group)
+                    assert len(groups) == document["file_count"]
+                elif document.get("manifests"):
+                    groups = [manifest(ref) for ref in document["manifests"]]
+                else:
+                    continue
+                document["file_groups"] = groups
+                document["segments"] = [
+                    segment for group in groups for segment in group["segments"]
+                ]
             return roots
 
         wait_ready()

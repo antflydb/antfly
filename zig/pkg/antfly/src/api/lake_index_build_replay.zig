@@ -122,6 +122,13 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             .text_segment => text: {
                 const native = @import("lake_index_native_text.zig");
                 if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                const directory = try native.loadRootDirectory(ca, store, declaration.artifact, cancellation, null);
+                if (directory.inventory_version == 3) {
+                    const records = try native.text_directory.fileRecords(ca, directory, store, null, cancellation);
+                    const files = try ca.alloc(state.File, records.len);
+                    for (files, records) |*file, record| file.* = record.file;
+                    break :text files;
+                }
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 const files = try ca.alloc(state.File, root.file_groups.len);
                 for (files, root.file_groups) |*file, group| file.* = group.file;

@@ -586,7 +586,16 @@ const Execution = struct {
                 else => return err,
             };
         };
-        var pin = try self.server.lake_text_corpora.acquireSelected(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation, selection);
+        var pin = self.server.lake_text_corpora.acquireSelected(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation, selection) catch |err| switch (err) {
+            // Exact segment routing is an optional admission optimization. Its
+            // detailed metadata can cost more than compact full-inventory
+            // routes; retry full admission when that optional budget is tight.
+            error.NativeLakeTextCacheBusy, error.NativeLakeTextCorpusTooLarge, error.ArtifactReadBudgetExceeded => if (selection != null)
+                try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation)
+            else
+                return err,
+            else => return err,
+        };
         errdefer pin.deinit();
         const identities = @as(*const @import("lake_index_text_predicate.zig").Identities, @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus))).*;
         if (self.overlay) |overlay| {

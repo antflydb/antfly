@@ -228,6 +228,8 @@ pub const Collector = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.descriptors) |descriptor| _ = try self.mark(descriptor);
+        if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
@@ -282,11 +284,19 @@ pub const Collector = struct {
                     try self.markPages(a, root.domain, root.serving_inventory, false);
                     try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.segment_files, false);
+                    try self.markPages(a, root.domain, root.directories.files, false);
+                    try self.markPages(a, root.domain, root.directories.segments, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
                     try self.markPages(a, root.domain, root.term_directory.leaves, false);
                     for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
-                    for (root.manifests) |manifest| {
+                    const manifests = if (root.inventory_version == 3) blk: {
+                        const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
+                        const refs = try a.alloc(artifacts.ChunkRef, records.len);
+                        for (refs, records) |*manifest, record| manifest.* = record.manifest;
+                        break :blk refs;
+                    } else root.manifests;
+                    for (manifests) |manifest| {
                         if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
                     }
                     for (root.file_groups) |group| for (group.rows) |block| {
@@ -702,4 +712,62 @@ test "external lake native GC admits text manifest reads before storage access" 
     }
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, collector.markArtifact(ca, ref));
     try std.testing.expectEqual(@as(u64, 0), collector.remaining_reads);
+}
+
+test "external lake native GC follows paged file catalogs and independent text descriptors" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("paged-text-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var child = try store.put("legacy heap segment");
+    defer child.deinit(a);
+    var descriptor = try store.put("independent authenticated segment admission");
+    defer descriptor.deinit(a);
+    var physical = try store.put("independent authenticated physical directory");
+    defer physical.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const group: text.FileGroup = .{ .file = .{ .id = "part", .digest = @splat(7) }, .segments = &.{.{ .artifact_id = child.artifact_id, .checksum = child.checksum, .byte_len = child.byte_len }}, .descriptors = &.{.{ .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }}, .physical_manifest = .{ .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len } };
+    const bytes = try std.json.Stringify.valueAlloc(ca, group, .{});
+    var manifest = try store.put(bytes);
+    defer manifest.deinit(a);
+    const record = try std.json.Stringify.valueAlloc(ca, text.text_directory.FileRecord{ .file = group.file, .manifest = .{ .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len } }, .{});
+    var key: [36]u8 = @splat(0);
+    key[0..32].* = text.term_directory.identity(group.file.id);
+    const Source = struct {
+        key: []const u8,
+        value: []const u8,
+        done: bool = false,
+        pub fn next(self: *@This()) !?@import("../serverless/graph_segment/page_tree.zig").Cursor.Record {
+            if (self.done) return null;
+            self.done = true;
+            return .{ .key = self.key, .value = self.value };
+        }
+    };
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    const page_store = @import("../serverless/graph_segment/page_store.zig");
+    var pages: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var source: Source = .{ .key = &key, .value = record };
+    const files = (try @import("../serverless/graph_segment/page_tree.zig").buildSorted(a, pages.store(), &source)).?;
+    const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} };
+    const root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .inventory_version = 3, .file_count = 1, .directories = .{ .files = files } }, .{});
+    var root = try store.put(root_bytes);
+    defer root.deinit(a);
+    var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 1024 * 1024, .namespace = namespace };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |owned| a.free(owned.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
+    for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
 }

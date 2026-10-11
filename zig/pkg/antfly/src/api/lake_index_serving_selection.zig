@@ -29,7 +29,7 @@ const Id = [32]u8;
 const max_candidates = 4096;
 
 pub fn select(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, query: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema) !?[]const Id {
-    if (root.collection == null or root.segment_files == null or root.serving_routes == null or root.inventory_version != 2 or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
+    if (root.collection == null or root.segment_files == null or root.serving_routes == null or root.inventory_version < 2 or root.term_directory.version != 2 or root.term_directory.leaves == null) return null;
     var budget: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
     var arena = std.heap.ArenaAllocator.init(budget.allocator());
     defer arena.deinit();
@@ -66,6 +66,13 @@ const Selector = struct {
         self.pages = .{ .domain = self.root.domain, .artifacts = &self.store, .cancellation = self.cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = .{ .ptr = self, .read = readPage } };
         const lowered = try local.storage_db_query_search_exec.textQueryToSearchQuery(self.a, query, analysis, schema);
         const selected = (try self.necessary(lowered, 0)) orelse return null;
+        // v3 routes exact segment proofs directly. Never widen a selective
+        // term in a large Parquet file to every native segment in that file.
+        if (self.root.inventory_version == 3) {
+            const result = try self.a.dupe(Id, selected);
+            std.mem.sort(Id, result, {}, less);
+            return result;
+        }
         var files: std.AutoHashMapUnmanaged(Id, void) = .empty;
         for (selected) |id| {
             var cursor = try tree.Cursor.init(self.a, self.pages.store(), self.root.segment_files, &id, null);

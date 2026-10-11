@@ -394,23 +394,30 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
             return result;
         }
-        /// Consume borrowed partition pairs directly into typed group columns.
+        /// Consume borrowed resident or partition pairs into typed group columns.
         /// No pair page, packed payload clone or interchange cell crosses the
         /// join/group boundary. The reducer owns its bounded spill fallback.
-        fn reducePartitions(self: *@This()) !void {
+        fn reducePairs(self: *@This()) !void {
             const context = self.engine.context;
             const specs = try self.arena.allocator().alloc(operators.AggregateSpec, self.plan.recipe.inputs.len);
             for (specs, self.plan.recipe.inputs) |*spec, input| spec.* = input.spec;
             self.reduced = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
-            while (try self.partitions.?.next()) |pair| {
+            while (true) {
                 _ = scratch.reset(.free_all);
                 try self.engine.checkpoint();
                 const a_ = scratch.allocator();
                 var compact: Compact = .{ .owner = self, .sides = undefined };
-                compact.sides[self.build_side] = pair.right.?;
-                compact.sides[1 - self.build_side] = pair.left.?;
+                if (self.partitions) |owner| {
+                    const pair = try owner.next() orelse break;
+                    compact.sides[self.build_side] = pair.right.?;
+                    compact.sides[1 - self.build_side] = pair.left.?;
+                } else {
+                    const built = try self.nextResidentPair(a_) orelse break;
+                    compact.sides[self.build_side] = built;
+                    compact.sides[1 - self.build_side] = self.current_values;
+                }
                 const keys = try a_.alloc(Datum, self.plan.output_keys.len);
                 for (self.plan.output_keys, keys) |key, *value| value.* = compact.sides[key.side][key.index];
                 const states = try a_.alloc(operators.Aggregate, specs.len);
@@ -418,15 +425,38 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 try self.reduced.?.importTypedPartialMapped(keys, states, null, self.ordinal);
                 self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
             }
-            self.partitions.?.close();
+            if (self.partitions) |owner| owner.close();
             self.partitions = null;
+            // Reduction owns all surviving keys and typed state. Release the
+            // input groups before the upper aggregate starts delivery/merging.
+            self.probe = null;
+            self.current = null;
+            self.current_values = &.{};
+            _ = self.probe_arena.reset(.free_all);
+            if (self.build) |build| build.deinit();
+            self.build = null;
+            if (self.probe_groups) |groups| groups.deinit();
+            self.probe_groups = null;
+        }
+        // Pair values are borrowed until the next pull. The typed reducer
+        // consumes them immediately, so resident joins need no output clones.
+        fn nextResidentPair(self: *@This(), scratch: A) !?[]const Datum {
+            while (true) {
+                if (self.probe) |*probe| if (try probe.next()) |match| return try match.materializeValues(scratch);
+                self.probe = null;
+                _ = self.probe_arena.reset(.free_all);
+                self.current = try self.probe_groups.?.nextTypedPartialResult(self.probe_arena.allocator());
+                if (self.current == null) return null;
+                self.current_values = try self.pack(self.probe_arena.allocator(), self.current.?);
+                self.probe = try self.build.?.probe(self.current.?.keys[0..self.plan.join_count]);
+            }
         }
         fn next(raw: *anyopaque, out: A, maximum: u32) anyerror!?[]const operators.GroupResult {
             const self = from(raw);
             if (maximum == 0) return error.InvalidSqlBackendResponse;
             if (self.done) return null;
             if (!self.ready) try self.prepare();
-            if (self.partitions != null and self.reduced == null and self.plan.canReducePairs()) try self.reducePartitions();
+            if (self.reduced == null and self.plan.canReducePairs()) try self.reducePairs();
             var results: std.ArrayList(operators.GroupResult) = .empty;
             const budget = @max(1, @min(self.engine.context.limits.page_bytes, self.engine.context.limits.retained_bytes / 16));
             var bytes: usize = 0;

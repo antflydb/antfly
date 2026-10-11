@@ -111,7 +111,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .text_segment and decl.artifact.metadata_version == native_text.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native_text.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
