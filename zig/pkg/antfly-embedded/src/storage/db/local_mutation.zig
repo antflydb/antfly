@@ -392,8 +392,10 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const applyCommittedBatchToShadowOrdered = commit.applyCommittedBatchToShadowOrdered;
         pub const applyDerivedBacklogPressureContext = materialization.applyDerivedBacklogPressureContext;
         pub const applyDerivedBatchContextProfiled = materialization.applyDerivedBatchContextProfiled;
+        pub const applyDerivedBatchContextProfiledWithReplay = materialization.applyDerivedBatchContextProfiledWithReplay;
         pub const applyDerivedBatchProfiled = materialization.applyDerivedBatchProfiled;
         pub const applyDerivedBatchTargetsContextProfiled = materialization.applyDerivedBatchTargetsContextProfiled;
+        pub const applyDerivedBatchTargetsContextProfiledWithReplay = materialization.applyDerivedBatchTargetsContextProfiledWithReplay;
         pub const applyDerivedBatchTargetsProfiled = materialization.applyDerivedBatchTargetsProfiled;
         pub const applyDerivedBatchToIndexContext = materialization.applyDerivedBatchToIndexContext;
         pub const applyDerivedBatchToIndexContextProfiled = materialization.applyDerivedBatchToIndexContextProfiled;

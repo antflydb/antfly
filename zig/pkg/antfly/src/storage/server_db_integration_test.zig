@@ -4512,15 +4512,18 @@ test "db child range outbox retires capture admission and retains reply loss or 
             const dispatcher: outbox.DocumentArtifactChildRangeDispatcher = .{ .ptr = &fixture, .select_destination = Fixture.select, .apply = Fixture.apply };
             try std.testing.expectError(if (failure == .reply_loss) error.CommitCompletionPending else error.Forbidden, db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root));
             try std.testing.expect(!root.held);
-            try std.testing.expect((try db.core.store.get(alloc, first)) == null);
-            const debt = (try db.core.store.get(alloc, second)) orelse return error.ChildOutboxDebtLost;
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, first));
+            const debt = db.core.store.get(alloc, second) catch |err| switch (err) {
+                error.NotFound => return error.ChildOutboxDebtLost,
+                else => return err,
+            };
             defer alloc.free(debt);
             fixture.failure = .none;
             fixture.closed = false;
             fixture.calls = 0;
             const retried = try db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root);
             try std.testing.expectEqual(@as(usize, 1), retried.deleted);
-            try std.testing.expect((try db.core.store.get(alloc, second)) == null);
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second));
             try std.testing.expect(!root.held);
             var after = barrier.tryAcquireExclusive() orelse return error.ChildOutboxCaptureLeaked;
             after.release();

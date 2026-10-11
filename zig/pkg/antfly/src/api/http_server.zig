@@ -41893,7 +41893,7 @@ test "api http server updates local table schema through bound write source" {
 
     var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
-    var source = @import("httpx_handler.zig").SchemaUpdateStatusSource{};
+    var source = @import("httpx_handler.zig").SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     defer server.deinit();
@@ -50131,6 +50131,7 @@ test "api http server drop table observes metadata absence before local cleanup"
 
     const FakeSource = struct {
         created: bool = true,
+        absence_observations: std.atomic.Value(u32) = .init(0),
         lifecycle_wait_calls: std.atomic.Value(u32) = .init(0),
 
         fn iface(self: *@This()) StatusSource {
@@ -50153,6 +50154,7 @@ test "api http server drop table observes metadata absence before local cleanup"
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.created) _ = self.absence_observations.fetchAdd(1, .monotonic);
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = if (self.created)
@@ -50206,7 +50208,8 @@ test "api http server drop table observes metadata absence before local cleanup"
 
     const FakeWrites = struct {
         lifecycle_wait_calls: *std.atomic.Value(u32),
-        expected_lifecycle_wait_calls: u32 = 1,
+        absence_observations: *std.atomic.Value(u32),
+        expected_lifecycle_wait_calls: u32 = 0,
         observed_group_id: ?u64 = null,
         fail_cleanup: bool = false,
 
@@ -50237,13 +50240,14 @@ test "api http server drop table observes metadata absence before local cleanup"
                 self.expected_lifecycle_wait_calls,
                 self.lifecycle_wait_calls.load(.monotonic),
             );
+            try std.testing.expect(self.absence_observations.load(.monotonic) > 0);
             self.observed_group_id = contract.group_ids[0];
             if (self.fail_cleanup) return error.InjectedCleanupFailure;
         }
     };
 
     var source = FakeSource{};
-    var writes = FakeWrites{ .lifecycle_wait_calls = &source.lifecycle_wait_calls };
+    var writes = FakeWrites{ .lifecycle_wait_calls = &source.lifecycle_wait_calls, .absence_observations = &source.absence_observations };
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
     defer server.deinit();
 
@@ -50253,12 +50257,13 @@ test "api http server drop table observes metadata absence before local cleanup"
     });
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
-    try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expect(source.absence_observations.load(.monotonic) > 0);
     try std.testing.expectEqual(@as(?u64, 10), writes.observed_group_id);
 
     source.created = true;
     writes.fail_cleanup = true;
-    writes.expected_lifecycle_wait_calls = 2;
+    source.absence_observations.store(0, .monotonic);
     var repair_response = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",
@@ -50266,7 +50271,8 @@ test "api http server drop table observes metadata absence before local cleanup"
     defer repair_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), repair_response.status);
     try std.testing.expect(std.mem.indexOf(u8, repair_response.body, "committed_repair_required") != null);
-    try std.testing.expectEqual(@as(u32, 2), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expect(source.absence_observations.load(.monotonic) > 0);
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {

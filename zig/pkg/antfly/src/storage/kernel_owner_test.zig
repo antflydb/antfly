@@ -2005,28 +2005,30 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a
     // broad failure after the inner provider unwinds.
-    var invalid_query_response: abi.QueryOwnedResponse = .{};
-    var invalid_query_failure: abi.FailureIdentity = .{};
-    const invalid_query_status = abi.antfly_storage_owner_query_json(
-        owner.handle,
-        &.{ .control = .{
-            .table_name = .fromSlice("docs"),
-            .request_json = .fromSlice("{"),
-        } },
-        &invalid_query_response,
-        &invalid_query_failure,
-    );
-    try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
-    try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
-    try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
-    try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
-    try std.testing.expectEqual(
-        @backingInt(abi.LocalQueryOperation.parse_internal_request),
-        invalid_query_failure.operation,
-    );
-    try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
-    try std.testing.expect(invalid_query_failure.error_name_hash != 0);
-    try std.testing.expectEqual(@as(u64, 0), invalid_query_response.buffer.len);
+    for ([_][]const u8{ "{", "{\"query_json\":\"{\"}" }) |invalid_request_json| {
+        var invalid_query_response: abi.QueryOwnedResponse = .{};
+        var invalid_query_failure: abi.FailureIdentity = .{};
+        const invalid_query_status = abi.antfly_storage_owner_query_json(
+            owner.handle,
+            &.{ .control = .{
+                .table_name = .fromSlice("docs"),
+                .request_json = .fromSlice(invalid_request_json),
+            } },
+            &invalid_query_response,
+            &invalid_query_failure,
+        );
+        try std.testing.expectEqual(abi.Status.invalid_query, invalid_query_status);
+        try std.testing.expectEqual(invalid_query_status, invalid_query_failure.status);
+        try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
+        try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
+        try std.testing.expectEqual(
+            @backingInt(abi.LocalQueryOperation.parse_internal_request),
+            invalid_query_failure.operation,
+        );
+        try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
+        try std.testing.expect(invalid_query_failure.error_name_hash != 0);
+        try std.testing.expectEqual(@as(u64, 0), invalid_query_response.buffer.len);
+    }
 
     var invalid_abi_response: abi.QueryOwnedResponse = .{};
     var invalid_abi_failure: abi.FailureIdentity = .{};

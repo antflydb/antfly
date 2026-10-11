@@ -3376,6 +3376,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchTargetsContextProfiled(ctx, batch, &.{}, profile);
         }
 
+        pub fn applyDerivedBatchContextProfiledWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, profile: ?*BatchProfile, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            try applyDerivedBatchTargetsContextProfiledWithReplay(ctx, batch, &.{}, profile, admitted_replay);
+        }
+
         pub fn applyDerivedBatchProfiled(self: anytype, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
@@ -3385,7 +3389,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (self.sparse_compaction_runtime) |runtime| runtime.notify();
         }
 
+        fn acquireBatchReplayAdmission(ctx: *const BatchExecutionContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+            const admission = ctx.snapshot_replay_admission orelse return null;
+            if (ctx.io) |io| return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+            return admission.acquireMutation();
+        }
+
+        /// Call before holding apply. Callers already holding a replay lease use
+        /// the explicit WithReplay form instead of requesting fresh admission.
         pub fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
+            var replay = try acquireBatchReplayAdmission(ctx);
+            defer if (replay) |*lease| lease.release();
+            try applyDerivedBatchTargetsContextProfiledWithReplay(ctx, batch, index_names, profile, if (replay) |*lease| lease else null);
+        }
+
+        /// The caller keeps admission alive across index replay, checkpoints and
+        /// replay truncation. A nested index application borrows that lease so a
+        /// waiting capture cannot close reader admission behind its own reader.
+        pub fn applyDerivedBatchTargetsContextProfiledWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            std.debug.assert(ctx.snapshot_replay_admission == null or admitted_replay != null);
+            if (admitted_replay) |lease| {
+                std.debug.assert(lease.active and lease.admission == ctx.snapshot_replay_admission);
+            }
             const managed_indexes = try ctx.index_manager.managedIndexes(ctx.alloc);
             defer {
                 for (managed_indexes) |index_ref| ctx.alloc.free(@constCast(index_ref.name));
@@ -3407,7 +3432,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
                     };
-                    try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, null);
+                    try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, admitted_replay);
                     const index_sync_start_ns = monotonicTimeNs();
                     try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.index_sync_ns, index_sync_start_ns);

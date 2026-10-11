@@ -3000,14 +3000,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    // The root file-imports cli_root.zig, which reaches storage and runtime
-    // sources that need the same module graph as the full test module.
+    // The command imports its HTTP, HA and object-store implementations
+    // directly; retain their production module graph and source identities.
     test_imports.configure(b, standby_cli_test_mod, true, true);
     standby_cli_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     standby_cli_test_mod.addImport("antfly-zig", antfly_mod);
     const standby_cli_tests = b.addTest(.{
         .root_module = standby_cli_test_mod,
         .filters = &.{"standby cmd"},
+        // The production standby command imports the physical storage graph.
+        // Native ReleaseSafe compilation peaked at 14.22 GB; reserve 16 GiB
+        // before scheduling this compiler. Preserve the existing Linux 10 GiB
+        // reservation until its pinned-toolchain measurement is available.
+        // This reservation does not change the server runtime memory budget.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 10) * 1024 * 1024 * 1024,
     });
     const run_standby_cli_tests = b.addRunArtifact(standby_cli_tests);
     hot_standby_test_step.dependOn(&run_standby_cli_tests.step);
@@ -5106,6 +5112,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 10) * 1024 * 1024 * 1024,
         .filters = &server_db_filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -5614,6 +5621,44 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("vopr", vopr_mod);
+
+    const ttl_cleanup_test_mod = makeLmdbModule(b, "pkg/antfly/src/ttl_cleanup_retirement_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    // Use the local owner constructor and keep ordered application in the
+    // server adapter; broad DB fixtures still need the shared storage imports.
+    antfly_imports.configureEmbedded(b, ttl_cleanup_test_mod, true);
+    antfly_imports.storage_boundary.configureSources(ttl_cleanup_test_mod, false, false);
+    ttl_cleanup_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
+    ttl_cleanup_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    ttl_cleanup_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
+    ttl_cleanup_test_mod.addImport("antfly_template_content", antfly_imports.template_content);
+    ttl_cleanup_test_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    ttl_cleanup_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    ttl_cleanup_test_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
+    ttl_cleanup_test_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
+    ttl_cleanup_test_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
+    ttl_cleanup_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
+    ttl_cleanup_test_mod.addImport("vopr", vopr_mod);
+
+    // Keep TTL cleanup admission independently selectable and require
+    // actual fixture execution without empty owners or skipped results.
+    const ttl_cleanup_retirement_filter = "storage.hot_standby TTL acknowledged cleanup keeps capture and authority protection";
+    const ttl_cleanup_retirement_tests = b.addTest(.{
+        .name = "ttl-cleanup-retirement-tests",
+        .root_module = ttl_cleanup_test_mod,
+        .filters = &.{ttl_cleanup_retirement_filter},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        // Merged-main native ARM64 macOS ReleaseSafe compilation peaked at
+        // 9,080,864,768 bytes after receipt-wait integration. The preceding
+        // Linux container peak of 12,064,215,040
+        // bytes bounds compiler RSS, including helpers and page cache. These
+        // reservations provide more than 25% headroom over those measurements
+        // and do not define runtime memory limits.
+        .max_rss = @as(usize, if (target.result.os.tag == .linux) 16 else 12) * 1024 * 1024 * 1024,
+    });
+    const run_ttl_cleanup_retirement_tests = b.addRunArtifact(ttl_cleanup_retirement_tests);
+    run_ttl_cleanup_retirement_tests.addArgs(&.{ "--suite-filter", ttl_cleanup_retirement_filter, "--require-no-skips" });
+    b.step("antfly-ttl-cleanup-retirement-test", "Verify physical TTL cleanup retirement, fencing and replay-capture lock order")
+        .dependOn(&run_ttl_cleanup_retirement_tests.step);
 
     const db_split_workload_default_filters = [_][]const u8{
         "db split sim default workload stays green",

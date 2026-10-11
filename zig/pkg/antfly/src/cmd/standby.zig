@@ -15,16 +15,18 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const antfly = @import("../cli_root.zig");
+const http = @import("../common/http/mod.zig");
+const config = @import("antfly_local_sources").common_config;
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const seed_activation_contract = @import("../storage/hot_standby/seed_activation_contract.zig");
 const storage_source_options = @import("storage_source_options");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const admin_api = antfly.admin;
-const ha = antfly.hot_standby;
+const admin_api = @import("../admin/mod.zig");
+const ha = @import("../storage/hot_standby/mod.zig");
 const hot_standby_validation = ha.validation;
-const http_common = antfly.common.http.http_common;
+const http_common = http.http_common;
 const control_only_storage_sources = storage_source_options.control_only;
 
 var test_path_counter: u64 = 0;
@@ -187,7 +189,7 @@ pub fn runArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) !
         }
         const bearer_token = try resolveRemoteBearerToken(alloc, parsed.options);
         defer if (bearer_token) |token| alloc.free(token);
-        var executor = antfly.common.http.StdHttpExecutor.init(alloc, .{});
+        var executor = http.StdHttpExecutor.init(alloc, .{});
         defer executor.deinit();
         if (std.mem.eql(u8, parsed.command_args[0], "switchover")) {
             try runSwitchover(alloc, io, remote_url, parsed.command_args[1..], executor.executor(), .{
@@ -409,7 +411,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             defer alloc.free(manifest_bytes);
             const capture_receipt_json = try readArtifactFileAlloc(alloc, capture_receipt_path, (ha.seed_artifact.Limits{}).max_receipt_bytes);
             defer alloc.free(capture_receipt_json);
-            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            var opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_artifact.publish(alloc, .{
                 .client = &opened.client,
@@ -434,7 +436,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const staging_root = options.staging_root orelse return error.SeedStagingRootMissing;
             const capture_receipt_sha256 = try requireCaptureReceiptDigest(options.capture_receipt_sha256);
             const binding = (try options.binding.finish()) orelse return error.SeedArtifactBindingMissing;
-            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            var opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_artifact.restoreToStaging(alloc, .{
                 .client = &opened.client,
@@ -515,7 +517,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const generation = options.generation orelse return error.SeedGenerationMissing;
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
-            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            var opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_artifact.prune(alloc, .{
                 .client = &opened.client,
@@ -534,7 +536,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             const slot_name = options.slot_name orelse return error.SeedSlotMissing;
             const location = options.location orelse return error.SeedLocationMissing;
             const capture_root = options.capture_root orelse return error.SeedCaptureRootMissing;
-            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
+            var opened = try object_store_support.OpenedObjectStore.initRemoteUri(alloc, location, "antfly-ha-seeds");
             defer opened.deinit();
             var result = try ha.seed_capture.prunePublishedGenerations(alloc, .{
                 .store = .{
@@ -578,7 +580,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             // Validate every controller-bound field and digest before opening a
             // remote client, so malformed cleanup authority has no side effect.
             try ha.seed_prefix_cleanup.validateRequestAuthority(alloc, request);
-            var opened = try antfly.serverless.object_store_support.OpenedObjectStore.initExistingS3RemoteUri(alloc, request.location);
+            var opened = try object_store_support.OpenedObjectStore.initExistingS3RemoteUri(alloc, request.location);
             defer opened.deinit();
             var result = try ha.seed_prefix_cleanup.deleteAll(alloc, .{
                 .client = &opened.client,
@@ -1996,9 +1998,9 @@ fn validateConfigPath(path: []const u8) ![]const u8 {
 /// and identity become the local handles. `ha.admin.token_env` supplies the
 /// token variable for any remote target that lacks one. The loaded config is
 /// returned so the borrowed strings stay valid for the rest of the command.
-fn applyConfigDefaults(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !?antfly.common.config.Config {
+fn applyConfigDefaults(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !?config.Config {
     const path = options.config_path orelse return null;
-    var cfg = try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, path, null, .standalone);
+    var cfg = try config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, path, null, .standalone);
     errdefer cfg.deinit();
     const hot_standby_cfg = cfg.ha orelse return cfg;
 

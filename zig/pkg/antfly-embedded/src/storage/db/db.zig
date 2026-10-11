@@ -25629,9 +25629,11 @@ pub const DB = struct {
         DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
+            var replay_lease = try acquireSnapshotReplayContext(&batch_ctx);
+            defer if (replay_lease) |*lease| lease.release();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            try applyDerivedBatchContext(&batch_ctx, prepared_value.batch);
+            try applyDerivedBatchContextWithReplay(&batch_ctx, prepared_value.batch, if (replay_lease) |*lease| lease else null);
         }
     }
 
@@ -47500,8 +47502,11 @@ const PrimaryReplicationEffect = struct {
 
     fn clear(self: *const @This(), ctx: *const BatchExecutionContext) !void {
         const key = self.key orelse return;
+        var mutation = acquireReplicationMutationSharedContext(ctx);
+        defer releaseReplicationMutationShared(&mutation);
         try lockApplyForPortableRuntimeContext(ctx);
         defer ctx.apply_mutex.unlockExclusive();
+        try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
         try ctx.store.putBatch(&.{}, &.{key});
     }
 };
@@ -47811,12 +47816,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
     } else {
         if (syncLevelRequiresDerivedVisibility(sync_level)) {
+            var replay = try acquireSnapshotReplayContext(ctx);
+            defer if (replay) |*lease| lease.release();
             try lockApplyForPortableRuntimeContext(ctx);
             defer ctx.apply_mutex.unlockExclusive();
+            const admitted_replay = if (replay) |*lease| lease else null;
             if (sync_level == .full_text) {
-                try applyDerivedBatchTargetsContext(ctx, derived_batch, sync_targets.full_text_indexes);
+                try applyDerivedBatchTargetsContextWithReplay(ctx, derived_batch, sync_targets.full_text_indexes, admitted_replay);
             } else {
-                try applyDerivedBatchContext(ctx, derived_batch);
+                try applyDerivedBatchContextWithReplay(ctx, derived_batch, admitted_replay);
             }
         }
         try waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
@@ -48184,9 +48192,11 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
         try waitForSyncLevelContext(ctx, .full_index, sequence, sync_targets);
     } else {
+        var replay = try acquireSnapshotReplayContext(ctx);
+        defer if (replay) |*lease| lease.release();
         try lockApplyForPortableRuntimeContext(ctx);
         defer ctx.apply_mutex.unlockExclusive();
-        try applyDerivedBatchContext(ctx, derived_batch);
+        try applyDerivedBatchContextWithReplay(ctx, derived_batch, if (replay) |*lease| lease else null);
     }
     return true;
 }
@@ -48413,9 +48423,11 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
         try waitForSyncLevelContext(ctx, .full_index, sequence, sync_targets);
     } else {
+        var replay = try acquireSnapshotReplayContext(ctx);
+        defer if (replay) |*lease| lease.release();
         try lockApplyForPortableRuntimeContext(ctx);
         defer ctx.apply_mutex.unlockExclusive();
-        try applyDerivedBatchContext(ctx, derived_batch);
+        try applyDerivedBatchContextWithReplay(ctx, derived_batch, if (replay) |*lease| lease else null);
     }
     return true;
 }
@@ -49899,9 +49911,11 @@ fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.De
 
     var applied_batch = batch;
     applied_batch.sequence = sequence;
+    var replay = try acquireSnapshotReplayContext(&batch_ctx);
+    defer if (replay) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchContextWithReplay(&batch_ctx, applied_batch, if (replay) |*lease| lease else null);
     return sequence;
 }
 
@@ -50140,9 +50154,11 @@ fn appendResolutionRecordWithHook(
 
     var applied_batch = write.batch;
     applied_batch.sequence = sequence;
+    var replay = try acquireSnapshotReplayContext(&batch_ctx);
+    defer if (replay) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchContextWithReplay(&batch_ctx, applied_batch, if (replay) |*lease| lease else null);
     return sequence;
 }
 
@@ -50833,9 +50849,11 @@ fn appendGeneratedBatchFromEnrichment(
 
     var applied_batch = replay_batch;
     applied_batch.sequence = sequence;
+    var replay = try acquireSnapshotReplayContext(&batch_ctx);
+    defer if (replay) |*lease| lease.release();
     try lockApplyForPortableRuntimeContext(&batch_ctx);
     defer batch_ctx.apply_mutex.unlockExclusive();
-    try applyDerivedBatchContext(&batch_ctx, applied_batch);
+    try applyDerivedBatchContextWithReplay(&batch_ctx, applied_batch, if (replay) |*lease| lease else null);
     return .{ .sequence = sequence, .promoted_artifact_bytes = promoted_artifact_bytes };
 }
 
@@ -51009,6 +51027,14 @@ fn applyDerivedBatchContext(ctx: *const BatchExecutionContext, batch: derived_ty
 
 fn applyDerivedBatchTargetsContext(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8) !void {
     try applyDerivedBatchTargetsContextProfiled(ctx, batch, index_names, null);
+}
+
+fn applyDerivedBatchContextWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+    try local_mutation.applyDerivedBatchContextProfiledWithReplay(ctx, batch, null, admitted_replay);
+}
+
+fn applyDerivedBatchTargetsContextWithReplay(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, index_names: []const []const u8, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+    try local_mutation.applyDerivedBatchTargetsContextProfiledWithReplay(ctx, batch, index_names, null, admitted_replay);
 }
 
 const applyDerivedBatchContextProfiled = local_mutation.applyDerivedBatchContextProfiled;
@@ -131600,7 +131626,7 @@ test "db graph endpoint cleanup pages preserve original pass through rejected ap
         defer alloc.free(job);
         try db.core.store.put(job, "hub");
         var stopping: std.atomic.Value(bool) = .init(false);
-        Clock.apply = &db.core.apply_mutex;
+        Clock.apply = db.core.apply_mutex;
         Clock.stopping = &stopping;
         Clock.cancel = cancel;
         Clock.reject = true;

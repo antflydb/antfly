@@ -10405,6 +10405,8 @@ const LookupStatusSource = struct {
 
 /// Test metadata authority shared by direct and HTTP schema route regressions.
 pub const SchemaUpdateStatusSource = struct {
+    // Committed fixture metadata outlives a transport request allocation scope.
+    schema_allocator: std.mem.Allocator,
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
@@ -10427,12 +10429,14 @@ pub const SchemaUpdateStatusSource = struct {
     }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.owns_schema_json) alloc.free(self.schema_json.?);
+        std.debug.assert(alloc.ptr == self.schema_allocator.ptr and alloc.vtable == self.schema_allocator.vtable);
+        if (self.owns_schema_json) self.schema_allocator.free(self.schema_json.?);
     }
 
-    fn replaceSchemaJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8) !void {
-        if (self.owns_schema_json) alloc.free(self.schema_json.?);
-        self.schema_json = try alloc.dupe(u8, next);
+    fn replaceSchemaJson(self: *@This(), next: []const u8) !void {
+        const owned = try self.schema_allocator.dupe(u8, next);
+        if (self.owns_schema_json) self.schema_allocator.free(self.schema_json.?);
+        self.schema_json = owned;
         self.owns_schema_json = true;
     }
 
@@ -10476,7 +10480,8 @@ pub const SchemaUpdateStatusSource = struct {
     pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
-        try self.replaceSchemaJson(alloc, schema_json);
+        _ = alloc;
+        try self.replaceSchemaJson(schema_json);
     }
 
     fn mutateSchema(
@@ -10502,7 +10507,7 @@ pub const SchemaUpdateStatusSource = struct {
         }
         const updated = try tables_api.applySchemaMutationRecord(alloc, &current, mode, body);
         defer metadata_table_manager.freeTable(alloc, updated);
-        try self.replaceSchemaJson(alloc, updated.schema_json);
+        try self.replaceSchemaJson(updated.schema_json);
         return .{
             .version = try tables_api.schemaVersion(updated.schema_json),
             .schema_json = try alloc.dupe(u8, updated.schema_json),
@@ -13002,7 +13007,7 @@ test "httpx SQL dispatch preserves imported executor authority including unavail
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
-        server.cfg.imported_runtime_io.?.durable = executor;
+        server.cfg.imported_runtime_io.?.sql_execution = executor;
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = "{\"statement\":\"SELECT id FROM docs\"}";
@@ -14459,6 +14464,32 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // sql-0557, sql-1205, sql-1206, sql-1265, sql-1268, sql-1269.
     // sql-1578.
     const alloc = std.testing.allocator;
+    // Direct adapters mirror the listener fence and join every retained
+    // cleanup task before their request/page arenas leave scope.
+    const FixtureLifetime = struct {
+        references: std.atomic.Value(usize) = .init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.references.fetchAdd(1, .monotonic);
+            std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The decrement is the callback's last access to its owner.
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 1);
+        }
+
+        fn drain(self: *@This()) void {
+            const io = std.testing.io;
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            while (self.references.load(.acquire) != 1)
+                io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+        }
+    };
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"},"amount":{"type":"integer"},"quantity":{"type":"integer"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"customer_id":{"type":"integer"},"tenant_id":{"type":"integer"},"created_at":{"type":"keyword"},"metadata":{"type":"object","properties":{"source":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}}}}
     ;
@@ -14577,30 +14608,6 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer identity.release(identity.context, alloc);
         // Mirror the listener's retained request arena: the adapter and
         // allocator remain alive until asynchronous stream cleanup retires.
-        const FixtureLifetime = struct {
-            references: std.atomic.Value(usize) = .init(1),
-
-            fn retain(raw: *anyopaque) void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                const previous = self.references.fetchAdd(1, .monotonic);
-                std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
-            }
-
-            fn release(raw: *anyopaque) void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                // The decrement is the callback's last access to its owner.
-                const previous = self.references.fetchSub(1, .acq_rel);
-                std.debug.assert(previous > 1);
-            }
-
-            fn drain(self: *@This()) void {
-                const io = std.testing.io;
-                const protection = io.swapCancelProtection(.blocked);
-                defer _ = io.swapCancelProtection(protection);
-                while (self.references.load(.acquire) != 1)
-                    io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
-            }
-        };
         var fixture_lifetime: FixtureLifetime = .{};
         defer fixture_lifetime.drain();
         var cancel: std.atomic.Value(bool) = .init(false);
@@ -15989,9 +15996,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
-            // The native INSERT and acknowledgement finish under one write
-            // grant; a query-class fallback or a write bypass fails this check.
-            try std.testing.expectEqual(write_grants_before_insert + 1, text_server.runnableSchedulingStats().grants[1]);
+            // This fixture forces a yield at every checkpoint. The retained
+            // completion task's initial fence reenters the same write owner,
+            // so admission and completion contribute two write grants.
+            try std.testing.expectEqual(write_grants_before_insert + 2, text_server.runnableSchedulingStats().grants[1]);
             const inserted_stats = text_server.runnable_scheduler.?.stats();
             try std.testing.expectEqual(@as(usize, 0), inserted_stats.operations);
             try std.testing.expectEqual(@as(usize, 0), inserted_stats.runnable_slots);
@@ -16039,7 +16047,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 try std.testing.expectEqual(@as(u64, 1), written.rows_affected);
                 try std.testing.expectEqual(@as(usize, 1), written.rows.len);
                 try std.testing.expectEqualStrings("pg_write_probe", written.rows[0][0].string);
-                try std.testing.expectEqual(write_grants_before + 1, text_server.runnableSchedulingStats().grants[1]);
+                // Native pgwire writes use the same checkpointed completion.
+                try std.testing.expectEqual(write_grants_before + 2, text_server.runnableSchedulingStats().grants[1]);
                 const written_stats = text_server.runnable_scheduler.?.stats();
                 try std.testing.expectEqual(@as(usize, 0), written_stats.operations);
                 try std.testing.expectEqual(@as(usize, 0), written_stats.runnable_slots);
@@ -16193,6 +16202,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager, .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
         defer pg_server.deinit();
         var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &pg_server };
+        var cursor_lifetime: FixtureLifetime = .{};
+        defer cursor_lifetime.drain();
         const wire_backend = pg_adapter.backend();
         const credential = try wire_backend.vtable.authenticate(wire_backend.context, alloc, "cursor_reader", "secret");
         defer credential.release(credential.context, alloc);
@@ -16205,6 +16216,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .io = std.testing.io,
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
+            .retained_lifetime = .{ .context = &cursor_lifetime, .retain_fn = FixtureLifetime.retain, .release_fn = FixtureLifetime.release },
         };
         for ([_][]const u8{
             "SELECT ARRAY[1,NULL,9223372036854775807]::bigint[]",
@@ -16248,6 +16260,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         for ([_]bool{ false, true }) |declared| for ([_]u16{ 0, 1 }) |format| {
             var array_arena: std.heap.ArenaAllocator = .init(alloc);
             defer array_arena.deinit();
+            // Stream/page defers run first; join retained task metadata before
+            // freeing the allocator borrowed by the native cursor.
+            defer cursor_lifetime.drain();
             const array_alloc = array_arena.allocator();
             const sources = @import("antfly_local_sources");
             const wire_values = @import("../pgwire/values.zig");
@@ -16285,6 +16300,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
         };
         {
+            defer cursor_lifetime.drain();
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
             defer stream.close(stream.context);
             const expected = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
@@ -16302,6 +16318,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             }
             try std.testing.expectEqual(expected.len, offset);
         }
+        cursor_lifetime.drain();
+        try std.testing.expectEqual(@as(usize, 1), cursor_lifetime.references.load(.acquire));
+        const cursor_retired = pg_server.runnable_scheduler.?.stats();
+        try std.testing.expectEqual(@as(usize, 0), cursor_retired.operations);
+        try std.testing.expectEqual(@as(usize, 0), cursor_retired.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), cursor_retired.retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), pg_server.query_admission.stats().in_flight);
         var result_arena = std.heap.ArenaAllocator.init(alloc);
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);
@@ -16724,7 +16747,7 @@ test "httpx relational row query mutation endpoints enforce exact versions and s
     // Admission and participants must agree on the authoritative schema.
     // The generic lookup fixture advertises a document table at epoch zero,
     // which should be rejected for this schema-fenced relational mutation.
-    var status_source = SchemaUpdateStatusSource{ .schema_json = schema_json };
+    var status_source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = schema_json };
     var server = ApiHttpServer.init(alloc, .{}, status_source.iface(), reads.source(), writes.source());
     var e2e: HttpxE2eServer = undefined;
     try e2e.init(alloc, &server);
@@ -17190,7 +17213,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
 test "httpx antfly schema update returns full table status after projection" {
     const alloc = std.testing.allocator;
 
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
@@ -17233,12 +17256,12 @@ test "httpx antfly schema update returns full table status after projection" {
 
 test "httpx antfly schema update owns self partial support and requires coordinated publication" {
     const alloc = std.testing.allocator;
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     const initial =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    try source.replaceSchemaJson(alloc, initial);
+    try source.replaceSchemaJson(initial);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
     defer api_server.deinit();
@@ -17579,7 +17602,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     };
     var fixture: Fixture = .{ .alloc = alloc, .schema = source_schema };
     defer fixture.deinit();
-    var source = SchemaUpdateStatusSource{ .schema_json = source_schema };
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = source_schema };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, source.iface(), null, writes.iface());
@@ -17647,7 +17670,7 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
     const child =
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"docs","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    var source = SchemaUpdateStatusSource{ .schema_json = parent, .dependency = .{ .table_id = 8, .name = "dependent", .schema_json = child, .indexes_json = "{}", .placement_role = "data" } };
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc, .schema_json = parent, .dependency = .{ .table_id = 8, .name = "dependent", .schema_json = child, .indexes_json = "{}", .placement_role = "data" } };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
@@ -17679,7 +17702,7 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
 
 test "httpx schema patch merges at the authority and accepts version zero ETag" {
     const alloc = std.testing.allocator;
-    var source = SchemaUpdateStatusSource{};
+    var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());

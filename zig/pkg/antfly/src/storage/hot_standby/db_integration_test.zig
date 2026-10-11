@@ -3681,3 +3681,6 @@ test "db graph ttl HA retirement preserves different replay progress" {
         }
     }
 }
+test {
+    _ = @import("ttl_cleanup_retirement_test.zig");
+}
