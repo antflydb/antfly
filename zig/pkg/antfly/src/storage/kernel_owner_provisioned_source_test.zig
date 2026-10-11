@@ -304,15 +304,23 @@ test "native index owner adapter executes fresh permission stages and recovers r
             .namespace = intent.fence.namespace,
             .owner_group_id = group,
         };
-        for (0..3) |attempt| {
+        // GC is time-sliced and may also be advanced by background maintenance.
+        // Assert bounded convergence and idempotence, not a fixed page count.
+        var retired = false;
+        for (0..16) |_| {
             var gc = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
             defer gc.deinit();
-            if (attempt < 2) {
-                try std.testing.expect(gc == .gc);
-                try std.testing.expect(gc.gc.value.advanced);
-                try std.testing.expectEqual(attempt == 1, gc.gc.value.artifacts_retired);
-            } else try std.testing.expect(gc == .retired);
+            if (gc == .retired) {
+                retired = true;
+                break;
+            }
+            try std.testing.expect(gc == .gc);
+            try std.testing.expect(gc.gc.value.advanced or gc.gc.value.artifacts_retired);
         }
+        try std.testing.expect(retired);
+        var repeated = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
+        defer repeated.deinit();
+        try std.testing.expect(repeated == .retired);
         var status = try owners.nativeIndexOwnerCancellationState(alloc, group, plan.before.name, owner_identity, .{});
         defer status.deinit();
         try std.testing.expectEqual(canceled.position, status.value.intent.?.position);
