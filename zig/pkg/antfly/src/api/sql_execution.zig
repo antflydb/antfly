@@ -108,9 +108,21 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
     if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
 }
 
+const ReceiptWaitBudget = struct {
+    deadline_ns: ?u64 = null,
+
+    fn deadline(self: *ReceiptWaitBudget, now: u64, wait_ms: u32) u64 {
+        // Zero still permits one check under the caller's I/O deadline.
+        if (wait_ms == 0) return now;
+        if (self.deadline_ns == null) self.deadline_ns = now +| @as(u64, wait_ms) * std.time.ns_per_ms;
+        return self.deadline_ns.?;
+    }
+};
+
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
+    receipt_wait_budget: ReceiptWaitBudget = .{},
     /// A transport may consume borrowed result columns within the same policy,
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
@@ -180,6 +192,9 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        const previous_receipt_wait_budget = self.receipt_wait_budget;
+        self.receipt_wait_budget = .{};
+        defer self.receipt_wait_budget = previous_receipt_wait_budget;
         const previous_visibility = self.lake_visibility;
         try self.read_requirements.validate(.sql);
         if (self.read_requirements.visibility) |visibility| self.lake_visibility = if (visibility == .accepted) .accepted else .committed;
@@ -550,6 +565,9 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
+        // Each new backend starts an execution scope; binding, cursor selection
+        // and fallback execution within that scope share the receipt budget.
+        self.receipt_wait_budget = .{};
         return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
@@ -1148,7 +1166,7 @@ pub const Adapter = struct {
         const normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wait_ms = self.read_requirements.wait_ms orelse 5000;
-        const wait_deadline = time.monotonicNs() +| @as(u64, wait_ms) * std.time.ns_per_ms;
+        const wait_deadline = self.receipt_wait_budget.deadline(time.monotonicNs(), wait_ms);
         const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
         // Zero permits one readiness check under the statement's I/O budget.
         // Positive budgets also bound catalog and WAL I/O, not just sleeps.
@@ -3698,4 +3716,21 @@ test "SQL receipt polling expiration preserves caller cancellation and statement
     var signal = std.atomic.Value(bool).init(true);
     try std.testing.expectEqual(error.Canceled, Adapter.receiptPollingError(.{ .cancellation = operation.CancellationToken.fromAtomic(&signal) }, 0, error.DeadlineExceeded));
     try std.testing.expectEqual(error.LakeCatalogForbidden, Adapter.receiptPollingError(.{}, 0, error.LakeCatalogForbidden));
+}
+
+test "SQL receipt readiness shares one deadline across preflight and scan checks" {
+    var budget: ReceiptWaitBudget = .{};
+    const start: u64 = 100 * std.time.ns_per_ms;
+    const deadline = budget.deadline(start, 10);
+    try std.testing.expectEqual(start + 10 * std.time.ns_per_ms, deadline);
+    // Time spent obtaining the preflight result remains spent when the scan
+    // checks readiness again, including after the original deadline expires.
+    try std.testing.expectEqual(deadline, budget.deadline(start + 9 * std.time.ns_per_ms, 10));
+    try std.testing.expectEqual(deadline, budget.deadline(start + 11 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start + 30 * std.time.ns_per_ms, budget.deadline(start + 20 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start, budget.deadline(start, 0));
+    try std.testing.expect(budget.deadline_ns == null);
+    try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
 }

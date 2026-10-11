@@ -135,8 +135,8 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
-        self.read_log[self.lake_count] = request.read_requirements;
         try self.checkSettingEpoch(request);
+        self.read_log[self.lake_count] = request.read_requirements;
         self.lake_log[self.lake_count] = request.lake_visibility;
         self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
