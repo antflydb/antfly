@@ -382,7 +382,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
         var after_forbidden = try std.json.parseFromSlice(std.json.Value, alloc, after_forbidden_response.body, .{});
         defer after_forbidden.deinit();
         try std.testing.expectEqualStrings(before_id, (try field(after_forbidden.value, "table_id")).string);
-        try waitRelationPublication(alloc, io, &metadata, case.name);
+        try waitRelationPublication(alloc, io_impl.io(), &metadata, case.name);
         var admitted = try sql(alloc, transport, &rewrite_headers, metadata_uri, alter);
         defer admitted.deinit(alloc);
         if (admitted.status != 202 and admitted.status != 409) std.debug.print("PK ALTER table={s} status={d} body={s}\n", .{ case.name, admitted.status, admitted.body });
