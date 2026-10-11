@@ -2126,7 +2126,7 @@ read is not a lease: cancellation must also fence late admission on previously
 unvisited owners, rather than merely acknowledging absence. Public activation
 and the original SQL inventory remain unchanged.
 
-### Native owner inspection and pre-fence input integrity (in qualification)
+### Native owner inspection and pre-fence input integrity
 
 Receivers can now inspect a local native job using only its immutable metadata
 identity: plan ID/digest, owner digest/ordinal, namespace and owner group. The
@@ -2152,8 +2152,9 @@ Apache boundary validation passes for 2028 sources. Raw-manifest byte budgets
 are now checked at the ABI boundary before slicing/dereferencing; empty and
 max-u64-length invalid-pointer requests reject before admission. The final
 bounded-input C-ABI/private-kernel Debug gate passes all 56 steps and both tests
-without skips, failures or leaks. Optimized qualification for inspection and
-pre-fence integrity remains in progress. No SQL inventory credits or public
+without skips, failures or leaks. Optimized inspection/pre-fence qualification
+passes all 64 steps, with two C-ABI, five system/page and eleven candidate/private
+tests and no skips, failures or leaks. No SQL inventory credits or public
 activation claim are made.
 
 ### Provisioned native index owner adapter (in qualification)
