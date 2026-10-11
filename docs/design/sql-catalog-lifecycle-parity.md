@@ -2547,7 +2547,7 @@ final completion cuts, epoch release and coordinated intent-aware capability
 barriers remain unfinished. No canceled ACK is emitted and the public producer
 remains disabled. No original SQL case is reclassified by this component work.
 
-### Unified owner effects and durable cleanup admission (in qualification)
+### Unified owner effects and durable cleanup admission
 
 The private owner protocol is newly introduced in this PR and absent from main.
 It now carries exactly one tagged effect in the version-22 envelope: ordinary
@@ -2566,7 +2566,7 @@ standby replay stages that same queue effect and transport LSN atomically.
 Its result has no publication receipt and survives committed mirror failure.
 Both C-ABI and leased-owner adapters expose only this internal progress step.
 
-The updated integration gate is running. It adds real primary outbox failure,
+The updated integration gate adds real primary outbox failure,
 cold reopen, exact pending-payload recovery, duplicate cleanup admission,
 standby clock-gap rejection, replay and standby reopen, plus compiled-owner
 cleanup retries. Fixture setup drains/burns the jobs using the independently
@@ -2575,3 +2575,16 @@ drain/burn delivery. GC page delivery, cleanup completion cuts, global claims,
 manifest/blob and binding retirement, epoch release and coordinated rollout
 barriers remain open. Public production stays disabled and no SQL case is
 credited by this protocol consolidation.
+
+Merged-head qualification at `6fad13874a`, with `origin/main` at
+`84a0080999`, passed all 137 build steps and 97 tests in Debug with no skips,
+failures or leaks. The targets were `antfly-native-owner-authority-test`,
+`antfly-relational-index-pages-test`, `native-index-owner-capi-test`,
+`antfly-storage-owner-source-test` (filter `native index owner adapter`),
+`antfly-relational-index-publication-test` and `relational-index-catalog-test`.
+This replaces the invalid first unified run, which encountered a shadowed
+fixture identifier and then source changes while other compilers were live.
+It qualifies the listed component contracts, not authenticated distributed
+activation, optimized merged-head execution or the still-open public failed
+CREATE UNIQUE INDEX atomicity gate. The original SQL inventory is unchanged:
+478 implemented, 136 rejected, 73 superseded and 899 unresolved of 1,586 cases.
