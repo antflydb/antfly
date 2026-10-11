@@ -2149,6 +2149,11 @@ test "pgwire retained portal lease fences session teardown after stream failure"
         teardown_continue: std.Io.Event = .unset,
         teardown_done: std.Io.Event = .unset,
 
+        fn describe(_: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !backend.Description {
+            // Execute rebinds the unstarted portal before opening its stream.
+            return .{ .columns = &.{}, .parameter_types = &.{} };
+        }
+
         fn open(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, req: backend.Request) !?backend.ReadStream {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.lease = (req.retained_lifetime orelse return error.MissingRetainedLifetime).retain();
@@ -2187,7 +2192,7 @@ test "pgwire retained portal lease fences session teardown after stream failure"
     var session: Session = .{
         .alloc = parent.allocator(),
         .io = std.testing.io,
-        .source = .{ .context = &fixture, .vtable = &.{ .authenticate = undefined, .describe = undefined, .execute = undefined, .disconnect = Fixture.disconnect, .open_stream = Fixture.open } },
+        .source = .{ .context = &fixture, .vtable = &.{ .authenticate = undefined, .describe = Fixture.describe, .execute = undefined, .disconnect = Fixture.disconnect, .open_stream = Fixture.open } },
         .identity = .{ .context = &fixture, .release = Fixture.release },
         .reader = &reader,
         .writer = &output.writer,
