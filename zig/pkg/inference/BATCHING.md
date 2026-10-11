@@ -453,8 +453,8 @@ device path; vector clipping compatibility and opt-in diagnostic stage dumps
 can still export tensors. Static weight materialization, including HF position
 tables, is a separate transfer concern. The public projected image/audio structs
 still contain host arrays, so their final export and subsequent prompt upload
-remain. Gemma 4 audio's existing device encoder operations are unchanged, and
-waveform/log-mel preparation remains CPU work.
+remain. The following audio phase extends Gemma 4's existing device encoder operations
+with a resident spectral/log-mel frontend.
 
 Synthetic regression fixtures compare head normalization, both query/key rotary
 scales, value normalization and spatial pooling against the existing host
@@ -474,6 +474,83 @@ zig build test -Donnx=false -Dmetal=true -Dtest-filter=gemma4
 zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='gemma4 resident vision'
 ```
 
+### Gemma 4 audio, CLAP, OCR and Qwen extensions
+
+The next phase removes additional activation exports using existing compute
+backend operations. These routes keep the same public vectors, token ordering
+and CTC text/confidence semantics. They do not introduce codec dependencies,
+CUDA-only preprocessing libraries or cross-request scheduling.
+
+| Route | Resident work added | Remaining host boundaries |
+| --- | --- | --- |
+| Gemma 4 audio | Zero-padded DFT, magnitude, mel projection, log/floor and frame masking; features feed subsampling directly; valid output rows gathered before export | Codec decode, bounded resampling, Hann-window frame packing; final projected arrays. Metal has the existing specialized conformer kernels; CUDA still uses host compatibility for conformer operations without CUDA kernels |
+| CLAP eager audio | Non-fused patch convolution/layout/norm, Swin blocks including cyclic shift/window maps, relative bias, attention masks, Q/K/V, MLP, patch merges, pooling and projection | Mel preparation, input batch norm and spectrogram image preparation; the long-audio AFF fusion frontend remains compatibility work before the resident Swin chain. Explicit graph strategies retain their existing route |
+| OCR CTC recognition | Resident session forward, batched argmax, gather winning confidence per timestep | Only O(timesteps) choices/scores downloaded for blank/repeat collapse and dictionary lookup. Image decode, crop/resize, detection/layout postprocessing and Apple-native OCR remain their existing routes |
+| Qwen 3 VL | Position addition to patch tensors and base-text/image prompt assembly | CPU interpolation of static position offsets; final visual/deepstack arrays; opt-in qualification hashes deliberately export activations |
+| Qwen 2 VL / ColQwen | Patch weight reshape without export/re-upload; spatial vision RoPE on backend tensors | CPU decode, resize/patch packing and rotary position metadata; final API outputs; unsupported attention/RoPE providers retain typed compatibility paths |
+
+Gemma's frontend uses the same 320-sample Hann windows, 160-sample hop,
+512-point zero-padded transform, **magnitudes** rather than power, mel
+filterbank, additive 1e-3 floor, natural logarithm and valid-frame mask as the
+CPU reference. Dense backend dot operations consume frame and coefficient
+matrices without treating transient DFT/filter tensors as cached model weights.
+This avoids a Metal weight-materialization readback and persistent linear slots.
+The frontend keeps the existing 480,000-sample source bound. Packed frames,
+spectrum, squared pairs, magnitudes and mel/log tensors add bounded request
+scratch; admission/peak-memory qualification must account for those live arrays
+before increasing audio concurrency. `TERMITE_GEMMA4_AUDIO_HOST_OPS=features`
+(or `all`) selects the CPU frontend for diagnosis. Decode and resampling remain
+CPU operations; this is not a PCM-only device pipeline.
+
+CLAP exposes `audioEncoderFromPatchTokensTensor`, borrowing patch tokens and
+returning an owned projected tensor. Only small index/mask metadata is assembled
+on the host; row gathers implement window shifts and patch merge ordering.
+Relative-position tables are gathered and broadcast on the backend, so Q/K/V
+and attention activations stay resident. Shifted-window bias includes the same
+mask and relative-bias terms as the original CPU attention. Explicit graph
+execution is preserved. The expanded window/head bias and attention scratch
+scale with batch size, head count and window area; qualify those bytes before
+increasing admitted batches. This phase does not add a resident CLAP text tower.
+
+OCR uses the session's admitted resident-output route when available and retains
+the host session fallback. It validates a single-image `[1, time, vocabulary]`
+CTC output, downloads argmax choices, gathers their original scores on the
+backend and downloads those scores. UTF-8 dictionary assembly, repeat/blank
+handling and mean confidence use the original CPU semantics. Cancellation and
+backend failures propagate through the controlled session permit. This change
+does not move detection maps, polygon finding or image crops onto GPU.
+
+Qwen 2's earlier device path used ordinary sequential text RoPE; the new path
+uses the spatial axes in merge-group order, matching the existing CPU vision
+reference, including repeated temporal slices. Unsupported attention operations
+may still use the CPU reference, while resource/cancellation failures propagate.
+Qwen 3 position/prompt changes preserve the existing qualification evidence path;
+hash collection is an explicit diagnostic synchronization boundary. Deepstack
+feature arrays still follow the existing host-facing API.
+
+The `media residency` fixtures cover native and Metal parity for a full CLAP
+Swin chain with shifted/unshifted attention and three patch merges at batches
+1/2, its batched patch convolution, Gemma log-mel features and invalid-frame
+masking, Qwen 2 spatial/temporal rotary ordering, Qwen 3 rectangular position
+interpolation and scaled prompt assembly, and CTC text/confidence. Metal
+counters assert zero intermediate downloads/accesses for tested numeric
+operations; CTC permits only compact O(time) downloads. An OCR session fixture
+also verifies that unsupported reductions reuse the resident forward output
+without a second inference. Gemma DFT-vs-FFT
+comparison uses the existing 2e-3 log-feature tolerance near the mel floor.
+CUDA fixtures compile into a Linux CUDA-enabled test binary and require CUDA
+hardware to execute. These tests are synthetic correctness/transfer checks;
+real-model quality and end-to-end throughput remain unmeasured. Validation on
+2026-10-11: 11 native/Metal media fixtures passed (5 CUDA hardware fixtures
+skipped); the combined regression filter passed 320 checks with 15 optional
+fixtures skipped. The CUDA-enabled Linux test binary cross-compiles.
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter='media residency'
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=clap -Dtest-filter=gemma4 -Dtest-filter=ocr -Dtest-filter=CTC -Dtest-filter=qwen -Dtest-filter=Qwen
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='media residency'
+```
+
 ### Further implementation and measurement
 
 1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,
@@ -491,9 +568,11 @@ zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=t
    Keep the codec implementation behind the existing image boundary; CPU formats
    must continue to work. PDF rendering remains CPU initially, with borrowed
    rasters rather than a compressed round trip.
-5. Add resident PCM-to-features and resident CLAP/other audio encoder boundaries.
-   Qualify resampling, channel mixing, windows, FFT, filterbanks, log floors,
-   padding and long-clip fusion against each model's existing processor.
+5. Extend residency through resampling/channel mixing and CLAP feature/AFF
+   fusion preparation, and add missing CUDA conformer kernels. Qualify windows,
+   FFT, filterbanks, log floors, padding and long-clip fusion against each model's
+   existing processor. Cache/reuse spectral coefficient matrices and scratch
+   after measuring the bounded frontend against the CPU FFT/BLAS baseline.
 
 The microbatch broker remains responsible for cross-request grouping and indexed
 results. Bucket images by resolved dimensions/patch count and audio by feature

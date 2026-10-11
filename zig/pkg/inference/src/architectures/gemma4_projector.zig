@@ -403,10 +403,11 @@ const ClampSpec = struct {
     }
 };
 
-/// `TERMITE_GEMMA4_AUDIO_HOST_OPS=clamp,glu,dwconv,attention,scale,bias,channel_norm,flatten,resident`
+/// `TERMITE_GEMMA4_AUDIO_HOST_OPS=features,clamp,glu,dwconv,attention,scale,bias,channel_norm,flatten,resident`
 /// (or `all`) keeps the named encoder steps on their host path; a debug
 /// knob for bisecting a device kernel against the host reference.
 const AudioHostOps = struct {
+    features: bool = false,
     clamp: bool = false,
     glu: bool = false,
     dwconv: bool = false,
@@ -637,9 +638,11 @@ fn encodeSingleAudio(
         active_audio_profile = null;
     };
 
-    var features = try prepareGemma4AudioFeatures(allocator, audio_bytes, cfg.mel_bins);
+    var features = try prepareGemma4AudioFeatures(cb, allocator, audio_bytes, cfg.mel_bins);
     defer features.deinit();
-    if (store.gguf == null) try embeddingGemma2Stage(allocator, "audio_features", features.data);
+    if (store.gguf == null) {
+        if (features.resident) |tensor| try embeddingGemma2StageTensor(cb, allocator, "audio_features", tensor) else try embeddingGemma2Stage(allocator, "audio_features", features.data);
+    }
     audioProfileMark(.features);
 
     // From the conv stack to the output projection every op runs on device
@@ -655,11 +658,12 @@ fn encodeSingleAudio(
 
     var subsampled = try audioSubsample(cb, allocator, store, cfg, &features);
     defer subsampled.deinit(allocator);
+    var hidden = subsampled.hidden;
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
-    var hidden = subsampled.hidden;
-    errdefer cb.free(hidden);
     // Per-block `per_dim_scale` vectors; the loaded tensors keep their names
     // until they are released, so the names outlive the loop.
     var per_dim_names = std.ArrayListUnmanaged([]u8).empty;
@@ -706,6 +710,7 @@ fn encodeSingleAudio(
 
     const output = try audioLinearWithBias(cb, allocator, store, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden);
     cb.free(hidden);
+    hidden_live = false;
     defer cb.free(output);
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
 
@@ -720,27 +725,34 @@ fn encodeSingleAudio(
         try cb.decoderRuntimeSubmitAndWaitFrame();
     }
 
+    const valid_count = countTrue(subsampled.valid_mask);
+    const valid_rows = try allocator.alloc(u32, valid_count);
+    defer allocator.free(valid_rows);
+    var dst: usize = 0;
+    for (subsampled.valid_mask, 0..) |valid, row| {
+        if (valid) {
+            valid_rows[dst] = @intCast(row);
+            dst += 1;
+        }
+    }
+    if (cb.vtable.takeRows != null and valid_count > 0) {
+        const compact = try cb.takeRows(projected, valid_rows, valid_count, cfg.text_hidden) orelse return error.UnsupportedResidentGemma4Audio;
+        defer cb.free(compact);
+        const embeddings = try cb.toFloat32(compact, allocator);
+        errdefer allocator.free(embeddings);
+        if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_projected", projected);
+        audioProfileMark(.readback);
+        if (profile_enabled) profile.finish(subsampled.seq_len);
+        return .{ .embeddings = embeddings, .tokens = valid_count };
+    }
     const projected_data = try cb.toFloat32(projected, allocator);
     defer allocator.free(projected_data);
     if (store.gguf == null) try embeddingGemma2Stage(allocator, "audio_projected", projected_data);
     audioProfileMark(.readback);
     if (profile_enabled) profile.finish(subsampled.seq_len);
-    const valid_count = countTrue(subsampled.valid_mask);
     const embeddings = try allocator.alloc(f32, valid_count * cfg.text_hidden);
-    var dst_token: usize = 0;
-    for (subsampled.valid_mask, 0..) |valid, token| {
-        if (!valid) continue;
-        @memcpy(
-            embeddings[dst_token * cfg.text_hidden ..][0..cfg.text_hidden],
-            projected_data[token * cfg.text_hidden ..][0..cfg.text_hidden],
-        );
-        dst_token += 1;
-    }
-
-    return .{
-        .embeddings = embeddings,
-        .tokens = valid_count,
-    };
+    for (valid_rows, 0..) |row, i| @memcpy(embeddings[i * cfg.text_hidden ..][0..cfg.text_hidden], projected_data[row * cfg.text_hidden ..][0..cfg.text_hidden]);
+    return .{ .embeddings = embeddings, .tokens = valid_count };
 }
 
 fn encodeUnifiedDirectAudio(
@@ -760,7 +772,7 @@ fn encodeUnifiedDirectAudio(
         };
     }
     const frame_shape = [_]i32{ @intCast(token_count), @intCast(cfg.raw_samples_per_token) };
-    const frame_ct = try cb.fromFloat32Shape(frames, &frame_shape);
+    const frame_ct = try deviceResidentFromFloat32(cb, frames, &frame_shape);
     defer cb.free(frame_ct);
 
     // Direct unified audio projects RMS-normalized raw waveform chunks, matching
@@ -847,11 +859,14 @@ test "gemma4 audio source window is bounded before resampling" {
 const AudioFeatures = struct {
     allocator: std.mem.Allocator,
     data: []f32,
+    resident: ?CT = null,
+    backend: ?*const ComputeBackend = null,
     mask: []bool,
     frames: usize,
     mel_bins: usize,
 
     pub fn deinit(self: *AudioFeatures) void {
+        if (self.resident) |tensor| self.backend.?.free(tensor);
         self.allocator.free(self.data);
         self.allocator.free(self.mask);
     }
@@ -868,6 +883,7 @@ const SubsampledAudio = struct {
 };
 
 fn prepareGemma4AudioFeatures(
+    cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     audio_bytes: []const u8,
     mel_bins: usize,
@@ -900,7 +916,8 @@ fn prepareGemma4AudioFeatures(
     else
         0;
 
-    const out = try allocator.alloc(f32, frames * mel_bins);
+    const gpu = !audioHostOps().features and supportsGemma4LogMel(cb) and frames > 0;
+    const out = try allocator.alloc(f32, if (gpu) 0 else frames * mel_bins);
     errdefer allocator.free(out);
     const mask = try allocator.alloc(bool, frames);
     errdefer allocator.free(mask);
@@ -925,9 +942,88 @@ fn prepareGemma4AudioFeatures(
         const frame_end = frame * hop_length + frame_size_for_unfold - 1;
         mask[frame] = frame_end >= pad_left and frame_end < pad_left + real_samples;
     }
+    if (gpu) {
+        const tensor = try gemma4LogMelTensor(cb, allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask);
+        return .{ .allocator = allocator, .data = out, .resident = tensor, .backend = cb, .mask = mask, .frames = frames, .mel_bins = mel_bins };
+    }
     try gemma4LogMelFrames(allocator, samples, frames, hop_length, frame_length, fft_length, window, filters, mel_bins, mel_floor, mask, out, audio.blas_available);
 
     return .{ .allocator = allocator, .data = out, .mask = mask, .frames = frames, .mel_bins = mel_bins };
+}
+
+// The GPU front end uses the same zero-padded DFT and magnitude filterbank
+// as the BLAS reference. Codec decode, resampling and bounded frame packing
+// stay on CPU; spectral and log-mel activations stay on the backend.
+fn gemma4LogMelTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    samples: []const f32,
+    frames: usize,
+    hop: usize,
+    frame_length: usize,
+    fft_length: usize,
+    window: []const f32,
+    filters: []const f32,
+    mel_bins: usize,
+    floor: f32,
+    mask: []const bool,
+) !CT {
+    const bins = fft_length / 2 + 1;
+    if (frames == 0 or window.len != frame_length or filters.len != bins * mel_bins or mask.len != frames or samples.len < (frames - 1) * hop + frame_length) return error.InvalidTensorShape;
+    try cb.checkExecutionControl();
+    const packed_rows = try allocator.alloc(f32, frames * frame_length);
+    defer allocator.free(packed_rows);
+    for (0..frames) |row| for (0..frame_length) |col| {
+        packed_rows[row * frame_length + col] = samples[row * hop + col] * window[col];
+    };
+    const basis = try allocator.alloc(f32, 2 * bins * frame_length);
+    defer allocator.free(basis);
+    for (0..bins) |bin| for (0..frame_length) |col| {
+        const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(bin * col)) / @as(f64, @floatFromInt(fft_length));
+        basis[(2 * bin) * frame_length + col] = @floatCast(@cos(angle));
+        basis[(2 * bin + 1) * frame_length + col] = @floatCast(-@sin(angle));
+    };
+    const input = try deviceResidentFromFloat32(cb, packed_rows, &.{ @intCast(frames), @intCast(frame_length) });
+    defer cb.free(input);
+    const basis_ct = try deviceResidentFromFloat32(cb, basis, &.{ @intCast(2 * bins), @intCast(frame_length) });
+    defer cb.free(basis_ct);
+    const spectrum = try cb.primDotGeneral(input, basis_ct, &.{ @intCast(frames), @intCast(frame_length) }, &.{ @intCast(2 * bins), @intCast(frame_length) }, &.{1}, &.{1}, &.{}, &.{});
+    defer cb.free(spectrum);
+    const squared = try cb.multiply(spectrum, spectrum);
+    defer cb.free(squared);
+    const shape = [_]i64{ @intCast(frames), @intCast(bins), 2 };
+    const pairs = try cb.primReshape(squared, &shape);
+    defer cb.free(pairs);
+    const power = try cb.primReduceSum(pairs, &.{2}, &shape);
+    defer cb.free(power);
+    const magnitude = try cb.primSqrt(power);
+    defer cb.free(magnitude);
+    const rows = try cb.primReshape(magnitude, &.{ @intCast(frames), @intCast(bins) });
+    defer cb.free(rows);
+    const filter_ct = try deviceResidentFromFloat32(cb, filters, &.{ @intCast(mel_bins), @intCast(bins) });
+    defer cb.free(filter_ct);
+    const mel = try cb.primDotGeneral(rows, filter_ct, &.{ @intCast(frames), @intCast(bins) }, &.{ @intCast(mel_bins), @intCast(bins) }, &.{1}, &.{1}, &.{}, &.{});
+    defer cb.free(mel);
+    const floor_ct = try deviceResidentFromFloat32(cb, &.{floor}, &.{1});
+    defer cb.free(floor_ct);
+    const floor_rows = try cb.primBroadcastInDim(floor_ct, &.{ @intCast(frames), @intCast(mel_bins) }, &.{1}, &.{1});
+    defer cb.free(floor_rows);
+    const floored = try cb.add(mel, floor_rows);
+    defer cb.free(floored);
+    const logged = try cb.primLog(floored);
+    defer cb.free(logged);
+    const mask_data = try allocator.alloc(f32, frames);
+    defer allocator.free(mask_data);
+    for (mask_data, mask) |*v, valid| v.* = if (valid) 1 else 0;
+    const mask_ct = try deviceResidentFromFloat32(cb, mask_data, &.{@intCast(frames)});
+    defer cb.free(mask_ct);
+    const expanded = try cb.primBroadcastInDim(mask_ct, &.{ @intCast(frames), @intCast(mel_bins) }, &.{0}, &.{@intCast(frames)});
+    defer cb.free(expanded);
+    return cb.multiply(logged, expanded);
+}
+
+fn supportsGemma4LogMel(cb: *const ComputeBackend) bool {
+    return (cb.kind() == .metal or cb.kind() == .cuda) and cb.vtable.dotGeneralOp != null and cb.vtable.reshapeOp != null and cb.vtable.reduceSumOp != null and cb.vtable.sqrtOp != null and cb.vtable.logOp != null and cb.vtable.broadcastInDimOp != null;
 }
 
 /// Log-mel rows for `frames` windows of `samples`. With BLAS the windowed
@@ -1067,16 +1163,19 @@ fn audioSubsample(
 ) !SubsampledAudio {
     if (features.mel_bins != cfg.mel_bins) return error.InvalidTensorShape;
 
-    var masked_features = try allocator.dupe(f32, features.data);
-    defer allocator.free(masked_features);
-    for (features.mask, 0..) |valid, frame| {
-        if (valid) continue;
-        @memset(masked_features[frame * features.mel_bins ..][0..features.mel_bins], 0.0);
-    }
-
     const shape = [_]i32{ 1, 1, @intCast(features.frames), @intCast(features.mel_bins) };
-    var hidden = try deviceResidentFromFloat32(cb, masked_features, &shape);
-    errdefer cb.free(hidden);
+    var hidden = if (features.resident) |tensor|
+        try cb.primReshape(tensor, &.{ 1, 1, @intCast(features.frames), @intCast(features.mel_bins) })
+    else blk: {
+        const masked_features = try allocator.dupe(f32, features.data);
+        defer allocator.free(masked_features);
+        for (features.mask, 0..) |valid, frame| {
+            if (!valid) @memset(masked_features[frame * features.mel_bins ..][0..features.mel_bins], 0);
+        }
+        break :blk try deviceResidentFromFloat32(cb, masked_features, &shape);
+    };
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
     var mask = try allocator.dupe(bool, features.mask);
     errdefer allocator.free(mask);
     var height = features.frames;
@@ -1101,7 +1200,6 @@ fn audioSubsample(
         const normed = try channelNormRelu(cb, allocator, store, hidden, norm_name, out_channels, out_h, out_w, cfg.layer_norm_eps);
         cb.free(hidden);
         hidden = normed;
-        errdefer cb.free(hidden);
 
         const next_mask = try subsampleMaskEveryOther(allocator, mask, out_h);
         allocator.free(mask);
@@ -1117,6 +1215,7 @@ fn audioSubsample(
 
     const projected = try linearNoBiasMaybeClipped(cb, allocator, store, hidden, "a.input_projection", height, width * channels, cfg.audio_hidden);
     cb.free(hidden);
+    hidden_live = false;
 
     return .{
         .hidden = projected,
@@ -3360,6 +3459,19 @@ fn linearNoBiasMaybeClipped(
     var output_max = try store.optionalF32(output_max_name);
     defer if (output_max) |*tensor| tensor.deinit();
 
+    if (!audioHostOps().clamp and
+        (input_min == null or input_min.?.data.len == 1) and
+        (input_max == null or input_max.?.data.len == 1) and
+        (output_min == null or output_min.?.data.len == 1) and
+        (output_max == null or output_max.?.data.len == 1))
+    {
+        return linearNoBiasScalarClipped(cb, allocator, store, input, weight_name, .{
+            .input_min = if (input_min) |t| t.data[0] else null,
+            .input_max = if (input_max) |t| t.data[0] else null,
+            .output_min = if (output_min) |t| t.data[0] else null,
+            .output_max = if (output_max) |t| t.data[0] else null,
+        }, rows, in_dim, out_dim);
+    }
     var linear_input = input;
     var free_linear_input = false;
     if (input_min != null or input_max != null) {
@@ -4024,4 +4136,48 @@ fn checkGemma4PatchResidency(cb: ComputeBackend, reference: ComputeBackend) !voi
     const actual = try cb.toFloat32(positioned, allocator);
     defer allocator.free(actual);
     for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-5);
+}
+
+fn checkGemma4AudioFeaturesResidency(cb: ComputeBackend, _: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const frames = 17;
+    const hop = 160;
+    const length = 320;
+    const fft = 512;
+    const mel_bins = 16;
+    var samples: [(frames - 1) * hop + length]f32 = undefined;
+    for (&samples, 0..) |*v, i| v.* = 0.3 * @sin(@as(f32, @floatFromInt(i)) * 0.037) + 0.1 * @cos(@as(f32, @floatFromInt(i)) * 0.11);
+    var window: [length]f32 = undefined;
+    for (&window, 0..) |*v, i| v.* = 0.5 - 0.5 * @cos(2 * std.math.pi * @as(f32, @floatFromInt(i)) / length);
+    const filters = try gemma4MelFilterbank(allocator, mel_bins, fft, 16_000);
+    defer allocator.free(filters);
+    var mask: [frames]bool = undefined;
+    for (&mask, 0..) |*v, i| v.* = i % 5 != 0;
+    var expected: [frames * mel_bins]f32 = undefined;
+    try gemma4LogMelFrames(allocator, &samples, frames, hop, length, fft, &window, filters, mel_bins, 1e-3, &mask, &expected, false);
+    const fixture = @import("../ops/media_residency_test.zig");
+    const before = fixture.Transfers.snapshot(cb);
+    const output = try gemma4LogMelTensor(&cb, allocator, &samples, frames, hop, length, fft, &window, filters, mel_bins, 1e-3, &mask);
+    defer cb.free(output);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    // Match the established DFT-vs-FFT tolerance near the mel floor.
+    for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-3);
+}
+
+test "media residency gemma4 audio log-mel native parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onNative(fixture.noWeights, checkGemma4AudioFeaturesResidency);
+}
+
+test "media residency gemma4 audio log-mel Metal parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkGemma4AudioFeaturesResidency);
+}
+
+test "media residency gemma4 audio log-mel CUDA parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(fixture.noWeights, checkGemma4AudioFeaturesResidency);
 }
