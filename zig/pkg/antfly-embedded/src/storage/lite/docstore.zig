@@ -1157,6 +1157,8 @@ pub const ArtifactLease = struct {
 pub const Store = struct {
     allocator: Allocator,
     workspace_reclaimer: ?u64 = null,
+    metadata_pool: @import("metadata_pool.zig").MetadataPool = .{},
+    metadata_ready: std.atomic.Value(bool) = .init(false),
     workspace_mutex: std.atomic.Mutex = .unlocked,
     workspace_pending: [2]bool = .{ false, false },
     workspaces: [2]?*ReadWorkspace = .{ null, null },
@@ -1305,9 +1307,23 @@ pub const Store = struct {
         self.maintenance_started.store(false, .release);
     }
 
+    fn readMetadataAllocator(self: *Store) Allocator {
+        if (self.metadata_ready.load(.acquire)) return self.metadata_pool.allocator(self.allocator, self.resource_manager);
+        platform_sync.lockYielding(&self.workspace_mutex);
+        if (self.workspace_reclaimer == null) {
+            if (self.resource_manager) |manager| self.workspace_reclaimer = manager.registerReclaimer(.lite_docstore_snapshot_cache, self, reclaimIdleWorkspaces) catch null;
+        }
+        if (self.resource_manager == null or self.workspace_reclaimer != null) self.metadata_ready.store(true, .release);
+        self.workspace_mutex.unlock();
+        return self.metadata_pool.allocator(self.allocator, self.resource_manager);
+    }
+
     fn reclaimIdleWorkspaces(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Store = @ptrCast(@alignCast(context));
-        var freed: u64 = 0;
+        var freed: u64 = self.metadata_pool.reclaim(target_bytes);
+        if (freed != 0) if (resource_manager_mod.BudgetedAllocator.fromAllocator(self.allocator)) |budget| {
+            _ = budget.releaseUnusedCreditThreadSafe();
+        };
         while (freed < target_bytes) {
             if (!self.workspace_mutex.tryLock()) break;
             const found: ?*ReadWorkspace = blk: {
@@ -1320,8 +1336,10 @@ pub const Store = struct {
             };
             self.workspace_mutex.unlock();
             const workspace = found orelse break;
-            const bytes = if (workspace.budget) |*budget| budget.reservation.bytes else 0;
+            const bytes = if (workspace.budget) |*budget| budget.reservation.bytes else workspace.live;
+            const backing_budget = resource_manager_mod.BudgetedAllocator.fromAllocator(workspace.backing);
             workspace.destroy();
+            if (backing_budget) |budget| _ = budget.releaseUnusedCreditThreadSafe();
             freed +|= bytes;
         }
         return freed;
@@ -1410,6 +1428,7 @@ pub const Store = struct {
             workspace.destroy();
             slot.* = null;
         };
+        self.metadata_pool.deinit();
         self.retireReadGeneration(0);
         self.artifact_marker_sweep.deinit(self.file.runtime());
         self.file.close();
@@ -1549,12 +1568,12 @@ pub const Store = struct {
             generation.kernel_readers -= 1;
             if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
         }
-        self.allocator.destroy(pin);
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
         if (!generation.retired) self.reader_frontier.store(if (generation.first_pin) |first| first.sequence else std.math.maxInt(u64), .release);
         const reclaim = generation.references == 0 and generation.retired;
         self.read_mutex.unlock(io);
+        self.readMetadataAllocator().destroy(pin);
         if (reclaim) {
             // Only the last releaser owns this unreachable generation. Preserve
             // owner -> reader lock ordering for admission/accounting updates.
@@ -2715,6 +2734,10 @@ pub const Txn = struct {
     read_pin: ?*ReadPin = null,
     checkpoint: native.CheckpointSlot = .{},
 
+    pub fn metadataAllocator(self: *const Txn, fallback: Allocator) Allocator {
+        return if (self.store) |store| store.readMetadataAllocator() else fallback;
+    }
+
     pub fn openRead(store: *Store) !Txn {
         return try openReadWithPrefix(store, "");
     }
@@ -2725,8 +2748,8 @@ pub const Txn = struct {
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);
-        const pin = try store.allocator.create(ReadPin);
-        errdefer store.allocator.destroy(pin);
+        const pin = try store.readMetadataAllocator().create(ReadPin);
+        errdefer store.readMetadataAllocator().destroy(pin);
         store.read_mutex.lockUncancelable(io);
         if (store.read_generation == null) {
             store.read_mutex.unlock(io);
@@ -2765,8 +2788,8 @@ pub const Txn = struct {
         defer store.mutex.unlock();
 
         const checkpoint = store.file.activeCheckpoint();
-        const pin = if (store.file.header.indexed_reclamation) try store.allocator.create(ReadPin) else null;
-        errdefer if (pin) |owned| store.allocator.destroy(owned);
+        const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
+        errdefer if (pin) |owned| store.readMetadataAllocator().destroy(owned);
         if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
         const generation = if (pin) |owned| try store.pinReadGeneration(owned) else null;
         return .{
@@ -2794,8 +2817,8 @@ pub const Txn = struct {
         defer store.mutex.unlock();
 
         const checkpoint = store.file.activeCheckpoint();
-        const pin = if (store.file.header.indexed_reclamation) try store.allocator.create(ReadPin) else null;
-        errdefer if (pin) |owned| store.allocator.destroy(owned);
+        const pin = if (store.file.header.indexed_reclamation) try store.readMetadataAllocator().create(ReadPin) else null;
+        errdefer if (pin) |owned| store.readMetadataAllocator().destroy(owned);
         if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
         const generation = if (pin) |owned| try store.pinReadGeneration(owned) else null;
         return .{
@@ -2888,6 +2911,24 @@ pub const Txn = struct {
         scratch: read_scratch,
         batch_scratch: read_scratch,
         native_batch: native.DocumentBatchReadState = .{},
+
+        pub fn metadataAllocator(self: *const @This(), fallback: Allocator) Allocator {
+            // Opaque caller allocators keep their own accounting/failure policy.
+            if (self.workspace == null) return fallback;
+            return self.parent.metadataAllocator(fallback);
+        }
+        pub fn metadataResidentManager(self: *const @This()) ?*resource_manager_mod.ResourceManager {
+            const store = self.parent.store orelse return null;
+            return store.metadata_pool.residentManager();
+        }
+
+        pub fn preparedScorePlan(self: *@This()) ?*@import("../prepared_score_plan.zig").PreparedScorePlan {
+            return if (self.workspace) |w| &w.score_plan else null;
+        }
+
+        pub fn preparedScoreAllocator(self: *@This()) Allocator {
+            return self.workspace.?.allocator();
+        }
 
         pub fn workingAllocator(self: *@This()) Allocator {
             return if (self.workspace) |w| w.graph.allocator() else self.scratch.arena.child_allocator;
@@ -6310,6 +6351,12 @@ test "lite fused graph visitors preserve reordered rows duplicate columns and er
     try std.testing.expectEqualSlices(?f64, &.{ 5, 2, 5, null }, &scores[1]);
     try std.testing.expectEqualSlices(?f64, &scores[0], &scores[2]);
     for (scores[3]) |score| try std.testing.expect(score == null);
+    const buffer = store.workspaces[0].?.score_plan.storage.?.ptr;
+    _ = try @import("../../graph/score_read.zig").populate(a, &wrapped, &.{ "q/", "p/", "q/", null }, &.{ "a", "b", "missing", "a" }, &columns);
+    try std.testing.expectEqual(buffer, store.workspaces[0].?.score_plan.storage.?.ptr);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 7, null, 3 }, &scores[0]);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 5, null, 2 }, &scores[1]);
+    try std.testing.expectEqualSlices(?f64, &scores[0], &scores[2]);
 }
 
 test "lite pooled workspace pressure reclaims idle slots and skips live scopes" {
@@ -6337,4 +6384,409 @@ test "lite pooled workspace pressure reclaims idle slots and skips live scopes" 
     try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes < before);
     try std.testing.expect(second.workspace.?.busy);
     try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.lite_docstore_snapshot_cache, 4 * 1024 * 1024));
+}
+
+test "lite workspace failed allocation returns query credit" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const workspace = try Workspace.create(backing.allocator(), null);
+    defer workspace.destroy();
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    backing.limit = backing.live;
+    try std.testing.expectError(error.OutOfMemory, workspace.allocator().alloc(u8, 4096));
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+}
+
+test "lite workspace failed resize returns query credit" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").NoResizeAllocator{ .backing = a };
+    const workspace = try Workspace.create(backing.allocator(), null);
+    defer workspace.destroy();
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    const bytes = try workspace.allocator().alloc(u8, 32);
+    defer workspace.allocator().free(bytes);
+    try std.testing.expect(!workspace.allocator().resize(bytes, 64));
+    try std.testing.expectEqual(@as(u64, 32), query.live_bytes);
+}
+
+test "lite workspace residency is not charged twice to node budget" {
+    const resources = resource_manager_mod;
+    const Workspace = ReadWorkspace;
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    const workspace = try Workspace.create(a, &manager);
+    defer workspace.destroy();
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try workspace.begin(&query);
+    defer workspace.end();
+    const bytes = workspace.allocator().alloc(u8, 96 * 1024) catch |err| {
+        std.debug.print("REVIEW_DOUBLE_CHARGE physical={d} query_charged={d} node_limit=131072 requested=98304\n", .{ workspace.live, query.live_bytes });
+        return err;
+    };
+    defer workspace.allocator().free(bytes);
+}
+
+test "lite reclaiming budgeted store backing does not recurse" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lite_docstore_snapshot_cache, a, 1);
+    defer backing.deinit();
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaiming-backing.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(backing.threadSafeAllocator(), path, .{ .io = std.testing.io, .no_sync = true, .resource_manager = &manager, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var txn = try store.beginRead();
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    _ = try scope.workingAllocator().alloc(u8, 4096);
+    scope.close();
+    _ = backing.releaseUnusedCreditThreadSafe();
+    manager.memory.budget.hard_limit_bytes = manager.memory.used_bytes;
+    const bytes = try backing.threadSafeAllocator().alloc(u8, 4096);
+    defer backing.threadSafeAllocator().free(bytes);
+}
+
+test "lite prepared graph plans own inputs rebind outputs and resolve new snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-snapshot.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "p/a\x00\x00", .value = &raw }, .{ .key = "q/a\x00\x00", .value = &raw } });
+    var old = try store.beginRead();
+    defer old.abort();
+    var first: [2]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    _ = try reader.populate(a, &old, &.{"p/"}, &.{ "a", "a" }, &.{&first});
+    var key: [1]u8 = .{'a'};
+    var prefix: [2]u8 = .{ 'p', '/' };
+    var second: [2]?f64 = undefined;
+    _ = try reader.populate(a, &old, &.{&prefix}, &.{ &key, &key }, &.{&second});
+    key[0] = 'b';
+    prefix[0] = 'q';
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2 }, &second);
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("p/a\x00\x00", &raw);
+        try write.delete("q/a\x00\x00");
+        try write.commit();
+    }
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    _ = try reader.populate(a, &fresh, &.{"p/"}, &.{ "a", "a" }, &.{&second});
+    try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &second);
+    _ = try reader.populate(a, &old, &.{"p/"}, &.{ "a", "a" }, &.{&first});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2 }, &first);
+    _ = try reader.populate(a, &fresh, &.{"q/"}, &.{ "a", "b" }, &.{&second});
+    try std.testing.expectEqualSlices(?f64, &.{ null, null }, &second);
+}
+
+test "lite metadata pool bounds retained nodes survives overflow and reclaims" {
+    const a = std.testing.allocator;
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.allocator(), null);
+    var nodes: [40][]u8 = undefined;
+    for (&nodes) |*node| node.* = try alloc.alloc(u8, 16);
+    for (nodes) |node| alloc.free(node);
+    try std.testing.expectEqual(@as(usize, 16), pool.idle_count);
+    const calls = backing.alloc_calls;
+    const bytes = try alloc.alloc(u8, 16);
+    try std.testing.expectEqual(calls, backing.alloc_calls);
+    try std.testing.expect(alloc.resize(bytes, 32));
+    alloc.free(bytes.ptr[0..32]);
+    const large = try alloc.alloc(u8, 2048);
+    try std.testing.expect(!alloc.resize(large, 16));
+    alloc.free(large);
+    try std.testing.expect(pool.reclaim(std.math.maxInt(u64)) > 0);
+    try std.testing.expectEqual(@as(usize, 0), backing.live);
+}
+
+test "lite resident admission combines borrowed and allocated query demand" {
+    const a = std.testing.allocator;
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 128 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 2);
+    defer query.deinit();
+    var borrowed = try query.borrowResidentScratch(96, &manager);
+    defer borrowed.release();
+    const bytes = try query.allocator().alloc(u8, 128);
+    defer query.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 224), query.live_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, borrowed.growTo(129));
+    borrowed.shrinkTo(32);
+    try std.testing.expectEqual(@as(u64, 160), query.live_bytes);
+    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+}
+
+test "lite prepared plan allocation failures preserve ownership and bounded fallback" {
+    const Plan = @import("../prepared_score_plan.zig").PreparedScorePlan;
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            var plan = Plan{};
+            defer plan.deinit();
+            try std.testing.expect(try plan.prepare(a, &.{ "q/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            try std.testing.expectEqual(@as(usize, 2), plan.read_keys.len);
+            try std.testing.expect(plan.storage.?.len <= Plan.max_bytes);
+            const pointer = plan.storage.?.ptr;
+            try std.testing.expect(try plan.prepare(a, &.{ "q/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            try std.testing.expectEqual(pointer, plan.storage.?.ptr);
+            try std.testing.expect(try plan.prepare(a, &.{ "p/", null, "q/" }, &.{ "b", "a\x00", "b" }));
+            var huge: [5000][]const u8 = undefined;
+            @memset(&huge, "a");
+            try std.testing.expect(!try plan.prepare(a, &.{"p/"}, &huge));
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "lite prepared fresh raw and erased graph allocation measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    var reversed = nodes;
+    std.mem.reverse([]const u8, &reversed);
+    var shuffled = nodes;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().shuffle([]const u8, &shuffled);
+    inline for (.{ 0, 1, 2 }) |varying| {
+        inline for (.{ false, true }) |erased| {
+            for (0..5) |_| {
+                const raw = try store.beginRead();
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+            }
+            const before = file_budget.alloc_calls;
+            const cpu_before = std.posix.getrusage(0);
+            for (0..5000) |i| {
+                const requested_nodes = if (varying == 0 or i % 2 == 1) &nodes else if (varying == 1) &reversed else &shuffled;
+                const raw = try store.beginRead();
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, requested_nodes, &.{&columns});
+                for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const cpu_after = std.posix.getrusage(0);
+            const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+            std.debug.print("LITE_PREPARED_MEASURE erased={any} varying={any} queries=5000 keys=512 cpu_us={d} file_allocations={d} scope_bytes={d}\n", .{ erased, varying, cpu_us, file_budget.alloc_calls - before, @sizeOf(Txn.ReadScope) });
+            try std.testing.expectEqual(before, file_budget.alloc_calls);
+        }
+    }
+}
+
+test "lite metadata residency is budgeted and independent of query admission" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4096 } });
+    defer manager.deinit(a);
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(a, &manager);
+    const bytes = try alloc.alloc(u8, 32);
+    alloc.free(bytes);
+    try std.testing.expect(manager.snapshot().memory.used_bytes > 32);
+    try std.testing.expect(pool.residentManager() == &manager);
+    _ = pool.reclaim(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "lite borrowed admission cannot release copied credit or adopt physical ownership" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var first = try query.borrowResidentScratch(32, &manager);
+    var stale = first;
+    var second = try query.borrowResidentScratch(64, &manager);
+    defer second.release();
+    var observed: u64 = 0;
+    try std.testing.expectError(error.ResourceAccountingMismatch, manager.adoptReservationUsage(&first.reservation, .lite_docstore_snapshot_cache, &observed, 32));
+    try std.testing.expectEqual(@as(u64, 0), observed);
+    first.release();
+    stale.release();
+    try std.testing.expectEqual(@as(u64, 64), query.live_bytes);
+    try std.testing.expectEqual(@as(u64, 64), manager.sliceStats(.dense_search_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ReservationReleased, first.growTo(1));
+}
+
+test "lite workspace nested residency charges host memory once across slices" {
+    const a = std.testing.allocator;
+    for ([_]resource_manager_mod.Slice{ .lite_docstore_snapshot_cache, .dense_source_payload_state }) |slice| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+        defer manager.deinit(a);
+        var backing = resource_manager_mod.BudgetedAllocator.init(&manager, slice, a, 1);
+        defer backing.deinit();
+        const workspace = try ReadWorkspace.create(backing.threadSafeAllocator(), &manager);
+        defer workspace.destroy();
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        try workspace.begin(&query);
+        defer workspace.end();
+        const bytes = try workspace.allocator().alloc(u8, 96 * 1024);
+        defer workspace.allocator().free(bytes);
+        try std.testing.expectEqual(backing.reservation.bytes, manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, bytes.len), query.live_bytes);
+    }
+}
+
+test "lite metadata pool concurrent reuse and pressure release preserve ownership" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(a, &manager);
+    var failed = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(allocator: Allocator, result: *std.atomic.Value(bool)) void {
+            for (0..100) |_| {
+                const bytes = allocator.alloc(u8, 32) catch {
+                    result.store(true, .release);
+                    return;
+                };
+                @memset(bytes, 42);
+                if (bytes[31] != 42) result.store(true, .release);
+                allocator.free(bytes);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ alloc, &failed });
+        started += 1;
+    }
+    for (0..100) |_| _ = pool.reclaim(1024);
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.active);
+    try std.testing.expect(pool.idle_count <= 16);
+    _ = pool.reclaim(std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "lite prepared plan buffer reuse on misses and recovery after allocation failure" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    var plan = @import("../prepared_score_plan.zig").PreparedScorePlan{};
+    defer plan.deinit();
+    try std.testing.expectError(error.OutOfMemory, plan.prepare(budget.allocator(), &.{"p/"}, &.{"a"}));
+    budget.limit = 65536;
+    try std.testing.expect(try plan.prepare(budget.allocator(), &.{"p/"}, &.{"a"}));
+    const before = budget.alloc_calls;
+    const ptr = plan.storage.?.ptr;
+    try std.testing.expect(try plan.prepare(budget.allocator(), &.{"q/"}, &.{"b"}));
+    try std.testing.expectEqual(before, budget.alloc_calls);
+    try std.testing.expectEqual(ptr, plan.storage.?.ptr);
+    try std.testing.expect(std.mem.startsWith(u8, plan.read_keys[0], "q/b"));
+}
+
+test "lite prepared plans preserve reads that fit a small query budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "plan-query-budget.aflite");
+    defer a.free(path);
+    var limits = resource_manager_mod.Options.defaultBudgets();
+    limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var keys: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&keys, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    for (0..3) |_| {
+        var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+        defer query.deinit();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        _ = try @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+        for (columns) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+        try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+    }
+}
+
+test "lite prepared plans sort overlapping prefixes and fan out shared keys" {
+    var plan = @import("../prepared_score_plan.zig").PreparedScorePlan{};
+    defer plan.deinit();
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{ "", "a" }, &.{ "b", "ab" }));
+    try std.testing.expectEqual(@as(usize, 3), plan.read_keys.len);
+    for (plan.read_keys[1..], plan.read_keys[0 .. plan.read_keys.len - 1]) |next, previous| {
+        try std.testing.expect(std.mem.order(u8, previous, next) == .lt);
+    }
+    var first: [2]?f64 = @splat(null);
+    var second: [2]?f64 = @splat(null);
+    var output = @import("../prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &first, &second } };
+    const sink = output.sink();
+    for (0..plan.read_keys.len) |i| sink.write(sink.context, i, @floatFromInt(i + 1));
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 2 }, &first);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 1 }, &second);
 }

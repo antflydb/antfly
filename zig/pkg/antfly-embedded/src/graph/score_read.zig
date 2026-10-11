@@ -50,6 +50,28 @@ pub fn populate(
     defer if (scoped) {
         if (scope) |*active| active.close();
     };
+    if (comptime scoped and @hasDecl(Scope, "preparedScorePlan") and @hasDecl(Scope, "visitManySortedScores")) {
+        if (scope) |*active| {
+            const supported = if (comptime @hasDecl(Scope, "supportsScoreVisitor")) active.supportsScoreVisitor() else true;
+            if (supported) if (active.preparedScorePlan()) |plan| {
+                const prepared = plan.prepare(active.preparedScoreAllocator(), prefixes, nodes) catch false;
+                if (prepared) prepared_read: {
+                    var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+                    active.visitManySortedScores(plan.read_keys, output.sink()) catch |err| switch (@as(anyerror, err)) {
+                        error.OutOfMemory, error.ResourceBudgetExceeded => {
+                            // Prepared ownership must not raise the minimum
+                            // memory needed by the streaming read path.
+                            plan.deinit();
+                            for (columns) |column| @memset(column, null);
+                            break :prepared_read;
+                        },
+                        else => return err,
+                    };
+                    return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1 };
+                }
+            };
+        }
+    }
     const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
     defer alloc.free(physical);
