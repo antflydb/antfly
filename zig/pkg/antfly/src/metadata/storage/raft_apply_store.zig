@@ -4619,6 +4619,9 @@ test "relational index publication terminal replacement bounds owner retention a
         var plan = if (attempt % 2 == 0) single else multiple;
         plan.id = @splat(0);
         std.mem.writeInt(u64, plan.id[0..8], attempt, .little);
+        // Both halves become exact transition/attempt identities. Retain all
+        // 32 distinct retries and the alternating full owner cohorts.
+        std.mem.writeInt(u64, plan.id[8..16], attempt, .little);
         var prepared = try plan.prepare(a);
         defer prepared.deinit();
         if (expected) |old| {

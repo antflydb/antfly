@@ -28,6 +28,7 @@ const candidate_mod = @import("relational_index_candidate.zig");
 const shape = @import("schema_publication_shape.zig");
 const lifecycle = @import("table_lifecycle_lock.zig");
 const Allocator = std.mem.Allocator;
+const native_control = local.storage_db_relational_index_owner_control;
 pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("owner_root_attestation.zig").Proof("antfly/index-build-owner-receipt/v1");
@@ -78,6 +79,32 @@ pub const OwnerDecision = struct {
     disposition: enum { execute, acknowledged },
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
+
+    /// Convert an independently authenticated admission projection, not a
+    /// caller-chosen physical binding. A fresh decision remains a permission
+    /// observation, not a lease against later metadata cancellation.
+    pub fn nativeAdmission(self: OwnerDecision) !native_control.Admission {
+        if (self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
+            self.disposition != .execute) return error.InvalidGenerationPublication;
+        if (try ownerPermission(self.head, self.owner, .fence) != .execute) return error.GenerationPublicationChanged;
+        const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
+        const inputs = self.inputs orelse return error.InvalidGenerationPublication;
+        const identity = try dispatch.nativeIdentity(self.owner.owner);
+        try inputs.requireHead(self.head);
+        if (inputs.namespace_id != dispatch.namespace_id or
+            !std.mem.eql(u8, inputs.before.name, dispatch.table_name) or
+            !std.mem.eql(u8, &digest(inputs.before.schema_json), &dispatch.table_guard.owner.schema_digest) or
+            !std.mem.eql(u8, &digest(inputs.after.schema_json), &dispatch.successor_schema_digest)) return error.InvalidCatalogRecord;
+        return .{
+            .id = identity.id,
+            .plan_digest = identity.plan_digest,
+            .owner_digest = identity.owner_digest,
+            .ordinal = identity.ordinal,
+            .fence = try privateIndexFence(dispatch.id, dispatch.owner),
+            .candidate_digest = self.head.candidate_digest,
+            .reservation_digest = self.head.reservation_digest,
+        };
+    }
 };
 
 /// Pure phase permission, not remote authentication or a lease. Data apply
@@ -339,6 +366,27 @@ pub const Inputs = struct {
     after: records.TableRecord,
     catalog_before_b64: []const u8,
 
+    /// Pack immutable bytes once for owner admission. The physical owner
+    /// compiles the candidate against its actual catalog and verifies the head
+    /// fingerprints; doing that compilation here as well would duplicate work.
+    pub fn prepareNativeManifest(self: Inputs, a: Allocator, head: progress.Head) !native_control.Manifest {
+        try self.requireHead(head);
+        try self.table_guard.validate();
+        var budget: FrameBudget = .{};
+        std.json.Stringify.value(self, .{}, &budget.writer) catch return error.IndexPublicationTooLarge;
+        const length = std.base64.standard.Decoder.calcSizeForSlice(self.catalog_before_b64) catch return error.InvalidIndexPublicationCandidate;
+        if (length == 0 or length > local.storage_db_relational_integrity_catalog.max_catalog_bytes) return error.InvalidIndexPublicationCandidate;
+        const predecessor = try a.alloc(u8, length);
+        defer a.free(predecessor);
+        std.base64.standard.Decoder.decode(predecessor, self.catalog_before_b64) catch return error.InvalidIndexPublicationCandidate;
+        return native_control.Manifest.init(a, .{
+            .before_json = self.before.schema_json,
+            .after_json = self.after.schema_json,
+            .predecessor = predecessor,
+            .name = self.index_name,
+        });
+    }
+
     /// Admission rebuilds the typed logical candidate and verifies BOTH admitted
     /// fingerprints. The projected plan ID/checksum is not a substitute for
     /// schema, index-pair and catalog validation. No owner-cohort decode occurs.
@@ -376,7 +424,59 @@ pub const Dispatch = struct {
     successor_schema_version: u32,
     successor_schema_digest: Digest,
     owner: Owner,
+
+    pub fn nativeIdentity(self: Dispatch, expected: progress.Owner) !native_control.Identity {
+        try self.requireOwner(expected);
+        if (self.owner.receipt_authority != .native) return error.InvalidGenerationPublication;
+        const identity: native_control.Identity = .{
+            .id = self.id,
+            .plan_digest = self.plan_digest,
+            .owner_digest = expected.fence_digest,
+            .ordinal = self.ordinal,
+            .namespace = self.owner.namespace,
+            .owner_group_id = self.owner.range.group_id,
+        };
+        try identity.validate();
+        return identity;
+    }
+
+    fn requireOwner(d: Dispatch, expected: progress.Owner) !void {
+        try (progress.OwnerState{ .owner = expected }).validate();
+        if (d.format_version != 1 or !std.mem.eql(u8, &d.id, &expected.plan_id) or
+            !std.mem.eql(u8, &d.plan_digest, &expected.plan_digest) or d.ordinal != expected.ordinal or
+            d.namespace_id == 0 or d.table_name.len == 0 or d.successor_schema_version == 0 or
+            d.owner.range.group_id != expected.group_id or !d.owner.namespace.eql(expected.namespace) or
+            d.owner.range.table_id != expected.namespace.table_id or
+            manager.rangeDocIdentityShardId(d.owner.range) != expected.namespace.shard_id or
+            manager.rangeDocIdentityRangeId(d.owner.range) != expected.namespace.range_id or
+            d.owner.receipt_authority != expected.authority or
+            !std.mem.eql(u8, &try ownerFenceDigest(d.owner), &expected.fence_digest)) return error.InvalidCatalogRecord;
+        try d.table_guard.validate();
+        if (d.table_guard.owner.kind != .table or d.table_guard.owner.table_id != expected.namespace.table_id or
+            d.table_guard.constraint_name_admission != null or
+            d.successor_schema_version != (std.math.add(u32, d.table_guard.owner.schema_version, 1) catch return error.InvalidCatalogRecord) or
+            !std.mem.eql(u8, d.table_guard.target.name, d.table_guard.logical_table)) return error.InvalidCatalogRecord;
+        _ = privateIndexFence(d.id, d.owner) catch return error.InvalidCatalogRecord;
+    }
 };
+
+/// Preserve both halves of the full publication ID, matching the existing
+/// generation-publication fence convention. Never synthesize Raft positions
+/// from these control identities or the separately admitted source epoch.
+fn privateIndexFence(id: Id, owner: Owner) !local.storage_db_relational_integrity_topology_contract.Fence {
+    const fence: local.storage_db_relational_integrity_topology_contract.Fence = .{
+        .role = .index_build,
+        .transition_id = std.mem.readInt(u64, id[0..8], .little),
+        .attempt = std.mem.readInt(u64, id[8..16], .little),
+        .admission_epoch = owner.admission_epoch,
+        .peer_group_id = owner.range.group_id,
+        .owner_group_id = owner.range.group_id,
+        .namespace = owner.namespace,
+        .catalog_digest = owner.catalog_digest,
+    };
+    _ = try fence.encode();
+    return fence;
+}
 
 /// These reads own every decoded string before another transactional get can
 /// invalidate borrowed bytes. A projection is not authority by itself: callers
@@ -400,17 +500,7 @@ pub fn readDispatch(a: Allocator, txn: anytype, group: u64, expected: progress.O
     if (bytes.len == 0 or bytes.len > max_bytes) return error.InvalidCatalogRecord;
     var parsed = try std.json.parseFromSlice(Dispatch, a, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
-    const d = parsed.value;
-    if (d.format_version != 1 or !std.mem.eql(u8, &d.id, &expected.plan_id) or
-        !std.mem.eql(u8, &d.plan_digest, &expected.plan_digest) or d.ordinal != expected.ordinal or
-        d.namespace_id == 0 or d.table_name.len == 0 or d.successor_schema_version == 0 or
-        d.owner.range.group_id != expected.group_id or !d.owner.namespace.eql(expected.namespace) or
-        d.owner.receipt_authority != expected.authority or
-        !std.mem.eql(u8, &try ownerFenceDigest(d.owner), &expected.fence_digest)) return error.InvalidCatalogRecord;
-    try d.table_guard.validate();
-    if (d.table_guard.owner.kind != .table or d.table_guard.owner.table_id != expected.namespace.table_id or
-        d.table_guard.constraint_name_admission != null or
-        !std.mem.eql(u8, d.table_guard.target.name, d.table_guard.logical_table)) return error.InvalidCatalogRecord;
+    try parsed.value.requireOwner(expected);
     return parsed;
 }
 
@@ -487,6 +577,7 @@ pub const Plan = struct {
         const before_digest = digest(candidate.reservation.expected.?);
         for (self.owners, ranges) |owner, *range| {
             range.* = owner.range;
+            _ = privateIndexFence(self.id, owner) catch return error.InvalidIndexPublicationCandidate;
             if (owner.range.table_id != self.before.table_id or owner.range.group_id == 0 or owner.admission_epoch == 0 or
                 owner.namespace.table_id != self.before.table_id or
                 owner.namespace.shard_id != manager.rangeDocIdentityShardId(owner.range) or
@@ -874,6 +965,93 @@ test "relational index publication signatures bind owner authority position and 
         altered.proof.signature = foreign.signature;
         try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
     }
+}
+
+test "relational index publication native dispatch binds exact admitted fence and packs raw manifest without recompilation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var plan = try testPlan(arena.allocator());
+    var native_owner = [_]Owner{plan.owners[0]};
+    native_owner[0].receipt_authority = .native;
+    plan.owners = &native_owner;
+    var prepared = try plan.prepare(a);
+    defer prepared.deinit();
+    var dispatch = try std.json.parseFromSlice(Dispatch, a, prepared.dispatch[0], .{});
+    defer dispatch.deinit();
+    var inputs = try std.json.parseFromSlice(Inputs, a, prepared.inputs, .{});
+    defer inputs.deinit();
+    const decision: OwnerDecision = .{
+        .metadata_group_id = 13,
+        .metadata_incarnation = @splat('1'),
+        .head = prepared.head,
+        .owner = prepared.owners[0],
+        .disposition = .execute,
+        .dispatch = dispatch.value,
+        .inputs = inputs.value,
+    };
+    const admission = try decision.nativeAdmission();
+    try std.testing.expectEqual(plan.id, admission.id);
+    try std.testing.expectEqual(prepared.head.plan_digest, admission.plan_digest);
+    try std.testing.expectEqual(prepared.owners[0].owner.fence_digest, admission.owner_digest);
+    try std.testing.expectEqual(prepared.head.candidate_digest, admission.candidate_digest);
+    try std.testing.expectEqual(prepared.head.reservation_digest, admission.reservation_digest);
+    try std.testing.expectEqual(@as(u64, 7), admission.fence.admission_epoch);
+    try std.testing.expectEqual(std.mem.readInt(u64, plan.id[0..8], .little), admission.fence.transition_id);
+    try std.testing.expectEqual(std.mem.readInt(u64, plan.id[8..16], .little), admission.fence.attempt);
+    try std.testing.expectEqual(@as(u64, 301), admission.fence.owner_group_id);
+    try std.testing.expectEqual(admission.fence.owner_group_id, admission.fence.peer_group_id);
+    try std.testing.expectEqual(.index_build, admission.fence.role);
+    try std.testing.expectEqual(native_owner[0].namespace, admission.fence.namespace);
+    try std.testing.expectEqual(native_owner[0].catalog_digest, admission.fence.catalog_digest);
+    var manifest = try inputs.value.prepareNativeManifest(a, prepared.head);
+    defer manifest.deinit();
+    try std.testing.expectEqualSlices(u8, prepared.candidate.inputs.bytes, manifest.bytes);
+    const Check = struct {
+        fn run(allocator: Allocator, input: Inputs, head: progress.Head) !void {
+            var owned_manifest = try input.prepareNativeManifest(allocator, head);
+            defer owned_manifest.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ inputs.value, prepared.head });
+    var bad = decision;
+    bad.inputs = null;
+    try std.testing.expectError(error.InvalidGenerationPublication, bad.nativeAdmission());
+    bad = decision;
+    bad.disposition = .acknowledged;
+    try std.testing.expectError(error.InvalidGenerationPublication, bad.nativeAdmission());
+    bad = decision;
+    bad.head = try prepared.head.cancel(prepared.head.revision, .requested);
+    try std.testing.expectError(error.GenerationPublicationChanged, bad.nativeAdmission());
+    bad = decision;
+    bad.dispatch.?.owner.admission_epoch += 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.nativeAdmission());
+    bad = decision;
+    bad.dispatch.?.owner.namespace.range_id += 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.nativeAdmission());
+    bad = decision;
+    bad.inputs.?.after.schema_json = "{}";
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.nativeAdmission());
+    bad = decision;
+    bad.inputs.?.before.schema_json = "{}";
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.nativeAdmission());
+    bad = decision;
+    bad.dispatch.?.successor_schema_version += 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.nativeAdmission());
+    var malformed = inputs.value;
+    malformed.catalog_before_b64 = "not base64!";
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, malformed.prepareNativeManifest(a, prepared.head));
+    malformed = inputs.value;
+    malformed.plan_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, malformed.prepareNativeManifest(a, prepared.head));
+    // IDs must be representable without replacing either half by a fake
+    // transition or attempt. Reject them at metadata admission, not data apply.
+    var invalid_plan = plan;
+    @memset(invalid_plan.id[0..8], 0);
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, invalid_plan.prepare(a));
+    invalid_plan = plan;
+    @memset(invalid_plan.id[8..16], 0);
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, invalid_plan.prepare(a));
 }
 
 test "relational index publication prepares owned immutable head owner and reserved name postimages" {

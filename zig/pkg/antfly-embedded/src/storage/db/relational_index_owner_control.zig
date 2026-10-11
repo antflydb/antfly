@@ -29,6 +29,7 @@ const Allocator = std.mem.Allocator;
 pub const envelope_version = 22;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_wire_bytes = max_encoded_inputs + 32 * 1024;
+pub const Manifest = inputs.Prepared;
 
 pub const Admission = struct {
     id: [16]u8,

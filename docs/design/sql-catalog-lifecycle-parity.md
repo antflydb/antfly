@@ -2217,3 +2217,31 @@ snapshot's decision. Optimized receipt-recovery qualification is pending.
 These remain unsigned logical receipts, not
 metadata authorization, root attestation or public activation. The original
 SQL inventory is unchanged.
+
+### Canonical metadata-to-native index admission (in qualification)
+
+An authenticated owner admission projection can now produce the exact typed
+native header from the admitted head and independently bound dispatch. The
+factory requires a live fencing permission, the admission inputs projection,
+native receipt authority, exact owner ordinal/group/namespace, owner-descriptor
+fingerprint, successor schema digest and table/namespace identity. Acknowledged
+or canceled decisions cannot be converted into a new admission. The factory
+does not authenticate its caller and is not a lease against later cancellation.
+
+The full publication ID supplies transition and attempt fields (both 64-bit
+halves), matching generation-publication conventions; the separately admitted
+source epoch is retained unchanged. These fields never become Raft positions.
+Metadata admission rejects IDs that cannot form a valid fence before publishing
+any plan. The terminal-retention fixture still covers all 32 CAS retries and
+alternating owner cohorts, now with representable two-half IDs; explicit
+negative tests cover each zero-half case.
+
+The inputs projection packs an owned, bounded raw manifest without compiling
+the logical candidate a second time in the receiving worker. The physical owner
+still compiles against its actual immutable catalog and checks both admitted
+fingerprints before committing. Tests compare the packed bytes with the
+independently prepared candidate manifest, exercise allocation-failure cleanup,
+and reject substituted epochs, namespaces, successor inputs and plan identity.
+Metadata publication qualification is in progress. Authenticated RPC execution,
+root-attested ACKs and the later lifecycle phases remain required; public
+publication and the original SQL inventory remain unchanged.
