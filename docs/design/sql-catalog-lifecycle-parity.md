@@ -2742,7 +2742,7 @@ not a signed owner acknowledgement and cannot substitute for distributed fault
 qualification. The public failed-UNIQUE-build atomicity gate remains open, and
 the original inventory remains 478 / 136 / 73 / 899.
 
-### Bounded private-claim creation provenance (merged-source qualification pending)
+### Bounded private-claim creation provenance (component qualification complete)
 
 The isolated ordered-claim implementation originally retained one exact-cut
 receipt per canonical batch. Reordering and coalescing were idempotent, but
@@ -2788,13 +2788,30 @@ paired keys and provenance bytes, using the same accounting. GC stops before
 the next record would exceed 1 MiB instead of checking only after appending.
 Large-record regressions add two 600-KiB claims, reject oversized command and
 prepared admission, and check the complete paired-byte total of every page.
-Its frozen-source Debug gate is running; passing earlier provenance tests
-cannot qualify this later change. The subsequent regression `8e031be1fe`
+Its frozen-source Debug gate passed 103/103 build steps and 102 targeted
+executions, including portable backup coverage. The subsequent regression `8e031be1fe`
 prepares overlapping batches before either commits. It verifies identical
 concurrent creation is accepted, only new members receive the next cut, and
 both batches retain distinct exact retry cuts after the later commit.
 
-The reviewed chain is integrated locally at `ef7154c10f`, with latest main
-`d3bbb9a0c6`. Formatting, diff, control-catalog freshness and the 2,034-file
-Apache boundary pass. Final merged-source qualification is still required
-before pushing this implementation. No new original-case credit is claimed.
+The reviewed chain was integrated at `ef7154c10f`, with latest main
+`d3bbb9a0c6`. Exact merged-source checkpoint `cbef979866` passed all 103 Debug
+build steps and 102 targeted executions, plus all 62 ReleaseFast steps and thirty
+candidate/transfer/retained-effects executions. The Debug selections cover
+forty-four portable backup, twenty-one publication, one decoder floor, thirteen
+candidate, two transfer, fifteen retained-effects and six compiled-owner tests.
+These overlapping component selections are not a full suite or distributed gate.
+
+Review also corrected overlapping-test transaction ownership: a later failed
+assertion must not abort a transaction already invalidated by successful commit.
+That fixture-only follow-up `cdddfddc80` passed all 52 Debug steps and fifteen
+candidate/transfer executions. All completed runs have zero skips, failures or
+leaks. All sixteen isolated PostgreSQL lifecycle oracle tests and the inventory
+audit pass at the merged-source checkpoint. Formatting, diff, control-catalog
+freshness and the 2,034-file Apache boundary pass.
+
+The public producer remains disabled. Authenticated hash-owner transport, root
+attestation/capability admission, complete build/validation/install/release,
+cohort cancellation and native restore/adoption still require integration and
+distributed fault evidence. The public failed-UNIQUE-build atomicity gate is
+still open. No new original-case credit is claimed: 478 / 136 / 73 / 899.
