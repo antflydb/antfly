@@ -10,6 +10,9 @@ These bytes were produced through the public standalone APIs of the official
 - `schema.json`: its public schema JSON, also extracted verbatim.
 - `native-generation.json`: the v0.2.5 native backup manifest, with the original
   v3 inventory and no `install_path` fields. Its corpus includes sparse indexes.
+- `native/`: the complete unmodified snapshot described by that manifest; the
+  manifest authenticates every primary, dense, sparse, full-text and graph file.
+- `native-indexes.json`: the verbatim public index contract from its backup metadata.
 
 The same server workflow on the v0.2.1, v0.2.2, v0.2.3 and v0.2.4 release
 executables produces the identical 212-byte runtime schema (SHA-256

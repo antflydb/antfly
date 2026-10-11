@@ -27,5 +27,7 @@
       "binary_sha256": "8900496c5a7fbd6a4d2cb0787faf49b3635f720c104745355053499f02a7582a",
       "native_manifest_version": 3
     }
-  }
+  },
+  "native_files": "native/ contains the unmodified complete v0.2.5 group snapshot; per-file digests are in native/native-generation.json",
+  "native_indexes_sha256": "3da01bc9fa4f1606b218768cb0191c07f23da854bab5719218b53279d0dd94e2"
 }

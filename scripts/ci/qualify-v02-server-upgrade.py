@@ -526,13 +526,40 @@ def qualify_swarm(
             )
             swarm.data.batch({"a": document("zebrafish raft", [1, 0, 0])})
             verify(swarm.data, vectors=False)
+            swarm.data.batch({"counter": {"_type": "doc", "count": 0}})
+            transformed = swarm.data.request(
+                "POST",
+                "/tables/upgrade/batch",
+                {
+                    "transforms": [
+                        {
+                            "key": "counter",
+                            "operations": [{"op": "$inc", "path": "count", "value": 7}],
+                        }
+                    ],
+                    "sync_level": "write",
+                },
+            )
+            assert transformed["transformed"] == 1, transformed
+            (root / "counter-proof.json").write_text('{"expected_count":7}\n')
         with Swarm(old_binary, root, "released-control") as swarm:
             verify(swarm.data, vectors=False)
+            assert (
+                swarm.data.request("GET", "/tables/upgrade/documents/counter")["count"]
+                == 7
+            )
         print(f"{release}: released swarm and same-binary control passed", flush=True)
     if not seed_only:
         for label in ("main-first", "main-second"):
             with Swarm(binary, root, label) as swarm:
                 verify(swarm.data, vectors=False)
+                if (root / "counter-proof.json").exists():
+                    assert (
+                        swarm.data.request("GET", "/tables/upgrade/documents/counter")[
+                            "count"
+                        ]
+                        == 7
+                    ), "released increment replayed twice"
                 swarm.data.batch({"c": document("raft control", [0, 0, 1])})
                 swarm.data.batch(deletes=["c"])
         print(
@@ -540,13 +567,139 @@ def qualify_swarm(
         )
 
 
-def qualify_ha(binary, release, evidence):
+def qualify_schema(
+    binary, old_binary, release, evidence, seed_only=False, verify_only=False
+):
+    root = evidence / "schema-history"
+    if not verify_only:
+        assert not root.exists(), f"schema fixture already exists: {root}"
+        schema = json.loads(json.dumps(SCHEMA))
+        schema.update({"ttl_duration_ns": 315360000000000000, "ttl_field": "expires"})
+        with Server(old_binary, root, "released-schema-create") as server:
+            server.request("POST", "/tables/upgrade", {"schema": schema})
+            row = document("zebrafish epoch zero", [1, 0, 0])
+            row["expires"] = "2099-01-01T00:00:00Z"
+            server.batch({"a": row})
+            schema["document_schemas"]["doc"]["schema"]["properties"]["note"] = {
+                "type": "string",
+                "x-antfly-types": ["keyword"],
+            }
+            updated = server.request("PUT", "/tables/upgrade/schema", schema)
+            assert updated["schema"]["version"] == 1, updated
+            server.batch(
+                {
+                    "b": {
+                        "_type": "doc",
+                        "body": "harbor epoch one",
+                        "note": "new",
+                        "expires": "2099-01-01T00:00:00Z",
+                    }
+                }
+            )
+            verify(server, vectors=False)
+        with Server(old_binary, root, "released-schema-control") as server:
+            verify(server, vectors=False)
+        print(
+            f"{release}: released TTL/schema-history writer and control passed",
+            flush=True,
+        )
+    if not seed_only:
+        for label in ("main-schema-first", "main-schema-second"):
+            with Server(binary, root, label) as server:
+                verify(server, vectors=False)
+                schema = server.request("GET", "/tables/upgrade")["schema"]
+                assert schema["version"] == 1 and schema["ttl_field"] == "expires", (
+                    schema
+                )
+                server.batch(
+                    {
+                        "c": {
+                            "_type": "doc",
+                            "body": "history control",
+                            "note": "updated",
+                            "expires": "2099-01-01T00:00:00Z",
+                        }
+                    }
+                )
+                server.batch(deletes=["c"])
+        print(
+            f"{release}: TTL and immutable schema history upgrade/restart passed",
+            flush=True,
+        )
+
+
+def ha_cli(binary, evidence, command, primary=False, state="ha-standby"):
+    options = [
+        "--standby-log",
+        str(evidence / f"{state}.wal"),
+        "--standby-progress",
+        str(evidence / f"{state}-progress.wal"),
+        "--standby-node-id",
+        "upgrade-standby",
+        "--ha-cluster-id",
+        "847",
+        "--ha-timeline-id",
+        "1",
+        "--ha-epoch",
+        "1",
+    ]
+    if primary:
+        options += [
+            "--primary-log",
+            str(evidence / "ha-primary" / "ha-primary.wal"),
+            "--primary-slots",
+            str(evidence / "ha-primary" / "ha-slots"),
+            "--primary-node-id",
+            "upgrade-primary",
+        ]
+    result = subprocess.run(
+        [str(binary), "ha", *options, *command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    with (evidence / "ha-cli.log").open("a") as log:
+        log.write(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def qualify_ha(binary, old_binary, release, evidence):
+    capture = json.loads((evidence / "ha-capture.json").read_text())
+    bootstrap = [
+        "seed",
+        "bootstrap",
+        "--manifest",
+        capture["manifest_path"],
+        "--content-root",
+        capture["content_root"],
+    ]
+    if not (evidence / "ha-standby-progress.wal").exists():
+        ha_cli(old_binary, evidence, bootstrap)
+    for _ in range(2):
+        snapshot = ha_cli(binary, evidence, ["status", "standby"])["snapshot"]
+        assert snapshot["applied_lsn"] >= capture["checkpoint_lsn"], snapshot
+    seed_state = f"ha-current-seed-{time.time_ns()}"
+    ha_cli(binary, evidence, bootstrap, state=seed_state)
+    stream_slot = f"upgrade-stream-{time.time_ns()}"
+    ha_cli(
+        binary,
+        evidence,
+        ["slot", "create", stream_slot, "--initial-lsn", str(snapshot["applied_lsn"])],
+        primary=True,
+    )
+    ha_cli(binary, evidence, ["stream", "once", "--slot", stream_slot], primary=True)
+    snapshot = ha_cli(binary, evidence, ["status", "standby"])["snapshot"]
+    assert snapshot["caught_up_to_received"], snapshot
     for label in ("main-ha-first", "main-ha-second"):
         with Server(binary, evidence / "ha-primary", label) as server:
             verify(server, vectors=False)
             server.batch({"c": document("HA control", [0, 0, 1])})
             server.batch(deletes=["c"])
-    print(f"{release}: HA primary WAL reopen and writes/restart passed", flush=True)
+    print(
+        f"{release}: HA primary/standby WAL, seed authentication and restart passed",
+        flush=True,
+    )
 
 
 def restore(server, location, kind):
@@ -656,6 +809,11 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--seed-only", action="store_true")
     mode.add_argument("--verify-only", action="store_true")
+    parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="Qualify TTL records and released schema history",
+    )
     args = parser.parse_args()
     if not args.seed_only and not args.new_bin:
         parser.error("--new-bin is required unless --seed-only")
@@ -665,6 +823,16 @@ def main():
         binary = Path(path).resolve()
         evidence = args.work_dir.resolve() / release
         evidence.mkdir(parents=True, exist_ok=True)
+        if args.schema_only:
+            qualify_schema(
+                args.new_bin.resolve() if args.new_bin else None,
+                binary,
+                release,
+                evidence,
+                seed_only=args.seed_only,
+                verify_only=args.verify_only,
+            )
+            continue
         if args.swarm_only:
             qualify_swarm(
                 args.new_bin.resolve() if args.new_bin else None,
@@ -682,7 +850,7 @@ def main():
                 seed(binary, release, evidence)
         if not args.seed_only:
             if args.ha_only:
-                qualify_ha(args.new_bin.resolve(), release, evidence)
+                qualify_ha(args.new_bin.resolve(), binary, release, evidence)
             else:
                 qualify(
                     args.new_bin.resolve(),

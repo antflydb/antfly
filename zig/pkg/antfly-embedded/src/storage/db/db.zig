@@ -13602,6 +13602,7 @@ pub const DB = struct {
         err_name: []const u8,
         terminal: bool,
     ) !void {
+        if (terminal) std.log.warn("index repair failed terminally repair_id={x} err={s}", .{ repair_id, err_name });
         try self.updateIndexRepairIntentWithBindingEffect(
             alloc,
             repair_id,
@@ -134060,4 +134061,47 @@ test "issue1015 degraded primary writes reject backlog exhaustion before commit"
         };
     }
     return error.TestUnexpectedResult;
+}
+
+test "db v02 native restore repairs released projections" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("db");
+    defer tmp.cleanup();
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(tmp.path().ptr));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    const snapshot_root = "pkg/antfly-embedded/src/storage/testdata/v02-server/native";
+    try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged, alloc, std.testing.io, snapshot_root, staged.path(), .{}, .{
+        .backup_id = "released-native",
+        .location = "local",
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        .snapshot_path = snapshot_root,
+        .group_id = 4351204774573063798,
+    });
+    var db = try DB.open(alloc, staged.path(), .{
+        .open_mode = .writer_no_replay,
+        .staged_generation = &staged,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer db.close();
+    const row = (try db.get(alloc, "a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+    _ = try db.rehydrateSchemaJson(@embedFile("../testdata/v02-server/schema.json"));
+    _ = try @import("../../metadata/index_reconcile.zig").reconcileDbIndexesWithOptions(alloc, &db, @embedFile("../testdata/v02-server/native-indexes.json"), .{ .drain_resolver_backfill = false });
+    for (0..30) |_| {
+        _ = db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(alloc, std.testing.io, .{}) catch |err| {
+            if (err == error.RestoreRuntimeRepairIncomplete) continue;
+            const path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
+            defer alloc.free(path);
+            var state = try index_repair_state.load(alloc, path);
+            defer state.deinit(alloc);
+            for (state.entries.items) |entry| std.debug.print("native repair {s}: {s} {?s}\n", .{ entry.intent.index_name, @tagName(entry.intent.phase), entry.intent.last_error });
+            return err;
+        };
+        if (!try db.restoreRuntimeRepairNeeded()) return;
+    }
+    return error.RestoreRuntimeRepairIncomplete;
 }

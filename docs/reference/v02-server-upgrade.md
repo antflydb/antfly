@@ -28,7 +28,9 @@ marker is not a rollback procedure.
 | Dense index projections | Existing generation migration rebuilds the native projection from authoritative sources. Index status exposes rebuild availability. |
 | Dense embedding source ownership | Preserve the persisted `primary_lsm` default. Moving sources into the shared vector store remains an explicit storage migration, independent of physical index migration. |
 | AFB2 portable backups, reader level 2 | Authenticate metadata before validating document rows, including released document-before-metadata archives. Verify the source fingerprint across passes. |
-| Native-generation manifest v3 | Recover canonical install paths absent from the released writer; retain ownership, digest and inventory checks. Restore the physical files, then apply the same schema binding and storage readers on open. |
+| Descriptorless Raft batches | Replay through the prepared resident owner with the atomic term/index receipt, preserving exactly-once increments across restart. |
+| HA v1 records/manifests and standby progress | Retain existing readers, verify captured file digests, reopen old WAL/progress state and continue streaming. |
+| Native-generation manifest v3 | Recover canonical install paths absent from the released writer; retain ownership, digest and inventory checks. Rebuild incompatible dense/full-text projections from the authenticated primary before publication. |
 
 Legacy public/runtime schemas must agree on every field the released writer
 persisted. Recovering new derived metadata does not authorize a user to change
@@ -53,5 +55,10 @@ same-binary controls before attempting upgrade. It retains binary/file hashes,
 logs, clean and crashed directories, and portable/native backups. It tests
 lookup, full-text, dense/sparse queries, writes/deletes, second restart,
 restoration and old-reader rejection. `--seed-only` and `--verify-only` split
-fixture generation from upgrade qualification. This standalone corpus does
-not replace a deployment-specific swarm/HA recovery qualification.
+fixture generation from upgrade qualification. Run the same command with
+`--swarm-only` for stopped metadata/data Raft upgrades and an exactly-once
+increment, `--schema-only` for TTL and immutable schema history, and `--ha-only`
+for primary/standby WAL and progress reopen plus seed manifest/file validation.
+The HA CLI test authenticates seed content and advances replication progress;
+it does not exercise physical seed activation or a promoted standby deployment.
+These checks do not qualify mixed-version rolling operation.
