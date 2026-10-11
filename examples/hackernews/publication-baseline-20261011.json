@@ -62,7 +62,13 @@
   "restart": "not measured; earlier composed failure aborted run",
   "cleanup": {
     "pod_deleted": true,
-    "artifacts": "retained temporarily for investigation"
+    "artifacts": {
+      "prefix": "hn-poc/archive-qualification/245412afa2ca4b7c8f247128d5c7e047",
+      "deleted": 11129,
+      "bytes": 370058845,
+      "generation_conditioned": true,
+      "source_preserved": true
+    }
   },
   "passed": false
 }
