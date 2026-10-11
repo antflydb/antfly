@@ -3317,6 +3317,54 @@ pub const DB = struct {
         return true;
     }
 
+    pub const NativeIndexCleanupMaintenanceOutcome = struct {
+        advanced: bool,
+        artifacts_retired: bool,
+    };
+
+    /// Derived private-generation cleanup may run on a standby without opening
+    /// ordinary write admission. Exact durable cancellation, allocation burns
+    /// and cleanup admission are rechecked in the deletion transaction. This
+    /// does not advance the source clock or release the publication fence.
+    pub fn collectCanceledNativeIndexGarbageStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexCleanupMaintenanceOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforcePortableRuntimeGate();
+        const jobs = @import("relational_index_owner_job.zig");
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try jobs.requireCancellationCleanup(&read, binding);
+        }
+        var page = try relational_index_gc.Page.prepareGeneration(self.alloc, self.backend_runtime.io(), self.core, binding.index);
+        defer if (page) |*value| value.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (page) |*value| {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try jobs.requireCancellationCleanup(&txn, binding);
+            try @import("relational_integrity_topology.zig").requireDrained(&txn, &manager, binding.fence);
+            try value.stage(self.core, &manager, &txn);
+            const retired = value.next == null;
+            if (retired) try jobs.requireCancellationArtifactsRetired(&txn, binding);
+            try txn.commit();
+            return .{ .advanced = true, .artifacts_retired = retired };
+        }
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireCancellationArtifactsRetired(&read, binding);
+        return .{ .advanced = false, .artifacts_retired = true };
+    }
+
     /// Retry only the observed failed generation. Healthy/building retries
     /// are idempotent; an old admin request cannot reset a replacement index.
     pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
