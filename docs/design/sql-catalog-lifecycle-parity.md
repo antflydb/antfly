@@ -1419,3 +1419,50 @@ the predecessor implementation and passes with the reverse proof; the aliased
 range fault also passes in both checkpoint and incoming-snapshot verification.
 Formatting, diff and control-source catalog freshness checks pass. These are
 metadata recovery results, not public SQL atomicity or full-suite qualification.
+
+### Live logical authority on recovery
+
+A fail-first regression constructed a self-consistent private plan/head/owner
+set with an old metadata incarnation. Immutable-frame and physical table/range
+verification accepted it. Nonterminal recovery now compares the plan guard's
+incarnation with the current durable metadata epoch and resolves the namespace,
+database and table resources by stable IDs. It verifies logical names, parent
+bindings and the unchanged physical storage name. These are bounded point
+reads once per job, not namespace-name scans or per-range plan parsing. The
+admission root's old revision is deliberately not required: staging the job
+itself advances the namespace source revision.
+
+Default database/public namespace and legacy unbound public table semantics
+match admission. Explicit nondefault resources must exist and match; missing
+resources are not treated as defaults. Completed job history remains exempt
+from current incarnation/catalog-binding checks, just as it is exempt from
+later schema/topology changes.
+
+Five new fault variants use a stale plan incarnation, a foreign namespace ID,
+or independently rebound table/namespace/database resources. The stale-plan
+variants recompute all private frame/head/owner digests, so this exercises live
+authority rather than another checksum mismatch. Native checkpoint and incoming
+snapshot paths share the verifier. An unpublished native storage fixture also
+accepts an explicit nondefault database/namespace and a logical table name
+different from its physical name; full namespace-registry recovery remains
+separately covered by the surrounding committed campaign.
+
+Native execution remains the next architectural dependency. Existing
+`relational_index_jobs.Page` acquires the published write snapshot and commit
+requires `isCurrent`; relaxing that check would not grant private-job authority.
+Private execution must instead pin a candidate plan independently and recheck
+its exact durable source fence, job digest, reserved catalog and maintenance
+predecessor when committing a bounded projected page. It should reuse the
+existing historical-schema projection and primary-value CAS machinery, without
+publishing the candidate write/query snapshot. Generation reservation, progress
+and outbox must share a transaction, and activation still requires independently
+attested owner support plus distributed UNIQUE validation and a durable metadata
+publication decision. None of those owner operations are enabled by this
+recovery checkpoint.
+
+Qualification passes the two targeted native gates in Debug and ReleaseFast:
+ten publication tests, one decoder-floor test and fifty namespace/recovery
+tests, zero skips/failures/leaks. The expanded recovery campaign covers 24 fault
+variants. Formatting, diff and control-source catalog freshness checks pass.
+These scoped results do not establish native owner support, public UNIQUE
+atomicity or completion of any additional SQL inventory case.

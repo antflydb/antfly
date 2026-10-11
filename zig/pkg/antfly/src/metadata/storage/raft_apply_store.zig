@@ -4243,7 +4243,7 @@ test "relational index publication admission reserves names atomically and survi
             defer metadata_table_manager.freeTable(a, current);
             try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(current, plan.before));
         }
-        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory, extra_range, aliased_range };
+        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory, extra_range, aliased_range, stale_plan_incarnation, foreign_plan_namespace, rebound_table, rebound_namespace, rebound_database };
         inline for (std.meta.tags(Fault)) |fault| {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -4303,6 +4303,33 @@ test "relational index publication admission reserves names atomically and survi
                     defer a.free(encoded);
                     try txn.put(try rangeKeyForGroup(&buf, group, plan.owners[0].range.group_id + 1), encoded);
                 },
+                .stale_plan_incarnation, .foreign_plan_namespace => {
+                    var changed = plan;
+                    if (fault == .stale_plan_incarnation) changed.table_guard.incarnation[0] ^= 1 else changed.namespace_id += 1;
+                    var prepared = try changed.prepare(a);
+                    defer prepared.deinit();
+                    // Keep the immutable frame, head and owners self-consistent:
+                    // this is stale authority, not a checksum-substitution test.
+                    try txn.put(try index_publication.planKey(&buf, group, plan.before.table_id), prepared.frame);
+                    try txn.put(try index_publication.headKey(&buf, group, plan.before.table_id), &try prepared.head.encode());
+                    for (prepared.owners, 0..) |owner, i| try txn.put(try index_publication.ownerKey(&buf, group, plan.before.table_id, @intCast(i)), &try owner.encode());
+                },
+                .rebound_table, .rebound_namespace, .rebound_database => {
+                    const resource: system_catalog.Resource = switch (fault) {
+                        .rebound_table => .{ .kind = .table, .id = plan.before.table_id, .parent_id = plan.namespace_id + 1, .name = plan.table_guard.logical_table, .storage_name = plan.before.name },
+                        .rebound_namespace => .{ .kind = .namespace, .id = plan.namespace_id, .parent_id = system_catalog.default_database_id, .name = "different_namespace" },
+                        .rebound_database => .{ .kind = .database, .id = system_catalog.default_database_id, .name = "different_database" },
+                        else => unreachable,
+                    };
+                    const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group, @tagName(resource.kind), resource.id });
+                    const encoded = try std.json.Stringify.valueAlloc(a, resource, .{});
+                    defer a.free(encoded);
+                    try txn.put(key, encoded);
+                },
+            }
+            switch (fault) {
+                .stale_plan_incarnation, .foreign_plan_namespace, .rebound_table, .rebound_namespace, .rebound_database => try std.testing.expectError(error.InvalidCatalogRecord, IndexPublicationVerification.verifyTableCut(a, &txn, group, plan.before.table_id)),
+                else => {},
             }
             try std.testing.expectError(error.InvalidMetadataHACheckpoint, verifyRelationCheckpointTxn(a, &txn));
             if (fault != .orphan_group and fault != .orphan_lock_group) {
@@ -4312,6 +4339,34 @@ test "relational index publication admission reserves names atomically and survi
                 defer freeMetadataSnapshotRows(a, rows);
                 try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, group, rows));
             }
+        }
+        {
+            // Isolate stable-ID authority for nondefault catalog bindings.
+            // The enclosing campaign verifies full registry recovery separately;
+            // this deliberately unpublished transaction cannot alter its root.
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var bound = plan;
+            bound.namespace_id = 1002;
+            bound.table_guard.target = .{ .database = "tenant", .namespace = "sales", .name = "visible_items" };
+            bound.table_guard.logical_table = "visible_items";
+            var prepared = try bound.prepare(a);
+            defer prepared.deinit();
+            var buf: [192]u8 = undefined;
+            for ([_]system_catalog.Resource{
+                .{ .kind = .database, .id = 1001, .name = "tenant" },
+                .{ .kind = .namespace, .id = 1002, .parent_id = 1001, .name = "sales" },
+                .{ .kind = .table, .id = plan.before.table_id, .parent_id = 1002, .name = "visible_items", .storage_name = plan.before.name },
+            }) |resource| {
+                const key = try std.fmt.bufPrint(&buf, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group, @tagName(resource.kind), resource.id });
+                const encoded = try std.json.Stringify.valueAlloc(a, resource, .{});
+                defer a.free(encoded);
+                try txn.put(key, encoded);
+            }
+            try txn.put(try index_publication.planKey(&buf, group, plan.before.table_id), prepared.frame);
+            try txn.put(try index_publication.headKey(&buf, group, plan.before.table_id), &try prepared.head.encode());
+            for (prepared.owners, 0..) |owner, i| try txn.put(try index_publication.ownerKey(&buf, group, plan.before.table_id, @intCast(i)), &try owner.encode());
+            _ = try IndexPublicationVerification.verifyTableCut(a, &txn, group, plan.before.table_id);
         }
         try verifyRelationRecoveryForTest(&store, a, group);
     }
@@ -30852,6 +30907,38 @@ const IndexPublicationVerification = struct {
             !std.mem.eql(u8, &owner.owner.plan_digest, &head.plan_digest)) return error.InvalidCatalogRecord;
     }
 
+    /// Verify logical authority by stable catalog IDs, not name-index scans or
+    /// the admission root's old revision (the job itself advances that root).
+    fn verifyAuthority(a: std.mem.Allocator, reader: anytype, group: u64, plan: index_publication.Plan, table: metadata.TableRecord) !void {
+        const epoch = try RaftApplyStore.relationSourceEpochTxn(reader, group);
+        if (!std.mem.eql(u8, &epoch.incarnation, &plan.table_guard.incarnation)) return error.InvalidCatalogRecord;
+        const target = plan.table_guard.target;
+        var namespace = try system_catalog_storage.getById(a, reader, group, .namespace, plan.namespace_id);
+        defer if (namespace) |*resource| resource.deinit();
+        const database_id = if (namespace) |resource| blk: {
+            if (!std.mem.eql(u8, resource.value.name, target.namespace)) return error.InvalidCatalogRecord;
+            break :blk resource.value.parent_id;
+        } else blk: {
+            if (plan.namespace_id != system_catalog.default_namespace_id or
+                !std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name)) return error.InvalidCatalogRecord;
+            break :blk system_catalog.default_database_id;
+        };
+        var database = try system_catalog_storage.getById(a, reader, group, .database, database_id);
+        defer if (database) |*resource| resource.deinit();
+        if (database) |resource| {
+            if (resource.value.parent_id != 0 or !std.mem.eql(u8, resource.value.name, target.database)) return error.InvalidCatalogRecord;
+        } else if (database_id != system_catalog.default_database_id or
+            !std.mem.eql(u8, target.database, system_catalog.default_database_name)) return error.InvalidCatalogRecord;
+        var binding = try system_catalog_storage.getById(a, reader, group, .table, table.table_id);
+        defer if (binding) |*resource| resource.deinit();
+        if (binding) |resource| {
+            if (resource.value.parent_id != plan.namespace_id or
+                !std.mem.eql(u8, resource.value.name, plan.table_guard.logical_table) or
+                !std.mem.eql(u8, resource.value.storage_name, table.name)) return error.InvalidCatalogRecord;
+        } else if (plan.namespace_id != system_catalog.default_namespace_id or
+            !std.mem.eql(u8, table.name, plan.table_guard.logical_table)) return error.InvalidCatalogRecord;
+    }
+
     fn verifyTableCut(a: std.mem.Allocator, reader: anytype, group: u64, id: u64) !index_progress.Head {
         var proof = try index_publication.verifyOwned(a, reader, group, id);
         defer proof.deinit();
@@ -30868,6 +30955,7 @@ const IndexPublicationVerification = struct {
         const plan = proof.plan.value;
         const expected = if (proof.head.phase == .installing or proof.head.phase == .releasing) plan.after else plan.before;
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return error.InvalidCatalogRecord;
+        try verifyAuthority(a, reader, group, plan, current);
         for (plan.owners) |owner| {
             const range = decodeRangeRecord(a, try reader.get(try rangeKeyForGroup(&buf, group, owner.range.group_id))) catch |err| switch (err) {
                 error.OutOfMemory => return err,
