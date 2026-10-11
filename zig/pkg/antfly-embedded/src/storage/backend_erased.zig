@@ -245,6 +245,7 @@ pub const ReadScope = struct {
         working_allocator: ?*const fn (*anyopaque) Allocator = null,
         prepared_score_plan: ?*const fn (*anyopaque) ?*@import("prepared_score_plan.zig").PreparedScorePlan = null,
         prepared_score_allocator: ?*const fn (*anyopaque) Allocator = null,
+        visit_prepared_request: ?*const fn (*anyopaque, *const @import("prepared_score_request.zig").PreparedScoreRequest, backend_types.CompleteScoreSink) anyerror!void = null,
         visit_prepared_scores: ?*const fn (*anyopaque, *@import("prepared_score_plan.zig").PreparedScorePlan, backend_types.CompleteScoreSink) anyerror!void = null,
         get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
@@ -254,6 +255,12 @@ pub const ReadScope = struct {
     }
     pub fn preparedScoreAllocator(self: *@This()) Allocator {
         return self.vtable.prepared_score_allocator.?(self.ptr);
+    }
+    pub fn supportsPreparedRequest(self: *const @This()) bool {
+        return self.vtable.visit_prepared_request != null;
+    }
+    pub fn visitPreparedRequest(self: *@This(), request: *const @import("prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
+        return (self.vtable.visit_prepared_request orelse return error.Unsupported)(self.ptr, request, sink);
     }
     pub fn supportsPreparedScores(self: *const @This()) bool {
         return self.vtable.visit_prepared_scores != null;
@@ -372,6 +379,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.visitManySortedScores(keys, sink);
         }
+        fn visitPreparedRequest(ptr: *anyopaque, request: *const @import("prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.visitPreparedRequest(request, sink);
+        }
         fn visitPreparedScores(ptr: *anyopaque, plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.visitPreparedScores(plan, sink);
@@ -428,7 +439,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try a.create(State);
     state.* = .{ .handle = handle, .parent = parent, .admission = admission };
-    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_request = if (@hasDecl(@TypeOf(handle), "visitPreparedRequest")) State.visitPreparedRequest else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies

@@ -3032,7 +3032,22 @@ pub const Txn = struct {
             }
         }
 
-        fn readPreparedScores(self: *@This(), plan: *@import("../prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
+        /// Caller-owned requests remain immutable for this call. The native
+        /// cache copies identity and keys; it never retains the request pointer.
+        pub fn visitPreparedRequest(self: *@This(), request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
+            if (!request.plan().valid) return error.InvalidBatch;
+            const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
+            self.readPreparedScores(request.plan(), sink) catch |err| {
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
+                return err;
+            };
+            if (self.workspace) |w| if (w.resolved_scores.recovered_optional_failure) {
+                w.resolved_scores.recovered_optional_failure = false;
+                w.allocation_failed = previous_failure;
+            };
+        }
+
+        fn readPreparedScores(self: *@This(), plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
             if (self.parent.pending_count != 0) return self.visitScores(plan.read_keys, sink);
             defer self.resetBatchScratch();
             const file = try self.parent.readFile();
@@ -7532,6 +7547,9 @@ test "lite prepared cached scores retry after page cache eviction" {
     const w = scope.workspace.?;
     try std.testing.expect(w.resolved_scores.storage != null);
     try std.testing.expect(w.native_state.window.bytes == null);
+    // Exercise the supported offset-only cache path, independently of the
+    // decoded hit that intentionally requires no reader growth.
+    w.resolved_scores.decoded_ready = false;
     const file = try txn.readFile();
     try std.testing.expect(file.page_cache.total_bytes > 0);
 
@@ -8070,4 +8088,187 @@ test "lite prepared lazy fallback clears failures and avoids empty invalid batch
     var out: [8]u8 = undefined;
     try std.testing.expectError(error.OutOfMemory, scope.getManySortedInto(&.{"doc"}, &.{&out}, &values));
     try std.testing.expectEqual(@as(?[]const u8, null), values[0]);
+}
+
+test "lite prepared immutable request owns inputs and fences pending writes and cache bypass" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "immutable-request.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "ns\x00p/a\x00\x00", .value = &raw }});
+    const reader = @import("../../graph/score_read.zig");
+    var node: [1]u8 = .{'a'};
+    var prefix: [2]u8 = .{ 'p', '/' };
+    var request = try reader.PreparedRequest.init(a, &.{ &prefix, null, &prefix }, &.{ &node, "missing", &node });
+    defer request.deinit();
+    node[0] = 'b';
+    prefix[0] = 'q';
+    var columns: [3][3]?f64 = undefined;
+    inline for (.{ false, true }) |erased| {
+        const raw_txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+        var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw_txn) else raw_txn;
+        defer txn.abort();
+        for (0..4) |_| _ = try reader.populatePrepared(alloc, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+        const before = counter.alloc_attempts;
+        _ = try reader.populatePrepared(alloc, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+        try std.testing.expectEqual(before, counter.alloc_attempts);
+        try std.testing.expectEqualSlices(?f64, &.{ 3, null, 3 }, &columns[0]);
+        try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &columns[1]);
+        try std.testing.expectEqualSlices(?f64, &.{ 3, null, 3 }, &columns[2]);
+    }
+    var txn = try Txn.openWriteWithPrefix(&store, "ns\x00");
+    defer txn.abort();
+    _ = try reader.populatePrepared(alloc, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    try txn.put("p/a\x00\x00", &raw);
+    _ = try reader.populatePrepared(alloc, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+    try std.testing.expectEqualSlices(?f64, &.{ 9, null, 9 }, &columns[0]);
+    try txn.delete("p/a\x00\x00");
+    _ = try reader.populatePrepared(alloc, &txn, &request, &.{ &columns[0], &columns[1], &columns[2] });
+    try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &columns[0]);
+    // Bypass makes validation and record reads observable again, and must
+    // invalidate decoded ownership even for the same immutable request.
+    var read = try Txn.openReadWithPrefix(&store, "ns\x00");
+    defer read.abort();
+    const file = try read.readFile();
+    file.page_cache_enabled.store(false, .monotonic);
+    defer file.page_cache_enabled.store(true, .monotonic);
+    _ = try reader.populatePrepared(alloc, &read, &request, &.{ &columns[0], &columns[1], &columns[2] });
+    try std.testing.expectEqualSlices(?f64, &.{ 3, null, 3 }, &columns[0]);
+    for (store.workspaces) |slot| if (slot) |w| try std.testing.expect(!w.resolved_scores.decoded_ready);
+}
+
+test "lite prepared invalid scores never publish a partial decoded batch" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "decoded-invalid.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var good: [8]u8 = undefined;
+    var bad: [8]u8 = undefined;
+    std.mem.writeInt(u64, &good, @bitCast(@as(f64, 3)), .little);
+    std.mem.writeInt(u64, &bad, @bitCast(std.math.inf(f64)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "a\x00\x00", .value = &good }, .{ .key = "b\x00\x00", .value = &bad } });
+    const reader = @import("../../graph/score_read.zig");
+    var request = try reader.PreparedRequest.init(a, &.{""}, &.{ "a", "b" });
+    defer request.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var column: [2]?f64 = .{ 99, 99 };
+    for (0..3) |_| {
+        try std.testing.expectError(error.InvalidGraphMetricScore, reader.populatePrepared(a, &txn, &request, &.{&column}));
+        try std.testing.expectEqualSlices(?f64, &.{ null, null }, &column);
+        for (store.workspaces) |slot| if (slot) |w| try std.testing.expect(!w.resolved_scores.decoded_ready);
+    }
+}
+
+test "lite prepared immutable request measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "immutable-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const reader = @import("../../graph/score_read.zig");
+    var request = try reader.PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
+    var column: [512]?f64 = undefined;
+    inline for (.{ false, true }) |immutable| {
+        for (0..5) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            if (immutable) {
+                _ = try reader.populatePrepared(alloc, &txn, &request, &.{&column});
+            } else {
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&column});
+            }
+        }
+        const before = counter.alloc_calls;
+        const started = std.posix.getrusage(0);
+        for (0..5000) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            if (immutable) {
+                _ = try reader.populatePrepared(alloc, &txn, &request, &.{&column});
+            } else {
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&column});
+            }
+            for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+        }
+        const ended = std.posix.getrusage(0);
+        const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+        try std.testing.expectEqual(before, counter.alloc_calls);
+        std.debug.print("LITE_IMMUTABLE immutable={any} cpu_us={d} allocations={d}\n", .{ immutable, cpu, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared changing checkpoint measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "changing-checkpoint-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        node.* = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var column: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    var cpu_us: i64 = 0;
+    var allocations: usize = 0;
+    for (0..200) |i| {
+        std.mem.writeInt(u64, &raw, @bitCast(@as(f64, @floatFromInt(i))), .little);
+        var write = try Txn.openWrite(&store);
+        errdefer write.abort();
+        try write.put(&key_storage[0], &raw);
+        try write.commit();
+        var txn = try Txn.openRead(&store);
+        defer txn.abort();
+        const before = counter.alloc_calls;
+        const start = std.posix.getrusage(0);
+        _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&column});
+        const end = std.posix.getrusage(0);
+        cpu_us += (end.utime.sec - start.utime.sec + end.stime.sec - start.stime.sec) * 1000000 + end.utime.usec - start.utime.usec + end.stime.usec - start.stime.usec;
+        allocations += counter.alloc_calls - before;
+        try std.testing.expectEqual(@as(?f64, @floatFromInt(i)), column[0]);
+        for (column[1..]) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+    }
+    std.debug.print("LITE_CHANGING queries=200 keys=512 cpu_us={d} allocations={d}\n", .{ cpu_us, allocations });
 }

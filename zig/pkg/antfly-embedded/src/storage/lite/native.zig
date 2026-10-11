@@ -1139,6 +1139,8 @@ pub const ResolvedScoreBatch = struct {
     keys: []const []const u8 = &.{},
     references: []u64 = &.{},
     order: ?[]usize = null,
+    decoded: []f64 = &.{},
+    decoded_ready: bool = false,
     borrowed: bool = false,
     recovered_optional_failure: bool = false,
     promotion_allocator: ?Allocator = null,
@@ -1182,6 +1184,11 @@ pub const ResolvedScoreBatch = struct {
             self.deinit(a);
             return false;
         }
+        // Decoded values share the existing cap. Large requests retain the
+        // offset-only path rather than increasing the cache memory ceiling.
+        const decoded_bytes = keys.len * @sizeOf(f64);
+        const retain_decoded = decoded_bytes <= 128 * 1024 - required;
+        if (retain_decoded) required += decoded_bytes;
         const capacity = std.math.ceilPowerOfTwo(usize, required) catch return false;
         if (self.storage == null or self.storage.?.len < capacity) {
             self.deinit(a);
@@ -1192,6 +1199,8 @@ pub const ResolvedScoreBatch = struct {
         const owned = try alloc.alloc([]const u8, keys.len);
         self.references = try alloc.alloc(u64, keys.len);
         const positions = try alloc.alloc(usize, keys.len);
+        self.decoded = if (retain_decoded) try alloc.alloc(f64, keys.len) else &.{};
+        self.decoded_ready = false;
         for (owned, keys) |*copy, key| copy.* = try alloc.dupe(u8, key);
         self.keys = owned;
         self.prepared_identity = if (prepared) |identity| .{ .canonical = identity.canonical, .namespace = try alloc.dupe(u8, identity.namespace) } else null;
@@ -6130,6 +6139,23 @@ pub const NativeFile = struct {
     pub fn visitPreparedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
         if (!plan.valid or plan.identity == 0) return error.InvalidBatch;
         const identity = ReadIdentity{ .canonical = plan.identity, .namespace = namespace };
+        if (checkpoint.document_index_root_page == 0) {
+            for (0..plan.read_keys.len) |i| sink.write(sink.context, i, null);
+            return;
+        }
+        // Owned physical keys and decoded values survive scope detach. A hit
+        // needs no namespace reconstruction, record reader, or temporary arena.
+        if (state.binding) |binding| if (state.resolved) |resolved| {
+            if (self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0 and
+                resolved.decoded_ready and resolved.matchesPrepared(binding, checkpoint, identity, plan.read_keys.len))
+            {
+                resolved.borrowed = true;
+                defer resolved.borrowed = false;
+                resolved.recovered_optional_failure = false;
+                for (resolved.decoded, 0..) |score, i| sink.write(sink.context, i, if (std.math.isNan(score)) null else score);
+                return;
+            }
+        };
         if (namespace.len == 0) return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
         var bytes_len: usize = 0;
         for (plan.read_keys) |key| {
@@ -6177,8 +6203,18 @@ pub const NativeFile = struct {
         };
         var cached = scores != null and state.binding != null and state.resolved != null and use_cache and
             (if (prepared) |identity| state.resolved.?.matchesPrepared(state.binding.?, checkpoint, identity, keys.len) else state.resolved.?.matches(state.binding.?, checkpoint, keys));
-        // A miss must have the same memory floor as an uncached batch. Build
-        // optional retained offsets only after all record reads succeed.
+        if (cached and state.resolved.?.decoded_ready) {
+            state.resolved.?.borrowed = true;
+            defer state.resolved.?.borrowed = false;
+            for (state.resolved.?.decoded, 0..) |score, i| {
+                if (complete) {
+                    scores.?.write(scores.?.context, i, if (std.math.isNan(score)) null else score);
+                } else if (!std.math.isNan(score)) scores.?.write(scores.?.context, i, score);
+            }
+            return;
+        }
+        // Release old residency on a miss so resolution keeps the uncached
+        // memory floor. Promote offsets only after required reads succeed.
         if (!cached and scores != null) if (state.resolved) |resolved| {
             resolved.deinit(state.allocator.?);
         };
@@ -6193,6 +6229,14 @@ pub const NativeFile = struct {
         defer if (!cached) {
             if (order) |positions| temporary.free(positions);
         };
+        // Collect decoded values only into an existing borrowed offset cache.
+        // Cold reads never raise their required allocation floor, even with a
+        // caller allocator that cannot evict optional residency automatically.
+        var capture = cached and state.resolved.?.decoded.len == keys.len;
+        errdefer if (scores != null) if (state.resolved) |resolved| {
+            resolved.decoded_ready = false;
+        };
+        var captured: usize = 0;
         var recovered = false;
         const reader = &state.reader;
         const window = &state.window;
@@ -6207,6 +6251,10 @@ pub const NativeFile = struct {
             const i = if (order) |positions| positions[position] else position;
             const reference = references[i];
             if (reference == 0) {
+                if (capture) {
+                    state.resolved.?.decoded[i] = std.math.nan(f64);
+                    captured += 1;
+                }
                 if (complete) if (scores) |out| out.write(out.context, i, null);
                 position += 1;
                 continue;
@@ -6221,6 +6269,7 @@ pub const NativeFile = struct {
                 resolved.borrowed = false;
                 resolved.deinit(state.allocator.?);
                 cached = false;
+                capture = false;
                 references = &.{};
                 order = null;
                 state.reset();
@@ -6234,6 +6283,10 @@ pub const NativeFile = struct {
             const entry = try decodeDocumentEntry(bytes);
             if (!std.mem.eql(u8, entry.key, keys[i])) return error.InvalidDocumentIndex;
             if (entry.is_delete) {
+                if (capture) {
+                    state.resolved.?.decoded[i] = std.math.nan(f64);
+                    captured += 1;
+                }
                 if (complete) if (scores) |out| out.write(out.context, i, null);
                 position += 1;
                 continue;
@@ -6246,7 +6299,12 @@ pub const NativeFile = struct {
                     try self.readValuePagesRangeInto(entry.external_value_root_page, 8, 0, &raw, checkpoint);
                     break :blk &raw;
                 } else entry.value;
-                out.write(out.context, i, try decodeScore(bytes_score));
+                const score = try decodeScore(bytes_score);
+                if (capture) {
+                    state.resolved.?.decoded[i] = score;
+                    captured += 1;
+                }
+                out.write(out.context, i, score);
             } else if (buffers) |out| {
                 const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
                 if (length > out[i].len) return error.BufferTooSmall;
@@ -6260,6 +6318,7 @@ pub const NativeFile = struct {
                 try allocator.dupe(u8, entry.value);
             position += 1;
         }
+        if (capture) state.resolved.?.decoded_ready = captured == keys.len;
         if (!cached and scores != null and state.binding != null and state.resolved != null and use_cache) {
             _ = state.resolved.?.remember(state.allocator.?, state.binding.?, checkpoint, keys, references, order, prepared) catch false;
         }
@@ -17731,4 +17790,49 @@ test "lite detached batch frames preserve allocator ownership across files" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), two_budget.live);
+}
+
+test "lite decoded score cache preserves offset-only fallback within its cap" {
+    const a = std.testing.allocator;
+    var resolved = ResolvedScoreBatch{};
+    defer resolved.deinit(a);
+    var keys: [3500][]const u8 = @splat("k");
+    var references: [3500]u64 = @splat(0);
+    try std.testing.expect(try resolved.remember(a, .{ .owner = 1, .generation = 1 }, .{}, &keys, &references, null, null));
+    try std.testing.expectEqual(@as(usize, 0), resolved.decoded.len);
+    try std.testing.expect(resolved.storage.?.len <= 128 * 1024);
+    try std.testing.expect(!resolved.decoded_ready);
+}
+
+test "lite decoded cold promotion preserves a direct native caller allocation floor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "direct-decoded-budget.aflite");
+    defer a.free(path);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].soft_limit_bytes = 1;
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].hard_limit_bytes = 1;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+    defer file.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    try file.putDocument("a", &raw);
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
+    var score: [1]?f64 = undefined;
+    {
+        var control = DocumentBatchReadState{ .allocator = backing.allocator() };
+        defer control.deinit();
+        try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{"a"}, &score, &control);
+        try std.testing.expectEqual(@as(?f64, 3), score[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backing.live);
+    var resolved = ResolvedScoreBatch{};
+    var state = DocumentBatchReadState{ .allocator = backing.allocator(), .resolved = &resolved, .binding = .{ .owner = 1, .generation = 1 } };
+    defer state.deinit();
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{"a"}, &score, &state);
+    try std.testing.expectEqual(@as(?f64, 3), score[0]);
+    try std.testing.expect(!resolved.decoded_ready);
 }

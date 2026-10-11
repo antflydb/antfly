@@ -22,6 +22,41 @@ pub const max_keys_per_read = 4096;
 pub const max_key_bytes_per_read = 1024 * 1024;
 pub const Stats = struct { keys: usize = 0, batches: usize = 0 };
 
+pub const PreparedRequest = @import("../storage/prepared_score_request.zig").PreparedScoreRequest;
+
+/// Reuse explicitly owned input identity. Resolve freshness before selecting
+/// the request: its physical generation prefixes do not track policy changes.
+/// Existing mutable-input callers keep populate(); unsupported backends retain
+/// its bounded streaming fallback.
+pub fn populatePrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, columns: []const []?f64) !Stats {
+    const plan = request.plan();
+    if (!plan.valid) return error.InvalidBatch;
+    if (columns.len != plan.prefixes.len) return error.InvalidBatch;
+    for (columns) |column| if (column.len != plan.nodes.len) return error.InvalidBatch;
+    errdefer for (columns) |column| @memset(column, null);
+    const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
+    if (scoped) {
+        var scope = txn.openReadScope(caller_alloc) catch |err| switch (@as(anyerror, err)) {
+            error.ReadOnly, error.Unsupported => return populate(caller_alloc, txn, plan.prefixes, plan.nodes, columns),
+            else => return err,
+        };
+        defer scope.close();
+        const Scope = @TypeOf(scope);
+        if (comptime @hasDecl(Scope, "visitPreparedRequest")) {
+            const supported = if (comptime @hasDecl(Scope, "supportsPreparedRequest")) scope.supportsPreparedRequest() else true;
+            if (supported) {
+                for (columns, plan.prefixes) |column, prefix| if (prefix == null) {
+                    @memset(column, null);
+                };
+                var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+                try scope.visitPreparedRequest(request, output.completeSink());
+                return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1 };
+            }
+        }
+    }
+    return populate(caller_alloc, txn, plan.prefixes, plan.nodes, columns);
+}
+
 pub fn populate(
     caller_alloc: std.mem.Allocator,
     txn: anytype,
