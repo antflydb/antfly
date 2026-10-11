@@ -29,7 +29,7 @@ pub fn groupFromKey(key: []const u8) !?u64 {
     var parts = std.mem.splitScalar(u8, key[prefix.len..], ':');
     const kind = parts.next() orelse return error.InvalidCatalogRecord;
     if (!std.mem.eql(u8, kind, "plan") and !std.mem.eql(u8, kind, "head") and
-        !std.mem.eql(u8, kind, "active") and !std.mem.eql(u8, kind, "owner")) return error.InvalidCatalogRecord;
+        !std.mem.eql(u8, kind, "active") and !std.mem.eql(u8, kind, "owner") and !std.mem.eql(u8, kind, "group")) return error.InvalidCatalogRecord;
     const number = parts.next() orelse return error.InvalidCatalogRecord;
     const group = std.fmt.parseInt(u64, number, 10) catch return error.InvalidCatalogRecord;
     var buf: [20]u8 = undefined;
@@ -41,6 +41,8 @@ pub fn groupFromKey(key: []const u8) !?u64 {
         const value = std.fmt.parseInt(u16, ordinal, 16) catch return error.InvalidCatalogRecord;
         var ordinal_buf: [4]u8 = undefined;
         if (value >= progress.max_owners or !std.mem.eql(u8, ordinal, try std.fmt.bufPrint(&ordinal_buf, "{x:0>4}", .{value}))) return error.InvalidCatalogRecord;
+    } else if (std.mem.eql(u8, kind, "group")) {
+        _ = try tableSuffix(parts.next() orelse return error.InvalidCatalogRecord);
     }
     if (parts.next() != null) return error.InvalidCatalogRecord;
     return group;
@@ -57,6 +59,24 @@ pub fn headPrefix(buf: []u8, group: u64) ![]const u8 {
 }
 pub fn ownersPrefix(buf: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}owner:{d}:", .{ prefix, group });
+}
+pub fn ownerGroupsPrefix(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}group:{d}:", .{ prefix, group });
+}
+pub fn ownerGroupKey(buf: []u8, group: u64, table: u64, owner_group: u64) ![]const u8 {
+    if (table == 0 or owner_group == 0) return error.InvalidCatalogRecord;
+    return std.fmt.bufPrint(buf, "{s}group:{d}:{x:0>16}:{x:0>16}", .{ prefix, group, table, owner_group });
+}
+
+/// Fixed-size point directory, shared by owner dispatch and reverse cohort
+/// verification. It is not a namespace source or independent job authority.
+pub fn ownerOrdinal(reader: anytype, group: u64, table: u64, owner_group: u64) !u16 {
+    var buf: [160]u8 = undefined;
+    const bytes = try reader.get(try ownerGroupKey(&buf, group, table, owner_group));
+    if (bytes.len != 2) return error.InvalidCatalogRecord;
+    const ordinal = std.mem.readInt(u16, bytes[0..2], .big);
+    if (ordinal >= progress.max_owners) return error.InvalidCatalogRecord;
+    return ordinal;
 }
 pub fn planKey(buf: []u8, group: u64, table: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}plan:{d}:{x:0>16}", .{ prefix, group, table });
@@ -318,23 +338,39 @@ pub const Prepared = struct {
             else => return err,
         };
         var old_count: u16 = 0;
+        var old_id: Id = @splat(0);
         if (expected_head) |expected| {
             if (prior_bytes == null or !std.mem.eql(u8, prior_bytes.?, &expected)) return error.GenerationPublicationChanged;
             const prior = try progress.Head.decode(&expected);
             if (prior.table_id != self.head.table_id or (prior.phase != .published and prior.phase != .canceled) or
                 std.mem.eql(u8, &prior.plan_id, &self.head.plan_id)) return error.GenerationPublicationChanged;
             old_count = prior.owner_count;
+            old_id = prior.plan_id;
         } else {
             if (prior_bytes != null) return error.GenerationPublicationChanged;
             if (try optionalGet(txn, try planKey(&buf, group, self.head.table_id)) != null) return error.InvalidCatalogRecord;
             const owner_prefix = try std.fmt.bufPrint(&buf, "{s}owner:{d}:{x:0>16}:", .{ prefix, group, self.head.table_id });
             if (try txn.hasPrefix(owner_prefix)) return error.InvalidCatalogRecord;
+            const group_prefix = try std.fmt.bufPrint(&buf, "{s}group:{d}:{x:0>16}:", .{ prefix, group, self.head.table_id });
+            if (try txn.hasPrefix(group_prefix)) return error.InvalidCatalogRecord;
         }
         if (try optionalGet(txn, try activeKey(&buf, group, self.head.table_id)) != null) return error.GenerationPublicationChanged;
         try lifecycle.acquire(txn, group, self.head.table_id, .{ .kind = .index_build, .id = self.head.plan_id });
+        // Remove the predecessor's group directory before overwriting ordinal
+        // rows. Its cohort may have changed completely during terminal DDL.
+        for (0..old_count) |i| {
+            const old = try progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, self.head.table_id, @intCast(i))));
+            if (old.owner.ordinal != i or !std.mem.eql(u8, &old.owner.plan_id, &old_id)) return error.InvalidCatalogRecord;
+            try txn.delete(try ownerGroupKey(&buf, group, self.head.table_id, old.owner.group_id));
+        }
         try txn.put(try planKey(&buf, group, self.head.table_id), self.frame);
         try txn.put(try headKey(&buf, group, self.head.table_id), &try self.head.encode());
-        for (self.owners, 0..) |owner, i| try txn.put(try ownerKey(&buf, group, self.head.table_id, @intCast(i)), &try owner.encode());
+        for (self.owners, 0..) |owner, i| {
+            try txn.put(try ownerKey(&buf, group, self.head.table_id, @intCast(i)), &try owner.encode());
+            var ordinal: [2]u8 = undefined;
+            std.mem.writeInt(u16, &ordinal, @intCast(i), .big);
+            try txn.put(try ownerGroupKey(&buf, group, self.head.table_id, owner.owner.group_id), &ordinal);
+        }
         for (self.owners.len..@max(self.owners.len, old_count)) |i| try txn.delete(try ownerKey(&buf, group, self.head.table_id, @intCast(i)));
         try txn.put(try activeKey(&buf, group, self.head.table_id), &self.head.plan_id);
     }
@@ -361,7 +397,12 @@ pub fn deleteTerminal(txn: anytype, group: u64, table: u64) !bool {
     const head = try progress.Head.decode(bytes);
     if (head.table_id != table or (head.phase != .published and head.phase != .canceled) or
         try optionalGet(txn, try activeKey(&buf, group, table)) != null) return error.GenerationPublicationChanged;
-    for (0..head.owner_count) |i| try txn.delete(try ownerKey(&buf, group, table, @intCast(i)));
+    for (0..head.owner_count) |i| {
+        const owner = try progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i))));
+        if (owner.owner.ordinal != i or !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id)) return error.InvalidCatalogRecord;
+        try txn.delete(try ownerGroupKey(&buf, group, table, owner.owner.group_id));
+        try txn.delete(try ownerKey(&buf, group, table, @intCast(i)));
+    }
     try txn.delete(try headKey(&buf, group, table));
     try txn.delete(try planKey(&buf, group, table));
     return true;
@@ -415,6 +456,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
     for (prepared.owners, 0..) |expected, i| {
         const owner = progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i)))) catch return error.InvalidCatalogRecord;
         if (!std.meta.eql(owner.owner, expected.owner)) return error.InvalidCatalogRecord;
+        if (try ownerOrdinal(txn, group, table, owner.owner.group_id) != i) return error.InvalidCatalogRecord;
         for (&counts, 0..) |*count, flag| if (owner.flags & (@as(u8, 1) << @as(u3, @intCast(flag))) != 0) {
             count.* += 1;
         };
@@ -440,13 +482,14 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
 
 test "relational index publication durable keys are canonical group scoped and exclude owner progress from namespace sources" {
     var buf: [160]u8 = undefined;
-    const Kind = enum { plan, active, head, owner };
+    const Kind = enum { plan, active, head, owner, group };
     inline for (std.meta.tags(Kind)) |kind| {
         const key = switch (kind) {
             .plan => try planKey(&buf, 13, 101),
             .active => try activeKey(&buf, 13, 101),
             .head => try headKey(&buf, 13, 101),
             .owner => try ownerKey(&buf, 13, 101, 0),
+            .group => try ownerGroupKey(&buf, 13, 101, 301),
         };
         try std.testing.expectEqual(@as(?u64, 13), try groupFromKey(key));
         try std.testing.expectEqual(null, try sourceKey(key, 14));
@@ -455,7 +498,8 @@ test "relational index publication durable keys are canonical group scoped and e
     for ([_][]const u8{
         "plan:013:0000000000000065",        "plan:13:00000000000000Af",       "plan:13:0000000000000000",
         "head:0:0000000000000065",          "owner:13:0000000000000065:1000", "owner:13:0000000000000065:000A",
-        "active:13:0000000000000065:extra", "unknown:13:0000000000000065",
+        "active:13:0000000000000065:extra", "unknown:13:0000000000000065",    "group:13:0000000000000065:0000000000000000",
+        "group:13:0000000000000065:000A",
     }) |suffix| {
         const key = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
         try std.testing.expectError(error.InvalidCatalogRecord, groupFromKey(key));

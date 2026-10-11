@@ -4036,6 +4036,35 @@ test "initial child root receipt requires enrollment current reporter and exact 
     }
 }
 
+test "relational index publication range enumeration stops before excess allocation or unbounded scanning" {
+    const Cursor = struct {
+        visits: usize = 0,
+        fail: bool = false,
+        const Row = struct { key: []const u8, value: []const u8 };
+        fn seekAtOrAfter(self: *@This(), _: []const u8) !?Row {
+            if (self.fail) return error.StorageReadFailed;
+            self.visits = 1;
+            return .{ .key = "range:1", .value = &.{ 7, 0, 0, 0, 0, 0, 0, 0 } };
+        }
+        fn next(self: *@This()) !?Row {
+            self.visits += 1;
+            return if (self.visits == 2) .{ .key = "range:2", .value = &.{ 8, 0, 0, 0, 0, 0, 0, 0 } } else null;
+        }
+    };
+    var cursor: Cursor = .{};
+    try std.testing.expectError(error.GenerationPublicationChanged, readTableRangeIdsBounded(std.testing.failing_allocator, &cursor, "range:", 0));
+    try std.testing.expectEqual(@as(usize, 1), cursor.visits);
+    cursor = .{};
+    try std.testing.expectError(error.GenerationPublicationChanged, readTableRangeIdsBounded(std.testing.allocator, &cursor, "range:", 1));
+    try std.testing.expectEqual(@as(usize, 2), cursor.visits);
+    cursor = .{};
+    const ids = try readTableRangeIdsBounded(std.testing.allocator, &cursor, "range:", 2);
+    defer std.testing.allocator.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, ids);
+    cursor = .{ .fail = true };
+    try std.testing.expectError(error.StorageReadFailed, readTableRangeIdsBounded(std.testing.failing_allocator, &cursor, "range:", 0));
+}
+
 test "relational index publication admission reserves names atomically and survives recovery with fault verification" {
     const a = std.testing.allocator;
     const group = group_ids.main_metadata_group_id;
@@ -4160,7 +4189,7 @@ test "relational index publication admission reserves names atomically and survi
             defer metadata_table_manager.freeTable(a, current);
             try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(current, plan.before));
         }
-        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted };
+        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory };
         inline for (std.meta.tags(Fault)) |fault| {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -4210,6 +4239,9 @@ test "relational index publication admission reserves names atomically and survi
                     defer a.free(encoded);
                     try txn.put(try rangeKeyForGroup(&buf, group, changed.group_id), encoded);
                 },
+                .directory_missing => try txn.delete(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, plan.owners[0].range.group_id)),
+                .directory_substituted => try txn.put(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, plan.owners[0].range.group_id), &.{ 0, 1 }),
+                .extra_directory => try txn.put(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, 999), &.{ 0, 0 }),
             }
             try std.testing.expectError(error.InvalidMetadataHACheckpoint, verifyRelationCheckpointTxn(a, &txn));
             if (fault != .orphan_group and fault != .orphan_lock_group) {
@@ -4269,10 +4301,10 @@ test "relational index publication terminal replacement bounds owner retention a
         }
         try prepared.stageBegin(&txn, group, expected);
         _ = try index_publication.verifyJob(a, &txn, group, plan.before.table_id);
-        {
+        inline for (.{ index_publication.ownersPrefix, index_publication.ownerGroupsPrefix }) |prefix_fn| {
             var cursor = try txn.openCursor();
             defer cursor.close();
-            const prefix = try index_publication.ownersPrefix(&buf, group);
+            const prefix = try prefix_fn(&buf, group);
             var row = try cursor.seekAtOrAfter(prefix);
             var count: usize = 0;
             while (row) |item| : (row = try cursor.next()) {
@@ -4322,7 +4354,7 @@ test "relational index publication terminal replacement bounds owner retention a
     try std.testing.expectEqual(index_progress.Phase.canceled, retained.phase);
     try std.testing.expect(try index_publication.deleteTerminal(&txn, group, single.before.table_id));
     try std.testing.expect(!try index_publication.deleteTerminal(&txn, group, single.before.table_id));
-    inline for (.{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix }) |prefix_fn| {
+    inline for (.{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix, index_publication.ownerGroupsPrefix }) |prefix_fn| {
         try std.testing.expect(!try txn.hasPrefix(try prefix_fn(&buf, group)));
     }
 }
@@ -13879,7 +13911,7 @@ pub const RaftApplyStore = struct {
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected) or
             (try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return error.GenerationPublicationChanged;
-        const ids = try self.indexedTableRangeIdsTxn(self.alloc, txn, group_id, expected.table_id);
+        const ids = try self.indexedTableRangeIdsBoundedTxn(self.alloc, txn, group_id, expected.table_id, ranges.len);
         defer self.alloc.free(ids);
         if (ids.len != ranges.len) return error.GenerationPublicationChanged;
         // Compare membership as well as cardinality. Sort the already-owned
@@ -18757,6 +18789,7 @@ pub const RaftApplyStore = struct {
         index_publication_active,
         index_publication_head,
         index_publication_owner,
+        index_publication_owner_group,
         fk_generation_work,
         fk_generation_table_lock,
         fk_initial_create,
@@ -18827,6 +18860,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .index_publication_active, .key = .{ .prefix = index_publication.activePrefix } },
         .{ .projection = .index_publication_head, .key = .{ .prefix = index_publication.headPrefix } },
         .{ .projection = .index_publication_owner, .key = .{ .prefix = index_publication.ownersPrefix } },
+        .{ .projection = .index_publication_owner_group, .key = .{ .prefix = index_publication.ownerGroupsPrefix } },
         .{ .projection = .fk_generation_work, .key = .{ .prefix = fk_generation_publication.workPrefixForGroup } },
         .{ .projection = .fk_generation_table_lock, .key = .{ .prefix = fk_generation_publication.tableLockPrefix } },
         .{ .projection = .fk_initial_create, .key = .{ .prefix = fk_generation_publication.initialPrefixForGroup } },
@@ -18858,7 +18892,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
-            .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
+            .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -18931,7 +18965,7 @@ pub const RaftApplyStore = struct {
         };
         // Table publication and DROP update lifecycle roots in the same cut.
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
-            mask | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
+            mask | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
         else
@@ -22206,20 +22240,23 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_id: u64,
     ) ![]u64 {
+        return self.indexedTableRangeIdsBoundedTxn(alloc, txn, group_id, table_id, std.math.maxInt(usize));
+    }
+
+    fn indexedTableRangeIdsBoundedTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        limit: usize,
+    ) ![]u64 {
         _ = self;
         var prefix_buf: [192]u8 = undefined;
         const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
-        var ids = std.ArrayListUnmanaged(u64).empty;
-        errdefer ids.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
-        var entry = try cursor.seekAtOrAfter(prefix);
-        while (entry) |row| : (entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
-            try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
-        }
-        return try ids.toOwnedSlice(alloc);
+        return readTableRangeIdsBounded(alloc, &cursor, prefix, limit);
     }
 
     fn retireRangeRestoreProgressTxn(
@@ -30719,8 +30756,8 @@ fn verifyRelationClaims(registry: anytype, claims: []const relation_names.Claim)
 /// Shared only by verification of the new private index-job record classes.
 /// Snapshots without these records/index-build locks keep their existing path.
 const IndexPublicationVerification = struct {
-    expected: [4]usize = @splat(0),
-    received: [4]usize = @splat(0),
+    expected: [5]usize = @splat(0),
+    received: [5]usize = @splat(0),
     has_records: bool = false,
 
     fn verifyTableCut(a: std.mem.Allocator, reader: anytype, group: u64, id: u64) !index_progress.Head {
@@ -30764,6 +30801,7 @@ const IndexPublicationVerification = struct {
                         else => 1,
                     };
                     self.expected[2] = std.math.add(usize, self.expected[2], head.owner_count) catch return error.InvalidCatalogRecord;
+                    self.expected[4] = std.math.add(usize, self.expected[4], head.owner_count) catch return error.InvalidCatalogRecord;
                     self.expected[3] += if (head.phase == .published or head.phase == .canceled) @as(usize, 0) else 1;
                     return;
                 },
@@ -30772,7 +30810,7 @@ const IndexPublicationVerification = struct {
                     return;
                 },
             };
-            if (std.mem.startsWith(u8, key, try index_publication.headPrefix(&buf, group))) self.received[0] += 1 else if (std.mem.startsWith(u8, key, try index_publication.ownersPrefix(&buf, group))) self.received[2] += 1 else return error.InvalidCatalogRecord;
+            if (std.mem.startsWith(u8, key, try index_publication.headPrefix(&buf, group))) self.received[0] += 1 else if (std.mem.startsWith(u8, key, try index_publication.ownersPrefix(&buf, group))) self.received[2] += 1 else if (std.mem.startsWith(u8, key, try index_publication.ownerGroupsPrefix(&buf, group))) self.received[4] += 1 else return error.InvalidCatalogRecord;
         } else if (std.mem.startsWith(u8, key, @import("../table_lifecycle_lock.zig").allGroupsPrefix())) {
             const lifecycle = @import("../table_lifecycle_lock.zig");
             const lock = lifecycle.Lock.decode(value) catch return error.InvalidCatalogRecord;
@@ -30794,7 +30832,7 @@ fn verifyIndexPublicationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocSt
     // Forward verification point-reads every required row. Equal reverse counts
     // then exclude extras/orphans without retaining all jobs in a hash table.
     var verification: IndexPublicationVerification = .{};
-    const fns = .{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix, fk_generation_publication.tableLockPrefix };
+    const fns = .{ index_publication.planPrefix, index_publication.headPrefix, index_publication.activePrefix, index_publication.ownersPrefix, index_publication.ownerGroupsPrefix, fk_generation_publication.tableLockPrefix };
     inline for (fns) |prefix_fn| {
         const owned = try prefix_fn(&buf, group_id);
         var row = try cursor.seekAtOrAfter(owned);
@@ -31243,6 +31281,21 @@ fn tableNameIndexKey(buf: []u8, group_id: u64, table_name: []const u8) ![]const 
         "\x00\x00__metadata_derived__:table_name:{d}:{d}:{s}",
         .{ group_id, table_name.len, table_name },
     );
+}
+
+/// Admission reads at most the expected cohort plus one rejecting row. The
+/// legacy full-enumeration caller explicitly supplies an unlimited bound.
+fn readTableRangeIdsBounded(alloc: std.mem.Allocator, cursor: anytype, prefix: []const u8, limit: usize) ![]u64 {
+    var ids = std.ArrayListUnmanaged(u64).empty;
+    errdefer ids.deinit(alloc);
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+        if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+        if (ids.items.len == limit) return error.GenerationPublicationChanged;
+        try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
+    }
+    return try ids.toOwnedSlice(alloc);
 }
 
 fn tableRangeIndexPrefixForTable(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {

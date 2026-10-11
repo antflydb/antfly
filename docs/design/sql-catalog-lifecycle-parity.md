@@ -1355,10 +1355,31 @@ Remaining activation work is still substantial: independently attested native
 owner capability/catalog/epoch admission, private projected builders, globally
 coordinated UNIQUE claims, authenticated owner receipts, the durable worker and
 publication/cancellation continuations, and the public SQL producer.
-Admission range-ID enumeration should also gain an early streaming bound for
-oversized/stale current cohorts before allocating their complete ID list;
-independent recovery proof of the complete current range cohort and live
+Independent recovery proof of the complete current range cohort and live
 namespace/incarnation bindings needs qualification before producer activation.
 The known regular `CREATE UNIQUE INDEX` atomicity regression remains open; this checkpoint
 does not credit any of the original 899 unresolved inventory cases or claim
 distributed build throughput, complete DDL churn qualification or public parity.
+
+### Bounded admission and owner lookup
+
+Admission now stops range-ID enumeration after the expected cohort plus one
+rejecting row, bounding allocation by the submitted cohort rather than a stale
+table's complete current range list. A failing-allocator regression proves that
+an empty expected cohort rejects its first row without allocation; cursor read
+failures remain visible.
+
+Private index jobs now persist a group-to-owner-ordinal directory in the same
+transaction as their plan and owner records. Dispatch can resolve an owner with
+a fixed-size point read without reparsing the plan. Snapshot/checkpoint
+verification checks every expected mapping and rejects missing, substituted or
+extra directory records. Terminal replacement and deletion remove old mappings;
+the 32-attempt retention test checks both owner and directory cardinalities.
+These records are not independent authority or namespace-clock sources.
+
+Debug and ReleaseFast qualification pass nine publication tests, one decoder-floor test and
+fifty namespace/recovery tests, with no skips, failures or leaks. The recovery
+fault set now includes seventeen variants. Reverse verification of *all* live
+ranges, native owner activation and the public SQL atomicity fix remain separate
+unfinished work; this checkpoint does not claim those capabilities or inventory
+credits.
