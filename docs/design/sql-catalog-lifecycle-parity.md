@@ -2618,3 +2618,65 @@ This is not automatic scheduling, authenticated cancellation dispatch, a final
 completion cut, global UNIQUE-claim/manifest/job retirement or epoch release.
 Those paths and their distributed fault evidence remain unfinished, the public
 producer stays disabled, and no original SQL case receives credit here.
+
+### Private UNIQUE claim retirement: generation ownership, not a global scan
+
+Cancellation queue admission retains the exact burned UNIQUE allocation in a
+canonical checksummed cleanup record. Its generation is derived from the table
+incarnation and allocation; it is not an incoming constraint name or tuple hash.
+Admission and recovery independently verify the exact reserved catalog digest,
+active owner job and source fence. This is retained scope, not deletion authority.
+
+The existing integrity claim key orders kind, routing hash, generation and tuple
+hash. Consequently, seeking a generation prefix cannot enumerate its claims.
+The physical index's forward/ownership GC proves only artifact retirement and
+must never be treated as proof of distributed UNIQUE retirement.
+
+The remaining implementation must satisfy these invariants:
+
+- Maintain a generation-owned inventory on each actual hash owner. Insert/remove
+  inventory entries in the same transaction as claim changes, with exact claim
+  identity checks. Normal replay and recovery/restore must preserve or strictly
+  reconstruct this invariant; an unexplained missing inventory is not emptiness.
+- Freeze the complete hash-owner cohort under independently read metadata
+  permission. A row-owner cancellation fence does not fence those hash owners.
+  Bind each retirement acknowledgement to the exact generation, plan, owner
+  incarnation/root and durable source cut; neither cardinality nor a source
+  owner's physical GC result proves coverage.
+- Persist retirement before deletion and check it both when preparing claim
+  effects and in the committing transaction. This must reject delayed prepared
+  establishes, replayed worker requests and duplicate deliveries after GC, while
+  retaining ordinary transaction-log replay semantics.
+- Traverse only the selected generation inventory using durable, CAS-protected,
+  bounded continuations. Validate companion records before deleting; unexpected
+  FK references or action jobs cannot be silently discarded. Keep unrelated
+  generations and their admission independent.
+- Retire immutable inputs, private binding and manifests only after all required
+  owner proofs are durable. Persist a final cancellation cut before reporting
+  completion. Epoch release is a separate coordinated phase, never an implicit
+  consequence of an empty artifact queue or elapsed time.
+- Exercise lost replies, committed mirror failures, duplicate/gapped replay,
+  owner/root replacement, late claim writes, incomplete cohort acknowledgements,
+  concurrent independent generations and interrupted restore under real owner
+  storage. Component fixtures do not replace authenticated distributed faults.
+
+These retirement and activation requirements are still open. The public native
+index producer remains disabled; no original SQL case is credited by the scope
+record or this design.
+
+Qualification checkpoints (no additional original-case credit):
+
+- `69d6f7a368`, including main through `1258e8cfcb`, passed all 120 Debug build
+  steps and 63 targeted test executions: owner C-API, catalog, physical pages,
+  publication/decoder floor, private candidates and the actual leased owner.
+- `c9cd67660b` passed all 117 Debug build steps and 49 test executions for the
+  retained scope implementation, including memory/LSM recovery, native standby
+  replay, cleanup and compiled-owner inspection. Its separate catalog selection
+  passed all 40 build steps and 14 test executions.
+- `16637b7ba6` passed all 65 Debug build steps and 50 test executions for catalog,
+  candidates and publication/receiver contracts. These add malformed/trailing
+  records, zero/missing/orphaned scope values, checksum/incarnation mismatch and
+  allocation counter boundaries. The Apache boundary check passed 2,033 source
+  files. These overlapping selections are not a full suite or distributed gate.
+
+The combined main-merged checkpoint still requires its own qualification.

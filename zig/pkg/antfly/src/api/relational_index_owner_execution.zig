@@ -487,6 +487,16 @@ test "relational index publication native cancellation receiver resumes one boun
     try std.testing.expectEqual(inspections + 1, driver.inspections);
     try std.testing.expectEqual(@as(usize, 2), driver.gc_pages);
     driver.cancel_state.?.source.sequence = 7;
+    driver.cancel_state.?.claim_allocation = null;
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    driver.cancel_state.?.claim_allocation = 0;
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    driver.cancel_state.?.claim_allocation = 1;
+    const cleanup_cut = driver.cancel_state.?.cleanup;
+    driver.cancel_state.?.cleanup = null;
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    driver.cancel_state.?.cleanup = cleanup_cut;
+    try std.testing.expectEqual(@as(usize, 2), driver.gc_pages);
     driver.cancel_state.?.intent.?.intent.owner_digest[0] ^= 1;
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
 
