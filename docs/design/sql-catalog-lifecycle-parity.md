@@ -2838,7 +2838,11 @@ foreign-owner rejection and cancellation/deadline checks before acquisition.
 No skips, failures or leaks occurred. The independent PostgreSQL lifecycle
 oracle passed all sixteen tests; the original inventory audit, selected Zig
 formatting, control-catalog freshness and Apache source-boundary checks pass.
-The broader claim-delivery storage gate is still running at this checkpoint.
+The broader frozen-source gate at `7873b6c95d` also passed: 127/127 Debug
+build steps and 61 targeted executions (six compiled-owner C API, one decoder
+floor, twenty-one publication, thirteen candidate, two transfer, three leased
+owner and fifteen retained-effects tests), with zero skips, failures or leaks.
+These overlapping selections are not a full-suite or distributed-fault gate.
 
 Public native claim production remains disabled. Authenticated mounted delivery,
 root enrollment/signing/capability barriers, complete activation and retirement,
