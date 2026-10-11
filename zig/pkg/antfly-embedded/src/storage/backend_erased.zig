@@ -146,8 +146,9 @@ fn allocBox(allocator: Allocator, value: anytype) !*Box(@TypeOf(value)) {
 
 fn allocParentBox(allocator: Allocator, value: anytype) !*ParentBox(@TypeOf(value)) {
     const T = @TypeOf(value);
-    const box = try allocator.create(ParentBox(T));
-    box.* = .{ .allocator = allocator, .handle = value };
+    const a = if (@hasDecl(T, "metadataAllocator")) value.metadataAllocator(allocator) else allocator;
+    const box = try a.create(ParentBox(T));
+    box.* = .{ .allocator = a, .handle = value };
     return box;
 }
 
@@ -240,8 +241,26 @@ pub const ReadScope = struct {
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
         get_many_sorted_into: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8) anyerror!void = null,
+        visit_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, backend_types.ScoreSink) anyerror!void = null,
+        working_allocator: ?*const fn (*anyopaque) Allocator = null,
+        prepared_score_plan: ?*const fn (*anyopaque) ?*@import("prepared_score_plan.zig").PreparedScorePlan = null,
+        prepared_score_allocator: ?*const fn (*anyopaque) Allocator = null,
+        visit_prepared_scores: ?*const fn (*anyopaque, *@import("prepared_score_plan.zig").PreparedScorePlan, backend_types.CompleteScoreSink) anyerror!void = null,
+        get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
+    pub fn preparedScorePlan(self: *@This()) ?*@import("prepared_score_plan.zig").PreparedScorePlan {
+        return if (self.vtable.prepared_score_plan) |get_plan| get_plan(self.ptr) else null;
+    }
+    pub fn preparedScoreAllocator(self: *@This()) Allocator {
+        return self.vtable.prepared_score_allocator.?(self.ptr);
+    }
+    pub fn supportsPreparedScores(self: *const @This()) bool {
+        return self.vtable.visit_prepared_scores != null;
+    }
+    pub fn visitPreparedScores(self: *@This(), plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
+        return (self.vtable.visit_prepared_scores orelse return error.Unsupported)(self.ptr, plan, sink);
+    }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return self.vtable.get(self.ptr, key);
     }
@@ -268,6 +287,32 @@ pub const ReadScope = struct {
             else => return err,
         };
     }
+    /// True only when the backend implements direct batch delivery.
+    pub fn supportsDirectBatchInto(self: *const @This()) bool {
+        return self.vtable.get_many_sorted_into != null;
+    }
+
+    pub fn workingAllocator(self: *@This()) Allocator {
+        return if (self.vtable.working_allocator) |working| working(self.ptr) else self.allocator;
+    }
+    pub fn supportsScoreVisitor(self: *const @This()) bool {
+        return self.vtable.visit_many_sorted_scores != null;
+    }
+    pub fn visitManySortedScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
+        const visit = self.vtable.visit_many_sorted_scores orelse return error.Unsupported;
+        return visit(self.ptr, keys, sink);
+    }
+    pub fn supportsDirectScores(self: *const @This()) bool {
+        return self.vtable.get_many_sorted_scores != null;
+    }
+    pub fn getManySortedScores(self: *@This(), keys: []const []const u8, scores: []?f64) !void {
+        if (keys.len != scores.len) return error.InvalidBatch;
+        @memset(scores, null);
+        errdefer @memset(scores, null);
+        const read = self.vtable.get_many_sorted_scores orelse return error.Unsupported;
+        return read(self.ptr, keys, scores);
+    }
+
     /// Slices belong to caller buffers, independently of reset or close.
     /// Output buffers must not overlap each other or the input keys.
     /// Contents may be partially written on errors; result slots are cleared.
@@ -305,9 +350,12 @@ pub fn readScopeFrom(alloc: Allocator, handle: anytype) !ReadScope {
 }
 
 fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRelease) !ReadScope {
+    const pooled_metadata = @hasDecl(@TypeOf(handle), "metadataAllocator");
+    const Receipt = @import("resource_manager.zig").BudgetedAllocator.BorrowedScratch;
     const State = struct {
         handle: @TypeOf(handle),
         parent: ?ParentRelease,
+        admission: if (pooled_metadata) ?Receipt else void,
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.get(key);
@@ -319,6 +367,30 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
         fn getManySortedInto(ptr: *anyopaque, keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySortedInto(keys, buffers, values);
+        }
+        fn visitManySortedScores(ptr: *anyopaque, keys: []const []const u8, sink: backend_types.ScoreSink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.visitManySortedScores(keys, sink);
+        }
+        fn visitPreparedScores(ptr: *anyopaque, plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.visitPreparedScores(plan, sink);
+        }
+        fn preparedScorePlan(ptr: *anyopaque) ?*@import("prepared_score_plan.zig").PreparedScorePlan {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.preparedScorePlan();
+        }
+        fn preparedScoreAllocator(ptr: *anyopaque) Allocator {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.preparedScoreAllocator();
+        }
+        fn workingAllocator(ptr: *anyopaque) Allocator {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.workingAllocator();
+        }
+        fn getManySortedScores(ptr: *anyopaque, keys: []const []const u8, scores: []?f64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySortedScores(keys, scores);
         }
         fn getInto(ptr: *anyopaque, key: []const u8, out: []u8) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -332,14 +404,31 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
 
         fn close(a: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            const parent_owner = self.parent;
+            var admission = self.admission;
             self.handle.close();
-            if (self.parent) |owner| owner.release(owner.ptr);
+            // Destroy store-owned wrapper before dropping its last snapshot pin.
             a.destroy(self);
+            if (pooled_metadata) {
+                if (admission) |*receipt| receipt.release();
+            }
+            if (parent_owner) |owner| owner.release(owner.ptr);
         }
     };
-    const state = try alloc.create(State);
-    state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    const a = if (@hasDecl(@TypeOf(handle), "metadataAllocator")) handle.metadataAllocator(alloc) else alloc;
+    var admission: @FieldType(State, "admission") = if (pooled_metadata) null else {};
+    if (pooled_metadata and (a.ptr != alloc.ptr or a.vtable != alloc.vtable)) {
+        if (@import("resource_manager.zig").BudgetedAllocator.fromAllocator(alloc)) |budget| {
+            const resident = if (@hasDecl(@TypeOf(handle), "metadataResidentManager")) handle.metadataResidentManager() else null;
+            admission = try budget.borrowResidentScratch(@sizeOf(State), resident);
+        }
+    }
+    errdefer if (pooled_metadata) {
+        if (admission) |*receipt| receipt.release();
+    };
+    const state = try a.create(State);
+    state.* = .{ .handle = handle, .parent = parent, .admission = admission };
+    return .{ .allocator = a, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .visit_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "visitManySortedScores")) State.visitManySortedScores else null, .working_allocator = if (@hasDecl(@TypeOf(handle), "workingAllocator")) State.workingAllocator else null, .prepared_score_plan = if (@hasDecl(@TypeOf(handle), "preparedScorePlan")) State.preparedScorePlan else null, .prepared_score_allocator = if (@hasDecl(@TypeOf(handle), "preparedScoreAllocator")) State.preparedScoreAllocator else null, .visit_prepared_scores = if (@hasDecl(@TypeOf(handle), "visitPreparedScores")) State.visitPreparedScores else null, .get_many_sorted_scores = if (@hasDecl(@TypeOf(handle), "getManySortedScores")) State.getManySortedScores else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
