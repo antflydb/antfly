@@ -94,10 +94,7 @@ pub fn execute(
             // accounting. This also retains native readonly-backend handling.
             direct = direct.forGroup(direct.cover[0].group_id) catch |err| return fail(err, .validate_request, out_failure);
         }
-        retained = live_db.openQueryCut(direct, requestCancellationToken(request)) catch |err| {
-            std.log.warn("retained native query open failed kind={s} create={} err={s}", .{ @tagName(request.kind), direct.create, @errorName(err) });
-            return fail(err, .validate_request, out_failure);
-        };
+        retained = live_db.openQueryCut(direct, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
     };
     const db: *db_mod.DB = if (retained) |*cut| cut else live_db;
 
