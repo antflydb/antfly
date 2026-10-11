@@ -465,7 +465,21 @@ const Owner = struct {
         try capability.check();
         if (self.directory_ref == null) return .{ .value = self.directory };
         if (capability.cache) |cache| {
-            const owned = try decoded.acquire(Directory, cache, capability.store, self.directoryArtifact(), capability.cancellation, decodeDirectory);
+            const Guard = struct {
+                read: *const Read,
+                parent: local.serverless_query_lake_read_context.Context,
+                fn check(raw: *anyopaque) !void {
+                    const self_: *@This() = @ptrCast(@alignCast(raw));
+                    try self_.read.check();
+                    try self_.parent.ensureActive();
+                }
+            };
+            // Decode admission and singleflight waits check both the current
+            // capability and the cache context, even when their fences differ.
+            var guard: Guard = .{ .read = &capability, .parent = cache.context };
+            var scoped = cache;
+            scoped.context.checkpoint = .{ .ptr = &guard, .check = Guard.check };
+            const owned = try decoded.acquire(Directory, scoped, capability.store, self.directoryArtifact(), capability.cancellation, decodeDirectory);
             errdefer owned.release();
             if (owned.value.bytes != self.directory_bytes) return error.InvalidNativeLakeTextCorpus;
             try capability.check();
@@ -857,9 +871,9 @@ test "external lake seekable text loads touched postings and keeps exact scoring
             try std.testing.expectEqual(left.score, right.score);
         }
     }
-    var loaded_count: usize = 0;
-    for (owner.loaded) |loaded| loaded_count += @intFromBool(loaded);
-    try std.testing.expect(loaded_count != 0);
+    // Admitted owners retain no touched-block array or parsed directory.
+    // Exact result comparison above exercises actual required payload reads.
+    try std.testing.expectEqual(@as(usize, 0), owner.loaded.len);
     // Bound readers use the current query's store capability. A failed read
     // must leave shared navigation reusable by a later authorized query.
     var retry_writer = try local.index.IndexWriter.init(a);
@@ -886,7 +900,7 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     defer denied_snapshot.release();
     try std.testing.expectError(error.TestRemoteUnavailable, denied_snapshot.termDocFreq(a, "body", "alpha"));
     var denied_bytes: [4]u8 = undefined;
-    try std.testing.expectError(error.TestRemoteUnavailable, denied_snapshot.segments[0].query_source.?.readInto(0, &denied_bytes));
+    try std.testing.expectError(error.TestRemoteUnavailable, (try denied_snapshot.readSegment(0)).query_source.?.readInto(0, &denied_bytes));
     var authorized: Read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none };
     const authorized_snapshot = try retry_writer.acquireSnapshotWithReadContext(&authorized);
     defer authorized_snapshot.release();
@@ -1611,7 +1625,19 @@ test "external lake admitted directories evict independently of the corpus heap 
         defer pin.release();
         try std.testing.expectEqual(encoded.len, pin.value.bytes);
         try std.testing.expectEqual(@as(usize, 0), owner.directory.blocks.len);
-        if (i == 0) first = .{ .value = pin.value, .shared = .{ .lease = pin.shared.?.lease.retain(), .value = pin.shared.?.value } };
+        if (i == 0) {
+            first = .{ .value = pin.value, .shared = .{ .lease = pin.shared.?.lease.retain(), .value = pin.shared.?.value } };
+            var read = capability;
+            var query_source = try Owner.bind(owner, a, &read);
+            defer query_source.close();
+            query_source.prefetch(0, encoded.len);
+            const query: *Owner.Query = @ptrCast(@alignCast(query_source.ranges.ptr));
+            var worker_pins: usize = 0;
+            for (query.directory_pins) |worker| worker_pins += @intFromBool(worker != null);
+            try std.testing.expect(worker_pins != 0);
+            query.drain(false);
+            for (query.directory_pins) |worker| try std.testing.expect(worker == null);
+        }
         if (i == 1) {
             // The first directory stays readable while a second gets an
             // uncached lease under pinned pressure. Then it becomes evictable.

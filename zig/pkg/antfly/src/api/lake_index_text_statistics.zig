@@ -630,10 +630,13 @@ pub const Reader = struct {
         var read_context: SeekRead = .{ .reader = self, .budget = shared };
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &shared.remaining, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &read_context, .read = SeekRead.readPage } };
-        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+        var cache: tree.Cache = .{ .alloc = memory.allocator(), .underlying = pages.store() };
         defer cache.deinit();
         var i = lane;
         while (i < terms.len) : (i += lanes) {
+            // Routing pages survive; cursor/key/value scratch does not grow
+            // with the number of terms assigned to this lane.
+            _ = arena.reset(.free_all);
             const term = terms[i];
             const count = &output[i];
             const key = try keyAlloc(a, field, term);
@@ -655,10 +658,13 @@ pub const Reader = struct {
         var read_context: SeekRead = .{ .reader = self, .budget = shared };
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &shared.remaining, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &read_context, .read = SeekRead.readPage } };
-        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+        var cache: tree.Cache = .{ .alloc = memory.allocator(), .underlying = pages.store() };
         defer cache.deinit();
         var i = lane;
         while (i < terms.len) : (i += lanes) {
+            // Routing pages survive; cursor/key/value scratch does not grow
+            // with the number of terms assigned to this lane.
+            _ = arena.reset(.free_all);
             const term = terms[i];
             const result = &output[i];
             const key = try keyAlloc(a, field, term);

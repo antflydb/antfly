@@ -135,6 +135,8 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         partitions: ?*@import("partition_join.zig").Join = null,
         current_values: []const Datum = &.{},
         state_offsets: [2][]usize = .{ &.{}, &.{} },
+        side_inputs: [2][]usize = .{ &.{}, &.{} },
+        input_slots: [2][]usize = .{ &.{}, &.{} },
         current: ?operators.GroupResult = null,
         probe: ?operators.HashJoin.Probe = null,
         ordinal: u64 = 0,
@@ -155,11 +157,9 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         fn collect(self: *@This(), side: u1) !*operators.Grouped {
             const context = self.engine.context;
             const owned = self.arena.allocator();
-            const specs = try owned.alloc(operators.AggregateSpec, self.plan.inputs.len + 1);
+            const specs = try owned.alloc(operators.AggregateSpec, self.side_inputs[side].len + 1);
             specs[0] = .{ .kind = .count };
-            for (self.plan.inputs, self.plan.recipe.inputs, specs[1..]) |input, recipe, *spec| {
-                spec.* = if (input != null and input.?.side == side) recipe.spec else .{ .kind = .count };
-            }
+            for (self.side_inputs[side], specs[1..]) |input, *spec| spec.* = self.plan.recipe.inputs[input].spec;
             const grouped = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
             errdefer grouped.deinit();
             const child = if ((side == 0) != self.iterator.flipped_join) self.iterator.left.? else self.iterator.right.?;
@@ -181,9 +181,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 one[0] = Datum.json(.{ .integer = 1 });
                 const inputs = try temporary.alloc(Batch, specs.len);
                 @memset(inputs, .{ .dictionary = .{ .values = one, .indices = ones } });
-                for (self.plan.inputs, inputs[1..]) |input, *value| if (input) |origin| {
-                    if (origin.side == side) value.* = try source.project(temporary, origin.column);
-                };
+                for (self.side_inputs[side], inputs[1..]) |input, *value| value.* = try source.project(temporary, self.plan.inputs[input].?.column);
                 try grouped.addEncodedColumns(keys, inputs, batch.len());
             }
             return grouped;
@@ -194,7 +192,18 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.build_side = if (self.iterator.flipped_join) 0 else 1;
             for (0..2) |side_index| {
                 const side: u1 = @intCast(side_index);
-                self.state_offsets[side] = try self.arena.allocator().alloc(usize, self.plan.inputs.len + 1);
+                const owned = self.arena.allocator();
+                self.input_slots[side] = try owned.alloc(usize, self.plan.inputs.len);
+                @memset(self.input_slots[side], std.math.maxInt(usize));
+                var needed: std.ArrayList(usize) = .empty;
+                for (self.plan.inputs, 0..) |input, index| if (input) |origin| {
+                    if (origin.side == side) {
+                        self.input_slots[side][index] = needed.items.len + 1;
+                        try needed.append(owned, index);
+                    }
+                };
+                self.side_inputs[side] = try needed.toOwnedSlice(owned);
+                self.state_offsets[side] = try owned.alloc(usize, self.side_inputs[side].len + 1);
                 var offset = self.plan.keys[side].len;
                 for (self.state_offsets[side], 0..) |*entry, slot| {
                     entry.* = offset;
@@ -286,7 +295,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             return values;
         }
         fn stateSpec(self: *@This(), side: u1, slot: usize) operators.AggregateSpec {
-            return if (slot != 0 and self.plan.inputs[slot - 1] != null and self.plan.inputs[slot - 1].?.side == side) self.plan.recipe.inputs[slot - 1].spec else .{ .kind = .count };
+            return if (slot != 0) self.plan.recipe.inputs[self.side_inputs[side][slot - 1]].spec else .{ .kind = .count };
         }
         fn countAt(values: []const Datum, offset: usize) !u64 {
             if (offset >= values.len or values[offset].sql_null or values[offset].value != .integer) return error.InvalidSqlSpill;
@@ -327,7 +336,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             for (self.plan.output_keys, keys) |key, *value| value.* = try operators.cloneDatum(out, if (key.side == 0) left[key.index] else right[key.index]);
             const states = try out.alloc(operators.Aggregate, self.plan.inputs.len);
             for (self.plan.inputs, states, 0..) |input, *state, slot| {
-                state.* = if (input) |source| try self.stateAt(out, source.side, slot + 1, if (source.side == 0) left else right) else try operators.Aggregate.init(out, .count, null);
+                state.* = if (input) |source| try self.stateAt(out, source.side, self.input_slots[source.side][slot], if (source.side == 0) left else right) else try operators.Aggregate.init(out, .count, null);
                 if (input) |source| {
                     const multiple = if (source.side == 0) right_count else left_count;
                     state.count = std.math.mul(u64, state.count, multiple) catch return error.SqlNumericOutOfRange;

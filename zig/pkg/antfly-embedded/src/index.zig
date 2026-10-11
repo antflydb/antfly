@@ -2011,7 +2011,12 @@ pub const IndexWriter = struct {
     pub fn acquireSnapshotWithReadContext(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
         const facade = try self.acquireReadFacade(context);
         errdefer facade.release();
-        for (0..facade.segments.len) |i| _ = try facade.readSegment(i);
+        for (0..facade.segments.len) |i| {
+            const entry = try facade.readSegment(i);
+            if (entry.query_source) |source| {
+                if (source == .ranges and facade.read_context_io == null) facade.read_context_io = source.ranges.read_io;
+            }
+        }
         return facade;
     }
     pub const ReadCapability = struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void, io: ?std.Io = null };
