@@ -4281,6 +4281,8 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
     const Fixture = struct {
         db: *DB,
         barrier: *Barrier,
+        root: ?*Barrier.RootSharedLease = null,
+        rooted_cleanup_observations: usize = 0,
         transition: *std.atomic.Mutex,
         failure: ?Failure,
         closed: bool = false,
@@ -4298,6 +4300,11 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
         fn publish(mirror: contract.AsyncEffectMirror, kind: Outbox.Kind, payload: []const u8, _: doc_identity.Namespace) !u64 {
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
             // Appends still belong to the protected local commit/tail phase.
+            if (self.root) |root| {
+                try std.testing.expect(root.held);
+                try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+                try std.testing.expectEqual(@as(usize, 1), self.barrier.reader_count);
+            }
             if (self.barrier.tryAcquireExclusive()) |lease| {
                 var unexpected = lease;
                 unexpected.release();
@@ -4321,6 +4328,10 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
         fn complete(mirror: contract.AsyncEffectMirror, lsn: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
             try std.testing.expectEqual(self.expected_appends, self.appended);
+            if (self.root) |root| {
+                try std.testing.expect(!root.held);
+                try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            }
             try std.testing.expect(self.transition.tryLock());
             self.transition.unlock();
             try std.testing.expect(self.db.core.apply_mutex.tryLockShared());
@@ -4340,6 +4351,19 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
             if (self.failure == .fence_at_cleanup_apply and self.completed != 0) {
                 if (self.db.core.apply_mutex.tryLockShared()) self.db.core.apply_mutex.unlockShared() else self.closed = true;
             }
+            if (self.root) |root| {
+                if (self.completed != 0) {
+                    if (self.db.core.apply_mutex.tryLockShared()) {
+                        self.db.core.apply_mutex.unlockShared();
+                    } else {
+                        // Observe the actual deletion phase under apply. It
+                        // must use this invocation root rather than legacy TLS.
+                        try std.testing.expect(root.held);
+                        try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
+                        self.rooted_cleanup_observations += 1;
+                    }
+                }
+            }
             if (self.closed) return error.Forbidden;
         }
         fn publisher(self: *@This()) contract.Publisher {
@@ -4347,48 +4371,57 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
         }
     };
     const alloc = std.testing.allocator;
-    for ([_]Failure{ .replay_reply_loss, .fence_after_reply, .fence_at_cleanup_apply }) |failure| {
-        var directory = try TestDirectory.init("transaction-outbox-retirement");
-        defer directory.cleanup();
-        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
-        defer db.close();
-        const txn = try db.beginTransaction(1_000);
-        try db.commitTransaction(txn, 2_000);
-        const batch_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn);
-        const replay_key = transactions_mod.makeTransactionReplicationReplayOutboxKey(txn);
-        // Model durable obligations surviving a restart before notification.
-        // The real DB resolver must retire its reader on this no-intents retry.
-        try db.core.store.putBatch(&.{ .{ .key = &batch_key, .value = "batch-debt" }, .{ .key = &replay_key, .value = "replay-debt" } }, &.{});
-        var barrier: Barrier = .{};
-        var transition: std.atomic.Mutex = .unlocked;
-        var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .transition = &transition, .failure = failure };
-        const mirror: contract.AsyncEffectMirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier, .transition_mutex = &transition, .requirements = .{ .synchronous = true, .durable_outbox = true } };
-        db.local_execution.replication_async_batch_mirror = mirror;
-        db.local_execution.replication_async_effect_mirror = mirror;
-        db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
-        defer {
-            db.local_execution.replication_async_batch_mirror = null;
-            db.local_execution.replication_async_effect_mirror = null;
-            db.local_execution.replication_write_gate = null;
+    for ([_]bool{ false, true }) |explicit_root| {
+        for ([_]Failure{ .replay_reply_loss, .fence_after_reply, .fence_at_cleanup_apply }) |failure| {
+            var directory = try TestDirectory.init("transaction-outbox-retirement");
+            defer directory.cleanup();
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            const txn = try db.beginTransaction(1_000);
+            try db.commitTransaction(txn, 2_000);
+            const batch_key = transactions_mod.makeTransactionReplicationBatchOutboxKey(txn);
+            const replay_key = transactions_mod.makeTransactionReplicationReplayOutboxKey(txn);
+            // Model durable obligations surviving a restart before notification.
+            // The real DB resolver must retire its reader on this no-intents retry.
+            try db.core.store.putBatch(&.{ .{ .key = &batch_key, .value = "batch-debt" }, .{ .key = &replay_key, .value = "replay-debt" } }, &.{});
+            var barrier: Barrier = .{};
+            var root = Barrier.RootSharedLease.initRetired(&barrier);
+            defer root.release();
+            var transition: std.atomic.Mutex = .unlocked;
+            var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .transition = &transition, .failure = failure, .root = if (explicit_root) &root else null };
+            const mirror: contract.AsyncEffectMirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier, .transition_mutex = &transition, .requirements = .{ .synchronous = true, .durable_outbox = true } };
+            db.local_execution.replication_async_batch_mirror = mirror;
+            db.local_execution.replication_async_effect_mirror = mirror;
+            db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
+            defer {
+                db.local_execution.replication_async_batch_mirror = null;
+                db.local_execution.replication_async_effect_mirror = null;
+                db.local_execution.replication_write_gate = null;
+            }
+            const result = if (explicit_root) db.flushTransactionReplicationOutboxWithRoot(txn, &root) else db.commitTransaction(txn, 2_000);
+            try std.testing.expectError(if (failure == .replay_reply_loss) error.InjectedOutboxReplyLoss else error.Forbidden, result);
+            try std.testing.expect(!root.held);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn));
+            var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+            defer pending.deinit(alloc);
+            try std.testing.expectEqual(failure != .replay_reply_loss, pending.batch_payload != null);
+            try std.testing.expect(pending.replay_payload != null);
+            try std.testing.expectEqual(@as(usize, if (failure == .replay_reply_loss) 2 else 1), fixture.completed);
+            fixture.failure = null;
+            fixture.closed = false;
+            fixture.appended = 0;
+            fixture.completed = 0;
+            fixture.expected_appends = if (pending.batch_payload == null) 1 else 2;
+            if (explicit_root) try db.flushTransactionReplicationOutboxWithRoot(txn, &root) else try db.commitTransaction(txn, 2_000);
+            try std.testing.expect(!root.held);
+            if (explicit_root) try std.testing.expect(fixture.rooted_cleanup_observations != 0);
+            try std.testing.expectEqual(fixture.expected_appends, fixture.completed);
+            var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn);
+            defer remaining.deinit(alloc);
+            try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
+            var capture = barrier.tryAcquireExclusive() orelse return error.OutboxRetirementLeakedMutationReader;
+            capture.release();
         }
-        try std.testing.expectError(if (failure == .replay_reply_loss) error.InjectedOutboxReplyLoss else error.Forbidden, db.commitTransaction(txn, 2_000));
-        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn));
-        var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn);
-        defer pending.deinit(alloc);
-        try std.testing.expectEqual(failure != .replay_reply_loss, pending.batch_payload != null);
-        try std.testing.expect(pending.replay_payload != null);
-        try std.testing.expectEqual(@as(usize, if (failure == .replay_reply_loss) 2 else 1), fixture.completed);
-        fixture.failure = null;
-        fixture.closed = false;
-        fixture.appended = 0;
-        fixture.completed = 0;
-        fixture.expected_appends = if (pending.batch_payload == null) 1 else 2;
-        try db.commitTransaction(txn, 2_000);
-        try std.testing.expectEqual(fixture.expected_appends, fixture.completed);
-        var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn);
-        defer remaining.deinit(alloc);
-        try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
-        var capture = barrier.tryAcquireExclusive() orelse return error.OutboxRetirementLeakedMutationReader;
-        capture.release();
     }
 }

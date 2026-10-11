@@ -3491,6 +3491,7 @@ pub const DB = struct {
     pub const mirrorReplicationReplayPayloadCommit = local_mutation.mirrorReplicationReplayPayloadCommit;
 
     pub const flushTransactionReplicationOutbox = local_mutation.flushTransactionReplicationOutbox;
+    pub const flushTransactionReplicationOutboxWithRoot = local_mutation.flushTransactionReplicationOutboxWithRoot;
 
     pub const clearDurableReplicationOutbox = local_mutation.clearDurableReplicationOutbox;
 
@@ -6850,6 +6851,7 @@ pub const DB = struct {
             try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{
                 .document_child_range_dispatcher = opts.document_child_range_dispatcher,
                 .committed_batch_effects_observer = opts.committed_batch_effects_observer,
+                .mutation_root = opts.mutation_root,
             });
             pages += 1;
         }

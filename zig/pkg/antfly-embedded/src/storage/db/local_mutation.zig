@@ -256,6 +256,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushDurableReplicationOutboxesLockedWithAdmission = commit.flushDurableReplicationOutboxesLockedWithAdmission;
         pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = commit.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
+        pub const flushTransactionReplicationOutboxWithRoot = commit.flushTransactionReplicationOutboxWithRoot;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;
@@ -831,6 +832,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const flushDurableReplicationOutboxesLockedWithAdmission = Implementation.flushDurableReplicationOutboxesLockedWithAdmission;
             pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
+            pub const flushTransactionReplicationOutboxWithRoot = Implementation.flushTransactionReplicationOutboxWithRoot;
             pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
             pub const lockApplyForPortableRuntime = Implementation.lockApplyForPortableRuntime;
             pub const markPrecomputedEnrichmentAppliedForSync = Implementation.markPrecomputedEnrichmentAppliedForSync;

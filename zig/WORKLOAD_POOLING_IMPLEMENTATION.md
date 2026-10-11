@@ -2743,3 +2743,24 @@ to fresh roots by default; the dedicated recovery receiver cannot replace reside
 DB semantics and maintenance. This change does not enable service-holder CPU
 lending or qualify pooling defaults. Enclosing owners must continue to serialize
 phase transitions and physically join borrowers before releasing the opening guard.
+
+### Resident outbox and graph cleanup root propagation
+
+Batch post-acknowledgement deletion now uses the explicit options root, including
+when the resident DB receiver has no invocation field. Transaction delivery keeps
+that root through local append context projection, reader retirement, and each
+separate acknowledged outbox deletion. Its scoped entry is available on both the
+resident DB and borrowed recovery receiver; legacy entry still selects the receiver
+root. Resolver child options explicitly carry the enclosing invocation root.
+Resident graph completion pages forward the originating options root while keeping
+the existing bounded-page and full-index completion behavior.
+
+The actual server DB regression covers both legacy resolver retries and explicit
+retired-root outbox delivery. It checks local append root ownership, retired root
+and physically joined capture during each remote completion, rooted deletion under
+apply, partial acknowledgement, final fencing and cleanup-time fencing, and healthy
+retry with retained debt. That fixture requires the full server DB gate; focused
+root/recovery helper passes do not qualify this new DB regression or all production
+generic instantiations. Other nested resident helpers still need call-graph
+propagation before ordinary outer entries can default to independent roots.
+Whole service-holder CPU lending and pooling defaults remain incomplete.

@@ -1076,7 +1076,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .enclosing = opts.enclosing_mutation_retirement,
                     };
                     if (!opts.bypass_replication_write_gate) {
-                        try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement);
+                        try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
                     } else retirement.retire();
                     try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                     return;
@@ -2983,7 +2983,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // satisfied durability and the final authority recheck. Keep
                     // the cleanup atomic with other local DB mutations without
                     // retaining the apply lock across the remote wait above.
-                    var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                    var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
                     defer releaseReplicationMutationShared(&cleanup_mutation);
                     try self.enforceReplicationWriteGate();
                     lockApply(self);
@@ -3408,15 +3408,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushTransactionReplicationOutbox(self: anytype, txn_id: transactions_mod.TxnId) !void {
-            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            try flushTransactionReplicationOutboxWithRoot(self, txn_id, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        /// Invocation ownership survives retirement of the append phase. The
+        /// same stable root opens each acknowledged outbox cleanup phase.
+        pub fn flushTransactionReplicationOutboxWithRoot(self: anytype, txn_id: transactions_mod.TxnId, root: ?*MutationBarrier.RootSharedLease) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer releaseReplicationMutationShared(&mutation);
-            try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &mutation });
+            try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &mutation }, root);
         }
 
         fn flushTransactionReplicationOutboxWithRetirement(
             self: anytype,
             txn_id: transactions_mod.TxnId,
             retirement: @import("mutation_admission.zig").MutationRetirement,
+            root: ?*MutationBarrier.RootSharedLease,
         ) !void {
             var outbox = try self.core.loadTransactionReplicationOutbox(self.alloc, txn_id);
             defer outbox.deinit(self.alloc);
@@ -3435,7 +3442,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
             }
             try self.enforceReplicationWriteGate();
-            var ctx = self.batchContext();
+            var ctx = batchContextWithMutationRoot(self, root);
             if (outbox.batch_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
             if (outbox.replay_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
             const projected = replicationCommitContext(&ctx);
@@ -3462,7 +3469,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var completion: ReplicationDeferredCommitGates = .{ .transition_mutex = projected.transition_mutex };
                 completion.append(gate);
                 try completion.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-                var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
                 defer releaseReplicationMutationShared(&cleanup_mutation);
                 try self.enforceReplicationWriteGate();
                 try self.lockApplyForPortableRuntime();
@@ -3816,7 +3823,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return err;
                     };
                     self.core.unlockApply();
-                    try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation });
+                    try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation }, admission.receiverMutationRoot(self));
                     try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
                 }
@@ -3843,6 +3850,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .visibility_cancellation = visibility_cancellation,
                     .admission_controls = retained,
                     .enclosing_mutation_retirement = &replication_mutation,
+                    .mutation_root = admission.receiverMutationRoot(self),
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
