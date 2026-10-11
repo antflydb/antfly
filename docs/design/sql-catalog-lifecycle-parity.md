@@ -2679,4 +2679,8 @@ Qualification checkpoints (no additional original-case credit):
   allocation counter boundaries. The Apache boundary check passed 2,033 source
   files. These overlapping selections are not a full suite or distributed gate.
 
-The combined main-merged checkpoint still requires its own qualification.
+The combined main-merged checkpoint `ddbe982d5f` passed all 120 Debug build
+steps and 64 targeted test executions with zero skips, failures or leaks.
+The catalog/candidate contracts at `16637b7ba6` also passed all 43 ReleaseFast
+build steps and 28 test executions. These qualify retained claim scope and its
+current integration, not distributed claim creation, retirement or activation.
