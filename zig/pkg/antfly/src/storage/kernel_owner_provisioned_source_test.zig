@@ -268,7 +268,10 @@ test "native index owner adapter executes fresh permission stages and recovers r
         // a synthetic source callback. Metadata/RPC authentication is a
         // separate gate; these operations prove the private storage boundary.
         const native = local.storage_db_relational_index_owner_control;
-        const canceled_binding = recovered.outcome().?.binding;
+        var canceled_binding = recovered.outcome().?.binding;
+        // Control commands carry the admitted preimage, even when inspection
+        // recovered the durable reserved postimage. Never relax that guard.
+        canceled_binding.phase = .fencing;
         const intent = native.Admission.fromBinding(canceled_binding);
         metadata.value.head = try metadata.value.head.cancel(metadata.value.head.revision, .requested);
         const cancel_request: execution.CancellationRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group };
