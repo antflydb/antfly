@@ -249,6 +249,18 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(catalog.key, prior.value);
+        var namespace_bytes: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace_bytes, fence.namespace);
+        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &namespace_bytes);
+        for ([_][]const u8{ "a", "b", "c" }, [_][]const u8{
+            "{\"id\":1,\"email\":\"a@example.org\"}", "{\"id\":2,\"email\":\"b@example.org\"}", "{\"id\":3,\"email\":\"c@example.org\"}",
+        }) |document, json| {
+            const primary = try @import("../internal_keys.zig").relationalRowKeyAlloc(a, document);
+            defer a.free(primary);
+            const row = try @import("relational_store.zig").encodeValueForSchemaAlloc(a, json, before_schema);
+            defer a.free(row);
+            try txn.put(primary, row);
+        }
         try txn.commit();
     }
     var manager = try @import("../transactions.zig").TxnManager.init(a, &store);
@@ -277,6 +289,7 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expectError(error.TransactionTopologyBusy, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.requireReserved(&txn, binding));
         try std.testing.expectError(error.IntegrityTopologyBusy, topology.requireUnfenced(&txn));
         try std.testing.expectError(error.PrivateIndexPublicationRequired, topology.stageRelease(&txn, fence));
         try std.testing.expectError(error.PrivateIndexCancellationRequired, topology.stageCancel(&txn, fence));
@@ -329,20 +342,196 @@ fn testOwnerJobAdmission(comptime Backend: type) !void {
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
         try txn.commit();
     }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(jobs.Phase.reserved, (try jobs.load(&txn)).?.phase);
+        try std.testing.expectEqualSlices(u8, candidate.reservation.value, try txn.get(catalog.key));
+        var active = (try physical.load(a, &txn)).?;
+        defer active.deinit();
+        try std.testing.expectEqual(@as(usize, 0), active.entries().len);
+        try std.testing.expectEqual(before_view.version(), active.head.schema_version);
+        var recovered = try jobs.reopenPhysical(a, &txn, before_view, after_view, "email_idx");
+        defer recovered.deinit();
+        try std.testing.expectEqual(binding.index.mapKey(), recovered.index.mapKey());
+        try std.testing.expect(recovered.reservation.expected == null);
+        try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &recovered));
+        try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.key));
+    }
+    try testPrivateBuildPages(a, &store, before_view, binding, &private_addition);
+}
+
+fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocStore, before: @import("schema_registry.zig").SchemaView, binding: @import("relational_index_owner_job.zig").Binding, addition_plan: *const @import("relational_index_catalog.zig").PrivateAddition) !void {
+    const jobs = @import("relational_index_jobs.zig");
+    const physical = @import("relational_index_catalog.zig");
+    const registry = @import("schema_registry.zig");
+    const txns = @import("../transactions.zig");
+    const Core = struct {
+        alloc: Allocator,
+        store: *@import("../docstore.zig").DocStore,
+        relational_indexes: physical.Controller,
+        identity_namespace: @import("doc_identity_namespace.zig").Namespace,
+        before: registry.SchemaView,
+        generation: u64 = 1,
+        historical_reads: usize = 0,
+        pub fn schemaNamespaceGeneration(self: *@This()) u64 {
+            return self.generation;
+        }
+        pub fn acquireSchemaVersionView(self: *@This(), version: u32) !?registry.SchemaView {
+            self.historical_reads += 1;
+            return if (version == self.before.version()) self.before.clone() else null;
+        }
+        pub fn initTxnManager(self: *@This()) !txns.TxnManager {
+            return txns.TxnManager.init(self.alloc, self.store);
+        }
+    };
+    var core: Core = .{ .alloc = a, .store = store, .relational_indexes = try physical.Controller.init(a, std.testing.io, store, before), .identity_namespace = binding.fence.namespace, .before = before };
+    defer core.relational_indexes.deinit();
+    var manager = try core.initTxnManager();
+    defer manager.deinit();
+    const budget: jobs.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+    {
+        var foreign = binding;
+        foreign.plan_digest[0] ^= 1;
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.Page.preparePrivate(a, std.testing.io, &core, foreign, addition_plan, budget));
+    }
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        try std.testing.expect(!core.relational_indexes.isCurrent(page.pinned));
+        try std.testing.expectError(error.PrivateIndexOrderedApplyRequired, page.commit(&core));
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try page.stage(&core, &manager, &txn);
+        try std.testing.expectError(error.RelationalIndexPageConsumed, page.stage(&core, &manager, &txn));
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(&jobs.progressKey(binding.index)));
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const prefix = try @import("relational_index_records.zig").forwardPrefix(binding.index);
+        if (try cursor.seekAtOrAfter(&prefix)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.key, &prefix));
+    }
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        core.generation += 1;
+        defer core.generation -= 1;
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.PreparedGenerationChanged, page.stage(&core, &manager, &txn));
+    }
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const primary = try @import("../internal_keys.zig").relationalRowKeyAlloc(a, "a");
+        defer a.free(primary);
+        try txn.put(primary, "changed-after-prepare");
+        try std.testing.expectError(error.PreparedGenerationChanged, page.stage(&core, &manager, &txn));
+    }
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, .{ .records = 2, .time_ns = std.time.ns_per_s })).?;
+        defer page.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const primary = try @import("../internal_keys.zig").relationalRowKeyAlloc(a, "b");
+        defer a.free(primary);
+        try txn.put(primary, "second-source-changed");
+        // First-candidate writes must roll back when the second candidate
+        // invalidates the frozen source. Progress must not skip that source.
+        try std.testing.expectError(error.PreparedGenerationChanged, page.stage(&core, &manager, &txn));
+    }
+    var completed = false;
+    var scan_work: usize = 0;
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(@import("relational_integrity_topology.zig").fence_key);
+        try std.testing.expectError(error.IntegrityTopologyFenceMissing, page.stage(&core, &manager, &txn));
+    }
+    {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer page.deinit();
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var foreign = binding.fence.namespace;
+        foreign.range_id += 1;
+        var namespace_bytes: [24]u8 = undefined;
+        @import("doc_identity.zig").encodeNamespace(&namespace_bytes, foreign);
+        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &namespace_bytes);
+        try std.testing.expectError(error.IdentityNamespaceMismatch, page.stage(&core, &manager, &txn));
+    }
+    {
+        var first_page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer first_page.deinit();
+        var stale_page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)).?;
+        defer stale_page.deinit();
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try first_page.stage(&core, &manager, &txn);
+            try txn.commit();
+            scan_work += first_page.records_examined;
+        }
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.PreparedGenerationChanged, stale_page.stage(&core, &manager, &txn));
+    }
+    for (0..128) |_| {
+        var page = (try jobs.Page.preparePrivate(a, std.testing.io, &core, binding, addition_plan, budget)) orelse {
+            completed = true;
+            break;
+        };
+        defer page.deinit();
+        try std.testing.expect(page.records_examined <= budget.records);
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try page.stage(&core, &manager, &txn);
+        try txn.put("\x00\x00__metadata__:private_page_test_outbox", "page-applied");
+        try txn.commit();
+        scan_work += page.records_examined;
+    }
+    try std.testing.expect(completed);
+    try std.testing.expectEqual(@as(usize, 3), scan_work);
+    try std.testing.expect(core.historical_reads != 0);
     var txn = try store.beginReadTxn();
     defer txn.abort();
-    try std.testing.expectEqual(jobs.Phase.reserved, (try jobs.load(&txn)).?.phase);
-    try std.testing.expectEqualSlices(u8, candidate.reservation.value, try txn.get(catalog.key));
+    const progress = try jobs.Progress.decode(try txn.get(&jobs.progressKey(binding.index)));
+    try std.testing.expectEqual(jobs.State.ready, progress.state);
+    try std.testing.expectEqual(jobs.Phase.primary, progress.phase);
+    try std.testing.expectEqual(@as(u64, 3), progress.rows_scanned);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const prefix = try @import("relational_index_records.zig").forwardPrefix(binding.index);
+    var entry = try cursor.seekAtOrAfter(&prefix);
+    var count: usize = 0;
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, &prefix)) break;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+    for ([_][]const u8{ "a", "b", "c" }, [_][]const u8{
+        "{\"id\":1,\"email\":\"a@example.org\"}", "{\"id\":2,\"email\":\"b@example.org\"}", "{\"id\":3,\"email\":\"c@example.org\"}",
+    }) |document, json| {
+        const primary = try @import("../internal_keys.zig").relationalRowKeyAlloc(a, document);
+        defer a.free(primary);
+        const original = try @import("relational_store.zig").encodeValueForSchemaAlloc(a, json, before.tableSchema().*);
+        defer a.free(original);
+        try std.testing.expectEqualSlices(u8, original, try txn.get(primary));
+    }
     var active = (try physical.load(a, &txn)).?;
     defer active.deinit();
     try std.testing.expectEqual(@as(usize, 0), active.entries().len);
-    try std.testing.expectEqual(before_view.version(), active.head.schema_version);
-    var recovered = try jobs.reopenPhysical(a, &txn, before_view, after_view, "email_idx");
-    defer recovered.deinit();
-    try std.testing.expectEqual(binding.index.mapKey(), recovered.index.mapKey());
-    try std.testing.expect(recovered.reservation.expected == null);
-    try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &recovered));
-    try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.key));
+    try std.testing.expectEqual(before.version(), active.head.schema_version);
+    var published = core.relational_indexes.acquire().?;
+    defer published.deinit();
+    try std.testing.expectEqual(@as(usize, 0), published.plan.boundIndexes().len);
 }
 
 test "relational index candidate owner binding fences drains and reserves both catalogs atomically on memory and LSM" {

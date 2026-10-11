@@ -30,6 +30,7 @@ const internal = @import("../internal_keys.zig");
 const docstore = @import("../docstore.zig");
 const range_state = @import("range_state.zig");
 const maintenance = @import("relational_index_maintenance_contract.zig");
+const owner_job = @import("relational_index_owner_job.zig");
 const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
 pub const progress_prefix = "\x00\x00__metadata__:relational_index_progress:";
@@ -174,9 +175,9 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
 }
 
 pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
-    const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
     const identity = @import("doc_identity.zig");
     const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
+    const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
     var namespace_bytes: [24]u8 = undefined;
     identity.encodeNamespace(&namespace_bytes, namespace);
     // Range bounds alone are not ownership: a restored/reassigned incarnation
@@ -201,8 +202,8 @@ pub fn statusWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex,
 pub const StatusProof = struct { progress: Progress, digest: Digest, maintenance_epoch: u64, last_maintenance_request: Digest };
 
 pub fn statusProofWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex, owner: Digest) !StatusProof {
-    const raw = try getOptional(txn, &progressKey(index.id()));
     const control = try maintenance.readControl(txn, index.id());
+    const raw = try getOptional(txn, &progressKey(index.id()));
     var current = Progress{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint };
     if (raw) |bytes| {
         const decoded = try Progress.decode(bytes);
@@ -237,6 +238,7 @@ pub const Budget = struct {
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     pinned: catalog.WriteSnapshot,
+    private_job: ?owner_job.Binding = null,
     index_offset: usize,
     namespace_generation: u64,
     expected: ?[]const u8,
@@ -303,8 +305,28 @@ pub const Page = struct {
     pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget) !?Page {
         try budget.validate();
         if (io) |runtime_io| try runtime_io.checkCancel();
+        return preparePinned(alloc, io, core, name, budget, core.relational_indexes.acquire() orelse return error.IndexNotFound, null);
+    }
+
+    /// Pins an unpublished candidate. Physical completion is not a UNIQUE
+    /// validation receipt or publication decision. The owner retains its DB
+    /// lifetime lease; use stage, not the local commit convenience, to apply.
+    pub fn preparePrivate(alloc: Allocator, io: ?std.Io, core: anytype, binding: owner_job.Binding, addition: *const catalog.PrivateAddition, budget: Budget) !?Page {
+        try budget.validate();
+        if (io) |runtime_io| try runtime_io.checkCancel();
+        if (!core.identity_namespace.eql(binding.fence.namespace) or
+            !addition.candidate.head.eql(binding.physical_candidate) or
+            !addition.reservation.head.eql(binding.physical_reserved) or
+            addition.index.mapKey() != binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged;
+        const name = for (addition.plan.boundIndexes()) |index| {
+            if (index.id().mapKey() == binding.index.mapKey()) break index.name;
+        } else return error.IndexNotFound;
+        return preparePinned(alloc, io, core, name, budget, .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, binding);
+    }
+
+    fn preparePinned(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding) !?Page {
         const namespace_generation = core.schemaNamespaceGeneration();
-        var pinned = core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        var pinned = snapshot;
         var transferred = false;
         defer if (!transferred) pinned.deinit();
         const index_offset = for (pinned.plan.boundIndexes(), 0..) |index, i| {
@@ -316,10 +338,13 @@ pub const Page = struct {
         const page_alloc = arena.allocator();
         var read = try core.store.beginReadTxn();
         defer read.abort();
+        if (private_job) |binding| try owner_job.requireReserved(&read, binding);
         const proof = try statusProofWithOwnership(&read, index, try ownership(&read));
         var progress = proof.progress;
+        progress.cursor = try page_alloc.dupe(u8, progress.cursor);
+        if (private_job != null and progress.phase != .primary) return error.InvalidRelationalIndexProgress;
         if (progress.state != .building) return null;
-        if (progress.phase != .primary) return prepareDerived(alloc, io, core, name, budget);
+        if (progress.phase != .primary) return prepareDerived(alloc, io, core, name, budget, .{ .head = pinned.head, .plan = pinned.plan.clone() });
         const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
         const range_raw = (try getOptional(&read, range_state.range_key)) orelse &full_range;
         const range = try range_state.decodeRangeAlloc(page_alloc, range_raw);
@@ -388,15 +413,21 @@ pub const Page = struct {
                 break;
             }
         }
-        if (failed_source == null and exhausted) progress.phase = .forward;
+        if (failed_source == null and exhausted) {
+            // A private generation is fresh, never write-maintained publicly,
+            // and its source stays fenced after drain. Atomic page writes and
+            // progress CAS prove construction at EOF without two repair scans.
+            // Public online rebuilds still verify their forward/reverse data.
+            if (private_job != null) progress.state = .ready else progress.phase = .forward;
+        }
         progress.cursor = if (failed_source == null and exhausted) "" else after;
         transferred = true;
-        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
+        return .{ .arena = arena, .pinned = pinned, .private_job = private_job, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
     }
 
-    fn prepareDerived(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget) !?Page {
+    fn prepareDerived(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot) !?Page {
         const namespace = core.schemaNamespaceGeneration();
-        var pinned = core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        var pinned = snapshot;
         var transferred = false;
         defer if (!transferred) pinned.deinit();
         const offset = for (pinned.plan.boundIndexes(), 0..) |index, i| {
@@ -410,6 +441,7 @@ pub const Page = struct {
         defer read.abort();
         const proof = try statusProofWithOwnership(&read, index, try ownership(&read));
         var progress = proof.progress;
+        progress.cursor = try page_alloc.dupe(u8, progress.cursor);
         if (progress.state != .building or progress.phase == .primary) return null;
         const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
         const range = try range_state.decodeRangeAlloc(page_alloc, (try getOptional(&read, range_state.range_key)) orelse &full_range);
@@ -525,30 +557,46 @@ pub const Page = struct {
     /// Caller holds apply-exclusive and rechecks its HA/ownership authority.
     /// No progress is published before the same transaction's index writes.
     pub fn commit(self: *Page, core: anytype) !void {
-        if (self.consumed) return error.RelationalIndexPageConsumed;
-        self.consumed = true;
-        if (core.schemaNamespaceGeneration() != self.namespace_generation or !core.relational_indexes.isCurrent(self.pinned))
-            return error.PreparedGenerationChanged;
+        if (self.private_job != null) return error.PrivateIndexOrderedApplyRequired;
         var manager = try core.initTxnManager();
         defer manager.deinit();
+        var txn = try core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try self.stage(core, &manager, &txn);
+        try txn.commit();
+    }
+
+    /// Caller holds apply-exclusive and stages its ordered operation receipt
+    /// and outbox before committing. Abort the WHOLE transaction on any error.
+    pub fn stage(self: *Page, core: anytype, manager: *@import("../transactions.zig").TxnManager, txn: *docstore.DocStore.Txn) !void {
+        if (self.consumed) return error.RelationalIndexPageConsumed;
+        self.consumed = true;
+        if (core.schemaNamespaceGeneration() != self.namespace_generation) return error.PreparedGenerationChanged;
+        if (self.private_job) |binding| {
+            if (!core.identity_namespace.eql(binding.fence.namespace) or
+                !self.pinned.head.eql(binding.physical_candidate) or self.next.id.mapKey() != binding.index.mapKey())
+                return error.PrivateIndexOwnerJobChanged;
+            try owner_job.requireReserved(txn, binding);
+            // The reserved phase commits only after predecessor drain, and
+            // the exact retained source fence prevents new admission. Do not
+            // rescan retained transaction history under every page apply lock.
+        } else if (!core.relational_indexes.isCurrent(self.pinned)) return error.PreparedGenerationChanged;
         try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.next.id));
         // A generation must not become queryable while a writer prepared
         // before that generation existed can still publish a new tuple. Apply
         // serializes this drain check with later intent admission.
         if (self.next.state == .ready and try manager.hasPendingIntents()) return error.IntentConflict;
-        var txn = try core.store.beginWriteTxn();
-        errdefer txn.abort();
-        if (!std.mem.eql(u8, &self.next.owner, &(try ownership(&txn)))) return error.PreparedGenerationChanged;
-        const control = try maintenance.readControl(&txn, self.next.id);
+        if (!std.mem.eql(u8, &self.next.owner, &(try ownership(txn)))) return error.PreparedGenerationChanged;
+        const control = try maintenance.readControl(txn, self.next.id);
         if (control.epoch != self.control.epoch or !std.mem.eql(u8, &control.last_request, &self.control.last_request)) return error.PreparedGenerationChanged;
         const key = progressKey(self.next.id);
-        const actual = try getOptional(&txn, &key);
+        const actual = try getOptional(txn, &key);
         if ((actual == null) != (self.expected == null) or (actual != null and !std.mem.eql(u8, actual.?, self.expected.?)))
             return error.PreparedGenerationChanged;
         if (self.failed_source) |failed| {
             // A repaired/deleted bad row invalidates failure just as a changed
             // source invalidates successful work. Do not publish stale failure.
-            const current = (try getOptional(&txn, failed.primary)) orelse return error.PreparedGenerationChanged;
+            const current = (try getOptional(txn, failed.primary)) orelse return error.PreparedGenerationChanged;
             if (!std.mem.eql(u8, &failed.hash, &digest(current))) return error.PreparedGenerationChanged;
         }
         var writer = records.Writer.init(self.arena.allocator());
@@ -556,22 +604,33 @@ pub const Page = struct {
         const index = self.pinned.plan.boundIndexes()[self.index_offset];
         for (self.candidates) |candidate| {
             if (candidate.primary) |primary| {
-                const current = try getOptional(&txn, primary);
-                if ((current == null) != (candidate.hash == null)) continue;
-                if (current) |bytes| if (!std.mem.eql(u8, &candidate.hash.?, &digest(bytes))) continue;
+                const current = try getOptional(txn, primary);
+                if ((current == null) != (candidate.hash == null)) {
+                    if (self.private_job != null) return error.PreparedGenerationChanged;
+                    continue;
+                }
+                if (current) |bytes| if (!std.mem.eql(u8, &candidate.hash.?, &digest(bytes))) {
+                    if (self.private_job != null) return error.PreparedGenerationChanged;
+                    continue;
+                };
             }
             if (candidate.observed_key) |observed| {
-                const current = (try getOptional(&txn, observed)) orelse continue;
-                if (!std.mem.eql(u8, &candidate.observed_hash, &digest(current))) continue;
+                const current = (try getOptional(txn, observed)) orelse {
+                    if (self.private_job != null) return error.PreparedGenerationChanged;
+                    continue;
+                };
+                if (!std.mem.eql(u8, &candidate.observed_hash, &digest(current))) {
+                    if (self.private_job != null) return error.PreparedGenerationChanged;
+                    continue;
+                }
             }
-            if (candidate.delete_observed) try deleteDerived(self.arena.allocator(), &txn, candidate.observed_key.?);
-            if (candidate.delete_reverse) |reverse| try deleteDerived(self.arena.allocator(), &txn, reverse);
-            if (candidate.nonmember) try writer.removeForRepair(&txn, index, candidate.document);
-            if (candidate.tuple) |tuple| _ = try writer.repairCovered(&txn, index, candidate.document, tuple, candidate.payload);
+            if (candidate.delete_observed) try deleteDerived(self.arena.allocator(), txn, candidate.observed_key.?);
+            if (candidate.delete_reverse) |reverse| try deleteDerived(self.arena.allocator(), txn, reverse);
+            if (candidate.nonmember) try writer.removeForRepair(txn, index, candidate.document);
+            if (candidate.tuple) |tuple| _ = try writer.repairCovered(txn, index, candidate.document, tuple, candidate.payload);
         }
         const encoded = try self.next.encode(self.arena.allocator());
         try txn.put(&key, encoded);
-        try txn.commit();
     }
 };
 

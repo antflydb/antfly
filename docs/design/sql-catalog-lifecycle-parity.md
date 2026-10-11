@@ -1610,3 +1610,76 @@ steps with zero skips, failures or leaks. Formatting, diff and generated control
 catalog checks pass. Shared cases execute in multiple contexts; this is not a
 full-suite or public distributed-activation claim. SQL inventory dispositions
 remain unchanged.
+
+### Shared bounded private backfill pages
+
+Private candidates now reuse the existing typed-row page preparation, historical
+schema projections, covering/partial plans and primary construction. Public
+online rebuilds retain their forward/reverse verification. The private iterator
+pins the owned unpublished candidate rather than acquiring the public controller
+snapshot. It retains the same row/byte/time budgets; no row is materialized as JSON
+or rewritten merely to construct the index. Progress cursors are owned before
+subsequent store reads can invalidate borrowed buffers.
+
+Private preparation/application checks the durable owner job, exact source
+fence, reserved catalog identities and actual durable namespace. Application
+also checks the namespace generation, the reserved lease established after drain,
+maintenance control, progress CAS and each observed source value. A changed or
+missing source invalidates a private page instead of advancing past it: unlike
+a published write-maintained index, the private frozen candidate cannot rely on
+an ordinary writer to fill that coverage gap.
+
+`Page.stage` lets the ordered owner commit page writes/progress with its receipt
+and outbox in one transaction. Private pages cannot use the local `commit`
+convenience. Public pages retain their published-snapshot checks and existing
+local commit path. Physical build completion does not authorize UNIQUE
+validation, metadata publication or fence release.
+
+The memory/LSM owner campaign now constructs and verifies private tuples from
+old-epoch rows with one-record budgets. It covers abort, consumed/stale page
+rejection, changed namespace generation, durable namespace substitution, changed
+first/second source values, competing progress CAS, historical projection and
+unchanged primary bytes/public index definitions. The explicit pages gate joins
+the native artifact to four public-owner regressions: bounded build pages,
+pre-generation writer drain, prepared tuple reservations and ordinary tuple
+replacement. Its test-selection inventory remains strict; native-only cases
+are not represented as filters in the server-owned test root.
+
+Remaining activation work includes authenticated native commands/receipts and
+capability barriers, phase-aware checkpoint verification, supervised scheduling,
+distributed UNIQUE claim construction/validation, publication decisions and
+bounded cancellation/GC. The public failed-UNIQUE-build atomicity case remains
+open; this component execution does not add SQL inventory disposition credits.
+
+Predecessor transaction-history reconciliation remains a reservation-time
+operation, not per-page work. The durable reserved phase plus the exact retained
+admission fence proves that drain remains valid; pages do not rescan retained
+terminal history under apply-exclusive. The constant-work pending-intent probe
+at physical completion remains intact. Ownership hashing reads its borrowed range
+bytes last, after decoding the fixed-size namespace, and hashes them before any
+further store operation.
+
+Before public activation, read-only participant admission/write upgrades also
+need explicit treatment: regular PostgreSQL index creation must permit readers
+without allowing a read-only predecessor to upgrade into an unfenced writer.
+The current conservative topology admission is not a claim of that final UX.
+
+Fresh private construction completes at primary EOF without the public online
+rebuild's two generation-local repair scans. This relies on a newly allocated,
+never-reused tuple generation, a drained and continuously fenced source, strict
+source-value CAS and atomic tuple/progress writes. Private non-primary progress
+is rejected; this is not a shortcut for public rebuilding/repair. Completion is
+still physical coverage only, not UNIQUE validation or a publication decision.
+The fail-first work counter examined nine records for three indexed source rows;
+the single-pass implementation examines exactly three while preserving primary
+bytes, unpublished definitions and all source/job/progress fault guards. That is
+a scan-work result for the fixture, not a wall-clock throughput claim.
+
+Final-source qualification ran `antfly-relational-index-pages-test` and
+`antfly-relational-index-candidate-test` in Debug and ReleaseFast. Each run
+completed 62/62 build steps: four public regressions, nine native candidate/job
+tests and six metadata candidate tests, with no failures, skips or leaks.
+These overlapping component executions are not additional SQL disposition
+credits. The earlier seven-gate campaign passed in both modes before the final
+localized single-pass changes; it is not claimed as a full-suite rerun of this
+checkpoint.

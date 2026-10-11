@@ -689,6 +689,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
+    const relational_index_page_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational index build pages", "relational index system ready publication waits", "relational index system prepared writer reserves", "relational index system ordinary tuple replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const relational_index_page_step = b.step("antfly-relational-index-pages-test", "Verify bounded public/private index pages, frozen source CAS and pre-generation writer drain");
+    relational_index_page_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_page_tests).step);
     const retained_transfer_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{ "relational index system rewrite", "relational index system retained", "relational index system merge tail", "relational index system source pin prepared crash", "storage.source_snapshot." },
@@ -6081,6 +6088,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const native_index_candidate_run = addFilteredTestRunArtifact(b, native_index_candidate_tests);
+    relational_index_page_step.dependOn(&native_index_candidate_run.step);
     b.step("relational-index-candidate-test", "Verify native private UNIQUE candidate compilation without server dependencies")
         .dependOn(&native_index_candidate_run.step);
     db_test_step.dependOn(&native_index_candidate_run.step);

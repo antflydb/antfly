@@ -150,14 +150,37 @@ pub fn load(txn: anytype) !?Binding {
     return if (try optional(txn, key)) |bytes| try Binding.decode(bytes) else null;
 }
 
+fn requireNamespace(txn: anytype, binding: Binding) !void {
+    const actual = (try @import("doc_identity.zig").loadNamespaceTxn(txn)) orelse return error.IdentityNamespaceMismatch;
+    if (!actual.eql(binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+}
+
 pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
     const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
     if (binding.phase != .fencing or !binding.fence.eql(fence)) return error.PrivateIndexOwnerJobChanged;
+    try requireNamespace(txn, binding);
 }
 
 pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
     const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
     if (!binding.fence.eql(fence)) return error.PrivateIndexOwnerJobChanged;
+    try requireNamespace(txn, binding);
+}
+
+/// Page authority uses the durable fixed-size job/fence and current catalog
+/// identities, not the public write snapshot. The owned candidate plan was
+/// independently compiled/reloaded before page preparation.
+pub fn requireReserved(txn: anytype, binding: Binding) !void {
+    var expected = binding;
+    expected.phase = .reserved;
+    const current = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    if (!std.mem.eql(u8, &try current.encode(), &try expected.encode())) return error.PrivateIndexOwnerJobChanged;
+    const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+    const raw = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+    if (!std.mem.eql(u8, &digest(raw), &binding.integrity_reserved)) return error.IntegrityCatalogChanged;
+    const physical = try physical_catalog.Head.decode(try txn.get(physical_catalog.head_key));
+    if (!physical.eql(binding.physical_reserved)) return error.PreparedGenerationChanged;
 }
 
 /// Cold owner recovery retains the originally absent/existing predecessor from
@@ -183,6 +206,7 @@ pub fn reopenPhysical(alloc: std.mem.Allocator, txn: anytype, before: @import("s
 pub fn stageBegin(txn: anytype, binding: Binding) !bool {
     if (binding.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
     const encoded = try binding.encode();
+    try requireNamespace(txn, binding);
     if (try load(txn)) |existing| {
         var original = existing;
         original.phase = .fencing;
