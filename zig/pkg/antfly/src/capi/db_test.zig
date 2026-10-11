@@ -1111,6 +1111,116 @@ test "capi system write cursor sees pending catalog rows and preserves abort" {
     try std.testing.expectError(error.NotFound, read.get("catalog:b"));
 }
 
+test "storage owner native index rejects prior ABI before dereferencing request fields" {
+    var response: kernel_owner_abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 1 };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, server_api.storageOwnerNativeIndexControlJson(null, &.{
+        .version = 0,
+        .operation = .admit,
+        .table_name = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .request_json = .{ .ptr = @ptrFromInt(1), .len = 1 },
+        .manifest = .{ .ptr = @ptrFromInt(1), .len = 1 },
+    }, &response));
+    try std.testing.expect(response.ptr == null);
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const before =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const after =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
+    ;
+    var directory = try TestDirectory.init("native-index-capi");
+    defer directory.cleanup();
+    var handle: Handle = .{
+        .alloc = a,
+        .db = try db_mod.DB.open(a, directory.path(), .{
+            .start_optional_runtimes = false,
+            .primary_backend = .{ .lsm = .{} },
+            .online_source_authority = .native,
+            .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 },
+        }),
+        .storage_owner_table_name = @constCast("items"),
+        .storage_owner_group_id = 11,
+    };
+    defer handle.db.close();
+    const id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(id);
+    try handle.db.setSchemaJson(a, before);
+    var schema = try local.schema_mod.parseValidatedTableSchema(a, before);
+    defer schema.deinit(a);
+    var prior = try local.schema_relational_declarations.compileCatalog(a, schema, 101, null);
+    defer prior.deinit();
+    try handle.db.core.store.putBatch(&.{.{ .key = local.storage_db_relational_integrity_catalog.key, .value = prior.value }}, &.{});
+    var candidate = try local.storage_db_relational_index_candidate.Candidate.prepare(a, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    var prior_digest: [32]u8 = undefined;
+    var candidate_digest: [32]u8 = undefined;
+    var reservation_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prior.value, &prior_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.next.value, &candidate_digest, .{});
+    std.crypto.hash.Blake3.hash(candidate.reservation.value, &reservation_digest, .{});
+    const header: db_mod.DB.NativeIndexOwnerAdmission = .{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = handle.db.core.identity_namespace, .catalog_digest = prior_digest },
+        .candidate_digest = candidate_digest,
+        .reservation_digest = reservation_digest,
+    };
+    const json = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(json);
+    var response: kernel_owner_abi.OwnedBytes = .{};
+    var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .admit,
+        .table_name = .fromSlice("wrong-table"),
+        .request_json = .fromSlice(json),
+        .manifest = .fromSlice(candidate.inputs.bytes),
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.table_name = .fromSlice("items");
+    request.operation = @fromBackingInt(@intCast(99));
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.operation = .admit;
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    var admitted = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+    defer admitted.deinit();
+    freeRawBuffer(response.ptr, response.len);
+    try std.testing.expect(!admitted.value.duplicate);
+    try std.testing.expect(admitted.value.receipt == null);
+    try std.testing.expectEqual(@as(u64, 1), admitted.value.position.sequence);
+    const binding = admitted.value.binding;
+    for ([_]kernel_owner_abi.NativeIndexOwnerOperation{ .fence, .reserve }, 2..) |operation, sequence| {
+        const command: db_mod.DB.NativeIndexOwnerCommand = .{ .effect = if (operation == .fence) .fenced else .reserved, .binding = binding };
+        const command_json = try std.json.Stringify.valueAlloc(a, command, .{});
+        defer a.free(command_json);
+        request.operation = operation;
+        request.request_json = .fromSlice(command_json);
+        // Non-admission controls must not introduce replacement schema inputs.
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        request.manifest = .{};
+        handle.storage_owner_group_id = 99;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        handle.storage_owner_group_id = 11;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        defer freeRawBuffer(response.ptr, response.len);
+        var outcome = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
+        defer outcome.deinit();
+        try std.testing.expect(!outcome.value.duplicate);
+        try std.testing.expectEqual(@as(u64, sequence), outcome.value.position.sequence);
+        try std.testing.expect(outcome.value.receipt != null);
+        request.manifest = .fromSlice(candidate.inputs.bytes);
+    }
+    try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+}
+
 test "storage owner open rejects prior ABI before reading expanded request fields" {
     var owner: ?*anyopaque = @ptrFromInt(1);
     const old_request: kernel_owner_abi.OpenRequest = .{

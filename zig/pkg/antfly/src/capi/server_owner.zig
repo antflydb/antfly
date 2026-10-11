@@ -3962,6 +3962,62 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+/// No ordinary-batch decoding or caller-selected replay position enters this
+/// boundary. Metadata permission is independently checked by the server worker;
+/// durable local job/catalog checks remain authoritative for each storage effect.
+pub fn storageOwnerNativeIndexControlJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.NativeIndexOwnerControlRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    // Headers/bindings contain only fixed-size identities. Large schema inputs
+    // remain raw borrowed bytes rather than another JSON/base64 representation.
+    if (request.request_json.len == 0 or request.request_json.len > 32 * 1024) return .invalid_argument;
+    var prepared = switch (request.operation) {
+        .admit => blk: {
+            if (request.manifest.len == 0) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerAdmission(parsed.value, request.manifest.slice()) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        .fence, .reserve => blk: {
+            if (request.manifest.len != 0) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCommand, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const effect: @FieldType(db_mod.DB.NativeIndexOwnerCommand, "effect") = if (request.operation == .fence) .fenced else .reserved;
+            if (parsed.value.effect != effect or parsed.value.inputs_b64 != null or
+                parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerControl(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+        },
+        else => return .invalid_argument,
+    };
+    defer prepared.deinit();
+    // Reserve response storage before committing. The bounded fixed-identity
+    // outcome does not require an allocator call during serialization.
+    const buffer = std.heap.c_allocator.alloc(u8, 32 * 1024) catch |err| return storageOwnerStatusFromError(err);
+    var owned = true;
+    defer if (owned) std.heap.c_allocator.free(buffer);
+    const outcome = handle.db.applyPreparedNativeIndexOwnerControl(&prepared, null) catch |err|
+        return storageOwnerStatusFromError(err);
+    var writer: std.Io.Writer = .fixed(buffer);
+    std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
+    // The C allocator guarantees in-place shrink, unlike general allocators.
+    const resized = std.heap.c_allocator.resize(buffer, writer.end);
+    std.debug.assert(resized);
+    out_response.* = .{ .ptr = buffer.ptr, .len = writer.end };
+    owned = false;
+    return .ok;
+}
+
 pub fn storageOwnerNativeFkGenerationControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.NativeFkGenerationControlRequest,

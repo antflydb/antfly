@@ -2088,3 +2088,39 @@ dispatch/ACK integration, global UNIQUE claims, terminal cancellation/publicatio
 and cleanup, and distributed fault qualification. The public producer remains
 disabled until those requirements and the public failed-build atomicity gate are
 proved, not merely because the private component campaign passes.
+
+### Private native index compiled-owner boundary (in qualification)
+
+The private server-owner ABI now separates raw-manifest admission from bounded
+fence/reserve commands. Admission accepts the small typed header and borrowed
+AIM1 bytes, not a coordinator-selected physical binding. The actual owner loads
+its schema/catalog and chooses the physical allocation locally. Fence/reserve
+accept only the corresponding original binding and cannot replace the immutable
+inputs or select a standby replay position. Operation/header mismatches, unknown
+operations, another table and another actual handle owner group fail before
+staging. The ordinary batch contract and public routes are unchanged.
+
+The private ABI has a typed consumer and an explicitly registered storage-kernel
+export. Response storage is reserved before committing and JSON uses a fixed
+writer; final ownership uses the C allocator's guaranteed allocation-free
+in-place shrink. This boundary is internal, so its types are not public OpenAPI
+models. Receiving server workers still must independently fetch fresh metadata
+owner permission; no caller-set authorization Boolean is introduced.
+
+Initial direct C-ABI tests pass all 51 Debug build steps, including two tests for
+prior-version pointer safety and LSM admission/fencing/reservation with raw
+inputs, rejected operations/tables/input replacement, committed native proofs
+and unchanged public schema. The actual `runtime-unit-storage_kernel` production
+build passes 16/16 Debug steps and compiles the new private export. This gate is
+distinct from `embedded-capi-check`, which only qualifies the public independent
+C-API owner. Apache boundary validation passes for 2028 sources. Final guards and
+negative tests for the actual handle owner group pass the combined direct C-ABI
+and private storage-kernel Debug gate, all 56 steps and both tests with no skips,
+failures or leaks. Optimized qualification remains in progress.
+
+The independent authenticated RPC receiver, capability admission, worker
+dispatch/root-attested ACK integration, Raft effect-cut implementation, global UNIQUE
+validation and terminal publish/cancel/cleanup remain required. A fresh metadata
+read is not a lease: cancellation must also fence late admission on previously
+unvisited owners, rather than merely acknowledging absence. Public activation
+and the original SQL inventory remain unchanged.

@@ -1185,6 +1185,24 @@ pub const NativeFkGenerationControlRequest = extern struct {
     request_json: BorrowedBytes = .{},
 };
 
+/// Private compiled-owner entry point. The receiving server independently
+/// authenticates the coordinator and obtains a fresh metadata owner decision.
+/// Admission supplies raw immutable inputs; physical IDs are chosen locally.
+pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, _ };
+pub const NativeIndexOwnerControlRequest = extern struct {
+    version: u32 = abi_version,
+    operation: NativeIndexOwnerOperation,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    manifest: BorrowedBytes = .{},
+};
+
+pub extern fn antfly_storage_owner_native_index_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeIndexOwnerControlRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_native_fk_generation_control_json(
     owner: ?*anyopaque,
     request: *const NativeFkGenerationControlRequest,

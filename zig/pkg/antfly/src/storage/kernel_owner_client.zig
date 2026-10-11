@@ -523,6 +523,28 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeIndexOwnerAdmissionJson(self: *Owner, table_name: []const u8, header_json: []const u8, manifest: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .admit,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(header_json),
+            .manifest = .fromSlice(manifest),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeIndexOwnerControlJson(self: *Owner, table_name: []const u8, operation: abi.NativeIndexOwnerOperation, command_json: []const u8) !Response {
+        if (operation != .fence and operation != .reserve) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = operation,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_fk_generation_control_json(self.handle, &.{
