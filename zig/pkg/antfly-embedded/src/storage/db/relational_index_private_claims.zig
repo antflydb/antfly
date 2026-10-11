@@ -235,7 +235,16 @@ pub const Prepared = struct {
         state.update(&try bindingDigest(binding));
         for (entries.items) |entry| {
             state.update(&entry.address.claimKey());
-            state.update(&hash(entry.value));
+            const claim = try integrity.Claim.decode(&entry.address.claimKey(), entry.value);
+            var version: [4]u8 = undefined;
+            std.mem.writeInt(u32, &version, claim.schema_version, .little);
+            state.update(&version);
+            for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, field.len, .little);
+                state.update(&length);
+                state.update(field);
+            }
         }
         var digest: integrity.Digest = undefined;
         state.final(&digest);

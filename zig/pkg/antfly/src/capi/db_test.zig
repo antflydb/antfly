@@ -1332,7 +1332,8 @@ test "storage owner native index raw admission and bounded controls preserve loc
     {
         var reserved_binding = binding;
         reserved_binding.phase = .reserved;
-        var text = "compiled-owner-claim".*;
+        const tuple = "compiled\x00\xff\x80-owner-claim";
+        var text = tuple.*;
         var prepared_claims = try handle.db.prepareNativeIndexOwnerClaims(.{
             .binding = reserved_binding,
             .claims = &.{.{
@@ -1355,7 +1356,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
         const Frame = local.storage_db_relational_index_owner_control.Frame;
         var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: Frame }, a, try prepared_claims.finalizePayload(claimed.position), .{});
         defer wire.deinit();
-        try std.testing.expectEqualStrings("compiled-owner-claim", wire.value.index_owner_control.effect.claims.claims[0].tuple);
+        try std.testing.expectEqualSlices(u8, tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
         try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
         try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
         var corrupt_frame = wire.value.index_owner_control;

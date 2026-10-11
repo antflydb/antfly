@@ -755,8 +755,35 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
                 var batch = try claims.Prepared.init(alloc, txn, current, &.{claim});
                 defer batch.deinit();
             }
+            fn ownedControl(alloc: Allocator, txn: *@import("../docstore.zig").DocStore.Txn, current: jobs.Binding, claim: integrity.Claim) !void {
+                const control = @import("relational_index_owner_control.zig");
+                var reserved_binding = current;
+                reserved_binding.phase = .reserved;
+                var prepared_control = try control.PreparedClaims.init(alloc, txn, .{ .binding = reserved_binding, .claims = &.{claim} });
+                defer prepared_control.deinit();
+                try prepared_control.preparePayload();
+                const bytes = try prepared_control.finalizePayload(.{ .namespace = current.fence.namespace, .sequence = 4 });
+                var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: control.Frame }, alloc, bytes, .{});
+                defer wire.deinit();
+                try wire.value.index_owner_control.validate();
+                try std.testing.expectEqualSlices(u8, claim.tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
+                const ExcludedOwner = struct {
+                    lower: [33]u8,
+                    pub fn byteRange(self: *const @This()) @import("types.zig").ByteRange {
+                        return .{ .start = &self.lower, .end = "" };
+                    }
+                };
+                var excluded: ExcludedOwner = undefined;
+                @memcpy(excluded.lower[0..32], &prepared_control.batch.entries[0].address.routing);
+                excluded.lower[32] = 0;
+                try std.testing.expectError(error.KeyOutOfRange, prepared_control.stage(&excluded, txn, null));
+            }
         };
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ &read, binding, first });
+        var binary = first;
+        binary.tuple = "\x00\xff\x80binary-tuple";
+        try Harness.ownedControl(a, &read, binding, binary);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.ownedControl, .{ &read, binding, binary });
     }
     // More than one full GC page, with request buffers overwritten before
     // apply, proves both bounded continuation and prepared-byte ownership.
@@ -854,6 +881,26 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const view = try transfer.TransferView.init(&txn);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, transfer.validateTransferredCompanionsWithView(&txn, &try reference.key(selected), reference_value, view));
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = selected, .kind = .reference }, @splat(0)));
+        }
+        if (page.receipts.len != 0) {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const receipt = page.receipts[0];
+            const damaged = try a.dupe(u8, receipt.value);
+            defer a.free(damaged);
+            damaged[damaged.len - 1] ^= 1;
+            try txn.put(receipt.key, damaged);
+            try std.testing.expectError(error.VersionConflict, page.stage(&txn));
+            try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, claims.GcPage.prepare(a, std.testing.io, &txn, binding));
+        }
+        if (page.receipts.len != 0) {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const restored = try first.encode(a, address);
+            defer a.free(restored);
+            try txn.put(&address.claimKey(), restored);
+            try txn.put(&inventory_key, &integrity.hash(restored));
+            try std.testing.expectError(error.VersionConflict, page.stage(&txn));
         }
         collected += page.entries.len;
         collected_receipts += page.receipts.len;
