@@ -93,7 +93,8 @@ process's port separately when running multiple nodes on one host.
   including an added unselected column or index, transparently refreshes the
   catalog guard. Changed result types fail with `0A000` and PostgreSQL's
   `cached plan must not change result type` message before reading or mutation
-  admission. Settings epochs retain their independent validation contract.
+  admission. Rebinding also refreshes the settings epoch; execution validates
+  that fresh epoch to fence concurrent setting catalog changes.
   Suspended portals keep their original snapshot; execution never replays an
   admitted mutation. Concurrent DDL after rebinding still meets a schema fence.
 - Extended-query errors drain queued messages until Sync. Backend transaction

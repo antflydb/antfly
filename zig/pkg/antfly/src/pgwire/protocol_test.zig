@@ -78,6 +78,23 @@ const Mock = struct {
     observed_setting: ?i64 = null,
     describe_setting_epoch: ?u64 = null,
     observed_setting_epoch: ?u64 = null,
+    setting_epoch_changes_on_describe: bool = false,
+    setting_changes_before_admission: bool = false,
+
+    fn settingEpoch(self: *const Mock) ?u64 {
+        return if (self.describe_setting_epoch) |epoch| epoch + (if (self.setting_epoch_changes_on_describe) self.describes - 1 else 0) else null;
+    }
+
+    fn checkSettingEpoch(self: *Mock, request: backend.Request) !void {
+        self.observed_setting_epoch = request.setting_epoch;
+        if (self.setting_epoch_changes_on_describe) {
+            const expected = self.settingEpoch().? + @intFromBool(self.setting_changes_before_admission);
+            if (request.setting_epoch != expected) {
+                request.diagnostics.?.set("40001", "setting catalog changed before admission", null, true);
+                return error.SettingCatalogChanged;
+            }
+        }
+    }
 
     fn source(self: *Mock) backend.Backend {
         return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
@@ -117,6 +134,7 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        try self.checkSettingEpoch(request);
         self.lake_log[self.lake_count] = request.lake_visibility;
         self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
@@ -193,13 +211,13 @@ const Mock = struct {
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
         if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
-        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
+        return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = if (self.catalog_rebind and self.describes > 1) "current-catalog-binding" else "immutable-catalog-binding", .setting_epoch = self.settingEpoch() };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (self.result_override) |result| return result;
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
-        self.observed_setting_epoch = request.setting_epoch;
+        try self.checkSettingEpoch(request);
         self.executions += 1;
         if (std.mem.startsWith(u8, request.statement, "SELECT")) {
             self.lake_log[self.lake_count] = request.lake_visibility;
@@ -1365,6 +1383,47 @@ test "pgwire prepared statement carries setting catalog epoch to execution" {
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
     try std.testing.expectEqual(@as(?u64, 17), mock.observed_setting_epoch);
+}
+
+test "pgwire cached statements refresh settings guards and fence changes after rebind" {
+    for ([_]bool{ false, true }) |sql_prepare| {
+        for ([_]bool{ false, true }) |streaming| {
+            for ([_]bool{ false, true }) |concurrent_change| {
+                var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+                defer input.deinit();
+                try startup(&input.writer);
+                if (sql_prepare) {
+                    try frame(&input.writer, 'Q', "PREPARE setting_plan AS SELECT 1\x00");
+                    try frame(&input.writer, 'Q', "EXECUTE setting_plan\x00");
+                } else {
+                    try parse(&input.writer, "setting_plan", "SELECT 1", false);
+                    try bind(&input.writer, "setting_portal", "setting_plan", null);
+                    try frame(&input.writer, 'D', "Ssetting_plan\x00");
+                    try execute(&input.writer, "setting_portal", 0);
+                    try frame(&input.writer, 'S', "");
+                }
+                try frame(&input.writer, 'X', "");
+                var mock: Mock = .{
+                    .describe_setting_epoch = 17,
+                    .setting_epoch_changes_on_describe = true,
+                    .setting_changes_before_admission = concurrent_change,
+                    .stream_rows = if (streaming) 2 else 0,
+                };
+                var output = try run(&mock, input.written(), .{});
+                defer output.deinit();
+                try std.testing.expectEqual(mock.settingEpoch(), mock.observed_setting_epoch);
+                try std.testing.expect(mock.observed_setting_epoch.? > 17);
+                if (concurrent_change) {
+                    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+                    try std.testing.expectEqual(@as(usize, 0), mock.stream_pulls);
+                    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40001") != null);
+                } else {
+                    try std.testing.expect(std.mem.indexOf(u8, output.written(), "SERROR") == null);
+                    try std.testing.expectEqual(@as(usize, if (streaming) 0 else 1), mock.executions);
+                }
+            }
+        }
+    }
 }
 
 test "pgwire DISCARD ALL inside a transaction leaves prepared plans intact" {

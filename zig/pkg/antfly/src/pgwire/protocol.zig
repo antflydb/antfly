@@ -397,8 +397,8 @@ pub const Session = struct {
     }
 
     /// Recompile against the current catalog before an unstarted execution.
-    /// Preserve the client's fixed parameter/result contract and settings epoch;
-    /// retain a fresh schema guard so concurrent DDL still fences admission.
+    /// Preserve the client's fixed parameter/result contract; retain fresh
+    /// schema and settings guards so concurrent changes still fence admission.
     /// Never call this for a suspended portal or an already admitted mutation.
     fn cachedPlanChanged(self: *Session) anyerror {
         self.diagnostic.set("0A000", "cached plan must not change result type", null, null);
@@ -406,7 +406,7 @@ pub const Session = struct {
     }
 
     fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
-        var current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
+        const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
         if (!cachedColumnsEqual(original.columns, current.columns) or
             original.parameter_types.len != current.parameter_types.len)
             return self.cachedPlanChanged();
@@ -421,7 +421,6 @@ pub const Session = struct {
                 try values.oid(after);
             if (before_oid != after_oid) return self.cachedPlanChanged();
         }
-        current.setting_epoch = original.setting_epoch;
         return current;
     }
 

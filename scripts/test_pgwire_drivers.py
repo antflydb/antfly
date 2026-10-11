@@ -29,6 +29,50 @@ ROOT = Path(__file__).resolve().parents[1]
 CLIENTS = ROOT / "scripts" / "pgwire_drivers"
 
 
+def exercise_cached_setting_plans(server, password):
+    import psycopg
+    import requests
+
+    def define_setting(value):
+        response = requests.post(
+            server.api_url + "/settings",
+            auth=("admin", password),
+            json={
+                "put": {
+                    "name": "app.cached_driver",
+                    "kind": "string",
+                    "default": {"string": value},
+                }
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+
+    define_setting("before")
+    url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
+    query = "SELECT current_setting('app.cached_driver')"
+    with (
+        psycopg.connect(url, autocommit=True, prepare_threshold=None) as conn,
+        psycopg.connect(url, autocommit=True, prepare_threshold=None) as migrator,
+        psycopg.ClientCursor(conn) as cursor,
+    ):
+        cursor.execute("PREPARE cached_setting AS " + query)
+
+        def assert_cached(value):
+            cursor.execute("EXECUTE cached_setting")
+            assert cursor.fetchone() == (value,)
+            assert conn.execute(query, prepare=True).fetchone() == (value,)
+
+        assert_cached("before")
+        # DDL on another connection keeps the driver's cache intact.
+        migrator.execute("CREATE TABLE settings_unrelated (id TEXT PRIMARY KEY)")
+        assert_cached("before")
+        # A compatible setting definition update also requires a fresh guard.
+        define_setting("after")
+        assert_cached("after")
+    print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
+
+
 def run_clients(url, drivers):
     env = {**os.environ, "ANTFLY_PGWIRE_URL": url}
     commands = {
@@ -87,6 +131,7 @@ def main():
         ) as conn:
             conn.execute("CREATE INDEX ready_after_restart ON ready_immediately(id)")
         print("cold-start and restart DDL without retries: PASS", flush=True)
+        exercise_cached_setting_plans(server, AUTH_BOOTSTRAP_PASSWORD)
         run_clients(
             f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
             args.drivers,
