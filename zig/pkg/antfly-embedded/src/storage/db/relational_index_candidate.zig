@@ -869,6 +869,29 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         }
         try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), count);
     }
+    {
+        const large = try a.alloc(u8, claims.max_bytes);
+        defer a.free(large);
+        @memset(large, 'x');
+        for (0..2) |ordinal| {
+            var buffer: [32]u8 = undefined;
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const large_claim: integrity.Claim = .{ .tuple = try std.fmt.bufPrint(&buffer, "large-{d}", .{ordinal}), .parent_table = "articles", .parent_key = large[0 .. 600 * 1024], .schema_version = binding.physical_candidate.schema_version };
+            var batch = try claims.Prepared.init(a, &txn, binding, &.{large_claim});
+            defer batch.deinit();
+            try std.testing.expectEqual(@as(usize, 1), (try batch.stageOrdered(&txn, null)).claims_added);
+            try txn.commit();
+        }
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var oversized = first;
+        oversized.parent_key = large[0 .. claims.max_bytes - claims.claim_entry_overhead];
+        try std.testing.expectError(error.TransactionTooLarge, claims.Prepared.init(a, &read, binding, &.{oversized}));
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        try std.testing.expectError(error.TransactionTooLarge, @import("relational_index_owner_control.zig").ClaimCommand.validate(.{ .binding = reserved_binding, .claims = &.{oversized} }));
+    }
     var third = first;
     third.tuple = "third";
     var late = blk: {
@@ -928,6 +951,9 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         };
         defer page.deinit();
         try std.testing.expect(page.entries.len > 0 and page.entries.len <= 256);
+        var page_bytes: usize = 0;
+        for (page.entries) |entry| page_bytes += entry.value.len + claims.inventoryKey(entry.address).len + entry.address.claimKey().len + claims.inventory_value_len;
+        try std.testing.expect(page_bytes <= claims.max_bytes);
         gc_pages += 1;
         try std.testing.expect(gc_pages <= 5 + 2 * claims.max_claims);
         if (page.entries.len != 0) {
@@ -1039,7 +1065,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             try std.testing.expectEqualSlices(u8, &try reserved_binding.encode(), &try (try jobs.load(&read)).?.encode());
         }
     }
-    try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), collected);
+    try std.testing.expectEqual(@as(usize, 4 + 2 * claims.max_claims), collected);
     try std.testing.expect(gc_pages >= 2);
     var read = try store.beginReadTxn();
     defer read.abort();

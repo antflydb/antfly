@@ -28,6 +28,9 @@ const Native = @import("receipt_position.zig").Native;
 pub const max_claims = 128;
 pub const max_bytes = 1024 * 1024;
 const key_len = prefix.len + 16 + 32 + 32;
+// AFC1 fixed fields/checksum, both paired keys, and the provenance value.
+// Count the actual bytes GC must carry, not just request string lengths.
+pub const claim_entry_overhead = 76 + key_len + integrity.key_len + inventory_value_len;
 
 fn hash(bytes: []const u8) integrity.Digest {
     return integrity.hash(bytes);
@@ -203,7 +206,7 @@ pub const Prepared = struct {
         var bytes: usize = 0;
         for (claims) |claim| {
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
-            bytes = std.math.add(usize, bytes, 256) catch return error.TransactionTooLarge;
+            bytes = std.math.add(usize, bytes, claim_entry_overhead) catch return error.TransactionTooLarge;
             for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         }
         if (bytes > max_bytes) return error.TransactionTooLarge;
@@ -381,12 +384,17 @@ pub const GcPage = struct {
             const inventory = entry.value[0..inventory_value_len].*;
             const raw = (try optional(txn, &address.claimKey())) orelse return error.InvalidPrivateIndexClaimInventory;
             if (raw.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
+            const record_bytes = raw.len + key_len + integrity.key_len + inventory_value_len;
+            if (record_bytes > max_bytes) return error.InvalidPrivateIndexClaimInventory;
+            // Stop BEFORE owning another row; checking after append can admit
+            // almost two page budgets when the next claim is large.
+            if (record_bytes > max_bytes - bytes) break;
             const sequence = try decodeInventory(&inventoryKey(address), &inventory, provenance, hash(raw));
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
             try entries.append(owned, .{ .address = address, .value = value, .expected = value, .sequence = sequence });
-            bytes +|= value.len + key_len + inventory_value_len;
+            bytes += record_bytes;
             if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
         }
         if (entries.items.len == 0) {

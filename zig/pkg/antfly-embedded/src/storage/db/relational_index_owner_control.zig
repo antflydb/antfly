@@ -84,7 +84,7 @@ pub const ClaimCommand = struct {
         for (self.claims) |claim| {
             if (claim.state != .live or claim.schema_version != self.binding.physical_candidate.schema_version or
                 claim.action != .restrict or claim.target_tuple != null or !std.mem.allEqual(u8, &claim.action_id, 0)) return error.InvalidPrivateIndexClaimInventory;
-            bytes = std.math.add(usize, bytes, 256) catch return error.TransactionTooLarge;
+            bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.TransactionTooLarge;
             for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         }
         if (bytes > private_claims.max_bytes) return error.TransactionTooLarge;
