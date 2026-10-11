@@ -424,6 +424,10 @@ def main() -> None:
                 "build",
                 "check-storage-compilation",
                 "-Doptimize=debug",
+                # Ownership and cache invalidation depend on Debug code and
+                # imports, not debug symbols. Retaining symbols across source
+                # mutations fills the PVC and forces repeated cold rebuilds.
+                "-Dstrip=true",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Donnx=false",

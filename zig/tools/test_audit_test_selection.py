@@ -76,6 +76,14 @@ class SelectionAuditTests(unittest.TestCase):
         result = self.run_cli("--test-filte", "route")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_namespace_exclusion_preserves_suffix_modules(self):
+        names = "TEST\tindex.test.lookup\nTEST\tretirement_index.test.durable cut\n"
+        self.assertEqual(audit([names], ["retirement_index."], ["^index."]), [])
+        self.assertIn(
+            "test selection matched no runnable tests",
+            audit([names], ["retirement_index."], ["index."]),
+        )
+
     def test_selection_can_span_owners(self):
         self.assertEqual(
             audit(

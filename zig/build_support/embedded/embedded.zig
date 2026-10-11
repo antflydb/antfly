@@ -290,6 +290,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     libantfly_link_mod.strip = strip;
     libantfly_link_mod.linkLibrary(native_inference);
     libantfly_link_mod.linkLibrary(native_enrichment);
+    // Final native library consumers need release metadata even in the
+    // embedded-only composition. Attach it before creating link artifacts
+    // and before any consumer can cache this module's dependency graph.
+    antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod);
     const install_libantfly = libantfly.install;
@@ -497,6 +501,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi SQL",
         "storage owner runtime status",
         "capi relational expression errors preserve public status semantics",
+        "bounded Lite retirement admission is retryable while uncertain publication is not",
         "capi artifact decode and lookup json",
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",

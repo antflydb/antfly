@@ -739,9 +739,12 @@ pub const ModelManifest = struct {
 
     pub fn hasIncompleteFlorence2GgufBundle(self: *const ModelManifest) bool {
         if (!self.isFlorence2GgufBundle()) return false;
+        // The authenticated variant declares the reader contract. Execution
+        // consumes the configuration, tokenizer and preprocessor below;
+        // model_manifest.json is optional metadata, including for older
+        // managed receipts that did not publish it as an artifact.
         return self.gguf_path == null or
             self.config_path == null or
-            self.model_manifest_path == null or
             self.tokenizer_json_path == null or
             self.tokenizer_config_path == null or
             self.preprocessor_config_path == null;
@@ -6565,6 +6568,48 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     try expectCanonicalPath(allocator, q4_path, manifest.gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "managed Florence variants do not require unreceipted declaration metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = .{
+        .{ "config.json", "{\"model_type\":\"florence2\"}" },
+        .{ "tokenizer.json", "{}" },
+        .{ "tokenizer_config.json", "{}" },
+        .{ "preprocessor_config.json", "{}" },
+        .{ "model.gguf", "GGUFstub" },
+        .{ "antfly_inference_variants.json", "{\"family\":\"florence_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"format\":\"Q4_K\",\"model\":\"model.gguf\"}]}" },
+    };
+    var artifacts: [files.len]managed_receipt.ArtifactReceipt = undefined;
+    inline for (files, 0..) |file, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+        artifacts[index] = .{ .path = file[0], .size = file[1].len };
+    }
+    // An unrelated, uncommitted declaration must neither be required nor
+    // alter the reader role authenticated by the variant publication.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "invalid unreceipted metadata" });
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 1, .artifacts = &artifacts }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var manifest = try loadFromDir(a, path);
+    defer manifest.deinit();
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expect(manifest.model_manifest_path == null);
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expect(!listing.hasIncompleteFlorence2GgufBundle());
+    // The consumed preprocessing sidecar remains required.
+    const preprocessor = manifest.preprocessor_config_path;
+    manifest.preprocessor_config_path = null;
+    try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
+    manifest.preprocessor_config_path = preprocessor;
 }
 
 test "manifest ignores stale florence2 variants with missing gguf files" {

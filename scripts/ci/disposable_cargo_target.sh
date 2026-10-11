@@ -19,7 +19,7 @@
 # all phase consumers have exited, before Actions starts saving other caches.
 with_disposable_cargo_target() (
   set -euo pipefail
-  cargo_phase_target=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-sdk-cargo.XXXXXXXX")
+  cargo_phase_target=$(mktemp -d "${ANTFLY_CARGO_TARGET_PARENT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}/antfly-sdk-cargo.XXXXXXXX")
   readonly cargo_phase_target
   trap 'rm -rf -- "$cargo_phase_target"' EXIT
   trap 'exit 130' INT

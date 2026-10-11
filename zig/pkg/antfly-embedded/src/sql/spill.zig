@@ -3157,20 +3157,21 @@ test "SQL fused sort cohorts reserve shared file capacity for merges" {
     var dummy: u8 = 0;
     var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
-    {
-        var sorts: [8]Sort = undefined;
-        for (&sorts) |*sort| {
+    for ([_]usize{ 4, 24 }) |run_limit| {
+        var storage: [8]Sort = undefined;
+        const sorts = storage[0..if (run_limit == 4) @as(usize, 8) else 2];
+        for (sorts) |*sort| {
             sort.* = Sort.init(a, &manager, &.{.{}}, 4096);
-            sort.run_limit = 4;
+            sort.run_limit = run_limit;
             sort.parallel_runs = false;
         }
-        defer for (&sorts) |*sort| sort.deinit();
-        for (0..512) |i| for (&sorts) |*sort| {
+        defer for (sorts) |*sort| sort.deinit();
+        for (0..512) |i| for (sorts) |*sort| {
             try sort.add(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(511 - i) })}, .ordinal = i });
         };
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        for (&sorts) |*sort| {
+        for (sorts) |*sort| {
             for (0..512) |i| {
                 _ = arena.reset(.retain_capacity);
                 const row = (try sort.next(arena.allocator())).?;
