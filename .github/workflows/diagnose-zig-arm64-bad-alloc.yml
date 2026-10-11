@@ -65,13 +65,6 @@ jobs:
       - name: Verify x86_64 host
         run: test "$(uname -m)" = x86_64
 
-      - name: Verify runtime boundaries and bounded runner
-        run: |
-          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
-          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
-          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
-          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
-
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -93,6 +86,13 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Verify runtime boundaries and bounded runner
+        run: |
+          python3 zig/tools/analyze_zig_import_graph.py --check-runtime-boundary --check-codegen-boundary --check-api-kernel-boundary --json
+          python3 -m unittest zig/tools/test_analyze_zig_import_graph.py
+          python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
+          python3 -m unittest zig/tools/test_run_bounded_zig_build.py
 
       - name: Install pinned macOS cross-compilation SDK
         env:

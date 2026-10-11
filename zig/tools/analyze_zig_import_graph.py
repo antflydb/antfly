@@ -204,12 +204,38 @@ class ObjectReport:
 
 
 class ImportGraph:
-    def __init__(self, source_root: Path):
+    def __init__(self, source_root: Path, package_roots: dict[str, Path] | None = None):
         self.source_root = source_root.resolve()
         if not self.source_root.is_dir():
             raise ValueError(f"source root is not a directory: {self.source_root}")
         self._edge_cache: dict[Path, tuple[Path, ...]] = {}
         self._line_cache: dict[Path, int] = {}
+        if package_roots is None:
+            package_roots = (
+                {"antfly-embedded": REPO_ROOT / "zig/pkg/antfly-embedded/src"}
+                if self.source_root == DEFAULT_SOURCE_ROOT.resolve()
+                else {}
+            )
+        self.package_roots = {
+            name: root.resolve() for name, root in package_roots.items()
+        }
+        self.local_sources: dict[str, Path] = {}
+        if root := self.package_roots.get("antfly-embedded"):
+            catalog = root / "source_catalog_control.zig"
+            if catalog.is_file():
+                for name, relative in re.findall(
+                    r'pub const (\w+) = @import\("([^"\n]+\.zig)"\);',
+                    catalog.read_text(encoding="utf-8"),
+                ):
+                    target = (root / relative).resolve()
+                    if self.contains(target) and target.is_file():
+                        self.local_sources[name] = target
+
+    def contains(self, path: Path) -> bool:
+        return any(
+            path.is_relative_to(root)
+            for root in (self.source_root, *self.package_roots.values())
+        )
 
     def resolve_source(self, value: str) -> Path:
         path = (self.source_root / value).resolve()
@@ -220,11 +246,22 @@ class ImportGraph:
                 f"source path escapes {self.source_root}: {value}"
             ) from error
         if not path.is_file():
+            # Local engine files keep their logical path after moving into the
+            # Apache package. Custom fixture roots remain strictly confined.
+            for root in self.package_roots.values():
+                candidate = (root / value).resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    return candidate
             raise ValueError(f"source file does not exist: {path}")
         return path
 
     def relative_name(self, path: Path) -> str:
-        return path.relative_to(self.source_root).as_posix()
+        if path.is_relative_to(self.source_root):
+            return path.relative_to(self.source_root).as_posix()
+        for name, root in self.package_roots.items():
+            if path.is_relative_to(root):
+                return f"@{name}/{path.relative_to(root).as_posix()}"
+        raise ValueError(f"source path escapes configured packages: {path}")
 
     def relative_edges(self, path: Path) -> tuple[Path, ...]:
         cached = self._edge_cache.get(path)
@@ -237,12 +274,20 @@ class ImportGraph:
             if not value.endswith(".zig"):
                 continue
             target = (path.parent / value).resolve()
-            try:
-                target.relative_to(self.source_root)
-            except ValueError:
+            if not self.contains(target):
                 continue
             if target.is_file():
                 targets.append(target)
+        # Follow only selected catalog members, never the entire catalog:
+        # broadening a selector import would invent implementation dependencies.
+        members = re.findall(r'@import\("antfly_local_sources"\)\.(\w+)', text)
+        for alias in re.findall(
+            r'const (\w+) = @import\("antfly_local_sources"\);', text
+        ):
+            members.extend(re.findall(rf"\b{re.escape(alias)}\.(\w+)", text))
+        targets.extend(
+            self.local_sources[name] for name in members if name in self.local_sources
+        )
         result = tuple(dict.fromkeys(targets))
         self._edge_cache[path] = result
         return result
@@ -1200,9 +1245,11 @@ def check_compiled_storage_boundary(
         )
         return False
 
+    graph = ImportGraph(source_root)
     forbidden = {
-        (source_root / relative).resolve(): relative
+        (root / relative).resolve(): relative
         for relative in DISTRIBUTED_FORBIDDEN_STORAGE_FILES
+        for root in (graph.source_root, *graph.package_roots.values())
     }
     clean = True
     for report in candidates:
