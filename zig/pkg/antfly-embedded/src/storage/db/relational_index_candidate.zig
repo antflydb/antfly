@@ -669,8 +669,26 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     try std.testing.expectEqual(@as(usize, 2), prepared.entries.len);
     {
         var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const result = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(!result.duplicate);
+        try std.testing.expectEqual(@as(usize, 2), result.claims_added);
+    }
+    const original_cut = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const selected = try claims.requireRegistered(&read, binding);
+        try std.testing.expectError(error.NotFound, read.get(&claims.receiptKey(selected.generation, prepared.digest)));
+        try std.testing.expectError(error.NotFound, read.get(&(try integrity.Address.init(selected.generation, first.tuple)).claimKey()));
+        break :blk (try @import("../source_authority.zig").load(&read)).?.sequence + 1;
+    };
+    {
+        var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expectEqual(@as(usize, 2), try prepared.stage(&txn));
+        const result = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(!result.duplicate);
+        try std.testing.expectEqual(@as(usize, 2), result.claims_added);
+        try std.testing.expectEqual(original_cut, result.position.sequence);
         try txn.commit();
     }
     const allocation = blk: {
@@ -682,6 +700,28 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     const inventory_key = claims.inventoryKey(address);
     try std.testing.expect(@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(&inventory_key));
     try std.testing.expect(@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(&claims.registrationKey(allocation.generation)));
+    const receipt_key = claims.receiptKey(allocation.generation, prepared.digest);
+    try std.testing.expect(@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(&receipt_key));
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var reordered = try claims.Prepared.init(a, &txn, binding, &.{ second, first, second });
+        defer reordered.deinit();
+        try std.testing.expectEqualSlices(u8, &prepared.digest, &reordered.digest);
+        const result = try reordered.stageOrdered(&txn, null);
+        try std.testing.expect(result.duplicate);
+        try std.testing.expectEqual(original_cut, result.position.sequence);
+        try std.testing.expectEqual(original_cut, (try @import("../source_authority.zig").load(&txn)).?.sequence);
+        try std.testing.expect((try reordered.stageOrdered(&txn, result.position)).duplicate);
+        var wrong_cut = result.position;
+        wrong_cut.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, reordered.stageOrdered(&txn, wrong_cut));
+        const raw = try a.dupe(u8, try txn.get(&receipt_key));
+        defer a.free(raw);
+        raw[12] ^= 1;
+        try txn.put(&receipt_key, raw);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, reordered.stageOrdered(&txn, null));
+    }
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
@@ -736,7 +776,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         for (&buffers) |*buffer| @memset(buffer, 'x');
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expectEqual(@as(usize, claims.max_claims), try batch.stage(&txn));
+        try std.testing.expectEqual(@as(usize, claims.max_claims), (try batch.stageOrdered(&txn, null)).claims_added);
         try txn.commit();
     }
     var third = first;
@@ -747,6 +787,22 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         break :blk try claims.Prepared.init(a, &read, binding, &.{third});
     };
     defer late.deinit();
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const clock = (try @import("../source_authority.zig").load(&txn)).?.sequence;
+        try std.testing.expectError(error.OnlineSourceScopeChanged, late.stageOrdered(&txn, .{ .namespace = binding.fence.namespace, .sequence = clock + 2 }));
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(&claims.receiptKey(allocation.generation, late.digest)));
+        // A late retry of the original batch still recovers its original cut,
+        // not the clock advanced by two later bulk claim effects.
+        const retry = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(retry.duplicate);
+        try std.testing.expectEqual(original_cut, retry.position.sequence);
+    }
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
@@ -763,6 +819,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expectError(error.PrivateIndexPublicationCanceled, late.stage(&txn));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, prepared.stageOrdered(&txn, null));
     }
     try reopenPrivateClaimTestStore(a, restart);
     const cleanup_clock = blk: {
@@ -772,6 +829,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         break :blk (try @import("../source_authority.zig").load(&read)).?.sequence;
     };
     var collected: usize = 0;
+    var collected_receipts: usize = 0;
     var gc_pages: usize = 0;
     while (true) {
         var page = blk: {
@@ -780,10 +838,10 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             break :blk (try claims.GcPage.prepare(a, std.testing.io, &read, binding)) orelse break;
         };
         defer page.deinit();
-        try std.testing.expect(page.entries.len > 0 and page.entries.len <= 256);
+        try std.testing.expect(page.entries.len + page.receipts.len > 0 and page.entries.len + page.receipts.len <= 256);
         gc_pages += 1;
-        try std.testing.expect(gc_pages <= 2 + 2 * claims.max_claims);
-        {
+        try std.testing.expect(gc_pages <= 5 + 2 * claims.max_claims);
+        if (page.entries.len != 0) {
             var txn = try store.beginWriteTxn();
             defer txn.abort();
             const selected = page.entries[0].address;
@@ -798,6 +856,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = selected, .kind = .reference }, @splat(0)));
         }
         collected += page.entries.len;
+        collected_receipts += page.receipts.len;
         // A crash before commit leaves the complete page retryable.
         {
             var txn = try store.beginWriteTxn();
@@ -823,11 +882,13 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         }
     }
     try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), collected);
+    try std.testing.expectEqual(@as(usize, 3), collected_receipts);
     try std.testing.expect(gc_pages >= 2);
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(&address.claimKey()));
     try std.testing.expectError(error.NotFound, read.get(&inventory_key));
+    try std.testing.expectError(error.NotFound, read.get(&receipt_key));
     try std.testing.expectError(error.NotFound, read.get(&(try integrity.Address.init(allocation.generation, third.tuple)).claimKey()));
     _ = try claims.requireRegistered(&read, binding);
     try claims.requireRetired(&read, binding);
