@@ -80,17 +80,21 @@ pub const OwnerDecision = struct {
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
 
+    pub fn requireRequest(self: OwnerDecision, request: OwnerRequest) !void {
+        try request.validate();
+        if (self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation)) return error.InvalidGenerationPublication;
+        if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
+            !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
+        if (try ownerPermission(self.head, self.owner, request.operation) != self.disposition) return error.InvalidCatalogRecord;
+    }
+
     /// Bind a fresh permission response to the receiver's independently parsed
     /// request before acquiring storage. A response for another table, owner or
     /// attempt is not interchangeable, even if it is otherwise well formed.
     /// This is neither transport authentication nor a cancellation lease.
     pub fn nativeExecutionIdentity(self: OwnerDecision, request: OwnerRequest) !native_control.Identity {
-        try request.validate();
-        if (self.metadata_group_id == 0 or !local.metadata_incarnation.isValid(self.metadata_incarnation) or
-            self.disposition != .execute) return error.InvalidGenerationPublication;
-        if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
-            !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
-        if (try ownerPermission(self.head, self.owner, request.operation) != .execute) return error.GenerationPublicationChanged;
+        if (self.disposition != .execute) return error.InvalidGenerationPublication;
+        try self.requireRequest(request);
         return (self.dispatch orelse return error.InvalidGenerationPublication).nativeIdentity(self.owner.owner);
     }
 

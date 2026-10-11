@@ -2268,3 +2268,26 @@ acknowledged responses, invalid metadata identity, altered durable bindings and
 reserved retries. These are projection tests, not signed or committed owner
 evidence. Execution qualification is pending. The public producer, failed-build
 atomicity gate and SQL inventory remain unchanged.
+
+### Bounded native owner execution (in qualification)
+
+The server-side execution layer accepts only table/group/publication identity
+and fence/reserve intent. It obtains its own permission from the configured
+metadata transport and validates the exact request and response disposition.
+Neither projected decisions nor physical allocations are accepted from an RPC
+body. Acknowledged work returns without acquiring storage. Native inspection
+verifies the actual persisted authority before an absent owner can be admitted.
+
+Each call performs at most one new owner effect. Only an absent fence admission
+fetches schema-sized inputs, using a second fresh metadata read that can reject
+intervening cancellation. Admission yields durable progress without claiming a
+fenced receipt; subsequent calls recover existing cuts or apply the next bounded
+control without downloading inputs again. Owned results retain pending error
+strings and do not turn cancellation after commit into an uncommitted outcome.
+
+Component assertions cover staging, retry recovery, owned pending responses,
+post-commit cancellation, changed permission, foreign table names, acknowledged
+work, missing admission and allocation-failure cleanup. Execution qualification
+is pending. This layer is not yet wired to an authenticated RPC/root-attestation
+producer. Durable cancellation/late-admission tombstones, all later phases and
+the distributed fault/public atomicity gates remain required before activation.
