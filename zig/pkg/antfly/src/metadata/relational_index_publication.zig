@@ -125,6 +125,26 @@ pub const OwnerDecision = struct {
     }
 
     fn boundNativeControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, effect: local.storage_db_relational_index_owner_job.NativeEffect) !native_control.Command {
+        try self.requireNativeBinding(request, observed);
+        var command: native_control.Command = .{ .effect = effect, .binding = observed };
+        // Command identity is the admitted preimage even on a reserved retry;
+        // do not rewrite or regress the phase of the durable observed job.
+        command.binding.phase = .fencing;
+        try command.validate();
+        return command;
+    }
+
+    /// Claims are produced only during build, against the actual reserved job.
+    /// The caller supplies values, never an allocation, fence or physical cut.
+    pub fn nativeClaims(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, claims: @FieldType(native_control.ClaimCommand, "claims")) !native_control.ClaimCommand {
+        if (request.operation != .build) return error.InvalidGenerationPublication;
+        try self.requireNativeBinding(request, observed);
+        const command: native_control.ClaimCommand = .{ .binding = observed, .claims = claims };
+        try command.validate();
+        return command;
+    }
+
+    fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {
         const identity = try self.nativeExecutionIdentity(request);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         _ = try observed.encode();
@@ -136,12 +156,6 @@ pub const OwnerDecision = struct {
             !std.mem.eql(u8, &observed.integrity_reserved, &self.head.reservation_digest) or
             observed.physical_reserved.schema_version != dispatch.table_guard.owner.schema_version or
             observed.physical_candidate.schema_version != dispatch.successor_schema_version) return error.PrivateIndexOwnerJobChanged;
-        var command: native_control.Command = .{ .effect = effect, .binding = observed };
-        // Command identity is the admitted preimage even on a reserved retry;
-        // do not rewrite or regress the phase of the durable observed job.
-        command.binding.phase = .fencing;
-        try command.validate();
-        return command;
     }
 
     /// Cancel a never-visited owner without loading schema-sized inputs. This

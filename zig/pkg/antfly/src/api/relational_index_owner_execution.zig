@@ -83,6 +83,53 @@ pub const Result = union(enum) {
 
 pub const CancellationRequest = struct { table_id: u64, group_id: u64, id: [16]u8 };
 
+pub const ClaimRequest = struct {
+    table_id: u64,
+    group_id: u64,
+    id: [16]u8,
+    claims: @FieldType(native.ClaimCommand, "claims"),
+};
+
+pub const ClaimResult = union(enum) {
+    acknowledged,
+    applied: struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native.ClaimOutcome),
+    },
+
+    pub fn deinit(self: *ClaimResult) void {
+        switch (self.*) {
+            .acknowledged => {},
+            .applied => |value| value.outcome.deinit(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// One bounded batch under freshly observed build permission. This is an
+/// internal receiver boundary, not authenticated mounted transport or a signed
+/// build acknowledgement. Local apply still fences cancellation atomically.
+pub fn claimStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: ClaimRequest, context: operation.RequestContext) !ClaimResult {
+    try context.ensureActive();
+    const lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build };
+    try lookup.validate();
+    if (table_name.len == 0) return error.InvalidGenerationPublication;
+    var permission = try decision(alloc, metadata, lookup, context);
+    defer permission.deinit();
+    if (permission.value.disposition == .acknowledged) return .acknowledged;
+    try requireTable(permission.value, table_name);
+    const identity = try permission.value.nativeExecutionIdentity(lookup);
+    var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
+    defer state.deinit();
+    const command = try permission.value.nativeClaims(lookup, state.value orelse return error.GenerationAdmissionPending, request.claims);
+    const rooted = try source.applyNativeIndexOwnerClaimsAtRoot(alloc, request.group_id, table_name, command, context);
+    errdefer rooted.outcome.deinit();
+    try rooted.outcome.value.validateFor(command);
+    // Preserve committed/pending progress even if cancellation arrived during
+    // dispatch. Never replay a new effect to recover an uncertain result.
+    return .{ .applied = .{ .root_generation = rooted.root_generation, .outcome = rooted.outcome } };
+}
+
 pub const CancellationResult = union(enum) {
     /// Only metadata's full canceled receipt can acknowledge this owner.
     acknowledged,
@@ -291,6 +338,7 @@ const TestDriver = struct {
     root_generation: u64 = 9,
     admissions: usize = 0,
     controls: usize = 0,
+    claim_batches: usize = 0,
     cancellations: usize = 0,
     cancel_state: ?jobs.CancellationState = null,
     cleanups: usize = 0,
@@ -342,6 +390,21 @@ const TestDriver = struct {
     pub fn nativeIndexOwnerReceiptAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.ReceiptRequest, _: operation.RequestContext) !@FieldType(Result, "recovered") {
         self.recoveries += 1;
         return .{ .root_generation = self.root_generation, .outcome = try parsed(?native.Outcome, alloc, self.receipt_result) };
+    }
+
+    pub fn applyNativeIndexOwnerClaimsAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.ClaimCommand, context: operation.RequestContext) !@FieldType(ClaimResult, "applied") {
+        try context.ensureActive();
+        try command.validate();
+        self.claim_batches += 1;
+        if (self.cancel_after_commit) |signal| signal.store(true, .release);
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ClaimOutcome, alloc, .{
+            .binding = command.binding,
+            .position = .{ .namespace = command.binding.fence.namespace, .sequence = 3 },
+            .claims_added = command.claims.len,
+            .duplicate = false,
+            .replication_pending = self.pending,
+            .error_name = if (self.pending) "ReplicationOutboxPending" else null,
+        }) };
     }
 
     pub fn admitNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, header: native.Admission, manifest: []const u8, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -597,6 +660,89 @@ test "relational index publication native cancellation receiver uses fixed permi
     driver.value.head = prepared.head;
     try std.testing.expectError(error.GenerationPublicationChanged, cancelIntentStep(alloc, &driver, &driver, plan.before.name, request, context));
     try std.testing.expectEqual(@as(usize, 0), driver.cancellations);
+}
+
+test "relational index publication claim receiver binds fresh build permission without schema projections" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    @constCast(plan.owners)[0].receipt_authority = .native;
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    var dispatch = try std.json.parseFromSlice(publication.Dispatch, alloc, prepared.dispatch[0], .{});
+    defer dispatch.deinit();
+    var driver: TestDriver = .{ .value = .{
+        .metadata_group_id = 13,
+        .metadata_incarnation = @splat('1'),
+        .head = prepared.head,
+        .owner = prepared.owners[0],
+        .disposition = .execute,
+        .dispatch = dispatch.value,
+    } };
+    var inputs = try std.json.parseFromSlice(publication.Inputs, alloc, prepared.inputs, .{});
+    defer inputs.deinit();
+    driver.value.inputs = inputs.value;
+    const header = try driver.value.nativeAdmission();
+    driver.value.inputs = null;
+    var admitted = try driver.admitNativeIndexOwner(alloc, plan.owners[0].range.group_id, plan.before.name, header, "synthetic", .{});
+    defer admitted.deinit();
+    driver.binding.?.phase = .reserved;
+    const progress = local.storage_db_relational_index_publication_progress;
+    inline for (.{ progress.Action.fenced, progress.Action.reserved }, 1..) |action, sequence| {
+        const next = try progress.acknowledge(driver.value.head, driver.value.owner, driver.value.head.revision, .{
+            .owner = driver.value.owner.owner,
+            .action = action,
+            .position = .{ .native = .{ .namespace = header.fence.namespace, .sequence = sequence } },
+            .candidate_digest = prepared.head.candidate_digest,
+            .reservation_digest = prepared.head.reservation_digest,
+            .evidence_digest = @splat(9),
+        });
+        driver.value.head = next.head;
+        driver.value.owner = next.owner;
+    }
+    const permission = driver.value;
+    const binding = driver.binding;
+    const request: ClaimRequest = .{
+        .table_id = plan.before.table_id,
+        .group_id = plan.owners[0].range.group_id,
+        .id = plan.id,
+        .claims = &.{.{ .tuple = "receiver\x00\xff", .parent_table = plan.before.name, .parent_key = "row", .schema_version = 2 }},
+    };
+    var result = try claimStep(alloc, &driver, &driver, plan.before.name, request, .{});
+    defer result.deinit();
+    try std.testing.expect(result == .applied);
+    try std.testing.expectEqual(@as(usize, 1), driver.claim_batches);
+    try std.testing.expectEqual(@as(usize, 1), driver.permission_reads);
+    try std.testing.expectEqual(@as(usize, 0), driver.admission_reads);
+    try std.testing.expectEqual(@as(u64, 9), result.applied.root_generation);
+    driver.root_generation += 1;
+    try std.testing.expectEqual(@as(u64, 9), result.applied.root_generation);
+    driver = .{ .value = permission, .binding = binding };
+    try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, "wrong table", request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.inspections);
+    driver.value.head = prepared.head;
+    driver.value.owner = prepared.owners[0];
+    try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    driver = .{ .value = permission };
+    try std.testing.expectError(error.GenerationAdmissionPending, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    driver.binding = binding;
+    driver.binding.?.owner_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    var signal = std.atomic.Value(bool).init(true);
+    const context: operation.RequestContext = .{ .cancellation = operation.CancellationToken.fromAtomic(&signal) };
+    driver = .{ .value = permission, .binding = binding };
+    try std.testing.expectError(error.Canceled, claimStep(alloc, &driver, &driver, plan.before.name, request, context));
+    try std.testing.expectEqual(@as(usize, 0), driver.permission_reads);
+    signal.store(false, .release);
+    driver.pending = true;
+    driver.cancel_after_commit = &signal;
+    var pending = try claimStep(alloc, &driver, &driver, plan.before.name, request, context);
+    defer pending.deinit();
+    try std.testing.expect(signal.load(.acquire));
+    try std.testing.expect(pending.applied.outcome.value.replication_pending);
+    try std.testing.expectEqualStrings("ReplicationOutboxPending", pending.applied.outcome.value.error_name.?);
 }
 
 test "relational index publication native receiver stages one effect recovers pending and rejects stale permission" {

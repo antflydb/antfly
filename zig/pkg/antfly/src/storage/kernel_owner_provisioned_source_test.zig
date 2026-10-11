@@ -290,6 +290,18 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(rooted_claim.root_generation, rooted_duplicate.root_generation);
         try std.testing.expect(rooted_duplicate.outcome.value.duplicate);
         try std.testing.expectEqual(claimed.position, rooted_duplicate.outcome.value.position);
+        // Advance the independently read metadata permission to build, then
+        // exercise the receiver against this actual compiled reserved owner.
+        const build_permission = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, reserved_receipt);
+        metadata.value.head = build_permission.head;
+        metadata.value.owner = build_permission.owner;
+        const delivery: execution.ClaimRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .claims = claim_command.claims };
+        var received = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, delivery, .{});
+        defer received.deinit();
+        try std.testing.expect(received == .applied);
+        try std.testing.expectEqual(rooted_claim.root_generation, received.applied.root_generation);
+        try std.testing.expect(received.applied.outcome.value.duplicate);
+        try std.testing.expectEqual(claimed.position, received.applied.outcome.value.position);
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owners.applyNativeIndexOwnerClaims(alloc, group + 1, plan.before.name, claim_command, .{}));
         // Control commands carry the admitted preimage, even when inspection
         // recovered the durable reserved postimage. Never relax that guard.
