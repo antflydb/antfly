@@ -328,11 +328,14 @@ pub const PreparedAck = struct {
             error.NotFound => return error.GenerationPublicationChanged,
             else => return err,
         };
+        // Consume a borrowed result before the next get can reuse its buffer.
+        // Both exact predecessors still pass before either write is staged.
+        if (!std.mem.eql(u8, head, &self.expected_head)) return error.GenerationPublicationChanged;
         const owner = txn.get(owner_key) catch |err| switch (err) {
             error.NotFound => return error.GenerationPublicationChanged,
             else => return err,
         };
-        if (!std.mem.eql(u8, head, &self.expected_head) or !std.mem.eql(u8, owner, &self.expected_owner)) return error.GenerationPublicationChanged;
+        if (!std.mem.eql(u8, owner, &self.expected_owner)) return error.GenerationPublicationChanged;
         if (self.changed) {
             try txn.put(head_key, &self.next_head);
             try txn.put(owner_key, &self.next_owner);
@@ -577,11 +580,13 @@ test "index ACK staging compares both durable predecessors before writing either
         owner: [OwnerState.encoded_len]u8,
         writes: usize = 0,
         read_error: bool = false,
+        scratch: [OwnerState.encoded_len]u8 = undefined,
         fn get(self: *@This(), key: []const u8) error{ NotFound, StorageReadFailed }![]const u8 {
             if (self.read_error) return error.StorageReadFailed;
-            if (std.mem.eql(u8, key, "head")) return &self.head;
-            if (std.mem.eql(u8, key, "owner")) return &self.owner;
-            return error.NotFound;
+            const bytes: []const u8 = if (std.mem.eql(u8, key, "head")) &self.head else if (std.mem.eql(u8, key, "owner")) &self.owner else return error.NotFound;
+            // A legal reader may reuse its borrowed-result buffer on get.
+            @memcpy(self.scratch[0..bytes.len], bytes);
+            return self.scratch[0..bytes.len];
         }
         fn put(self: *@This(), key: []const u8, value: []const u8) !void {
             self.writes += 1;

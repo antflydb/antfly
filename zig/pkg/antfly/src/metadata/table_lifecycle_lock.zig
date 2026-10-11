@@ -10,6 +10,23 @@ const std = @import("std");
 pub const Id = [16]u8;
 pub const Kind = enum(u8) { generation = 1, initial_support = 2, index_build = 3 };
 pub const encoded_len = 17;
+const all_prefix = "\x00\x00__metadata__:fk_generation_table_lock:";
+pub fn allGroupsPrefix() []const u8 {
+    return all_prefix;
+}
+pub fn groupFromKey(storage_key: []const u8) !?u64 {
+    if (!std.mem.startsWith(u8, storage_key, all_prefix)) return null;
+    var parts = std.mem.splitScalar(u8, storage_key[all_prefix.len..], ':');
+    const group_bytes = parts.next() orelse return error.InvalidCatalogRecord;
+    const table_bytes = parts.next() orelse return error.InvalidCatalogRecord;
+    if (parts.next() != null) return error.InvalidCatalogRecord;
+    const group = std.fmt.parseInt(u64, group_bytes, 10) catch return error.InvalidCatalogRecord;
+    const table = std.fmt.parseInt(u64, table_bytes, 10) catch return error.InvalidCatalogRecord;
+    var buf: [20]u8 = undefined;
+    if (group == 0 or table == 0 or !std.mem.eql(u8, group_bytes, try std.fmt.bufPrint(&buf, "{d}", .{group})) or
+        !std.mem.eql(u8, table_bytes, try std.fmt.bufPrint(&buf, "{d}", .{table}))) return error.InvalidCatalogRecord;
+    return group;
+}
 
 // Keep the original durable namespace: all schema/topology writers must see
 // the SAME exclusion key, including databases predating index-build jobs.

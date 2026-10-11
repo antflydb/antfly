@@ -65,7 +65,11 @@ const std = @import("std");
 /// generated-name admission predicates for catalog, FK and rewrite workflows.
 /// Version 35 binds regular FK publication to owner-identical CHECK coverage.
 /// The explicit plan/command marker preserves predecessor log interpretation.
-pub const current_version: u16 = 35;
+/// Version 36 decodes private UNIQUE publication admission, including durable
+/// pending namespace sources and fixed-size owner progress. It does not imply
+/// native owner build/install capability or enable a public SQL producer.
+pub const current_version: u16 = 36;
+pub const index_publication_admission_version: u16 = 36;
 pub const checks_catalog_identity_version: u16 = 35;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 34;

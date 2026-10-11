@@ -1274,3 +1274,91 @@ atomically stage plan, head, owner records, shared table lock and pending name
 through the verified catalog source/checkpoint machinery. Production owner
 builders, distributed uniqueness claims and public publication also remain
 unfinished. No original SQL inventory credit or latency/throughput claim is made.
+
+### Durable private UNIQUE admission and namespace recovery
+
+The private `begin_relational_index_publication` metadata transition now
+independently prepares the candidate and rechecks the live logical table guard,
+metadata incarnation, exact namespace, current table and complete range cut,
+conflicting topology/backup/restore work and row-policy admission. It requires a
+constraint-membership-capable live namespace root and a distinct metadata decoder
+floor (36). This floor does **not** advertise native owner build/install support
+or enable a SQL/API producer.
+
+Admission stages the immutable plan, fixed-size head and ordinal owner records,
+pending pointer and shared index-build lifecycle lock in one existing metadata
+transaction. Pending names are derived through the ordinary successor `TableCut`
+and published by the same journaled namespace writer as document/FK/restore
+operations. Name collisions roll back all staged job records, the lock, source
+clock and buffered effects. The old public table definition remains unchanged.
+The index reservation is occupied but is not an active lookup result; an
+index-origin uniqueness rule does not invent a separate SQL constraint name.
+
+Immutable plan and pending-pointer changes participate in source epochs,
+reconciliation input and semantic checkpoint fingerprints. Head/owner progress
+is deliberately excluded from namespace sources. Checkpoint verification
+independently recompiles each bounded plan, verifies its canonical frame digest,
+candidate/reservation identities and complete owner cohort, recomputes progress
+counters, and verifies lifecycle visibility and the exact shared lock. Reverse
+record counts reject orphan/extra records without retaining a global job map.
+Incoming snapshot validation uses the same private-index record/cohort verifier;
+same-group corruptions are rejected before a staging snapshot can be published.
+Nonterminal jobs also match the actual full table and range descriptors against
+their locked plan cut. Terminal history deliberately skips these comparisons so
+later legitimate DDL/topology is not frozen by a completed job. The decoded plan
+is owned and reused for these checks rather than parsed a second time.
+Global key scans also reject jobs and index locks in unadopted metadata groups.
+All four new record classes are registered for Raft snapshots and standby replay.
+
+Only stale table-guard/head CAS failures are expected no-ops during committed
+replay, and only after the adopted namespace journal has rolled back storage and
+buffered outcomes. Capability/coverage, policy, corruption and storage failures
+remain errors. Fresh attempts CAS the exact terminal predecessor head; the same
+job ID cannot be reused. Replacement trims superseded owner ordinals, and table
+deletion removes the retained terminal job rather than accumulating job history.
+
+The native admission regression exercises actual metadata transactions, reopen
+and snapshot verification, a post-staging namespace collision, stale-CAS replay,
+decoder downgrade rejection, unchanged public schema, and fourteen deliberate
+recovery faults (missing/substituted head, owner, pointer, plan and lock records,
+counter disagreement, orphan groups/locks and actual table/range substitution).
+
+A separate real-storage component test alternates one/two-owner plans over 32
+terminal replacements, verifies exact retained cardinality, rejects stale heads
+and reused job IDs, and verifies complete terminal-job deletion. Synthetic
+kernel cleanup receipts exercise storage/CAS only; they are not evidence of
+authenticated native owner cleanup or a complete distributed churn workflow.
+It also accepts a changed current table and absent historical ranges after
+terminal completion, qualifying the retained-history exemption.
+
+Review also reproduced a borrowed-result lifetime bug in `PreparedAck.stage`:
+reading the owner could overwrite the head buffer before comparison. A mock
+reader that reuses one scratch buffer made the existing staging regression fail.
+Staging now consumes each predecessor before the next read; both comparisons
+still precede either write. It retains allocation-free, two-point-read/two-write
+behavior and exact replay/CAS semantics.
+
+Final qualification passes all six targeted gates in both Debug and ReleaseFast:
+`antfly-relational-index-publication-test`, `antfly-table-lifecycle-lock-test`,
+`antfly-relational-index-candidate-test`, `antfly-fk-generated-name-admission-test`,
+`relational-index-publication-progress-test`, and
+`system-catalog-relation-store-test`. The native runs report eight publication
+tests plus one decoder-floor test, four lock tests, four candidate tests, six FK
+tests and fifty existing namespace/recovery tests, with zero skips/failures/leaks.
+The allocation-free progress gate passes all nine tests. These are gate
+execution counts, not unique inventory credits or a full native-suite claim.
+Formatting, diff checks and control-source catalog freshness also pass. The
+PostgreSQL oracle and public SQL failed-build atomicity gate were not rerun for
+this metadata-only checkpoint.
+
+Remaining activation work is still substantial: independently attested native
+owner capability/catalog/epoch admission, private projected builders, globally
+coordinated UNIQUE claims, authenticated owner receipts, the durable worker and
+publication/cancellation continuations, and the public SQL producer.
+Admission range-ID enumeration should also gain an early streaming bound for
+oversized/stale current cohorts before allocating their complete ID list;
+independent recovery proof of the complete current range cohort and live
+namespace/incarnation bindings needs qualification before producer activation.
+The known regular `CREATE UNIQUE INDEX` atomicity regression remains open; this checkpoint
+does not credit any of the original 899 unresolved inventory cases or claim
+distributed build throughput, complete DDL churn qualification or public parity.

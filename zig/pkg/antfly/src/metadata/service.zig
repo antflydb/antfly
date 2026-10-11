@@ -3416,6 +3416,8 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .begin_relational_index_publication)
+        return metadata_topology_protocol.index_publication_admission_version;
     if (command == .apply_fk_generation_publication and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_generation_publication, fk_generation_publication.max_bytes))
         return metadata_topology_protocol.checks_catalog_identity_version;
     if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
@@ -3502,6 +3504,12 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         else => false,
     };
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
+}
+
+test "relational index publication admission requires its own coordinated decoder floor" {
+    const command: metadata_storage.TransitionCommand = .{ .begin_relational_index_publication = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.index_publication_admission_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expect(transitionRequiredCoordinatedDecoderVersion(command) > metadata_topology_protocol.checks_catalog_identity_version);
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {

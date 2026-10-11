@@ -259,6 +259,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_fk_generation_publication,
+        .begin_relational_index_publication,
         .apply_fk_initial_create,
         .upsert_table,
         .compare_and_replace_table,

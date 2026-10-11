@@ -300,12 +300,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
     const index_publication_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{"relational index publication"},
+        .filters = &.{ "relational index publication", "snapshot key registry" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const index_publication_run = addFilteredTestRunArtifact(b, index_publication_tests);
-    b.step("antfly-relational-index-publication-test", "Verify immutable UNIQUE plan and owned admission postimages")
-        .dependOn(&index_publication_run.step);
+    const index_publication_step = b.step("antfly-relational-index-publication-test", "Verify immutable UNIQUE plans, durable admission, namespace rollback and recovery faults");
+    index_publication_step.dependOn(&index_publication_run.step);
+    const index_publication_barrier_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"relational index publication admission requires its own coordinated decoder floor"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    index_publication_step.dependOn(&addFilteredTestRunArtifact(b, index_publication_barrier_tests).step);
     const lifecycle_lock_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "table lifecycle lock", "generation lock freezes the table cut", "index build lock freezes the table cut" },
