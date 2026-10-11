@@ -28,6 +28,97 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_anonymous_primary_key_validation_preserves_failed_source(self):
+        cases = (
+            ("pk_anonymous", [(1, "a"), (2, "b")], None, False),
+            ("pk_anonymous_null", [(None, "null")], "23502", False),
+            ("pk_anonymous_duplicate", [(7, "a"), (7, "b")], "23505", False),
+            ("pk_anonymous_collision", [(1, "a"), (2, "b")], None, True),
+        )
+        with postgres() as db:
+            db.execute("CREATE TABLE public.name_owner (id BIGINT)")
+            for name, rows, expected_error, collision in cases:
+                with self.subTest(name=name):
+                    relation = pgsql.Identifier("public", name)
+                    db.execute(
+                        pgsql.SQL("CREATE TABLE {} (id BIGINT, note TEXT)").format(
+                            relation
+                        )
+                    )
+                    for row in rows:
+                        db.execute(
+                            pgsql.SQL("INSERT INTO {} VALUES (%s, %s)").format(
+                                relation
+                            ),
+                            row,
+                        )
+                    if collision:
+                        db.execute(
+                            pgsql.SQL(
+                                "CREATE INDEX {} ON public.name_owner (id)"
+                            ).format(pgsql.Identifier(name + "_pkey"))
+                        )
+                    alter = pgsql.SQL("ALTER TABLE {} ADD PRIMARY KEY (id)").format(
+                        relation
+                    )
+                    if expected_error is None:
+                        self.assertEqual("ALTER TABLE", db.execute(alter).statusmessage)
+                    else:
+                        with self.assertRaises(psycopg.Error) as rejected:
+                            db.execute(alter)
+                        self.assertEqual(expected_error, rejected.exception.sqlstate)
+                    self.assertEqual(
+                        rows,
+                        db.execute(
+                            pgsql.SQL("SELECT id, note FROM {} ORDER BY note").format(
+                                relation
+                            )
+                        ).fetchall(),
+                    )
+                    expected_name = name + ("_pkey1" if collision else "_pkey")
+                    self.assertEqual(
+                        [(expected_name, "p", True, True)]
+                        if expected_error is None
+                        else [],
+                        db.execute(
+                            "SELECT c.conname, c.contype, i.indisvalid, i.indisready "
+                            "FROM pg_constraint c JOIN pg_index i "
+                            "ON i.indexrelid=c.conindid WHERE c.conrelid=%s::regclass",
+                            ("public." + name,),
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
+                        [(expected_error is None,)],
+                        db.execute(
+                            "SELECT attnotnull FROM pg_attribute "
+                            "WHERE attrelid=%s::regclass AND attname='id'",
+                            ("public." + name,),
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
+                        [(1 if expected_error is None else 0,)],
+                        db.execute(
+                            "SELECT count(*) FROM pg_index WHERE indrelid=%s::regclass",
+                            ("public." + name,),
+                        ).fetchall(),
+                    )
+                    if expected_error is None:
+                        with self.assertRaises(psycopg.Error) as duplicate:
+                            db.execute(
+                                pgsql.SQL(
+                                    "INSERT INTO {} VALUES (1, 'duplicate')"
+                                ).format(relation)
+                            )
+                        self.assertEqual("23505", duplicate.exception.sqlstate)
+                        self.assertEqual(
+                            rows,
+                            db.execute(
+                                pgsql.SQL(
+                                    "SELECT id, note FROM {} ORDER BY note"
+                                ).format(relation)
+                            ).fetchall(),
+                        )
+
     def test_alter_generated_names_distinguish_index_and_constraint_ownership(self):
         cases = (
             (

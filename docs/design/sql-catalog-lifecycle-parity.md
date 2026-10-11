@@ -1,6 +1,6 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: follow-up to merged PR #1048, merged with `origin/main` at `b7e4f43a30`.
+Status: follow-up to merged PR #1048, merged with `origin/main` at `121699433e`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -754,8 +754,16 @@ during freeze. The optimized rerun also passes all five focused tests, and the
 native store rerun passes 49 tests with no leaks.
 
 The public campaign bootstraps an independently verified namespace through
-real leader/all-voter admission before its first anonymous CREATE. Broader
-coordinator/public campaigns are still running. The new native named-FK gate
+real leader/all-voter admission before its first anonymous CREATE. The public
+catalog/index Debug gate passes 24 tests and one boundary audit; this establishes
+declaration and metadata recovery evidence, not complete original-case DML
+qualification. The broader coordinator rerun and mounted primary-key/FK
+data-owner campaigns remain pending. Both mounted gates now fail on skipped
+tests, so a denied loopback bind cannot masquerade as successful qualification.
+The primary-key campaign retains the explicit-name cases and adds anonymous
+success, NULL and duplicate rejection plus post-restart enforcement. The FK
+campaign exercises SQL name preparation during the existing three-voter hidden
+child leadership-transfer scenario. The new native named-FK gate
 passes three tests in both Debug and ReleaseFast: it prepares the name from an attested namespace,
 begins with typed child/parent schemas and exact metadata cuts, and preserves
 both owner locks, the guard and plan digest through restart. Cancellation stays
@@ -765,3 +773,14 @@ native fixtures supply the capability barrier externally; they are not proof
 of quorum failover or data-owner enforcement. Distributed ownership/failover
 and data-owner activation qualification remain
 required; no original-case dispositions change at this checkpoint.
+
+The expanded PostgreSQL 18 oracle passes all 14 catalog-lifecycle tests. Its
+anonymous primary-key cases independently verify NULL rejection (`23502`),
+duplicate rejection (`23505`), unchanged source rows and absence of residual
+indexes/constraints or NOT NULL changes after failure. Successful additions
+choose the ordinary or collision-suffixed name, publish a ready/valid index,
+and reject a later duplicate without changing the rows. This is oracle evidence,
+not native/distributed original-case completion. The coordinator qualification
+also asserts that index retirement and legacy-shaped source writes preserve
+the activated occupancy floor instead of downgrading to the older mutation
+protocol; the current rerun remains pending.

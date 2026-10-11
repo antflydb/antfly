@@ -325,6 +325,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     });
     defer child_response.deinit(alloc);
 
+    if (child_response.status != 202) std.debug.print("initial FK admission failed status={d} body={s}\n", .{ child_response.status, child_response.body });
     try std.testing.expectEqual(@as(u16, 202), child_response.status);
     var accepted = try std.json.parseFromSlice(struct {
         table_id: ?[]const u8 = null,

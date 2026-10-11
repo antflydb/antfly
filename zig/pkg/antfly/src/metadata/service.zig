@@ -19134,7 +19134,9 @@ test "relation reconciliation worker activates and publishes verified roots in r
     const dropped = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "shared_key" }} });
     defer dropped.deinit(a);
     try std.testing.expect(dropped.relations[0] == null);
-    try std.testing.expectEqual(metadata_topology_protocol.relation_mutation_version, (try store.topologyActivation(group)).?.version);
+    // A legacy-shaped source write must inherit, never downgrade, the
+    // namespace's activated occupancy floor after the index is retired.
+    try std.testing.expectEqual(metadata_topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
     svc.lockRuntime();
     defer svc.unlockRuntime();
     try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());
