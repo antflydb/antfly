@@ -1959,7 +1959,8 @@ Debug qualification of these replay changes passes 65/65 build steps across
 and `relational-index-catalog-test`. Custom artifacts pass seven candidate,
 ten candidate/private-addition, four system/page and fourteen catalog tests,
 with no skips, failures or leaks; these overlapping selections are not summed
-as independent SQL cases. ReleaseFast qualification is running. The original
+as independent SQL cases. ReleaseFast also passes 65/65 build steps and all
+four custom artifact selections without skips, failures or leaks. The original
 SQL inventory remains unchanged, and the remaining activation requirements
 above still apply.
 
@@ -1972,6 +1973,53 @@ predecessor integrity catalog and index identity needed to reconstruct the
 candidate, bound to the durable job fingerprints. Recovery must validate those
 bindings before rebuilding owned schema views outside the apply lock. Standby
 replay must not depend on a fresh metadata network read to reconstruct effects
-already admitted by its authenticated primary. Neither the new replay staging
-entry points nor the existing binding-only component fixtures establish this
-durable input/admission/outbox contract; it remains part of worker activation.
+already admitted by its authenticated primary. The binding-only replay
+checkpoint did not establish this durable input/admission/outbox contract. The
+next checkpoint adds the local manifest; the ordered DB/standby outbox portion
+still remains part of worker activation.
+
+### Durable native worker manifests
+
+Prepared native candidates now own a bounded, length-framed manifest containing
+the exact before/after API schema bytes, predecessor integrity catalog and index
+name. Framing retains raw bytes without JSON/base64 expansion and checks its
+lengths and physical checksum before allocation. The private job binding is now
+version 3 (688 bytes), with a manifest digest included in its own checksum and
+native receipt context. Earlier PR-local private formats are not accepted.
+
+Admission requires the prepared manifest and commits it with the job, fence and
+native admission cut in the caller's transaction. Exact retries verify the
+immutable stored bytes; a substituted or orphan manifest cannot authorize a
+new job. The manifest key is protected alongside other private index metadata.
+Cold recovery owns the manifest before subsequent transactional reads, rebuilds
+the typed candidate, and verifies both admitted catalog fingerprints and the
+native before-schema identity. API schema JSON is not the serialized native
+schema: the latter's identity comes from the shared typed compiler, not a hash
+of the API JSON. Live page guards still read fixed-size bindings/receipt slots,
+not schema-sized manifests or repeated JSON compilation.
+Receipt reconstruction separately checks the durable manifest's framing,
+checksum and admitted digest without allocation or schema compilation. Missing
+or substituted inputs therefore cannot produce a new ACK proof from a worker
+that was already open before corruption. This check is per receipt, not per
+row/page.
+
+The component campaign includes absent, corrupt and checksum-valid substituted
+manifests on memory/LSM recovery and live receipts, orphan rejection at both
+recovery and admission, atomic admission rollback, exact replay, schema
+representation identity, borrowed-buffer ownership and allocation-failure
+cleanup. Final Debug and ReleaseFast qualification each pass 65/65 build steps
+across the candidate, page and catalog gates. Custom artifacts pass eight
+candidate, eleven candidate/private-addition, four system/page and fourteen
+catalog tests with no skips, failures or leaks; overlapping selections are
+not added to SQL inventory credits. Metadata publication integration passes
+59/59 Debug build steps, seventeen publication tests and the decoder-floor
+test. The actual `embedded-capi-check` production gate passes 28/28 Debug
+build steps. Formatting, diff checks, the 822-source embedded dependency
+boundary, control-catalog freshness and original inventory integrity pass.
+The initial API-byte/native-schema fingerprint mismatch was fixed by checking
+the independently rebuilt native identity, not by weakening schema guards.
+This persists the reconstruction inputs;
+it does not yet implement the ordered DB/C-ABI/RPC entry point or its atomic
+standby outbox/frame, independently attested public admission, global UNIQUE
+claims, terminal cleanup, publication/cancellation or distributed fault gates.
+The public producer stays disabled and original SQL dispositions stay unchanged.

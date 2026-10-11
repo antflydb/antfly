@@ -28,6 +28,7 @@ const transactions = @import("../transactions.zig");
 const source_authority = @import("../source_authority.zig");
 const positions = @import("receipt_position.zig");
 const publication = @import("relational_index_publication_progress.zig");
+const inputs_mod = @import("relational_index_inputs.zig");
 const Digest = [32]u8;
 pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
 pub const Phase = enum(u8) { fencing, reserved };
@@ -51,7 +52,7 @@ fn optional(txn: anytype, physical_key: []const u8) !?[]const u8 {
 /// transition number alone never authenticates retries. Hashes are identity,
 /// not proof of metadata authority. Admission and reserve are independently CASed.
 pub const Binding = struct {
-    pub const encoded_len = 656;
+    pub const encoded_len = 688;
     id: [16]u8,
     plan_digest: Digest,
     owner_digest: Digest,
@@ -67,9 +68,10 @@ pub const Binding = struct {
     physical_reserved: physical_catalog.Head,
     physical_candidate: physical_catalog.Head,
     index: records.Id,
+    inputs_digest: Digest,
 
     pub fn encode(self: Binding) ![encoded_len]u8 {
-        if (!nonzero(&self.id) or !nonzero(&self.plan_digest) or !nonzero(&self.owner_digest) or
+        if (!nonzero(&self.id) or !nonzero(&self.plan_digest) or !nonzero(&self.owner_digest) or !nonzero(&self.inputs_digest) or
             self.ordinal >= @import("relational_index_publication_progress.zig").max_owners or
             self.fence.role != .index_build or !nonzero(&self.integrity_before) or
             self.fence.namespace.shard_id == 0 or self.fence.namespace.range_id == 0 or
@@ -86,7 +88,7 @@ pub const Binding = struct {
         } else if (self.physical_reserved.revision != 2) return error.InvalidPrivateIndexOwnerJob;
         var out: [encoded_len]u8 = @splat(0);
         @memcpy(out[0..4], "AIOJ");
-        std.mem.writeInt(u32, out[4..8], 2, .little);
+        std.mem.writeInt(u32, out[4..8], 3, .little);
         @memcpy(out[8..24], &self.id);
         @memcpy(out[24..56], &self.plan_digest);
         @memcpy(out[56..88], &self.owner_digest);
@@ -103,15 +105,16 @@ pub const Binding = struct {
         @memcpy(out[444..528], &self.physical_reserved.encode());
         @memcpy(out[528..612], &self.physical_candidate.encode());
         @memcpy(out[612..624], &self.index.encode());
-        @memcpy(out[624..656], &digest(out[0..624]));
+        @memcpy(out[624..656], &self.inputs_digest);
+        @memcpy(out[656..688], &digest(out[0..656]));
         return out;
     }
 
     pub fn decode(bytes: []const u8) !Binding {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIOJ") or
-            std.mem.readInt(u32, bytes[4..8], .little) != 2 or bytes[227] > 1 or
+            std.mem.readInt(u32, bytes[4..8], .little) != 3 or bytes[227] > 1 or
             !std.mem.allEqual(u8, bytes[229..232], 0) or
-            !std.mem.eql(u8, bytes[624..656], &digest(bytes[0..624]))) return error.InvalidPrivateIndexOwnerJob;
+            !std.mem.eql(u8, bytes[656..688], &digest(bytes[0..656]))) return error.InvalidPrivateIndexOwnerJob;
         if (bytes[227] == 0 and !std.mem.allEqual(u8, bytes[360..444], 0)) return error.InvalidPrivateIndexOwnerJob;
         const result: Binding = .{
             .id = bytes[8..24].*,
@@ -129,6 +132,7 @@ pub const Binding = struct {
             .physical_reserved = try physical_catalog.Head.decode(bytes[444..528]),
             .physical_candidate = try physical_catalog.Head.decode(bytes[528..612]),
             .index = try records.Id.decode(bytes[612..624]),
+            .inputs_digest = bytes[624..656].*,
         };
         _ = try result.encode();
         return result;
@@ -152,6 +156,7 @@ pub fn prepare(id: [16]u8, plan_digest: Digest, owner_digest: Digest, ordinal: u
         .physical_reserved = physical.reservation.head,
         .physical_candidate = physical.candidate.head,
         .index = physical.index,
+        .inputs_digest = inputs_mod.digest(candidate.inputs.bytes),
     };
     const incarnation = try integrity_catalog.incarnationFromTableId(fence.namespace.table_id);
     if (!std.mem.eql(u8, &candidate.next.catalog.incarnation, &incarnation) or
@@ -167,6 +172,23 @@ pub fn prepare(id: [16]u8, plan_digest: Digest, owner_digest: Digest, ordinal: u
 
 pub fn load(txn: anytype) !?Binding {
     return if (try optional(txn, key)) |bytes| try Binding.decode(bytes) else null;
+}
+
+/// Cold preparation owns its input bytes before any further store read. This
+/// compiler work belongs outside serialized apply, never on a build-page path.
+pub fn reopenCandidate(alloc: std.mem.Allocator, txn: anytype, binding: Binding) !candidate_mod.Candidate {
+    var inputs = try inputs_mod.Prepared.load(alloc, txn, binding.inputs_digest);
+    defer inputs.deinit();
+    const view = try inputs_mod.decode(inputs.bytes);
+    var candidate = try candidate_mod.Candidate.prepare(alloc, binding.fence.namespace.table_id, view.before_json, view.after_json, view.predecessor, view.name);
+    errdefer candidate.deinit();
+    // API JSON and serialized native schema are different representations.
+    // Match the independently rebuilt native identity, not the API byte hash.
+    if (!std.mem.eql(u8, &candidate.reservation.catalog.schema_digest, &binding.schema_before) or
+        !std.mem.eql(u8, &digest(view.predecessor), &binding.integrity_before) or
+        !std.mem.eql(u8, &digest(candidate.reservation.value), &binding.integrity_reserved) or
+        !std.mem.eql(u8, &digest(candidate.next.value), &binding.integrity_candidate)) return error.InvalidPrivateIndexInputs;
+    return candidate;
 }
 
 fn requireNamespace(txn: anytype, binding: Binding) !void {
@@ -296,6 +318,7 @@ fn logicalReceipt(binding: Binding, action: NativeEffect, cut: NativeCut) !publi
 /// receiving worker; local state and a checksum alone cannot grant it.
 pub fn nativeReceipt(txn: anytype, binding: Binding, action: NativeEffect) !publication.Receipt {
     const current = try requireNativeJob(txn, binding);
+    try inputs_mod.require(txn, current.inputs_digest);
     if (action == .reserved and current.phase != .reserved) return error.InvalidPrivateIndexNativeReceipt;
     return logicalReceipt(binding, action, try requireNativeCut(txn, binding, action));
 }
@@ -382,6 +405,7 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     const fence = if (try optional(txn, topology.fence_key)) |bytes| try topology.Fence.decode(bytes) else null;
     if (binding == null) {
         if (fence) |value| if (value.role == .index_build) return error.PrivateIndexJobRequired;
+        if (try optional(txn, inputs_mod.key) != null) return error.InvalidPrivateIndexInputs;
         return;
     }
     const job = binding.?;
@@ -389,6 +413,8 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     if (fence == null) return error.IntegrityTopologyFenceMissing;
     if (!fence.?.eql(job.fence)) return error.IntegrityTopologyChanged;
     try requireNativeCuts(txn, job);
+    var prepared_candidate = try reopenCandidate(alloc, txn, job);
+    defer prepared_candidate.deinit();
     if (try topology.completed(txn)) |completed| {
         if (completed.admission_epoch >= job.fence.admission_epoch) return error.PrivateIndexPublicationRequired;
     }
@@ -460,22 +486,26 @@ pub fn reopenPhysical(alloc: std.mem.Allocator, txn: anytype, before: @import("s
 /// Metadata authority and local range identity must already be independently
 /// attested by the ordered owner. Fence and binding commit atomically; old
 /// participants may finish but no new participants may enter after this commit.
-pub fn stageBegin(txn: anytype, binding: Binding) !bool {
-    return stageBeginWithReplay(txn, binding, null);
+pub fn stageBegin(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prepared) !bool {
+    return stageBeginWithReplay(txn, binding, inputs, null);
 }
 
 /// The ordered owner stages the forwarded clock and admitted job in the same
 /// transaction. Errors require aborting that transaction, including when the
 /// forwarded clock is not the exact successor of the local durable clock.
-pub fn stageBeginWithReplay(txn: anytype, binding: Binding, replay: ?positions.Native) !bool {
+pub fn stageBeginWithReplay(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prepared, replay: ?positions.Native) !bool {
     try validateReplay(binding, replay);
     if (binding.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
     const encoded = try binding.encode();
+    _ = try inputs_mod.decode(inputs.bytes);
+    if (!std.mem.eql(u8, &inputs_mod.digest(inputs.bytes), &binding.inputs_digest)) return error.InvalidPrivateIndexInputs;
     try requireNamespace(txn, binding);
     if (try load(txn)) |existing| {
         var original = existing;
         original.phase = .fencing;
         if (!std.mem.eql(u8, &try original.encode(), &encoded)) return error.PrivateIndexOwnerJobChanged;
+        const stored_inputs = (try optional(txn, inputs_mod.key)) orelse return error.InvalidPrivateIndexInputs;
+        if (!std.mem.eql(u8, stored_inputs, inputs.bytes)) return error.InvalidPrivateIndexInputs;
         const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
         if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
         try requireNativeCuts(txn, existing);
@@ -490,6 +520,8 @@ pub fn stageBeginWithReplay(txn: anytype, binding: Binding, replay: ?positions.N
     } else if (physical != null) return error.PreparedGenerationChanged;
     const schema_bytes = (try optional(txn, schema.schema_key)) orelse return error.RelationalIndexCatalogSchemaMismatch;
     if (!std.mem.eql(u8, &digest(schema_bytes), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+    if (try optional(txn, inputs_mod.key) != null) return error.InvalidPrivateIndexInputs;
+    try txn.put(inputs_mod.key, inputs.bytes);
     try txn.put(key, &encoded);
     try topology.stagePrivateIndexBegin(txn, binding.fence);
     if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .admitted, replay);
