@@ -938,11 +938,14 @@ pub const ResolveMany = struct {
     include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
     relations: []const RelationTarget = &.{},
+    /// Name allocation may use an authoritative metadata cut without a
+    /// published index-owner registry. It never authorizes schema mutation.
+    name_allocation: bool = false,
     expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         if (self.relations.len != 0 or self.expected_relation_epoch != null) {
-            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .expected_relation_epoch = self.expected_relation_epoch });
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .name_allocation = self.name_allocation, .expected_relation_epoch = self.expected_relation_epoch });
         } else {
             // Keep ordinary table resolution compatible with strict old peers.
             try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision });
@@ -958,10 +961,12 @@ pub const ResolvedMany = struct {
     /// A missing field from an older peer must never prove name absence.
     relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
     relations: []const ?ResolvedRelation = &.{},
+    /// These owners attest name occupancy only, not index publication.
+    relation_names_only: bool = false,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         if (self.relation_epoch != null or self.relations.len != 0) {
-            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations });
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations, .relation_names_only = self.relation_names_only });
         } else {
             try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names });
         }
@@ -970,6 +975,7 @@ pub const ResolvedMany = struct {
     /// Validate the optional capability before consuming a peer's answers.
     /// In particular, an old receiver's empty default is not a negative lookup.
     pub fn validateRelations(self: @This(), request: ResolveMany) !void {
+        if (self.relation_names_only and !request.name_allocation) return error.CatalogPublicationProofPending;
         if (request.relations.len == 0) {
             if (request.expected_relation_epoch != null) return error.InvalidCatalogMutation;
             return;

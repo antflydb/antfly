@@ -35,6 +35,10 @@ pub const Identity = struct {
 
 pub const Request = struct {
     statement: []const u8,
+    /// Reclaiming allocator sharing the connection cap. Result envelopes use
+    /// the describe/execute arena; backend-owned execution scratch/results can
+    /// release memory independently instead of nesting under that arena.
+    scratch_allocator: ?std.mem.Allocator = null,
     parameters: []const std.json.Value = &.{},
     parameter_types: []const Type = &.{},
     parameter_descriptors: []const Parameter = &.{},
