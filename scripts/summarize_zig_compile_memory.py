@@ -21,14 +21,58 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
+import shutil
 
 GIB = 1024**3
 
 
-def summarize(text):
+def expand_response_files(command, response_dir=None, cache=None, capture_dir=None):
+    """Retain response files with the trace; missing arguments must fail closed."""
+    if " @" not in command:
+        return command
+    cache = {} if cache is None else cache
+
+    def expand(arguments, active=()):
+        result = []
+        for argument in arguments:
+            if not argument.startswith("@"):
+                result.append(argument)
+                continue
+            path = Path(argument[1:])
+            if not path.is_file() and response_dir is not None:
+                path = Path(response_dir) / path.name
+            path = path.resolve()
+            if path in active or len(active) >= 8:
+                raise ValueError(f"recursive compiler response file: {path}")
+            if path not in cache:
+                try:
+                    content = path.read_text()
+                    cache[path] = shlex.split(content)
+                    if capture_dir is not None:
+                        destination = Path(capture_dir) / path.name
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if destination.exists() and destination.read_text() != content:
+                            raise ValueError(
+                                f"response file basename collision: {path.name}"
+                            )
+                        if destination.resolve() != path:
+                            shutil.copyfile(path, destination)
+                except OSError as error:
+                    raise ValueError(
+                        f"compiler response file unavailable: {path}; retain it or use --response-dir"
+                    ) from error
+            result.extend(expand(cache[path], (*active, path)))
+        return result
+
+    return shlex.join(expand(shlex.split(command)))
+
+
+def summarize(text, response_dir=None, capture_dir=None):
     units = {}
     samples = {}
     precise_samples = True
+    response_cache = {}
     for line in text.splitlines()[1:]:
         fields = line.split("\t")
         if len(fields) not in (6, 7):
@@ -43,16 +87,23 @@ def summarize(text):
         # per-PID maxima form an upper envelope, not a simultaneous RSS peak.
         processes = samples.setdefault(sample, {})
         processes[pid] = max(processes.get(pid, 0), size)
+        expanded = expand_response_files(
+            command, response_dir, response_cache, capture_dir
+        )
         match = re.search(
-            r"(?:^|\s)--name\s+(antfly-storage-kernel|antfly-runtime-[\w-]+)(?:\s|$)",
-            command,
+            r"(?:^|\s)--name\s+(antfly(?:-[\w-]+)?|libantfly)(?:\s|$)",
+            expanded,
         )
         if not match:
             continue
         unit = (
             "storage_kernel"
             if match[1] == "antfly-storage-kernel"
-            else match[1].removeprefix("antfly-runtime-")
+            else (
+                match[1].removeprefix("antfly-runtime-")
+                if match[1].startswith("antfly-runtime-")
+                else match[1].removeprefix("antfly-").replace("-", "_")
+            )
         )
         row = units.setdefault(unit, {"peak_rss_bytes": 0, "command": command})
         if size > row["peak_rss_bytes"]:
@@ -77,8 +128,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--response-dir", type=Path, help="Directory of retained Zig response files"
+    )
+    parser.add_argument(
+        "--capture-response-dir",
+        type=Path,
+        help="Copy compiler response files for portable trace attribution",
+    )
     args = parser.parse_args()
-    report = summarize(args.trace.read_text())
+    report = summarize(
+        args.trace.read_text(), args.response_dir, args.capture_response_dir
+    )
     report["trace"] = str(args.trace.resolve())
     args.output.write_text(json.dumps(report, indent=2) + "\n")
 
