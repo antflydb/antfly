@@ -27,6 +27,11 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const cohort_files = @import("lake_index_cohort_files.zig");
+// Share the existing 4 MiB workspace across active builders. Reusable spill
+// extents decouple logical merge levels from the 64-file descriptor limit.
+// Small cohorts receive larger runs; fused cohorts avoid extra replay passes.
+const cohort_size = 8;
+const sort_workspace_bytes = 4 * 1024 * 1024;
 
 pub fn logicalName(a: A, name: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
@@ -119,7 +124,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var planned_roots: ?[]?ordered.Root = null;
     var planned_files: ?[]const cohort_files.File = null;
     var replay_files: ?[]const bool = null;
-    if (input.replay == null and definitions.len > 8) {
+    if (input.replay == null and definitions.len > cohort_size) {
         const roots = try ca.alloc(?ordered.Root, definitions.len);
         @memset(roots, null);
         const requirements = try ca.alloc(cohort_files.Requirement, definitions.len);
@@ -163,7 +168,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     while (first < definitions.len) {
         // Retained runs share one anonymous extent container per sort.
         // Pending runs and bounded merges remain within the 64-file manager.
-        const end = @min(first + 8, definitions.len);
+        const end = @min(first + cohort_size, definitions.len);
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
         defer {
@@ -229,10 +234,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (slot_names.items, slot_hashes.items) |file, *digest| if (!files.contains(file)) {
                 digest.* = @splat(0);
             };
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
         }
         if (entries.items.len == 0) continue;
+        for (entries.items) |*entry| entry.sort.memory_bytes = sort_workspace_bytes / entries.items.len;
         for (entries.items) |*entry| if (entry.delta.previous == null) {
             entry.reverse = try ordered.ReverseBuilder.create(a, store, cancellation);
         };

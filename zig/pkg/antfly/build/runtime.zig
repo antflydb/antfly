@@ -106,7 +106,6 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
-    libantfly_link_mod: *std.Build.Module,
 };
 pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
@@ -128,7 +127,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const production_antfly_imports = options.production_antfly_imports;
     const antfly_client_pkg_mod = options.antfly_client_pkg_mod;
     const capi_mod = options.capi_mod;
-    const libantfly_link_mod = options.libantfly_link_mod;
     const main_module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("pkg/antfly/src/main.zig"),
         .target = target,
@@ -153,7 +151,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     });
     addMacosSdkPaths(b, antfly_main_tests.root_module, target);
     production_antfly_imports.build_info.link(antfly_main_mod);
-    production_antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
@@ -204,8 +201,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             capi_options.addOption(bool, "linked_storage", true);
             // This archive is shared by the default `libantfly` and by the
             // `antfly` executable. Both link the inference runtime archive
-            // in-process (see `link_anchor.zig` and the `.inference` unit
-            // linked into `libantfly_link_mod` below), so the
+            // in-process (see `link_anchor.zig` and the embedded library
+            // composition), so the
             // embedded-inference construction path is always available.
             capi_options.addOption(bool, "inference_enabled", true);
             role_mod.addOptions("capi_build_options", capi_options);

@@ -47,6 +47,10 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         .linkage = if (macho) .static else .dynamic,
         .name = if (macho) "antfly-capi-objects" else "antfly",
         .root_module = module,
+        // ELF version scripts must also hide compiler-provided Debug UBSan
+        // symbols. Use the linker that applies the final export boundary to
+        // every linked object, including those runtime objects.
+        .use_lld = if (elf) true else null,
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const binary = if (macho) blk: {

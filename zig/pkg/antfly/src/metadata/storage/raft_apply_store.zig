@@ -126,10 +126,19 @@ fn adoptRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, grou
     defer if (cursor_open) cursor.close();
     var buf: [160]u8 = undefined;
     const prefix = try tablePrefixForGroup(&buf, group);
+    var table_ids: std.ArrayList(u64) = .empty;
+    defer table_ids.deinit(a);
     var row = try cursor.seekAtOrAfter(prefix);
     while (row) |item| : (row = try cursor.next()) {
         if (!std.mem.startsWith(u8, item.key, prefix)) break;
         const id = (try RaftApplyStore.capturedRelationTableId(item.key, group)).?;
+        try table_ids.append(a, id);
+    }
+    // Registry writes can replace the transaction's memtable sources. Finish
+    // traversal before mutating them, retaining only owned table identifiers.
+    cursor.close();
+    cursor_open = false;
+    for (table_ids.items) |id| {
         var cut = try RaftApplyStore.relationWriterSnapshot(a, &txn, group, id, true);
         defer cut.deinit();
         var plan = try relation_names.Plan.init(a, &.{}, cut.claims());
@@ -137,8 +146,6 @@ fn adoptRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, grou
         var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
         try plan.apply(&registry);
     }
-    cursor.close();
-    cursor_open = false;
     try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
     try verifyRelationCheckpointTxn(a, &txn);
     try txn.commit();
@@ -196,13 +203,90 @@ test "system catalog relation namespace transaction bulk resolution requires a l
     defer a.free(root);
     var store = try RaftApplyStore.init(a, .{ .root_dir = root });
     defer store.deinit();
-    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+
     const description: [256 * 1024]u8 = @splat('x');
     var table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .description = &description, .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"old_idx\"}]}" };
-    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    // Hosted name allocation requires a durable Raft cursor for its source
+    // cut. Exercise production apply rather than a standalone-only fixture.
+    const initialize = try encodeTransitionCommand(a, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    defer a.free(initialize);
+    const upsert = try encodeTransitionCommand(a, .{ .upsert_table = table });
+    defer a.free(upsert);
+    const entries = try raft_state_machine.encodeCommittedEntries(a, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = initialize },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = upsert },
+    });
+    defer a.free(entries);
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 2, .entries_bytes = entries });
     const targets = [_]system_catalog.RelationTarget{ .{ .name = "items" }, .{ .name = "old_idx" }, .{ .name = "new_idx" }, .{ .namespace = "missing", .name = "old_idx" } };
     try std.testing.expectError(error.CatalogPublicationProofPending, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets }));
+    var allocation_epoch: relation_reconciliation.Epoch = undefined;
+    {
+        const allocation: system_catalog.ResolveMany = .{ .relations = &targets, .name_allocation = true };
+        const names = try store.resolveSystemCatalogIdentities(a, group, allocation);
+        defer names.deinit(a);
+        try names.validateRelations(allocation);
+        allocation_epoch = names.relation_epoch.?;
+        try std.testing.expectError(error.DeadlineExceeded, store.resolveSystemCatalogIdentitiesWithContext(a, group, allocation, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }));
+        try std.testing.expect(names.relation_names_only);
+        try std.testing.expectEqual(relation_names.Kind.table, names.relations[0].?.owner.kind);
+        try std.testing.expectEqual(relation_names.Kind.index, names.relations[1].?.owner.kind);
+        try std.testing.expect(names.relations[2] == null and names.relations[3] == null);
+        try std.testing.expectError(error.CatalogPublicationProofPending, names.validateRelations(.{ .relations = &targets }));
+        try std.testing.expectError(error.InvalidCatalogMutation, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .include_query_definitions = true }));
+        var stale = names.relation_epoch.?;
+        stale.revision += 1;
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = stale }));
+    }
+    {
+        const Apply = struct {
+            fn command(s: *RaftApplyStore, allocator: std.mem.Allocator, g: u64, index: u64, value: restore_staging.Command) !void {
+                const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+                defer allocator.free(json);
+                const wire = try encodeTransitionCommand(allocator, .{ .apply_restore_staging = json });
+                defer allocator.free(wire);
+                const batch = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = wire }});
+                defer allocator.free(batch);
+                try s.snapshotBuilder().applyBatch(.{ .group_id = g, .commit_index = index, .entries_bytes = batch });
+            }
+        };
+        const plan: restore_staging.Plan = .{
+            .id = @splat(8),
+            .cohort_digest = @splat(9),
+            .targets = &.{.{
+                .source_table_id = 1,
+                .table = .{ .table_id = 11, .name = "hidden_restore", .schema_json = "{}" },
+                .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+            }},
+        };
+        try plan.validate(a);
+        const catalog_before = (try store.captureCatalogCursor(group)).revision;
+        try Apply.command(&store, a, group, 3, .{ .id = plan.id, .action = .reserve, .plan = plan });
+        var staged = (try store.loadRestoreStaging(a, group, plan.id)) orelse return error.MissingRestoreReservation;
+        defer staged.deinit();
+        try std.testing.expectEqual(catalog_before, (try store.captureCatalogCursor(group)).revision);
+        // Even a lookup for unrelated names must reject the old source cut.
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = allocation_epoch }));
+        const reserved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true });
+        defer reserved.deinit(a);
+        try std.testing.expectEqualSlices(u8, &allocation_epoch.incarnation, &reserved.relation_epoch.?.incarnation);
+        try std.testing.expect(reserved.relation_epoch.?.revision > allocation_epoch.revision);
+        for ([_][]const u8{"hidden_restore"}) |name| {
+            try std.testing.expectError(error.CatalogPublicationProofPending, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = name }}, .name_allocation = true }));
+        }
+        try Apply.command(&store, a, group, 4, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 1 });
+        try Apply.command(&store, a, group, 5, .{ .id = plan.id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = try plan.digest(a), .completion_digest = @splat(3) } });
+        try Apply.command(&store, a, group, 6, .{ .id = plan.id, .action = .finish_cancel, .expected_revision = 2 });
+        try std.testing.expectEqual(catalog_before, (try store.captureCatalogCursor(group)).revision);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = reserved.relation_epoch }));
+        const released = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "hidden_restore" }}, .name_allocation = true });
+        defer released.deinit(a);
+        try std.testing.expect(released.relation_epoch.?.revision > reserved.relation_epoch.?.revision);
+        try std.testing.expectEqualSlices(u8, &allocation_epoch.incarnation, &released.relation_epoch.?.incarnation);
+        try std.testing.expect(released.relations[0] == null);
+    }
     _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = allocation_epoch }));
     var epoch: relation_reconciliation.Epoch = undefined;
     {
         const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .include_query_definitions = true });
@@ -14038,6 +14122,11 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
+        return self.resolveSystemCatalogIdentitiesWithContext(alloc, group_id, request, .{});
+    }
+
+    pub fn resolveSystemCatalogIdentitiesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
+        try context.ensureActive();
         if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
         for (request.relations) |target| try target.validate();
@@ -14045,6 +14134,9 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         if (request.expected_revision) |expected| if (expected != meta.revision) return error.CatalogGenerationChanged;
+        if (request.name_allocation and request.relations.len != 0 and
+            (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) == null)
+            return self.resolveAllocationNamesTxn(alloc, &txn, group_id, meta.revision, request, context);
         // One root and one source cut for the whole batch. An unpublished or
         // stale registry cannot attest absence, even for a missing namespace.
         var live = if (request.relations.len != 0)
@@ -14105,6 +14197,79 @@ pub const RaftApplyStore = struct {
             slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
         return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
+    }
+
+    /// Name selection can precede registry adoption. Read the complete source
+    /// cut through the same bounded cursor used by reconciliation, including
+    /// hidden creates and restores. This attests occupancy only; schema/index
+    /// admission still requires the published registry and its guarded owner.
+    fn resolveAllocationNamesTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, revision: u64, request: system_catalog.ResolveMany, context: @import("antfly_local_sources").api_operation.RequestContext) !system_catalog.ResolvedMany {
+        _ = self;
+        if (request.include_query_definitions or request.targets.len != 0 or request.storage_names.len != 0) return error.InvalidCatalogMutation;
+        var buf: [160]u8 = undefined;
+        const identity = try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)));
+        var incarnation: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&incarnation, &identity.incarnation) catch return error.InvalidMetadataIncarnation;
+        // Source-cut revisions and published-registry revisions are distinct
+        // authorities. A coincident numeric revision must not join those cuts.
+        var epoch_hash = std.crypto.hash.Blake3.init(.{});
+        epoch_hash.update("antfly.catalog-name-allocation.v1");
+        epoch_hash.update(&incarnation);
+        var epoch_digest: [32]u8 = undefined;
+        epoch_hash.final(&epoch_digest);
+        incarnation = epoch_digest[0..16].*;
+        // The published catalog cursor excludes hidden restore reservations.
+        // Every hosted source mutation commits with the group's applied index;
+        // read that complete watermark from this same pinned source cut.
+        const epoch: relation_reconciliation.Epoch = .{ .incarnation = incarnation, .revision = try durableAppliedIndexTxn(txn, group_id) };
+        if (epoch.revision == 0) return error.CatalogPublicationProofPending;
+        if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
+        const relations = try alloc.alloc(?system_catalog.ResolvedRelation, request.relations.len);
+        @memset(relations, null);
+        errdefer {
+            for (relations) |relation| if (relation) |value| value.deinit(alloc);
+            alloc.free(relations);
+        }
+        var namespaces: [256]?u64 = undefined;
+        for (request.relations, 0..) |target, i| namespaces[i] = try resolveSystemCatalogNamespaceTxn(alloc, txn, group_id, target.database, target.namespace);
+        var buffers: RelationSourceBuffers = undefined;
+        var source = try relationTableSource(alloc, txn, group_id, &buffers);
+        defer source.deinit();
+        var cursor_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+        var cursor: []const u8 = "";
+        while (true) {
+            try context.ensureActive();
+            const row = (try source.nextAfter(cursor)) orelse break;
+            for (row.claims) |claim| {
+                try context.ensureActive();
+                for (request.relations, relations, namespaces[0..request.relations.len]) |target, *slot, namespace| {
+                    if (namespace == null or namespace.? != claim.key.namespace_id or !std.mem.eql(u8, target.name, claim.key.name)) continue;
+                    // Reserved names must not become a negative answer or an
+                    // invented active owner while their publication is pending.
+                    if (claim.owner.phase != .active) return error.CatalogPublicationProofPending;
+                    if (slot.*) |prior| {
+                        if (!prior.owner.eql(claim.owner)) return error.InvalidCatalogRecord;
+                        continue;
+                    }
+                    const table_bytes = txn.get(try tableKeyForGroup(&buf, group_id, claim.owner.table_id)) catch |err| switch (err) {
+                        error.NotFound => return error.CatalogPublicationProofPending,
+                        else => return err,
+                    };
+                    var table = try decodeTableIdentity(alloc, table_bytes);
+                    errdefer table.deinit(alloc);
+                    var binding = try system_catalog_storage.getById(alloc, txn, group_id, .table, table.table_id);
+                    defer if (binding) |*value| value.deinit();
+                    const logical_name = if (binding) |value| value.value.name else table.name;
+                    slot.* = .{ .owner = claim.owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
+                }
+            }
+            if (row.key.len > cursor_buf.len) return error.InvalidCatalogRecord;
+            @memcpy(cursor_buf[0..row.key.len], row.key);
+            cursor = cursor_buf[0..row.key.len];
+        }
+        try context.ensureActive();
+        const tables = try alloc.alloc(?system_catalog.ResolvedTable, 0);
+        return .{ .revision = revision, .tables = tables, .relations = relations, .relation_epoch = epoch, .relation_names_only = true };
     }
 
     pub fn writeValidationRevision(self: *RaftApplyStore, group_id: u64) !u64 {

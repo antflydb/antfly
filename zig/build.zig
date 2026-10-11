@@ -248,7 +248,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_embedded_api_pkg_mod = embedded.antfly_embedded_api_pkg_mod;
     const antfly_client_pkg_mod = embedded.antfly_client_pkg_mod;
     const capi_mod = embedded.capi_mod;
-    const libantfly_link_mod = embedded.libantfly_link_mod;
     const install_libantfly = embedded.install_libantfly;
     if (install_apple_bridge) |install| install_libantfly.dependOn(&install.step);
     const install_capi_header = embedded.install_capi_header;
@@ -864,7 +863,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
-        .libantfly_link_mod = libantfly_link_mod,
     });
     b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
