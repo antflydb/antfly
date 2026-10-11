@@ -208,6 +208,7 @@ class BuildFailureEvidence(unittest.TestCase):
             label, rebuilt = expected[len(seen)]
             local_cache = Path(command[command.index("--cache-dir") + 1])
             self.assertNotIn("--global-cache-dir", command)
+            self.assertIn("-Dstrip=true", command)
             global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)
