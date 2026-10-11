@@ -308,6 +308,9 @@ test "private index claim client requires service credentials preserves binary v
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            const budget = try std.fmt.parseUnsigned(u32, request.header(execution.claim_remaining_ms_header).?, 10);
+            try std.testing.expect(budget > 0 and budget <= execution.max_claim_budget_ms);
+            try std.testing.expectEqual(budget, request.timeout_ms);
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/relational-index-claims"));
             var parsed = try std.json.parseFromSlice(execution.ClaimRequest, a, request.body, .{});
             defer parsed.deinit();
@@ -327,8 +330,10 @@ test "private index claim client requires service credentials preserves binary v
     fixture.status = 409;
     try std.testing.expectError(error.UniqueConstraintViolation, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.status = 501;
+    try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
     try std.testing.expectError(error.GenerationPublicationChanged, client.fetchRelationalIndexClaims("http://owner", 8, "docs", request, .{}));
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
 
 pub const ApiHttpClient = struct {
@@ -888,13 +893,17 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(body);
         if (body.len > native.max_claim_wire_bytes) return error.TransactionTooLarge;
         const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        const remaining_ms = @min(execution.max_claim_budget_ms, try control.remainingTimeoutMs());
+        var budget_buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{remaining_ms});
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
-        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .headers = &.{.{ .name = execution.claim_remaining_ms_header, .value = budget }} });
         defer response.deinit(self.alloc);
         switch (response.status) {
             200 => {},
             401, 403 => return error.Unauthorized,
             413 => return error.TransactionTooLarge,
+            501 => return error.UnsupportedNativeIndexOwner,
             409 => {
                 if (std.mem.eql(u8, response.body, "UniqueConstraintViolation")) return error.UniqueConstraintViolation;
                 return error.GenerationPublicationChanged;

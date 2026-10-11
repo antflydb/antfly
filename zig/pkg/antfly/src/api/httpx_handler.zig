@@ -2517,12 +2517,18 @@ pub const AntflyApiHandler = struct {
         var service = self.api_server.authenticateInternalServiceRequest(token) catch return unauthorizedResponse(ctx);
         defer service.deinit(self.api_server.alloc);
         if (!service.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const execution = @import("relational_index_owner_execution.zig");
+        const budget_header = ctx.header(execution.claim_remaining_ms_header) orelse return textResponse(ctx, 400, "private index claim budget required");
+        const budget_ms = std.fmt.parseUnsigned(u32, budget_header, 10) catch return textResponse(ctx, 400, "invalid private index claim budget");
+        if (budget_ms == 0 or budget_ms > execution.max_claim_budget_ms) return textResponse(ctx, 400, "invalid private index claim budget");
+        var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index claim deadline expired");
+        const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
+        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index claims required");
         const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
         if (body.len > native.max_claim_wire_bytes) return textResponse(ctx, 413, "private index claims too large");
-        const execution = @import("relational_index_owner_execution.zig");
         var parsed = std.json.parseFromSlice(execution.ClaimRequest, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return switch (err) {
             error.OutOfMemory => textResponse(ctx, 503, "private index claim decoder unavailable"),
             else => textResponse(ctx, 400, "invalid private index claims"),
@@ -2530,7 +2536,8 @@ pub const AntflyApiHandler = struct {
         defer parsed.deinit();
         parsed.value.validate(params.group_id) catch return textResponse(ctx, 400, "invalid private index claim scope");
         const port = self.api_server.cfg.relational_index_claims orelse return textResponse(ctx, 503, "private index claim receiver unavailable");
-        var result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+        var result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, context) catch |err| return switch (err) {
+            error.UnsupportedNativeIndexOwner => textResponse(ctx, 501, @errorName(err)),
             error.UniqueConstraintViolation => textResponse(ctx, 409, @errorName(err)),
             error.GenerationPublicationChanged, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled => textResponse(ctx, 409, @errorName(err)),
             error.Canceled, error.Cancelled, error.DeadlineExceeded => textResponse(ctx, 408, @errorName(err)),
@@ -16650,6 +16657,7 @@ test "httpx private index claims require explicit service authentication and bou
             try std.testing.expectEqual(@as(u64, 7), group);
             try std.testing.expectEqual(@as(usize, 1), value.claims.len);
             try std.testing.expectEqualStrings("tuple\x00\xff\x80", value.claims[0].tuple);
+            try std.testing.expect(context.deadline_ns != null and context.deadline_io == null);
             self.batches += 1;
             // Transport fixture only, not a real completed build or ACK.
             return .acknowledged;
@@ -16690,6 +16698,25 @@ test "httpx private index claims require explicit service authentication and bou
     const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(token);
     try request.headers.append(internal_service_auth.header_name, token);
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try request.headers.append(execution.claim_remaining_ms_header, "1000");
+    {
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        ctx.application_deadline_ns = 0;
+        var response = try handler.internalGroupRelationalIndexClaims(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 408), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.batches);
     {
         var ctx = httpx.Context.init(alloc, std.testing.io, &request);
         defer ctx.deinit();
@@ -16738,7 +16765,7 @@ test "httpx private index claims require explicit service authentication and bou
     defer alloc.free(base);
     const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/relational-index-claims", .{base});
     defer alloc.free(url);
-    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token }, .{ execution.claim_remaining_ms_header, "1000" } };
     var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);

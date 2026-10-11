@@ -83,6 +83,9 @@ pub const Result = union(enum) {
 
 pub const CancellationRequest = struct { table_id: u64, group_id: u64, id: [16]u8 };
 
+pub const claim_remaining_ms_header = "X-Antfly-Index-Claim-Remaining-Ms";
+pub const max_claim_budget_ms: u32 = 30_000;
+
 pub const ClaimRequest = struct {
     table_id: u64,
     group_id: u64,

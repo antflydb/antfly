@@ -56,6 +56,22 @@ pub const CallbackDispatch = *const fn (
     output: ?*anyopaque,
 ) callconv(.c) error_abi.Status;
 
+test "boundary dispatcher preserves native index claim conflicts and capability failures across runtime units" {
+    const VTable = struct { apply: *const fn (*const anyerror) anyerror!u64 };
+    const TestBoundary = Boundary(VTable);
+    const Callbacks = struct {
+        fn apply(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+        fn foreign(contract: *const native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) error_abi.Status {
+            return TestBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.UnsupportedNativeIndexOwner, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled, error.InvalidPrivateIndexClaimReceipt, error.UniqueConstraintViolation }) |err| {
+        try std.testing.expectError(err, TestBoundary.call("apply", &Callbacks.foreign, &Callbacks.apply, .{&err}));
+    }
+}
+
 pub fn Boundary(comptime VTable: type) type {
     return BoundaryImpl(VTable);
 }

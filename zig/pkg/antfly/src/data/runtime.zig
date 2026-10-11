@@ -11601,17 +11601,6 @@ pub const DataServer = struct {
         return antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
     }
 
-    test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
-        var server: DataServer = undefined;
-        const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
-        var signal = std.atomic.Value(bool).init(true);
-        try std.testing.expectError(error.Canceled, nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
-        try std.testing.expectError(error.DeadlineExceeded, nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
-        server.api_server_cfg = .{ .deployment_mode = .standalone };
-        server.data_raft = @ptrFromInt(4096);
-        try std.testing.expectError(error.UnsupportedNativeIndexOwner, nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
-    }
-
     fn installRowPolicyControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.row_policy_install.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.row_policy_install.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const Receipt = antfly.public_api.row_policy_install.Response;
@@ -33926,6 +33915,16 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "native index claims data receiver rejects canceled and incompatible authority before owner acquisition" {
+            var server: DataServer = undefined;
+            const request: antfly.public_api.relational_index_owner_execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "claim", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
+            var signal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .cancellation = .fromAtomic(&signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{ .deadline_ns = 0 }));
+            server.api_server_cfg = .{ .deployment_mode = .standalone };
+            server.data_raft = @ptrFromInt(4096);
+            try std.testing.expectError(error.UnsupportedNativeIndexOwner, DataServer.nativeIndexClaimsControl(&server, std.testing.allocator, "docs", 7, request, .{}));
+        }
         test "system catalog runtime observation targets its group and preserves errors" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const Fake = struct {
