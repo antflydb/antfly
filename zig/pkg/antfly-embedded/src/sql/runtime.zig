@@ -2450,6 +2450,8 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
 
 const TestBackend = struct {
     estimate_scans: bool = false,
+    enable_dynamic_filters: bool = false,
+    dynamic_filters: usize = 0,
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
@@ -2475,10 +2477,11 @@ const TestBackend = struct {
         alloc: std.mem.Allocator,
         cursors: []catalog.Cursor,
         states: []State,
-        const State = struct { owner: *Statement, table: catalog.Table, request: catalog.Scan, after: ?[]const u8 = null, done: bool = false };
+        const State = struct { owner: *Statement, table: catalog.Table, request: catalog.Scan, after: ?[]const u8 = null, done: bool = false, started: bool = false };
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const state: *State = @ptrCast(@alignCast(ptr));
             if (state.done) return .{ .rows = &.{} };
+            state.started = true;
             var request = state.request;
             request.limit = limit;
             request.after = state.after;
@@ -2488,6 +2491,13 @@ const TestBackend = struct {
             state.after = next_key;
             state.done = page.after == null;
             return page;
+        }
+        fn setFilter(ptr: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!state.started);
+            try std.testing.expect(filter.sealed);
+            state.owner.backend.dynamic_filters += 1;
+            return false; // The fixture keeps row execution to verify exact results.
         }
         fn closeCursor(_: *anyopaque) void {
             @panic("statement-owned cursor closed individually");
@@ -2511,7 +2521,7 @@ const TestBackend = struct {
         owner.* = .{ .backend = backend, .alloc = alloc, .cursors = cursors, .states = states };
         for (scans, states, cursors) |request, *state, *cursor| {
             state.* = .{ .owner = owner, .table = request.table, .request = request.request };
-            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor, .estimated_rows = if (backend.estimate_scans) backend.row_count else null };
+            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor, .estimated_rows = if (backend.estimate_scans) backend.row_count else null, .set_dynamic_filter = if (backend.enable_dynamic_filters) Statement.setFilter else null };
         }
         backend.statement_opens += 1;
         backend.statement_scan_count = scans.len;
@@ -4722,7 +4732,7 @@ test "SQL review regression nested probe projection preserves satisfied limit" {
     try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
 }
 
-test "SQL native aggregate materialization retains projection and fails closed after selection" {
+test "external lake SQL native aggregate materialization retains projection and fails closed after selection" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -4817,11 +4827,45 @@ test "SQL native aggregate materialization retains projection and fails closed a
     try std.testing.expectEqualStrings("2", count_result.output.rows[0][0].string);
     try std.testing.expectEqual(@as(usize, 2), driver.opened);
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+    // Stored groups may serve predicates and FILTERs over their direct keys.
+    // Other input columns retain the row path. Empty filters preserve groups.
+    var keyed = try compiler.compile(a, "SELECT id, SUM(id), COUNT(*) FROM docs GROUP BY id", .{});
+    defer keyed.deinit();
+    const keyed_bound = try @import("aggregate_binding.zig").bind(scratch, table, keyed.statement.select, &.{});
+    driver.recipe = (try @import("aggregate_materialization.zig").fromBound(scratch, table, keyed_bound)).?;
+    const keyed_source = try operators.Grouped.create(a, keyed_bound.specs, .{});
+    defer keyed_source.deinit();
+    for (0..2) |_| try keyed_source.add(&.{Datum.json(.{ .integer = 9007199254740993 })}, &.{ Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .integer = 1 }) });
+    const keyed_partials = try scratch.alloc(operators.GroupResult, 1);
+    keyed_partials[0] = (try keyed_source.nextPartialResult(scratch)).?;
+    driver.partials = keyed_partials;
+    for ([_]struct { sql: []const u8, rows: usize, sum: ?[]const u8, count: []const u8 }{
+        .{ .sql = "SELECT id, SUM(id), COUNT(*) FROM docs WHERE id >= 9007199254740993 GROUP BY id", .rows = 1, .sum = "18014398509481986", .count = "2" },
+        .{ .sql = "SELECT id, SUM(id) FILTER (WHERE id < 0), COUNT(*) FILTER (WHERE id > 0) FROM docs GROUP BY id", .rows = 1, .sum = null, .count = "2" },
+        .{ .sql = "SELECT id, SUM(id) FILTER (WHERE NULL), COUNT(*) FILTER (WHERE NULL) FROM docs GROUP BY id", .rows = 1, .sum = null, .count = "0" },
+        .{ .sql = "SELECT id, SUM(id), COUNT(*) FROM docs WHERE id < 0 GROUP BY id", .rows = 0, .sum = null, .count = "0" },
+    }) |case| {
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        const before = driver.opened;
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(before + 1, driver.opened);
+        try std.testing.expectEqual(driver.opened, driver.closed);
+        try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        if (case.rows != 0) {
+            if (case.sum) |sum| try std.testing.expectEqualStrings(sum, result.output.rows[0][1].string) else try std.testing.expect(result.output.sql_nulls.?[0][1]);
+            try std.testing.expectEqualStrings(case.count, result.output.rows[0][2].string);
+        }
+    }
+    const before_failure = driver.opened;
+
     driver.recipe = recipe;
     driver.partials = partials;
     driver.fail = true;
     try std.testing.expectError(error.ArtifactChecksumMismatch, execute(a, driver.backend(), &reference, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 3), driver.opened);
+    try std.testing.expectEqual(before_failure + 1, driver.opened);
     try std.testing.expectEqual(driver.opened, driver.closed);
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
 }
@@ -5165,4 +5209,101 @@ test "SQL captured search scans bind execution parameters without mutating plans
     try std.testing.expect(bound.relation.?.scans[0].request.search.?.request_text == null);
     capture.release();
     try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+}
+
+test "external lake SQL exact join partial aggregation preserves fanout NULLs filters and fallback" {
+    const a = std.testing.allocator;
+    const from = " FROM (VALUES (1,2,true),(1,3,false),(1,NULL,NULL),(2,7,true),(NULL,99,true)) l(k,v,b) JOIN (VALUES (1,5,true),(1,6,false),(2,8,NULL),(3,9,true),(NULL,9,true)) r(k,v,b) ON l.k=r.k";
+    for ([_][]const u8{
+        "SELECT l.k, COUNT(*), COUNT(l.v), SUM(l.v), SUM(r.v), MIN(l.v), MAX(r.v), BOOL_AND(l.b), BOOL_OR(r.b)",
+        "SELECT l.k, SUM(l.v) FILTER (WHERE l.k=1), COUNT(*) FILTER (WHERE l.k=2)",
+        "SELECT l.k, SUM(l.v), COUNT(*)",
+        "SELECT l.k, SUM(CAST(l.v AS DOUBLE PRECISION)), COUNT(DISTINCT r.v)",
+        "SELECT l.b, COUNT(*) FILTER (WHERE l.b IS NULL), SUM(l.v) FILTER (WHERE l.b IS NOT NULL)",
+    }, 0..) |select, i| {
+        const tail = if (i == 2) " WHERE l.k>=2 GROUP BY l.k ORDER BY l.k" else if (i == 4) " GROUP BY l.b ORDER BY l.b" else " GROUP BY l.k ORDER BY l.k";
+        const sql = try std.mem.concat(a, u8, &.{ select, from, tail });
+        defer a.free(sql);
+        const fallback_sql = try std.mem.concat(a, u8, &.{ select, from, " AND (l.v IS NOT DISTINCT FROM l.v)", tail });
+        defer a.free(fallback_sql);
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var baseline = try compiler.compile(a, fallback_sql, .{});
+        defer baseline.deinit();
+        var actual = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer actual.deinit();
+        var expected = try execute(a, backend.iface(), &baseline, &.{}, .{});
+        defer expected.deinit();
+        const actual_rows = try std.json.Stringify.valueAlloc(a, actual.output.rows, .{});
+        defer a.free(actual_rows);
+        const expected_rows = try std.json.Stringify.valueAlloc(a, expected.output.rows, .{});
+        defer a.free(expected_rows);
+        try std.testing.expectEqualStrings(expected_rows, actual_rows);
+        try std.testing.expectEqualDeep(expected.output.sql_nulls, actual.output.sql_nulls);
+    }
+    // 24 input rows produce 144 pairs. A 64-row execution budget admits the
+    // compact partial path, while expanding the pairs exceeds that budget.
+    const repeated = "(VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1))";
+    const sql = try std.fmt.allocPrint(a, "SELECT COUNT(*), SUM(l.k) FROM {s} l(k) JOIN {s} r(k) ON l.k=r.k", .{ repeated, repeated });
+    defer a.free(sql);
+    var backend: TestBackend = .{};
+    var compiled = try compiler.compile(a, sql, .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.iface(), &compiled, &.{}, .{ .scan_rows = 64 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("144", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("144", result.output.rows[0][1].string);
+    const fallback = try std.mem.concat(a, u8, &.{ sql, " AND (l.k IS NOT DISTINCT FROM l.k)" });
+    defer a.free(fallback);
+    var baseline = try compiler.compile(a, fallback, .{});
+    defer baseline.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(a, backend.iface(), &baseline, &.{}, .{ .scan_rows = 64 }));
+}
+
+test "external lake SQL join partial state spills and unwinds allocation failures" {
+    const a = std.testing.allocator;
+    var source: TestBackend = .{ .row_count = 4096 };
+    var backend = source.coordinated();
+    backend.execution_io = std.testing.io;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+    defer manager.deinit();
+    backend.spill_manager = &manager;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l._id=r._id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+    defer result.deinit();
+    try std.testing.expect(manager.written_bytes > 0);
+    try std.testing.expectEqualStrings("4096", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][2].string);
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var test_backend: TestBackend = .{};
+            var query = try compiler.compile(allocator, "SELECT COUNT(*), SUM(l.n) FROM (VALUES (1,2),(1,3)) l(k,n) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k", .{});
+            defer query.deinit();
+            var output = try execute(allocator, test_backend.iface(), &query, &.{}, .{});
+            defer output.deinit();
+            try std.testing.expectEqualStrings("4", output.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("10", output.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{});
+}
+
+test "external lake SQL join partials install scan filters before either oriented probe" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*), SUM(l.id) FROM things l JOIN (VALUES (9007199254740993),(9007199254740993)) r(k) ON l.id=r.k",
+        "SELECT COUNT(*), SUM(r.id) FROM (VALUES (9007199254740993),(9007199254740993)) l(k) JOIN things r ON l.k=r.id",
+    }) |sql| {
+        var source: TestBackend = .{ .row_count = 256, .estimate_scans = true, .enable_dynamic_filters = true };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, source.coordinated(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("512", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("4611686018427388416", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 1), source.dynamic_filters);
+    }
 }

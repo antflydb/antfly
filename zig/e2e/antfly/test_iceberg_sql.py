@@ -214,6 +214,23 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
                 {
                     "num_shards": 1,
                     "schema": {"storage_mode": "relational", "base_source": source},
+                    "indexes": {
+                        "region_stats": {
+                            "type": "algebraic",
+                            "derive_from_schema": True,
+                            "aggregates": [
+                                {"name": "rows", "op": "count", "group_by": ["region"]},
+                                {
+                                    "name": "total",
+                                    "op": "sum",
+                                    "measure": "id",
+                                    "group_by": ["region"],
+                                },
+                            ],
+                        }
+                    }
+                    if name == "ice_events"
+                    else {},
                 },
             )
 
@@ -237,6 +254,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert time.monotonic() < deadline, response.text + server.debug_logs()
             time.sleep(0.1)
 
+        deadline = time.monotonic() + 60
+        while True:
+            response = requests.get(
+                server.api_url + "/tables/ice_events/indexes/region_stats",
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            resource = response.json()
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+
         for cold in (False, True):
             if cold:
                 server.restart()
@@ -250,6 +281,20 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             assert sql(
                 "SELECT COUNT(*), SUM(id) FROM ice_events WHERE region = 'west'"
             ) == [["3", "9"]]
+            assert sql(
+                "SELECT region, SUM(id) FILTER (WHERE region='west'), "
+                "COUNT(*) FILTER (WHERE region='east') FROM ice_events "
+                "GROUP BY region ORDER BY region"
+            ) == [["east", None, "2"], ["west", "9", "0"]]
+            assert sql(
+                "SELECT region, SUM(id), COUNT(*) FILTER (WHERE region='east') "
+                "FROM ice_events WHERE region='west' GROUP BY region"
+            ) == [["west", "9", "0"]]
+            assert sql(
+                "SELECT l.region, COUNT(*), SUM(l.id) FROM ice_events l "
+                "JOIN (VALUES ('west'),('west'),('east')) r(region) "
+                "ON l.region=r.region GROUP BY l.region ORDER BY l.region"
+            ) == [["east", "2", "10"], ["west", "6", "18"]]
             assert sql("SELECT id, label FROM ice_pinned ORDER BY id") == [
                 ["1", "one"],
                 ["2", "two"],

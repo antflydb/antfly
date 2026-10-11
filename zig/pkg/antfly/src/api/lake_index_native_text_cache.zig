@@ -373,6 +373,11 @@ const Entry = struct {
         defer removed.deinit(self.allocator);
         var additions: std.ArrayList(artifacts.ChunkRef) = .empty;
         defer additions.deinit(self.allocator);
+        var admission_by_id: std.StringHashMapUnmanaged(local.segment.SegmentReader.Admission) = .empty;
+        defer admission_by_id.deinit(self.allocator);
+        for (root.file_groups) |group| if (group.admissions.len != 0) {
+            for (group.segments, group.admissions) |ref, metadata| try admission_by_id.put(self.allocator, ref.artifact_id, metadata);
+        };
         var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(self.allocator);
         var shared: std.ArrayList(local.index.IndexWriter.ImmutableSegment) = .empty;
@@ -420,10 +425,18 @@ const Entry = struct {
             for (position..end) |ordinal| {
                 const ref = additions.items[ordinal];
                 try cancellation.check();
+                // Descriptor admission performs no artifact reads. Do not
+                // charge unvisited directory payloads or queue an I/O-sized
+                // CPU job for these small, bounded metadata copies.
+                if (admission_by_id.get(ref.artifact_id)) |metadata| {
+                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal], metadata);
+                    loaded += 1;
+                    continue;
+                }
                 try stores.chargeReadBudget(&read_bytes, ref.byte_len);
-                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation, ids.items[ordinal] });
+                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation, ids.items[ordinal], admission_by_id.get(ref.artifact_id) });
                 if (tasks[ordinal - position] == null) {
-                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal]);
+                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal], admission_by_id.get(ref.artifact_id));
                     loaded += 1;
                 }
             }
@@ -462,7 +475,15 @@ const Entry = struct {
         }
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
-    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64) anyerror!local.index.ReplacementSegmentData {
+    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64, metadata: ?local.segment.SegmentReader.Admission) anyerror!local.index.ReplacementSegmentData {
+        if (metadata) |admitted| {
+            var data = try @import("lake_index_seekable_text.zig").loadAdmitted(a, .{ .store = loader.store, .cache = loader.cache, .context = loader.cache.context, .cancellation = cancellation, .resource_manager = loader.resource_manager }, ref, admitted);
+            errdefer data.deinit(a);
+            var reader = try local.segment.SegmentReader.initAuthenticated(a, data.native, admitted);
+            errdefer reader.deinit();
+            try cancellation.check();
+            return .{ .id = id, .data = data, .prepared_reader = reader };
+        }
         const mapped = loader.loader();
         var data = try mapped.load(mapped.ptr, a, ref, cancellation);
         errdefer data.deinit(a);

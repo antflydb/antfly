@@ -1555,9 +1555,9 @@ This follows the scheduling lesson in
 remote request concurrency and CPU concurrency need independent controls, with
 read-ahead constrained by memory. It uses the existing `std.Io.concurrent`
 backend and keeps production Threaded defaults. See `lib/platform/EVENTED.md`
-for Evented qualification. Full multi-row-group ready queues with cross-query
-fairness, typed nested Parquet/JSON path execution and semantics-aware partial
-aggregation below joins remain separate work. No latency-adaptive tuning or
+for Evented qualification. Rolling row-group lookahead and exact partial aggregation below compatible
+joins are described below. Cross-query fairness beyond bounded admission and
+typed nested Parquet/JSON path execution remain separate work. No latency-adaptive tuning or
 archive-scale speedup is claimed by this refinement.
 
 ### Qualification
@@ -1610,3 +1610,94 @@ assertions; it makes no archive-scale throughput claim. Measure cold/warm latenc
 metadata/posting bytes, provider requests, publication amplification, temporary
 disk, planning/lane peaks and process RSS on a representative archive before
 changing strategy thresholds or envelope/bucket sizes.
+
+### Lazy admission, rolling scan lookahead, and exact join partials
+
+New text file manifests carry versioned admission descriptors authenticated by
+that manifest's SHA-256 identity: source size, section offsets, document counts,
+stored-identity navigation header, and per-field scoring statistics. Corpus
+assembly builds native readers from these descriptors without opening each
+segment directory. The full directory loads only when a selected segment is
+accessed. Publication owns the descriptors; query capabilities own provider
+reads, cancellation and deadlines. Failed directory loads leave no retained
+partial arena, and another authorized query can retry. Waiters check their own
+capability without holding a spin mutex across provider I/O. Canonically sorted
+field names and a section-kind bitset bound structural validation to linear work.
+
+The range source must independently authenticate every payload. Lake readers
+verify SHA-256 packs and blocks; descriptor admission explicitly preserves that
+contract instead of falling back to a whole-section CRC scan. Legacy manifests
+keep eager admission until maintenance upgrades their descriptors. Unchanged
+native segments can upgrade without rescanning Parquet. File manifests and
+corpus metadata retain their existing byte limits, and every query still uses
+full-corpus statistics and the pinned physical identity mapping. Descriptor
+copies use the bounded corpus allocator without charging unvisited directory
+payloads to the artifact read budget; legacy directory reads retain that budget.
+Required reads discover cold native directories; optional prefetch never performs that
+discovery under its queue mutex.
+
+Page-header discovery runs on I/O workers, reserving the bounded possible page
+payload before submission. Complete pages already contained in a header probe
+need no second provider GET. Four rolling row-group jobs warm first required
+pages while the consumer advances; completed jobs release admission and permit
+new submissions. Temporary input, decode and structural workspace is reserved
+and worker allocation is capped. Resident raw and decoded caches keep their
+independent limits. Saturation leaves required reads available through the
+existing synchronous path.
+
+Prefetch jobs own their immutable object and version strings. File cleanup
+cancels borrowed current-file work while preserving next-file footer jobs. A
+required next-file open joins that same parsed-footer flight. Scan close cancels
+and joins every remaining job before releasing providers or metadata. This
+ownership distinction is covered by a gated provider and a real Parquet footer,
+including the assertion that handoff performs one provider request.
+
+Aggregate reuse now has a separate group-constant residual proof. Direct group
+keys, constants, parameters, comparisons, boolean operations and null tests can
+serve WHERE and aggregate FILTER from unfiltered materialized state. FILTER
+rejection imports an empty reducer for that slot while preserving the group;
+COUNT returns zero and SUM remains SQL NULL. Row-dependent expressions, casts,
+functions and unproven shapes keep row execution. HAVING, ordering and delivery
+continue above reduction, and persisted recipe identity stays unfiltered.
+
+A relational partial provider aggregates both sides before a proven direct-key
+inner equijoin. Its grouping keys contain the join keys and required output
+keys. COUNT state carries input multiplicity; selected reducer states cross the
+join with checked multiplication rather than expanding duplicate row pairs.
+COUNT, integer SUM, MIN/MAX and boolean reducers are supported. Both grouping
+and the compact join build use existing typed, byte-bounded, spillable state.
+The provider follows the row executor's cost-based build orientation and installs
+its bounded dynamic filter before pulling any probe rows. VALUES cardinality is
+the checked sum of its arms, so a small constant build remains small on either
+side of a physical join.
+Floating SUM/AVG, DISTINCT, outer joins, correlated joins, residual ON predicates
+and expressions without an equivalence proof retain ordinary execution. The
+fanout regression compares exact results and admits 144 pairs from 24 inputs
+under a 64-row execution budget, where the expanding fallback exceeds the limit.
+Real Parquet and independent PyIceberg E2Es cover group-key predicates, FILTER,
+join multiplicity, snapshot changes and restart.
+
+Cross-query fairness beyond bounded admission, latency-adaptive queue sizing,
+typed nested Parquet/JSON paths, and broader algebraic join rewrites remain
+future work. Archive-scale cold/warm latency and RSS measurements are still
+required before claiming an end-to-end speedup or changing strategy thresholds.
+
+
+Qualification after merging main through `121699433e` (Zig 0.17.0):
+
+- Debug: all 319 lake integration tests pass (130 shared lake/SQL and 189 API),
+  with no allocator leaks. Coverage includes zero-I/O admission, authorized
+  retry, OOM unwinding, preserved footer flights, both dynamic-filter probe
+  orientations, and an explicit disk-write assertion for 4,096 unique join
+  keys with the 2 MiB retained-state setting.
+- All 50 focused ranking tests pass; the optimized-only benchmark is skipped
+  in Debug. The three existing native column-batch/deferred-error join
+  regressions pass in both owner paths. All five standalone scheduler tests
+  pass in Debug and ReleaseFast.
+- The final Debug production server builds successfully. All seven real
+  Parquet/Iceberg/sparse and incremental-generation E2Es pass in a fresh run
+  against that rebuilt server (254.33 seconds), after the admission read-budget
+  correction. They exercise filtering, ordering/cursors, aggregate FILTER,
+  join multiplicity, independent Iceberg commits/deletes, and restart.
+- Canonical license headers, the Apache dependency boundary (2,019 source
+  files), Zig formatting, Python lint/format, and diff checks pass.

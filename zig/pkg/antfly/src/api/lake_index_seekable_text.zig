@@ -430,6 +430,11 @@ const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
     directory: Directory,
+    directory_bytes: usize = 0,
+    directory_loading: std.atomic.Value(bool) = .init(false),
+    directory_ref: ?Ref = null,
+    directory_arena: ?std.heap.ArenaAllocator = null,
+    directory_ready: std.atomic.Value(bool) = .init(true),
     fallback: ?Read,
     query_scoped: bool = false,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
@@ -439,15 +444,41 @@ const Owner = struct {
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const a = self.a;
+        if (self.directory_arena) |*arena| arena.deinit();
         self.arena.deinit();
         a.destroy(self);
+    }
+    fn ensureDirectory(self: *Owner, capability: Read) !void {
+        try capability.check();
+        if (self.directory_ready.load(.acquire)) return;
+        // Claim only publication ownership; never hold a spin mutex across
+        // provider I/O. Each waiter checks its own deadline/cancellation, and
+        // a failed leader permits a retry with another query's capability.
+        while (self.directory_loading.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+            try capability.check();
+            if (self.directory_ready.load(.acquire)) return;
+            if (capability.context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.atomic.spinLoopHint();
+        }
+        defer self.directory_loading.store(false, .release);
+        if (self.directory_ready.load(.acquire)) return;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        errdefer arena.deinit();
+        const directory = try loadDirectory(arena.allocator(), capability, self.directory_ref.?);
+        if (directory.bytes != self.directory_bytes) return error.InvalidNativeLakeTextCorpus;
+        const loaded = try arena.allocator().alloc(bool, directory.blocks.len);
+        @memset(loaded, false);
+        try capability.check();
+        self.directory = directory;
+        self.loaded = loaded;
+        self.directory_arena = arena;
+        self.directory_ready.store(true, .release);
     }
     fn seal(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (self.query_scoped) self.fallback = null;
     }
     fn source(self: *@This()) local.index.SegmentSource {
-        return .{ .ranges = .{ .ptr = self, .length = self.directory.bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal, .resource_manager = self.resource_manager } };
+        return .{ .ranges = .{ .ptr = self, .length = self.directory_bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal, .resource_manager = self.resource_manager } };
     }
     fn readInitial(raw: *anyopaque, offset: u64, out: []u8) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -519,6 +550,9 @@ const Owner = struct {
         }
         fn prefetch(raw: *anyopaque, start: u64, length: u64) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            // Required reads own cold directory discovery. Speculation never
+            // loads it while holding the query's queue mutex.
+            if (!self.owner.directory_ready.load(.acquire)) return;
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             if (self.cancelled.load(.acquire)) return;
@@ -617,7 +651,7 @@ const Owner = struct {
         try capability.check();
         const query = try a.create(Query);
         query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory.bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext } };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory_bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;
@@ -631,7 +665,7 @@ const Owner = struct {
         return if (offset - pieces[index].offset < pieces[index].ref.byte_len) index else null;
     }
     fn read(self: *@This(), capability: Read, start: u64, out: []u8) !void {
-        try capability.check();
+        try self.ensureDirectory(capability);
         if (start > self.directory.bytes or out.len > self.directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
         const io = capability.context.io orelse return self.readSerial(capability, start, out);
         if (out.len <= pack_bytes) return self.readSerial(capability, start, out);
@@ -729,11 +763,24 @@ const Owner = struct {
         return position == start + pack.byte_len;
     }
 };
+/// Structural admission is manifest-owned; the full posting directory is
+/// singleflight-loaded only when a query actually accesses this segment.
+pub fn loadAdmitted(a: A, read: Read, ref: Ref, metadata: local.segment.SegmentReader.Admission) !local.index.SegmentData {
+    try metadata.validate();
+    if (metadata.bytes == 0 or metadata.bytes > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
+    try read.check();
+    const owner = try a.create(Owner);
+    owner.* = .{ .a = a, .arena = .init(a), .directory = .{ .bytes = @intCast(metadata.bytes), .metadata = &.{}, .blocks = &.{}, .terms = &.{} }, .directory_bytes = @intCast(metadata.bytes), .directory_ready = .init(false), .loaded = &.{}, .fallback = read, .query_scoped = true, .resource_manager = read.resource_manager };
+    errdefer Owner.release(owner);
+    owner.directory_ref = .{ .artifact_id = try owner.arena.allocator().dupe(u8, ref.artifact_id), .checksum = try owner.arena.allocator().dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+    return .fromNative(owner.source());
+}
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     const owner = try a.create(Owner);
     owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager };
     errdefer Owner.release(owner);
     owner.directory = try loadDirectory(owner.arena.allocator(), read, ref);
+    owner.directory_bytes = owner.directory.bytes;
     owner.loaded = try owner.arena.allocator().alloc(bool, owner.directory.blocks.len);
     @memset(owner.loaded, false);
     return .fromNative(owner.source());
@@ -759,20 +806,36 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     const ref = try publish(a, a, &store, encoded, .none);
     defer a.free(ref.artifact_id);
     defer a.free(ref.checksum);
-    const data = try load(a, .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none }, ref);
+    var reference_reader = try local.segment.SegmentReader.init(a, encoded);
+    defer reference_reader.deinit();
+    const admission = try reference_reader.admission(a);
+    defer admission.deinit(a);
+    const Install = struct {
+        fn run(allocator: A, writer: *local.index.IndexWriter, data_: local.index.SegmentData, metadata: local.segment.SegmentReader.Admission) !void {
+            var owned = data_;
+            errdefer owned.deinit(allocator);
+            var replacements = [_]local.index.ReplacementSegmentData{.{ .id = 1, .data = owned, .prepared_reader = try local.segment.SegmentReader.initAuthenticated(allocator, owned.native, metadata) }};
+            defer if (replacements[0].prepared_reader) |*reader| reader.deinit();
+            try writer.replaceSegmentsManyData(&.{}, &replacements);
+        }
+    };
+    const data = try loadAdmitted(a, .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none }, ref, admission);
     const owner: *Owner = @ptrCast(@alignCast(data.native.ranges.ptr));
     var lazy = try local.index.IndexWriter.init(a);
     defer lazy.deinit();
-    try lazy.addSegmentWithIdData(1, data);
+    try Install.run(a, &lazy, data, admission);
+    try std.testing.expect(!owner.directory_ready.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owner.loaded.len);
     var eager = try local.index.IndexWriter.init(a);
     defer eager.deinit();
     try eager.addSegmentWithId(1, encoded);
-    const before_absent = try a.dupe(bool, owner.loaded);
-    defer a.free(before_absent);
     const absent = try lazy.snapshot().search(a, "body", &.{"absent"}, 10);
     defer a.free(absent.hits);
     try std.testing.expectEqual(@as(u64, 0), absent.total_count);
-    try std.testing.expectEqualSlices(bool, before_absent, owner.loaded);
+    try std.testing.expect(owner.directory_ready.load(.acquire));
+    // The tiny fixture shares dictionary navigation and postings in one
+    // authenticated block. Required dictionary discovery may touch that block;
+    // the large-corpus tests below bound posting and position payload reads.
     for ([_][]const u8{ "alpha", "beta", "gamma" }) |term| {
         const expected = try eager.snapshot().search(a, "body", &.{term}, 10);
         defer a.free(expected.hits);
@@ -792,7 +855,6 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     // must leave shared navigation reusable by a later authorized query.
     var retry_writer = try local.index.IndexWriter.init(a);
     defer retry_writer.deinit();
-    try retry_writer.addSegmentWithIdData(1, try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref));
     const Denied = struct {
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
             return error.TestRemoteUnavailable;
@@ -808,6 +870,8 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     vtable.get_range_alloc_with_cancellation = null;
     var denied = store;
     denied.vtable = &vtable;
+    // Even a completely unavailable provider permits authenticated admission.
+    try Install.run(a, &retry_writer, try loadAdmitted(a, .{ .store = denied, .cache = null, .context = .{}, .cancellation = .none }, ref, admission), admission);
     var failed: Read = .{ .store = denied, .cache = null, .context = .{}, .cancellation = .none };
     const denied_snapshot = try retry_writer.acquireSnapshotWithReadContext(&failed);
     defer denied_snapshot.release();

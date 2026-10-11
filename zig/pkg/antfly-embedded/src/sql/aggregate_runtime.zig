@@ -261,7 +261,8 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
 
 fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, table: catalog.Table) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
-    const recipe = (try @import("aggregate_materialization.zig").fromBound(context.arena, table, bound.*)) orelse return false;
+    const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
+    const recipe = reuse.recipe;
     const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
     defer cursor.close(cursor.ptr);
     var pages: usize = 0;
@@ -277,7 +278,34 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
         groups += partials.len;
         for (partials) |partial| {
             if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
-            try grouped.importPartialMapped(partial.keys, partial.aggregates, partial.aggregate_slots, partial.ordinal);
+            const a = arena.allocator();
+            const cells = try a.alloc(Datum, bound.input.columns.len);
+            @memset(cells, .{});
+            for (reuse.key_columns, partial.keys) |column, key| {
+                if (column >= cells.len) return error.InvalidSqlBackendResponse;
+                cells[column] = key;
+            }
+            if (!try bound.input.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
+            if (partial.aggregate_slots) |slots| {
+                if (slots.len != partial.aggregates.len) return error.InvalidSqlBackendResponse;
+            } else if (partial.aggregates.len != bound.specs.len) return error.InvalidSqlBackendResponse;
+            const aggregates = try a.dupe(Datum, partial.aggregates);
+            for (aggregates, 0..) |*value, i| {
+                const slot = if (partial.aggregate_slots) |slots| slots[i] else i;
+                if (slot >= bound.filters.len) return error.InvalidSqlBackendResponse;
+                if (bound.filters[slot]) |filter| {
+                    const test_value = try context.evaluate(a, bound.input.projections[filter].?, cells);
+                    if (!test_value.sql_null and test_value.value != .bool) return error.SqlTypeMismatch;
+                    if (test_value.sql_null or !test_value.value.bool) {
+                        const spec = bound.specs[slot];
+                        var empty = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
+                        defer empty.deinit();
+                        empty.distinct = spec.distinct;
+                        value.* = try @import("aggregate_partial.zig").cell(a, empty);
+                    }
+                }
+            }
+            try grouped.importPartialMapped(partial.keys, aggregates, partial.aggregate_slots, partial.ordinal);
         }
     }
     return true;
@@ -320,7 +348,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        var aggregate_loaded = try loadMaterialized(context, bound, grouped, table);
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, grouped, table) else false;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
         } else true;

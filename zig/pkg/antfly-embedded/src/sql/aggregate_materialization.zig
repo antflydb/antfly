@@ -96,6 +96,10 @@ pub fn fromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     if (bound.input.predicate != null) return null;
     if (bound.specs.len != bound.inputs.len or bound.inputs.len != bound.filters.len or bound.group_count > bound.input.projections.len) return error.InvalidSqlBackendResponse;
     for (bound.filters) |filter| if (filter != null) return null;
+    return recipeFromBound(a, table, bound);
+}
+
+fn recipeFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     const keys = try a.alloc(Key, bound.group_count);
     errdefer a.free(keys);
     for (keys, bound.input.projections[0..keys.len]) |*key, program| {
@@ -123,6 +127,56 @@ pub fn fromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
         } else null };
     }
     return .{ .keys = keys, .inputs = inputs };
+}
+
+/// A residual may consume stored groups only when it is constant for every
+/// source row in that group. Keep this proof separate from recipe identity:
+/// persisted states always describe the unfiltered source.
+pub const Reuse = struct { recipe: Recipe, key_columns: []const u32 };
+pub fn reuseFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Reuse {
+    if (bound.specs.len != bound.inputs.len or bound.inputs.len != bound.filters.len or bound.group_count > bound.input.projections.len) return error.InvalidSqlBackendResponse;
+    const columns = try a.alloc(u32, bound.group_count);
+    errdefer a.free(columns);
+    for (columns, bound.input.projections[0..bound.group_count]) |*column, optional| {
+        const program = optional orelse return error.InvalidSqlBackendResponse;
+        if (program.instructions.len != 1 or program.instructions[0].operation != .column) {
+            a.free(columns);
+            return null;
+        }
+        column.* = program.instructions[0].operation.column;
+    }
+    if (bound.input.predicate) |program| if (!groupConstant(program, columns)) {
+        a.free(columns);
+        return null;
+    };
+    for (bound.filters) |optional| if (optional) |slot| {
+        if (slot >= bound.input.projections.len) return error.InvalidSqlBackendResponse;
+        if (!groupConstant(bound.input.projections[slot] orelse return error.InvalidSqlBackendResponse, columns)) {
+            a.free(columns);
+            return null;
+        }
+    };
+    const recipe = (try recipeFromBound(a, table, bound)) orelse {
+        a.free(columns);
+        return null;
+    };
+    return .{ .recipe = recipe, .key_columns = columns };
+}
+fn groupConstant(program: scalar.Program, columns: []const u32) bool {
+    for (program.instructions) |instruction| switch (instruction.operation) {
+        .literal, .parameter, .in_list => {},
+        .column => |column| if (std.mem.indexOfScalar(u32, columns, column) == null) return false,
+        .unary => |unary| switch (unary.op) {
+            .positive, .negative => return false,
+            else => {},
+        },
+        .binary => |binary| switch (binary.op) {
+            .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or", .is_distinct, .is_not_distinct => {},
+            else => return false,
+        },
+        else => return false,
+    };
+    return true;
 }
 
 /// COUNT(*) has a dedicated compiler path. It still uses the same semantic

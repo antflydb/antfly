@@ -834,6 +834,11 @@ fn Engine(comptime Context: type) type {
                 .scan => |scan| self.cursors[scan.index].estimated_rows,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
+                .values => |arms| total: {
+                    var rows: u64 = 0;
+                    for (arms) |arm| rows = std.math.add(u64, rows, self.estimate(arm) orelse break :total null) catch break :total null;
+                    break :total rows;
+                },
                 .prepared_rows => if (self.context.returning_cursor) |cursor| cursor.count() else self.context.returning_rows.len,
                 .query => |query| blk: {
                     const source = self.estimate(query.source);
@@ -1059,7 +1064,7 @@ fn Engine(comptime Context: type) type {
                 }
                 return .{ .rows = rows.items };
             }
-            fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
+            pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
@@ -1754,7 +1759,7 @@ fn Engine(comptime Context: type) type {
                 }
                 return null;
             }
-            fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
+            pub fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
                 const probe = self.left.?;
                 if (probe.node.operation != .scan or programs.len == 0) return;
                 const scan = probe.node.operation.scan;
@@ -1968,7 +1973,15 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+            }
+            fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
+                const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
+                const cursor = try @import("join_aggregate.zig").open(a, self.engine, self.iterator, plan);
+                self.opened = true;
+                return cursor;
             }
             fn resolve(ptr: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

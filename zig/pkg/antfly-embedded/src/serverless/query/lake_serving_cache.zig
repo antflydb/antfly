@@ -654,6 +654,25 @@ pub const Reader = struct {
         task: Scheduling.Task(anyerror!void),
         bytes: usize,
         key: [32]u8,
+        work: *Warm,
+    };
+    const Warm = struct {
+        reader: *Reader,
+        read: ranges.RangeRead,
+        arena: std.heap.ArenaAllocator,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        page_end: ?u64 = null,
+        page_limit: usize = 0,
+        fn destroy(self: *Warm) void {
+            self.arena.deinit();
+            std.heap.page_allocator.destroy(self);
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const Warm = @ptrCast(@alignCast(raw));
+            if (self.cancelled.load(.acquire)) return true;
+            self.reader.context.ensureActive() catch return true;
+            return false;
+        }
     };
     cache: *Cache,
     base: ObjectReader,
@@ -662,28 +681,51 @@ pub const Reader = struct {
     scheduler: *Scheduling.Scheduler = Scheduling.global(),
     pending: [8]?Prefetch = @splat(null),
     prefetch_bytes: usize = 0,
-    prefetch_cancelled: std.atomic.Value(bool) = .init(false),
     /// Rolling lookahead, at most eight ranges and 32 MiB per reader. Shared
     /// I/O admission further limits in-flight bytes under memory pressure.
     /// Workers use independent page allocations, never a SQL arena/quota.
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
+        return self.prefetchImpl(reads, null, 0);
+    }
+    /// Header discovery belongs to I/O workers. Reserve the bounded possible
+    /// payload before discovering its size, rather than blocking a scan pull.
+    pub fn prefetchPage(self: *Reader, read: ranges.RangeRead, chunk_end: u64, limit: usize) !void {
+        if (chunk_end <= read.range.offset or limit < read.range.len) return;
+        return self.prefetchImpl(&.{read}, chunk_end, @intCast(@min(chunk_end - read.range.offset, @min(limit, 2 * 1024 * 1024))));
+    }
+    fn prefetchImpl(self: *Reader, reads: []const ranges.RangeRead, page_end: ?u64, page_limit: usize) !void {
         self.reapPrefetch();
         const io = self.context.io orelse return;
         try self.context.ensureActive();
-        self.prefetch_cancelled.store(false, .release);
         for (reads) |read| {
             const slot = for (self.pending, 0..) |pending, i| {
                 if (pending == null) break i;
             } else break;
-            if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) continue;
+            const reserved = @max(read.range.len, page_limit);
+            if (reserved > 32 * 1024 * 1024 -| self.prefetch_bytes) continue;
             const key = try self.objectKey(std.heap.page_allocator, read, "prefetch-v1");
             const duplicate = for (self.pending) |pending| {
                 if (pending) |active| if (std.mem.eql(u8, &key, &active.key)) break true;
             } else false;
             if (duplicate) continue;
-            const task = self.scheduler.submitIoTransient(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse continue;
-            self.pending[slot] = .{ .task = task, .bytes = @intCast(read.range.len), .key = key };
-            self.prefetch_bytes += @intCast(read.range.len);
+            const work = try std.heap.page_allocator.create(Warm);
+            work.* = .{ .reader = self, .read = read, .arena = .init(std.heap.page_allocator) };
+            work.page_end = page_end;
+            work.page_limit = page_limit;
+            errdefer work.destroy();
+            const a = work.arena.allocator();
+            work.read.object.bucket = try a.dupe(u8, read.object.bucket);
+            work.read.object.key = try a.dupe(u8, read.object.key);
+            work.read.object.version.etag = try a.dupe(u8, read.object.version.etag);
+            work.read.object.version.version_id = try a.dupe(u8, read.object.version.version_id);
+            work.read.compression_codec = try a.dupe(u8, read.compression_codec);
+            work.read.decoded_column_id = try a.dupe(u8, read.decoded_column_id);
+            const task = self.scheduler.submitIoTransient(io, @intCast(reserved *| 2), warm, .{work}) orelse {
+                work.destroy();
+                continue;
+            };
+            self.pending[slot] = .{ .task = task, .bytes = @intCast(reserved), .key = key, .work = work };
+            self.prefetch_bytes += @intCast(reserved);
         }
     }
     /// Completed workers have already released execution admission. Joining
@@ -695,14 +737,39 @@ pub const Reader = struct {
             if (!active.task.isComplete()) continue;
             active.task.await(io) catch {};
             self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
             pending.* = null;
         };
     }
-    fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {
+    fn warm(work: *Warm) anyerror!void {
+        const self = work.reader;
+        const read = work.read;
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
-        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
+        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = work, .is_cancelled_fn = Warm.canceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (work.page_end) |end| {
+            var probe = read;
+            const page = @import("lake_parquet_page.zig");
+            while (true) {
+                const lease = try readLease(&worker, std.heap.page_allocator, probe);
+                defer lease.release();
+                const parsed = page.parsePageHeader(lease.bytes) catch |err| {
+                    const next = @min(end - probe.range.offset, @min(probe.range.len * 2, @min(work.page_limit, 64 * 1024)));
+                    if (next <= probe.range.len) return err;
+                    probe.range.len = next;
+                    continue;
+                };
+                try parsed.header.validateResourceLimits();
+                const length = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
+                if (length > end - probe.range.offset or length > work.page_limit) return;
+                if (length <= lease.bytes.len) return;
+                probe.range.len = length;
+                const payload = try readLease(&worker, std.heap.page_allocator, probe);
+                payload.release();
+                return;
+            }
+        }
         if (read.purpose == .parquet_footer) {
             const lease = try worker.footerRead(read);
             defer lease.release();
@@ -711,26 +778,30 @@ pub const Reader = struct {
             defer bytes.release();
         }
     }
-    fn prefetchCanceled(raw: *const anyopaque) bool {
-        const self: *const Reader = @ptrCast(@alignCast(raw));
-        if (self.prefetch_cancelled.load(.acquire)) return true;
-        self.context.ensureActive() catch return true;
-        return false;
-    }
     /// Prefetch failures are speculative. Required reads preserve their own
     /// errors; close cancels/joins before footer metadata or clients are freed.
     pub fn drain(self: *Reader, cancel: bool) void {
-        if (cancel) self.prefetch_cancelled.store(true, .release);
+        self.drainExceptFooter(cancel, false);
+    }
+    /// Footer jobs own their immutable range descriptors and belong to the
+    /// scan, so file teardown can preserve them without borrowing file metadata.
+    pub fn clearFile(self: *Reader) void {
+        self.drainExceptFooter(true, true);
+    }
+    fn drainExceptFooter(self: *Reader, cancel: bool, preserve_footer: bool) void {
         const io = self.context.io orelse return;
         for (&self.pending) |*future| if (future.*) |*active| {
+            if (preserve_footer and active.work.read.purpose == .parquet_footer) continue;
             if (cancel) {
+                active.work.cancelled.store(true, .release);
                 active.task.cancel(io) catch {};
             } else {
                 active.task.await(io) catch {};
             }
+            self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
             future.* = null;
         };
-        self.prefetch_bytes = 0;
     }
     pub fn reader(self: *Reader) parquet.ObjectRangeReader {
         return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned, .read_planned_range_lease = readLease };
@@ -990,6 +1061,60 @@ test "external lake prefetch rolls across blocked batches warms versions and joi
     for (reader.pending) |future| try std.testing.expect(future == null);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_bytes);
+    // A next-file footer owns its descriptors and remains scan-owned while
+    // current-file page jobs are canceled. Final close still joins the footer.
+    scheduler.max_bytes = 128;
+    reader.scope[0] = 3;
+    slow.gate.store(false, .release);
+    const footer_before = slow.entered.load(.acquire);
+    var footer = reads[0];
+    footer.purpose = .parquet_footer;
+    try reader.prefetch(&.{ footer, reads[1] });
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) >= footer_before + 2) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(footer_before + 2, slow.entered.load(.acquire));
+    const canceled_before = slow.canceled.load(.acquire);
+    reader.clearFile();
+    try std.testing.expectEqual(canceled_before + 1, slow.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), reader.prefetch_bytes);
+    var retained: usize = 0;
+    for (reader.pending) |future| if (future) |active| {
+        retained += 1;
+        try std.testing.expectEqual(@as(@TypeOf(footer.purpose), .parquet_footer), active.work.read.purpose);
+        try std.testing.expect(active.work.read.object.key.ptr != footer.object.key.ptr);
+        try std.testing.expect(!active.work.cancelled.load(.acquire));
+    };
+    try std.testing.expectEqual(@as(usize, 1), retained);
+    reader.drain(true);
+    try std.testing.expectEqual(canceled_before + 2, slow.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), reader.prefetch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    // A required next-file open joins the preserved parsed-footer flight;
+    // it does not issue another provider request after file teardown.
+    const parquet_bytes = try @import("lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "n", .values = &.{ 1, 2 } }});
+    defer a.free(parquet_bytes);
+    var next_put = try client.putObject("bucket", "next.parquet", parquet_bytes, .{});
+    defer next_put.deinit(a);
+    const next_file: @import("../external_source/types.zig").FileEntry = .{ .file_id = @constCast("next"), .object_uri = @constCast("s3://bucket/next.parquet"), .etag = next_put.etag.?, .byte_len = parquet_bytes.len, .row_count = 2, .row_groups = &.{} };
+    const next_footer = try ranges.planParquetFooterRead(try ranges.objectRefForExternalFileUri(next_file), 64 * 1024);
+    scheduler.max_bytes = 1024 * 1024;
+    reader.scope[0] = 4;
+    const opened_before = slow.entered.load(.acquire);
+    try reader.prefetch(&.{next_footer});
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) > opened_before) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(opened_before + 1, slow.entered.load(.acquire));
+    reader.clearFile();
+    slow.gate.store(true, .release);
+    const parsed = try reader.footer(next_file);
+    parsed.release();
+    reader.drain(false);
+    try std.testing.expectEqual(opened_before + 1, slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
 }
 
 test "external lake immutable artifact cache survives restart without provider reads" {

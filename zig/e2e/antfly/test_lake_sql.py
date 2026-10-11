@@ -2061,6 +2061,18 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 [str(amount), "1", str(amount), str(amount), str(amount)]
                 for amount in sorted(expected)
             ], grouped
+            filtered_groups = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT amount, SUM(amount), COUNT(*) FILTER (WHERE amount < 0) FROM incremental WHERE amount >= 0 GROUP BY amount ORDER BY amount"
+                },
+            )
+            assert filtered_groups["rows"] == [
+                [str(amount), str(amount), "0"]
+                for amount in sorted(expected)
+                if amount >= 0
+            ], filtered_groups
             public_id = results[0]["hits"]["hits"][0]["_id"]
             for request in (text_request, dense_request, sparse_request):
                 filtered = call(
