@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const codecs = @import("codecs/decoder.zig");
 pub const vp8 = @import("vp8.zig");
 pub const software = @import("software.zig");
 pub const h264_dynamic = @import("h264_dynamic.zig");
@@ -31,6 +32,7 @@ pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
 pub const sampling = @import("sampling.zig");
 test {
+    _ = @import("codecs/test.zig");
     _ = avc;
     _ = vp8;
     _ = h264_sparse;

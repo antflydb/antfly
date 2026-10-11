@@ -1,0 +1,152 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Geometry and superframe preflight before the reconstruction core allocates.
+const std = @import("std");
+pub const Geometry = struct { width: u32, height: u32 };
+pub const References = [8]?Geometry;
+pub const Parts = struct { packets: [8][]const u8 = undefined, len: usize = 0 };
+const Bits = struct {
+    bytes: []const u8,
+    position: usize = 0,
+    fn read(self: *Bits, count: u5) !u32 {
+        if (@as(usize, count) > self.bytes.len * 8 -| self.position) return error.InvalidVideoData;
+        var value: u32 = 0;
+        for (0..count) |_| {
+            value = (value << 1) | ((self.bytes[self.position / 8] >> @intCast(7 - self.position % 8)) & 1);
+            self.position += 1;
+        }
+        return value;
+    }
+    fn flag(self: *Bits) !bool {
+        return try self.read(1) != 0;
+    }
+};
+pub fn split(bytes: []const u8) !Parts {
+    if (bytes.len == 0) return error.InvalidVideoData;
+    var result: Parts = .{};
+    const marker = bytes[bytes.len - 1];
+    if (marker & 0xe0 != 0xc0) {
+        result.packets[0] = bytes;
+        result.len = 1;
+        return result;
+    }
+    const count: usize = (marker & 7) + 1;
+    const magnitude: usize = ((marker >> 3) & 3) + 1;
+    const index_size = 2 + count * magnitude;
+    // A marker-looking last payload byte without a matching index is payload.
+    if (index_size > bytes.len or bytes[bytes.len - index_size] != marker) {
+        result.packets[0] = bytes;
+        result.len = 1;
+        return result;
+    }
+    var offset: usize = 0;
+    var index = bytes.len - index_size + 1;
+    for (0..count) |i| {
+        var packet_size: usize = 0;
+        for (0..magnitude) |j| {
+            packet_size |= @as(usize, bytes[index]) << @intCast(j * 8);
+            index += 1;
+        }
+        if (packet_size == 0 or packet_size > bytes.len - index_size -| offset) return error.InvalidVideoData;
+        result.packets[i] = bytes[offset..][0..packet_size];
+        offset += packet_size;
+    }
+    if (offset != bytes.len - index_size) return error.InvalidVideoData;
+    result.len = count;
+    return result;
+}
+fn color(bits: *Bits, profile: u32) !void {
+    if (profile >= 2) _ = try bits.read(1);
+    const space = try bits.read(3);
+    if (space != 7) {
+        _ = try bits.read(1);
+        if (profile == 1 or profile == 3) {
+            _ = try bits.read(2);
+            if (try bits.flag()) return error.InvalidVideoData;
+        }
+    } else {
+        if (profile != 1 and profile != 3) return error.InvalidVideoData;
+        if (try bits.flag()) return error.InvalidVideoData;
+    }
+}
+fn size(bits: *Bits) !Geometry {
+    return .{ .width = try bits.read(16) + 1, .height = try bits.read(16) + 1 };
+}
+fn render(bits: *Bits) !void {
+    if (try bits.flag()) {
+        _ = try bits.read(16);
+        _ = try bits.read(16);
+    }
+}
+fn sync(bits: *Bits) !void {
+    if (try bits.read(24) != 0x498342) return error.InvalidVideoData;
+}
+pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) !void {
+    var bits: Bits = .{ .bytes = bytes };
+    if (try bits.read(2) != 2) return error.InvalidVideoData;
+    const low = try bits.read(1);
+    const profile = low + 2 * try bits.read(1);
+    if (profile == 3 and try bits.flag()) return error.InvalidVideoData;
+    if (try bits.flag()) {
+        const geometry = references[try bits.read(3)] orelse return error.InvalidVideoData;
+        try validate(geometry, max_pixels);
+        return;
+    }
+    const inter = try bits.flag();
+    const show = try bits.flag();
+    const resilient = try bits.flag();
+    var refresh: u32 = 255;
+    var geometry: Geometry = undefined;
+    if (!inter) {
+        try sync(&bits);
+        try color(&bits, profile);
+        geometry = try size(&bits);
+        try render(&bits);
+    } else {
+        const intra = if (!show) try bits.flag() else false;
+        if (!resilient) _ = try bits.read(2);
+        if (intra) {
+            try sync(&bits);
+            if (profile > 0) try color(&bits, profile);
+            refresh = try bits.read(8);
+            geometry = try size(&bits);
+            try render(&bits);
+        } else {
+            refresh = try bits.read(8);
+            var refs: [3]u32 = undefined;
+            for (&refs) |*ref| {
+                ref.* = try bits.read(3);
+                _ = try bits.read(1);
+            }
+            var found: ?Geometry = null;
+            for (refs) |ref| {
+                if (try bits.flag()) {
+                    found = references[ref] orelse return error.InvalidVideoData;
+                    break;
+                }
+            }
+            geometry = found orelse try size(&bits);
+            try render(&bits);
+        }
+    }
+    try validate(geometry, max_pixels);
+    for (0..8) |i| {
+        if (refresh & (@as(u32, 1) << @intCast(i)) != 0) references[i] = geometry;
+    }
+}
+fn validate(geometry: Geometry, max_pixels: usize) !void {
+    if (geometry.width > 16_384 or geometry.height > 16_384 or @as(u64, geometry.width) * geometry.height > max_pixels) return error.ResourceLimitExceeded;
+}

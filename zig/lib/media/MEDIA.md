@@ -333,7 +333,7 @@ contracts are not a claim that every MP4 or WebM stream is supported.
 fallback when Cues are absent. Positions must resolve to the selected track's
 indexed visible sync packet; malformed targets, duplicate times, unsupported
 codec-state changes and budget excess fail. A container sync hint is not proof
-of a codec dependency reset. VP8/VP9/AV1 decoding is still unavailable.
+of a codec dependency reset. Native video decoder consumers are documented below.
 
 `stream.Sequential` adapts a non-seekable reader. `stream.collect` explicitly
 spools to a bounded immutable `Snapshot`, handling short reads, final EOF, cancellation
@@ -472,8 +472,8 @@ The caller supplies clock synchronization and selects the representation upstrea
 WebM packet indexing now feeds `antfly_video.vp8.Session` for pure Zig stateful
 VP8 reconstruction, including invisible reference pictures. Packet ordering and
 visibility remain transport metadata; the decoder independently checks coded
-frame tags and updates references in coded order. WebM model ingestion and
-VP9/AV1 reconstruction remain unsupported.
+frame tags and updates references in coded order. WebM model ingestion remains
+unsupported; the VP9/AV1 decoder consumers are documented below.
 
 MP4 orthogonal display matrices and pixel aspect ratios now reach the
 EmbeddingGemma 2 presentation renderer. AVC VUI primaries are retained alongside
@@ -482,3 +482,23 @@ metadata before selecting the explicit PQ/HLG rendering policy. Color conflicts
 and unsupported transforms fail. These model policies use a new embedding recipe
 identity and have separate positive pretrained rendering oracles; media indexing
 still performs no color conversion itself. See [VIDEO.md](../video/VIDEO.md#stateful-vp8-and-presentationhdr-rendering-continuation).
+
+## VP9 and AV1 decoder consumers
+
+The WebM VP9/AV1 index now has a native consumer in
+`video.codecs.Session.decodeWebmPacket`; earlier statements that these codecs
+have no reconstruction route are superseded by this implementation. Antfly
+maintains checked-in Zig source ports, with no runtime codec-library dependency.
+VP9 fixtures cover profiles 0–3 at 8/10/12-bit across 4:2:0/4:2:2/4:4:4. AV1's
+qualified public route is Main profile, 8/10-bit 4:2:0 low-overhead OBU packets,
+including film grain and reference updates.
+
+The consumer leases packets through the existing source interface, applies
+session/reader control checks, and handles AV1 configuration OBUs from WebM
+CodecPrivate. Decode remains sequential; seek recovery must create a new decoder
+and replay coded dependencies from a synchronization point. Output is a bounded,
+independently owned picture batch. Multiple pictures in one container packet
+retain that packet's timestamp; this does not invent a logical-picture timeline
+or add model WebM ingestion. See [VIDEO.md](../video/VIDEO.md) and the
+[maintained port contract](../video/src/codecs/PORTING.md) for support and failure
+semantics.

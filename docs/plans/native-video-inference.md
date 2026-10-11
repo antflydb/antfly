@@ -563,3 +563,41 @@ hardware HDR imports and broader real-world HDR qualification remain separate.
 The manual Linux workflow now generates its own pinned PyTorch rendering oracle
 and compares the native model against it. Cross-compilation is not Linux runtime
 evidence, and prior runtime receipts remain tied to their earlier source/binary.
+
+## Maintained VP9/AV1 decoder implementation
+
+The codec implementation gates above now have native reconstruction, rather
+than packet parsing alone. `video.codecs.Session` owns maintained Zig source
+ports of dav1d 1.5.1 and libvpx 1.15.2. The checked-in Zig builds without codec C,
+runtime libraries or downloads. Antfly's allocator/control/admission services
+replace libc allocation, worker management and VP9 non-local error exits.
+Upstream BSD notices, authorship and VP9 PATENTS remain with the owned source.
+
+Initial qualified fixtures cover VP9 profiles 0–3, 8/10/12-bit 4:2:0/4:2:2/4:4:4,
+interframes, odd geometry and multiple visible superframe pictures. AV1 is
+qualified for Main profile, 8/10-bit 4:2:0 low-overhead OBUs, reference updates,
+film grain and odd geometry. Every displayed picture matches an independently
+executed reference decoder: 144 pictures across 12 pinned synthetic streams.
+Regeneration reproduces the coded bytes and reference picture hashes.
+
+WebM packet leases, timestamps and AV1 configuration OBUs connect to the new
+session API. Decoded native-depth/chroma surfaces use existing CPU/Metal
+preparation; actual-device parity includes odd dimensions and 12-bit/4:2:2/4:4:4
+VP9 output. The semiplanar boundary uses portable Zig vectors with scalar tails.
+This does not add model WebM ingestion or hardware VP9/AV1 decode.
+
+Memory, pixel, packet and output bounds share existing admission. Sessions have
+stable ownership and reclaim every allocation after partial initialization or
+failed decoding. Independent sessions run concurrently with atomic once setup;
+internal codec workers remain disabled. Preflight failures are retryable, but
+post-entry errors invalidate the decoder and require a new session/replay from
+a synchronization point. Tests cover allocation failure, cancellation, bounded
+mutations, truncation, concurrency and output lifetime.
+
+Local validation: 136/138 ReleaseSafe video tests pass on macOS with actual Metal
+(two existing platform skips); Linux x86_64 and ARM64 musl compile/link without
+libc or codec libraries. Actual Linux runtime qualification remains a separate
+workflow receipt. Broader real-world codec conformance, coverage-guided fuzzing,
+AV1 additional profiles/layer policies and measured throughput remain explicit
+qualification work. See `src/codecs/PORTING.md` for the maintained-source contract
+and `testdata/vpx-av1/README.md` for reproducible reference fixtures.

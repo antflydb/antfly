@@ -675,7 +675,7 @@ measured reconstruction hotspots and bounded persistent scratch. Full reference
 pictures remain necessary even when the model needs a small resized output.
 Reduced-resolution reference reconstruction cannot be treated as an exact
 optimization. Reject unsupported interlace, chroma, bit depth, or tools before
-advertising support. HEVC, VP9, and AV1 are independent later projects.
+advertising support. HEVC remains a later project. The maintained VP9/AV1 routes are documented below.
 
 ### Metal execution after either decoder
 
@@ -874,8 +874,8 @@ container sync flags alone never authorize a seek. Dynamic parameter-set session
 retain their existing route. The model uses at most 8192 submitted software
 packets per clip, 32 selected pictures and the existing decoder allocation cap.
 
-Codec implementations remain pure Zig. VP8/VP9/AV1 decoding is still an explicit
-open implementation and conformance gate, without libvpx/dav1d runtime adapters.
+Codec implementations remain pure Zig. Stateful VP8 and the maintained VP9/AV1
+source ports are documented below; no libvpx/dav1d runtime adapters are used.
 
 
 ## Portable VP8 keyframe entry point
@@ -886,8 +886,8 @@ intra prediction, transforms and loop filters with `lib/image`, through a raw
 packet API; it requires no RIFF wrapping, RGB conversion or external decoder.
 The coded frame tag is checked independently of the container sync hint.
 Reference-dependent interframes fail with `UnsupportedVp8Interframe`; this is
-not general VP8 video playback or model WebM integration. VP9 and AV1 decoding
-remain open.
+not model WebM integration. Later sections add VP8 interframes and VP9/AV1
+reconstruction.
 
 Packet, pixel and live allocation limits apply before/during decoding. A shared
 admission token reserves decoder workspace, then shrinks to the owned output
@@ -1007,8 +1007,8 @@ optimization, not a decoding dependency.
 174 displayed pictures and three hidden alt-reference pictures, multiple token
 partitions, keyframe resets, versions 0–3, and a real Sintel excerpt. These are
 qualification examples, not exhaustive codec conformance. Runtime reconstruction
-links no codec libraries. Model WebM ingestion, VP9 and AV1 decoding remain
-unimplemented; `capabilities` exposes those distinctions explicitly.
+links no codec libraries. Model WebM ingestion remains unimplemented. The
+maintained VP9/AV1 routes below expose their qualified capabilities explicitly.
 
 The EmbeddingGemma 2 model now honors orthogonal rotation and SAR metadata.
 SAR controls model target geometry through one direct separable resize; it does
@@ -1037,3 +1037,57 @@ pretrained qualification scripts and full PyTorch CPU/MPS vectors are in
 processor's presentation policy. Qualification remains bounded to these inputs;
 hardware HDR import, all depths/chroma formats and real-world HDR scenes require
 additional evidence. Earlier dated receipts continue to qualify their own binaries.
+
+## Maintained pure Zig VP9 and AV1 reconstruction
+
+`video.codecs.Session` now decodes elementary VP9 and AV1 packets, and
+`decodeWebmPacket` connects these decoders to the existing bounded WebM range
+reader. This supersedes the earlier VP9/AV1 implementation gaps above. The cores
+are checked-in, Antfly-maintained Zig source ports of pinned BSD reference code;
+there is no libvpx/dav1d/FFmpeg runtime, codec C build, or build-time download.
+Ownership, pinned origins and port-specific changes are recorded in
+[src/codecs/PORTING.md](src/codecs/PORTING.md).
+
+The qualified VP9 fixtures cover profiles 0–3, 8/10/12-bit 4:2:0, 4:2:2 and
+4:4:4, interframes, superframes and odd geometry. The AV1 public route is Main
+profile at 8/10-bit 4:2:0, including interframes, hidden/show-existing updates,
+film grain and odd geometry, using low-overhead OBU packets. Other AV1 profiles,
+12-bit/monochrome/chroma formats, Annex B and scalable-layer policy remain
+unqualified. Capabilities expose both routes and their qualified subsets.
+
+Create one Session per sequential coded stream. `decode` returns an owned Batch
+containing every visible picture; hidden updates retain references without
+inventing an output. VP9 superframes are split and drained separately so earlier
+visible pictures are retained. A packet producing multiple visible pictures
+assigns its caller-provided PTS/duration to each; callers needing distinct
+picture timestamps must supply distinct framed access units. WebM supplies its
+stored packet timestamps, initializes AV1 configuration OBUs from CodecPrivate,
+and checks both reader and session cancellation controls. It does not add a
+model-level WebM ingestion or sampling policy.
+
+Frames own right-aligned native-depth semiplanar samples and color metadata.
+`Frame.host()` exposes the existing CPU/Metal preparation surface, with ceil
+chroma dimensions for odd widths/heights. Callers must pass the frame's color
+metadata into their preparation/display policy. Planar-to-semiplanar output
+uses Zig portable vectors plus scalar tails; no SIMD throughput claim is made.
+Apple import, resident model execution and CUDA coverage are separate routes.
+
+Options bound packet bytes, pixels, core live memory, output bytes and picture
+count. Stable session owners use the existing decode Budget and shared
+admission; separately admitted outputs can outlive the session. Allocation,
+cancellation or decode failure after core entry invalidates and reclaims the
+session. Recovery requires a new session and replay from a synchronization
+point. Preflight/admission denial before entry is retryable. Internal workers
+are disabled; distinct sessions can run concurrently with atomic initialization.
+
+Qualification fixtures and per-picture reference hashes are in
+[testdata/vpx-av1](testdata/vpx-av1/README.md). They cover 144 visible pictures
+across 12 streams, including AV1 grain and VP9 depth/chroma variants. Tests also
+exercise every first-picture allocation failure, concurrent shared admission,
+cancellation, output lifetime, truncation, header mutations and multiple visible
+pictures in a VP9 superframe, plus actual CPU/Metal preparation parity on decoded
+high-depth/chroma/odd-geometry frames. macOS execution and Linux x86_64/ARM64 compilation
+are separate receipts; cross-compilation does not establish actual Linux runtime
+qualification. The existing Linux qualification workflow runs these portable
+tests. Broad real-world conformance/fuzzing and realistic performance remain
+qualification work, rather than implied by the source port.
