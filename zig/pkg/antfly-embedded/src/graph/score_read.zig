@@ -20,7 +20,7 @@ const std = @import("std");
 const keys = @import("../storage/internal_keys.zig");
 pub const max_keys_per_read = 4096;
 pub const max_key_bytes_per_read = 1024 * 1024;
-pub const Stats = struct { keys: usize = 0, batches: usize = 0, reused_plan: bool = false };
+pub const Stats = struct { keys: usize = 0, batches: usize = 0, plan_identity: u64 = 0 };
 
 pub const PreparedRequest = @import("../storage/prepared_score_request.zig").PreparedScoreRequest;
 
@@ -104,7 +104,6 @@ pub fn populate(
         if (scope) |*active| {
             const supported = if (comptime @hasDecl(Scope, "supportsScoreVisitor")) active.supportsScoreVisitor() else true;
             if (supported) if (active.preparedScorePlan()) |plan| {
-                const previous_identity = plan.identity;
                 const prepared = plan.prepare(active.preparedScoreAllocator(), prefixes, nodes) catch false;
                 if (prepared) prepared_read: {
                     var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
@@ -138,7 +137,7 @@ pub fn populate(
                         },
                         else => return err,
                     };
-                    return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1, .reused_plan = previous_identity != 0 and previous_identity == plan.identity };
+                    return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1, .plan_identity = plan.identity };
                 } else {
                     // Plan construction itself can fail after partial work.
                     active.close();

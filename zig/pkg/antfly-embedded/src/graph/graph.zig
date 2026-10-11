@@ -20069,8 +20069,9 @@ pub const GraphIndex = struct {
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
         reads: score_read.Stats = .{},
-        // Query/session-owned only. Prepare after a plan is reused so one-shot
-        // reads incur no extra ownership; release before retrying under pressure.
+        // Promote only after this session repeats the same canonical plan.
+        // Shared workspace hits alone do not prove session-local reuse.
+        last_plan_identity: u64 = 0,
         prepared_request: ?score_read.PreparedRequest = null,
 
         pub fn deinit(self: *@This()) void {
@@ -20104,6 +20105,7 @@ pub const GraphIndex = struct {
                             // of a query that can still stream its original inputs.
                             request.deinit();
                             self.prepared_request = null;
+                            self.last_plan_identity = 0;
                             const retry_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
                             self.reads.keys += retry_stats.keys;
                             self.reads.batches += retry_stats.batches;
@@ -20117,11 +20119,14 @@ pub const GraphIndex = struct {
                 }
                 request.deinit();
                 self.prepared_request = null;
+                self.last_plan_identity = 0;
             }
             const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
-            if (read_stats.reused_plan) {
+            const repeated = read_stats.plan_identity != 0 and self.last_plan_identity == read_stats.plan_identity;
+            self.last_plan_identity = read_stats.plan_identity;
+            if (repeated) {
                 self.prepared_request = score_read.PreparedRequest.init(self.alloc, prefixes, nodes) catch |err| switch (@as(anyerror, err)) {
                     error.OutOfMemory, error.ResourceBudgetExceeded, error.GraphMetricQueryBudgetExceeded => null,
                     else => return err,

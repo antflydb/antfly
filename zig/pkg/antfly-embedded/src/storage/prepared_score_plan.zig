@@ -58,6 +58,7 @@ pub const PreparedScorePlan = struct {
     column_sorted: []const usize = &.{},
     column_count: usize = 0,
     column_order_identity: bool = true,
+    dense_columns: bool = false,
 
     pub fn deinit(self: *@This()) void {
         if (self.storage) |storage| self.backing.?.free(storage);
@@ -227,6 +228,15 @@ pub const PreparedScorePlan = struct {
         self.targets = targets;
         self.read_keys = read_keys[0..unique];
         self.ends = ends[0..unique];
+        // Prove once that canonical scores consist of whole contiguous columns.
+        // Duplicate keys, interleaved prefixes and unsorted rows use fanout.
+        self.dense_columns = nodes.len != 0 and unique == targets.len;
+        if (self.dense_columns) for (targets, 0..) |target, i| {
+            if (target.row != i % nodes.len or target.column != columns[i / nodes.len]) {
+                self.dense_columns = false;
+                break;
+            }
+        };
         self.identity = next_identity.fetchAdd(1, .monotonic);
         if (self.identity == 0 or self.identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
         self.valid = true;
@@ -363,10 +373,23 @@ pub const PreparedScorePlan = struct {
             return .{ .context = self, .write = if (self.plan.column_order_identity)
                 (if (self.plan.row_order_identity) completeCanonical else completeRemapped)
             else
-                (if (self.plan.row_order_identity) completeColumns else completeBoth), .write_decoded = if (self.plan.column_order_identity)
+                (if (self.plan.row_order_identity) completeColumns else completeBoth), .write_decoded = if (self.plan.dense_columns and self.plan.row_order_identity and self.plan.nodes.len >= 8)
+                decodedDense
+            else if (self.plan.column_order_identity)
                 (if (self.plan.row_order_identity) decodedCanonical else decodedRemapped)
             else
                 (if (self.plan.row_order_identity) decodedColumns else decodedBoth) };
+        }
+        fn decodedDense(ctx: *anyopaque, scores: []const f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const rows = self.plan.nodes.len;
+            std.debug.assert(scores.len == self.plan.read_keys.len);
+            for (self.plan.column_sorted[0..self.plan.column_count], 0..) |column, ordinal| {
+                const output = self.columns[if (self.plan.column_order_identity) column else self.plan.column_remap[column]];
+                for (scores[ordinal * rows ..][0..rows], output) |score, *value| {
+                    value.* = if (std.math.isNan(score)) null else score;
+                }
+            }
         }
         fn decodedCanonical(ctx: *anyopaque, scores: []const f64) void {
             writeDecoded(ctx, scores, false, false);
@@ -574,4 +597,30 @@ test "prepared score bulk delivery preserves null duplicate and permutation fano
         second.completeSink().deliverDecoded(values[0..plan.read_keys.len]);
         for (expected, actual) |want, got| try std.testing.expectEqualSlices(?f64, &want, &got);
     }
+}
+
+test "prepared score dense columns preserve missing scores null columns and remaps" {
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    const prefixes = [_]?[]const u8{ "q/", null, "p/" };
+    const nodes = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    const reordered = [_]?[]const u8{ "p/", "q/", null };
+    const reversed = [_][]const u8{ "h", "g", "f", "e", "d", "c", "b", "a" };
+    for (0..4) |mode| {
+        try std.testing.expect(try plan.prepare(std.testing.allocator, if (mode & 1 == 0) &prefixes else &reordered, if (mode & 2 == 0) &nodes else &reversed));
+        try std.testing.expect(plan.dense_columns);
+        var expected: [3][8]?f64 = @splat(@splat(null));
+        var actual: [3][8]?f64 = @splat(@splat(null));
+        var scalar = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &expected[0], &expected[1], &expected[2] } };
+        var bulk = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &actual[0], &actual[1], &actual[2] } };
+        const values = [_]f64{ 3, std.math.nan(f64), 5, 8, 1, 2, 3, 4, 9, 8, 7, std.math.nan(f64), 5, 4, 3, 2 };
+        const sink = scalar.completeSink();
+        for (values, 0..) |value, i| sink.write(sink.context, i, if (std.math.isNan(value)) null else value);
+        bulk.completeSink().deliverDecoded(&values);
+        for (expected, actual) |first, second| try std.testing.expectEqualSlices(?f64, &first, &second);
+    }
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{ "p/", "p/" }, &nodes));
+    try std.testing.expect(!plan.dense_columns);
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &prefixes, &.{ "a", "a" }));
+    try std.testing.expect(!plan.dense_columns);
 }

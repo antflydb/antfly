@@ -521,6 +521,25 @@ pub const DocumentIndexEntry = struct {
 /// Validated immutable index page. Inline keys borrow the retained page;
 /// overflow comparisons use one reusable record buffer, never a key array.
 const IndexReadFrame = IndexReadFrameType(false);
+// Compare an index key with namespace ++ canonical key without materializing
+// a second key batch. Exact bytes (including embedded zeroes) decide equality.
+const PrefixedReadKey = struct {
+    prefix: []const u8,
+    key: []const u8,
+    fn order(self: @This(), indexed: []const u8) std.math.Order {
+        const count = @min(indexed.len, self.prefix.len);
+        const prefix_order = std.mem.order(u8, indexed[0..count], self.prefix[0..count]);
+        if (prefix_order != .eq) return prefix_order;
+        if (indexed.len < self.prefix.len) return .lt;
+        return std.mem.order(u8, indexed[self.prefix.len..], self.key);
+    }
+};
+
+fn readKeyOrder(indexed: []const u8, wanted: anytype) std.math.Order {
+    if (comptime @TypeOf(wanted) == PrefixedReadKey) return wanted.order(indexed);
+    return std.mem.order(u8, indexed, wanted);
+}
+
 const BatchIndexReadFrame = IndexReadFrameType(true);
 
 // Only batch frames carry leases and an allocator override. Ordinary readers
@@ -681,13 +700,13 @@ fn IndexReadFrameType(comptime batch: bool) type {
             return std.mem.readInt(u64, self.payload[offset + 10 ..][0..8], .little);
         }
 
-        fn bound(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, wanted: []const u8, upper: bool) !usize {
+        fn bound(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, wanted: anytype, upper: bool) !usize {
             var low: usize = 0;
             var high = self.entries().len;
             while (low < high) {
                 if (builtin.is_test) _ = file.test_index_comparisons.fetchAdd(1, .monotonic);
                 const mid = low + (high - low) / 2;
-                const order = std.mem.order(u8, try self.key(file, checkpoint, mid), wanted);
+                const order = readKeyOrder(try self.key(file, checkpoint, mid), wanted);
                 if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
             }
             return low;
@@ -697,17 +716,17 @@ fn IndexReadFrameType(comptime batch: bool) type {
         // slot. Gallop from the previous bound, then binary-search the gap; this
         // avoids re-reading overflow separators for every dense request while
         // sparse batches still skip unrelated keys logarithmically.
-        fn boundFrom(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, wanted: []const u8, upper: bool, start: usize) !usize {
+        fn boundFrom(self: *@This(), file: *NativeFile, checkpoint: CheckpointSlot, wanted: anytype, upper: bool, start: usize) !usize {
             const count = self.entries().len;
             if (start == count) return count;
-            const first_order = std.mem.order(u8, try self.key(file, checkpoint, start), wanted);
+            const first_order = readKeyOrder(try self.key(file, checkpoint, start), wanted);
             if (first_order == .gt or (!upper and first_order == .eq)) return start;
             var low = start + 1;
             var high = count;
             var stride: usize = 1;
             while (low < count) : (stride *= 2) {
                 const probe = @min(start + stride, count - 1);
-                const order = std.mem.order(u8, try self.key(file, checkpoint, probe), wanted);
+                const order = readKeyOrder(try self.key(file, checkpoint, probe), wanted);
                 if (order == .gt or (!upper and order == .eq)) {
                     high = probe;
                     break;
@@ -716,7 +735,7 @@ fn IndexReadFrameType(comptime batch: bool) type {
             }
             while (low < high) {
                 const mid = low + (high - low) / 2;
-                const order = std.mem.order(u8, try self.key(file, checkpoint, mid), wanted);
+                const order = readKeyOrder(try self.key(file, checkpoint, mid), wanted);
                 if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
             }
             return low;
@@ -6184,30 +6203,12 @@ pub const NativeFile = struct {
                 return;
             }
         };
-        if (namespace.len == 0) return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
-        var bytes_len: usize = 0;
-        for (plan.read_keys) |key| {
-            bytes_len = std.math.add(usize, bytes_len, namespace.len) catch return error.InvalidBatch;
-            bytes_len = std.math.add(usize, bytes_len, key.len) catch return error.InvalidBatch;
-        }
-        const physical = try temporary.alloc([]const u8, plan.read_keys.len);
-        defer temporary.free(physical);
-        const bytes = try temporary.alloc(u8, bytes_len);
-        defer temporary.free(bytes);
-        var offset: usize = 0;
-        for (physical, plan.read_keys) |*out, key| {
-            const begin = offset;
-            @memcpy(bytes[offset..][0..namespace.len], namespace);
-            offset += namespace.len;
-            @memcpy(bytes[offset..][0..key.len], key);
-            offset += key.len;
-            out.* = bytes[begin..offset];
-        }
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, physical, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
     }
 
     fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: anytype, state: *DocumentBatchReadState, prepared: ?ReadIdentity) !void {
         const complete = comptime @TypeOf(scores) == ?CompleteScoreSink;
+        const namespace = if (prepared) |identity| identity.namespace else "";
         state.prepare(self);
         defer state.reset();
         if (state.resolved) |resolved| resolved.recovered_optional_failure = false;
@@ -6255,11 +6256,11 @@ pub const NativeFile = struct {
         defer if (state.resolved) |resolved| {
             resolved.borrowed = false;
         };
-        var references = if (cached) state.resolved.?.references else self.resolveBatchReferences(temporary, checkpoint, keys, &state.path) catch |err| retry: {
+        var references = if (cached) state.resolved.?.references else self.resolveBatchReferences(temporary, checkpoint, keys, namespace, &state.path) catch |err| retry: {
             if (!staged or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
             state.resolved.?.deinit(state.allocator.?);
             recovered = true;
-            break :retry try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+            break :retry try self.resolveBatchReferences(temporary, checkpoint, keys, namespace, &state.path);
         };
         defer if (!cached) temporary.free(references);
         var order = if (cached) state.resolved.?.order else batchReferenceOrder(temporary, references) catch |err| retry: {
@@ -6325,7 +6326,7 @@ pub const NativeFile = struct {
                 references = &.{};
                 order = null;
                 state.reset();
-                references = try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+                references = try self.resolveBatchReferences(temporary, checkpoint, keys, namespace, &state.path);
                 order = try batchReferenceOrder(temporary, references);
                 const resumed = if (order) |positions| positions[position] else position;
                 if (resumed != i or references[resumed] != reference) return error.InvalidDocumentIndex;
@@ -6333,7 +6334,7 @@ pub const NativeFile = struct {
                 continue;
             };
             const entry = try decodeDocumentEntry(bytes);
-            if (!std.mem.eql(u8, entry.key, keys[i])) return error.InvalidDocumentIndex;
+            if (readKeyOrder(entry.key, PrefixedReadKey{ .prefix = namespace, .key = keys[i] }) != .eq) return error.InvalidDocumentIndex;
             if (entry.is_delete) {
                 if (capture) {
                     state.resolved.?.decoded[i] = std.math.nan(f64);
@@ -6377,11 +6378,15 @@ pub const NativeFile = struct {
         if (recovered) state.resolved.?.recovered_optional_failure = true;
     }
 
-    fn resolveBatchReferences(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, path: *BatchIndexReadPath) ![]u64 {
+    fn resolveBatchReferences(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, namespace: []const u8, path: *BatchIndexReadPath) ![]u64 {
         const references = try temporary.alloc(u64, keys.len);
         errdefer temporary.free(references);
         @memset(references, 0);
-        try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, path, 0);
+        if (namespace.len == 0) {
+            try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, path, 0, {});
+        } else {
+            try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, path, 0, namespace);
+        }
         return references;
     }
 
@@ -6402,28 +6407,29 @@ pub const NativeFile = struct {
     fn readDocumentBatchNode(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64) !void {
         var path = IndexReadPath{};
         defer path.deinit(self.allocator);
-        try self.readDocumentBatchWithPath(checkpoint, page, keys, references, &path, 0);
+        try self.readDocumentBatchWithPath(checkpoint, page, keys, references, &path, 0, {});
     }
 
-    fn readDocumentBatchWithPath(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64, path: anytype, depth: usize) !void {
+    fn readDocumentBatchWithPath(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64, path: anytype, depth: usize, namespace: anytype) !void {
         const node = if (comptime @TypeOf(path.*) == BatchIndexReadPath) try path.loadMode(self, checkpoint, depth, page, true) else try path.load(self, checkpoint, depth, page);
         var group_start: usize = 0;
         var group_child: usize = 0;
         var previous_bound: usize = 0;
         for (keys, 0..) |key, i| {
-            const low = if (i == 0) try node.bound(self, checkpoint, key, node.kind == .internal) else try node.boundFrom(self, checkpoint, key, node.kind == .internal, previous_bound);
+            const wanted = if (comptime @TypeOf(namespace) == void) key else PrefixedReadKey{ .prefix = namespace, .key = key };
+            const low = if (i == 0) try node.bound(self, checkpoint, wanted, node.kind == .internal) else try node.boundFrom(self, checkpoint, wanted, node.kind == .internal, previous_bound);
             previous_bound = low;
             if (node.kind == .leaf) {
-                if (low < node.entries().len and std.mem.eql(u8, try node.key(self, checkpoint, low), key)) references[i] = node.pointer(low);
+                if (low < node.entries().len and readKeyOrder(try node.key(self, checkpoint, low), wanted) == .eq) references[i] = node.pointer(low);
             } else {
                 if (i > 0 and low != group_child) {
-                    try self.readDocumentBatchWithPath(checkpoint, node.pointer(group_child), keys[group_start..i], references[group_start..i], path, depth + 1);
+                    try self.readDocumentBatchWithPath(checkpoint, node.pointer(group_child), keys[group_start..i], references[group_start..i], path, depth + 1, namespace);
                     group_start = i;
                 }
                 group_child = low;
             }
         }
-        if (node.kind == .internal) try self.readDocumentBatchWithPath(checkpoint, node.pointer(group_child), keys[group_start..], references[group_start..], path, depth + 1);
+        if (node.kind == .internal) try self.readDocumentBatchWithPath(checkpoint, node.pointer(group_child), keys[group_start..], references[group_start..], path, depth + 1, namespace);
     }
 
     /// Existence query over live record metadata, never document values. Skip
@@ -17887,4 +17893,17 @@ test "lite decoded cold promotion preserves a direct native caller allocation fl
     try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{"a"}, &score, &state);
     try std.testing.expectEqual(@as(?f64, 3), score[0]);
     try std.testing.expect(!resolved.decoded_ready);
+}
+
+test "lite prefixed key comparisons match materialized byte order" {
+    const samples = [_][]const u8{ "", "a", "a\x00", "a\xff", "b", "\x00\xff", "\xff\x00\xff", "longer/index/key" };
+    for (samples) |prefix| for (samples) |key| {
+        var buffer: [64]u8 = undefined;
+        @memcpy(buffer[0..prefix.len], prefix);
+        @memcpy(buffer[prefix.len..][0..key.len], key);
+        const joined = buffer[0 .. prefix.len + key.len];
+        const wanted = PrefixedReadKey{ .prefix = prefix, .key = key };
+        for (samples) |indexed| try std.testing.expectEqual(std.mem.order(u8, indexed, joined), wanted.order(indexed));
+        for (0..joined.len + 1) |cut| try std.testing.expectEqual(std.mem.order(u8, joined[0..cut], joined), wanted.order(joined[0..cut]));
+    };
 }

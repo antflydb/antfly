@@ -8554,3 +8554,171 @@ test "lite prepared production metric session measurement" {
     const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
     std.debug.print("LITE_PRODUCTION cpu_us={d} allocations={d} cache_bytes={d}\n", .{ cpu, counter.alloc_calls - before, store.workspaces[0].?.resolved_scores.storage.?.len });
 }
+
+test "lite prepared fresh one shot sessions never promote shared plans" {
+    const a = std.testing.allocator;
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-owned-session.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    try store.file.putDocument("p/a\x00\x00", &score);
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocument("p/b\x00\x00", &score);
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var node = [_]u8{'a'};
+    var column: [1]?f64 = undefined;
+    for (0..2) |iteration| {
+        const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+        statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+        const prefixes = try alloc.alloc(?[]const u8, 1);
+        prefixes[0] = try alloc.dupe(u8, "p/");
+        var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openRead(&store)), .statuses = statuses, .prefixes = prefixes };
+        defer session.deinit();
+        const before = counter.alloc_calls;
+        try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+        std.debug.print("ONE_SHOT iteration={d} calls={d} owned={any} bytes={d}\n", .{ iteration, counter.alloc_calls - before, session.prepared_request != null, if (session.prepared_request) |r| r.plan().storage.?.len else @as(usize, 0) });
+        try std.testing.expectEqual(@as(?f64, 3), column[0]);
+        try std.testing.expect(session.prepared_request == null);
+    }
+}
+
+test "lite prepared one shot session measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var column: [512]?f64 = undefined;
+    for (0..3) |iteration| {
+        const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+        statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+        const prefixes = try alloc.alloc(?[]const u8, 1);
+        prefixes[0] = try alloc.dupe(u8, "");
+        var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openReadWithPrefix(&store, "ns\x00")), .statuses = statuses, .prefixes = prefixes };
+        defer session.deinit();
+        const before = counter.alloc_calls;
+        try session.readColumns(alloc, &.{"metric"}, &nodes, &.{&column});
+        std.debug.print("ONE_SHOT_512 iteration={d} allocations={d} owned={any} plan_bytes={d}\n", .{ iteration, counter.alloc_calls - before, session.prepared_request != null, if (session.prepared_request) |r| r.plan().storage.?.len else @as(usize, 0) });
+        for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+    }
+}
+
+test "lite prepared namespace cold measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const checkpoint = try store.file.materializeTransactionCheckpoint();
+    var request = try @import("../../graph/score_read.zig").PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
+    var state = native.DocumentBatchReadState{ .allocator = alloc };
+    defer state.deinit();
+    var column: [512]?f64 = undefined;
+    var output = @import("../prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = request.plan(), .columns = &.{&column} };
+    for (0..5) |_| try store.file.visitPreparedScoresAtCheckpointWithState(alloc, checkpoint, request.plan(), "ns\x00", output.completeSink(), &state);
+    const before = counter.alloc_calls;
+    const live = counter.live;
+    counter.peak = live;
+    const started = std.posix.getrusage(0);
+    for (0..500) |_| {
+        try store.file.visitPreparedScoresAtCheckpointWithState(alloc, checkpoint, request.plan(), "ns\x00", output.completeSink(), &state);
+        for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+    }
+    const ended = std.posix.getrusage(0);
+    const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+    std.debug.print("LITE_PREFIX_COLD cpu_us={d} allocations={d} scratch_bytes={d}\n", .{ cpu, counter.alloc_calls - before, counter.peak - live });
+}
+
+test "lite prepared virtual namespaces preserve overflow keys and pinned snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "virtual-overflow-prefix.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var namespace: [768]u8 = @splat('x');
+    namespace[100] = 0;
+    namespace[600] = 0xff;
+    namespace[767] = 0;
+    var key_storage: [128][778]u8 = undefined;
+    var nodes: [128][]const u8 = undefined;
+    var docs: [96]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, 0..) |*key, *node, i| {
+        @memcpy(key[0..namespace.len], &namespace);
+        node.* = try std.fmt.bufPrint(key[namespace.len..][0..8], "{d:0>8}", .{i});
+        key[776] = 0;
+        key[777] = 0;
+        if (i < docs.len) docs[i] = .{ .key = key, .value = &raw, .is_delete = i == 3 };
+    }
+    try store.file.putDocumentBatch(&docs);
+    // Neighboring namespaces must not alias this request, even at overflow
+    // separator boundaries. One indexed key is shorter than the namespace.
+    try store.file.putDocument(namespace[0..100], &raw);
+    var neighbor = key_storage[0];
+    neighbor[766] += 1;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocument(&neighbor, &raw);
+    var request = try @import("../../graph/score_read.zig").PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
+    var old = try Txn.openReadWithPrefix(&store, &namespace);
+    defer old.abort();
+    var column: [128]?f64 = undefined;
+    for (0..4) |_| _ = try @import("../../graph/score_read.zig").populatePrepared(a, &old, &request, &.{&column});
+    for (column, 0..) |value, i| try std.testing.expectEqual(if (i >= docs.len or i == 3) @as(?f64, null) else @as(?f64, 3), value);
+    try store.file.putDocument(&key_storage[0], &raw);
+    var current = try Txn.openReadWithPrefix(&store, &namespace);
+    defer current.abort();
+    _ = try @import("../../graph/score_read.zig").populatePrepared(a, &current, &request, &.{&column});
+    try std.testing.expectEqual(@as(?f64, 9), column[0]);
+    _ = try @import("../../graph/score_read.zig").populatePrepared(a, &old, &request, &.{&column});
+    try std.testing.expectEqual(@as(?f64, 3), column[0]);
+}
