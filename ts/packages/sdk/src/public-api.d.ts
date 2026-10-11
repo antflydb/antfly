@@ -26122,7 +26122,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
             };
             400: components["responses"]["BadRequest"];
             /** @description Source already exists */

@@ -14084,7 +14084,10 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
                 var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, ddl, .{});
                 defer compiled.deinit();
                 const change = compiled.statement.catalog_ddl;
-                try std.testing.expectEqualStrings(name, change.name.table);
+                try std.testing.expectEqual(.index, change.kind);
+                try std.testing.expectEqual(.create, change.action);
+                try std.testing.expectEqualStrings(name, change.index_table.?.table);
+                try std.testing.expectEqualStrings(change.name.table, change.schema_change.?.create_index.name);
                 try std.testing.expect(change.schema_change.?.create_index.unique);
                 if (indexed_selectors) selector_index_name = try a.dupe(u8, change.schema_change.?.create_index.name);
                 try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, change));

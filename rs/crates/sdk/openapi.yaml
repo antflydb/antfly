@@ -7463,6 +7463,10 @@ paths:
                 $ref: '#/components/schemas/SavedQuerySource'
         '202':
           description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
