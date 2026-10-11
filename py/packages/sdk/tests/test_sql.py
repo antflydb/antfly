@@ -420,3 +420,21 @@ async def test_generated_sql_async_bounds_and_no_redirects():
     assert stream.closed
     assert stream.read == (16 << 20) + (64 << 10)
     assert len(calls) == 2
+
+
+def test_read_requirements_share_opaque_receipts_and_preserve_zero_wait():
+    from antfly import ReadRequirements, SQLPreparedExecutionRequest, read_after_write
+
+    read = read_after_write({"table_id": 2, "object_generation": 3, "wal_lsn": 10, "state": "accepted"}, wait_ms=0)
+    expected = {
+        "visibility": "accepted",
+        "after_write": {"table_id": 2, "object_generation": 3, "wal_lsn": 10},
+        "wait_ms": 0,
+    }
+    assert read.to_dict() == expected
+    assert ReadRequirements.from_dict(expected).to_dict() == expected
+    sql = SQLRequest(statement="SELECT 1", read_requirements=read).to_dict()
+    assert sql["read_requirements"] == expected
+    assert "lake_visibility" not in sql
+    prepared = SQLPreparedExecutionRequest(read_requirements=read).to_dict()
+    assert prepared["read_requirements"] == expected

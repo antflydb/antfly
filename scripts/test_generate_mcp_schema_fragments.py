@@ -152,6 +152,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "order_by",
             "search_after",
             "lake_read",
+            "read_requirements",
         }
         self.assertEqual(
             set(query_schema["properties"]),
@@ -176,8 +177,21 @@ class McpSchemaFragmentTests(unittest.TestCase):
         }
         self.assertEqual([], list(validator.iter_errors(valid)))
         with_read_requirement = copy.deepcopy(valid)
-        with_read_requirement["lake_read"] = {"visibility": "accepted", "wait_ms": 100}
+        with_read_requirement["read_requirements"] = {
+            "visibility": "accepted",
+            "wait_ms": 100,
+        }
         self.assertEqual([], list(validator.iter_errors(with_read_requirement)))
+        with_read_requirement["read_requirements"]["after_write"] = {
+            "table_id": 2,
+            "object_generation": 3,
+            "wal_lsn": 10,
+        }
+        self.assertEqual([], list(validator.iter_errors(with_read_requirement)))
+        self.assertNotIn("lake_read", validator.schema["properties"])
+        invalid_wait = copy.deepcopy(with_read_requirement)
+        invalid_wait["read_requirements"]["wait_ms"] = 60001
+        self.assertTrue(list(validator.iter_errors(invalid_wait)))
 
         invalid_variants = []
         for field, value in (

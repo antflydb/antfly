@@ -227,7 +227,7 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     const transaction = try server.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = isolation, .mode = .read_only } }, server.localSessionNodeId(), null);
     const id = std.fmt.bytesToHex(transaction.txn_id, .lower);
     var identity: ?server_mod.AuthenticatedIdentity = null;
-    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .lake_visibility = .accepted };
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 1 }, .wait_ms = 0 } };
     var compiled = try local.sql_compiler.compile(a, "SELECT SUM(amount) FROM events", .{});
     defer compiled.deinit();
     var first = try adapter.execute(a, &compiled, &.{}, .{}, null);
@@ -258,16 +258,57 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     var again = try resumed.execute(a, &compiled, &.{}, .{}, null);
     defer again.deinit();
     try std.testing.expectEqualStrings("1", again.output.rows[0][0].string);
+    var unavailable: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 999 }, .wait_ms = 0 } };
+    try std.testing.expectError(error.ReadRequirementNotReady, unavailable.execute(a, &compiled, &.{}, .{}, null));
+    unavailable.read_requirements.wait_ms = 1;
+    try std.testing.expectError(error.ReadRequirementNotReady, unavailable.execute(a, &compiled, &.{}, .{}, null));
+    unavailable.read_requirements.after_write.?.object_generation = 1;
+    try std.testing.expectError(error.ReadReceiptGenerationMismatch, unavailable.execute(a, &compiled, &.{}, .{}, null));
+    var committed: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .read_requirements = .{ .visibility = .committed, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 1 }, .wait_ms = 0 } };
+    var committed_result = try committed.execute(a, &compiled, &.{}, .{}, null);
+    defer committed_result.deinit();
+    try std.testing.expectEqualStrings("1", committed_result.output.rows[0][0].string);
+    // An already covered receipt must not succeed after its positive polling
+    // budget expires while the provider performs readiness checkpoints.
+    const SlowCheckpoint = struct {
+        fn canceled(_: *const anyopaque) bool {
+            std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+            return false;
+        }
+    };
+    var checkpoint_state: u8 = 0;
+    committed.context.cancellation = .{ .ptr = &checkpoint_state, .is_cancelled_fn = SlowCheckpoint.canceled };
+    committed.read_requirements.wait_ms = 1;
+    try std.testing.expectError(error.ReadRequirementNotReady, committed.execute(a, &compiled, &.{}, .{}, null));
+    committed.context = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, committed.execute(a, &compiled, &.{}, .{}, null));
+    var canceled = std.atomic.Value(bool).init(true);
+    committed.context = .{ .cancellation = @import("antfly_local_sources").api_operation.CancellationToken.fromAtomic(&canceled) };
+    try std.testing.expectError(error.Canceled, committed.execute(a, &compiled, &.{}, .{}, null));
     var joined = try local.sql_compiler.compile(a, "SELECT SUM(e.amount) FROM events e JOIN events f ON e.amount = f.amount", .{});
     defer joined.deinit();
     var joined_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id };
     var joined_result = try joined_adapter.execute(a, &joined, &.{}, .{}, null);
     defer joined_result.deinit();
     try std.testing.expectEqualStrings("1", joined_result.output.rows[0][0].string);
+    var too_new: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 2 }, .wait_ms = 1000 } };
+    try std.testing.expectError(error.ReadSnapshotTooOld, too_new.execute(a, &compiled, &.{}, .{}, null));
     var fresh: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .lake_visibility = .accepted };
     var latest = try fresh.execute(a, &compiled, &.{}, .{}, null);
     defer latest.deinit();
     try std.testing.expectEqualStrings("3", latest.output.rows[0][0].string);
+    const mode_transaction = try server.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = isolation, .mode = .read_only } }, server.localSessionNodeId(), null);
+    const mode_id = std.fmt.bytesToHex(mode_transaction.txn_id, .lower);
+    var mode_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &mode_id, .read_requirements = .{ .visibility = .accepted } };
+    var mode_first = try mode_adapter.execute(a, &compiled, &.{}, .{}, null);
+    defer mode_first.deinit();
+    mode_adapter.read_requirements.visibility = .committed;
+    try std.testing.expectError(error.ReadSnapshotTooOld, mode_adapter.execute(a, &compiled, &.{}, .{}, null));
+    var rollback = try local.sql_compiler.compile(a, "ROLLBACK", .{});
+    defer rollback.deinit();
+    var rolled_back = try mode_adapter.execute(a, &rollback, &.{}, .{}, null);
+    defer rolled_back.deinit();
+    try std.testing.expectEqualStrings("ROLLBACK", rolled_back.output.command_tag);
 }
 
 test "lake SQL API binds external catalog sources for aggregates joins public rows and read-only rejection" {

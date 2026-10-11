@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.read_receipt import ReadReceipt
+
 
 T = TypeVar("T", bound="IngestLakeChangesResponse202")
 
@@ -16,6 +20,8 @@ class IngestLakeChangesResponse202:
     """
     Attributes:
         state (str | Unset):
+        read_receipt (ReadReceipt | Unset): Opaque write receipt returned by ingestion. Pass it back unchanged to
+            require a read including that write; it is a minimum freshness frontier, not an exact snapshot.
         wal_lsn (int | Unset):
         table_id (int | Unset):
         object_generation (int | Unset):
@@ -23,6 +29,7 @@ class IngestLakeChangesResponse202:
     """
 
     state: str | Unset = UNSET
+    read_receipt: ReadReceipt | Unset = UNSET
     wal_lsn: int | Unset = UNSET
     table_id: int | Unset = UNSET
     object_generation: int | Unset = UNSET
@@ -31,6 +38,10 @@ class IngestLakeChangesResponse202:
 
     def to_dict(self) -> dict[str, Any]:
         state = self.state
+
+        read_receipt: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.read_receipt, Unset):
+            read_receipt = self.read_receipt.to_dict()
 
         wal_lsn = self.wal_lsn
 
@@ -45,6 +56,8 @@ class IngestLakeChangesResponse202:
         field_dict.update({})
         if state is not UNSET:
             field_dict["state"] = state
+        if read_receipt is not UNSET:
+            field_dict["read_receipt"] = read_receipt
         if wal_lsn is not UNSET:
             field_dict["wal_lsn"] = wal_lsn
         if table_id is not UNSET:
@@ -58,8 +71,17 @@ class IngestLakeChangesResponse202:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.read_receipt import ReadReceipt
+
         d = dict(src_dict)
         state = d.pop("state", UNSET)
+
+        _read_receipt = d.pop("read_receipt", UNSET)
+        read_receipt: ReadReceipt | Unset
+        if isinstance(_read_receipt, Unset):
+            read_receipt = UNSET
+        else:
+            read_receipt = ReadReceipt.from_dict(_read_receipt)
 
         wal_lsn = d.pop("wal_lsn", UNSET)
 
@@ -71,6 +93,7 @@ class IngestLakeChangesResponse202:
 
         ingest_lake_changes_response_202 = cls(
             state=state,
+            read_receipt=read_receipt,
             wal_lsn=wal_lsn,
             table_id=table_id,
             object_generation=object_generation,
