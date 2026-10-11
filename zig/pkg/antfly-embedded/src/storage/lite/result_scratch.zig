@@ -42,7 +42,10 @@ const Arena = struct {
         used: usize = 0,
         alignment: std.mem.Alignment,
         fn offset(self: *const Node) usize {
-            return std.mem.alignForward(usize, @sizeOf(Node), self.alignment.toByteUnits());
+            return std.mem.alignForward(usize, @intFromPtr(self) + @sizeOf(Node), self.alignment.toByteUnits()) - @intFromPtr(self);
+        }
+        fn allocationLen(self: *const Node) usize {
+            return @sizeOf(Node) + self.alignment.toByteUnits() - @alignOf(Node) + self.capacity;
         }
         fn payload(self: *Node) []u8 {
             const ptr: [*]u8 = @ptrCast(self);
@@ -50,6 +53,10 @@ const Arena = struct {
         }
     };
     child_allocator: Allocator,
+    // Speculative growth uses the original owner; only required allocation may
+    // reclaim optional workspace residency. Both adapters must have the same
+    // allocation owner and compatible free operations.
+    preferred_allocator: ?Allocator = null,
     head: ?*Node = null,
     current: ?*Node = null,
     pub fn allocator(self: *Arena) Allocator {
@@ -75,15 +82,19 @@ const Arena = struct {
             if (n.next) |next| node = next else break;
         }
         const previous_capacity = if (node) |n| n.capacity else 0;
-        const preferred = @max(len, @min(@as(usize, 4096), @max(@as(usize, 64), previous_capacity *| 2)));
+        const preferred = @max(len, @min(@as(usize, 64 * 1024), @max(@as(usize, 64), previous_capacity *| 2)));
         const node_alignment = std.mem.Alignment.fromByteUnits(@max(@alignOf(Node), alignment.toByteUnits()));
-        const offset = std.mem.alignForward(usize, @sizeOf(Node), node_alignment.toByteUnits());
+        const offset = @sizeOf(Node) + node_alignment.toByteUnits() - @alignOf(Node);
+        // Payload alignment lives inside the allocation, so varying alignments
+        // never leave unreclaimable gaps between chunks on a LIFO backing.
+        const allocation_alignment = std.mem.Alignment.fromByteUnits(@alignOf(Node));
         const bytes_len = std.math.add(usize, offset, preferred) catch return null;
         var capacity = preferred;
-        const ptr = self.child_allocator.rawAlloc(bytes_len, node_alignment, ra) orelse fallback: {
+        const preferred_allocator = if (preferred == len) self.child_allocator else self.preferred_allocator orelse self.child_allocator;
+        const ptr = preferred_allocator.rawAlloc(bytes_len, allocation_alignment, ra) orelse fallback: {
             if (preferred == len) return null;
             capacity = len;
-            break :fallback self.child_allocator.rawAlloc(std.math.add(usize, offset, len) catch return null, node_alignment, ra) orelse return null;
+            break :fallback self.child_allocator.rawAlloc(std.math.add(usize, offset, len) catch return null, allocation_alignment, ra) orelse return null;
         };
         const created: *Node = @ptrCast(@alignCast(ptr));
         created.* = .{ .capacity = capacity, .used = len, .alignment = node_alignment };
@@ -106,23 +117,34 @@ const Arena = struct {
     }
     fn destroy(self: *Arena, node: *Node) void {
         const ptr: [*]u8 = @ptrCast(node);
-        self.child_allocator.rawFree(ptr[0 .. node.offset() + node.capacity], node.alignment, @returnAddress());
+        self.child_allocator.rawFree(ptr[0..node.allocationLen()], .fromByteUnits(@alignOf(Node)), @returnAddress());
     }
     fn reset(self: *Arena, limit: usize) void {
         var retained: usize = 0;
         var head: ?*Node = null;
         var tail: ?*Node = null;
+        var discarded: ?*Node = null;
+        var retain_prefix = true;
         var next = self.head;
         while (next) |node| {
             next = node.next;
-            const allocation_len = node.offset() + node.capacity;
-            if (allocation_len <= limit - retained) {
+            const allocation_len = node.allocationLen();
+            if (retain_prefix and allocation_len <= limit - retained) {
                 retained += allocation_len;
                 node.used = 0;
                 node.next = null;
                 if (tail) |last| last.next = node else head = node;
                 tail = node;
-            } else self.destroy(node);
+            } else {
+                retain_prefix = false;
+                node.next = discarded;
+                discarded = node;
+            }
+        }
+        // LIFO allocators can reclaim each chunk only in reverse order.
+        while (discarded) |node| {
+            discarded = node.next;
+            self.destroy(node);
         }
         self.head = head;
         self.current = head;
@@ -175,4 +197,58 @@ test "lite result scratch resize and free preserve other chunks" {
     try std.testing.expectEqualStrings("preserved", first);
     scratch.reset();
     try std.testing.expectEqual(@as(usize, 64), scratch.arena.queryCapacity());
+}
+
+test "lite result scratch closes repeatedly with LIFO backing" {
+    var buffer: [1024]u8 align(64) = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&buffer);
+    for (0..16) |_| {
+        var scratch = Scratch.init(backing.allocator(), 256 * 1024);
+        _ = try scratch.allocator().alloc(u8, 64);
+        _ = try scratch.allocator().alloc(u8, 256);
+        scratch.deinit();
+        try std.testing.expectEqual(@as(usize, 0), backing.end_index);
+    }
+}
+
+test "lite result scratch pressure fallback crosses growth boundaries" {
+    for ([_]usize{ 2048, 4096, 8192, 65536 }) |size| {
+        const buffer = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(64), 3 * (size + @sizeOf(Arena.Node)));
+        defer std.testing.allocator.free(buffer);
+        var backing = std.heap.FixedBufferAllocator.init(buffer);
+        var scratch = Scratch.init(backing.allocator(), 256 * 1024);
+        var values: [3][]u8 = undefined;
+        for (&values, 0..) |*value, i| {
+            value.* = try scratch.allocator().alloc(u8, size);
+            @memset(value.*, @intCast(i));
+        }
+        for (values, 0..) |value, i| for (value) |byte| {
+            try std.testing.expectEqual(@as(u8, @intCast(i)), byte);
+        };
+        scratch.deinit();
+        try std.testing.expectEqual(@as(usize, 0), backing.end_index);
+    }
+}
+
+test "lite result scratch reset keeps a prefix for LIFO reclaim" {
+    var buffer: [65536]u8 align(64) = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var scratch = Scratch.init(backing.allocator(), 256);
+    _ = try scratch.allocator().alloc(u8, 8);
+    _ = try scratch.allocator().alloc(u8, 16384);
+    _ = try scratch.allocator().alloc(u8, 16384);
+    scratch.reset();
+    try std.testing.expectEqual(@as(usize, 64), scratch.arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, @sizeOf(Arena.Node) + 64), backing.end_index);
+    scratch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), backing.end_index);
+}
+test "lite result scratch mixed alignments reclaim LIFO padding" {
+    var buffer: [4096]u8 align(64) = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var scratch = Scratch.init(backing.allocator(), 256 * 1024);
+    _ = try scratch.allocator().alloc(u8, 8);
+    _ = try scratch.allocator().alignedAlloc(u8, .fromByteUnits(64), 256);
+    scratch.deinit();
+    try std.testing.expectEqual(@as(usize, 0), backing.end_index);
 }

@@ -20,6 +20,9 @@ const std = @import("std");
 const keys = @import("internal_keys.zig");
 const ScoreSink = @import("backend_types.zig").ScoreSink;
 
+// A rebuild gets a process-unique identity, including after deinit and address
+// reuse. Row/column permutations keep the canonical physical key identity.
+var next_identity = std.atomic.Value(u64).init(1);
 pub const PreparedScorePlan = struct {
     pub const max_bytes = 256 * 1024;
     pub const max_keys = 4096;
@@ -40,6 +43,7 @@ pub const PreparedScorePlan = struct {
     targets: []const Target = &.{},
     ends: []const usize = &.{},
     valid: bool = false,
+    identity: u64 = 0,
     // Targets keep canonical row identities; requests only update this mapping.
     row_remap: []u16 = &.{},
     row_identity: []u16 = &.{},
@@ -223,6 +227,8 @@ pub const PreparedScorePlan = struct {
         self.targets = targets;
         self.read_keys = read_keys[0..unique];
         self.ends = ends[0..unique];
+        self.identity = next_identity.fetchAdd(1, .monotonic);
+        if (self.identity == 0 or self.identity == std.math.maxInt(u64)) @panic("prepared read identity exhausted");
         self.valid = true;
         return true;
     }
@@ -352,6 +358,24 @@ pub const PreparedScorePlan = struct {
             else
                 (if (self.plan.row_order_identity) writeColumns else writeBoth) };
         }
+        pub fn completeSink(self: *@This()) @import("backend_types.zig").CompleteScoreSink {
+            return .{ .context = self, .write = if (self.plan.column_order_identity)
+                (if (self.plan.row_order_identity) completeCanonical else completeRemapped)
+            else
+                (if (self.plan.row_order_identity) completeColumns else completeBoth) };
+        }
+        fn completeCanonical(ctx: *anyopaque, index: usize, score: ?f64) void {
+            writeRows(ctx, index, score, false, false);
+        }
+        fn completeRemapped(ctx: *anyopaque, index: usize, score: ?f64) void {
+            writeRows(ctx, index, score, true, false);
+        }
+        fn completeColumns(ctx: *anyopaque, index: usize, score: ?f64) void {
+            writeRows(ctx, index, score, false, true);
+        }
+        fn completeBoth(ctx: *anyopaque, index: usize, score: ?f64) void {
+            writeRows(ctx, index, score, true, true);
+        }
         fn writeCanonical(ctx: *anyopaque, index: usize, score: f64) void {
             writeRows(ctx, index, score, false, false);
         }
@@ -364,7 +388,7 @@ pub const PreparedScorePlan = struct {
         fn writeBoth(ctx: *anyopaque, index: usize, score: f64) void {
             writeRows(ctx, index, score, true, true);
         }
-        fn writeRows(ctx: *anyopaque, index: usize, score: f64, comptime remapped: bool, comptime columns_remapped: bool) void {
+        fn writeRows(ctx: *anyopaque, index: usize, score: ?f64, comptime remapped: bool, comptime columns_remapped: bool) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (self.plan.read_keys.len == self.plan.targets.len) {
                 const target = self.plan.targets[index];
@@ -475,4 +499,19 @@ test "prepared score plan column permutations preserve duplicate null and row fa
     // A changed multiset must rebuild, even after a partial mapping attempt.
     try std.testing.expect(try plan.prepare(a, &.{ "q/", "p/", "q/", null }, &.{ "b", "a", "a" }));
     try std.testing.expectEqualStrings("q/", plan.prefixes[0].?);
+}
+
+test "prepared score plan identity survives permutations and changes after rebuild and deinit" {
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"p"}, &.{ "a", "b" }));
+    const identity = plan.identity;
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"p"}, &.{ "b", "a" }));
+    try std.testing.expectEqual(identity, plan.identity);
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"q"}, &.{ "a", "b" }));
+    try std.testing.expect(plan.identity != identity);
+    const rebuilt = plan.identity;
+    plan.deinit();
+    try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"q"}, &.{ "a", "b" }));
+    try std.testing.expect(plan.identity != rebuilt);
 }

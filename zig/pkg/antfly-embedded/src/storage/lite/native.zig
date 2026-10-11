@@ -30,6 +30,8 @@ const maintenance = @import("../maintenance.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
 const ScoreSink = @import("../backend_types.zig").ScoreSink;
+const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
+const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
@@ -1140,6 +1142,7 @@ pub const ResolvedScoreBatch = struct {
     borrowed: bool = false,
     recovered_optional_failure: bool = false,
     promotion_allocator: ?Allocator = null,
+    prepared_identity: ?ReadIdentity = null,
 
     pub fn deinit(self: *@This(), a: Allocator) void {
         const promotion = self.promotion_allocator;
@@ -1155,8 +1158,17 @@ pub const ResolvedScoreBatch = struct {
         return true;
     }
 
-    fn remember(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8, references: []const u64, order: ?[]const usize) !bool {
-        if (self.matches(binding, checkpoint, keys)) return true;
+    fn matchesPrepared(self: *const @This(), binding: Binding, checkpoint: CheckpointSlot, identity: ReadIdentity, count: usize) bool {
+        const owned = self.prepared_identity orelse return false;
+        return self.binding != null and std.meta.eql(self.binding.?, binding) and
+            std.meta.eql(self.checkpoint, checkpoint) and self.keys.len == count and
+            owned.canonical == identity.canonical and std.mem.eql(u8, owned.namespace, identity.namespace);
+    }
+
+    fn remember(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8, references: []const u64, order: ?[]const usize, prepared: ?ReadIdentity) !bool {
+        if (prepared) |identity| {
+            if (self.matchesPrepared(binding, checkpoint, identity, keys.len)) return true;
+        } else if (self.matches(binding, checkpoint, keys)) return true;
         self.binding = null;
         if (keys.len > 4096) {
             self.deinit(a);
@@ -1165,6 +1177,7 @@ pub const ResolvedScoreBatch = struct {
         var required = std.math.mul(usize, keys.len, @sizeOf([]const u8) + @sizeOf(u64) + @sizeOf(usize)) catch return false;
         required = std.math.add(usize, required, 32) catch return false;
         for (keys) |key| required = std.math.add(usize, required, key.len) catch return false;
+        if (prepared) |identity| required = std.math.add(usize, required, identity.namespace.len) catch return false;
         if (required > 128 * 1024) {
             self.deinit(a);
             return false;
@@ -1181,6 +1194,7 @@ pub const ResolvedScoreBatch = struct {
         const positions = try alloc.alloc(usize, keys.len);
         for (owned, keys) |*copy, key| copy.* = try alloc.dupe(u8, key);
         self.keys = owned;
+        self.prepared_identity = if (prepared) |identity| .{ .canonical = identity.canonical, .namespace = try alloc.dupe(u8, identity.namespace) } else null;
         @memcpy(self.references, references);
         self.order = if (order != null) positions else null;
         if (order) |indices| @memcpy(positions, indices);
@@ -6082,7 +6096,7 @@ pub const NativeFile = struct {
 
     /// Reuse bounded native working storage independently of the result arena.
     pub fn getDocumentsAtCheckpointWithState(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, null, state);
+        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null);
     }
 
     /// Fixed-width scores are decoded while the authenticated record is borrowed.
@@ -6102,30 +6116,67 @@ pub const NativeFile = struct {
     }
 
     pub fn visitScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, sink: ScoreSink, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, sink, state);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?ScoreSink, sink), state, null);
     }
 
-    fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: ?ScoreSink, state: *DocumentBatchReadState) !void {
+    /// Arbitrary complete batches retain sorted-input validation.
+    pub fn visitCompleteScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?CompleteScoreSink, sink), state, null);
+    }
+
+    /// Canonical keys come from the owned plan; no caller-supplied validation
+    /// flag or identity can bypass input checks. The plan stays immutable during
+    /// delivery. Namespace translation preserves its sorted, unique order.
+    pub fn visitPreparedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
+        if (!plan.valid or plan.identity == 0) return error.InvalidBatch;
+        const identity = ReadIdentity{ .canonical = plan.identity, .namespace = namespace };
+        if (namespace.len == 0) return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
+        var bytes_len: usize = 0;
+        for (plan.read_keys) |key| {
+            bytes_len = std.math.add(usize, bytes_len, namespace.len) catch return error.InvalidBatch;
+            bytes_len = std.math.add(usize, bytes_len, key.len) catch return error.InvalidBatch;
+        }
+        const physical = try temporary.alloc([]const u8, plan.read_keys.len);
+        defer temporary.free(physical);
+        const bytes = try temporary.alloc(u8, bytes_len);
+        defer temporary.free(bytes);
+        var offset: usize = 0;
+        for (physical, plan.read_keys) |*out, key| {
+            const begin = offset;
+            @memcpy(bytes[offset..][0..namespace.len], namespace);
+            offset += namespace.len;
+            @memcpy(bytes[offset..][0..key.len], key);
+            offset += key.len;
+            out.* = bytes[begin..offset];
+        }
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, physical, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
+    }
+
+    fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: anytype, state: *DocumentBatchReadState, prepared: ?ReadIdentity) !void {
+        const complete = comptime @TypeOf(scores) == ?CompleteScoreSink;
         state.prepare(self);
         defer state.reset();
         if (state.resolved) |resolved| resolved.recovered_optional_failure = false;
         if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
         if (scores == null and keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
-        for (keys, 0..) |key, i| {
+        if (prepared == null) for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
-        }
+        };
         errdefer {
             if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
             @memset(values, null);
         }
-        if (keys.len == 0 or checkpoint.document_index_root_page == 0) return;
+        if (keys.len == 0 or checkpoint.document_index_root_page == 0) {
+            if (complete) if (scores) |out| for (0..keys.len) |i| out.write(out.context, i, null);
+            return;
+        }
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         if (!use_cache) if (state.resolved) |resolved| {
             resolved.binding = null;
         };
         var cached = scores != null and state.binding != null and state.resolved != null and use_cache and
-            state.resolved.?.matches(state.binding.?, checkpoint, keys);
+            (if (prepared) |identity| state.resolved.?.matchesPrepared(state.binding.?, checkpoint, identity, keys.len) else state.resolved.?.matches(state.binding.?, checkpoint, keys));
         // A miss must have the same memory floor as an uncached batch. Build
         // optional retained offsets only after all record reads succeed.
         if (!cached and scores != null) if (state.resolved) |resolved| {
@@ -6156,6 +6207,7 @@ pub const NativeFile = struct {
             const i = if (order) |positions| positions[position] else position;
             const reference = references[i];
             if (reference == 0) {
+                if (complete) if (scores) |out| out.write(out.context, i, null);
                 position += 1;
                 continue;
             }
@@ -6182,6 +6234,7 @@ pub const NativeFile = struct {
             const entry = try decodeDocumentEntry(bytes);
             if (!std.mem.eql(u8, entry.key, keys[i])) return error.InvalidDocumentIndex;
             if (entry.is_delete) {
+                if (complete) if (scores) |out| out.write(out.context, i, null);
                 position += 1;
                 continue;
             }
@@ -6208,7 +6261,7 @@ pub const NativeFile = struct {
             position += 1;
         }
         if (!cached and scores != null and state.binding != null and state.resolved != null and use_cache) {
-            _ = state.resolved.?.remember(state.allocator.?, state.binding.?, checkpoint, keys, references, order) catch false;
+            _ = state.resolved.?.remember(state.allocator.?, state.binding.?, checkpoint, keys, references, order, prepared) catch false;
         }
         if (recovered) state.resolved.?.recovered_optional_failure = true;
     }

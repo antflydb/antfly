@@ -32,15 +32,18 @@ pub fn populate(
     std.debug.assert(prefixes.len == columns.len);
     for (columns) |column| {
         std.debug.assert(column.len == nodes.len);
-        @memset(column, null);
     }
+    errdefer for (columns) |column| @memset(column, null);
     if (nodes.len == 0) return .{};
     var has_prefix = false;
     for (prefixes) |prefix| if (prefix != null) {
         has_prefix = true;
         break;
     };
-    if (!has_prefix) return .{};
+    if (!has_prefix) {
+        for (columns) |column| @memset(column, null);
+        return .{};
+    }
     const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
     const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(caller_alloc))).error_union.payload else void;
     // Probe-only wrappers expose the method but cannot open a pinned scope.
@@ -57,7 +60,22 @@ pub fn populate(
                 const prepared = plan.prepare(active.preparedScoreAllocator(), prefixes, nodes) catch false;
                 if (prepared) prepared_read: {
                     var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
-                    active.visitManySortedScores(plan.read_keys, output.sink()) catch |err| switch (@as(anyerror, err)) {
+                    const complete = if (comptime @hasDecl(Scope, "visitPreparedScores"))
+                        (if (comptime @hasDecl(Scope, "supportsPreparedScores")) active.supportsPreparedScores() else true)
+                    else
+                        false;
+                    if (complete) {
+                        for (columns, prefixes) |column, prefix| if (prefix == null) {
+                            @memset(column, null);
+                        };
+                    } else {
+                        for (columns) |column| @memset(column, null);
+                    }
+                    const read = if (comptime @hasDecl(Scope, "visitPreparedScores"))
+                        (if (complete) active.visitPreparedScores(plan, output.completeSink()) else active.visitManySortedScores(plan.read_keys, output.sink()))
+                    else
+                        active.visitManySortedScores(plan.read_keys, output.sink());
+                    read catch |err| switch (@as(anyerror, err)) {
                         error.OutOfMemory, error.ResourceBudgetExceeded => {
                             // Prepared ownership must not raise the minimum
                             // memory needed by the streaming read path.
@@ -82,6 +100,7 @@ pub fn populate(
             };
         }
     }
+    for (columns) |column| @memset(column, null);
     const alloc = if (scoped and scope != null and @hasDecl(Scope, "workingAllocator")) scope.?.workingAllocator() else caller_alloc;
     const physical = try alloc.alloc(usize, prefixes.len);
     defer alloc.free(physical);
