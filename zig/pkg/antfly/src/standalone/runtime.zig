@@ -2612,11 +2612,12 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store.?;
                 const publication = @import("../metadata/fk_generation_publication.zig");
                 const command: publication.Command = switch (call) {
-                    .fk_generation_publication_begin => |plan| .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan },
+                    .fk_generation_publication_begin => |plan| .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan, .catalog_coverage = plan.catalog_coverage },
                     .fk_generation_publication_mutate => |value| value,
                     else => unreachable,
                 };
                 try command.validateShape();
+                if (command.plan) |plan| try plan.requireAdmissionCoverage();
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > publication.max_bytes) return error.CatalogCommandTooLarge;

@@ -5423,6 +5423,7 @@ pub const ApiHttpServer = struct {
             .plan_id = value.plan.id,
             .child_table_id = value.plan.child_before.table_id,
             .expected_revision = value.revision,
+            .catalog_coverage = value.plan.catalog_coverage,
             .action = undefined,
         };
         switch (target) {

@@ -1116,3 +1116,51 @@ Durable plan admission, name/table locks, capability barriers, verified owner
 ports, projected private builders/unique claims and atomic public publication
 still need integration. The native failed-build atomicity gate remains red;
 there is no original-case disposition credit or claim of public SQL parity.
+
+### Versioned CHECK catalog identities for regular FK publication
+
+The fail-first metadata regression reproduced a compiler mismatch: the owner
+validator produced a nonzero CHECK fingerprint while metadata's catalog compiler
+stored zero. This is also a prerequisite for staged UNIQUE publication, whose
+candidate must preserve the predecessor's CHECK coverage exactly.
+
+Canonical catalog compilation now uses the owner's CHECK layout and expression
+compiler through `relational_declarations.checksFingerprint`. It compiles only
+CHECKs, not a second full property/regex validator, and this helper's empty-CHECK
+path allocates nothing. Regular FK producers mark new plans and every continuation
+command with `catalog_coverage: checks_v1`. The plan and command markers must
+agree, and an ACK cannot change a persisted plan's coverage. Owner source
+decisions carry the same marker and independently derive the matching catalog.
+Unmarked durable plans retain their predecessor derivation; omitted legacy
+markers preserve exact plan/command JSON bytes and their existing digests.
+
+CHECK-aware admission and planless ACKs require metadata decoder version 35,
+including commands which also carry generated-name guards. The fixed-memory
+classifier fails closed for malformed/future markers without materializing large
+schema bodies. Ordinary metadata commands keep their existing decoder floors.
+Before admitting a new regular FK plan, the builder requires explicit owner
+support from every child/parent range identity; a missing capability is not
+treated as support. Self-FKs reuse the same checked dual-role cut.
+
+Proposal-time validation rejects new unmarked CHECK-bearing jobs without changing
+the replay or continuation of already-committed plans.
+
+The focused metadata gates pass seven tests in Debug and ReleaseFast, including
+owner CHECK parity across schema epochs, retained UNIQUE generation identity,
+byte-stable legacy serialization and the new decoder barrier. The standalone
+wire classifier passes two tests in both Debug and ReleaseFast. These are not evidence that the
+complete distributed workflow passed. The mounted CHECK-bearing FK campaign
+initially failed three cases before FK admission: first CREATE received typed
+53300 with an explicit no-schema-change-admitted diagnostic. The shared fixture
+now establishes attested name absence before each CREATE, without mutation replay
+or larger deadlines. That campaign passed all four cases once, but the final
+combined Debug rerun passed only three: DROP timed out at its initial parent seed
+write, before FK admission, with a data read-index timeout. Therefore mounted
+qualification is not consistently green. Both DROP/TRUNCATE build aliases now
+share one run node, and the combined invocation executed the four cases once.
+
+Legacy initial-FK creation still uses its prior catalog derivation. It needs its
+own versioned plan/provisioning/receipt integration before claiming CHECK-aware
+initial-create parity. Already-admitted legacy CHECK-bearing jobs must not be
+silently reinterpreted under new identities. No original SQL dispositions change
+at this checkpoint, and staged UNIQUE publication remains unfinished.

@@ -26,6 +26,7 @@ pub const Identity = struct {
     catalog_digest: [32]u8,
     next_epoch: u64,
     backup_seal_supported: bool = false,
+    catalog_checks_identity_supported: bool = false,
     // Explicit durable authority domain; native receipts never contain a
     // fabricated Raft position. Missing capability fails closed at admission.
     generation_handoff_receipt_authority: GenerationHandoffReceiptAuthority = .unsupported,

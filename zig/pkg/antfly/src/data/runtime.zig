@@ -11263,9 +11263,9 @@ pub const DataServer = struct {
         defer before_schema.deinit(scratch);
         var after_schema = try schema.parseValidatedTableSchema(scratch, decision.child_after.schema_json);
         defer after_schema.deinit(scratch);
-        var old_compiled = try publication.compileCatalog(scratch, before_schema, request.child_table_id, null);
+        var old_compiled = try publication.compileCatalogWithCoverage(scratch, before_schema, request.child_table_id, null, decision.catalog_coverage);
         defer old_compiled.deinit();
-        var next_compiled = try publication.compileCatalog(scratch, after_schema, request.child_table_id, old_bytes);
+        var next_compiled = try publication.compileCatalogWithCoverage(scratch, after_schema, request.child_table_id, old_bytes, decision.catalog_coverage);
         defer next_compiled.deinit();
         var next_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(next_compiled.value, &next_digest, .{});
@@ -11418,7 +11418,7 @@ pub const DataServer = struct {
         if (!std.mem.eql(u8, &catalog_digest, &decision.catalog_digest)) return error.IntegrityCatalogChanged;
         var parsed = try schema.parseValidatedTableSchema(scratch, decision.child.schema_json);
         defer parsed.deinit(scratch);
-        var compiled = try publication.compileCatalog(scratch, parsed, request.child_table_id, null);
+        var compiled = try publication.compileCatalogWithCoverage(scratch, parsed, request.child_table_id, null, .legacy);
         defer compiled.deinit();
         if (!std.mem.eql(u8, compiled.value, catalog_bytes) or
             !std.mem.eql(u8, &compiled.catalog.schema_digest, &decision.schema_digest)) return error.IntegrityCatalogChanged;

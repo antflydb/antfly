@@ -2237,10 +2237,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const hosted_fk_lifecycle_run = addFilteredTestRunArtifact(b, hosted_fk_drop_tests);
     b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+        .dependOn(&hosted_fk_lifecycle_run.step);
     b.step("antfly-api-hosted-fk-truncate-test", "Run mounted external-parent FK generation retirement and restart")
-        .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
+        .dependOn(&hosted_fk_lifecycle_run.step);
     const hosted_graph_truncate_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{"mounted hosted graph TRUNCATE"},

@@ -63,7 +63,10 @@ const std = @import("std");
 /// relation-owner, logical-binding and metadata-incarnation mutation fence.
 /// Version 34 decodes constraint-membership reconciliation and immutable
 /// generated-name admission predicates for catalog, FK and rewrite workflows.
-pub const current_version: u16 = 34;
+/// Version 35 binds regular FK publication to owner-identical CHECK coverage.
+/// The explicit plan/command marker preserves predecessor log interpretation.
+pub const current_version: u16 = 35;
+pub const checks_catalog_identity_version: u16 = 35;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 34;
 pub const relation_mutation_version: u16 = 33;

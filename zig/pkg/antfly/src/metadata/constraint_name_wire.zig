@@ -35,6 +35,31 @@ pub fn requiresOccupancy(bytes: []const u8, max_bytes: usize) bool {
         (if (shape.plan) |plan| plan.constraint_name_admission != null or plan.constraint_name_guard != null else false);
 }
 
+/// Fixed-memory projection for versioned catalog-identity commands, including
+/// ACKs which carry no plan. Unknown or malformed markers fail closed.
+pub fn requiresCatalogChecks(bytes: []const u8, max_bytes: usize) bool {
+    if (bytes.len > max_bytes) return true;
+    const Coverage = enum { legacy, checks_v1 };
+    const Shape = struct {
+        catalog_coverage: Coverage = .legacy,
+        plan: ?struct { catalog_coverage: Coverage = .legacy } = null,
+    };
+    var buffer: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const shape = std.json.parseFromSliceLeaky(Shape, fixed.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return true;
+    return shape.catalog_coverage != .legacy or (if (shape.plan) |plan| plan.catalog_coverage != .legacy else false);
+}
+
+test "CHECK identity wire projection gates both plan admission and planless ACKs" {
+    const limit = 3 * 1024 * 1024;
+    try std.testing.expect(!requiresCatalogChecks("{}", limit));
+    try std.testing.expect(!requiresCatalogChecks("{\"catalog_coverage\":\"legacy\"}", limit));
+    try std.testing.expect(requiresCatalogChecks("{\"catalog_coverage\":\"checks_v1\",\"plan\":null}", limit));
+    try std.testing.expect(requiresCatalogChecks("{\"plan\":{\"catalog_coverage\":\"checks_v1\"}}", limit));
+    for ([_][]const u8{ "{", "{\"catalog_coverage\":\"future\"}", "{\"catalog_coverage\":null}" }) |invalid|
+        try std.testing.expect(requiresCatalogChecks(invalid, limit));
+}
+
 test "naming wire projection skips large escaped schemas and detects nested and direct predicates" {
     const a = std.testing.allocator;
     const large = try a.alloc(u8, 64 * 1024);

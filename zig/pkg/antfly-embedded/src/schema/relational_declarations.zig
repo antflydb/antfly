@@ -21,6 +21,18 @@ const schema = @import("table_schema_impl.zig");
 const native = @import("../storage/schema.zig");
 const catalog = @import("../storage/db/relational_integrity_catalog.zig");
 
+/// Compile only CHECKs, using the exact layout/compiler used by the owner
+/// validator. No row parsing or full property/regex validator is needed.
+pub fn checksFingerprint(alloc: std.mem.Allocator, public: schema.TableSchema) ![32]u8 {
+    const definitions = public.checks orelse return @splat(0);
+    if (definitions.value.len == 0) return @splat(0);
+    const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, public);
+    errdefer native.freeSchema(alloc, runtime);
+    const checks = try @import("relational_checks.zig").Set.createOwned(alloc, runtime, definitions.value);
+    defer checks.deinit();
+    return checks.fingerprint();
+}
+
 pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSchema, runtime: native.TableSchema) ![]catalog.Definition {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();

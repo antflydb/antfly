@@ -3416,6 +3416,8 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_fk_generation_publication and @import("constraint_name_wire.zig").requiresCatalogChecks(command.apply_fk_generation_publication, fk_generation_publication.max_bytes))
+        return metadata_topology_protocol.checks_catalog_identity_version;
     if (command == .apply_system_catalog and carriesConstraintNameAdmission(command.apply_system_catalog))
         return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .apply_fk_initial_create and carriesConstraintNameAdmission(command.apply_fk_initial_create))
@@ -3500,6 +3502,18 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         else => false,
     };
     return if (requires_v11) metadata_topology_protocol.coordinated_lifecycle_version else 0;
+}
+
+test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
+    const protocol = metadata_topology_protocol;
+    const marked: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":null}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(marked));
+    const named: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(named));
+    const legacy: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
+    try std.testing.expectEqual(protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(legacy));
+    const unknown: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"future\"}" };
+    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(unknown));
 }
 
 pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {

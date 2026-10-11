@@ -13740,7 +13740,7 @@ pub const RaftApplyStore = struct {
             return error.GenerationPublicationChanged;
         var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, publication.plan.child.schema_json);
         defer schema.deinit(a);
-        var catalog = try fk_generation_publication.compileCatalog(a, schema, publication.plan.child.table_id, null);
+        var catalog = try fk_generation_publication.compileCatalogWithCoverage(a, schema, publication.plan.child.table_id, null, .legacy);
         defer catalog.deinit();
         const catalog_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(catalog.value.len));
         _ = std.base64.standard.Encoder.encode(catalog_b64, catalog.value);
@@ -14642,6 +14642,7 @@ pub const RaftApplyStore = struct {
             .child_after = publication.plan.child_after,
             .child_catalog_before_b64 = publication.plan.child_catalog_before_b64,
             .child_range = publication.plan.child_ranges[index],
+            .catalog_coverage = publication.plan.catalog_coverage,
         };
         return std.json.Stringify.valueAlloc(alloc, decision, .{});
     }

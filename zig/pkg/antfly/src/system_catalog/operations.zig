@@ -347,8 +347,10 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
+    if (command.plan) |plan| try plan.requireAdmissionCoverage();
     const naming = if (command.plan) |plan| plan.constraint_name_guard != null else false;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (naming) protocol.constraint_occupancy_version else protocol.fk_generation_publication_version);
+    const required = if (command.catalog_coverage == .checks_v1) protocol.checks_catalog_identity_version else if (naming) protocol.constraint_occupancy_version else protocol.fk_generation_publication_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
@@ -516,7 +518,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .policy_publication_begin => |request| beginPolicyPublication(svc, alloc, context, request),
         .policy_definition_mutate => |command| mutatePolicyDefinition(svc, alloc, context, command),
         .policy_publication_mutate => |command| mutatePolicyPublication(svc, alloc, context, command),
-        .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan }),
+        .fk_generation_publication_begin => |plan| mutateFkGenerationPublication(svc, alloc, context, .{ .plan_id = plan.id, .child_table_id = plan.child_before.table_id, .expected_revision = 0, .action = .begin, .plan = plan, .catalog_coverage = plan.catalog_coverage }),
         .fk_generation_publication_mutate => |command| mutateFkGenerationPublication(svc, alloc, context, command),
         .fk_generation_publication_status => |child_table_id| fkGenerationPublicationStatusJson(svc, alloc, context, child_table_id),
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),

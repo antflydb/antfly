@@ -24294,6 +24294,7 @@ pub const DB = struct {
             .namespace = self.core.identity_namespace,
             .catalog_digest = digest,
             .next_epoch = try @import("relational_integrity_topology.zig").nextEpoch(&read),
+            .catalog_checks_identity_supported = true,
             .generation_handoff_receipt_authority = handoff_authority,
             .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
                 nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.backend_runtime.filesystemIo() != null and

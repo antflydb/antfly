@@ -300,11 +300,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
     const fk_name_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably", "system catalog relation namespace transaction activated generated FK begin" },
+        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably", "system catalog relation namespace transaction activated generated FK begin", "FK generation publication catalog" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
         .dependOn(&addFilteredTestRunArtifact(b, fk_name_admission_tests).step);
+    const checks_identity_decoder_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"system catalog CHECK identity decoder barrier"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-checks-catalog-identity-test", "Verify CHECK-aware FK metadata admission and owner ACK decoder barriers")
+        .dependOn(&addFilteredTestRunArtifact(b, checks_identity_decoder_tests).step);
     const rewrite_name_admission_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata_rewrite_name_test_root.zig"),
         .target = target,
