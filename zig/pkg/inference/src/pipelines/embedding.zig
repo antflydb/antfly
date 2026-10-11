@@ -126,6 +126,8 @@ pub const EmbeddingConfig = struct {
     ensure_trailing_eos_id: ?i32 = null,
     /// Keep a supported text encoder, pooling, and normalization on the GPU.
     resident_text_encoder: bool = false,
+    /// EmbeddingGemma 2 trims before normalization, including device readback.
+    embedding_gemma2_dimensions: usize = 768,
     /// For CLIP/SigLIP multimodal models: image size for vision encoder.
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
@@ -598,6 +600,32 @@ pub const EmbeddingPipeline = struct {
             trace.execute_pool_normalize_ns += embedding_trace.now() -| execute_started;
         };
         if (self.execution_control) |control| try control.check();
+
+        if (self.config.resident_text_encoder and self.session.backend() == .metal and self.config.normalize and self.config.pooling == .mean and self.text_projection == null) {
+            if (session_factory.getEmbeddingGemma2Config(self.session)) |cfg| {
+                const dimensions = self.config.embedding_gemma2_dimensions;
+                if (!@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+                var managed = try session_factory.getManagedComputeBackend(self.session, alloc, null, self.execution_control);
+                defer managed.deinit();
+                const mask = try alloc.alloc(i64, all_mask.len);
+                defer alloc.free(mask);
+                for (mask, all_mask) |*dest, source| dest.* = source;
+                const embeddings = try alloc.alloc([]f32, batch);
+                var initialized: usize = 0;
+                errdefer {
+                    for (embeddings[0..initialized]) |embedding| alloc.free(embedding);
+                    alloc.free(embeddings);
+                }
+                for (embeddings, 0..) |*embedding, index| {
+                    if (self.execution_control) |control| try control.check();
+                    embedding.* = try @import("embedding_gemma2.zig").preparedText(&managed.backend, alloc, cfg, ids_i64[index * effective_len ..][0..effective_len], mask[index * effective_len ..][0..effective_len], dimensions);
+                    initialized += 1;
+                }
+                self.last_resident_backend_timing = managed.backend.debugTimingSnapshot();
+                self.recordResidentProjection(.text, .success, "text.embeddinggemma2.pool_normalize.resident", batch, null);
+                return embeddings;
+            }
+        }
 
         if (self.text_projection) |proj| {
             if (try self.tryEmbedTextResidentProjection(
@@ -1122,7 +1150,7 @@ pub const EmbeddingPipeline = struct {
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
-            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             return .{ .vectors = result.vectors, .execution = result.execution };
         }
         const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
@@ -1477,7 +1505,7 @@ pub const EmbeddingPipeline = struct {
         for (media, 0..) |bytes, index| {
             if (item_errors) |errors| errors[index] = null;
             const part: grouped.Part = if (images) .{ .image = bytes } else .{ .audio = bytes };
-            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{}, self.execution_lock, self.execution_control) catch |err| {
+            const result = grouped.embed(self.allocator, self.session, self.tok, .{ .content = &.{part} }, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control) catch |err| {
                 if (item_errors) |errors| {
                     if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded) return err;
                     errors[index] = err;
@@ -1591,7 +1619,7 @@ pub const EmbeddingPipeline = struct {
             // bounded decoder, downmix, resample and HF processor as HTTP.
             const encoded = try audio.wav.encodeInterleaved(std.heap.smp_allocator, clip.samples, channels, .{ .audio_format = 3, .sample_rate = clip.sample_rate, .bits_per_sample = 32 });
             defer std.heap.smp_allocator.free(encoded);
-            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{}, self.execution_lock, self.execution_control);
+            const result = try @import("embedding_gemma2.zig").embed(self.allocator, self.session, self.tok, .{ .content = &.{.{ .audio = encoded }} }, .{ .dimensions = self.config.embedding_gemma2_dimensions }, self.execution_lock, self.execution_control);
             vector.* = result.vector;
             initialized += 1;
         }

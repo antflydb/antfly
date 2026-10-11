@@ -2342,6 +2342,9 @@ pub const ComputeBackend = struct {
         /// Masked mean of [rows,width], truncated before final readback. Null
         /// declines; device-only callers must not silently reduce on the host.
         maskedMeanRows: ?*const fn (ctx: *anyopaque, input: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT = null,
+        /// Masked mean, dimension truncation and stable L2 normalization on
+        /// device. Invalid/zero norms produce NaNs for final output validation.
+        maskedMeanNormalizedRows: ?*const fn (ctx: *anyopaque, input: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].

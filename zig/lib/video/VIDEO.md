@@ -5,7 +5,7 @@ benchmarks and the qualified pure Zig H.264 subset are implemented. Latest main
 (PR #1014) is merged as of 2026-10-09. EmbeddingGemma 2 ordered video groups now
 use native decode/CPU preparation or VideoToolbox/Metal preparation and the merged
 native/Metal vision and text encoders. Completed Metal patch buffers enter inference
-directly; Metal video projection, token composition and backbone input remain on the device. Final vector normalization retains a host boundary. Six pretrained
+directly; Metal video projection, token composition and backbone input remain on the device. Final pooling and vector normalization now execute on Metal before the response readback; pretrained CPU/Metal parity and reduced-dimension HTTP checks pass. Six pretrained
 F32 video cases qualify native CPU and Metal numerical parity under the declared
 RGB decoder policy. A real-clip reference-preservation campaign also executes on
 macOS CPU/Metal and actual Linux ARM64; resident vision/backbone optimization
@@ -807,7 +807,7 @@ Video patch projection, learned-position addition, Q/K/V normalization, vision
 RoPE, spatial pooling and active-token sequence mean pooling execute on Metal.
 Projected video tokens are composed with text and other media using device
 concatenation and typed row gathering, and enter the backbone directly. Final
-vector normalization retains a host boundary; this adapter does not claim an entirely resident model.
+vector normalization now executes on device before the response readback. The new normalization path is described below; CPU output validation and serialization remain host operations.
 
 The HTTP grouped form accepts `media` or binary `attachment` with `video/mp4` or
 `video/quicktime`; existing Go/Python/TypeScript media contracts carry these MIME bytes.
@@ -1195,3 +1195,40 @@ and reproducible commands are in
 [the sampling corpus](../../../tools/embeddinggemma2/testdata/sampling/README.md).
 General mixed-tool conformance and broader display/Colour qualification remain
 separate requirements.
+
+
+## Device final pooling and normalization continuation (2026-10-11)
+
+`ComputeBackend.maskedMeanNormalizedRows` combines masked mean pooling, requested
+output-dimension truncation and device L2 normalization. Metal retains the output
+in private storage and returns it as a CT. The first dispatch preserves the
+existing masked-mean accumulation policy; the second rescales by the largest
+finite component before reducing squared values, avoiding norm overflow and
+underflow for the tested finite scales. A buffer barrier separates dispatches,
+and one threadgroup completes all reads before its in-place writes. Invalid or
+zero norms produce NaNs that final response validation rejects.
+
+Ordered multimodal groups, resident text and raster cohorts use this path.
+Flat text/media requests pass their requested EmbeddingGemma 2 dimension into
+preparation so HTTP serialization does not perform a second truncation/normalize
+step. Flat resident text uses the same bounded encoder and normalized pooling
+primitive. The default remains 768 dimensions; 128/256/512 are trimmed before
+normalization. Other model families retain their existing contract. Explicit
+resident-text diagnostic disablement can still select its host route.
+
+The returned vector is read back once for length, finite/nonzero validation and
+serialization. No CPU centroid or L2 normalization follows this device output.
+The ordinary `maskedMeanRows` slot remains available to unrelated consumers.
+CPU pooling remains available for native execution. This is a numerical/layout
+optimization, preserving the v4 sampling/rendering recipe rather than defining
+a different processor policy.
+
+Actual-Metal units pass long 8192-row masked pooling, skipped NaN padding,
+retained row views after parent destruction, 128/256/512/768 outputs, finite
+scales 1/1e-35/1e35, invalid norms and planned command scopes. The preceding
+sampling receipt continues to qualify its frozen source/binary. Pretrained
+requalification passes ten vectors and exact rankings/top-k on CPU/Metal,
+twenty Metal dimension cases plus default-dimension reset, and the six original
+mixed/video cases with admission and damaged-frame retries. See the new
+[resident normalization receipt](../../../tools/embeddinggemma2/testdata/resident-normalization/README.md). Cross-request scheduling, cross-group frame
+reuse and isolated performance measurements remain separate work.

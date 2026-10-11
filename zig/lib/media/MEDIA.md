@@ -534,3 +534,13 @@ choose reference index/FPS sampling or explicit rational timestamp windows;
 container duration and caller interval semantics remain distinct.
 See [VIDEO.md](../video/VIDEO.md#logical-avc-pictures-and-explicit-model-windows-2026-10-11)
 for bounds, endpoint behavior, recipe identity and window embedding semantics.
+
+
+## Resident inference output continuation (2026-10-11)
+
+The EmbeddingGemma 2 Metal consumer now pools, applies requested dimensions and
+normalizes on device before final response readback. Container indexing and
+source timestamp policies retain their existing contracts; media code does not
+perform model normalization. Actual device ownership/planned-scope units and
+pretrained CPU/Metal vector/dimension/retry campaigns qualify this consumer path.
+See the [normalization receipt](../../../tools/embeddinggemma2/testdata/resident-normalization/README.md).

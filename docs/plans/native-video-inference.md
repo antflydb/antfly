@@ -622,7 +622,8 @@ current receipts are in `zig/lib/video/testdata/webm-validation`. Full completio
 - Broader WebM display/Colour qualification and decoded/projected frame reuse
   across model window groups. Logical AVC indexing and explicit model timestamp
   windows are implemented; their current qualification is recorded below.
-- Final resident device normalization and scheduling across requests.
+- Cross-request scheduling and coordinated preprocessing/model resource budgets;
+  final Metal pooling/normalization is implemented and qualified below.
 - DASH inherited templates/BaseURL, multiple periods/representations and broader
   live/HLS coverage.
 
@@ -652,3 +653,19 @@ rankings/top-k and eight successful concurrent-load requests. The static musl
 server is bound by its binary SHA in the sampling receipt. This closes the Linux
 ARM64 execution gate for these policies, not x86_64 execution or general codec
 conformance.
+
+
+### Device final normalization implementation (2026-10-11)
+
+Metal now has a masked mean/truncation/normalization primitive retaining private
+storage through final response readback. The multimodal, text and raster routes
+use it; requested dimensions reach the flat text/media pipeline before readback.
+Peak-scaled reduction, resource barriers and invalid-output validation cover the
+numerical and ownership boundaries. Actual device unit tests pass, including
+long masked sequences, extreme finite scales, retained views and planned scopes.
+The updated production server builds with task-local Zig caches after a
+shared-cache object failure. Pretrained CPU/Metal vectors and rankings, twenty
+Metal dimension cases and the original mixed/video retry campaign now pass;
+receipts are in `tools/embeddinggemma2/testdata/resident-normalization`.
+This implementation does not close cross-request scheduling, window reuse,
+streaming inheritance or the broader performance/codec qualification scope.

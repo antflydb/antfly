@@ -1076,6 +1076,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> sdpa_f32_grouped_softmax_pipeline;
     id<MTLComputePipelineState> sdpa_f32_grouped_unpack_pipeline;
     id<MTLComputePipelineState> masked_mean_rows_pipeline;
+    id<MTLComputePipelineState> normalize_embedding_pipeline;
 
     id<MTLComputePipelineState> modernbert_training_attention_forward_pipeline;
     id<MTLComputePipelineState> modernbert_training_attention_dq_pipeline;
@@ -11265,6 +11266,41 @@ static NSString *termite_metal_shader_source(void) {
            "    float sum = 0.0f;\n"
            "    for (uint r = 0; r < p.x; ++r) if (mask[r] != 0) sum += input[r * p.y + d] / float(p.w);\n"
            "    output[d] = sum;\n"
+           "}\n"
+           "kernel void termite_normalize_embedding(device float *values [[buffer(0)]], constant uint &dimensions [[buffer(1)]], uint t [[thread_index_in_threadgroup]], uint3 group [[threads_per_threadgroup]]) {\n"
+           "    threadgroup float scratch[256];\n"
+           "    uint n = group.x;\n"
+           "    float peak = 0.0f;\n"
+           "    for (uint d = t; d < dimensions; d += n) {\n"
+           "        float value = values[d];\n"
+           "        peak = isfinite(value) ? max(peak, abs(value)) : INFINITY;\n"
+           "    }\n"
+           "    scratch[t] = peak;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = n / 2; stride > 0; stride /= 2) {\n"
+           "        if (t < stride) scratch[t] = max(scratch[t], scratch[t + stride]);\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    peak = scratch[0];\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float sum = 0.0f;\n"
+           "    if (peak > 0.0f && isfinite(peak)) {\n"
+           "        for (uint d = t; d < dimensions; d += n) {\n"
+           "            float scaled = values[d] / peak;\n"
+           "            sum += scaled * scaled;\n"
+           "        }\n"
+           "    }\n"
+           "    scratch[t] = sum;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint stride = n / 2; stride > 0; stride /= 2) {\n"
+           "        if (t < stride) scratch[t] += scratch[t + stride];\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    sum = scratch[0];\n"
+           "    // All lanes finish reading the original vector before any in-place write.\n"
+           "    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n"
+           "    bool valid = peak > 0.0f && isfinite(peak) && sum > 0.0f && isfinite(sum);\n"
+           "    for (uint d = t; d < dimensions; d += n) values[d] = valid ? (values[d] / peak) / sqrt(sum) : NAN;\n"
            "}\n"
            "kernel void termite_sdpa_grouped_pack(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device float *pq [[buffer(3)]], device float *pk [[buffer(4)]], device float *pv [[buffer(5)]], constant termite_metal_sdpa_segments_f32_params &p [[buffer(6)]], uint i [[thread_position_in_grid]]) {\n"
            "    uint D = p.head_dim;\n"
@@ -26697,6 +26733,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->sdpa_f32_segments_wide_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_segments_wide");
         runtime->sdpa_f32_segments_blocks_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_segments_blocks");
         runtime->masked_mean_rows_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_masked_mean_rows");
+        runtime->normalize_embedding_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_normalize_embedding");
         runtime->sdpa_f32_grouped_unpack_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_grouped_unpack");
         runtime->sdpa_f32_grouped_softmax_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_grouped_softmax");
         runtime->sdpa_f32_grouped_pack_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_grouped_pack");
@@ -27590,6 +27627,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sdpa_f32_segments_wide_pipeline = nil;
     runtime->sdpa_f32_segments_blocks_pipeline = nil;
     runtime->masked_mean_rows_pipeline = nil;
+    runtime->normalize_embedding_pipeline = nil;
     runtime->sdpa_f32_grouped_unpack_pipeline = nil;
     runtime->sdpa_f32_grouped_softmax_pipeline = nil;
     runtime->sdpa_f32_grouped_pack_pipeline = nil;
@@ -46667,8 +46705,9 @@ int termite_metal_decode_runtime_sdpa_grouped_f32_device(
     }
 }
 
-int termite_metal_decode_runtime_masked_mean_rows(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t active, void *output_handle, size_t output_offset) {
+static int termite_metal_decode_runtime_masked_mean_rows_impl(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t active, void *output_handle, size_t output_offset, bool normalize) {
     if (runtime == NULL || runtime->masked_mean_rows_pipeline == nil || input_handle == NULL || output_handle == NULL || mask == NULL || active == 0 || active > rows || dimensions == 0 || dimensions > width || rows > UINT32_MAX || width > UINT32_MAX) return -1;
+    if (normalize && (runtime->normalize_embedding_pipeline == nil || runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup == 0)) return -1;
     @autoreleasepool {
         bool frame_owned = runtime->active_frame_cb == nil;
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle, output = (__bridge id<MTLBuffer>)output_handle;
@@ -46686,9 +46725,28 @@ int termite_metal_decode_runtime_masked_mean_rows(termite_metal_decode_runtime *
         uint32_t p[4] = { (uint32_t)rows, (uint32_t)width, (uint32_t)dimensions, (uint32_t)active };
         [encoder setComputePipelineState:runtime->masked_mean_rows_pipeline]; [encoder setBuffer:input offset:input_offset atIndex:0]; [encoder setBuffer:staged.buffer offset:staged.offset atIndex:1]; [encoder setBuffer:output offset:output_offset atIndex:2]; [encoder setBytes:p length:sizeof(p) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(dimensions, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->masked_mean_rows_pipeline, dimensions), 1, 1)];
+        if (normalize) {
+            id<MTLResource> resource = output;
+            [encoder memoryBarrierWithResources:&resource count:1];
+            [encoder setComputePipelineState:runtime->normalize_embedding_pipeline];
+            [encoder setBuffer:output offset:output_offset atIndex:0];
+            const uint32_t count = (uint32_t)dimensions;
+            [encoder setBytes:&count length:sizeof(count) atIndex:1];
+            size_t threads = 256;
+            while (threads > runtime->normalize_embedding_pipeline.maxTotalThreadsPerThreadgroup) threads /= 2;
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        }
         termite_metal_end_scoped_compute_encoder(encoder, owned);
         return termite_metal_decode_runtime_finish_command_buffer(cb, frame_owned, -7);
     }
+}
+
+int termite_metal_decode_runtime_masked_mean_rows(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t active, void *output_handle, size_t output_offset) {
+    return termite_metal_decode_runtime_masked_mean_rows_impl(runtime, input_handle, input_offset, mask, rows, width, dimensions, active, output_handle, output_offset, false);
+}
+
+int termite_metal_decode_runtime_masked_mean_rows_normalized(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, const int64_t *mask, size_t rows, size_t width, size_t dimensions, size_t active, void *output_handle, size_t output_offset) {
+    return termite_metal_decode_runtime_masked_mean_rows_impl(runtime, input_handle, input_offset, mask, rows, width, dimensions, active, output_handle, output_offset, true);
 }
 
 /// ModernBERT training attention V1. Forward: output rows [tokens, hidden],

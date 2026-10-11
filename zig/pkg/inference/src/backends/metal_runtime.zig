@@ -3028,14 +3028,23 @@ pub fn decoderRuntimeSegmentAttentionF32Device(self: anytype, q: MetalTensor, k:
 }
 
 pub fn decoderRuntimeMaskedMeanRows(self: anytype, input: MetalTensor, mask: []const i64, width: usize, dimensions: usize) !?MetalTensor {
+    return decoderRuntimeMaskedMeanRowsImpl(self, input, mask, width, dimensions, false);
+}
+pub fn decoderRuntimeMaskedMeanNormalizedRows(self: anytype, input: MetalTensor, mask: []const i64, width: usize, dimensions: usize) !?MetalTensor {
+    return decoderRuntimeMaskedMeanRowsImpl(self, input, mask, width, dimensions, true);
+}
+fn decoderRuntimeMaskedMeanRowsImpl(self: anytype, input: MetalTensor, mask: []const i64, width: usize, dimensions: usize, normalize: bool) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
-    if (!input.isDevice() or mask.len == 0 or width == 0 or dimensions == 0 or dimensions > width or input.elemCount() != mask.len * width) return null;
+    if (!input.isDevice() or mask.len == 0 or mask.len > std.math.maxInt(u32) or width == 0 or width > std.math.maxInt(u32) or dimensions == 0 or dimensions > width or dimensions > std.math.maxInt(i32)) return null;
+    const elements = std.math.mul(usize, mask.len, width) catch return null;
+    if (input.elemCount() != elements) return null;
     var active: usize = 0;
     for (mask) |m| active += @intFromBool(m != 0);
     if (active == 0) return error.EmptyEmbeddingInput;
     var output = try MetalTensor.deviceAllocate(runtime, dimensions * @sizeOf(f32), .private, &.{@intCast(dimensions)});
     errdefer output.deinit();
-    if (termite_metal_decode_runtime_masked_mean_rows(runtime, input.deviceHandle(), input.deviceByteOffset(), mask.ptr, mask.len, width, dimensions, active, output.deviceHandle(), output.deviceByteOffset()) != 0) {
+    const operation: *const @TypeOf(termite_metal_decode_runtime_masked_mean_rows) = if (normalize) &termite_metal_decode_runtime_masked_mean_rows_normalized else &termite_metal_decode_runtime_masked_mean_rows;
+    if (operation(runtime, input.deviceHandle(), input.deviceByteOffset(), mask.ptr, mask.len, width, dimensions, active, output.deviceHandle(), output.deviceByteOffset()) != 0) {
         output.deinit();
         return null;
     }
@@ -19550,6 +19559,7 @@ pub extern fn termite_metal_decode_runtime_sdpa_segments_f32_device(
     output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_masked_mean_rows(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
+pub extern fn termite_metal_decode_runtime_masked_mean_rows_normalized(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, mask: [*c]const i64, rows: usize, width: usize, dimensions: usize, active: usize, output: ?*anyopaque, output_offset: usize) c_int;
 pub extern fn termite_metal_decode_runtime_sdpa_grouped_f32_device(runtime: ?*RawMetalDecodeRuntime, q: ?*anyopaque, q_offset: usize, k: ?*anyopaque, k_offset: usize, v: ?*anyopaque, v_offset: usize, ranges: [*c]const u32, query_positions: [*c]const i32, key_positions: [*c]const i32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32, window: u32, scores: ?*anyopaque, query_tile: usize, output: ?*anyopaque, output_offset: usize, check_ctx: ?*anyopaque, check_fn: *const fn (?*anyopaque) callconv(.c) c_int) c_int;
 pub extern fn termite_metal_decode_runtime_apply_mrope_device(
     runtime: ?*RawMetalDecodeRuntime,

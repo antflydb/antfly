@@ -31293,7 +31293,11 @@ fn applyDenseEmbeddingRequestOptions(
     if (style == .embedding_gemma2) {
         if (request.instruction != null) return error.InstructionNotSupportedForModel;
         pipeline.config.text_prefix = try @import("../architectures/embedding_gemma2.zig").taskPrefix(@tagName(task_type));
-        if (request.dimensions) |dim| if (dim <= 0 or !@import("../architectures/embedding_gemma2.zig").validDimension(@intCast(dim))) return error.InvalidEmbeddingDimensions;
+        pipeline.config.embedding_gemma2_dimensions = 768;
+        if (request.dimensions) |dim| {
+            if (dim <= 0 or !@import("../architectures/embedding_gemma2.zig").validDimension(@intCast(dim))) return error.InvalidEmbeddingDimensions;
+            pipeline.config.embedding_gemma2_dimensions = @intCast(dim);
+        }
         return null;
     }
 

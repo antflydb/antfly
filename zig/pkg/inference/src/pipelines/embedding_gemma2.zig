@@ -25,6 +25,20 @@ const scoring = @import("antfly_decisions").scoring;
 pub const SampledVideo = struct { bytes: []const u8, sampling: @import("embedding_gemma2_video.zig").Sampling };
 pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
+/// Final response materialization; normalization already completed on device.
+fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.mem.Allocator, pooled: @import("../ops/ops.zig").CT, dimensions: usize) ![]f32 {
+    const vector = try cb.toFloat32(pooled, a);
+    errdefer a.free(vector);
+    if (vector.len != dimensions) return error.InvalidEmbeddingDimensions;
+    var nonzero = false;
+    for (vector) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidEmbeddingDecisionOutput;
+        nonzero = nonzero or value != 0;
+    }
+    if (!nonzero) return error.InvalidEmbeddingDecisionOutput;
+    return vector;
+}
+
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
         .raster => |raster| raster.bytes,
@@ -99,12 +113,10 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     const output = try encoder.forwardEmbeddingsCT(cb, a, cfg, input, mask, 1, count);
     defer cb.free(output);
     if (cb.kind() == .metal) {
-        const op = cb.vtable.maskedMeanRows orelse return error.EmbeddingGemma2OperationUnavailable;
+        const op = cb.vtable.maskedMeanNormalizedRows orelse return error.EmbeddingGemma2OperationUnavailable;
         const pooled = (try op(cb.ptr, output, mask, 768, options.dimensions)) orelse return error.EmbeddingGemma2OperationUnavailable;
         defer cb.free(pooled);
-        const values = try cb.toFloat32(pooled, a);
-        defer a.free(values);
-        const vector = try scoring.centroid(a, &.{values}, options.dimensions);
+        const vector = try readNormalizedVector(cb, a, pooled, options.dimensions);
         errdefer a.free(vector);
         try effective.check();
         return .{ .vector = vector, .input_tokens = count };
@@ -444,6 +456,24 @@ fn runPreparedBatch(a: std.mem.Allocator, cb: *const ComputeBackend, cfg: encode
     defer cb.free(input);
     const output = try encoder.forwardEmbeddingsCT(cb, a, cfg, input, batch_inputs.mask, rows.len, batch_inputs.sequence);
     defer cb.free(output);
+    if (cb.kind() == .metal) {
+        const operation = cb.vtable.maskedMeanNormalizedRows orelse return error.EmbeddingGemma2OperationUnavailable;
+        const vectors = try a.alloc([]f32, rows.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (vectors[0..initialized]) |vector| a.free(vector);
+            a.free(vectors);
+        }
+        for (vectors, 0..) |*vector, index| {
+            const view = try cb.sliceRows2D(a, output, index * batch_inputs.sequence, batch_inputs.sequence, 768);
+            defer cb.free(view);
+            const pooled = (try operation(cb.ptr, view, batch_inputs.mask[index * batch_inputs.sequence ..][0..batch_inputs.sequence], 768, dimensions)) orelse return error.EmbeddingGemma2OperationUnavailable;
+            defer cb.free(pooled);
+            vector.* = try readNormalizedVector(cb, a, pooled, dimensions);
+            initialized += 1;
+        }
+        return vectors;
+    }
     const values = try cb.toFloat32(output, a);
     defer a.free(values);
     return poolBatch(a, values, batch_inputs.mask, rows.len, batch_inputs.sequence, dimensions);
@@ -520,11 +550,9 @@ pub fn preparedText(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.
     if (resident) {
         const output = try encoder.forwardCT(cb, a, cfg, ids, mask, 1, ids.len);
         defer cb.free(output);
-        const pooled = (if (cb.vtable.maskedMeanRows) |op| try op(cb.ptr, output, mask, 768, dimensions) else null) orelse return error.EmbeddingGemma2OperationUnavailable;
+        const pooled = (if (cb.vtable.maskedMeanNormalizedRows) |op| try op(cb.ptr, output, mask, 768, dimensions) else null) orelse return error.EmbeddingGemma2OperationUnavailable;
         defer cb.free(pooled);
-        const vector = try cb.toFloat32(pooled, a);
-        defer a.free(vector);
-        return scoring.centroid(a, &.{vector}, dimensions);
+        return readNormalizedVector(cb, a, pooled, dimensions);
     }
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);

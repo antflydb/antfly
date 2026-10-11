@@ -13456,6 +13456,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    fn maskedMeanNormalizedRowsOp(ctx: *anyopaque, input_ct: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
+        defer input.deinit();
+        const output = (try metal_runtime.decoderRuntimeMaskedMeanNormalizedRows(self.provider_impl, input, mask, width, dimensions)) orelse return null;
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
     fn scaledDotProductAttentionQwen3VlVisionOp(
         ctx: *anyopaque,
         q_ct: CT,
@@ -31370,6 +31378,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.segmentAttention = segmentAttentionOp;
         vt.segmentAttentionGrouped = segmentAttentionGroupedOp;
         vt.maskedMeanRows = maskedMeanRowsOp;
+        vt.maskedMeanNormalizedRows = maskedMeanNormalizedRowsOp;
         vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
@@ -40789,6 +40798,13 @@ test "metal_compute: embeddinggemma2 masked device mean truncates skips NaNs and
         const got = try cb.toFloat32(output, a);
         defer a.free(got);
         try std.testing.expectEqual(dimensions, got.len);
+        const normalized = (try cb.vtable.maskedMeanNormalizedRows.?(cb.ptr, input, mask, width, dimensions)) orelse return error.TestUnexpectedResult;
+        defer cb.free(normalized);
+        const normalized_values = try cb.toFloat32(normalized, a);
+        defer a.free(normalized_values);
+        const reference = try @import("antfly_decisions").scoring.centroid(a, &.{got}, dimensions);
+        defer a.free(reference);
+        for (normalized_values, reference) |x, want| try std.testing.expectApproxEqAbs(want, x, 1e-6);
         for (got, 0..) |x, d| {
             var expected: f32 = 0;
             for (mask, 0..) |m, row| if (m != 0) {
@@ -40799,6 +40815,76 @@ test "metal_compute: embeddinggemma2 masked device mean truncates skips NaNs and
     }
     @memset(mask, 0);
     try std.testing.expectError(error.EmptyEmbeddingInput, cb.vtable.maskedMeanRows.?(cb.ptr, input, mask, width, 768));
+}
+
+test "metal_compute: embeddinggemma2 normalized device mean preserves views and extreme finite scales" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime;
+    const metal = @import("../backends/metal_runtime.zig");
+    const width = 768;
+    const values = try a.alloc(f32, 4 * width);
+    defer a.free(values);
+    for ([_]f32{ 1, 1e-35, 1e35 }) |scale| for ([_]usize{ 128, 256, 512, 768 }) |dimensions| for ([_]bool{ false, true }) |planned| {
+        @memset(values, std.math.nan(f32));
+        for (values[width..][0..width], 0..) |*x, d| x.* = (@as(f32, @floatFromInt(d % 23)) - 11) / 13 * scale;
+        const expected = try @import("antfly_decisions").scoring.centroid(a, &.{values[width..][0..dimensions]}, dimensions);
+        defer a.free(expected);
+        const parent = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ 4, width }));
+        const input = try cb.sliceRows2D(a, parent, 1, 2, width);
+        cb.free(parent);
+        var view = try compute.ownedDeviceMetalTensorFromCt(input);
+        try std.testing.expect(view.isDevice() and view.deviceByteOffset() > 0);
+        view.deinit();
+        const output = blk: {
+            if (planned) {
+                try metal.beginFrame(runtime);
+                errdefer if (metal.hasActiveFrame(runtime)) metal.cancelFrame(runtime) catch {};
+                try metal.beginPlannedComputeScope(runtime, @backingInt(metal.ComputeSource.embedding), .layer);
+            }
+            const result = (try cb.vtable.maskedMeanNormalizedRows.?(cb.ptr, input, &.{ 1, 0 }, width, dimensions)) orelse return error.TestUnexpectedResult;
+            errdefer cb.free(result);
+            if (planned) {
+                try metal.endPlannedComputeScope(runtime);
+                try metal.submitFrame(runtime);
+                try metal.waitFrame(runtime);
+            }
+            break :blk result;
+        };
+        cb.free(input);
+        defer cb.free(output);
+        var device = try compute.ownedDeviceMetalTensorFromCt(output);
+        try std.testing.expect(device.isDevice());
+        device.deinit();
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        var norm: f64 = 0;
+        for (got, expected) |x, want| {
+            try std.testing.expectApproxEqAbs(want, x, 1e-6);
+            norm += @as(f64, x) * x;
+        }
+        try std.testing.expectApproxEqAbs(@as(f64, 1), norm, 1e-6);
+    };
+    for ([_]f32{ 0, std.math.nan(f32), std.math.inf(f32) }) |invalid| {
+        @memset(values, invalid);
+        const input = try cb.fromFloat32Shape(values[0..width], &.{ 1, width });
+        defer cb.free(input);
+        const output = (try cb.vtable.maskedMeanNormalizedRows.?(cb.ptr, input, &.{1}, width, width)) orelse return error.TestUnexpectedResult;
+        defer cb.free(output);
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        for (got) |x| try std.testing.expect(std.math.isNan(x));
+        try std.testing.expectError(error.EmptyEmbeddingInput, cb.vtable.maskedMeanNormalizedRows.?(cb.ptr, input, &.{0}, width, width));
+    }
 }
 
 test "metal_compute: embeddinggemma2 grouped tile cancellation and wrapping OOM drain before retry" {
