@@ -89,6 +89,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerClaims(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerClaimsAtRoot(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
@@ -3622,14 +3623,26 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// authenticated receiver independently obtains current metadata permission
     /// before calling this leased physical adapter. Kernel apply rechecks the
     /// durable job, actual receiving range and cancellation in its transaction.
-    pub fn applyNativeIndexOwnerClaims(
+    /// Retain the physical root from the lease that committed these claims.
+    /// This is provenance, not enrollment or a signed publication receipt.
+    pub const RootedNativeIndexOwnerClaims = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native_index_control.ClaimOutcome),
+
+        pub fn deinit(self: *RootedNativeIndexOwnerClaims) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn applyNativeIndexOwnerClaimsAtRoot(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         command: native_index_control.ClaimCommand,
         context: request_operation.RequestContext,
-    ) !std.json.Parsed(native_index_control.ClaimOutcome) {
+    ) !RootedNativeIndexOwnerClaims {
         try context.ensureActive();
         try command.validate();
         const binding = command.binding;
@@ -3651,7 +3664,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         var parsed = try std.json.parseFromSlice(native_index_control.ClaimOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer parsed.deinit();
         try parsed.value.validateFor(command);
-        return parsed;
+        return .{ .root_generation = lease.entry.generation, .outcome = parsed };
+    }
+
+    pub fn applyNativeIndexOwnerClaims(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.ClaimCommand,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.ClaimOutcome) {
+        // Transfer the owned result without reconstructing its physical root
+        // from another lookup. Signing callers must use the rooted operation.
+        return (try self.applyNativeIndexOwnerClaimsAtRoot(alloc, group_id, table_name, command, context)).outcome;
     }
 
     pub fn nativeIndexOwnerState(

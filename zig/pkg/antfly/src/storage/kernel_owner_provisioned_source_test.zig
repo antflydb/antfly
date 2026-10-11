@@ -275,14 +275,21 @@ test "native index owner adapter executes fresh permission stages and recovers r
             .binding = claim_binding,
             .claims = &.{.{ .tuple = "leased\x00\xff\x80-claim", .parent_table = plan.before.name, .parent_key = "leased-owner", .schema_version = claim_binding.physical_candidate.schema_version }},
         };
-        var claimed = try owners.applyNativeIndexOwnerClaims(alloc, group, plan.before.name, claim_command, .{});
-        defer claimed.deinit();
-        try std.testing.expect(!claimed.value.duplicate and claimed.value.claims_added == 1);
-        try std.testing.expectEqual(reserved_receipt.position.native.sequence + 1, claimed.value.position.sequence);
+        var rooted_claim = try owners.applyNativeIndexOwnerClaimsAtRoot(alloc, group, plan.before.name, claim_command, .{});
+        defer rooted_claim.deinit();
+        try std.testing.expectEqual(root_generation, rooted_claim.root_generation);
+        const claimed = rooted_claim.outcome.value;
+        try std.testing.expect(!claimed.duplicate and claimed.claims_added == 1);
+        try std.testing.expectEqual(reserved_receipt.position.native.sequence + 1, claimed.position.sequence);
         var duplicate_claim = try owners.applyNativeIndexOwnerClaims(alloc, group, plan.before.name, claim_command, .{});
         defer duplicate_claim.deinit();
         try std.testing.expect(duplicate_claim.value.duplicate);
-        try std.testing.expectEqual(claimed.value.position, duplicate_claim.value.position);
+        try std.testing.expectEqual(claimed.position, duplicate_claim.value.position);
+        var rooted_duplicate = try owners.applyNativeIndexOwnerClaimsAtRoot(alloc, group, plan.before.name, claim_command, .{});
+        defer rooted_duplicate.deinit();
+        try std.testing.expectEqual(rooted_claim.root_generation, rooted_duplicate.root_generation);
+        try std.testing.expect(rooted_duplicate.outcome.value.duplicate);
+        try std.testing.expectEqual(claimed.position, rooted_duplicate.outcome.value.position);
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owners.applyNativeIndexOwnerClaims(alloc, group + 1, plan.before.name, claim_command, .{}));
         // Control commands carry the admitted preimage, even when inspection
         // recovered the durable reserved postimage. Never relax that guard.
