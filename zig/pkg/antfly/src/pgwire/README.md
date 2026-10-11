@@ -115,7 +115,9 @@ TLS itself.
 
 Standalone completes initial durable relation catalog publication before opening
 public HTTP or PostgreSQL listeners. This also applies on restart with persisted
-tables; startup fails if publication cannot finish within its bounded deadline.
+tables. Publication uses bounded control rounds without a fixed total startup
+deadline. SIGINT/SIGTERM cancel the wait; terminal publication failures
+for the current source epoch fail startup.
 HA retains its separate writer/replica authority contract.
 
 `53300` with `retryable:true` for relation catalog publication means no schema
