@@ -2575,3 +2575,48 @@ drain/burn delivery. GC page delivery, cleanup completion cuts, global claims,
 manifest/blob and binding retirement, epoch release and coordinated rollout
 barriers remain open. Public production stays disabled and no SQL case is
 credited by this protocol consolidation.
+
+### Private UNIQUE claim retirement: generation ownership, not a global scan
+
+Cancellation queue admission retains the exact burned UNIQUE allocation in a
+canonical checksummed cleanup record. Its generation is derived from the table
+incarnation and allocation; it is not an incoming constraint name or tuple hash.
+Admission and recovery independently verify the exact reserved catalog digest,
+active owner job and source fence. This is retained scope, not deletion authority.
+
+The existing integrity claim key orders kind, routing hash, generation and tuple
+hash. Consequently, seeking a generation prefix cannot enumerate its claims.
+The physical index's forward/ownership GC proves only artifact retirement and
+must never be treated as proof of distributed UNIQUE retirement.
+
+The remaining implementation must satisfy these invariants:
+
+- Maintain a generation-owned inventory on each actual hash owner. Insert/remove
+  inventory entries in the same transaction as claim changes, with exact claim
+  identity checks. Normal replay and recovery/restore must preserve or strictly
+  reconstruct this invariant; an unexplained missing inventory is not emptiness.
+- Freeze the complete hash-owner cohort under independently read metadata
+  permission. A row-owner cancellation fence does not fence those hash owners.
+  Bind each retirement acknowledgement to the exact generation, plan, owner
+  incarnation/root and durable source cut; neither cardinality nor a source
+  owner's physical GC result proves coverage.
+- Persist retirement before deletion and check it both when preparing claim
+  effects and in the committing transaction. This must reject delayed prepared
+  establishes, replayed worker requests and duplicate deliveries after GC, while
+  retaining ordinary transaction-log replay semantics.
+- Traverse only the selected generation inventory using durable, CAS-protected,
+  bounded continuations. Validate companion records before deleting; unexpected
+  FK references or action jobs cannot be silently discarded. Keep unrelated
+  generations and their admission independent.
+- Retire immutable inputs, private binding and manifests only after all required
+  owner proofs are durable. Persist a final cancellation cut before reporting
+  completion. Epoch release is a separate coordinated phase, never an implicit
+  consequence of an empty artifact queue or elapsed time.
+- Exercise lost replies, committed mirror failures, duplicate/gapped replay,
+  owner/root replacement, late claim writes, incomplete cohort acknowledgements,
+  concurrent independent generations and interrupted restore under real owner
+  storage. Component fixtures do not replace authenticated distributed faults.
+
+These retirement and activation requirements are still open. The public native
+index producer remains disabled; no original SQL case is credited by the scope
+record or this design.

@@ -388,6 +388,37 @@ test "relational integrity catalog retains unchanged identities and never revive
     try std.testing.expectEqual(@as(usize, 2), decoded.bindings.len);
 }
 
+test "relational index catalog private claim allocation verifies exact bounded reservation" {
+    const alloc = std.testing.allocator;
+    var value = try prepare(alloc, null, try incarnationFromTableId(101), 1, @splat(2), &.{});
+    defer value.deinit();
+    try std.testing.expectError(error.InvalidIntegrityCatalog, privateIndexAllocationFromReservation(value.value, digest(value.value), 101));
+    // The extractor is allocation-free, but is not authority: these header
+    // fixtures deliberately do not constitute a real reserved owner job.
+    value.catalog.next_generation = 2;
+    const reserved = try encode(alloc, value.catalog);
+    defer alloc.free(reserved);
+    const scope = try privateIndexAllocationFromReservation(reserved, digest(reserved), 101);
+    try std.testing.expectEqual(@as(u64, 1), scope.allocation);
+    try std.testing.expectEqual(try privateIndexGeneration(101, 1), scope.generation);
+    try std.testing.expectError(error.InvalidIntegrityCatalog, privateIndexGeneration(101, 0));
+    try std.testing.expectError(error.InvalidIntegrityCatalog, privateIndexAllocationFromReservation(reserved, digest(reserved), 102));
+    try std.testing.expectError(error.IntegrityCatalogChanged, privateIndexAllocationFromReservation(reserved, @splat(0), 101));
+    for (0..reserved.len) |length| try std.testing.expectError(error.IntegrityCatalogChanged, privateIndexAllocationFromReservation(reserved[0..length], digest(reserved), 101));
+    const corrupt = try alloc.dupe(u8, reserved);
+    defer alloc.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidIntegrityCatalog, privateIndexAllocationFromReservation(corrupt, digest(corrupt), 101));
+    @memcpy(corrupt, reserved);
+    std.mem.writeInt(u32, corrupt[64..68], max_definitions + 1, .little);
+    @memcpy(corrupt[corrupt.len - 32 ..], &digest(corrupt[0 .. corrupt.len - 32]));
+    try std.testing.expectError(error.InvalidIntegrityCatalog, privateIndexAllocationFromReservation(corrupt, digest(corrupt), 101));
+    value.catalog.next_generation = std.math.maxInt(u64);
+    const last = try encode(alloc, value.catalog);
+    defer alloc.free(last);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, (try privateIndexAllocationFromReservation(last, digest(last), 101)).allocation);
+}
+
 test "index-only publication preserves active and retired bindings and rejects unrelated changes" {
     const alloc = std.testing.allocator;
     const pk: Definition = .{ .kind = .unique, .name = "id", .fingerprint = @splat(4), .payload = "id-key" };

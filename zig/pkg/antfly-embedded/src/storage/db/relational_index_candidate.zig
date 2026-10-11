@@ -1228,6 +1228,14 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         try std.testing.expectEqual(claim_scope.generation, try stored_cleanup.claimGeneration());
         const cleanup_bytes = try stored_cleanup.encode();
         for (0..cleanup_bytes.len) |length| try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.CancellationCleanupRecord.decode(cleanup_bytes[0..length]));
+        var extended: [jobs.CancellationCleanupRecord.encoded_len + 1]u8 = undefined;
+        @memcpy(extended[0..cleanup_bytes.len], &cleanup_bytes);
+        extended[cleanup_bytes.len] = 0;
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.CancellationCleanupRecord.decode(&extended));
+        var no_allocation = cleanup_bytes;
+        @memset(no_allocation[376..384], 0);
+        std.crypto.hash.Blake3.hash(no_allocation[0..384], no_allocation[384..416], .{});
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.CancellationCleanupRecord.decode(&no_allocation));
         for ([_]usize{ 0, 5, 375, 376, 415 }) |offset| {
             var corrupt = cleanup_bytes;
             corrupt[offset] ^= 1;
