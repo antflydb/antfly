@@ -426,6 +426,54 @@ Run the CUDA parity fixture on a CUDA host with `-Dcuda=true -Dmetal=false`;
 keep the hardware failure visible rather than treating a missing device as a
 successful qualification.
 
+### Gemma 4 vision residency
+
+`architectures/gemma4_projector.zig` now retains patch projection outputs as
+backend tensors through position addition, the vision blocks, spatial pooling,
+optional standardization, RMS normalization and the final projection. GGUF
+convolution output is transposed on the backend instead of exported for CPU
+layout conversion. The HF patch-linear path retains its exact patch order.
+Static position offsets are prepared from the learned weight table on CPU and
+uploaded separately; image activations are not exported to add them.
+
+Q/K/V head RMS normalization uses backend operations. Gemma's 2D rotary layout
+pairs channels within each spatial axis; the existing GPU vision-RoPE primitive
+pairs the global halves. A device transpose converts between those layouts in
+both directions, preserving the query scale that compensates for SDPA scaling.
+Spatial pooling gathers and adds each merge offset in the original order, then
+applies the hidden-width scale. The unified direct image projector likewise
+keeps its post-projection bias, layer norms and position addition on the backend.
+CPU decode, resize, initial pixel/patch preparation and the direct projector's
+first patch norm remain on the host. Providers missing the relevant RoPE or
+pooling operations retain their host compatibility paths.
+
+This change covers vision projector activation boundaries. It does not add
+cross-image batching or GPU codec/resize kernels. Scalar clipping already has a
+device path; vector clipping compatibility and opt-in diagnostic stage dumps
+can still export tensors. Static weight materialization, including HF position
+tables, is a separate transfer concern. The public projected image/audio structs
+still contain host arrays, so their final export and subsequent prompt upload
+remain. Gemma 4 audio's existing device encoder operations are unchanged, and
+waveform/log-mel preparation remains CPU work.
+
+Synthetic regression fixtures compare head normalization, both query/key rotary
+scales, value normalization and spatial pooling against the existing host
+reference. They use multiple heads, rectangular grids and merge sizes 1/2.
+Patch projection and position addition are checked on native and Metal backends.
+Metal counters assert no intermediate device-to-host accesses/download bytes in
+these tested operations. Host export is also disabled during the activation
+operations to catch accidental readbacks. These checks establish numerical
+parity and residency, not an end-to-end throughput improvement or real-model
+quality qualification. Validation on 2026-10-11: native and local Metal fixtures
+pass, and the Gemma 4 regression filter reports 118 passed / 3 skipped (optional
+real-model fixtures and CUDA hardware). The CUDA-enabled Linux test binary
+cross-compiles; CUDA execution remains unqualified.
+
+```sh
+zig build test -Donnx=false -Dmetal=true -Dtest-filter=gemma4
+zig build test-bin -Dtarget=x86_64-linux-gnu -Donnx=false -Dmetal=false -Dcuda=true -Dblas=off -Dtest-filter='gemma4 resident vision'
+```
+
 ### Further implementation and measurement
 
 1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,
