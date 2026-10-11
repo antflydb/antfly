@@ -586,17 +586,6 @@ fn requireReservedState(txn: anytype, binding: Binding) !void {
     _ = try @import("relational_index_private_claims.zig").requireRegistered(txn, binding);
 }
 
-/// Classify unpublished derived claims for source retention, not write or
-/// publication authority. Validate the exact reserved catalogs, held fence,
-/// namespace, native cuts and registration in the capturing transaction.
-/// Cancellation cleanup retains this identity until coordinated retirement.
-pub fn retainedPrivateClaimGeneration(txn: anytype) !?@import("relational_integrity_contract.zig").Generation {
-    const binding = (try load(txn)) orelse return null;
-    if (binding.phase != .reserved or binding.authority != .native) return null;
-    try requireReservedState(txn, binding);
-    return (try @import("relational_index_private_claims.zig").requireRegistered(txn, binding)).generation;
-}
-
 /// Cold startup/restore validation in the SAME snapshot as the public catalog.
 /// Structural recovery is not metadata authentication or permission to publish.
 /// Work is bounded by catalog size, never the number of primary rows.

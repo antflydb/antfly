@@ -679,6 +679,8 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         const result = try prepared.stageOrdered(&txn, null);
         try std.testing.expect(!result.duplicate);
         try std.testing.expectEqual(@as(usize, 2), result.claims_added);
+        try std.testing.expectError(error.RetainedEffectsMixedControl, txn.put(&prepared.entries[0].address.claimKey(), prepared.entries[0].value));
+        try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.commit());
     }
     const original_cut = blk: {
         var read = try store.beginReadTxn();
@@ -897,6 +899,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
             const value = try reference.encode(a, selected);
             defer a.free(value);
+            try page.stage(&txn);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, txn.put(&try reference.key(selected), value));
             try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.delete(&selected.claimKey()));
         }
@@ -916,8 +919,9 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             defer txn.abort();
             const restored = try first.encode(a, address);
             defer a.free(restored);
-            try txn.put(&address.claimKey(), restored);
-            try txn.put(&inventory_key, &integrity.hash(restored));
+            // Inject a physical drift without binding a legitimate writer.
+            try txn.write.?.put(&address.claimKey(), restored);
+            try txn.write.?.put(&inventory_key, &integrity.hash(restored));
             try std.testing.expectError(error.VersionConflict, page.stage(&txn));
         }
         collected += page.entries.len;

@@ -253,7 +253,8 @@ pub const Prepared = struct {
 
     pub fn stage(self: *const Prepared, txn: anytype) !usize {
         try jobs.requireReserved(txn, self.binding);
-        _ = try requireRegistered(txn, self.binding);
+        const allocation = try requireRegistered(txn, self.binding);
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix, receipt_prefix);
         for (self.entries) |entry| {
             const actual = try optional(txn, &entry.address.claimKey());
             if (!optionalEqual(actual, entry.expected)) return error.VersionConflict;
@@ -423,6 +424,7 @@ pub const GcPage = struct {
     pub fn stage(self: *const GcPage, txn: anytype) !void {
         _ = try jobs.requireCancellationCleanup(txn, self.binding);
         const allocation = try requireRegistered(txn, self.binding);
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix, receipt_prefix);
         if (self.receipts.len != 0) {
             var cursor = try txn.openCursor();
             defer cursor.close();
