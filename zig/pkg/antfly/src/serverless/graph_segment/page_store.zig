@@ -247,7 +247,11 @@ const TestArtifacts = struct {
     fail_delete_after: ?usize = null,
     mutex: std.atomic.Mutex = .unlocked,
     fail_upload: bool = false,
+    cancel_upload: ?*std.atomic.Value(bool) = null,
     completed_uploads: std.atomic.Value(usize) = .init(0),
+    active_uploads: std.atomic.Value(usize) = .init(0),
+    peak_uploads: std.atomic.Value(usize) = .init(0),
+    upload_io: ?std.Io = null,
 
     fn capability(self: *@This()) artifacts.ArtifactStore {
         return .{ .allocator = self.memory.alloc, .ptr = self, .vtable = &.{
@@ -284,7 +288,14 @@ const TestArtifacts = struct {
 
     fn putScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifacts.UploadScope, bytes: []const u8, cancellation: CancellationToken) !artifacts.ArtifactMetadata {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        defer _ = self.completed_uploads.fetchAdd(1, .acq_rel);
+        const active = self.active_uploads.fetchAdd(1, .acq_rel) + 1;
+        _ = self.peak_uploads.fetchMax(active, .acq_rel);
+        defer {
+            _ = self.active_uploads.fetchSub(1, .acq_rel);
+            _ = self.completed_uploads.fetchAdd(1, .acq_rel);
+        }
+        if (self.upload_io) |io| try std.Io.sleep(io, .fromMilliseconds(5), .awake);
+        if (self.cancel_upload) |signal| signal.store(true, .release);
         try cancellation.check();
         if (self.fail_upload) return error.InjectedUploadFailure;
         var digest: [32]u8 = undefined;
@@ -580,7 +591,7 @@ test "serverless graph page store bounded uploads drain failures and respect adm
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var fixture: TestArtifacts = .{ .memory = .{ .alloc = alloc } };
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = alloc }, .upload_io = io_impl.io() };
     defer fixture.memory.deinit();
     var capability = fixture.capability();
     var read_bytes: u64 = 0;
@@ -608,6 +619,8 @@ test "serverless graph page store bounded uploads drain failures and respect adm
     try store.put_many.?(store.ptr, &writes);
     try std.testing.expectEqual(@as(u64, 0), write_bytes);
     try std.testing.expectEqual(@as(usize, 8), fixture.completed_uploads.load(.acquire));
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) > 1);
+    try std.testing.expect(fixture.peak_uploads.load(.acquire) <= tree.max_write_batch);
     fixture.fail_upload = true;
     write_bytes = 512;
     try std.testing.expectError(error.InjectedUploadFailure, store.put_many.?(store.ptr, &writes));
@@ -618,4 +631,15 @@ test "serverless graph page store bounded uploads drain failures and respect adm
     write_bytes = 512;
     try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
     try std.testing.expectEqual(@as(usize, 16), fixture.completed_uploads.load(.acquire));
+    // Cancellation arriving inside an upload must also drain every child.
+    signal.store(false, .release);
+    fixture.fail_upload = false;
+    fixture.cancel_upload = &signal;
+    write_bytes = 512;
+    try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
+    // Siblings may stop at ArtifactStore's cancellation preflight without
+    // entering the provider. Every provider that did enter has finished.
+    const completed = fixture.completed_uploads.load(.acquire);
+    try std.testing.expect(completed >= 17 and completed <= 24);
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
 }
