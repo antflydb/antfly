@@ -333,6 +333,9 @@ pub fn admitInventoryBounded(a: A, scratch_backing: A, directory: Root, store: s
     return inventory;
 }
 
+pub fn admitSelectedServingInventory(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation, files: []const [32]u8) !Inventory {
+    return .{ .root = try @import("lake_index_serving_inventory.zig").loadSelected(a, scratch_backing, directory, store, cached, cancellation, files), .manifests = &.{} };
+}
 pub fn admitServingInventory(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
     if (directory.inventory_version == 2 and directory.serving_routes != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, true), .manifests = &.{} };
     return admitInventoryBounded(a, scratch_backing, directory, store, cached, cancellation);

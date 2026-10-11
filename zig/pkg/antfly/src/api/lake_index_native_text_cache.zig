@@ -182,10 +182,10 @@ pub const Cache = struct {
         var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
         var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
         defer metadata_arena.deinit();
-        const inventory = (if (selection) |files| selected: {
-            const subset = try @import("lake_index_serving_inventory.zig").loadSelected(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files);
-            break :selected corpus.Inventory{ .root = subset, .manifests = &.{} };
-        } else corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
+        const inventory = (if (selection) |files|
+            corpus.admitSelectedServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation, files)
+        else
+            corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation)) catch |err| {
             if (err == error.OutOfMemory and self.inventory_budget.isExhausted()) return error.NativeLakeTextCacheBusy;
             return err;
         };
@@ -572,14 +572,30 @@ const Entry = struct {
         defer self.allocator.free(ordered_ids);
         for (root.segments, ordered_ids) |segment, *id| id.* = self.segments.get(segment.artifact_id).?.id;
         try self.writer.?.orderImmutableSegments(ordered_ids);
+        // A formerly selected subset can become the complete corpus after
+        // file removal. Both directions need private, generation-owned scoring
+        // state even when ordering and physical readers remain unchanged.
+        const physical = self.writer.?.acquireSnapshot();
+        defer physical.release();
+        var documents: u64 = 0;
+        const field_count = if (root.collection) |totals| totals.fields.len else physical.global_total_field_len.count();
+        const fields = try a.alloc(local.index.IndexWriter.CollectionField, field_count);
+        if (root.collection) |totals| {
+            documents = totals.documents;
+            for (fields, totals.fields) |*field, total| field.* = .{ .name = total.name, .total_length = total.total_length };
+        } else {
+            if (root.partial_inventory) return error.InvalidNativeLakeTextCorpus;
+            for (physical.segments) |segment| documents += segment.reader.doc_count;
+            var totals = physical.global_total_field_len.iterator();
+            for (fields) |*field| {
+                const total = totals.next().?;
+                field.* = .{ .name = total.key_ptr.*, .total_length = total.value_ptr.* };
+            }
+        }
+        if (documents > std.math.maxInt(u32)) return error.InvalidNativeLakeTextCorpus;
+        try self.writer.?.sealImmutableCollection(@intCast(documents), fields);
         const snapshot = self.writer.?.acquireSnapshot();
         defer snapshot.release();
-        if (root.partial_inventory) {
-            const totals = root.collection orelse return error.InvalidNativeLakeTextCorpus;
-            snapshot.collection_doc_count = totals.documents;
-            snapshot.global_total_field_len.clearRetainingCapacity();
-            for (totals.fields) |field| try snapshot.global_total_field_len.put(self.allocator, try a.dupe(u8, field.name), field.total_length);
-        }
         self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
         if (root.statistics_version >= 1) {
             const ordinals = try a.alloc(corpus.statistics.IdentityOrdinal, root.segments.len);

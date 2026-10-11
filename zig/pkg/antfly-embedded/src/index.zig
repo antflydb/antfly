@@ -941,6 +941,7 @@ pub const IndexSnapshot = struct {
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
     collection_doc_count: ?u32 = null,
+    collection_field_lens: ?std.StringHashMapUnmanaged(u64) = null,
     term_doc_freq_cache_mu: std.atomic.Mutex,
     // Bounded singleflight stripes. Warm hits avoid these; cold readers of
     // the same term batch reuse the first reader's exact, generation-bound result.
@@ -1277,7 +1278,14 @@ pub const IndexSnapshot = struct {
         var summaries = self.text_summaries.keyIterator();
         while (summaries.next()) |key| alloc.free(key.*);
         self.text_summaries.deinit(alloc);
-        if (self.inventory_owner) |owner| owner.release() else self.global_total_field_len.deinit(alloc);
+        if (self.inventory_owner) |owner| owner.release() else {
+            self.global_total_field_len.deinit(alloc);
+            if (self.collection_field_lens) |*totals| {
+                var names = totals.keyIterator();
+                while (names.next()) |name| alloc.free(name.*);
+                totals.deinit(alloc);
+            }
+        }
         if (self.scoring_owner) |owner| owner.release();
         const backing = if (self.binding_allocator) |locked| locked.backing else alloc;
         backing.destroy(self);
@@ -1448,7 +1456,9 @@ pub const IndexSnapshot = struct {
         else
             try alloc.alloc(u32, terms.len);
         defer if (terms.len > term_doc_freq_stack.len) alloc.free(term_doc_freqs);
-        if (override == null and self.segments.len > 1) {
+        // One visible segment can be a selected part of a larger sealed
+        // collection. Only ordinary local snapshots can use its local DF.
+        if (override == null and (self.segments.len > 1 or self.collection_doc_count != null)) {
             try self.termDocFreqs(alloc, field, terms, term_doc_freqs);
         } else for (terms, 0..) |term, i| {
             term_doc_freqs[i] = if (override) |stats| stats.termDocFreq(term) orelse try self.termDocFreq(alloc, field, term) else 0;
@@ -1938,6 +1948,7 @@ pub const IndexSnapshot = struct {
         // sumTotalTermFreq this is immutable segment metadata; deletes affect
         // live-doc masks immediately and statistics when a merge rewrites the
         // segment.
+        if (self.collection_field_lens) |totals| return totals.get(field) orelse 0;
         return self.global_total_field_len.get(field) orelse 0;
     }
 };
@@ -2149,6 +2160,7 @@ pub const IndexWriter = struct {
         facade.segments = old.segments;
         facade.global_total_field_len = old.global_total_field_len;
         facade.collection_doc_count = old.collection_doc_count;
+        facade.collection_field_lens = old.collection_field_lens;
         facade.epoch = old.epoch;
         facade.inventory_owner = old;
         facade.read_context = context;
@@ -2270,6 +2282,54 @@ pub const IndexWriter = struct {
         snapshot_ref.epoch = self.next_epoch;
         self.next_epoch += 1;
         for (ordered) |*segment| segment.retain();
+        self.publishSnapshot(snapshot_ref);
+        old.release();
+    }
+
+    pub const CollectionField = struct { name: []const u8, total_length: u64 };
+    /// Seal global scoring inputs onto a private immutable generation. Physical
+    /// readers may be reused unchanged, but global DF caches and field totals
+    /// must never alias another publication (or another selected file set).
+    pub fn sealImmutableCollection(self: *IndexWriter, documents: u32, fields: []const CollectionField) !void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        var visible: u64 = 0;
+        for (old.segments) |segment| visible += segment.reader.doc_count;
+        if (documents < visible) return error.InvalidSegment;
+        var collection: std.StringHashMapUnmanaged(u64) = .empty;
+        errdefer {
+            var names = collection.keyIterator();
+            while (names.next()) |name| self.alloc.free(name.*);
+            collection.deinit(self.alloc);
+        }
+        for (fields) |field| {
+            if (field.name.len == 0) return error.InvalidSegment;
+            const entry = try collection.getOrPut(self.alloc, field.name);
+            if (entry.found_existing) return error.InvalidSegment;
+            // Install an owned name only after allocation succeeds.
+            const name = self.alloc.dupe(u8, field.name) catch |err| {
+                _ = collection.remove(field.name);
+                return err;
+            };
+            entry.key_ptr.* = name;
+            entry.value_ptr.* = field.total_length;
+        }
+        var lengths = old.global_total_field_len.iterator();
+        while (lengths.next()) |field| if ((collection.get(field.key_ptr.*) orelse return error.InvalidSegment) < field.value_ptr.*) return error.InvalidSegment;
+        const segments = try self.alloc.dupe(SegmentEntry, old.segments);
+        errdefer self.alloc.free(segments);
+        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer totals.deinit(self.alloc);
+        const empty = try IndexWriter.init(self.alloc);
+        const snapshot_ref = empty.current;
+        snapshot_ref.segments = segments;
+        snapshot_ref.global_total_field_len = totals;
+        snapshot_ref.collection_doc_count = documents;
+        snapshot_ref.collection_field_lens = collection;
+        snapshot_ref.epoch = self.next_epoch;
+        self.next_epoch += 1;
+        for (segments) |*segment| segment.retain();
         self.publishSnapshot(snapshot_ref);
         old.release();
     }
@@ -4646,4 +4706,53 @@ test "external lake cold bindings singleflight by ordinal while unrelated provid
     try std.testing.expectEqual(error.Canceled, blocked.failure.?);
     try std.testing.expectEqual(@as(u32, 0), pending.bound_segments.count());
     try std.testing.expectEqual(@as(u32, 0), pending.binding_flights.count());
+}
+
+fn sealedCollectionScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(std.testing.allocator, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer std.testing.allocator.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const old = writer.acquireSnapshot();
+    defer old.release();
+    try std.testing.expectEqual(@as(u32, 1), try old.termDocFreq(a, "body", "common"));
+    var fork = try writer.forkImmutable();
+    defer fork.deinit();
+    var name: [4]u8 = "body".*;
+    try fork.sealImmutableCollection(10, &.{.{ .name = &name, .total_length = 50 }});
+    @memset(&name, 'x'); // published field names own their storage
+    const sealed = fork.acquireSnapshot();
+    defer sealed.release();
+    try std.testing.expect(sealed != old);
+    try std.testing.expectEqual(@as(u32, 0), sealed.term_doc_freq_cache.count());
+    try std.testing.expect(sealed.segments[0].shared == old.segments[0].shared);
+    try std.testing.expectEqual(@as(u32, 1), old.scoringDocCount());
+    try std.testing.expectEqual(@as(f32, 2), old.textAvgDocLen("body"));
+    try std.testing.expectEqual(@as(u32, 10), sealed.scoringDocCount());
+    try std.testing.expectEqual(@as(f32, 5), sealed.textAvgDocLen("body"));
+    try std.testing.expectEqual(@as(u64, 2), sealed.global_total_field_len.get("body").?);
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    const facade = try fork.acquireSnapshotWithReadCapability(.{ .ptr = &dummy, .check = Check.check });
+    defer facade.release();
+    try std.testing.expectEqual(@as(u32, 10), facade.scoringDocCount());
+    try std.testing.expectEqual(@as(f32, 5), facade.textAvgDocLen("body"));
+    try std.testing.expectError(error.InvalidSegment, fork.sealImmutableCollection(0, &.{}));
+    // Removing all outside files turns this same physical subset into the
+    // whole collection. A previously retained reader keeps its old totals.
+    try fork.sealImmutableCollection(1, &.{.{ .name = "body", .total_length = 2 }});
+    const complete = fork.acquireSnapshot();
+    defer complete.release();
+    try std.testing.expectEqual(@as(u32, 1), complete.scoringDocCount());
+    try std.testing.expectEqual(@as(f32, 2), complete.textAvgDocLen("body"));
+    try std.testing.expectEqual(@as(u32, 10), facade.scoringDocCount());
+    try std.testing.expectEqual(@as(f32, 5), facade.textAvgDocLen("body"));
+    try std.testing.expect(complete.segments[0].shared == sealed.segments[0].shared);
+}
+test "external lake sealed collection statistics own names and isolate unchanged physical generations under OOM" {
+    try sealedCollectionScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sealedCollectionScenario, .{});
 }

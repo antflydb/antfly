@@ -253,6 +253,9 @@ test "external lake overlapping text generations share every physical segment on
             try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none));
             try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
             try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
+            try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{try stores.sha256DigestFromChecksum(directory_root.manifests[0].checksum)}));
+            try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
+            try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
         }
         {
             var owner: @import("lake_index_native_text_cache.zig").Cache = .{};
@@ -262,18 +265,24 @@ test "external lake overlapping text generations share every physical segment on
             defer selected.deinit();
             var complete = try owner.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
             defer complete.deinit();
+            const tokens = try local.search_analysis.default_analyzer.analyze(a, "needle");
+            defer local.search_analysis.Analyzer.freeTokens(a, tokens);
+            try std.testing.expectEqual(@as(usize, 1), tokens.len);
+            const term = tokens[0].term;
             try std.testing.expectEqual(@as(u32, 1), selected.snapshot.liveDocCount());
             try std.testing.expectEqual(@as(u32, 3), selected.snapshot.scoringDocCount());
-            try std.testing.expectEqual(@as(u32, 3), try selected.snapshot.termDocFreq(a, "body", "needle"));
+            try std.testing.expectEqual(@as(u32, 3), try selected.snapshot.termDocFreq(a, "body", term));
             try std.testing.expectEqual(complete.snapshot.textAvgDocLen("body"), selected.snapshot.textAvgDocLen("body"));
-            const stats = (try selected.snapshot.textTermStats(a, "body", "needle", 0)).?;
-            const oracle = (try complete.snapshot.textTermStats(a, "body", "needle", 1)).?;
-            try std.testing.expectEqual(oracle.score, stats.score);
-            const request: local.search_search.SearchRequest = .{ .query = .{ .term = .{ .field = "body", .term = "needle" } }, .k = 10 };
+            const request: local.search_search.SearchRequest = .{ .query = .{ .term = .{ .field = "body", .term = term } }, .k = 10 };
+            // Compare actual search scores: native lake identities use their
+            // physical-row sidecar rather than embedded document ordinals.
+            var oracle = try local.search_search.execute(a, complete.snapshot, request);
+            defer oracle.deinit();
+            try std.testing.expectEqual(@as(usize, 3), oracle.hits.len);
             var result = try local.search_search.execute(a, selected.snapshot, request);
             defer result.deinit();
             try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-            try std.testing.expectEqual(oracle.score, result.hits[0].score);
+            try std.testing.expectEqual(oracle.hits[0].score, result.hits[0].score);
             // A different file subset gets its own corpus and statistics facade.
             const other = [_][32]u8{try stores.sha256DigestFromChecksum(directory_root.manifests[2].checksum)};
             var different = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &other);

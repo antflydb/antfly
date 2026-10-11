@@ -2078,8 +2078,12 @@ restriction. Selected partitions seek their immutable digest prefixes in the
 compact route tree rather than decoding all file routes. Cache keys distinguish
 full and selected corpora and their file sets. Selected snapshots retain global
 BM25 document counts, average lengths, and term frequencies, while local ordinals
-and predicate membership cover only the selected files. Highlights reuse the
-same query selection. WAL-overlay composition keeps full admission.
+and predicate membership cover only the selected files. Sealing each publication
+creates private scoring state even when its physical file subset is unchanged;
+reader sharing cannot carry cached term frequencies across corpus generations.
+Single-segment search also uses global term frequencies for sealed collections;
+its ordinary local-reader shortcut cannot substitute subset statistics. Highlights
+reuse the same query selection. WAL-overlay composition keeps full admission.
 
 These optional root fields preserve reading of existing publications; the next
 rebuild upgrades their routing contract. Garbage collection traverses the new
@@ -2090,3 +2094,28 @@ segment admission scale with selected files. Fuzzy/pattern queries and broad
 necessary sets retain the full-inventory path. Archive-scale latency, RSS, and
 provider request-count qualification remain separate from deterministic regression
 coverage and fixture timings.
+
+
+Qualification after merging `origin/main` through `77a276cd53` (Zig 0.17.0,
+Debug):
+
+- All 332 lake integration tests pass (137 shared SQL/lake, 195 API), with no
+  allocator leaks. All 52 focused ranking tests and 30 spill tests pass; the
+  optimized-only ranking benchmark is skipped in Debug. The production CLI builds.
+- All 11 selected real Parquet/Iceberg E2Es pass in 193.72 seconds, including
+  independent Iceberg commits/schema IDs/deletes/restart, fragmented text hierarchy
+  in both formats, global scoring/filter/highlight/cursor behavior, incremental
+  generation and full/selected scoring transitions, both ordered hydration and
+  signed timestamp modes, wide typed joins, and indexed metadata predicates.
+- The final 100,003-row predicate fixture takes 121.33 seconds versus the earlier
+  419-second qualification. This measures the complete fixture and includes
+  main's changes; it is not an isolated spill benchmark or archive-scale claim.
+- The deterministic shared-run regression writes 2,163,648 bytes versus 2,421,065
+  for legacy runs. Cancellation, allocation failures, physical quota reclamation,
+  and eight-cohort descriptor admission also pass.
+- The native subset scoring oracle compares actual search scores with the full
+  corpus, including a single visible segment. Exhaustive allocation failures
+  verify owned global field names, retained older generations, private scoring
+  caches, and transitions back to the complete physical collection.
+- Formatting, Python syntax, license headers, both source-boundary audits, and
+  diff checks pass. A final fetch confirms the merged main revision is current.

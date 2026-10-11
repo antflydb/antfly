@@ -1953,7 +1953,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             pa.Table.from_pylist(
                 [
                     {
-                        "body": "needle",
+                        "body": f"needle marker{amount}",
                         "amount": amount,
                         "dense_native": "[1,0]",
                         "sparse_native": '{"1":2}',
@@ -2116,6 +2116,38 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 == {hit["_id"] for hit in results[1]["hits"]["hits"]}
                 == {hit["_id"] for hit in results[2]["hits"]["hits"]}
             )
+            # The unchanged first file stays selected while other files change
+            # global DF. A cached physical reader must get fresh scoring state.
+            selective_query = {
+                "conjuncts": [
+                    {"match": "marker1", "field": "body"},
+                    {"match": "needle", "field": "body"},
+                ]
+            }
+            selective = call(
+                "POST",
+                "/tables/incremental/query",
+                dict(text_request, full_text_search=selective_query),
+            )["hits"]["hits"]
+            oracle = call(
+                "POST",
+                "/tables/incremental/query",
+                dict(
+                    text_request,
+                    full_text_search={
+                        "disjuncts": [
+                            selective_query,
+                            {"prefix": "never_present_in_fixture", "field": "body"},
+                        ]
+                    },
+                ),
+            )["hits"]["hits"]
+            assert [h["_id"] for h in selective] == [h["_id"] for h in oracle]
+            assert len(selective) == int(1 in expected)
+            if selective:
+                assert selective[0]["_score"] == pytest.approx(
+                    oracle[0]["_score"], abs=1e-6
+                )
             ordered = call(
                 "POST",
                 "/sql",
@@ -2124,7 +2156,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 },
             )
             assert ordered["rows"] == [
-                [str(amount), "needle"] for amount in sorted(expected)
+                [str(amount), f"needle marker{amount}"] for amount in sorted(expected)
             ], ordered
             grouped = call(
                 "POST",
@@ -2238,9 +2270,13 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
         verify([3])
         put_file("part.parquet", 1)
         rebuild(4)
-        before_restart = verify([1, 3])
+        verify([1, 3])
+        # A previously cached selected first file becomes the full corpus.
+        (objects / "part2.parquet").unlink()
+        rebuild(5)
+        before_restart = verify([1])
         server.restart()
-        after_restart = verify([1, 3])
+        after_restart = verify([1])
         assert [
             [hit["_id"] for hit in result["hits"]["hits"]] for result in after_restart
         ] == [
