@@ -62,3 +62,8 @@ path = "tests/pure.rs"
 name = "sqlx"
 path = "tests/sqlx.rs"
 required-features = ["libantfly", "sqlx"]
+
+[[test]]
+name = "sql_scaling"
+path = "tests/sql_scaling.rs"
+required-features = ["libantfly", "sqlx"]

@@ -29,6 +29,7 @@ pub const Provider = struct {
     source: *serving.ServingSource,
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
+    progress: ?BuildProgress = null,
     embedding_options: ?local.inference_managed_embedder.InitOptions = null,
     context: Context,
     limits: stream_api.Limits = .{},
@@ -37,6 +38,14 @@ pub const Provider = struct {
     only_files: ?[]const bool = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
+    pub const BuildProgress = struct {
+        ptr: *anyopaque,
+        save: *const fn (*anyopaque, local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void,
+    };
+    pub fn checkpoint(self: *Provider, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        try self.context.ensureActive();
+        if (self.progress) |progress| try progress.save(progress.ptr, declaration);
+    }
     pub fn provider(self: *Provider) @import("../serverless/build/lake_rebuild.zig").RowSourceProvider {
         return .{ .ptr = self, .open_fn = open, .open_with_cancellation_fn = openCanceled };
     }

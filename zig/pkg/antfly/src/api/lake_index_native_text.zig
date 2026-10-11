@@ -300,6 +300,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.statistics_version == 1 and std.mem.eql(u8, &root.recipe, &recipe)) {
+                try validateReuse(a, store.*, root, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -311,6 +312,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.statistics_version != 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
+            try validateReuse(a, store.*, root, provider.context, cancellation);
             break root;
         } else null;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
@@ -331,6 +333,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var summaries: std.ArrayList(?statistics.Ref) = .empty;
         var input_bytes: usize = 0;
+        const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
+        @memset(file_manifests, null);
+        var global_statistics: ?statistics.Ref = if (seed) |old| old.term_statistics else null;
+        // Retain each old file contribution until its replacement is complete.
+        // A checkpoint's DF root therefore describes exactly its manifests.
+        if (seed) |old| for (old.file_groups) |group| {
+            if (plan.by_id.get(group.file.id)) |index| {
+                file_manifests[index] = try publishFileManifest(a, ca, store, group, cancellation);
+            } else {
+                global_statistics = try updateStatistics(a, store, provider, group, null, global_statistics, cancellation);
+            }
+        };
         for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
             group.* = .{ .file = file, .segments = &.{} };
             if (!changed) {
@@ -341,6 +355,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
                 try summaries.appendSlice(ca, group.summaries);
                 try segments.appendSlice(ca, group.segments);
+                file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
                 continue;
             }
             const first_segment = segments.items.len;
@@ -350,9 +365,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
-            const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
+            const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
             defer rows.deinit(a);
-            while (try rows.next(a)) |batch| {
+            while (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) |batch| {
                 for (batch.row_refs, 0..) |ref, row| {
                     try provider.context.ensureActive();
                     try cancellation.check();
@@ -377,90 +392,165 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
                     if (builder.batch().docs.len != before) {
                         if (ref != .external) return error.InvalidNativeLakeTextCorpus;
-                        try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
+                        ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
-            try ordinals.flush();
+            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
+            ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
             group.summaries = try ca.dupe(?statistics.Ref, summaries.items[first_segment..]);
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
+            file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
+            global_statistics = updateStatistics(a, store, provider, previous_groups.get(file.id), group.*, global_statistics, cancellation) catch |err| return buildFailure(err, "file_statistics", file_ordinal, segments.items.len);
+            // This non-serving checkpoint has internally consistent file/DF
+            // roots, including retained old files awaiting replacement.
+            if (provider.progress != null) {
+                var checkpoint_arena = std.heap.ArenaAllocator.init(a);
+                defer checkpoint_arena.deinit();
+                const manifests = try presentManifests(checkpoint_arena.allocator(), file_manifests);
+                const partial: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .manifests = manifests };
+                try provider.checkpoint(try publishRoot(a, checkpoint_arena.allocator(), store, want.name, partial, cancellation));
+            }
         }
-        // Global DF touches only changed file contributions. The spill manager
-        // bounds disk independently of the sort's 4 MiB resident working set.
-        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-        defer spill_manager.deinit();
-        var stats_builder = statistics.Builder.init(a, &spill_manager);
-        defer stats_builder.deinit();
-        var stats_reads: u64 = 512 * 1024 * 1024;
-        var stats_writes: u64 = 512 * 1024 * 1024;
-        const scope = store.upload_scope.?;
-        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
-        if (seed) |old| for (old.file_groups) |group| {
-            const current = plan.by_id.get(group.file.id);
-            if (current != null and !plan.changed[current.?]) continue;
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, -1);
-        };
-        for (groups, plan.changed) |group, changed| if (changed) {
-            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, 1);
-        };
-        const global_statistics = try stats_builder.finish(stats_pages.store(), if (seed) |old| old.term_statistics else null);
         var root: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
-        // Publish one immutable manifest per file. Large corpora do not put
-        // every native segment reference (twice) into the root artifact.
-        const manifests = try ca.alloc(artifacts.ChunkRef, groups.len);
-        for (groups, manifests) |group, *manifest| {
-            try cancellation.check();
-            const page = try std.json.Stringify.valueAlloc(a, group, .{});
-            defer a.free(page);
-            if (page.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-            var page_upload = store.*;
-            page_upload.allocator = ca;
-            const ref = try page_upload.putWithCancellation(page, cancellation);
-            manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-        }
-        root.manifests = manifests;
+        root.manifests = try presentManifests(ca, file_manifests);
         root.file_groups = &.{};
         root.segments = &.{};
-        try root.validate();
-        const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
-        if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-        var upload = store.*;
-        upload.allocator = ca;
-        const uploaded = try upload.putWithCancellation(bytes, cancellation);
-        const owned = try std.json.Stringify.valueAlloc(ca, Declared{ .name = want.name, .binding = binding, .artifact = .{ .name = want.name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len } }, .{});
-        try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
+        try declarations.append(out, try publishRoot(a, out, store, want.name, root, cancellation));
     }
     return declarations.toOwnedSlice(out);
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool) !void {
+// Reusing manifests must prove their retained leaves still exist. HEAD checks
+// bound memory and avoid downloading the archive; normal serving continues to
+// authenticate posting ranges. Metadata trees are read and authenticated in
+// bounded pages, including descendants not touched by incremental updates.
+fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const Validator = struct {
+        a: A,
+        store: stores.ArtifactStore,
+        context: local.serverless_query_lake_read_context.Context,
+        cancellation: Cancellation,
+        remaining_reads: u64 = tree.max_page_bytes,
+        fn check(v: *@This()) !void {
+            try v.context.ensureActive();
+            try v.cancellation.check();
+        }
+        fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
+            try v.check();
+            var metadata = try v.store.statWithCancellationUsingAllocator(v.a, ref.artifact_id, v.cancellation);
+            defer metadata.deinit(v.a);
+            if (metadata.byte_len != ref.byte_len or !std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) or !std.mem.eql(u8, metadata.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
+        }
+        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+            try v.check();
+            v.remaining_reads = tree.max_page_bytes;
+            return false;
+        }
+        pub fn visit(_: *@This(), _: tree.Ref) !void {}
+        fn pages(v: *@This(), domain: [32]u8, ref: ?tree.Ref) !void {
+            var writes: u64 = 0;
+            var pages_store: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
+            if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
+        }
+    };
+    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation };
+    try validator.pages(root.domain, root.term_statistics);
+    for (root.file_groups) |group| {
+        for (group.summaries) |summary| try validator.pages(root.domain, summary);
+        for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
+    }
+    for (root.segments) |segment| {
+        if (!root.seekable) {
+            try validator.leaf(segment);
+            continue;
+        }
+        try validator.check();
+        // loadDirectory independently bounds each decoded directory to 4 MiB.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = backend, .cache = null, .context = context, .cancellation = cancellation }, segment);
+        for ([_][]const @import("lake_index_seekable_text.zig").Piece{ directory.metadata, directory.blocks }) |pieces| {
+            var prior: ?artifacts.ChunkRef = null;
+            for (pieces) |piece| {
+                const retained = piece.retainedArtifact();
+                if (prior) |old| if (std.mem.eql(u8, old.artifact_id, retained.artifact_id)) continue;
+                try validator.leaf(retained);
+                prior = retained;
+            }
+        }
+    }
+}
+fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {
+    var refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+    for (slots) |slot| if (slot) |ref| try refs.append(a, ref);
+    return refs.toOwnedSlice(a);
+}
+fn updateStatistics(a: A, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, old: ?FileGroup, next: ?FileGroup, previous: ?statistics.Ref, cancellation: Cancellation) !?statistics.Ref {
+    var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+    defer manager.deinit();
+    var builder = statistics.Builder.init(a, &manager);
+    defer builder.deinit();
+    var reads: u64 = 512 * 1024 * 1024;
+    var writes: u64 = 512 * 1024 * 1024;
+    const scope = store.upload_scope.?;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    if (old) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, -1);
+    if (next) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, 1);
+    return builder.finish(pages.store(), previous);
+}
+fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
+    const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
+    defer a.free(bytes);
+    if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+    var upload = store.*;
+    upload.allocator = out;
+    const ref = try upload.putWithCancellation(bytes, cancellation);
+    return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+}
+fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, root: Root, cancellation: Cancellation) !Declared {
+    try root.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
+    defer a.free(bytes);
+    if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+    var upload = store.*;
+    upload.allocator = a;
+    var ref = try upload.putWithCancellation(bytes, cancellation);
+    defer ref.deinit(a);
+    const declaration: Declared = .{ .name = name, .binding = root.binding, .artifact = .{ .name = name, .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len } };
+    const encoded = try std.json.Stringify.valueAlloc(a, declaration, .{});
+    defer a.free(encoded);
+    return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
+}
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+    const encoded = mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", file_ordinal, segments.items.len);
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {
         try cancellation.check();
         if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
-        const ref = try @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation);
-        try summaries.append(out, try statistics.publishSegment(a, store, bytes, cancellation));
+        const ref = @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
+        const summary = statistics.publishSegment(a, store, bytes, cancellation) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
+        try summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 }
@@ -483,3 +573,8 @@ const StatisticsCheckpoint = struct {
         try self.cancellation.check();
     }
 };
+
+fn buildFailure(err: anyerror, stage: []const u8, file_ordinal: usize, completed_segments: usize) anyerror {
+    if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake text construction deferred stage={s} file_index={d} completed_segments={d} err={s}", .{ stage, file_ordinal, completed_segments, @errorName(err) });
+    return err;
+}

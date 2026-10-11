@@ -525,6 +525,11 @@ promise gap-free vendor CDC. Credentials remain named connections/secret referen
 
 ## Hacker News rollout and qualification
 
+The follow-up [deployment qualification plan](hackernews-deployment-qualification.md)
+sets reproducible archive benchmarks, budget reservations and release gates for
+source freshness and the public service. A single-table archive verdict does not
+establish current/history deployment readiness.
+
 The example supports independent historical/current workers and HTTP qualification
 of a two-table union or overlay, including a saved logical source. Its accepted-WAL
 suffix is a bounded publication backlog, not a rolling year-long current tier. A

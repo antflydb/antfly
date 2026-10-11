@@ -15,8 +15,9 @@
 
 //! Connection lifetimes are independent of writer ownership. A kernel lease
 //! covers a complete exported operation (including SQL's commit coordinator).
-//! Cached runtimes are immutable to other connections: after an external
-//! publication we reopen them, retaining generations borrowed by SQL streams.
+//! Compatible connections share a persistent storage owner and its caches.
+//! External publications reopen that owner; SQL streams retain their pinned
+//! generations, and sessions and cursor IDs remain connection-local.
 const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
@@ -57,7 +58,12 @@ const QueuedMutex = struct {
 
 // Connections in one process queue on a canonical file gate. The kernel
 // sidecar remains the authority between processes and with CLI/server owners.
-const PathGate = struct { path: []u8, mutex: QueuedMutex = .{}, references: usize = 1 };
+const PathGate = struct {
+    path: []u8,
+    mutex: QueuedMutex = .{},
+    references: usize = 1,
+    owners: std.ArrayList(*Owner) = .empty,
+};
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
 fn retainGate(path: []const u8) !*PathGate {
@@ -82,6 +88,8 @@ fn releaseGate(gate: *PathGate) void {
     gate.references -= 1;
     if (gate.references != 0) return;
     _ = gates.remove(gate.path);
+    std.debug.assert(gate.owners.items.len == 0);
+    gate.owners.deinit(alloc);
     alloc.free(gate.path);
     alloc.destroy(gate);
     if (gates.count() == 0) {
@@ -90,45 +98,26 @@ fn releaseGate(gate: *PathGate) void {
     }
 }
 
-pub const Connection = struct {
-    path: []u8,
+// Compatible connections borrow one persistent generation and one maintenance
+// worker. SQL sessions, cursor IDs, and child handles remain connection-local.
+const Owner = struct {
+    path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
-    gate: *PathGate = undefined,
+    gate: *PathGate,
+    connections: std.ArrayList(*Connection) = .empty,
     worker: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     maintenance_pending: bool = false,
     next_ttl_ns: i96 = 0,
     wake: std.Io.Event = .unset,
-    mutex: QueuedMutex = .{},
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
-
-    pub fn acquire(self: *Connection) !native.PathWriterLock {
-        const io = h.handleLockIo();
-        self.gate.mutex.lockUncancelable(io);
-        errdefer self.gate.mutex.unlock(io);
-        const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms;
-        var backoff: i96 = std.time.ns_per_ms;
-        while (true) {
-            const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
-                native.lockWriterPathWithIo(alloc, io, self.path)
-            else
-                native.lockReaderPathWithIo(alloc, io, self.path);
-            if (lease) |held| return held else |err| {
-                if (err != error.WouldBlock and err != error.FileBusy) return err;
-                const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
-                if (remaining <= 0) return error.FileBusy;
-                try io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
-                backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
-            }
-        }
-    }
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
-    pub fn refresh(self: *Connection) !*h.Handle {
+    pub fn refresh(self: *Owner) !*h.Handle {
         if (self.current) |current| {
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
@@ -142,17 +131,6 @@ pub const Connection = struct {
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
             try self.retired.append(alloc, previous);
-            replacement.readable_lease_hook = previous.readable_lease_hook;
-            replacement.sql_sessions = previous.sql_sessions;
-            replacement.next_sql_session_id = previous.next_sql_session_id;
-            previous.sql_sessions = .empty;
-            var sessions = replacement.sql_sessions.valueIterator();
-            while (sessions.next()) |session| session.*.handle = replacement;
-            replacement.sql_cursors = previous.sql_cursors;
-            replacement.next_sql_cursor_id = previous.next_sql_cursor_id;
-            previous.sql_cursors = .empty;
-            replacement.table_handles = previous.table_handles;
-            previous.table_handles = .empty;
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
@@ -160,19 +138,29 @@ pub const Connection = struct {
             previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
         }
         self.current = replacement;
+        for (self.connections.items) |connection| {
+            connection.current = replacement;
+            var sessions = connection.sql_sessions.valueIterator();
+            while (sessions.next()) |session| session.*.handle = replacement;
+        }
         self.collectRetired();
         return replacement;
     }
 
-    pub fn collectRetired(self: *Connection) void {
-        const current = self.current orelse return;
+    pub fn collectRetired(self: *Owner) void {
+        if (self.current == null) return;
         var i: usize = 0;
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
-            var cursors = current.sql_cursors.valueIterator();
-            const retained = while (cursors.next()) |cursor| {
-                if (cursor.*.adapter.handle == retired) break true;
-            } else false;
+            const retained = retained: {
+                for (self.connections.items) |connection| {
+                    var cursors = connection.sql_cursors.valueIterator();
+                    while (cursors.next()) |cursor| {
+                        if (cursor.*.adapter.handle == retired) break :retained true;
+                    }
+                }
+                break :retained false;
+            };
             if (retained) {
                 i += 1;
             } else {
@@ -182,7 +170,7 @@ pub const Connection = struct {
         }
     }
 
-    pub fn notifyMutation(self: *Connection) void {
+    pub fn notifyMutation(self: *Owner) void {
         if (self.worker == null) return;
         self.maintenance_pending = true;
         self.wake.set(h.handleLockIo());
@@ -194,15 +182,12 @@ pub const Connection = struct {
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
     }
 
-    fn maintenanceLoop(self: *Connection) void {
+    fn maintenanceLoop(self: *Owner) void {
         const io = h.handleLockIo();
         var next_wait_ms: i64 = 1000;
         while (!self.stopping.load(.acquire)) {
             self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
             self.wake.reset();
-            if (self.stopping.load(.acquire)) break;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
             if (self.stopping.load(.acquire)) break;
             self.gate.mutex.lockUncancelable(io);
             defer self.gate.mutex.unlock(io);
@@ -252,25 +237,175 @@ pub const Connection = struct {
         }
     }
 
-    pub fn close(self: *Connection) void {
-        self.stopping.store(true, .release);
-        self.wake.set(h.handleLockIo());
+    fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
-
-        // Registry close has already drained calls on this connection and its
-        // children enter the same parent slot. Teardown must never publish a
-        // stale generation, including when another writer currently owns it.
-        if (self.current) |current| @import("sql_cursor.zig").closeAll(current);
-        if (self.current) |current| current.sql_cursors = .empty;
         for (self.retired.items) |retired| h.closeHandle(retired);
         if (self.current) |current| {
             current.lease_snapshot = true;
             h.closeHandle(current);
         }
-        releaseGate(self.gate);
         self.retired.deinit(alloc);
-        alloc.free(self.path);
-        if (self.owned_ttl_owner_id) |owner_id| alloc.free(owner_id);
+        self.connections.deinit(alloc);
+        if (self.owned_ttl_owner_id) |id| alloc.free(id);
+        alloc.destroy(self);
+    }
+};
+
+fn compatible(a: api.LiteResolvedOpenOptions, b: api.LiteResolvedOpenOptions) bool {
+    var left = a;
+    var right = b;
+    // This controls an individual caller's admission deadline, not storage.
+    left.busy_timeout_ms = 0;
+    right.busy_timeout_ms = 0;
+    if (left.ttl_cleanup) |*ttl| {
+        const other = right.ttl_cleanup orelse return false;
+        if (!std.mem.eql(u8, ttl.owner_id, other.owner_id)) return false;
+        ttl.owner_id = "";
+        right.ttl_cleanup.?.owner_id = "";
+    }
+    return std.meta.eql(left, right);
+}
+
+pub const Connection = struct {
+    path: []const u8,
+    options: api.LiteResolvedOpenOptions,
+    gate: *PathGate,
+    owner: *Owner,
+    mutex: QueuedMutex = .{},
+    current: ?*h.Handle = null,
+    attached: bool = false,
+    sql_sessions: @FieldType(h.Handle, "sql_sessions") = .empty,
+    next_sql_session_id: u64 = 1,
+    sql_cursors: @FieldType(h.Handle, "sql_cursors") = .empty,
+    next_sql_cursor_id: u64 = 1,
+    table_handles: @FieldType(h.Handle, "table_handles") = .empty,
+    readable_lease_hook: ?h.ReadableLeaseHook = null,
+
+    pub fn acquire(self: *Connection) !native.PathWriterLock {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        errdefer self.gate.mutex.unlock(io);
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i96, self.options.busy_timeout_ms) * std.time.ns_per_ms;
+        var backoff: i96 = std.time.ns_per_ms;
+        while (true) {
+            const lease = if (h.liteOpenModeCanWrite(self.options.open_mode))
+                native.lockWriterPathWithIo(alloc, io, self.path)
+            else
+                native.lockReaderPathWithIo(alloc, io, self.path);
+            if (lease) |held| return held else |err| {
+                if (err != error.WouldBlock and err != error.FileBusy) return err;
+                const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+                if (remaining <= 0) return error.FileBusy;
+                try io.sleep(.fromNanoseconds(@min(backoff, remaining)), .awake);
+                backoff = @min(backoff * 2, 50 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    pub fn refresh(self: *Connection) !*h.Handle {
+        const root = try self.owner.refresh();
+        self.current = root;
+        self.attach(root);
+        return root;
+    }
+
+    pub fn pin(self: *Connection) !*h.Handle {
+        const root = self.owner.current orelse return error.InvalidArgument;
+        self.current = root;
+        self.attach(root);
+        return root;
+    }
+
+    fn attach(self: *Connection, root: *h.Handle) void {
+        std.debug.assert(!self.attached);
+        std.debug.assert(root.sql_sessions.count() == 0 and root.sql_cursors.count() == 0);
+        root.lite_connection_context = self;
+        root.sql_sessions = self.sql_sessions;
+        root.next_sql_session_id = self.next_sql_session_id;
+        root.sql_cursors = self.sql_cursors;
+        root.next_sql_cursor_id = self.next_sql_cursor_id;
+        root.table_handles = self.table_handles;
+        root.readable_lease_hook = self.readable_lease_hook;
+        self.sql_sessions = .empty;
+        self.sql_cursors = .empty;
+        self.table_handles = .empty;
+        self.attached = true;
+    }
+
+    pub fn detach(self: *Connection) void {
+        if (!self.attached) return;
+        const root = self.current.?;
+        self.sql_sessions = root.sql_sessions;
+        self.next_sql_session_id = root.next_sql_session_id;
+        self.sql_cursors = root.sql_cursors;
+        self.next_sql_cursor_id = root.next_sql_cursor_id;
+        self.table_handles = root.table_handles;
+        self.readable_lease_hook = root.readable_lease_hook;
+        root.sql_sessions = .empty;
+        root.sql_cursors = .empty;
+        root.table_handles = .empty;
+        root.readable_lease_hook = null;
+        root.lite_connection_context = null;
+        self.attached = false;
+    }
+
+    /// Caller holds the owner gate. Only streams borrow the live runtime
+    /// between calls. Staged writes own their metadata, and child handles
+    /// rebind and revalidate identity before using a cached table pointer.
+    pub fn ensureOtherConnectionsCanDrop(self: *Connection) !void {
+        for (self.owner.connections.items) |other| {
+            if (other == self) continue;
+            var cursors = other.sql_cursors.valueIterator();
+            while (cursors.next()) |cursor| {
+                if (cursor.*.adapter.handle == self.owner.current) return error.SqlStatementReadUnavailable;
+            }
+        }
+    }
+
+    pub fn notifyMutation(self: *Connection) void {
+        self.owner.notifyMutation();
+    }
+
+    pub fn collectRetired(self: *Connection) void {
+        self.owner.collectRetired();
+    }
+
+    pub fn close(self: *Connection) void {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        if (self.owner.current) |root| {
+            self.current = root;
+            self.attach(root);
+            @import("sql_cursor.zig").closeAll(root);
+            root.sql_cursors = .empty;
+            @import("sql_session.zig").closeAll(root);
+            root.sql_sessions = .empty;
+            for (root.table_handles.items) |id| h.closeHandleId(id);
+            root.table_handles.deinit(alloc);
+            root.table_handles = .empty;
+            self.detach();
+        }
+        const owner = self.owner;
+        for (owner.connections.items, 0..) |connection, i| {
+            if (connection == self) {
+                _ = owner.connections.swapRemove(i);
+                break;
+            }
+        }
+        const last = owner.connections.items.len == 0;
+        if (last) {
+            owner.stopping.store(true, .release);
+            owner.wake.set(io);
+            for (self.gate.owners.items, 0..) |candidate, i| {
+                if (candidate == owner) {
+                    _ = self.gate.owners.swapRemove(i);
+                    break;
+                }
+            }
+        } else owner.collectRetired();
+        self.gate.mutex.unlock(io);
+        if (last) owner.deinit();
+        releaseGate(self.gate);
         alloc.destroy(self);
     }
 };
@@ -278,63 +413,87 @@ pub const Connection = struct {
 pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool) !*h.Handle {
     if (!h.lite_backend.isAflitePath(path)) return error.InvalidArgument;
     if (create and !h.liteOpenModeCanWrite(options.open_mode)) return error.InvalidArgument;
-    const connection = try alloc.create(Connection);
-    errdefer alloc.destroy(connection);
-    connection.* = .{ .path = undefined, .options = options };
+    // Own string options before opening a generation: its lazy table opens
+    // retain these settings after the caller's options buffer disappears.
+    var resolved_options = options;
+    var ttl_owner_id: ?[]u8 = null;
     if (options.ttl_cleanup) |ttl| {
-        connection.owned_ttl_owner_id = try alloc.dupe(u8, ttl.owner_id);
-        connection.options.ttl_cleanup.?.owner_id = connection.owned_ttl_owner_id.?;
+        ttl_owner_id = try alloc.dupe(u8, ttl.owner_id);
+        resolved_options.ttl_cleanup.?.owner_id = ttl_owner_id.?;
     }
-    errdefer if (connection.owned_ttl_owner_id) |owner_id| alloc.free(owner_id);
+    defer if (ttl_owner_id) |id| alloc.free(id);
     var initial: ?*h.Handle = null;
-    errdefer if (initial) |handle| {
-        handle.lease_snapshot = true;
-        h.closeHandle(handle);
+    errdefer if (initial) |root| {
+        root.lease_snapshot = true;
+        h.closeHandle(root);
     };
     if (create) {
-        var resolved = connection.options;
+        var resolved = resolved_options;
         resolved.externally_locked = true;
         initial = try api.openLiteHandleAllocWithRuntime(alloc, path, resolved, true, h.handleLockIo(), null);
         initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
     } else {
-        // Check existence and permissions without reading a header that another
-        // writer may be publishing. Validate the format under the path lease
-        // below, or on the first call if an operation currently holds it.
         const probe = try std.Io.Dir.cwd().openFile(h.handleLockIo(), path, .{
             .mode = if (h.liteOpenModeCanWrite(options.open_mode)) .read_write else .read_only,
         });
         probe.close(h.handleLockIo());
     }
-    connection.path = try native.realPathAlloc(alloc, h.handleLockIo(), path);
-    errdefer alloc.free(connection.path);
-    connection.current = initial;
-    connection.gate = try retainGate(connection.path);
-    errdefer releaseGate(connection.gate);
-    if (!create and connection.gate.mutex.tryLock()) {
-        // Initialize eagerly when no writer is active. If initialization would
-        // contend, keep the validated connection open and defer it to a call.
-        const io = h.handleLockIo();
-        defer connection.gate.mutex.unlock(io);
-        const attempt = if (h.liteOpenModeCanWrite(options.open_mode))
-            native.lockWriterPathWithIo(alloc, io, connection.path)
-        else
-            native.lockReaderPathWithIo(alloc, io, connection.path);
-        if (attempt) |held| {
-            var lease = held;
-            defer lease.close();
-            initial = try connection.refresh();
-        } else |err| switch (err) {
-            error.WouldBlock, error.FileBusy => {},
-            else => return err,
-        }
+    const canonical = try native.realPathAlloc(alloc, h.handleLockIo(), path);
+    defer alloc.free(canonical);
+    const gate = try retainGate(canonical);
+    errdefer releaseGate(gate);
+    const io = h.handleLockIo();
+    gate.mutex.lockUncancelable(io);
+    defer gate.mutex.unlock(io);
+    const connection = try alloc.create(Connection);
+    errdefer alloc.destroy(connection);
+    const wrapper = try alloc.create(h.Handle);
+    errdefer alloc.destroy(wrapper);
+    const existing = for (gate.owners.items) |owner| {
+        if (compatible(owner.options, options)) break owner;
+    } else null;
+    const owner = existing orelse try alloc.create(Owner);
+    errdefer if (existing == null) alloc.destroy(owner);
+    if (existing == null) {
+        owner.* = .{ .path = gate.path, .gate = gate, .options = resolved_options, .current = initial, .owned_ttl_owner_id = ttl_owner_id };
     }
-    const handle = try alloc.create(h.Handle);
-    handle.* = .{ .alloc = alloc, .db = undefined, .db_live = false, .open_mode = options.open_mode, .lite_connection = connection };
-    errdefer alloc.destroy(handle);
-    if (comptime h.builtin.os.tag != .freestanding and !h.builtin.single_threaded) {
-        if (options.profile == .native and h.liteOpenModeCanWrite(options.open_mode)) {
-            connection.worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Connection.maintenanceLoop, .{connection});
+    try owner.connections.ensureUnusedCapacity(alloc, 1);
+    errdefer if (existing == null) owner.connections.deinit(alloc);
+    if (existing == null) {
+        try gate.owners.ensureUnusedCapacity(alloc, 1);
+        if (!create) {
+            const attempt = if (h.liteOpenModeCanWrite(options.open_mode))
+                native.lockWriterPathWithIo(alloc, io, gate.path)
+            else
+                native.lockReaderPathWithIo(alloc, io, gate.path);
+            if (attempt) |held| {
+                var lease = held;
+                defer lease.close();
+                _ = try owner.refresh();
+            } else |err| switch (err) {
+                error.WouldBlock, error.FileBusy => {},
+                else => return err,
+            }
         }
+        errdefer if (!create) if (owner.current) |root| {
+            root.lease_snapshot = true;
+            h.closeHandle(root);
+        };
+        if (comptime h.builtin.os.tag != .freestanding and !h.builtin.single_threaded) {
+            if (options.profile == .native and h.liteOpenModeCanWrite(options.open_mode))
+                owner.worker = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Owner.maintenanceLoop, .{owner});
+        }
+        gate.owners.appendAssumeCapacity(owner);
     }
-    return handle;
+    connection.* = .{ .path = gate.path, .gate = gate, .owner = owner, .options = owner.options, .current = owner.current };
+    connection.options.busy_timeout_ms = options.busy_timeout_ms;
+    owner.connections.appendAssumeCapacity(connection);
+    wrapper.* = .{ .alloc = alloc, .db = undefined, .db_live = false, .open_mode = options.open_mode, .lite_connection = connection };
+    if (existing != null) if (initial) |root| {
+        root.lease_snapshot = true;
+        h.closeHandle(root);
+    };
+    initial = null;
+    if (existing == null) ttl_owner_id = null;
+    return wrapper;
 }
