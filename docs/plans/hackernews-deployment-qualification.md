@@ -140,16 +140,15 @@ Separate native-client probes in the existing pod verified complete GCS uploads
 and media reads for 24 KiB, 1 MiB and 8 MiB bodies. Upload samples were 105/94/253
 ms; verified media-read samples were 62/76/223 ms. These are transfer diagnostics,
 not search benchmarks. Their traffic overlaps pod-wide construction network
-counters. Basic large-body transfers work; the exact construction timeout stage
-remains unconfirmed. Concurrent artifact collection also remained in its mark
+counters. Basic large-body transfers worked, but those probes did not exercise the
+TLS plaintext-buffer boundary subsequently identified below. Concurrent artifact collection also remained in its mark
 phase with no eligible deletions; that trace is retained without attributing the
 construction error to maintenance.
 
 Publication and checkpoint phases now have failure diagnostics, with more
 specific text stages for source rows, ordinal pages, segment encoding/packs and
 statistics. They preserve the original error and omit source text and credentials.
-This instrumentation was added after the measured binary, so a rebuilt attempt
-is needed to locate the failure. The 160 lake regressions, 22 harness tests and
+This instrumentation was added after the measured binary, and a subsequent focused production-builder attempt located the failure. The 160 lake regressions, 22 harness tests and
 a keep-alive TLS upload regression pass. Archive latency remains unqualified.
 
 ## Bounded, resumable construction
@@ -236,3 +235,33 @@ Broader graph operators, serializable read-write lake transactions and new
 catalog providers remain platform work. Semantic search and similar-discussion
 features follow a relevance evaluation; they are not prerequisites for shipping
 useful full-text HN search.
+
+
+## TLS construction timeout resolution
+
+A native production-builder diagnostic reproduced the timeout in text
+`segment_statistics`, in a GCS page PUT, after 84 artifacts (7,660,290 bytes).
+The TLS compatibility writer reset its plaintext buffer after one encryption
+pass even when framing and authentication tags left an unencrypted tail.
+The HTTP peer waited for the missing Content-Length bytes. Flush now consumes
+only encrypted bytes and continues until empty; engine timeouts are unchanged.
+An exact-capacity HTTP request reproduces the failure before this fix and passes
+afterward with TLS 1.2 and TLS 1.3 on reused connections. All seven focused HTTPS
+tests pass.
+
+The first fixed optimized GCS diagnostic reached 1,995 artifacts (139,903,056
+bytes) without an engine timeout before its local 300-second bound. Its artifacts
+were generation-deleted after the local process stopped. The source is one
+unchanged raw BigQuery file (142,577 rows, 61,797,036 bytes). The diagnostic uses
+the production publication builder with a body-only schema, testing allocator,
+local source and real GCS artifacts; it does not exercise the coordinator or
+public serving API. Filesystem publication also passed in a debug correctness
+run. These results do not qualify search or full-archive performance.
+
+The budget is now fully reserved: the previous $145 plus a $5 local GCS diagnostic
+allowance. The harness includes that allowance when admitting subsequent runs.
+Billing export usage predates the final jobs, so no reservation has been released.
+Further regional qualification requires actual-charge reconciliation or an
+explicit budget extension. Required serving-path measurements remain cold/warm,
+indexed filters, concurrency, deep cursors and restart recovery, followed by the
+complete 47,717,307-row archive.

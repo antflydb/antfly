@@ -6495,25 +6495,33 @@ test "HTTPS client uploads large immutable packs without truncation" {
         \\listener = socket.socket()
         \\listener.bind(('127.0.0.1', int(sys.argv[1])))
         \\listener.listen()
-        \\raw, _ = listener.accept()
-        \\with context.wrap_socket(raw, server_side=True) as connection:
-        \\    connection.settimeout(3)
-        \\    for _ in range(3):
-        \\        data = b''
-        \\        while b'\r\n\r\n' not in data:
-        \\            chunk = connection.recv(4096)
-        \\            if not chunk:
-        \\                raise RuntimeError('Truncated request headers')
-        \\            data += chunk
-        \\        headers, body = data.split(b'\r\n\r\n', 1)
-        \\        length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
-        \\        while len(body) < length:
-        \\            chunk = connection.recv(min(65536, length-len(body)))
-        \\            if not chunk:
-        \\                raise RuntimeError('Truncated request body')
-        \\            body += chunk
-        \\        assert body == b'*' * length
-        \\        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
+        \\versions = [ssl.TLSVersion.TLSv1_2]
+        \\if ssl.HAS_TLSv1_3:
+        \\    versions.append(ssl.TLSVersion.TLSv1_3)
+        \\with open('versions.txt', 'w') as ready:
+        \\    ready.write(str(len(versions)))
+        \\for version in versions:
+        \\    context.minimum_version = version
+        \\    context.maximum_version = version
+        \\    raw, _ = listener.accept()
+        \\    with context.wrap_socket(raw, server_side=True) as connection:
+        \\        connection.settimeout(3)
+        \\        for _ in range(4):
+        \\            data = b''
+        \\            while b'\r\n\r\n' not in data:
+        \\                chunk = connection.recv(4096)
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request headers')
+        \\                data += chunk
+        \\            headers, body = data.split(b'\r\n\r\n', 1)
+        \\            length = int(next(line.split(b':', 1)[1] for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')))
+        \\            while len(body) < length:
+        \\                chunk = connection.recv(min(65536, length-len(body)))
+        \\                if not chunk:
+        \\                    raise RuntimeError('Truncated request body')
+        \\                body += chunk
+        \\            assert body == b'*' * length
+        \\            connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok')
         \\listener.close()
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
@@ -6530,20 +6538,46 @@ test "HTTPS client uploads large immutable packs without truncation" {
     try io.sleep(Io.Duration.fromMilliseconds(1000), .awake);
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
-    var client = Client.initWithConfig(allocator, io, .{
-        .keep_alive = true,
-        .verify_ssl = false,
-        .retry_policy = .{ .max_retries = 0 },
-        .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
-    });
-    defer client.deinit();
-    for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
-        const body = try allocator.alloc(u8, size);
+    const version_bytes = try tmp.dir.readFileAlloc(io, "versions.txt", allocator, .limited(8));
+    defer allocator.free(version_bytes);
+    const version_count = try std.fmt.parseInt(usize, version_bytes, 10);
+    try std.testing.expect(version_count >= 1 and version_count <= 2);
+    for (0..version_count) |_| {
+        var client = Client.initWithConfig(allocator, io, .{
+            .keep_alive = true,
+            .verify_ssl = false,
+            .retry_policy = .{ .max_retries = 0 },
+            .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
+        });
+        defer client.deinit();
+        for ([_]usize{ 24 * 1024, 1024 * 1024, 8 * 1024 * 1024 }) |size| {
+            const body = try allocator.alloc(u8, size);
+            defer allocator.free(body);
+            @memset(body, '*');
+            var response = try client.post(url, .{ .body = body });
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expectEqualStrings("ok", response.body orelse "");
+        }
+        // Fill the TLS plaintext buffer exactly. Ciphertext framing needs extra
+        // space, so one encryption pass cannot necessarily consume all of it.
+        const capacity = @import("../tls/client_compat.zig").min_buffer_len;
+        const body = try allocator.alloc(u8, capacity);
         defer allocator.free(body);
         @memset(body, '*');
-        var response = try client.post(url, .{ .body = body });
+        var request = try Request.init(allocator, .POST, url);
+        defer request.deinit();
+        try request.setBorrowedBody(body);
+        const head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(head);
+        try request.setBorrowedBody(body[0 .. capacity - head.len]);
+        const exact_head = try serializeRequestHeadAlloc(allocator, &request);
+        defer allocator.free(exact_head);
+        try std.testing.expectEqual(capacity, exact_head.len + request.bodyLen());
+        var response = try client.executeRequest(&request, null, null, null);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 200), response.status.code);
         try std.testing.expectEqualStrings("ok", response.body orelse "");
     }
+    std.debug.print("TLS buffer boundary verified protocol_versions={d}\n", .{version_count});
 }

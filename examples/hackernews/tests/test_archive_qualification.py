@@ -124,6 +124,17 @@ class ArchiveQualificationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ledger budget differs"):
                 archive.reserve(ledger, self.config, "second")
 
+    def test_local_diagnostics_reserve_the_same_cloud_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.json"
+            archive.reserve(ledger, self.config, "first")
+            recorded = json.loads(ledger.read_text())
+            recorded["local_diagnostics"] = [{"id": "local", "reserved_usd": 100}]
+            ledger.write_text(json.dumps(recorded))
+            with self.assertRaisesRegex(ValueError, "Budget exhausted"):
+                archive.reserve(ledger, self.config, "second")
+            self.assertEqual(json.loads(ledger.read_text()), recorded)
+
     def test_reviewed_retry_extension_preserves_spend_and_failed_attempts(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "ledger.json"

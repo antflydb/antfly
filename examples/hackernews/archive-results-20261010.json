@@ -53,12 +53,13 @@
     "note": "Reservations are conservative allowances, not measured cloud billing.",
     "third_attempt_reserved_usd": 20,
     "fourth_diagnostic_reserved_usd": 20,
-    "total_reserved_usd": 145,
-    "max_planned_reserved_usd": 145,
+    "total_reserved_usd": 150,
+    "max_planned_reserved_usd": 150,
     "max_attempts": 6,
     "fifth_attempt_reserved_usd": 20,
     "sixth_diagnostic_reserved_usd": 20,
-    "run_allowances_exhausted": true
+    "run_allowances_exhausted": true,
+    "local_diagnostics_reserved_usd": 5
   },
   "rerun": {
     "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
@@ -79,9 +80,9 @@
     "derived_bytes_deleted": 144166
   },
   "next_blocker": {
-    "shape": "Identify and fix the text-construction Timeout with the new stage diagnostics, then complete search and archive qualification.",
-    "diagnosis": "Complete metadata trees survive fenced retries, but the raw-file text contribution cannot finish before the build deadline. Fresh credential admission succeeds and basic native GCS upload/read probes pass; the exact failure stage is unconfirmed.",
-    "required_work": "Reconcile actual cloud charges before additional attempts; rebuild with stage diagnostics, resolve the measured failure, then collect cold/warm/filter/concurrent/deep-cursor/restart search samples and qualify the full archive."
+    "shape": "TLS flush truncation fixed; complete public search and full-archive qualification.",
+    "diagnosis": "A focused production builder reproduced Timeout during segment_statistics GCS PUT. TLS flush discarded a plaintext tail when ciphertext framing filled its output buffer; preserving and draining that tail fixes the exact-buffer loopback regression.",
+    "required_work": "Complete serving-path cold/warm/filter/concurrent/deep-cursor/restart samples and full-archive qualification after actual-charge reconciliation permits another bounded cloud attempt."
   },
   "bounded_construction": {
     "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
@@ -285,5 +286,41 @@
     "original_source_preserved": true,
     "original_generation": "1791578150213682",
     "reader_pods_stopped": true
+  },
+  "tls_flush_fix": {
+    "shape": "Consume only encrypted plaintext and repeat flush until the buffer is empty; engine HTTP timeouts unchanged.",
+    "regression_before": "Timeout",
+    "regression_after": "Passed with TLS 1.2 and TLS 1.3, including exact plaintext-buffer capacity and reused connections.",
+    "https_tests_passed": 7,
+    "harness_tests_passed": 23,
+    "raw_file": {
+      "rows": 142577,
+      "bytes": 61797036,
+      "sha256": "e568043355dd35700f29e9a6c055f3e4dd541724e4c844db3436f409d38b5a52",
+      "cloud_source_generation": "1791578150213682"
+    },
+    "before_fix_gcs": {
+      "stage": "segment_statistics",
+      "error": "Timeout",
+      "objects": 84,
+      "bytes": 7660290,
+      "generation_conditioned_cleanup": true
+    },
+    "fixed_bounded_gcs": {
+      "status": "stopped_at_local_300_second_bound",
+      "engine_timeout_observed": false,
+      "objects": 1995,
+      "bytes": 139903056,
+      "generation_conditioned_cleanup": true
+    },
+    "scope": "Focused native aarch64-macos fast production publication builder, testing allocator, body-only schema and local unchanged raw Parquet source with real GCS artifacts. Excludes coordinator, serving API and public search measurements.",
+    "binary_sha256": "c14d975f7545683d4b23c42bab2df325ae383c342cf5f799b0b90e120348c09e",
+    "filesystem_publication": {
+      "status": "passed",
+      "elapsed_ms": 1294288,
+      "optimization": "debug",
+      "note": "Testing allocator; correctness diagnostic, not performance qualification."
+    },
+    "billing_reconciliation": "Export usage predates the final diagnostic jobs; reservations cannot yet be released."
   }
 }

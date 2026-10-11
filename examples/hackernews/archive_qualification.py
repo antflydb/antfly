@@ -158,7 +158,9 @@ def reserve(ledger_path, config, run_id, *, extend_run_limit=False):
                 "Run limit exhausted; review recorded attempts before retrying"
             )
         reserved = b["prior_work_reserved_usd"] + sum(
-            r["reserved_usd"] for r in ledger["runs"]
+            r["reserved_usd"]
+            for lane in ("runs", "local_diagnostics")
+            for r in ledger.get(lane, [])
         )
         if reserved + b["reservation_per_run_usd"] > b["ceiling_usd"]:
             raise ValueError("Budget exhausted")

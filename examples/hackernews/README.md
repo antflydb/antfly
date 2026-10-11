@@ -699,7 +699,25 @@ Native-client probes in the same pod verified full GCS uploads and media reads
 up to 8 MiB, narrowing the failure investigation. Their traffic overlaps build
 network counters and does not qualify search latency. New publication/checkpoint
 and text-stage diagnostics preserve errors without logging source text or
-credentials. Those diagnostics were not in the measured binary. A rebuilt run
-must locate and fix the timeout before search or full-archive qualification;
-reconcile actual cloud charges before further attempts. The 160 lake regressions,
+credentials. Those diagnostics were not in the measured binary. The timeout was subsequently reproduced and fixed as described below;
+reconcile actual cloud charges before further regional attempts. The 160 lake regressions,
 22 harness tests and keep-alive TLS upload regression pass.
+
+
+A focused production builder subsequently reproduced `Timeout` in
+`segment_statistics` while uploading a GCS page. The TLS writer discarded a
+plaintext tail when record framing filled the ciphertext buffer. Flush now
+consumes only encrypted bytes and repeats until empty, without increasing engine
+HTTP timeouts. An exact-buffer regression fails before the fix and passes after
+it with TLS 1.2 and TLS 1.3; all seven focused HTTPS tests pass.
+
+The fixed native optimized diagnostic reached 1,995 GCS artifacts (139,903,056
+bytes) without an engine timeout before its local 300-second bound. Those
+artifacts were generation-deleted after stopping the reader. This body-only,
+testing-allocator production-builder diagnostic uses unchanged raw Parquet and
+real GCS artifacts, but excludes the serving API and public search measurements.
+The shared ledger now reserves the complete $150 ceiling: $145 for earlier work
+and six pod attempts, plus $5 for local GCS diagnostics. Local diagnostic
+reservations count against the same harness budget. Billing exports are still
+too stale to release allowances. Full-archive and search latency remain
+unqualified.
