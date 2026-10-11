@@ -716,7 +716,6 @@ pub const Capture = struct {
     pin_checked: bool = false,
     private_claim_generation: ?integrity.Generation = null,
     private_claim_inventory_prefix: []const u8 = "",
-    private_claim_receipt_prefix: []const u8 = "",
     private_claim_context_revoked: bool = false,
     has_state: bool = false,
     enabled: bool = false,
@@ -733,24 +732,21 @@ pub const Capture = struct {
     /// Internal kernel classification, supplied only AFTER the private claim
     /// writer/GC revalidates the durable job, catalogs, fence and registration
     /// in this transaction. Not an RPC flag or a general capture bypass.
-    pub fn bindPrivateClaims(self: *Capture, generation: integrity.Generation, inventory_prefix: []const u8, receipt_prefix: []const u8) !void {
+    pub fn bindPrivateClaims(self: *Capture, generation: integrity.Generation, inventory_prefix: []const u8) !void {
         if (self.poisoned or self.staged or self.touched_primary or self.control or self.private_claim_context_revoked)
             return error.RetainedEffectsMixedControl;
-        if (std.mem.allEqual(u8, &generation, 0) or inventory_prefix.len == 0 or receipt_prefix.len == 0)
+        if (std.mem.allEqual(u8, &generation, 0) or inventory_prefix.len == 0)
             return error.InvalidPrivateIndexClaimInventory;
         if (self.private_claim_generation) |current| if (!std.mem.eql(u8, &generation, &current)) return error.RetainedEffectsMixedControl;
         self.private_claim_generation = generation;
         self.private_claim_inventory_prefix = inventory_prefix;
-        self.private_claim_receipt_prefix = receipt_prefix;
     }
 
     fn privateClaimMetadata(self: *const Capture, key: []const u8) bool {
         const generation = self.private_claim_generation orelse return false;
-        for ([_][]const u8{ self.private_claim_inventory_prefix, self.private_claim_receipt_prefix }) |prefix| {
-            if (key.len >= prefix.len + 16 and std.mem.startsWith(u8, key, prefix) and
-                std.mem.eql(u8, key[prefix.len..][0..16], &generation)) return true;
-        }
-        return false;
+        const prefix = self.private_claim_inventory_prefix;
+        return key.len >= prefix.len + 16 and std.mem.startsWith(u8, key, prefix) and
+            std.mem.eql(u8, key[prefix.len..][0..16], &generation);
     }
     pub fn deinit(self: *Capture, alloc: Allocator) void {
         var iter = self.keys.keyIterator();
@@ -760,7 +756,7 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, alloc: Allocator, txn: anytype, key: []const u8, primary: bool, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
-        // Any non-inventory/receipt mutation revokes the private context.
+        // Any non-inventory mutation revokes the private context.
         // This includes the batch's final source-clock write; no claim may
         // follow it. Ordinary integrity transactions pay no metadata lookup.
         if (self.private_claim_generation != null and !integrity.isKey(key) and !self.privateClaimMetadata(key)) {

@@ -1462,8 +1462,8 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer freeRawBuffer(claim_response.ptr, claim_response.len);
         var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexClaimCleanupMaintenanceOutcome, a, claim_response.slice(), .{});
         defer progress.deinit();
-        try std.testing.expectEqual(attempt < 2, progress.value.advanced);
-        try std.testing.expectEqual(attempt > 0, progress.value.claims_retired);
+        try std.testing.expectEqual(attempt == 0, progress.value.advanced);
+        try std.testing.expect(progress.value.claims_retired);
     }
     {
         var read = try handle.db.core.store.beginReadTxn();

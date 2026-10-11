@@ -23,7 +23,6 @@ const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 pub const prefix = jobs.key ++ ":claim-inventory:";
 pub const registration_prefix = jobs.key ++ ":claim-registration:";
-pub const receipt_prefix = jobs.key ++ ":claim-receipt:";
 const authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
 pub const max_claims = 128;
@@ -118,6 +117,7 @@ const Entry = struct {
     address: integrity.Address,
     value: []const u8,
     expected: ?[]const u8,
+    sequence: u64 = 0,
 };
 
 fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
@@ -126,20 +126,11 @@ fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
     return hash(&try normalized.encode());
 }
 
-const receipt_key_len = receipt_prefix.len + 16 + 32;
-const receipt_value_len = 108;
+pub const inventory_value_len = 108;
 
-pub fn receiptKey(generation: integrity.Generation, digest: integrity.Digest) [receipt_key_len]u8 {
-    var result: [receipt_key_len]u8 = undefined;
-    @memcpy(result[0..receipt_prefix.len], receipt_prefix);
-    @memcpy(result[receipt_prefix.len..][0..16], &generation);
-    @memcpy(result[receipt_prefix.len + 16 ..], &digest);
-    return result;
-}
-
-fn receiptChecksum(key: []const u8, body: []const u8) integrity.Digest {
+fn inventoryChecksum(key: []const u8, body: []const u8) integrity.Digest {
     var state = std.crypto.hash.Blake3.init(.{});
-    state.update("antfly private claim receipt v1");
+    state.update("antfly private claim provenance v1");
     state.update(key);
     state.update(body);
     var result: integrity.Digest = undefined;
@@ -147,29 +138,52 @@ fn receiptChecksum(key: []const u8, body: []const u8) integrity.Digest {
     return result;
 }
 
-fn encodeReceipt(key: []const u8, binding: jobs.Binding, digest: integrity.Digest, sequence: u64) ![receipt_value_len]u8 {
-    var result: [receipt_value_len]u8 = undefined;
-    @memcpy(result[0..4], "AICR");
+fn encodeInventory(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, sequence: u64) [inventory_value_len]u8 {
+    var result: [inventory_value_len]u8 = undefined;
+    @memcpy(result[0..4], "AICP");
     std.mem.writeInt(u64, result[4..12], sequence, .little);
-    @memcpy(result[12..44], &try bindingDigest(binding));
-    @memcpy(result[44..76], &digest);
-    @memcpy(result[76..], &receiptChecksum(key, result[0..76]));
+    @memcpy(result[12..44], &binding_digest);
+    @memcpy(result[44..76], &value_digest);
+    @memcpy(result[76..], &inventoryChecksum(key, result[0..76]));
     return result;
 }
 
-fn decodeReceipt(key: []const u8, value: []const u8, binding_digest: integrity.Digest, reserved: u64, maximum: u64) !u64 {
-    if (key.len != receipt_key_len or !std.mem.startsWith(u8, key, receipt_prefix) or
-        value.len != receipt_value_len or !std.mem.eql(u8, value[0..4], "AICR") or
-        !std.mem.eql(u8, value[12..44], &binding_digest) or
-        !std.mem.eql(u8, value[44..76], key[receipt_prefix.len + 16 ..]) or
-        !std.mem.eql(u8, value[76..], &receiptChecksum(key, value[0..76]))) return error.InvalidPrivateIndexClaimReceipt;
+fn decodeInventory(key: []const u8, value: []const u8, provenance: Provenance, value_digest: integrity.Digest) !u64 {
+    _ = try addressFromInventory(key);
+    if (value.len != inventory_value_len or !std.mem.eql(u8, value[0..4], "AICP") or
+        !std.mem.eql(u8, value[12..44], &provenance.binding_digest) or
+        !std.mem.eql(u8, value[44..76], &value_digest) or
+        !std.mem.eql(u8, value[76..], &inventoryChecksum(key, value[0..76]))) return error.InvalidPrivateIndexClaimInventory;
     const sequence = std.mem.readInt(u64, value[4..12], .little);
-    if (sequence <= reserved or sequence > maximum) return error.InvalidPrivateIndexClaimReceipt;
+    if (sequence <= provenance.reserved or sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
     return sequence;
 }
 
+const Provenance = struct {
+    binding_digest: integrity.Digest,
+    reserved: u64,
+    maximum: u64,
+
+    fn init(txn: anytype, binding: jobs.Binding) !Provenance {
+        const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
+        const current = try authority.require(txn, .native, namespace);
+        const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        var maximum = current.sequence;
+        const cancellation = @import("relational_index_cancellation_intent.zig");
+        if (try cancellation.load(txn)) |canceled| {
+            if (canceled.intent.fence.admission_epoch < binding.fence.admission_epoch) {
+                try cancellation.requireOpen(txn, binding);
+            } else {
+                try cancellation.requireCanceled(txn, binding);
+                maximum = @min(maximum, canceled.position.sequence -| 1);
+            }
+        }
+        if (maximum < reserved.sequence) return error.InvalidPrivateIndexClaimInventory;
+        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum };
+    }
+};
+
 pub const OrderedOutcome = struct { position: Native, duplicate: bool, claims_added: usize };
-const ReceiptEntry = struct { key: []const u8, value: []const u8 };
 
 /// Own all tuple/claim bytes before serialized apply. A prepared batch does not
 /// retain a store snapshot or borrow request memory. Cancellation is checked
@@ -178,7 +192,6 @@ pub const Prepared = struct {
     arena: std.heap.ArenaAllocator,
     binding: jobs.Binding,
     entries: []const Entry,
-    digest: integrity.Digest,
 
     pub fn deinit(self: *Prepared) void {
         self.arena.deinit();
@@ -196,6 +209,7 @@ pub const Prepared = struct {
         if (bytes > max_bytes) return error.TransactionTooLarge;
         try jobs.requireReserved(txn, binding);
         const allocation = try requireRegistered(txn, binding);
+        const provenance = try Provenance.init(txn, binding);
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -219,83 +233,63 @@ pub const Prepared = struct {
                 if (!std.mem.eql(u8, raw, value)) return error.UniqueConstraintViolation;
                 break :blk value;
             } else null;
-            try checkInventory(txn, address, expected);
-            try entries.append(owned, .{ .address = address, .value = value, .expected = expected });
+            const sequence = try checkInventory(txn, address, expected, provenance);
+            try entries.append(owned, .{ .address = address, .value = value, .expected = expected, .sequence = sequence });
         }
-        // Canonical set identity makes reordered/coalesced retries recover the
-        // same cut. No request-owned byte or incidental physical encoding is
-        // included in the batch receipt identity.
+        // Stable transport order, independent of request order/coalescing.
         std.mem.sort(Entry, entries.items, {}, struct {
             fn less(_: void, left: Entry, right: Entry) bool {
                 return std.mem.order(u8, &left.address.claimKey(), &right.address.claimKey()) == .lt;
             }
         }.less);
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly private claim batch v1");
-        state.update(&try bindingDigest(binding));
-        for (entries.items) |entry| {
-            state.update(&entry.address.claimKey());
-            const claim = try integrity.Claim.decode(&entry.address.claimKey(), entry.value);
-            var version: [4]u8 = undefined;
-            std.mem.writeInt(u32, &version, claim.schema_version, .little);
-            state.update(&version);
-            for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| {
-                var length: [8]u8 = undefined;
-                std.mem.writeInt(u64, &length, field.len, .little);
-                state.update(&length);
-                state.update(field);
-            }
-        }
-        var digest: integrity.Digest = undefined;
-        state.final(&digest);
-        return .{ .arena = arena, .binding = binding, .entries = entries.items, .digest = digest };
+        return .{ .arena = arena, .binding = binding, .entries = entries.items };
     }
 
-    pub fn stage(self: *const Prepared, txn: anytype) !usize {
-        try jobs.requireReserved(txn, self.binding);
-        const allocation = try requireRegistered(txn, self.binding);
-        try txn.retained.bindPrivateClaims(allocation.generation, prefix, receipt_prefix);
-        for (self.entries) |entry| {
-            const actual = try optional(txn, &entry.address.claimKey());
-            if (!optionalEqual(actual, entry.expected)) return error.VersionConflict;
-            try checkInventory(txn, entry.address, entry.expected);
-        }
-        var changed: usize = 0;
-        for (self.entries) |entry| {
-            if (entry.expected != null) continue;
-            try txn.put(&entry.address.claimKey(), entry.value);
-            try txn.put(&inventoryKey(entry.address), &hash(entry.value));
-            changed += 1;
-        }
-        return changed;
-    }
-
-    /// Caller commits the claim pairs, this exact-cut receipt, transport marker
-    /// and outbox together. A duplicate is proved by both receipt and retained
-    /// claim postimages, never inferred from a newer global source clock.
+    /// Caller commits claim pairs, immutable creation cuts, transport marker
+    /// and outbox together. The batch cut is the maximum creation cut of its
+    /// members: new members receive this effect's cut, existing members never
+    /// change. Retries and regrouping therefore add no metadata and recover an
+    /// exact cut without a per-batch ledger or a global-clock approximation.
     pub fn stageOrdered(self: *const Prepared, txn: anytype, replay: ?Native) !OrderedOutcome {
         try jobs.requireReserved(txn, self.binding);
         const allocation = try requireRegistered(txn, self.binding);
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.binding.fence.namespace);
         const current = try authority.require(txn, .native, namespace);
-        const reserved = (try jobs.nativeEffectPosition(txn, self.binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        const provenance = try Provenance.init(txn, self.binding);
         if (replay) |position| {
             try position.validate();
             if (!position.namespace.eql(self.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
         }
-        const key = receiptKey(allocation.generation, self.digest);
-        if (try optional(txn, &key)) |raw| {
-            const sequence = try decodeReceipt(&key, raw, try bindingDigest(self.binding), reserved.sequence, current.sequence);
-            if (replay) |position| if (position.sequence != sequence) return error.InvalidPrivateIndexClaimReceipt;
-            for (self.entries) |entry| {
-                if (!optionalEqual(try optional(txn, &entry.address.claimKey()), entry.value)) return error.InvalidPrivateIndexClaimReceipt;
-                try checkInventory(txn, entry.address, entry.value);
+        var changed: usize = 0;
+        var maximum: u64 = 0;
+        for (self.entries) |entry| {
+            if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
+            const actual = try optional(txn, &entry.address.claimKey());
+            if (actual) |value| {
+                if (!std.mem.eql(u8, value, entry.value)) return error.UniqueConstraintViolation;
+                const sequence = try checkInventory(txn, entry.address, entry.value, provenance);
+                if (entry.expected != null and sequence != entry.sequence) return error.VersionConflict;
+                maximum = @max(maximum, sequence);
+            } else {
+                if (entry.expected != null) return error.VersionConflict;
+                _ = try checkInventory(txn, entry.address, null, provenance);
+                changed += 1;
             }
-            return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = sequence }, .duplicate = true, .claims_added = 0 };
         }
-        const changed = try self.stage(txn);
-        const sequence = try authority.advance(txn, namespace, if (replay) |position| position.sequence else null);
-        try txn.put(&key, &try encodeReceipt(&key, self.binding, self.digest, sequence));
+        if (changed == 0) {
+            if (replay) |position| if (position.sequence != maximum) return error.InvalidPrivateIndexClaimReceipt;
+            return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = maximum }, .duplicate = true, .claims_added = 0 };
+        }
+        const sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt;
+        if (replay) |position| if (position.sequence != sequence) return error.OnlineSourceScopeChanged;
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix);
+        for (self.entries) |entry| {
+            if (try optional(txn, &entry.address.claimKey()) != null) continue;
+            const key = inventoryKey(entry.address);
+            try txn.put(&entry.address.claimKey(), entry.value);
+            try txn.put(&key, &encodeInventory(&key, provenance.binding_digest, hash(entry.value), sequence));
+        }
+        _ = try authority.advance(txn, namespace, sequence);
         return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = sequence }, .duplicate = false, .claims_added = changed };
     }
 };
@@ -304,11 +298,12 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return if (a) |left| if (b) |right| std.mem.eql(u8, left, right) else false else b == null;
 }
 
-fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u8) !void {
+fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u8, provenance: Provenance) !u64 {
     const actual = try optional(txn, &inventoryKey(address));
     if (expected) |value| {
-        if (actual == null or !std.mem.eql(u8, actual.?, &hash(value))) return error.InvalidPrivateIndexClaimInventory;
+        return decodeInventory(&inventoryKey(address), actual orelse return error.InvalidPrivateIndexClaimInventory, provenance, hash(value));
     } else if (actual != null) return error.InvalidPrivateIndexClaimInventory;
+    return 0;
 }
 
 /// Pin once in the same source/staging transaction as a transfer page. This
@@ -316,11 +311,12 @@ fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u
 /// information for physical validation, never execution/publication authority.
 pub const TransferView = struct {
     generation: ?integrity.Generation = null,
+    provenance: ?Provenance = null,
 
     pub fn init(txn: anytype) !TransferView {
         const binding = (try jobs.load(txn)) orelse return .{};
         if (binding.phase != .reserved) return .{};
-        return .{ .generation = (try requireRegistered(txn, binding)).generation };
+        return .{ .generation = (try requireRegistered(txn, binding)).generation, .provenance = if (binding.authority == .native) try Provenance.init(txn, binding) else null };
     }
 
     pub fn isPrivate(self: TransferView, generation: integrity.Generation) bool {
@@ -333,7 +329,7 @@ pub const TransferView = struct {
         // jobs. Those records must not acquire legitimacy through restoration.
         if (parsed.kind != .claim) return error.InvalidPrivateIndexClaimInventory;
         const actual = (try optional(txn, &inventoryKey(parsed.address))) orelse return error.InvalidPrivateIndexClaimInventory;
-        if (!std.mem.eql(u8, actual, &value_digest)) return error.InvalidPrivateIndexClaimInventory;
+        _ = try decodeInventory(&inventoryKey(parsed.address), actual, self.provenance orelse return error.InvalidPrivateIndexClaimInventory, value_digest);
     }
 };
 
@@ -346,9 +342,6 @@ pub fn requireRetired(txn: anytype, binding: jobs.Binding) !void {
     defer cursor.close();
     const start = generationPrefix(allocation.generation);
     if (try cursor.seekAtOrAfter(&start)) |entry| if (std.mem.startsWith(u8, entry.key, &start)) return error.PrivateIndexCancellationPending;
-    const receipt_start = receiptKey(allocation.generation, @splat(0));
-    const selected = receipt_start[0 .. receipt_prefix.len + 16];
-    if (try cursor.seekAtOrAfter(selected)) |entry| if (std.mem.startsWith(u8, entry.key, selected)) return error.PrivateIndexCancellationPending;
 }
 
 /// Deleting the first bounded inventory page is itself the durable continuation:
@@ -358,7 +351,6 @@ pub const GcPage = struct {
     arena: std.heap.ArenaAllocator,
     binding: jobs.Binding,
     entries: []const Entry,
-    receipts: []const ReceiptEntry = &.{},
 
     pub fn deinit(self: *GcPage) void {
         self.arena.deinit();
@@ -368,6 +360,7 @@ pub const GcPage = struct {
     pub fn prepare(alloc: Allocator, io: ?std.Io, txn: anytype, binding: jobs.Binding) !?GcPage {
         _ = try jobs.requireCancellationCleanup(txn, binding);
         const allocation = try requireRegistered(txn, binding);
+        const provenance = try Provenance.init(txn, binding);
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -383,43 +376,22 @@ pub const GcPage = struct {
             if (!std.mem.startsWith(u8, entry.key, &start)) break;
             if (io) |runtime| try runtime.checkCancel();
             const address = try addressFromInventory(entry.key);
-            if (entry.value.len != 32) return error.InvalidPrivateIndexClaimInventory;
-            const expected_hash = entry.value[0..32].*;
+            if (entry.value.len != inventory_value_len) return error.InvalidPrivateIndexClaimInventory;
+            // Copy before the claim read can invalidate borrowed cursor bytes.
+            const inventory = entry.value[0..inventory_value_len].*;
             const raw = (try optional(txn, &address.claimKey())) orelse return error.InvalidPrivateIndexClaimInventory;
-            if (raw.len > integrity.max_record_bytes or !std.mem.eql(u8, &expected_hash, &hash(raw))) return error.InvalidPrivateIndexClaimInventory;
+            if (raw.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
+            const sequence = try decodeInventory(&inventoryKey(address), &inventory, provenance, hash(raw));
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
-            try entries.append(owned, .{ .address = address, .value = value, .expected = value });
-            bytes +|= value.len + key_len;
+            try entries.append(owned, .{ .address = address, .value = value, .expected = value, .sequence = sequence });
+            bytes +|= value.len + key_len + inventory_value_len;
             if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
         }
         if (entries.items.len == 0) {
-            // Receipts remain until all claims are gone. Their identity and
-            // source cuts are self-contained, so this phase never scans rows
-            // or attempts to decode claims that earlier pages retired.
-            const digest = try bindingDigest(binding);
-            const canceled = (try @import("relational_index_cancellation_intent.zig").load(txn)) orelse return error.PrivateIndexCancellationRequired;
-            const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
-            var receipts: std.ArrayList(ReceiptEntry) = .empty;
-            const receipt_start = receiptKey(allocation.generation, @splat(0));
-            const selected = receipt_start[0 .. receipt_prefix.len + 16];
-            next = try cursor.seekAtOrAfter(selected);
-            while (next) |entry| : (next = try cursor.next()) {
-                if (!std.mem.startsWith(u8, entry.key, selected)) break;
-                if (io) |runtime| try runtime.checkCancel();
-                // Every claim cut precedes cancellation, not merely today's
-                // potentially newer source clock. A checksummed post-intent
-                // receipt cannot acquire legitimacy during restoration/GC.
-                _ = try decodeReceipt(entry.key, entry.value, digest, reserved.sequence, canceled.position.sequence -| 1);
-                try receipts.append(owned, .{ .key = try owned.dupe(u8, entry.key), .value = try owned.dupe(u8, entry.value) });
-                if (receipts.items.len >= 256 or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
-            }
-            if (receipts.items.len == 0) {
-                arena.deinit();
-                return null;
-            }
-            return .{ .arena = arena, .binding = binding, .entries = &.{}, .receipts = receipts.items };
+            arena.deinit();
+            return null;
         }
         return .{ .arena = arena, .binding = binding, .entries = entries.items };
     }
@@ -427,29 +399,12 @@ pub const GcPage = struct {
     pub fn stage(self: *const GcPage, txn: anytype) !void {
         _ = try jobs.requireCancellationCleanup(txn, self.binding);
         const allocation = try requireRegistered(txn, self.binding);
-        try txn.retained.bindPrivateClaims(allocation.generation, prefix, receipt_prefix);
-        if (self.receipts.len != 0) {
-            var cursor = try txn.openCursor();
-            defer cursor.close();
-            const start = generationPrefix(allocation.generation);
-            if (try cursor.seekAtOrAfter(&start)) |entry| if (std.mem.startsWith(u8, entry.key, &start)) return error.VersionConflict;
-        }
-        if (self.receipts.len != 0) {
-            const canceled = (try @import("relational_index_cancellation_intent.zig").load(txn)) orelse return error.PrivateIndexCancellationRequired;
-            const reserved = (try jobs.nativeEffectPosition(txn, self.binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
-            const digest = try bindingDigest(self.binding);
-            const receipt_start = receiptKey(allocation.generation, @splat(0));
-            const selected = receipt_start[0 .. receipt_prefix.len + 16];
-            for (self.receipts) |receipt| {
-                if (!std.mem.startsWith(u8, receipt.key, selected)) return error.InvalidPrivateIndexClaimReceipt;
-                if (!optionalEqual(try optional(txn, receipt.key), receipt.value)) return error.VersionConflict;
-                _ = try decodeReceipt(receipt.key, receipt.value, digest, reserved.sequence, canceled.position.sequence -| 1);
-            }
-        }
+        const provenance = try Provenance.init(txn, self.binding);
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix);
         for (self.entries) |entry| {
             if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
             if (!optionalEqual(try optional(txn, &entry.address.claimKey()), entry.expected)) return error.VersionConflict;
-            try checkInventory(txn, entry.address, entry.expected);
+            if (try checkInventory(txn, entry.address, entry.expected, provenance) != entry.sequence) return error.VersionConflict;
             if (try optional(txn, &entry.address.jobKey()) != null) return error.InvalidPrivateIndexClaimInventory;
             var cursor = try txn.openCursor();
             defer cursor.close();
@@ -460,6 +415,5 @@ pub const GcPage = struct {
             try txn.delete(&entry.address.claimKey());
             try txn.delete(&inventoryKey(entry.address));
         }
-        for (self.receipts) |receipt| try txn.delete(receipt.key);
     }
 };

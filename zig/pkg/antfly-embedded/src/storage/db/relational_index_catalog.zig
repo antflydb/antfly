@@ -657,7 +657,6 @@ pub const Controller = struct {
             std.mem.eql(u8, key, @import("relational_index_owner_job.zig").cancellation_cleanup_key) or
             std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").registration_prefix) or
-            std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").receipt_prefix) or
             std.mem.eql(u8, key, @import("relational_index_cancellation_intent.zig").key) or
             std.mem.eql(u8, key, @import("relational_index_inputs.zig").key) or
             std.mem.startsWith(u8, key, @import("relational_index_owner_job.zig").native_effect_prefix) or
