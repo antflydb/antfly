@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Dense activation operations. FP32 activations; packed FP16 weights are handled
+// by matmul_transb_f16. No optional shader-f16 device feature is required.
+
 struct Params { len: u32, mode: u32, dim: u32, stride: u32, offset: u32, seq: u32, theta: f32, pad: u32 };
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> indices: array<u32>;
