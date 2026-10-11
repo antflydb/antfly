@@ -200,6 +200,32 @@ fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u
     } else if (actual != null) return error.InvalidPrivateIndexClaimInventory;
 }
 
+/// Pin once in the same source/staging transaction as a transfer page. This
+/// avoids decoding the job or hashing its catalog once per claim. The view is
+/// information for physical validation, never execution/publication authority.
+pub const TransferView = struct {
+    generation: ?integrity.Generation = null,
+
+    pub fn init(txn: anytype) !TransferView {
+        const binding = (try jobs.load(txn)) orelse return .{};
+        if (binding.phase != .reserved) return .{};
+        return .{ .generation = (try requireRegistered(txn, binding)).generation };
+    }
+
+    pub fn isPrivate(self: TransferView, generation: integrity.Generation) bool {
+        return if (self.generation) |current| std.mem.eql(u8, &current, &generation) else false;
+    }
+
+    pub fn validateCompanion(self: TransferView, txn: anytype, parsed: integrity.ParsedKey, value_digest: integrity.Digest) !void {
+        if (!self.isPrivate(parsed.address.generation)) return;
+        // An unpublished UNIQUE generation cannot have FK references/action
+        // jobs. Those records must not acquire legitimacy through restoration.
+        if (parsed.kind != .claim) return error.InvalidPrivateIndexClaimInventory;
+        const actual = (try optional(txn, &inventoryKey(parsed.address))) orelse return error.InvalidPrivateIndexClaimInventory;
+        if (!std.mem.eql(u8, actual, &value_digest)) return error.InvalidPrivateIndexClaimInventory;
+    }
+};
+
 /// Deleting the first bounded inventory page is itself the durable continuation:
 /// abort leaves every pair present, commit advances both keys atomically. No
 /// whole-claim scan, RAM cursor or generation-global rewrite is required.

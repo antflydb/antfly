@@ -647,11 +647,16 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         var duplicate = try claims.Prepared.init(a, &txn, binding, &.{first});
         defer duplicate.deinit();
         try std.testing.expectEqual(@as(usize, 0), try duplicate.stage(&txn));
+        const transfer = @import("relational_integrity.zig");
+        const transfer_view = try transfer.TransferView.init(&txn);
+        try transfer.validateTransferredCompanionsWithView(&txn, &address.claimKey(), try txn.get(&address.claimKey()), transfer_view);
+        try transfer.validateTransferredCompanions(&txn, &address.claimKey(), try txn.get(&address.claimKey()));
         var conflicting = first;
         conflicting.parent_key = "different-owner";
         try std.testing.expectError(error.UniqueConstraintViolation, claims.Prepared.init(a, &txn, binding, &.{conflicting}));
         try txn.delete(&inventory_key);
         try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.Prepared.init(a, &txn, binding, &.{first}));
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, transfer.validateTransferredCompanionsWithView(&txn, &address.claimKey(), try txn.get(&address.claimKey()), transfer_view));
         try txn.put(&inventory_key, &@as([32]u8, @splat(0)));
         try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.Prepared.init(a, &txn, binding, &.{first}));
     }

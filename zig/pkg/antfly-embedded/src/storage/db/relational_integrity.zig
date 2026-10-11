@@ -124,16 +124,37 @@ pub const parseKey = @import("relational_integrity_contract.zig").parseKey;
 
 pub const routingKey = @import("relational_integrity_contract.zig").routingKey;
 pub const validateTransferRecord = @import("relational_integrity_contract.zig").validateTransferRecord;
+pub const TransferView = @import("relational_index_private_claims.zig").TransferView;
+
 pub fn validateTransferredCompanions(txn: anytype, key: []const u8, value: []const u8) !void {
-    const address = try validateTransferRecord(key, value);
+    // Capture before metadata/companion reads invalidate borrowed store bytes.
+    _ = try validateTransferRecord(key, value);
     const parsed = try parseKey(key);
+    const value_digest = hash(value);
+    try validateOrdinaryTransferredCompanions(txn, key, value, parsed);
+    const view = try TransferView.init(txn);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+pub fn validateTransferredCompanionsWithView(txn: anytype, key: []const u8, value: []const u8, view: TransferView) !void {
+    _ = try validateTransferRecord(key, value);
+    const parsed = try parseKey(key);
+    const value_digest = if (view.isPrivate(parsed.address.generation)) hash(value) else @as(Digest, @splat(0));
+    try validateOrdinaryTransferredCompanions(txn, key, value, parsed);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+fn validateOrdinaryTransferredCompanions(txn: anytype, key: []const u8, value: []const u8, parsed: ParsedKey) !void {
+    const address = parsed.address;
+    // A point read for the claim may reuse the buffer containing a job passed
+    // by the caller. Copy its fixed identity before that read.
+    const transferred_job = if (parsed.kind == .job) (try Job.decode(key, value)).action_id else null;
     const claim_key = address.claimKey();
     const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse return error.IntegrityMissingCompanion;
     const claim = try Claim.decode(&claim_key, claim_raw);
     if (claim.state == .draining) {
-        const job_raw = if (parsed.kind == .job) value else try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion;
-        const job = try Job.decode(&address.jobKey(), job_raw);
-        if (!std.mem.eql(u8, &job.action_id, &claim.action_id)) return error.ForeignKeyActionMismatch;
+        const job_action = transferred_job orelse (try Job.decode(&address.jobKey(), try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion)).action_id;
+        if (!std.mem.eql(u8, &job_action, &claim.action_id)) return error.ForeignKeyActionMismatch;
     } else if (parsed.kind == .job) return error.InvalidIntegrityRecord;
 }
 
