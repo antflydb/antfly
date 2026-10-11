@@ -975,14 +975,18 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const future = try a.dupe(u8, try txn.get(&selected_key));
             defer a.free(future);
             const canceled = (try @import("relational_index_cancellation_intent.zig").load(&txn)).?;
-            std.mem.writeInt(u64, future[4..12], canceled.position.sequence, .little);
+            std.mem.writeInt(u64, future[0..8], canceled.position.sequence, .little);
             // Re-sign the physical checksum to isolate cut-order validation
             // from the preceding ordinary checksum-corruption regression.
             var checksum = std.crypto.hash.Blake3.init(.{});
             checksum.update("antfly private claim provenance v1");
             checksum.update(&selected_key);
-            checksum.update(future[0..76]);
-            checksum.final(future[76..108]);
+            var normalized = binding;
+            normalized.phase = .reserved;
+            checksum.update(&integrity.hash(&try normalized.encode()));
+            checksum.update(&integrity.hash(page.entries[0].value));
+            checksum.update(future[0..8]);
+            checksum.final(future[8..40]);
             try txn.put(&selected_key, future);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.GcPage.prepare(a, std.testing.io, &txn, binding));
             const view = try claims.TransferView.init(&txn);
@@ -996,12 +1000,16 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const selected_key = claims.inventoryKey(page.entries[0].address);
             const drift = try a.dupe(u8, try txn.get(&selected_key));
             defer a.free(drift);
-            std.mem.writeInt(u64, drift[4..12], if (page.entries[0].sequence == original_cut) cleanup_clock - 2 else original_cut, .little);
+            std.mem.writeInt(u64, drift[0..8], if (page.entries[0].sequence == original_cut) cleanup_clock - 2 else original_cut, .little);
             var checksum = std.crypto.hash.Blake3.init(.{});
             checksum.update("antfly private claim provenance v1");
             checksum.update(&selected_key);
-            checksum.update(drift[0..76]);
-            checksum.final(drift[76..108]);
+            var normalized = binding;
+            normalized.phase = .reserved;
+            checksum.update(&integrity.hash(&try normalized.encode()));
+            checksum.update(&integrity.hash(page.entries[0].value));
+            checksum.update(drift[0..8]);
+            checksum.final(drift[8..40]);
             try txn.write.?.put(&selected_key, drift);
             try std.testing.expectError(error.VersionConflict, page.stage(&txn));
         }

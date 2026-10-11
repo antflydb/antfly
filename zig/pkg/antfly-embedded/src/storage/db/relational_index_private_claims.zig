@@ -126,13 +126,18 @@ fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
     return hash(&try normalized.encode());
 }
 
-pub const inventory_value_len = 108;
+// One immutable cut plus a binding/claim/key/cut digest. The shared generation
+// registration already owns binding identity; duplicating that identity and a
+// claim hash as plaintext in every row adds bytes without additional integrity.
+pub const inventory_value_len = 40;
 
-fn inventoryChecksum(key: []const u8, body: []const u8) integrity.Digest {
+fn inventoryChecksum(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, cut: []const u8) integrity.Digest {
     var state = std.crypto.hash.Blake3.init(.{});
     state.update("antfly private claim provenance v1");
     state.update(key);
-    state.update(body);
+    state.update(&binding_digest);
+    state.update(&value_digest);
+    state.update(cut);
     var result: integrity.Digest = undefined;
     state.final(&result);
     return result;
@@ -140,21 +145,16 @@ fn inventoryChecksum(key: []const u8, body: []const u8) integrity.Digest {
 
 fn encodeInventory(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, sequence: u64) [inventory_value_len]u8 {
     var result: [inventory_value_len]u8 = undefined;
-    @memcpy(result[0..4], "AICP");
-    std.mem.writeInt(u64, result[4..12], sequence, .little);
-    @memcpy(result[12..44], &binding_digest);
-    @memcpy(result[44..76], &value_digest);
-    @memcpy(result[76..], &inventoryChecksum(key, result[0..76]));
+    std.mem.writeInt(u64, result[0..8], sequence, .little);
+    @memcpy(result[8..], &inventoryChecksum(key, binding_digest, value_digest, result[0..8]));
     return result;
 }
 
 fn decodeInventory(key: []const u8, value: []const u8, provenance: Provenance, value_digest: integrity.Digest) !u64 {
     _ = try addressFromInventory(key);
-    if (value.len != inventory_value_len or !std.mem.eql(u8, value[0..4], "AICP") or
-        !std.mem.eql(u8, value[12..44], &provenance.binding_digest) or
-        !std.mem.eql(u8, value[44..76], &value_digest) or
-        !std.mem.eql(u8, value[76..], &inventoryChecksum(key, value[0..76]))) return error.InvalidPrivateIndexClaimInventory;
-    const sequence = std.mem.readInt(u64, value[4..12], .little);
+    if (value.len != inventory_value_len or
+        !std.mem.eql(u8, value[8..], &inventoryChecksum(key, provenance.binding_digest, value_digest, value[0..8]))) return error.InvalidPrivateIndexClaimInventory;
+    const sequence = std.mem.readInt(u64, value[0..8], .little);
     if (sequence <= provenance.reserved or sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
     return sequence;
 }
