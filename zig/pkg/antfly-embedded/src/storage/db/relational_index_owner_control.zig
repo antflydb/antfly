@@ -31,15 +31,7 @@ pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_b
 pub const max_wire_bytes = max_encoded_inputs + 32 * 1024;
 pub const Manifest = inputs.Prepared;
 
-pub const Admission = struct {
-    id: [16]u8,
-    plan_digest: [32]u8,
-    owner_digest: [32]u8,
-    ordinal: u16,
-    fence: @import("relational_integrity_topology.zig").Fence,
-    candidate_digest: [32]u8,
-    reservation_digest: [32]u8,
-};
+pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 
 /// Metadata's immutable owner identity, without physical allocation choices or
 /// schema-sized inputs. Status is information, never publication permission.

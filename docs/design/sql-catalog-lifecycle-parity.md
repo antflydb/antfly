@@ -2409,3 +2409,47 @@ its durable placement admission, just as the Raft host does. Reopening
 defeat the point-read boundary. The engine-level generic Raft catalog is not
 the relevant serving-owner interface. Missing native placement remains unknown
 authority, never permission to invent a replica ID from a group or node number.
+
+### Durable cancellation intent before owner visitation (in qualification)
+
+The native transaction primitives now retain one 368-byte canonical intent per
+owner, binding the full plan/owner identity, exact source fence, candidate and
+reservation fingerprints, and a real native sequence. Intent, source clock and
+source fence are staged together, including for a never-visited owner. That
+closes ordinary participant admission and schema mutation immediately, without
+first fetching or compiling schema-sized worker inputs. Existing predecessor
+participants may still resolve and must drain before any fenced proof or burn.
+
+Normal admission, fence, reservation and private pages check the intent in their
+committing snapshot, closing the delayed-dispatch race after metadata canceled
+the plan. Cancellation-specific admission/drain/reservation paths require the
+exact persisted intent; there is no incoming bypass flag. A new plan cannot
+replace the slot until the old epoch is durably consumed. Intent retries retain
+their original cut and do not advance the native clock again. Recovery validates
+an intent even when no worker job or manifest was ever created, as well as its
+namespace, clock, source fence and public predecessor catalog.
+
+This is intent and fence/drain/burn machinery, NOT a canceled publication ACK.
+Artifact/claim cleanup, release, authenticated command execution, the dedicated
+replication envelope and coordinated intent-aware owner capability barrier are
+still required. The caller must commit its durable outbox with these primitives
+and abort on every error; direct transaction tests are not production standby
+delivery evidence. An older owner cannot safely receive intent-bearing state
+until that decoder/executor rollout barrier is implemented. Public production
+remains disabled and no original SQL case is credited.
+
+Memory and LSM cases cover never-visited, admitted
+and reserved owners, rollback, clock-gap rejection, exact replay, foreign
+identity, delayed normal operations, generic cancellation refusal, predecessor
+draining, both catalog burns and cold verification. Framing tests include every
+truncation, checksum corruption, canonical padding, Raft/native separation and
+namespace substitution. Review adds a real private page prepared before intent
+whose apply is rejected before candidate/progress writes, and reserves the
+intent key against extra-metadata writes and deletes. The first compilation
+exposed a shadowed local name. The first runtime run exposed the old assumption
+that every index fence already had a worker binding; only an exact, pending
+durable intent now authorizes the never-visited intermediate state. Generic
+job-less index fences remain rejected. Final Debug qualification passes 43/43
+build steps and all 27 candidate/catalog tests, with no skips, failures or
+leaks. The licensing boundary passes for 2,029 source files and original SQL
+inventory integrity passes unchanged. Optimized qualification is pending.

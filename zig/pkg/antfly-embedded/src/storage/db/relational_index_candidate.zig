@@ -963,6 +963,198 @@ fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocSto
     try std.testing.expectEqual(addition_plan.plan.boundIndexes().len - 1, published.plan.boundIndexes().len);
 }
 
+fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { absent, admitted, reserved }) !void {
+    const a = std.testing.allocator;
+    const jobs = @import("relational_index_owner_job.zig");
+    const cancellation = @import("relational_index_cancellation_intent.zig");
+    const physical = @import("relational_index_catalog.zig");
+    const registry = @import("schema_registry.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const authority = @import("../source_authority.zig");
+    var before = try schema_api.parseValidatedTableSchema(a, test_before);
+    defer before.deinit(a);
+    var after = try schema_api.parseValidatedTableSchema(a, test_after);
+    defer after.deinit(a);
+    var prior = try compiler.compileCatalog(a, before, 101, null);
+    defer prior.deinit();
+    var candidate = try Candidate.prepare(a, 101, test_before, test_after, prior.value, "email_idx");
+    defer candidate.deinit();
+    const before_schema = try schema_api.deriveRuntimeTableSchema(a, before);
+    defer native_schema.freeSchema(a, before_schema);
+    const after_schema = try schema_api.deriveRuntimeTableSchema(a, after);
+    defer native_schema.freeSchema(a, after_schema);
+    var before_registry = try registry.Registry.initCloned(a, std.testing.io, before_schema);
+    defer before_registry.deinit();
+    var before_view = before_registry.acquire().?;
+    defer before_view.release();
+    var after_registry = try registry.Registry.initCloned(a, std.testing.io, after_schema);
+    defer after_registry.deinit();
+    var after_view = after_registry.acquire().?;
+    defer after_view.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var private_addition = try physical.PrivateAddition.init(a, before_view, after_view, null, (try after.relationalIndexDefinitions(arena.allocator())).?, "email_idx");
+    defer private_addition.deinit();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prior.value, &hash, .{});
+    const fence: topology.Fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .catalog_digest = hash };
+    const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, .native, &candidate, &private_addition);
+    const intent = cancellation.Intent.fromBinding(binding);
+    try std.testing.expect(physical.Controller.isReservedMetadataKey(cancellation.key));
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{.{ .key = cancellation.key, .value = "forged" }}, &.{}));
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{}, &.{cancellation.key}));
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "cancel-intent" });
+    defer runtime.deinit();
+    var store = try @import("../docstore.zig").DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    _ = try native_schema.saveSchema(&store, a, before_schema);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(catalog.key, prior.value);
+        const bytes = @import("online_source_contract.zig").namespaceBytes(fence.namespace);
+        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &bytes);
+        try authority.bind(&txn, .native, bytes);
+        try txn.commit();
+    }
+    var manager = try @import("../transactions.zig").TxnManager.init(a, &store);
+    defer manager.deinit();
+    if (prior_phase != .reserved) try manager.initTransaction(@splat(9), 1);
+    if (prior_phase != .absent) {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try jobs.stageBegin(&txn, binding, &candidate.inputs);
+        if (prior_phase == .reserved) {
+            _ = try jobs.stageNativeFenced(&txn, &manager, binding);
+            _ = try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition);
+        }
+        try txn.commit();
+    }
+    const old_sequence: u64 = if (prior_phase == .absent) 0 else if (prior_phase == .admitted) 1 else 3;
+    const Pages = @import("relational_index_jobs.zig");
+    const PageCore = struct {
+        alloc: Allocator,
+        store: *@import("../docstore.zig").DocStore,
+        relational_indexes: physical.Controller,
+        identity_namespace: @import("doc_identity_namespace.zig").Namespace,
+        before: registry.SchemaView,
+        pub fn schemaNamespaceGeneration(_: *@This()) u64 {
+            return 1;
+        }
+        pub fn acquireSchemaVersionView(self: *@This(), version: u32) !?registry.SchemaView {
+            return if (version == self.before.version()) self.before.clone() else null;
+        }
+    };
+    var page_core: ?PageCore = if (prior_phase == .reserved) .{ .alloc = a, .store = &store, .relational_indexes = try physical.Controller.init(a, std.testing.io, &store, before_view), .identity_namespace = fence.namespace, .before = before_view } else null;
+    defer if (page_core) |*value| value.relational_indexes.deinit();
+    var prepared_page: ?Pages.Page = if (page_core) |*value| try Pages.Page.preparePrivate(a, std.testing.io, value, binding, &private_addition, .{ .records = 1, .time_ns = std.time.ns_per_s }) else null;
+    defer if (prepared_page) |*value| value.deinit();
+    if (prior_phase == .reserved) try std.testing.expect(prepared_page != null);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const staged = try jobs.stageCancellationIntentWithReplay(&txn, intent, null);
+        try std.testing.expect(!staged.duplicate);
+        try std.testing.expectEqual(old_sequence + 1, staged.record.position.sequence);
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(try cancellation.load(&txn) == null);
+        try std.testing.expectEqual(old_sequence, (try authority.load(&txn)).?.sequence);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.OnlineSourceScopeChanged, jobs.stageCancellationIntentWithReplay(&txn, intent, .{ .namespace = fence.namespace, .sequence = old_sequence + 2 }));
+    }
+    var committed: cancellation.Record = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        committed = (try jobs.stageCancellationIntentWithReplay(&txn, intent, .{ .namespace = fence.namespace, .sequence = old_sequence + 1 })).record;
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const duplicate = try jobs.stageCancellationIntentWithReplay(&txn, intent, committed.position);
+        try std.testing.expect(duplicate.duplicate);
+        try std.testing.expectEqualDeep(committed, duplicate.record);
+        try std.testing.expectEqual(committed.position.sequence, (try authority.load(&txn)).?.sequence);
+        var foreign = intent;
+        foreign.owner_digest[0] ^= 1;
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.stageCancellationIntentWithReplay(&txn, foreign, null));
+        foreign = intent;
+        foreign.fence.namespace.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, jobs.stageCancellationIntentWithReplay(&txn, foreign, null));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.stageBegin(&txn, binding, &candidate.inputs));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.stageNativeFenced(&txn, &manager, binding));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.requireReserved(&txn, binding));
+        if (prepared_page) |*page| {
+            // This page was independently prepared before intent committed.
+            // Apply must reject it before writing candidate data or progress.
+            try std.testing.expectError(error.PrivateIndexPublicationCanceled, page.stage(&page_core.?, &manager, &txn));
+            try std.testing.expectError(error.NotFound, txn.get(&Pages.progressKey(binding.index)));
+        }
+        try std.testing.expectError(error.IntegrityTopologyBusy, topology.requireUnfenced(&txn));
+        try std.testing.expectError(error.PrivateIndexCancellationRequired, topology.stageCancel(&txn, fence));
+        var later = intent;
+        later.id[0] ^= 1;
+        later.fence.admission_epoch += 1;
+        try std.testing.expectError(if (prior_phase == .absent) error.PrivateIndexCancellationPending else error.PrivateIndexOwnerJobChanged, jobs.stageCancellationIntentWithReplay(&txn, later, null));
+        try testOwnerRecoveryAllocations(a, &txn);
+    }
+    if (prior_phase != .reserved) {
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            _ = try jobs.stageCanceledBeginWithReplay(&txn, binding, &candidate.inputs, null);
+            try std.testing.expectError(error.TransactionTopologyBusy, jobs.stageCanceledFencedWithReplay(&txn, &manager, binding, null));
+        }
+        try manager.resolveIntents(@splat(9), .aborted, 2);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(prior_phase == .absent, try jobs.stageCanceledBeginWithReplay(&txn, binding, &candidate.inputs, null));
+        const drained = try jobs.stageCanceledFencedWithReplay(&txn, &manager, binding, null);
+        try std.testing.expectEqual(.fenced, drained.action);
+        _ = try jobs.stageCanceledReservationWithReplay(&txn, &manager, binding, &candidate, &private_addition, null);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try testOwnerRecoveryAllocations(a, &txn);
+        try std.testing.expectEqual(.reserved, (try jobs.load(&txn)).?.phase);
+        try std.testing.expectEqualSlices(u8, candidate.reservation.value, try txn.get(catalog.key));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, jobs.requireReserved(&txn, binding));
+        // Intent is neither a completed epoch nor cleanup evidence. The fence
+        // remains closed, and no canceled publication ACK has been fabricated.
+        try std.testing.expect(try topology.completed(&txn) == null);
+        try std.testing.expect((try topology.current(&txn)).?.eql(fence));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var future = committed;
+        future.position.sequence = (try authority.load(&txn)).?.sequence + 1;
+        try txn.put(cancellation.key, &try future.encode());
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
+    }
+}
+
+test "relational index candidate cancellation intent blocks delayed normal work but permits exact drain and burns" {
+    inline for (.{ .absent, .admitted, .reserved }) |phase| {
+        try testCancellationIntent(@import("../mem_backend.zig").Backend, phase);
+        try testCancellationIntent(@import("../lsm_backend.zig").Backend, phase);
+    }
+}
+
 test "relational index candidate owner binding fences drains and reserves both catalogs atomically on memory and LSM" {
     inline for (.{ false, true }) |existing| {
         try testOwnerJobAdmission(@import("../mem_backend.zig").Backend, existing, false);

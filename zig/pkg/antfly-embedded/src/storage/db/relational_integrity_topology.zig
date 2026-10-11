@@ -105,6 +105,15 @@ pub fn stagePrivateIndexBegin(txn: anytype, fence: Fence) !void {
     return stageBeginImpl(txn, fence, null);
 }
 
+/// A never-visited cancellation closes ordinary admission before schema-sized
+/// inputs are fetched. Its durable intent is exact owner authority, not a job
+/// absence ACK. Generic begin/release/cancel remain unable to bypass it.
+pub fn stagePrivateIndexCancellationIntent(txn: anytype, fence: Fence) !void {
+    if (fence.role != .index_build) return error.InvalidIntegrityTopologyFence;
+    try @import("relational_index_cancellation_intent.zig").requireFence(txn, fence);
+    return stageBeginImpl(txn, fence, null);
+}
+
 fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_integrity_topology_contract.zig").GenerationHandoffIntent) !void {
     try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
     if (handoff != null and fence.role != .rewrite_source) return error.InvalidGenerationHandoff;
