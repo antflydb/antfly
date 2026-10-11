@@ -64,7 +64,7 @@ def percentile(values, percent):
 def load_http(args, images):
     """One image per request: clients are concurrency, never model batch size."""
     reports = []
-    for image in images:
+    for image_index, image in enumerate(images):
         mime = mimetypes.guess_type(image.name)[0] or "image/png"
         data_url = (
             "data:" + mime + ";base64," + base64.b64encode(image.read_bytes()).decode()
@@ -127,6 +127,14 @@ def load_http(args, images):
                     "responses": results,
                 }
             )
+            (args.output_dir / f"http-{image_index}-{clients}.json").write_text(
+                json.dumps(reports[-1], indent=2) + "\n"
+            )
+            print(
+                f"completed HTTP {image.name} clients={clients} "
+                f"successes={len(successes)}/{len(results)}",
+                flush=True,
+            )
     return reports
 
 
@@ -143,6 +151,8 @@ def run(args):
         "cases": [],
     }
     if args.url:
+        report["http_model"] = args.http_model
+        report["url"] = args.url
         report["http"] = load_http(args, images)
     else:
         if args.baseline is None or args.candidate is None or args.model_dir is None:

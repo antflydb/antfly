@@ -646,6 +646,83 @@ images at batches 1/2/4/8, mixed-grid splits, order, budget rejection and isolat
 Metal fixtures assert only the final projected output downloads. CUDA fixtures
 cross-compile; executing them needs CUDA hardware.
 
+### Local Gemma 4 image measurements (2026-10-11)
+
+On an Apple M4 Max (32 GPU cores, 36 GiB unified memory), the real HF
+EmbeddingGemma2 checkpoint has BF16 tensors. Each warm case used 10 warmups
+and 100 synchronized samples. The prepared square image has 2,304 patch tokens
+and 256 projected tokens per image. Each speedup below uses its own paired
+resident singleton run, rather than the first row of the table.
+
+| Requested / actual vision batch | p50 batch seconds | p95 batch seconds | Images/sec | Paired throughput speedup | Device-owned tensor peak MiB |
+| --- | --- | --- | --- | --- | --- |
+| 1 / 1 | 1.459 | 1.517 | 0.682 | 1.015x | 155.3 |
+| 2 / 2 | 2.868 | 3.211 | 0.687 | 1.026x | 310.5 |
+| 4 / 4 | 5.287 | 5.350 | 0.755 | 1.109x | 621.0 |
+| 8 / 8 | 12.449 | 12.978 | 0.663 | 0.971x | 1242.1 |
+
+Batch four improved throughput about 11%; batch eight was about 3% slower
+than its paired singleton and used twice batch four's device-owned tensor
+memory. Keep the serving ceiling at four. These are local development results,
+not a CUDA or GGUF runtime qualification. The separate preliminary residency
+comparison measured 1.35–1.42x singleton p50 speedups across square, landscape
+and document-shaped inputs, reducing vision device readbacks from 47 to one
+final projected-token export. Outputs matched with cosine above 0.99999999999.
+Those preliminary runs overlapped some CPU builds and tiny fixture tests. Our
+benchmark processes ran sequentially. Unrelated build/test activity appeared
+during the four-image full-embedding baseline; affected later timings are local
+loaded-machine measurements, rather than controlled performance comparisons.
+
+The encoded-image scope measured about 29% higher throughput for the JPEG
+and 35% for the document-shaped PNG. Single-image full embedding throughput
+increased about 35%, with p50 falling from 2.31s to 1.73s. The four-image full
+embedding comparison observed about 32% higher throughput under resource
+contention; treat that row as contextual. Every offline pair passed output
+shape/finiteness checks and per-image cosine of at least 0.9999.
+
+| Scope / input | Batch | Baseline p50 s | Candidate p50 s | Candidate p95 s | Baseline images/sec | Candidate images/sec |
+| --- | --- | --- | --- | --- | --- | --- |
+| Image / photo.jpg | 1 | 2.038 | 1.581 | 1.742 | 0.485 | 0.626 |
+| Image / page.png | 1 | 2.511 | 1.834 | 2.246 | 0.396 | 0.533 |
+| Embedding / page.png | 1 | 2.311 | 1.735 | 1.826 | 0.424 | 0.572 |
+| Embedding / page.png (contended) | 4 | 10.147 | 8.234 | 8.598 | 0.376 | 0.495 |
+
+The HTTP sweep sent one image per request, 100 measured requests at each
+concurrency, using the dedicated Metal server and admission budgets recorded
+in the report. All 400 requests succeeded and matched the serial vector.
+These loaded-machine results show queueing latency rising without a throughput
+benefit from additional clients:
+
+| Concurrent clients | Successful requests | Images/sec | p50 s | p95 s |
+| --- | --- | --- | --- | --- |
+| 1 | 100/100 | 0.546 | 1.769 | 2.187 |
+| 2 | 100/100 | 0.560 | 3.429 | 4.438 |
+| 4 | 100/100 | 0.539 | 6.523 | 16.115 |
+| 8 | 100/100 | 0.492 | 14.002 | 37.571 |
+
+Separate cold-process image runs observed model-session load / first-forward
+seconds of 0.104 / 2.253 before residency and 0.086 / 1.563 after. These are
+single observations with existing system caches, not warm percentiles or
+machine-cold startup qualification.
+
+Real-model HTTP checks also compared four distinct same-grid images with their
+singleton vectors and verified that a valid PNG header with a truncated codec
+body retains successful indexes 0 and 2 with an indexed error at 1. Malformed
+headers are rejected during request validation before decoder execution.
+The final native/Metal regression selection passed 165 tests, with 10 optional
+skips; residency and image-batching CUDA fixtures cross-compiled successfully.
+
+[The compact results report](../../../docs/design/inference/gemma4-image-performance.json)
+records hashes, hardware, latency, throughput, memory-counter availability,
+parity, admission budgets and contention evidence. Raw samples, final vectors,
+fixtures, logs and measured-source snapshots are retained locally under
+`.benchmark-results/gemma4-image-2026-10-11/`. Host peaks cover bounded workspace,
+not model memory or RSS; device-owned tensor peaks do not include every provider
+buffer. Unavailable internal embedding/HTTP counters are not total-memory
+measurements. Relative baseline parity does not replace an independent model
+quality oracle. GPU-assisted decode/resize and cross-request scheduling remain
+separate future work; this phase reuses existing broker cohorts.
+
 ### Further implementation and measurement
 
 1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,
