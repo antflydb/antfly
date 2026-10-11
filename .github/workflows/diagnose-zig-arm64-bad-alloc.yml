@@ -167,7 +167,7 @@ jobs:
           name: zig-darwin-arm64-release-fast
           path: |
             dist/release-archives/antfly_diagnostic_Darwin_arm64.tar.gz
-            ${{ runner.temp }}/antfly-zig-release-aarch64-macos
+            ${{ runner.temp }}/antfly-zig-release-server-aarch64-macos
             ${{ runner.temp }}/darwin-arm64-release.time
             ${{ runner.temp }}/darwin-arm64.binary-file
             ${{ runner.temp }}/darwin-arm64.binary-size

@@ -707,6 +707,29 @@ python3 -m unittest zig.tools.test_analyze_zig_import_graph
 
 ### Compiler report capture
 
+To measure the actual Darwin release archive pipeline, run this from the
+repository root with Zig 0.17 on `PATH`. Use a new report directory for each
+cold run:
+
+```sh
+report="$PWD/.local-test-results/darwin-release-cold"
+RUNNER_TEMP="$report/work" ANTFLY_ZIG_CACHE_ROOT="$report/cache" \
+  scripts/diagnose-zig-build-memory.sh --command \
+  --out-dir "$report/trace" --label darwin-release \
+  --target aarch64-macos --optimize fast --strip true --interval 5 -- \
+  "$PWD/scripts/packaging/build_zig_release_archive.sh" \
+  --version 0.0.0-diagnostic --target aarch64-macos --optimize fast \
+  --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
+  --out-dir "$report/dist" --metal true --system-blas true
+```
+
+This retains production job admission, captures per-compiler RSS and CPU clocks,
+and includes the full Zig step summary and packaging output. Darwin packaging
+allows a 32 GiB admission ceiling so the 28 GiB storage reservation fits; the
+bounded runner still clamps admission to 80% of host or cgroup memory. Run on an
+otherwise idle host. Record host, SDK, commit and cache state alongside results;
+native Darwin timings do not establish Linux cross-build performance.
+
 Start the exact candidate build with fresh caches, `--time-report`, and a local
 WebUI:
 
