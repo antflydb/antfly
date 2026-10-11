@@ -54,5 +54,18 @@ contains source, artifact and clip hashes. `pytorch.json`, `native.json` and
 `metal.json` retain complete vectors, frame selections and retrieval metrics.
 `retry-oracle.json` preserves the exact earlier reference used by both HTTP
 retry reports. General codec conformance, isolated performance measurements,
-expanded display/Colour coverage and actual Linux pretrained policy execution
+expanded display/Colour coverage and actual x86_64 runtime execution
 remain outside this receipt's passing scope.
+
+
+`linux-arm64-native.json` records the actual offline Linux pretrained run, including
+all ten vectors, exact rankings/top-k and eight successful load requests at
+concurrency two. `linux-arm64-server-build.log` records the static musl build.
+The source is commit `98226fcb22`; the report binds its exact server binary and
+the same checkpoint/reference as the macOS runs. The Linux container uses the
+existing `antfly-pooling-qualification:latest` ARM64 image, overrides its entrypoint
+with `python3`, mounts this worktree/model and the server readonly, and supplies a
+writable result directory and tmpfs. Network is disabled; only local HTTP is used.
+The `video_compare.py --backend native` command is identical except for Linux
+paths. The PyTorch oracle remains the pinned CPU reference, rather than a separate
+Linux PyTorch installation.

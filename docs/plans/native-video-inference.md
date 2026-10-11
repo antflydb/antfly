@@ -644,3 +644,11 @@ covers VFR, PAFF, VP9/AV1 timestamps and separate intervals of a 52-second clip;
 see `tools/embeddinggemma2/testdata/sampling`. This does not close device final
 normalization, whole-pipeline scheduling, cross-group reuse, streaming inheritance
 or the broader codec/performance qualification items above.
+
+
+The logical/timestamp sampling continuation now also passes pretrained execution
+on actual Linux ARM64: ten vectors, maximum coordinate error 5.30e-7, exact
+rankings/top-k and eight successful concurrent-load requests. The static musl
+server is bound by its binary SHA in the sampling receipt. This closes the Linux
+ARM64 execution gate for these policies, not x86_64 execution or general codec
+conformance.

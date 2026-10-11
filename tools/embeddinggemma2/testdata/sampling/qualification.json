@@ -1,7 +1,7 @@
 {
   "version": 1,
   "status": "pass",
-  "scope": "Logical AVC indexing and timestamp/window model policies; pretrained macOS CPU/Metal and portable Linux ARM64 decoder execution",
+  "scope": "Logical AVC indexing and timestamp/window model policies; pretrained macOS CPU/Metal and actual Linux ARM64 execution",
   "recipe": "embeddinggemma2-f32-mean-v4-logical-timestamps",
   "base_commit": "11ab8db968dcb54cebfb0bb9fa8904fc9b5c1c6a",
   "source_sha256": {
@@ -229,7 +229,10 @@
     "parser-tests.log": "0d65c22853fbbf5caf0cd28912014f0721cad6c690fd5d8bec6058056578931b",
     "pytorch.json": "f9390a200d51b8d2f27e317516e32935641f455d006fe5f3e451beb06a3fd4e1",
     "retry-oracle.json": "f807f2257964b797d257107f1a041af2569f913b64ecdfff6b5a661595a44801",
-    "vfr.mov": "2bbe46520cae1507de4e0007af9da102d4c5ae37fea25dafa539e84a9d172287"
+    "vfr.mov": "2bbe46520cae1507de4e0007af9da102d4c5ae37fea25dafa539e84a9d172287",
+    "linux-arm64-native.json": "c723ff99588ad087e7de95bd1a7640be9bb693aa9c069a64392bf86cc15f442e",
+    "linux-arm64-server-build.log": "66131f0331eef0405fd7463a2d90173b548bbf9fa03b5553ee266c20dd196b59",
+    "linux-arm64-pretrained.log": "734b1d2ab7c06a0400a7606376d97dc5aa07a3dc4a8fcd8594ab78530c516022"
   },
   "clip_sha256": {
     "tools/embeddinggemma2/testdata/sampling/vfr.mov": "2bbe46520cae1507de4e0007af9da102d4c5ae37fea25dafa539e84a9d172287",
@@ -266,19 +269,27 @@
       "cpu_max_abs": 4.6193599700927734e-07,
       "metal_max_abs": 3.848690539598465e-07,
       "rankings": "exact",
-      "top_k_overlap": 1.0
+      "top_k_overlap": 1.0,
+      "linux_arm64_max_abs": 5.299225449562073e-07
     },
     "http_policies": {
       "rejected_policies_per_backend": 11,
       "non_video_rejection": true,
       "clean_retries": true,
       "separate_ordered_window_outputs": 2
+    },
+    "linux_arm64_pretrained": {
+      "vectors": 10,
+      "rankings": "exact",
+      "top_k_overlap": 1.0,
+      "successful_load_requests": 8,
+      "disconnect_retry": true
     }
   },
   "pending": [
-    "Pretrained timestamp/window execution on actual Linux; corrected server rebuild is still running.",
     "Actual x86_64 runtime execution; cross-compilation alone is not runtime qualification."
   ],
   "performance_scope": "Timing and RSS were collected under shared build load; these are correctness/operational campaigns, not isolated performance benchmarks.",
-  "provenance_note": "retry-oracle.json preserves the exact earlier PyTorch report referenced by the HTTP retry campaign; final parity reports bind the final lint-clean tool. Both pin the same checkpoint and selected pictures."
+  "provenance_note": "retry-oracle.json preserves the exact earlier PyTorch report referenced by the HTTP retry campaign; final parity reports bind the final lint-clean tool. Both pin the same checkpoint and selected pictures.",
+  "qualified_source_commit": "98226fcb22"
 }

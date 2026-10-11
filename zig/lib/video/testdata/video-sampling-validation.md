@@ -14,13 +14,14 @@ Sintel clip; two text queries compare reference cosine scores and retrieval orde
 | Focused HTTP parser tests | 2 passed |
 | Pretrained native CPU vs pinned PyTorch | 10 vectors; maximum coordinate error 4.62e-7 |
 | Pretrained Metal vs pinned PyTorch | 10 vectors; maximum coordinate error 3.85e-7 |
-| Rankings and top-k sets | Exact for both queries on CPU and Metal |
+| Pretrained Linux ARM64 vs pinned PyTorch | 10 vectors; maximum coordinate error 5.30e-7 |
+| Rankings and top-k sets | Exact for both queries on CPU, Metal and Linux ARM64 |
 | Malformed/empty policy and clean retry | 11 policies per backend, HTTP 400; clean retry parity |
 | Sampling on non-video content | HTTP 400 on CPU and Metal |
 | Separate window groups | Two ordered vectors, each agrees with its independent reference |
 
 The final source-bound campaign also completes eight requests at concurrency two
-on each backend. The earlier operational run completed sixteen per backend.
+on each macOS backend and the actual Linux ARM64 native server. The earlier operational run completed sixteen per macOS backend.
 A deliberately disconnected request is followed by a matching clean retry; HTTP
 alone does not establish when the cancelled GPU work completed.
 
@@ -41,6 +42,8 @@ The pretrained PAFF fixture has eight packets and four completed pictures.
 bind the exact source, binary, checkpoint, independent frame selections and
 result vectors. Timing/RSS were collected under shared build load and are not
 isolated performance comparisons. Actual Linux pretrained timestamp/window
-execution remains pending while the corrected server rebuild runs. This phase
+execution now passes in the offline ARM64 VM. Its report binds the statically
+linked musl server and the same pinned checkpoint/reference; x86_64 runtime
+execution remains unverified. This phase
 does not close device normalization, cross-request scheduling, cross-window
 frame reuse, streaming inheritance or the broader codec/performance gates.
