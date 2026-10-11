@@ -124,10 +124,12 @@ class ReleaseLicenseTests(unittest.TestCase):
                     self.assertEqual(
                         product == "server", "-Dapple-providers=false" in args
                     )
-                    self.assertEqual(
-                        args[args.index("--max-rss-cap") + 1],
-                        str((32 if target == "aarch64-macos" else 20) * 1024**3),
-                    )
+                    if target == "aarch64-macos":
+                        self.assertNotIn("--max-rss-cap", args)
+                    else:
+                        self.assertEqual(
+                            args[args.index("--max-rss-cap") + 1], str(20 * 1024**3)
+                        )
                     self.assertIn("--summary", args)
                     self.assertEqual(args[args.index("--summary") + 1], "all")
                     if product == "embedded":

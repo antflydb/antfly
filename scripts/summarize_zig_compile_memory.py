@@ -91,7 +91,7 @@ def summarize(text, response_dir=None, capture_dir=None):
             command, response_dir, response_cache, capture_dir
         )
         match = re.search(
-            r"(?:^|\s)--name\s+(antfly-storage-kernel|antfly-runtime-[\w-]+|antfly-embedded-[\w-]+|antfly|libantfly)(?:\s|$)",
+            r"(?:^|\s)--name\s+(antfly(?:-[\w-]+)?|libantfly)(?:\s|$)",
             expanded,
         )
         if not match:

@@ -725,8 +725,10 @@ RUNNER_TEMP="$report/work" ANTFLY_ZIG_CACHE_ROOT="$report/cache" \
 
 This retains production job admission, captures per-compiler RSS and CPU clocks,
 and includes the full Zig step summary and packaging output. Darwin packaging
-allows a 32 GiB admission ceiling so the 28 GiB storage reservation fits; the
-bounded runner still clamps admission to 80% of host or cgroup memory. Run on an
+uses the bounded runner's 80% host/cgroup budget so the 28 GiB storage reservation
+fits on adequately provisioned hosts and larger hosts can admit safe overlap.
+Compiler response files are retained beside the trace for portable attribution.
+Run on an
 otherwise idle host. Record host, SDK, commit and cache state alongside results;
 native Darwin timings do not establish Linux cross-build performance.
 

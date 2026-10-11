@@ -229,24 +229,20 @@ zig_install_args=(
 )
 
 run_zig_build_steps() {
-  # Darwin storage reserves 28 GiB and API reserves 24 GiB. A 20 GiB
-  # aggregate cap cannot admit either unit. The bounded runner still clamps
-  # this ceiling to 80% of the actual host/cgroup memory limit.
-  local scheduler_cap=21474836480
-  case "$target" in
-    *macos*) scheduler_cap=34359738368 ;;
-  esac
+  # Darwin storage reserves 28 GiB and API reserves 24 GiB. Use the bounded
+  # runner's 80% host/cgroup budget for Darwin rather than an arbitrary cap
+  # that rejects these units or prevents safe overlap on larger CI hosts.
   local -a command=(
     python3
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
-    --max-rss-cap
-    "$scheduler_cap"
-    --
-    build
-    --summary all
   )
+  case "$target" in
+    *macos*) ;;
+    *) command+=(--max-rss-cap 21474836480) ;;
+  esac
+  command+=(-- build --summary all)
 
   if [[ "$product" = lite || "$product" = embedded ]]; then
     command+=(--build-file embedded.build.zig)
