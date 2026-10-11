@@ -6020,6 +6020,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const index_publication_progress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/relational_index_publication_progress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_index_publication_progress_tests = b.addRunArtifact(index_publication_progress_tests);
+    b.step("relational-index-publication-progress-test", "Run bounded index publication, cancellation and receipt CAS contracts")
+        .dependOn(&run_index_publication_progress_tests.step);
+    db_test_step.dependOn(&run_index_publication_progress_tests.step);
+    unit_test_step.dependOn(&run_index_publication_progress_tests.step);
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },

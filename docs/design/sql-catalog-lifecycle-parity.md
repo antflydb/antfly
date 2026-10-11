@@ -932,3 +932,187 @@ NOT DISTINCT still rejects it. Read-admission and runtime failure-identity gates
 also pass in ReleaseFast; failure identity passes in Debug as well. PostgreSQL
 18 passes all 16 lifecycle tests. This is scoped qualification, not a claim
 that the full integration suite or every distributed fault boundary passed.
+
+### Regular unique-index publication boundary
+
+The PostgreSQL oracle's failed-build contract is now paired with a focused
+mounted native gate, `antfly-api-sql-index-build-atomicity-test`. It is a
+development regression, not a qualified CI gate or original-case credit. Its
+first run observes duplicate input receiving HTTP 202 / DDL PENDING with a
+committed schema receipt. A pending asynchronous response alone does not prove
+a PostgreSQL semantic defect. The
+strengthened run reached terminal invalid activation: complete SQL rows/column
+metadata were unchanged, but the exact owner/query definition had changed.
+Both runs failed the PostgreSQL atomicity contract, with zero skips or leaks.
+Do not treat an asynchronous invalid-index declaration as regular PostgreSQL
+DDL success. The production staged-publication fix is not implemented yet.
+
+The required implementation is an index-only staged publication, sharing owner
+fences, metadata authority, bounded scans and durable receipts with existing
+integrity machinery. It must not use a full table/dependency-cohort rewrite or
+restore an old schema in a late compensating API call. The former copies
+unrelated primary data; the latter can overwrite a concurrent committed change.
+
+1. Admit a durable metadata-owned plan with the exact logical/physical owner,
+   predecessor schema and catalog digests, successor index definition, schema
+   version, namespace name reservation and complete range-owner cut. The
+   successor changes only the requested index and its integrity binding; row
+   layout, existing constraint generations and FK definitions are unchanged.
+   Reserve the index name atomically without exposing a queryable descriptor.
+2. Obtain durable source fences from every owner using existing replicated
+   topology-fence mechanisms. A regular build fences writes to this table;
+   reads retain the old immutable schema and active index catalog. Do not
+   enlist unrelated FK tables when their identities/constraints are unchanged.
+   Mixed-version admission requires an explicit supported capability, not a
+   best-effort owner loop.
+3. Build into a plan-owned index generation and checkpoint namespace while the
+   active integrity catalog remains unchanged. Decode through the pinned old
+   row layout and project only key/expression/predicate dependencies plus
+   covering payload fields. Existing unique generations need not be rebuilt.
+   Use bounded pages and replicated row/version and progress CAS guards;
+   acquire unique claims through the existing distributed coordinator, so
+   duplicates on different owners cannot escape local validation. INCLUDE
+   payloads never participate in uniqueness, and NULL policy belongs to the
+   typed key encoder.
+4. Collect exact owner-bound completion receipts covering the same range cut,
+   plan digest and candidate generation. Only then may metadata atomically
+   replace the public schema/index descriptor and consume its name reservation.
+   Each owner installs the verified catalog/activation state and releases its
+   fence in an atomic local transaction with its durable outbox record. Old
+   readers keep their immutable schema views; no primary row rewrite is needed.
+5. Before publication, deterministic failure enters durable cancellation.
+   Reclaim only this plan's claims/artifacts, collect cancellation receipts and
+   release reservations/fences. Never overwrite the active predecessor or
+   delete another generation's claims. After proven cancellation, return 23505
+   for duplicate data and allow an explicit repaired resubmission with the same
+   index name. An uncertain cancellation retains its recovery handle and must
+   not be reported as a safely retryable rejection.
+6. Metadata restart, owner promotion and request cancellation resume from
+   persisted phase and receipt revisions. Publication and cancellation must be
+   mutually exclusive. Request deadlines bound waiting, not durable ownership:
+   after uncertain admission the SQL API retains a typed receipt rather than
+   inventing success, rejection, or replay authority. A synchronous PostgreSQL
+   command completes only at ready or proven canceled; asynchronous maintenance
+   receipts remain an explicit API distinction.
+
+Required fault/scaling qualification includes cross-owner duplicate keys,
+NULL/INCLUDE/partial-expression policies, concurrent name/schema publication,
+promotion and restart in every phase, cancellation/publication races, repeated
+cleanup, unchanged full postimages on rejection, and measured primary bytes
+written versus projected index bytes. CREATE INDEX CONCURRENTLY needs its own
+write-maintained candidate and snapshot/old-transaction barriers; a blocking
+build with a different flag is not concurrent-index parity.
+
+Generation reservation is also part of admission, not cleanup. A failed private
+candidate must not let a later job reuse its generation. Reserve the candidate
+allocation by advancing only the predecessor catalog's allocation high-water
+mark, leaving its schema version, active/retired bindings and CHECK coverage
+unchanged. First fence ordinary writes and drain predecessor participants; do
+not invalidate an unresolved prepared writer by changing its catalog early.
+Retain the original source-fence identity and separately attest the reserved
+catalog digest. Cancellation must complete this fence/drain/reserve sequence on
+every owner, including an owner that never received begin, before releasing the
+cohort. Never rewind the allocator. Publication
+installs the prevalidated candidate against the exact reserved predecessor;
+rebuilding it with the ordinary allocator would silently allocate a different
+generation. These transitions still require durable metadata authority and
+owner receipts; a catalog helper alone does not authorize publication.
+
+### Catalog preparation and candidate-validation checkpoint
+
+Preparation now uses temporary kind-scoped name and allocation-membership
+indexes for large catalogs, with a bounded linear path through 64 definitions.
+Decoder allocation-membership scratch no longer lives as long as the immutable
+catalog. Definition order, generation allocation, canonical encoding and
+retired identities are unchanged. The allocation-free `indexAddition` check
+requires exactly one successor UNIQUE generation and byte-identical existing
+bindings, including FK payloads and retired descriptors. CHECK changes, owner
+changes, schema/counter mismatches and implicit constraint retirement fail
+closed. This primitive is not yet wired into a public staged-index controller.
+
+All eleven direct catalog/contract tests pass in Debug and ReleaseFast, including
+allocation-failure injection across both small and large membership paths.
+Generation-allocation corruption is rejected even with valid physical checksums.
+`prepareIndexReservation` burns the candidate allocation without publishing its
+schema/binding, and `prepareIndexPublication` requires the exact reserved
+predecessor before constructing the installation CAS. Tests prove a repaired
+submission cannot reuse the canceled generation and a stale CAS cannot overwrite
+a concurrent publication. These are catalog primitives, not metadata authority:
+durable plan admission, all-owner burn/fencing, staged builders, receipt-driven
+publication/cancellation and the public API integration remain unfinished.
+Preparation also preflights the aggregate encoded byte budget before predecessor
+decoding or owned payload allocation, and accounts for retained historical
+descriptors before cloning them. A fail-at-first-allocation regression failed
+with OutOfMemory before the fix and now rejects oversized input with
+IntegrityCatalogTooLarge without inducing an allocation failure. Exact-limit
+catalogs remain accepted; this closes allocation amplification without reducing
+the supported catalog size.
+
+The explicit `relational_catalog_benchmark.zig` harness is outside normal test
+aggregates. ReleaseFast measurements compare the exact committed catalog at
+`5cb3d7c73e` with the working implementation using identical source fixtures and
+harnesses: 1,000 iterations per profile, three alternating before/after runs.
+Final measurements include the bounded-allocation fix. Median microseconds per
+preparation on the local macOS host (not an isolated service benchmark):
+
+| Definitions | Mutation profile | Before | After |
+| --- | --- | ---: | ---: |
+| 64 | Retain all | 44.53 | 43.45 |
+| 64 | Retire half | 35.47 | 37.19 |
+| 256 | Retain all | 193.54 | 159.76 |
+| 256 | Retire half | 130.61 | 123.95 |
+| 1,000 | Retain all | 1,497.90 | 559.40 |
+| 1,000 | Retire half | 803.29 | 451.82 |
+
+This proves a catalog-preparation scaling improvement, not an end-to-end SQL
+latency improvement, index-build throughput, or completion of staged publication.
+The small retirement profile adds about 1.7 microseconds in this run; do not
+describe the change as a measured speedup for every size/profile.
+No original SQL disposition changes follow from these component tests.
+
+The combined mounted Debug rerun passed the primary-key campaign but timed out
+in the index campaign's attested absence read immediately after CREATE SCHEMA,
+before CREATE TABLE. Its root cause is not established. Timeout-only diagnostics
+now record the namespace, attempt count, last pending admission error and durable
+reconciliation phase/coverage/failure without logging every poll or extending
+the deadline. The instrumented index campaign and three subsequent bounded
+repetitions passed with zero skips, failures or leaks. Those passing repetitions
+do not resolve the earlier timeout or the separate failed-build atomicity defect.
+
+### Bounded staged-index progress checkpoint
+
+`relational_index_publication_progress.zig` implements the private progress
+contract for a regular, index-only UNIQUE build. A fixed-size 184-byte head
+tracks phase, revision and seven counters; each point-read owner record is
+376 bytes. Receipt application is allocation-free and constant work, independent
+of the admitted cohort size (bounded at 4,096 owners). It does not reparse or
+rewrite the immutable plan on each ACK. `PreparedAck` owns its encoded buffers,
+checks both exact durable predecessors before either write, and stages both
+outputs in the caller's transaction. The caller must abort on a staging error
+and include its outbox/receipt in that same transaction.
+
+Publication requires every owner fenced/drained, every allocation reserved and
+every private candidate validated. A distinct revision-CAS decision must switch
+the public descriptor/name reservation in the same metadata transaction; after
+that decision cancellation is forbidden. All owners install before any success
+fence release. Prepublication cancellation instead requires cleanup/burn proof
+from every owner, including unvisited owners, before any cancellation release.
+Replays preserve counters; stale revisions, conflicting ACKs, substituted
+owner/range/fence/candidate/reservation identities and regressing applied cuts
+fail closed. Physical checksums detect damaged progress bytes, not forged
+authority: the controller must independently verify owner evidence and immutable
+membership from its admitted plan.
+
+All nine direct tests pass in Debug and ReleaseFast. They exercise every one of
+ten prepublication cancellation cuts, reversed receipt order, restart decoding
+after every transition, publication/cancellation races, stale/conflicting ACKs,
+dual-record CAS guards, storage-read error propagation, byte corruption and the
+maximum owner count. The focused `relational-index-publication-progress-test`
+build gate passes in Debug and is included in the storage DB and unit gates.
+These are protocol/component tests, not distributed fault qualification.
+
+This progress contract is not yet used by a production metadata controller.
+Durable plan admission, name/table locks, capability barriers, verified owner
+ports, projected private builders/unique claims and atomic public publication
+still need integration. The native failed-build atomicity gate remains red;
+there is no original-case disposition credit or claim of public SQL parity.

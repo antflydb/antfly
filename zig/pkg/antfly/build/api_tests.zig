@@ -2139,7 +2139,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // own runtime campaign and independently requires no skips.
     const sql_owner_lifecycle_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart" },
+        .filters = &.{ "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation", "mounted SQL original unique indexes enforce exact postimages across owner restart", "mounted SQL regular unique index build failure is atomic" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
@@ -2151,6 +2151,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_index_lifecycle_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-index-lifecycle-test", "Run exact original index DDL, data-owner enforcement and restart qualification")
         .dependOn(&sql_index_lifecycle_run.step);
+    const sql_index_atomicity_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL regular unique index build failure is atomic"});
+    sql_index_atomicity_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-index-build-atomicity-test", "Run regular unique-index build rejection and repaired resubmission qualification")
+        .dependOn(&sql_index_atomicity_run.step);
     const hosted_initial_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_initial_fk_test_root.zig"),
         .target = target,

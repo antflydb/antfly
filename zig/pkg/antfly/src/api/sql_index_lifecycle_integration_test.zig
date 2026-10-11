@@ -56,10 +56,14 @@ fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
     const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
     const lookup: domain.ResolveMany = .{ .relations = &.{.{ .database = "default", .namespace = namespace, .name = "usage_records" }}, .include_query_definitions = true };
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var attempts: usize = 0;
+    var pending_error: ?anyerror = null;
     while (platform.time.monotonicNs() < deadline) {
         try ctx.checkDrivers();
+        attempts += 1;
         const bytes = source.systemCatalog(ctx.alloc, .{ .deadline_ns = deadline }, .{ .resolve_many = lookup }) catch |err| switch (err) {
             error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady => {
+                pending_error = err;
                 try ctx.io.sleep(.fromMilliseconds(20), .awake);
                 continue;
             },
@@ -71,6 +75,16 @@ fn relationOwner(ctx: *fixture.Context, namespace: []const u8) !?u64 {
         try snapshot.value.validateRelations(lookup);
         return if (snapshot.value.relations[0]) |relation| relation.owner.table_id else null;
     }
+    std.debug.print("SQL index catalog publication timeout namespace={s} attempts={d} pending={s}\n", .{ namespace, attempts, if (pending_error) |err| @errorName(err) else "none" });
+    const svc = ctx.metadata.server.svc;
+    if (svc.projectedStore()) |store| {
+        const work = store.relationReconciliationWork(svc.metadata_group_id) catch |err| {
+            std.debug.print("SQL index catalog reconciliation diagnostic failed: {s}\n", .{@errorName(err)});
+            return error.SqlIndexCampaignPublicationTimeout;
+        };
+        std.debug.print("SQL index catalog reconciliation epoch={} root={} current={}\n", .{ work.epoch != null, work.root != null, work.current != null });
+        if (work.current) |current| std.debug.print("SQL index catalog reconciliation phase={s} coverage={s} failure={s} cursor_bytes={d}\n", .{ @tagName(current.phase), @tagName(current.coverage), @tagName(current.failure), current.cursor_len });
+    }
     return error.SqlIndexCampaignPublicationTimeout;
 }
 
@@ -78,7 +92,9 @@ fn owner(ctx: *fixture.Context, namespace: []const u8) !u64 {
     return (try relationOwner(ctx, namespace)) orelse error.SqlIndexCampaignMissingTable;
 }
 
-fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
+const ConstraintState = enum { enforced, validating, invalid };
+
+fn waitTerminalActivation(ctx: *fixture.Context, namespace: []const u8) !ConstraintState {
     const suffix = try std.fmt.allocPrint(ctx.alloc, "/db/v1/databases/default/namespaces/{s}/tables/usage_records/constraints/status", .{namespace});
     defer ctx.alloc.free(suffix);
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
@@ -87,11 +103,10 @@ fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
         var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, suffix, .GET, null, 1_000);
         defer response.deinit(ctx.alloc);
         if (response.status == 200) {
-            var status = try std.json.parseFromSlice(struct { state: enum { enforced, validating, invalid } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            var status = try std.json.parseFromSlice(struct { state: ConstraintState }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
             defer status.deinit();
             switch (status.value.state) {
-                .enforced => return,
-                .invalid => return error.SqlIndexCampaignInvalidConstraint,
+                .enforced, .invalid => return status.value.state,
                 .validating => {},
             }
         } else if (response.status != 503) {
@@ -103,9 +118,45 @@ fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
     return error.SqlIndexCampaignActivationTimeout;
 }
 
+fn waitEnforced(ctx: *fixture.Context, namespace: []const u8) !void {
+    try std.testing.expectEqual(ConstraintState.enforced, try waitTerminalActivation(ctx, namespace));
+}
+
+fn snapshotRows(ctx: *fixture.Context, namespace: []const u8) ![]u8 {
+    var response = try execute(ctx, namespace, "SELECT id, email, tenant_id, status FROM usage_records ORDER BY id", true);
+    defer response.deinit(ctx.alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, response.body, .{});
+    defer parsed.deinit();
+    return std.json.Stringify.valueAlloc(ctx.alloc, .{
+        .columns = try fixture.field(parsed.value, "columns"),
+        .rows = try fixture.field(parsed.value, "rows"),
+    }, .{});
+}
+
+fn snapshotDefinition(ctx: *fixture.Context, namespace: []const u8) ![]u8 {
+    const domain = sources.system_catalog_domain;
+    const source = server.StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+    const lookup: domain.ResolveMany = .{ .relations = &.{.{ .database = "default", .namespace = namespace, .name = "usage_records" }}, .include_query_definitions = true };
+    const bytes = try source.systemCatalog(ctx.alloc, .{ .deadline_ns = platform.time.monotonicNs() +| 15 * std.time.ns_per_s }, .{ .resolve_many = lookup });
+    defer ctx.alloc.free(bytes);
+    var snapshot = try std.json.parseFromSlice(domain.ResolvedMany, ctx.alloc, bytes, .{});
+    defer snapshot.deinit();
+    try snapshot.value.validateRelations(lookup);
+    const relation = snapshot.value.relations[0] orelse return error.SqlIndexCampaignMissingTable;
+    return std.json.Stringify.valueAlloc(ctx.alloc, .{
+        .owner = relation.owner,
+        .definition = relation.table.query_definition orelse return error.InvalidSqlBackendResponse,
+    }, .{});
+}
+
 fn rejected(ctx: *fixture.Context, namespace: []const u8, statement: []const u8) !void {
     var response = try execute(ctx, namespace, statement, false);
     defer response.deinit(ctx.alloc);
+    try expectRejected(ctx, response);
+}
+
+fn expectRejected(ctx: *fixture.Context, response: http.HttpResponse) !void {
     if (response.status != 400) std.debug.print("SQL index campaign rejection status={d} body={s}\n", .{ response.status, response.body });
     try std.testing.expectEqual(@as(u16, 400), response.status);
     var diagnostic = try std.json.parseFromSlice(struct { code: []const u8, retryable: bool }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
@@ -181,4 +232,90 @@ const Campaign = struct {
 
 test "mounted SQL original unique indexes enforce exact postimages across owner restart" {
     try fixture.run(Campaign);
+}
+
+/// Regular CREATE UNIQUE INDEX must not publish an invalid descriptor. This
+/// is deliberately distinct from CREATE INDEX CONCURRENTLY's failed-build
+/// semantics and from the public asynchronous schema-maintenance API.
+const FailedBuildCampaign = struct {
+    table_ids: [profiles.len]u64 = undefined,
+    pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+        var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for (profiles, &self.table_ids) |profile, *retained_id| {
+            const namespace = try std.fmt.allocPrint(ctx.alloc, "failed_{s}", .{profile.namespace});
+            defer ctx.alloc.free(namespace);
+            const create_namespace = try std.fmt.allocPrint(ctx.alloc, "CREATE SCHEMA {s}", .{namespace});
+            defer ctx.alloc.free(create_namespace);
+            try command(ctx, "public", create_namespace);
+            try std.testing.expect((try relationOwner(ctx, namespace)) == null);
+            try command(ctx, namespace, "CREATE TABLE usage_records (id UUID PRIMARY KEY, email TEXT, tenant_id TEXT, status TEXT)");
+            const table_id = try owner(ctx, namespace);
+            retained_id.* = table_id;
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, table_id);
+            try waitEnforced(ctx, namespace);
+            const email = if (profile.nulls_not_distinct) "NULL" else "'owner@example.com'";
+            const inserts = try std.fmt.allocPrint(ctx.alloc, "INSERT INTO usage_records(id,email,tenant_id,status) VALUES('00000000-0000-0000-0000-000000000001',{s},'tenant-1','pending'),('00000000-0000-0000-0000-000000000002',{s},'tenant-2','pending')", .{ email, email });
+            defer ctx.alloc.free(inserts);
+            try command(ctx, namespace, inserts);
+            const before_rows = try snapshotRows(ctx, namespace);
+            defer ctx.alloc.free(before_rows);
+            const before_definition = try snapshotDefinition(ctx, namespace);
+            defer ctx.alloc.free(before_definition);
+            const original = try corpus.get(profile.id);
+            try std.testing.expectEqual(@as(usize, 0), original.params.len);
+            var response = try execute(ctx, namespace, original.sql, false);
+            defer response.deinit(ctx.alloc);
+            const state = try waitTerminalActivation(ctx, namespace);
+            const after_rows = try snapshotRows(ctx, namespace);
+            defer ctx.alloc.free(after_rows);
+            const after_definition = try snapshotDefinition(ctx, namespace);
+            defer ctx.alloc.free(after_definition);
+            if (response.status != 400) std.debug.print("regular unique-index failure case={s} state={s} same_rows={} same_definition={}\n", .{ profile.id, @tagName(state), std.mem.eql(u8, before_rows, after_rows), std.mem.eql(u8, before_definition, after_definition) });
+            try std.testing.expectEqualStrings(before_rows, after_rows);
+            try std.testing.expect(std.mem.eql(u8, before_definition, after_definition));
+            try std.testing.expectEqual(ConstraintState.enforced, state);
+            try expectRejected(ctx, response);
+            // The old owner and enforcement remain usable after a rejected
+            // build. Repair is an explicit new user operation, never replay.
+            try std.testing.expectEqual(table_id, try owner(ctx, namespace));
+            try waitEnforced(ctx, namespace);
+            try command(ctx, namespace, "DELETE FROM usage_records WHERE id='00000000-0000-0000-0000-000000000002'");
+            try command(ctx, namespace, original.sql);
+            try waitEnforced(ctx, namespace);
+            try std.testing.expectEqual(table_id, try owner(ctx, namespace));
+            try repairedPostimage(ctx, namespace, profile.nulls_not_distinct);
+        }
+    }
+    pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        for (profiles, self.table_ids) |profile, table_id| {
+            const namespace = try std.fmt.allocPrint(ctx.alloc, "failed_{s}", .{profile.namespace});
+            defer ctx.alloc.free(namespace);
+            try std.testing.expectEqual(table_id, try owner(ctx, namespace));
+            try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, table_id);
+            try waitEnforced(ctx, namespace);
+            try repairedPostimage(ctx, namespace, profile.nulls_not_distinct);
+            try rejected(ctx, namespace, if (profile.nulls_not_distinct) second_null else duplicate);
+            try repairedPostimage(ctx, namespace, profile.nulls_not_distinct);
+        }
+    }
+};
+
+fn repairedPostimage(ctx: *fixture.Context, namespace: []const u8, null_email: bool) !void {
+    const bytes = try snapshotRows(ctx, namespace);
+    defer ctx.alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, bytes, .{});
+    defer parsed.deinit();
+    const rows = (try fixture.field(parsed.value, "rows")).array.items;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const cells = rows[0].array.items;
+    try std.testing.expectEqual(@as(usize, 4), cells.len);
+    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", cells[0].string);
+    if (null_email) try std.testing.expect(cells[1] == .null) else try std.testing.expectEqualStrings("owner@example.com", cells[1].string);
+    try std.testing.expectEqualStrings("tenant-1", cells[2].string);
+    try std.testing.expectEqualStrings("pending", cells[3].string);
+}
+
+test "mounted SQL regular unique index build failure is atomic" {
+    try fixture.run(FailedBuildCampaign);
 }
