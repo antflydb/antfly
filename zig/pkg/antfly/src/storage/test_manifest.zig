@@ -83,6 +83,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_rewrite_tail_spool;
     _ = @import("relational_read_set.zig");
     _ = @import("antfly_local_sources").storage_statement_read_fence;
+    _ = @import("antfly_local_sources").storage_prepared_score_plan;
     _ = @import("antfly_local_sources").storage_range_protection;
     _ = @import("retained_read_registry.zig");
     _ = @import("antfly_local_sources").storage_row_identity;
@@ -349,7 +350,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_result_scratch;
-    _ = @import("antfly_local_sources").storage_prepared_score_plan;
     _ = @import("antfly_local_sources").storage_lite_reclamation;
     _ = @import("antfly_local_sources").storage_lite_restore_staging;
     _ = @import("antfly_local_sources").storage_lite_secret_store;

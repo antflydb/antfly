@@ -192,29 +192,13 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
         if (if_exists) return;
         return error.UndefinedTable;
     };
-    for (handle.table_handles.items) |id| {
-        const child, const slot = h.handle_registry.enter(id) orelse continue;
-        defer h.HandleRegistry.leave(slot);
-        // A child can still cache a pointer into a retired generation. That
-        // address may have been reused by an unrelated table after refresh.
-        if (child.selected_table_name) |selected_name| {
-            if (child.selected_table_id == table.id and std.mem.eql(u8, selected_name, name)) return error.SqlStatementReadUnavailable;
-        }
-    }
-    var sessions = handle.sql_sessions.valueIterator();
-    while (sessions.next()) |session| {
-        for (session.*.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.table.physical_name, name)) return error.SqlStatementReadUnavailable;
-        }
-    }
+    try ensureTableUnused(handle, name, table.id);
     if (table.db.core.identity_namespace.table_id != handle.db.core.identity_namespace.table_id) try checkDependency(handle, &handle.db, name);
     var others = handle.embedded_tables.valueIterator();
     while (others.next()) |other| {
         if (other.* == table) continue;
         try checkDependency(handle, &other.*.db, name);
     }
-    // A stream owns snapshots and borrows this table's runtime until close.
-    if (handle.sql_cursors.count() != 0) return error.SqlStatementReadUnavailable;
     // Retire outgoing FK generations at every parent before the namespace
     // becomes unreachable. A durable publication job also owns the final DROP.
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
@@ -236,9 +220,33 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
     try finishDrop(handle, name);
 }
 
+fn ensureTableUnused(handle: *h.Handle, name: []const u8, table_id: u64) !void {
+    if (handle.lite_connection_context) |connection| try connection.ensureOtherConnectionsCanDrop();
+    for (handle.table_handles.items) |id| {
+        const child, const slot = h.handle_registry.enter(id) orelse continue;
+        defer h.HandleRegistry.leave(slot);
+        // A child can still cache a pointer into a retired generation. That
+        // address may have been reused by an unrelated table after refresh.
+        if (child.selected_table_name) |selected_name| {
+            if (child.selected_table_id == table_id and std.mem.eql(u8, selected_name, name)) return error.SqlStatementReadUnavailable;
+        }
+    }
+    var sessions = handle.sql_sessions.valueIterator();
+    while (sessions.next()) |session| {
+        for (session.*.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table.physical_name, name)) return error.SqlStatementReadUnavailable;
+        }
+    }
+    // A stream owns snapshots and borrows this table's runtime until close.
+    if (handle.sql_cursors.count() != 0) return error.SqlStatementReadUnavailable;
+}
+
 /// Recovery calls this only after the exact outgoing generation retirement.
 pub fn finishDrop(handle: *h.Handle, name: []const u8) !void {
     const table = handle.embedded_tables.get(name) orelse return;
+    // Durable FK jobs can finish a drop during recovery on another connection.
+    // Recheck borrowed resources before retiring the shared table runtime.
+    try ensureTableUnused(handle, name, table.id);
     _ = handle.embedded_tables.remove(name);
     errdefer handle.embedded_tables.putAssumeCapacity(table.name, table);
     try persist(handle);

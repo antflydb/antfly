@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -95,6 +96,52 @@ void antfly_second(
                 {"antfly_first", "__dso_handle"},
             )
 
+    @unittest.skipUnless(shutil.which("zig"), "Zig compiler required")
+    def test_production_elf_helper_links_debug_with_lld(self):
+        zig_root = Path(__file__).resolve().parents[1]
+        for relative in (
+            "build_support/embedded/shared_library.zig",
+            "tools/capi_exports.py",
+        ):
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(zig_root / relative, destination)
+        header = self.root / "pkg/antfly-embedded/include/antfly.h"
+        header.parent.mkdir(parents=True)
+        shutil.copyfile(self.header, header)
+        (self.root / "probe.zig").write_text(
+            "export fn antfly_first() u32 { return 1; }\n"
+            "export fn antfly_second() void {}\n"
+            "export fn antfly_private_probe() u32 { return 2; }\n"
+        )
+        (self.root / "build.zig").write_text("""
+const std = @import("std");
+const shared_library = @import("build_support/embedded/shared_library.zig");
+pub fn build(b: *std.Build) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("probe.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+        .optimize = .Debug,
+    });
+    const library = shared_library.add(b, module);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(library.binary, .lib, "libantfly.so").step);
+}
+""")
+        result = subprocess.run(
+            [shutil.which("zig"), "build"],
+            cwd=self.root,
+            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(self.root / "global-cache")},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        library = self.root / "zig-out/lib/libantfly.so"
+        self.assertEqual(library.read_bytes()[:4], b"\x7fELF")
+        nm = shutil.which("llvm-nm")
+        if nm or platform.system() == "Linux":
+            exports.check(header, library, "elf", nm)
+
     @unittest.skipUnless(
         platform.system() in {"Darwin", "Linux"}
         and (shutil.which("clang") or shutil.which("cc"))
@@ -146,9 +193,14 @@ int termite_metal_buffer_alloc(void) { return 8; }
                     deployment="11.0",
                     exports=manifest,
                     output=library,
+                    map=self.root / "library.map",
                     archive=archive,
                     link_args=[str(object_file)],
                 )
+            )
+            self.assertIn(
+                "_antfly_abi_version",
+                (self.root / "library.map").read_text(errors="replace"),
             )
         else:
             subprocess.run(
