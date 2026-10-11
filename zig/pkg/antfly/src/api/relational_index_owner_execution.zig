@@ -88,6 +88,55 @@ pub const ClaimRequest = struct {
     group_id: u64,
     id: [16]u8,
     claims: @FieldType(native.ClaimCommand, "claims"),
+
+    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ClaimRequest {
+        const wire = try std.json.innerParse(struct { table_id: u64, group_id: u64, id: [16]u8, claims: native.ClaimCommand.BoundedClaims }, alloc, source, options);
+        return .{ .table_id = wire.table_id, .group_id = wire.group_id, .id = wire.id, .claims = wire.claims.items };
+    }
+
+    pub fn validate(self: ClaimRequest, group_id: u64) !void {
+        if (self.group_id != group_id) return error.GenerationPublicationChanged;
+        try (publication.OwnerRequest{ .table_id = self.table_id, .group_id = self.group_id, .id = self.id, .operation = .build }).validate();
+        try (native.ClaimCommand.BoundedClaims{ .items = self.claims }).validate();
+    }
+};
+
+/// Borrowed wire view; the owning ClaimResult must outlive serialization.
+/// A physical progress response is never a signed build-completion receipt.
+pub const ClaimResponse = union(enum) {
+    acknowledged,
+    applied: struct { root_generation: u64, outcome: native.ClaimOutcome },
+
+    pub fn validate(self: ClaimResponse, request: ClaimRequest) !void {
+        try request.validate(request.group_id);
+        switch (self) {
+            .acknowledged => {},
+            .applied => |value| {
+                const binding = value.outcome.binding;
+                if (value.root_generation == 0 or !std.mem.eql(u8, &binding.id, &request.id) or
+                    binding.fence.owner_group_id != request.group_id or binding.fence.namespace.table_id != request.table_id)
+                    return error.InvalidPrivateIndexClaimReceipt;
+                try value.outcome.validateFor(.{ .binding = binding, .claims = request.claims });
+            },
+        }
+    }
+};
+
+pub const ClaimPort = struct {
+    ptr: *anyopaque,
+    execute_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, ClaimRequest, operation.RequestContext) anyerror!ClaimResult,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const VTable = struct { execute_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, ClaimRequest, operation.RequestContext) anyerror!ClaimResult };
+    const BoundaryAbi = local.runtime_callback_abi.Boundary(VTable);
+
+    pub fn execute(self: ClaimPort, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: ClaimRequest, context: operation.RequestContext) !ClaimResult {
+        try context.ensureActive();
+        try request.validate(group_id);
+        var result = try BoundaryAbi.call("execute_fn", self.boundary_dispatch, self.execute_fn, .{ self.ptr, alloc, table_name, group_id, request, context });
+        errdefer result.deinit();
+        try result.response().validate(request);
+        return result;
+    }
 };
 
 pub const ClaimResult = union(enum) {
@@ -104,6 +153,13 @@ pub const ClaimResult = union(enum) {
         }
         self.* = undefined;
     }
+
+    pub fn response(self: *const ClaimResult) ClaimResponse {
+        return switch (self.*) {
+            .acknowledged => .acknowledged,
+            .applied => |value| .{ .applied = .{ .root_generation = value.root_generation, .outcome = value.outcome.value } },
+        };
+    }
 };
 
 /// One bounded batch under freshly observed build permission. This is an
@@ -111,6 +167,7 @@ pub const ClaimResult = union(enum) {
 /// build acknowledgement. Local apply still fences cancellation atomically.
 pub fn claimStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: ClaimRequest, context: operation.RequestContext) !ClaimResult {
     try context.ensureActive();
+    try request.validate(request.group_id);
     const lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build };
     try lookup.validate();
     if (table_name.len == 0) return error.InvalidGenerationPublication;

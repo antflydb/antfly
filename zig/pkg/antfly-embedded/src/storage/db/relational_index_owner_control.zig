@@ -84,8 +84,21 @@ pub const ClaimCommand = struct {
         return .{ .binding = wire.binding, .claims = wire.claims.items };
     }
 
-    const BoundedClaims = struct {
+    /// Shared bounded decoding for physical control and identity-only RPCs.
+    pub const BoundedClaims = struct {
         items: []const integrity.Claim,
+
+        pub fn validate(self: BoundedClaims) !void {
+            if (self.items.len == 0 or self.items.len > private_claims.max_claims) return error.InvalidPrivateIndexClaimInventory;
+            var bytes: usize = 0;
+            for (self.items) |claim| {
+                if (claim.state != .live or claim.action != .restrict or claim.target_tuple != null or
+                    !std.mem.allEqual(u8, &claim.action_id, 0)) return error.InvalidPrivateIndexClaimInventory;
+                bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.TransactionTooLarge;
+                for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+            }
+            if (bytes > private_claims.max_bytes) return error.TransactionTooLarge;
+        }
 
         pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !BoundedClaims {
             if (try source.next() != .array_begin) return error.UnexpectedToken;
@@ -111,16 +124,11 @@ pub const ClaimCommand = struct {
 
     pub fn validate(self: ClaimCommand) !void {
         _ = try self.binding.encode();
-        if (self.binding.authority != .native or self.binding.phase != .reserved or
-            self.claims.len == 0 or self.claims.len > private_claims.max_claims) return error.InvalidPrivateIndexClaimInventory;
-        var bytes: usize = 0;
+        if (self.binding.authority != .native or self.binding.phase != .reserved) return error.InvalidPrivateIndexClaimInventory;
+        try (BoundedClaims{ .items = self.claims }).validate();
         for (self.claims) |claim| {
-            if (claim.state != .live or claim.schema_version != self.binding.physical_candidate.schema_version or
-                claim.action != .restrict or claim.target_tuple != null or !std.mem.allEqual(u8, &claim.action_id, 0)) return error.InvalidPrivateIndexClaimInventory;
-            bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.TransactionTooLarge;
-            for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+            if (claim.schema_version != self.binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
         }
-        if (bytes > private_claims.max_bytes) return error.TransactionTooLarge;
     }
 };
 

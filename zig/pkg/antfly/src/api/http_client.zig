@@ -298,6 +298,39 @@ pub const EmptyResponse = struct {
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
 
+test "private index claim client requires service credentials preserves binary values and never replays conflicts" {
+    const alloc = std.testing.allocator;
+    const execution = @import("relational_index_owner_execution.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        status: u16 = 200,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/groups/7/tables/docs/relational-index-claims"));
+            var parsed = try std.json.parseFromSlice(execution.ClaimRequest, a, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("key\x00\xff", parsed.value.claims[0].tuple);
+            return .{ .status = self.status, .body = try a.dupe(u8, if (self.status == 200) "{\"acknowledged\":{}}" else "UniqueConstraintViolation") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+    const request: execution.ClaimRequest = .{ .table_id = 1, .group_id = 7, .id = @splat(3), .claims = &.{.{ .tuple = "key\x00\xff", .parent_table = "docs", .parent_key = "row", .schema_version = 2 }} };
+    try std.testing.expectError(error.Unauthorized, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "test");
+    var result = try client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{});
+    defer result.deinit();
+    try std.testing.expect(result.value == .acknowledged);
+    fixture.status = 409;
+    try std.testing.expectError(error.UniqueConstraintViolation, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectError(error.GenerationPublicationChanged, client.fetchRelationalIndexClaims("http://owner", 8, "docs", request, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
@@ -835,6 +868,47 @@ pub const ApiHttpClient = struct {
 
     pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
+    }
+
+    /// Owned physical progress; no automatic retry or build-completion ACK.
+    pub fn fetchRelationalIndexClaims(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+        const execution = @import("relational_index_owner_execution.zig");
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        if (self.internal_service == null) return error.Unauthorized;
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.relational_index_claims_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > native.max_claim_wire_bytes) return error.TransactionTooLarge;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            413 => return error.TransactionTooLarge,
+            409 => {
+                if (std.mem.eql(u8, response.body, "UniqueConstraintViolation")) return error.UniqueConstraintViolation;
+                return error.GenerationPublicationChanged;
+            },
+            400 => return error.InvalidGenerationPublication,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        if (response.body.len == 0 or response.body.len > 32 * 1024) return error.InvalidPrivateIndexClaimReceipt;
+        var parsed = try std.json.parseFromSlice(execution.ClaimResponse, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validate(request);
+        return parsed;
     }
 
     pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
