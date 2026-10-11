@@ -6766,6 +6766,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.prepared_score_plan.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
             "storage.typed_json.",

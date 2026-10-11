@@ -13,7 +13,7 @@ record the extraction sequence; current ownership is specified in
 ## Intended ownership
 
 - `zig/pkg/antfly-embedded`: embedded engine, local database and API surfaces,
-  Antfly inference provider adapters, C ABI, Lite CLI, shared local contracts,
+  Antfly Inference provider adapters, C ABI, Lite CLI, shared local contracts,
   and their build owner.
 - `zig/pkg/inference`: native inference engine, host, worker, and CLI.
 - `zig/pkg/antfly-server-api`: Apache generated admin/internal schemas and

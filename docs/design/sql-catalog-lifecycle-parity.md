@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `1258e8cfcb` (through #1080).
+at `d3bbb9a0c6` (including #1078).
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 

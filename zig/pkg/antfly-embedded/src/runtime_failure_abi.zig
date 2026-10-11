@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 62;
+pub const abi_version: u32 = 63;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -735,7 +735,8 @@ pub const Status = enum(u32) {
     invalid_generated_tool_arguments = 775,
     sql_feature_not_supported = 776,
     catalog_publication_proof_pending = 777,
-    catalog_occupancy_not_ready = 778,
+    seed_replica_policy_mismatch = 778,
+    catalog_occupancy_not_ready = 779,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -774,6 +775,12 @@ pub const FailureIdentity = extern struct {
         return self.error_name[0..@min(self.error_name_len, failure_error_name_capacity)];
     }
 };
+
+test "concurrent main and SQL statuses retain distinct wire identities" {
+    const std_test = @import("std");
+    try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.catalog_occupancy_not_ready));
+}
 
 test "released main Status identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(10_000);
