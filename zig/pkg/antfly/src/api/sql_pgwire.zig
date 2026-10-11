@@ -490,7 +490,8 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .lake_visibility = @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        try request.read_requirements.validate(.sql);
+        self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         if (self.native_adapter.runnable != null) {
             // Async closure borrows the connection's allocator and listener
             // adapter. A production session supplies the lifetime fence that
@@ -516,7 +517,10 @@ const OwnedRead = struct {
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
             self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
-            if (state.metadata.accepted_lake_reads) self.native_adapter.lake_visibility = .accepted;
+            if (state.metadata.accepted_lake_reads) {
+                if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
+                self.native_adapter.lake_visibility = .accepted;
+            }
             self.native_adapter.accepted_lake_repeatable = self.native_adapter.lake_visibility == .accepted and (state.metadata.isolation != .serializable or state.metadata.mode == .read_only);
             self.native_adapter.active_transaction = id;
             self.native_adapter.staged = &self.staged;
@@ -555,6 +559,11 @@ const OwnedRead = struct {
             alloc.destroy(self);
             return null;
         }
+        // Capture the admission budget before this owner outlives the request.
+        // A later statement can then reset its connection-owned budget safely.
+        if (request.read_receipt_budget) |budget| self.native_adapter.receipt_wait_budget = budget.*;
+        self.native_adapter.shared_receipt_wait_budget = null;
+        self.authority.request.read_receipt_budget = null;
         self.stream = opened.?;
         errdefer self.stream.close();
         if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
@@ -1056,6 +1065,8 @@ const Job = struct {
             .context = context,
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
+            .read_requirements = self.request.read_requirements,
+            .shared_receipt_wait_budget = self.request.read_receipt_budget,
             .lake_visibility = @fromBackingInt(@intCast(@backingInt(self.request.lake_visibility))),
             .ddl_search_path = if (self.request.search_path) |*path| path else null,
             .session_id = self.request.session_id,
@@ -1090,7 +1101,7 @@ const Job = struct {
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
-            var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
+            var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
@@ -1108,7 +1119,7 @@ const Job = struct {
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
+        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -1525,18 +1536,18 @@ const GuardedCatalog = struct {
         return .{ .ptr = owner, .cursors = cursors, .close = StatementRead.close };
     }
 
-    fn ddl(raw: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
+    fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         const dispatch_ddl = self.native.vtable.ddl orelse return error.UnsupportedSqlExecution;
         // Refresh current grants before native DDL authorizes resource, rename
         // destination and tablespace. Prepared metadata never grants authority.
-        var current = try self.authority.credential.identity(alloc);
-        defer current.deinit(alloc);
+        var current = try self.authority.credential.identity(allocators.scratch);
+        defer current.deinit(allocators.scratch);
         const prior = self.authority.identity.*;
         self.authority.identity.* = current;
         defer self.authority.identity.* = prior;
-        return dispatch_ddl(self.native.ptr, alloc, input);
+        return dispatch_ddl(self.native.ptr, allocators, input);
     }
 };
 

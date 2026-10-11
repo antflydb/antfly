@@ -4786,6 +4786,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    const standalone_ddl_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"system catalog standalone relation coordinator"},
+    });
+    b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
     // storage-kernel owner through api/kernel_owner_source.zig the same way
@@ -6594,11 +6600,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_rewrite_staging_test.",
             "storage.db.relational_rewrite_program.",
             "storage.db.relational_row_transform_test.",
+            "storage.db.relational_row_transform.",
+            "storage.db.relational_index_cover.",
             "storage.db.source_pin.",
             "storage.db.source_pin_gc.",
             "storage.db.source_publication_job.",
             "storage.db.mod.",
             "storage.db.native_backup.",
+            "storage.db.native_query_cut.",
+            "storage.db.native_query_cut_contract.",
+            "storage.db.native_query_remote_storage.",
+            "storage.db.native_query_warming.",
             "storage.db.snapshot_staging.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",

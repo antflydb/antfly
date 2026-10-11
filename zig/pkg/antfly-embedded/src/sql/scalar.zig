@@ -180,6 +180,12 @@ pub const Column = struct {
     /// They are binding metadata, never additional physical row values.
     aliases: []const []const u8 = &.{},
 };
+/// Resolve the SQL width of a direct column consistently for binding and
+/// persisted aggregate recipes. Untyped integer/number columns retain the
+/// same default widths as ordinary scalar expressions.
+pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
+    return element orelse (if (kind == .integer) arrays.ElementType.int64 else if (kind == .number) arrays.ElementType.float64 else null);
+}
 pub const BindLimits = struct {
     nodes: usize = 8192,
     depth: usize = 64,
@@ -2100,7 +2106,7 @@ const Binder = struct {
                     try modifier.validate();
                 }
                 if (column.type == .array and column.element_type == null) return error.InvalidSqlProgram;
-                break :blk .{ .kind = column.type, .nullable = column.nullable, .element_type = column.element_type orelse (if (column.type == .integer) arrays.ElementType.int64 else if (column.type == .number) arrays.ElementType.float64 else null), .numeric_modifier = column.numeric_modifier };
+                break :blk .{ .kind = column.type, .nullable = column.nullable, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
             },
             .cast => |cast| blk: {
                 if (cast.type == .array and cast.element_type == null) return error.InvalidSqlProgram;

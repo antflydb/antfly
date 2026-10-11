@@ -170,7 +170,7 @@ fn execute(a: A, handler: *handler_mod.AntflyApiHandler, sql: []const u8, tag: ?
 
 fn parent(kind: domain.Kind) u64 {
     return switch (kind) {
-        .database, .tablespace => 0,
+        .database, .tablespace, .query_source => 0,
         .namespace => domain.default_database_id,
         .table => domain.default_namespace_id,
     };

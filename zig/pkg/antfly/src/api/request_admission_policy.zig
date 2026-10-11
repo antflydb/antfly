@@ -36,6 +36,20 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "disconnectChatGPT", .class = .none },
     .{ .operation_id = "listChatGPTModels", .class = .none },
     .{ .operation_id = "administerSqlSettings", .class = .none },
+    // Saved sources are bounded catalog metadata; their execution is admitted
+    // by the query route that consumes them.
+    .{ .operation_id = "listQuerySources", .class = .none },
+    .{ .operation_id = "getQuerySource", .class = .none },
+    .{ .operation_id = "createQuerySource", .class = .none },
+    .{ .operation_id = "dropQuerySource", .class = .none },
+    .{ .operation_id = "getLakeCatalog", .class = .none },
+    .{ .operation_id = "getLakeCommitOutcome", .class = .none },
+    // Lake publication, change ingestion and maintenance perform durable
+    // object-store writes and share foreground mutation admission.
+    .{ .operation_id = "initializeLakeCatalog", .class = .write },
+    .{ .operation_id = "commitLakeCatalog", .class = .write },
+    .{ .operation_id = "ingestLakeChanges", .class = .write },
+    .{ .operation_id = "maintainLakeTable", .class = .write },
     .{ .operation_id = "listDatabases", .class = .none },
     .{ .operation_id = "getDatabase", .class = .none },
     .{ .operation_id = "createDatabase", .class = .none },

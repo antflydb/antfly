@@ -76,6 +76,8 @@ def test_generated_numeric_assignment_cast_preserves_builtin_identity():
     model = RelationalColumnExpression.from_dict(value)
     assert model.expression.op is RelationalExpressionOp.CAST
     assert model.expression.sql_type is SQLBuiltinType.INT16
+    assert isinstance(model.expression.args, list)
+    assert len(model.expression.args) == 1
     assert model.expression.args[0].sql_type is SQLBuiltinType.INT32
     assert model.to_dict() == value
 

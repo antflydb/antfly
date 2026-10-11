@@ -378,6 +378,8 @@ export type {
   QueryResult,
   QueryScoreDetails,
   QueryStrategy,
+  ReadReceipt,
+  ReadRequirements,
   RelationalColumnExpression,
   RelationalConstraintConflictReason,
   RelationalConstraintRangeStatus,
@@ -462,12 +464,12 @@ export type {
   SQLArrayValue,
   SQLBuiltinType,
   SQLColumn,
-  SQLNumericModifier,
   SQLColumnType,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
   SQLDiagnostic,
   SQLMutationOutcome,
+  SQLNumericModifier,
   SQLParameterDescriptor,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
@@ -506,6 +508,7 @@ export {
   queryHitsTotalValue,
   queryResultHitsTotal,
   queryResultTotalHits,
+  readAfterWrite,
 } from "./types.js";
 
 // Default export for convenience

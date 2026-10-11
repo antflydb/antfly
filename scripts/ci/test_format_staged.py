@@ -225,7 +225,17 @@ class StagedFormattingTests(unittest.TestCase):
         self.write(name, valid)
         self.git("add", "--", name)
         self.write(name, b"const value = 2;\n")
-        self.git("commit", "-qm", "licensed")
+        # This regression tests staged license ownership, independently of
+        # whether the SDK-only runner installs a Zig formatter.
+        tools = self.root / "tools"
+        tools.mkdir()
+        zig = tools / "zig"
+        zig.write_text("#!/bin/sh\nset -eu\n[ \"$*\" = 'fmt --stdin' ]\ncat\n")
+        zig.chmod(0o755)
+        with patch.dict(
+            os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}
+        ):
+            self.git("commit", "-qm", "licensed")
         self.assertEqual(self.git("show", f"HEAD:{name}"), valid)
         self.assertEqual((self.root / name).read_bytes(), b"const value = 2;\n")
 

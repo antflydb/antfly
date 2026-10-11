@@ -17,7 +17,6 @@
 
 import os
 from pathlib import Path
-import sys
 import time
 
 import pytest
@@ -33,13 +32,16 @@ from test_iceberg_sql import _export_table
 pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
 
 
-def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
+def test_hackernews_streaming_snapshots_roots_deletions_and_restart(
+    tmp_path, monkeypatch
+):
+    # The example imports its catalog lazily during publication and maintenance.
+    # Keep sibling modules available for the complete test, then restore sys.path.
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[3] / "examples/hackernews")
+    )
+    import ingest
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples/hackernews"))
-    try:
-        import ingest
-    finally:
-        sys.path.pop(0)
     directory = tmp_path / "state"
     directory.mkdir()
     warehouse = (tmp_path / "warehouse").as_uri()

@@ -148,14 +148,15 @@ pub const Session = struct {
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
-    lake_visibility: commands.LakeVisibility = .committed,
+    lake_visibility: commands.ReadRequirements = .{},
+    read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.LakeVisibility, lake_committed: commands.LakeVisibility } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.LakeVisibility, committed_lake: commands.LakeVisibility, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.ReadRequirements, lake_committed: commands.ReadRequirements } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.ReadRequirements, committed_lake: commands.ReadRequirements, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -501,6 +502,7 @@ pub const Session = struct {
         return .{
             .statement = statement,
             .completion_drain = self.completion_drain,
+            .scratch_allocator = self.alloc,
             .parameters = parameters,
             .parameter_types = types,
             .database = self.database,
@@ -508,7 +510,9 @@ pub const Session = struct {
             .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
-            .lake_visibility = self.lake_visibility,
+            .lake_visibility = if (self.lake_visibility.visibility == .accepted) .accepted else .committed,
+            .read_requirements = self.lake_visibility,
+            .read_receipt_budget = &self.read_receipt_budget,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -529,6 +533,8 @@ pub const Session = struct {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
                 .lake_visibility => |value| if (value == .show) &.{.{ .name = "antfly.lake_visibility", .type = .string }} else &.{},
+                .read_visibility => |value| if (value == .show) &.{.{ .name = "antfly.read_visibility", .type = .string }} else &.{},
+                .read_requirements => |value| if (value == .show) &.{.{ .name = "antfly.read_requirements", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
@@ -557,6 +563,34 @@ pub const Session = struct {
         return result;
     }
 
+    /// Recompile against the current catalog before an unstarted execution.
+    /// Preserve the client's fixed parameter/result contract; retain fresh
+    /// schema and settings guards so concurrent changes still fence admission.
+    /// Never call this for a suspended portal or an already admitted mutation.
+    fn cachedPlanChanged(self: *Session) anyerror {
+        self.diagnostic.set("0A000", "cached plan must not change result type", null, null);
+        return error.CachedPlanResultTypeChanged;
+    }
+
+    fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
+        const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
+        if (!cachedColumnsEqual(original.columns, current.columns) or
+            original.parameter_types.len != current.parameter_types.len)
+            return self.cachedPlanChanged();
+        for (original.parameter_types, current.parameter_types, 0..) |before, after, i| {
+            const before_oid = if (original.parameter_descriptors.len == original.parameter_types.len)
+                try values.parameterOid(original.parameter_descriptors[i])
+            else
+                try values.oid(before);
+            const after_oid = if (current.parameter_descriptors.len == current.parameter_types.len)
+                try values.parameterOid(current.parameter_descriptors[i])
+            else
+                try values.oid(after);
+            if (before_oid != after_oid) return self.cachedPlanChanged();
+        }
+        return current;
+    }
+
     fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
         return self.executeTyped(alloc, statement, parameters, types, &.{}, binding_guard, setting_epoch);
     }
@@ -567,7 +601,9 @@ pub const Session = struct {
             return switch (setting) {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
-                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value),
+                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.lake_visibility"),
+                .read_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.read_visibility"),
+                .read_requirements => |value| self.executeReadRequirementsSetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
@@ -724,13 +760,37 @@ pub const Session = struct {
         return result;
     }
 
-    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting) !backend.Result {
+    fn executeReadRequirementsSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ReadRequirementsSetting) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
         if (setting == .show) {
-            result.columns = &.{.{ .name = "antfly.lake_visibility", .type = .string }};
+            result.columns = &.{.{ .name = "antfly.read_requirements", .type = .string }};
             const row = try alloc.alloc(std.json.Value, 1);
-            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility)) };
+            row[0] = .{ .string = try std.json.Stringify.valueAlloc(alloc, self.lake_visibility, .{ .emit_null_optional_fields = false }) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.ReadRequirementsSetting{ .set = .{ .local = false, .value = .{} } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        try update.value.validate(.sql);
+        self.lake_visibility = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed = update.value;
+        };
+        return result;
+    }
+
+    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting, name: []const u8) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = name, .type = .string };
+            result.columns = columns;
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility.visibility orelse .committed)) };
             const rows = try alloc.alloc([]const std.json.Value, 1);
             rows[0] = row;
             result.rows = rows;
@@ -738,9 +798,9 @@ pub const Session = struct {
         }
         const update = if (setting == .reset) (commands.LakeVisibilitySetting{ .set = .{ .local = false, .value = .committed } }).set else setting.set;
         if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
-        self.lake_visibility = update.value;
+        self.lake_visibility.visibility = if (update.value == .accepted) .accepted else .committed;
         if (!update.local) if (self.timeout_transaction) |*settings| {
-            settings.lake_committed = update.value;
+            settings.lake_committed.visibility = self.lake_visibility.visibility;
         };
         return result;
     }
@@ -854,7 +914,7 @@ pub const Session = struct {
         self.statement_timeout = null;
         self.namespace_setting = null;
         self.application_name = .{};
-        self.lake_visibility = .committed;
+        self.lake_visibility = .{};
         if (self.catalog_settings) |*state| state.resetAll();
         // RESET ALL is a session-level change even inside a transaction.
         // Savepoint snapshots can still roll it back locally; a committed
@@ -863,7 +923,7 @@ pub const Session = struct {
             settings.committed = null;
             settings.namespace_committed = null;
             settings.application_committed = .{};
-            settings.lake_committed = .committed;
+            settings.lake_committed = .{};
         }
         return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
     }
@@ -890,6 +950,7 @@ pub const Session = struct {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
             'Q' => {
+                self.read_receipt_budget = .{};
                 const statement = try cursor.string();
                 try cursor.finish();
                 self.removePortal("");
@@ -973,6 +1034,13 @@ pub const Session = struct {
                 var transferred = false;
                 errdefer if (!transferred) self.destroyRetainedArena(arena);
                 const a = arena.allocator();
+                const previous_namespace = self.request_namespace;
+                const previous_search_path = self.request_search_path;
+                self.request_namespace = statement.namespace;
+                defer self.request_namespace = previous_namespace;
+                self.request_search_path = statement.search_path;
+                defer self.request_search_path = previous_search_path;
+                const current = try self.rebindCached(a, statement.statement, statement.description);
                 const format_count = try cursor.int(u16);
                 if (format_count > self.limits.parameters) return error.ProgramLimitExceeded;
                 const formats = try a.alloc(u16, format_count);
@@ -1004,11 +1072,11 @@ pub const Session = struct {
                 try cursor.finish();
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
-                    .columns = try cloneColumns(a, statement.description.columns),
+                    .columns = current.columns,
                     .parameter_types = types,
-                    .parameter_descriptors = try a.dupe(backend.Parameter, statement.description.parameter_descriptors),
-                    .binding_guard = if (statement.description.binding_guard) |guard| try a.dupe(u8, guard) else null,
-                    .setting_epoch = statement.description.setting_epoch,
+                    .parameter_descriptors = current.parameter_descriptors,
+                    .binding_guard = current.binding_guard,
+                    .setting_epoch = current.setting_epoch,
                 };
                 const owned_name = try (try self.retainedAllocator()).dupe(u8, name);
                 errdefer if (!transferred) self.retainedAlloc().free(owned_name);
@@ -1028,12 +1096,21 @@ pub const Session = struct {
                 switch (target) {
                     'S' => {
                         const prepared = self.prepared.get(name) orelse return error.InvalidStatementName;
+                        var arena = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena.deinit();
+                        const previous_namespace = self.request_namespace;
+                        const previous_search_path = self.request_search_path;
+                        self.request_namespace = prepared.namespace;
+                        defer self.request_namespace = previous_namespace;
+                        self.request_search_path = prepared.search_path;
+                        defer self.request_search_path = previous_search_path;
+                        const description = try self.rebindCached(arena.allocator(), prepared.statement, prepared.description);
                         var bytes = std.Io.Writer.Allocating.init(self.alloc);
                         defer bytes.deinit();
                         try bytes.writer.writeInt(u16, @intCast(prepared.parameter_oids.len), .big);
                         for (prepared.parameter_oids) |oid| try bytes.writer.writeInt(u32, oid, .big);
                         try self.message('t', bytes.written());
-                        try self.rowDescription(prepared.description.columns, &.{});
+                        try self.rowDescription(description.columns, &.{});
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
@@ -1061,6 +1138,8 @@ pub const Session = struct {
                     portal.stream = null;
                 };
                 if (!portal.stream_opened) {
+                    self.read_receipt_budget = .{};
+                    portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
                     if (self.source.vtable.open_stream) |open| if (!self.protectedControl(portal.statement) and try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
@@ -1169,18 +1248,19 @@ pub const Session = struct {
                 defer self.request_namespace = previous_namespace;
                 self.request_search_path = prepared.search_path;
                 defer self.request_search_path = previous_search_path;
-                if (execute_command.expressions.len != prepared.description.parameter_types.len) return error.InvalidParameter;
+                const description = try self.rebindCached(alloc, prepared.statement, prepared.description);
+                if (execute_command.expressions.len != description.parameter_types.len) return error.InvalidParameter;
                 const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
                 self.cancel_requested.store(false, .release);
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
-                var req = self.request(prepared.statement, &.{}, prepared.description.parameter_types);
-                req.parameter_descriptors = prepared.description.parameter_descriptors;
+                var req = self.request(prepared.statement, &.{}, description.parameter_types);
+                req.parameter_descriptors = description.parameter_descriptors;
                 try req.check();
                 const parameters = try evaluator(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
-                if (parameters.len != prepared.description.parameter_types.len) return error.InvalidParameter;
-                if (try self.simpleStreamParameters(prepared.statement, parameters, prepared.description.parameter_types, prepared.description.parameter_descriptors, prepared.description.binding_guard, prepared.description.setting_epoch)) return true;
-                var result = try self.executeTyped(alloc, prepared.statement, parameters, prepared.description.parameter_types, prepared.description.parameter_descriptors, prepared.description.binding_guard, prepared.description.setting_epoch);
+                if (parameters.len != description.parameter_types.len) return error.InvalidParameter;
+                if (try self.simpleStreamParameters(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch)) return true;
+                var result = try self.executeTyped(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch);
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
@@ -1817,6 +1897,13 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
     for (result) |*column| column.name = try alloc.dupe(u8, column.name);
     return result;
 }
+fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or
+        !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier)) return false;
+    return true;
+}
+
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
@@ -1832,6 +1919,12 @@ test "pgwire result shape fences array element identity across prepared and curs
     try std.testing.expect(!columnsEqual(&int4, &int8));
     try std.testing.expect(!columnsEqual(&int4, &missing));
     try std.testing.expect(!columnsEqual(&int4, &json));
+    try std.testing.expect(cachedColumnsEqual(&int4, &int4));
+    try std.testing.expect(!cachedColumnsEqual(&int4, &int8));
+    try std.testing.expect(!cachedColumnsEqual(&int4, &missing));
+    var renamed = int4;
+    renamed[0].name = "renamed";
+    try std.testing.expect(cachedColumnsEqual(&int4, &renamed));
 }
 
 test "pgwire NUMERIC result identity fences precision scale and unconstrained results" {
@@ -1840,8 +1933,10 @@ test "pgwire NUMERIC result identity fences precision scale and unconstrained re
     changed[0].numeric_modifier.?.scale = 1;
     try std.testing.expect(columnsEqual(&scalar, &scalar));
     try std.testing.expect(!columnsEqual(&scalar, &changed));
+    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
     changed[0].numeric_modifier = null;
     try std.testing.expect(!columnsEqual(&scalar, &changed));
+    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
 }
 
 test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
@@ -1879,6 +1974,10 @@ fn sqlstate(err: anyerror) []const u8 {
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
+        error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
+        error.UnsupportedReadVisibility => "0A000",
+        error.ReadRequirementNotReady => "53300",
+        error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
@@ -1896,7 +1995,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnsupportedEncoding => "22021",
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",
-        error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
+        error.CachedPlanResultTypeChanged, error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
         else => "XX000",
     };
 }

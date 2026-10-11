@@ -707,6 +707,7 @@ impl Default for types::CreateFullTextIndexRequest {
             field: None,
             mem_only: None,
             sources: None,
+            store_source: false,
             type_: types::CreateFullTextIndexRequestType::FullText,
             version: 0,
         }

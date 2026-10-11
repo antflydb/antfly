@@ -498,4 +498,12 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_source_proof_batch;
     _ = @import("antfly_local_sources").storage_projection_seal;
     _ = @import("antfly_local_sources").storage_retained_frame;
+    _ = @import("antfly_local_sources").storage_db_native_query_cut;
+    _ = @import("antfly_local_sources").storage_db_native_query_cut_contract;
+    _ = @import("antfly_local_sources").storage_db_native_query_remote_storage;
+    _ = @import("antfly_local_sources").storage_db_native_query_warming;
+    _ = @import("antfly_local_sources").storage_db_relational_index_cover;
+    _ = @import("antfly_local_sources").storage_db_relational_row_transform;
+    _ = @import("antfly_local_sources").storage_lsm_backend_recycling_workspace;
+    _ = @import("hot_standby/metadata_effect_probe.zig");
 }

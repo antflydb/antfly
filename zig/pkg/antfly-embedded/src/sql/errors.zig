@@ -67,6 +67,10 @@ pub fn notNull(context: ?*Context, name: []const u8) anyerror {
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
+        error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => .{ .code = "22023", .message = "The read requirements or write receipt do not match this table generation.", .retryable = false },
+        error.UnsupportedReadVisibility => .{ .code = "0A000", .message = "This execution path does not support the requested read visibility.", .retryable = false },
+        error.ReadRequirementNotReady => .{ .code = "53300", .message = "The requested write is not yet visible within the readiness budget.", .retryable = true },
+        error.ReadSnapshotTooOld => .{ .code = "40001", .message = "The transaction snapshot cannot include the requested write.", .hint = "Start a new transaction with the write receipt before its first read.", .retryable = false },
         error.InvalidDecisionSpecification, error.InvalidDeciderConfig => .{ .code = "22023", .message = "The decision specification is invalid.", .retryable = false },
         error.UnknownDecider => .{ .code = "42704", .message = "The configured decider does not exist.", .retryable = false },
         error.DecisionLimitExceeded => .{ .code = "54000", .message = "The decision evaluation budget was exceeded.", .retryable = false },

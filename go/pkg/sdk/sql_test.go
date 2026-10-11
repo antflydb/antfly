@@ -250,3 +250,29 @@ func TestPreparedSQLLifecycleAndTransportPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestReadRequirementsPreserveZeroWaitAndReceiptPrecision(t *testing.T) {
+	receipt := ReadReceipt{TableId: 9007199254740993, ObjectGeneration: 3, WalLsn: 10}
+	read := ReadAfterWrite(receipt, 0)
+	encoded, err := json.Marshal(SQLRequest{Statement: "SELECT 1", ReadRequirements: read})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	var actual struct {
+		AfterWrite ReadReceipt `json:"after_write"`
+		WaitMs     *uint32     `json:"wait_ms"`
+	}
+	if err := json.Unmarshal(decoded["read_requirements"], &actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual.AfterWrite != receipt || actual.WaitMs == nil || *actual.WaitMs != 0 {
+		t.Fatalf("lost receipt or zero wait: %s", encoded)
+	}
+	if _, ok := decoded["lake_visibility"]; ok {
+		t.Fatalf("unexpected legacy visibility: %s", encoded)
+	}
+}

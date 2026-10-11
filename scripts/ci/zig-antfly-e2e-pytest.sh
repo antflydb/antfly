@@ -61,8 +61,8 @@ if (( workers > 1 )); then
   # scheduled longest-first without exceeding the Antfly process budget.
   # Keep test identities visible even if the job is cancelled before pytest's
   # final summary; quiet progress dots hide the failing or stalled scenario.
-  exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" \
+  exec uv run --project e2e/antfly ${uv_extras[@]+"${uv_extras[@]}"} pytest -v --tb=short --continue-on-collection-errors ${report_args[@]+"${report_args[@]}"} \
     -n "$workers" --dist=loadgroup --e2e-process-slots "$process_slots" "$@"
 fi
 
-exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" "$@"
+exec uv run --project e2e/antfly ${uv_extras[@]+"${uv_extras[@]}"} pytest -v --tb=short --continue-on-collection-errors ${report_args[@]+"${report_args[@]}"} "$@"
