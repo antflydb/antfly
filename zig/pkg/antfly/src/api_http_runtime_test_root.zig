@@ -84,6 +84,8 @@ test {
     _ = @import("api/native_query_repository.zig");
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_text_query.zig");
+    _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_text_statistics.zig");
 }
 
 test {
