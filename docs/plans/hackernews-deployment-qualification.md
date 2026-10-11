@@ -336,3 +336,14 @@ state directory. Use regular capacity for reproducible timing runs. Before
 using Spot for resumable construction, persist authoritative catalog/checkpoint
 ownership and prove recovery in a replacement pod; remote derived artifacts
 alone are not sufficient.
+
+
+The follow-up now implements reviewed compute reconciliation in
+`archive_budget.py`. The six deleted pods release $59.072894 of excess reserved
+compute while retaining $10 per run for noncompute, all earlier/local holds and
+the original history. Recorded exposure is $90.927106. The reconciled follow-up
+plan permits two new $20 reservations, for at most $130.927106 held or recorded,
+under the unchanged $150 ceiling. No pending storage/networking hold was refunded.
+The broad cursor query is recorded separately as `the`; a physical count of the
+unchanged one-file source found only 854 bodies mentioning `database`, so the
+primary relevance query cannot qualify the intended cursor depth by itself.

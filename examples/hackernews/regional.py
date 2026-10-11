@@ -42,6 +42,10 @@ def compare_runs(reports):
         for hit in reference["first_response"]["hits"]["hits"]
     ]
     for report in reports[1:]:
+        if report.get("cursor_depth", {}).get("term") != reference.get(
+            "cursor_depth", {}
+        ).get("term"):
+            raise ValueError("Cursor workload differs between runs")
         for field in ("source", "row_count", "query", "concurrency"):
             if report[field] != reference[field]:
                 raise ValueError(f"Benchmark {field} differs between runs")
@@ -147,6 +151,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--cursor-pages", type=int, default=0)
+    parser.add_argument("--cursor-term")
     args = parser.parse_args()
     if len(set(args.modes)) != len(args.modes):
         parser.error("modes must not contain duplicates")
@@ -323,6 +328,8 @@ def main():
                 str(args.cursor_retention_ms),
             ]
             command.extend(["--cursor-pages", str(args.cursor_pages)])
+            if args.cursor_term:
+                command.extend(["--cursor-term", args.cursor_term])
             if args.workload_terms:
                 command.extend(["--workload-terms", *args.workload_terms])
             if mode == "text-only":

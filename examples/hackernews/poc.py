@@ -100,6 +100,9 @@ def main():
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument(
+        "--cursor-term", help="Separate broad query for deep cursor coverage"
+    )
+    parser.add_argument(
         "--bearer-stdin",
         action="store_true",
         help="Read a short-lived token from stdin instead of gcloud; never persist it",
@@ -469,19 +472,40 @@ def main():
         assert [h["_id"] for h in second["hits"]["hits"]] == [
             h["_id"] for h in hits[1:]
         ]
-        cursor_depth = {"hits": 1 + len(second["hits"]["hits"]), "samples_ms": []}
+        cursor_query = query
+        deep_snapshot = first_page["remote_snapshot"]
+        cursor_depth = {
+            "hits": 1 + len(second["hits"]["hits"]),
+            "samples_ms": [],
+            "term": term,
+        }
         deep_page = second
         seen = {h["_id"] for h in first_page["hits"]["hits"] + second["hits"]["hits"]}
+        if args.cursor_term:
+            cursor_query = dict(
+                query, full_text_search={"match": args.cursor_term, "field": "body"}
+            )
+            deep_page, initial_ms = timed_query(
+                dict(cursor_query, limit=128), "cursor_initial"
+            )
+            deep_snapshot = deep_page["remote_snapshot"]
+            seen = {h["_id"] for h in deep_page["hits"]["hits"]}
+            cursor_depth = {
+                "hits": len(seen),
+                "samples_ms": [],
+                "term": args.cursor_term,
+                "initial_ms": initial_ms,
+            }
         deep_request = None
         deep_signature = None
         for _ in range(args.cursor_pages):
             if not deep_page["hits"]["hits"]:
                 break
             deep_request = dict(
-                query,
+                cursor_query,
                 limit=128,
                 search_after=deep_page["hits"]["hits"][-1]["_sort"],
-                remote_snapshot=first_page["remote_snapshot"],
+                remote_snapshot=deep_snapshot,
             )
             deep_page, elapsed = timed_query(deep_request, "cursor_depth")
             deep_signature = [

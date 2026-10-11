@@ -20,9 +20,11 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location(
     "hn_archive", ROOT / "archive_qualification.py"
 )
@@ -91,6 +93,13 @@ class ArchiveQualificationTest(unittest.TestCase):
         self.regional["runs"]["indexed"][0]["concurrent_search_ms"] = [100]
         self.regional["runs"]["indexed"][0]["warm_samples_ms"] = [100]
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+
+    def test_deep_cursor_workload_cannot_silently_change(self):
+        self.config["cursor_term"] = "the"
+        self.assertFalse(archive.assess(self.regional, self.config)["passed"])
+        for report in self.regional["runs"]["indexed"]:
+            report["cursor_depth"]["term"] = "the"
+        self.assertTrue(archive.assess(self.regional, self.config)["passed"])
 
     def test_registration_is_part_of_the_initial_publication_gate(self):
         self.regional["runs"]["indexed"][0]["registration_seconds"] = 3000

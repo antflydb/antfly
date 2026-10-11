@@ -16,9 +16,9 @@
 
 """Plan and qualify a pinned HN archive with budget reservations and release gates.
 
-Default is a local dry run. Execution reserves its entire allowance permanently,
-including failed/interrupted attempts, and invokes the regional temporary pod.
-Reservations bound approved work, not GCP's delayed billing meter.
+Default is a local dry run. Execution reserves an allowance, including for
+failed/interrupted attempts, and invokes the regional temporary pod. Reviewed
+compute reconciliation retains pending noncompute holds and original history.
 """
 
 import argparse
@@ -32,6 +32,8 @@ import subprocess
 import sys
 import time
 import uuid
+
+from archive_budget import exposure, money
 
 REQUIRED_CHECKS = {
     "remote_bm25",
@@ -53,7 +55,22 @@ def percentile(values, fraction=0.95):
     return sorted(values)[math.ceil(len(values) * fraction) - 1]
 
 
-def plan(config, inventory):
+def plan(config, inventory, ledger=None):
+    r, b = config["resources"], config["budget"]
+    if ledger is not None:
+        previous = ledger["budget"]
+        if ledger["project"] != config["project"] or {
+            k: v for k, v in previous.items() if k != "max_runs"
+        } != {k: v for k, v in b.items() if k != "max_runs"}:
+            raise ValueError("Existing ledger budget differs")
+        if b["max_runs"] < previous["max_runs"]:
+            raise ValueError("Retry extension cannot erase prior limits")
+        held = exposure(ledger)
+        future_runs = max(0, b["max_runs"] - len(ledger["runs"]))
+    else:
+        held = b["prior_work_reserved_usd"]
+        future_runs = b["max_runs"]
+    planned = money(held) + future_runs * money(b["reservation_per_run_usd"])
     if (
         config["project"] != inventory["project"]
         or config["bucket"] != inventory["bucket"]
@@ -74,7 +91,6 @@ def plan(config, inventory):
         not o.get("generation") or not o.get("crc32c") for o in inventory["objects"]
     ):
         raise ValueError("Inventory lacks immutable object identities")
-    r, b = config["resources"], config["budget"]
     if (
         r["cpu"] <= 0
         or r["memory_gib"] <= 0
@@ -103,23 +119,24 @@ def plan(config, inventory):
         or b["prior_work_reserved_usd"] < 0
         or b["ceiling_usd"] > 150
         or b["ceiling_usd"] <= 0
-        or b["prior_work_reserved_usd"] + b["max_runs"] * b["reservation_per_run_usd"]
-        > b["ceiling_usd"]
+        or planned > money(b["ceiling_usd"])
     ):
         raise ValueError("Plan exceeds approved $150 ceiling")
     return {
         "compute_upper_estimate_usd": round(compute, 4),
         "run_estimate_with_allowance_usd": round(estimate, 4),
         "reservation_usd": b["reservation_per_run_usd"],
-        "planned_total_reserved_usd": b["prior_work_reserved_usd"]
-        + b["max_runs"] * b["reservation_per_run_usd"],
+        "planned_total_reserved_usd": float(planned),
+        "current_exposure_usd": held,
         "note": "Same-region reads; existing export reused. Actual billing and GCS operations must be reconciled separately.",
     }
 
 
 def reserve(ledger_path, config, run_id, *, extend_run_limit=False):
-    """Serialize attempts; never refund failed work or overwrite an existing budget."""
+    """Serialize attempts; preserve history and settle only reviewed compute."""
     b = config["budget"]
+    if not 0 < money(b["ceiling_usd"]) <= 150:
+        raise ValueError("Plan exceeds approved $150 ceiling")
     with os.fdopen(os.open(ledger_path, os.O_RDWR | os.O_CREAT, 0o600), "r+") as file:
         fcntl.flock(file, fcntl.LOCK_EX)
         file.seek(0)
@@ -157,12 +174,11 @@ def reserve(ledger_path, config, run_id, *, extend_run_limit=False):
             raise ValueError(
                 "Run limit exhausted; review recorded attempts before retrying"
             )
-        reserved = b["prior_work_reserved_usd"] + sum(
-            r["reserved_usd"]
-            for lane in ("runs", "local_diagnostics")
-            for r in ledger.get(lane, [])
-        )
-        if reserved + b["reservation_per_run_usd"] > b["ceiling_usd"]:
+        if any(r["id"] == run_id for r in ledger["runs"]):
+            raise ValueError("Duplicate run identity")
+        if money(exposure(ledger)) + money(b["reservation_per_run_usd"]) > money(
+            b["ceiling_usd"]
+        ):
             raise ValueError("Budget exhausted")
         ledger["runs"].append(
             {
@@ -237,6 +253,13 @@ def assess(regional, config):
                         f"{label}: workload {term} exceeds sample/latency gate"
                     )
             cursor_depth = report.get("cursor_depth", {})
+            if (
+                config.get("cursor_term")
+                and cursor_depth.get("term") != config["cursor_term"]
+            ):
+                failures.append(
+                    f"{label}: cursor workload differs from configured term"
+                )
             if cursor_depth.get("hits", 0) < c[
                 "cursor_min_hits"
             ] or not cursor_depth.get("samples_ms"):
@@ -285,7 +308,8 @@ def main():
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     inventory = json.loads(args.inventory.read_text())
-    estimate = plan(config, inventory)
+    ledger = json.loads(args.ledger.read_text()) if args.ledger.exists() else None
+    estimate = plan(config, inventory, ledger)
     run_id = "hn-poc/archive-qualification/" + uuid.uuid4().hex
     r = config["resources"]
     command = [
@@ -323,6 +347,8 @@ def main():
     ):
         command.extend(["--" + flag, str(config[key])])
     command.extend(["--cursor-pages", str(config["cursor_pages"])])
+    if config.get("cursor_term"):
+        command.extend(["--cursor-term", config["cursor_term"]])
     command.extend(
         [
             "--cursor-retention-ms",
@@ -342,7 +368,13 @@ def main():
             binary_digest.update(chunk)
     harness_digests = {
         name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ("archive_qualification.py", "regional.py", "poc.py")
+        for name in (
+            "archive_qualification.py",
+            "archive_budget.py",
+            "archive_inventory.py",
+            "regional.py",
+            "poc.py",
+        )
     }
     # Check live object versions before spending a run reservation. The regional
     # engine separately fences source/publication versions during serving.

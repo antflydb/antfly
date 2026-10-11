@@ -729,3 +729,33 @@ reading pages through GCS. Complete GCS publication remains unverified; this
 sample does not attribute all elapsed time or qualify regional performance.
 All 2,265 artifacts were generation-deleted after the builder stopped; the
 original archive source was preserved.
+
+
+### Reconciled follow-up admission
+
+Completed pod compute can be reconciled from a reviewed detailed billing export
+without erasing original reservations or failed attempts:
+
+```sh
+python examples/hackernews/archive_budget.py \
+  --ledger /private/tmp/hn-archive-budget.json \
+  --evidence examples/hackernews/archive-reconciliation-20261011.json
+```
+
+Evidence must identify a deleted pod, the matching ledger run, closure and export
+coverage timestamps, gross CPU/memory/ephemeral-storage charges, and the retained
+noncompute allowance. Promotion credits do not reduce exposure. Repeated evidence
+is idempotent, costs cannot decrease, and unsettled local diagnostics still count.
+The October 11 reconciliation releases $59.072894 in excess compute reservations,
+leaving $90.927106 held or recorded, including $60 for the six runs' unexported or
+shared noncompute costs, $25 for earlier work and $5 for local diagnostics.
+
+Use `archive-qualification-followup.json` with the same reconciled ledger and
+`--extend-run-limit` for two additional attempts within the original $150 ceiling.
+Its plan includes prior reconciled exposure; it must not be admitted against a
+fresh ledger. Original attempts and extension records remain auditable.
+The deep cursor workload explicitly uses `the`: the one-file source only has
+roughly 854 bodies containing `database`, insufficient for the 4,097-hit gate.
+Relevance and shallow pagination still use the primary query. Deep pages and their
+restart continuation use the broad query's own retained snapshot. Reports record
+the cursor term and comparisons reject differing cursor workloads.
