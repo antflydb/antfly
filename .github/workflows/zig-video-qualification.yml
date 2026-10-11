@@ -44,6 +44,8 @@ jobs:
           python -m pip install 'torch==2.10.0' 'torchvision==0.25.0' --index-url https://download.pytorch.org/whl/cpu
           python -m pip install 'Pillow==12.3.0' 'numpy==2.2.6' 'transformers @ https://github.com/huggingface/transformers/archive/92cd495f2720c064bc78eb2d93e28704c5bce51f.zip'
           mkdir -p .benchmark-results/video-linux
+          uname -a > .benchmark-results/video-linux/kernel.txt
+          uname -m > .benchmark-results/video-linux/architecture.txt
           zig version > .benchmark-results/video-linux/zig-version.txt
           ffmpeg -version > .benchmark-results/video-linux/ffmpeg-version.txt
           python -m pip freeze > .benchmark-results/video-linux/python-packages.txt
@@ -85,6 +87,32 @@ jobs:
             --binary .benchmark-results/video-linux/install/bin/antfly-inference \
             --reference .benchmark-results/video-linux/webm-pytorch-cpu.json \
             --output .benchmark-results/video-linux/webm-request-recovery.json
+      - name: Qualify logical pictures, explicit windows and requested dimensions
+        run: |
+          python tools/embeddinggemma2/video_compare.py --backend cpu \
+            --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --warmups 0 --iterations 1 \
+            --output .benchmark-results/video-linux/sampling-pytorch-cpu.json
+          python tools/embeddinggemma2/video_compare.py --backend native \
+            --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
+            --warmups 0 --iterations 1 --sustained-rounds 1 \
+            --output .benchmark-results/video-linux/sampling-native.json
+          python tools/embeddinggemma2/video_sampling_errors.py --backend native \
+            --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
+            --output .benchmark-results/video-linux/sampling-errors.json
+          python tools/embeddinggemma2/video_resident_qualification.py --backend native \
+            --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+            --model-dir .benchmark-assets/video-linux/model \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
+            --output .benchmark-results/video-linux/dimensions-native.json
       - name: Qualify positive pretrained display and HDR rendering
         run: |
           python tools/embeddinggemma2/video_render_qualification.py \
