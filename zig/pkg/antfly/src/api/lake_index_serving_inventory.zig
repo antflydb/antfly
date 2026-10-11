@@ -410,3 +410,42 @@ test "external lake selected compact inventory seeks file partitions and retains
     try std.testing.expect(empty.partial_inventory and empty.file_groups.len == 0 and empty.segments.len == 0);
     try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadSelected(ca, a, root, store, cached, .none, &.{@splat(9)}));
 }
+
+/// Recovery visits one compact file route at a time. It never opens a combined
+/// maintenance manifest or retains an archive's detailed admission metadata.
+pub fn walkRoutes(a: A, directory: corpus.Root, store_value: stores.ArtifactStore, cancellation: Cancellation, visitor: anytype) !void {
+    var store = store_value;
+    var reads: u64 = 128 * 1024 * 1024;
+    var writes: u64 = 0;
+    var pages: pages_mod.PageStore = .{ .domain = directory.domain, .artifacts = &store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var cursor = try tree.Cursor.init(a, pages.store(), directory.serving_routes, "", null);
+    defer cursor.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var digest: ?[32]u8 = null;
+    var files: usize = 0;
+    while (try cursor.next()) |record| {
+        try visitor.check();
+        if (record.key.len != 36 or record.value.len == 0 or record.value.len > chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+        const current: [32]u8 = record.key[0..32].*;
+        if (digest != null and !std.mem.eql(u8, &digest.?, &current)) {
+            try visitRoute(a, bytes.items, visitor);
+            files += 1;
+            bytes.clearRetainingCapacity();
+        }
+        digest = current;
+        if (std.mem.readInt(u32, record.key[32..36], .big) != bytes.items.len or record.value.len > corpus.max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+        try bytes.appendSlice(a, record.value);
+    }
+    if (digest != null) {
+        try visitRoute(a, bytes.items, visitor);
+        files += 1;
+    }
+    if (files != directory.file_count) return error.InvalidNativeLakeTextCorpus;
+}
+fn visitRoute(a: A, bytes: []const u8, visitor: anytype) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const route = try std.json.parseFromSliceLeaky(FileRouting, arena.allocator(), bytes, .{ .allocate = .alloc_always });
+    try visitor.route(route);
+}

@@ -224,7 +224,7 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     var progress: Progress = .{ .collector = collector, .a = a, .work_a = budget.allocator(), .value = value, .pages = &pages, .page_cache = &page_cache, .old_end = value.end, .previous = if (collection.progress) |ref| ref.artifact_id else null };
     collector.progress = &progress;
     defer collector.progress = null;
-    if (collection.progress == null) for (state.publications) |publication| {
+    if (collection.progress == null) for (try state.gcPublications(a)) |publication| {
         if (!std.meta.eql(publication.namespace, collector.namespace) or !std.mem.eql(u8, &publication.signature.store, &collector.identity)) continue;
         const retired = for (collection.retired) |generation| {
             if (generation == publication.generation) break true;

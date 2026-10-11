@@ -51,7 +51,7 @@ pub const Cursor = struct {
         pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
-        decoded: ?parquet.OwnedBatch = null,
+        decoded: ?parquet.OwnedColumns = null,
         cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
         dictionary_lease: ?@import("lake_decoded_cache.zig").Lease = null,
@@ -221,7 +221,7 @@ pub const Cursor = struct {
                     var admission = self.limits;
                     admission.max_rows = @max(admission.max_rows, parsed.header.value_count);
                     admission.max_struct_allocation_bytes /= share;
-                    _ = try parquet.admitMaterialization(parsed.header.value_count, 1, admission);
+                    _ = try parquet.admitColumnMaterialization(parsed.header.value_count, 1, admission);
                     column.cached = lease;
                     column.offset += len;
                     column.count = parsed.header.value_count;
@@ -297,7 +297,7 @@ pub const Cursor = struct {
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
                         const cursor = value.cursor;
-                        const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
+                        const decoded = try parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
                         item.payload = .{ .columns = decoded.columns };
                         if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                     }
@@ -308,7 +308,7 @@ pub const Cursor = struct {
                 // Cursor-owned dictionaries outlive every uncached page. Only
                 // cache publication needs an independently retained dependency.
                 limits.borrow_dictionary = true;
-                column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                column.decoded = try parquet.buildSupportedColumnsAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
             }
             column.count = count;
             column.consumed = @intCast(self.position - column.first);

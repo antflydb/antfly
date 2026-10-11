@@ -82,7 +82,9 @@ pub const Collector = struct {
         defer scratch.deinit();
         // Every non-retired generation is a root, including long-lived reader
         // and builder sessions. Reused roots retain their original upload IDs.
-        for (state.publications) |publication| {
+        const roots = try state.gcPublications(self.a);
+        defer self.a.free(roots);
+        for (roots) |publication| {
             if (!std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &self.identity)) continue;
             const retired = for (collection.retired) |generation| {
                 if (generation == publication.generation) break true;

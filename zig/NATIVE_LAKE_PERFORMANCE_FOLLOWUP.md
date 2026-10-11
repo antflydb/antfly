@@ -2183,3 +2183,24 @@ text scoring and cursors, incremental artifact reuse, and the wide typed join.
 The 2,048-file catalog initially writes 64 pages; replacing one file changes
 three pages and reads five, while two identity lookups read four pages. Formatting,
 Python syntax, license headers, source boundaries, and diff checks pass.
+
+Main integration through `1258e8cfcb` retains bounded per-file replay, durable
+construction checkpoints and damaged-artifact recovery. Text DF deltas apply
+once per completed file; checkpoint manifests describe exactly those totals.
+Final version-3 publication reuses those completed manifests and adds paged
+routes and term contribution directories. Retained-artifact recovery streams
+compact routes one file at a time, validates independent descriptors and
+physical bitmaps, and checks seekable packs without reopening unchanged
+combined maintenance manifests. Recovery still checks retained metadata and
+pack existence across the retained corpus. Ordered checkpoints retain shared
+spill extents and the common 4 MiB workspace, with direct reverse construction
+for the initial file and bounded COW updates for subsequent files.
+
+Qualification after this main merge passes 342 lake checks (138 shared, 204 API)
+with no allocator leaks, builds the production CLI, and passes all eight selected
+real Parquet/Iceberg E2Es in 72.95 seconds. The recovery matrix additionally covers
+missing independent segment and physical descriptors and preserves completed
+file identities across resume. Formatting, Python syntax, license headers, the
+Apache product boundary and diff checks pass. The legacy lexical boundary
+analyzer stops at obsolete storage paths that moved to the embedded package;
+its unchanged full audit cannot complete.

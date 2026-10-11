@@ -23,6 +23,7 @@ The pod is removed in finally and has a hard lifetime if the caller disconnects.
 
 import argparse
 import hashlib
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -50,12 +51,61 @@ def compare_runs(reports):
         ]
         if actual != expected:
             raise ValueError("Ranked HN IDs/scores changed between runs")
+        expected_workloads = reference.get("workloads", {})
+        if report.get("workloads", {}).keys() != expected_workloads.keys():
+            raise ValueError("Workload coverage differs between runs")
+        for term, result in expected_workloads.items():
+            actual_workload = report["workloads"][term]
+            if any(
+                actual_workload[field] != result[field]
+                for field in ("total", "top_hits")
+            ):
+                raise ValueError(f"Workload results differ for {term}")
         expected_filters = reference["metadata_filters"]
         if report["metadata_filters"].keys() != expected_filters.keys():
             raise ValueError("Filter coverage differs between runs")
         for name, result in expected_filters.items():
             if report["metadata_filters"][name]["total"] != result["total"]:
                 raise ValueError(f"Exact filter total differs for {name}")
+
+
+def fresh_bearer_for_lifetime(invoke, project, required_seconds, *, now=None):
+    """Keep one admitted token in memory for the worker's bounded lifetime."""
+    completed = invoke(
+        [
+            "gcloud",
+            "config",
+            "config-helper",
+            "--force-auth-refresh",
+            "--project",
+            project,
+            "--format=json(credential.access_token,credential.token_expiry)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        credential = json.loads(completed.stdout)["credential"]
+        token = credential["access_token"]
+        expiry = datetime.fromisoformat(
+            credential["token_expiry"].replace("Z", "+00:00")
+        )
+        if (
+            not isinstance(token, str)
+            or not 0 < len(token) <= 65536
+            or expiry.tzinfo is None
+        ):
+            raise ValueError("Invalid credential metadata")
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise RuntimeError("Cannot admit bounded credential lifetime") from None
+    remaining = (expiry - (now or datetime.now(timezone.utc))).total_seconds()
+    if remaining < required_seconds:
+        raise RuntimeError("Credential expires before the worker hard deadline")
+    return token, {
+        "expires_at": expiry.isoformat(),
+        "remaining_seconds": round(remaining, 2),
+        "required_seconds": round(required_seconds, 2),
+    }
 
 
 def main():
@@ -95,6 +145,8 @@ def main():
     parser.add_argument("--memory", default="8Gi")
     parser.add_argument("--disk", default="4Gi")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--workload-terms", nargs="+", default=[])
+    parser.add_argument("--cursor-pages", type=int, default=0)
     args = parser.parse_args()
     if len(set(args.modes)) != len(args.modes):
         parser.error("modes must not contain duplicates")
@@ -208,6 +260,7 @@ def main():
                 text=True,
             ).stdout
         )
+        (args.output / "worker.json").write_text(json.dumps(worker, indent=2) + "\n")
         run(kubectl + ["exec", pod_name, "--", "mkdir", "-p", "/workspace"])
         run(kubectl + ["cp", str(args.binary), pod_name + ":/workspace/antfly"])
         run(
@@ -219,6 +272,21 @@ def main():
             ]
         )
         run(kubectl + ["exec", pod_name, "--", "chmod", "+x", "/workspace/antfly"])
+        worker_start = datetime.fromisoformat(
+            worker["status"]["startTime"].replace("Z", "+00:00")
+        )
+        remaining_lifetime = max(
+            0,
+            args.lifetime - (datetime.now(timezone.utc) - worker_start).total_seconds(),
+        )
+        token, credential_admission = fresh_bearer_for_lifetime(
+            run, args.project, remaining_lifetime + 30
+        )
+        (args.output / "credential-admission.json").write_text(
+            json.dumps(credential_admission, indent=2) + "\n"
+        )
+        # Reuse this admitted token across cycles. Rotating a bearer also changes
+        # the publication's credential identity and would force a rebuild.
         reports = {}
         for mode in args.modes:
             command = kubectl + [
@@ -254,17 +322,14 @@ def main():
                 "--cursor-retention-ms",
                 str(args.cursor_retention_ms),
             ]
+            command.extend(["--cursor-pages", str(args.cursor_pages)])
+            if args.workload_terms:
+                command.extend(["--workload-terms", *args.workload_terms])
             if mode == "text-only":
                 command.append("--text-only")
             reports[mode] = []
             for cycle in range(args.cycles):
                 label = mode + "-" + str(cycle + 1)
-                # Refresh for each cycle; OAuth credentials stay in memory.
-                token = run(
-                    ["gcloud", "auth", "print-access-token", "--project", args.project],
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
                 with (args.output / (label + ".log")).open("w") as log:
                     completed = subprocess.run(
                         command,
@@ -275,6 +340,17 @@ def main():
                         stderr=subprocess.STDOUT,
                     )
                 if completed.returncode:
+                    subprocess.run(
+                        kubectl
+                        + [
+                            "cp",
+                            pod_name + ":/workspace/" + mode + "/failure.json",
+                            str(args.output / (label + "-failure.json")),
+                        ],
+                        env=env,
+                        check=False,
+                        capture_output=True,
+                    )
                     run(
                         kubectl
                         + [
@@ -320,6 +396,7 @@ def main():
             "node": worker["spec"]["nodeName"],
             "resources": worker["spec"]["containers"][0]["resources"],
             "image": SDK_IMAGE,
+            "credential_admission": credential_admission,
             "revision": args.revision,
             "binary_sha256": digest.hexdigest(),
             "runs": reports,
@@ -330,13 +407,25 @@ def main():
         }
         (args.output / "regional.json").write_text(json.dumps(report, indent=2) + "\n")
     finally:
+        cleanup = {"pod": pod_name, "created": created, "deleted": not created}
         try:
             if created:
                 run(
                     kubectl
-                    + ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
+                    + [
+                        "delete",
+                        "pod",
+                        pod_name,
+                        "--wait=true",
+                        "--timeout=60s",
+                        "--ignore-not-found",
+                    ]
                 )
+                cleanup["deleted"] = True
         finally:
+            (args.output / "cleanup.json").write_text(
+                json.dumps(cleanup, indent=2) + "\n"
+            )
             credentials.cleanup()
 
 
