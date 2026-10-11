@@ -20,6 +20,16 @@
 
 const std = @import("std");
 
+/// Canonical declaration identity, streamed without an intermediate JSON copy.
+/// This is separate from typed comparison identity and from a physical tuple ID.
+pub fn definitionDigest(definition: RelationalIndexDefinition) ![32]u8 {
+    var hashing = std.Io.Writer.Hashing(std.crypto.hash.Blake3).initHasher(std.crypto.hash.Blake3.init(.{}), &.{});
+    try std.json.Stringify.value(definition, .{}, &hashing.writer);
+    var result: [32]u8 = undefined;
+    hashing.hasher.final(&result);
+    return result;
+}
+
 /// Store-local immutable physical identity. A catalog revision allocates one
 /// slot per changed/new index; unchanged definitions retain their original ID.
 /// Names remain in the catalog, not in every forward and reverse row key.

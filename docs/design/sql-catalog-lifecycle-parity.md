@@ -1560,3 +1560,53 @@ steps with zero skips, failures or leaks. Formatting, diff and control-source
 catalog freshness checks pass. Repeated cases across gates are not separate SQL
 coverage credits; the original inventory and open public atomicity case remain
 unchanged.
+
+### Durable native owner admission and dual reservation
+
+The native owner now has a fixed-size, checksummed 656-byte private job binding.
+It retains the full job ID, immutable metadata-plan and owner digests, complete
+topology fence, owner ordinal, schema identity, integrity-catalog identities,
+original optional physical predecessor, reserved/candidate heads and tuple ID.
+The job key is protected by ordinary extra-metadata admission. Matching hashes
+remain identities, not authentication of a metadata decision.
+
+Admission stages the job and dedicated `index_build` source fence in one caller
+transaction after checking the actual predecessor schema and both catalogs.
+The existing topology machinery closes new participant admission while old
+participants finish. Reservation independently checks that exact durable job and
+fence and requires the existing transaction manager to prove the predecessor
+drained. Both integrity and physical allocation burns, retained private
+definitions and the job phase then stage in one transaction. The caller must
+independently attest metadata/local range identity and add its durable outbox
+before committing; these primitives do not provide a public command or receipt.
+
+Logical and physical preparations also bind the same canonical declaration
+fingerprint and native schema identities. The declaration hash streams directly
+into Blake3 without allocating an intermediate JSON copy. A different but valid
+physical plan cannot be substituted for the independently compiled UNIQUE rule.
+Cold owner recovery checks the durable binding/fence and reserved integrity
+catalog, reconstructs the owned private plan, and preserves whether the physical
+predecessor was originally absent (including first-index bootstrap).
+
+Generic topology begin/release/cancel cannot acquire or lift index-build
+authority. An index fence with a missing or mismatched durable job fails closed.
+No owner capability or transport handler advertises these new operations yet.
+Authenticated command/receipt integration, phase-aware checkpoint/snapshot
+verification, private projected execution, distributed UNIQUE claims, publication
+decisions and bounded cancellation/GC remain required before public activation.
+
+The native memory/LSM campaign exercises admitted old transactions, blocked
+reservation before drain, new-write exclusion, begin/reserve rollback and replay,
+foreign jobs, missing/mismatched fence bindings, substituted physical definitions,
+failure of the second catalog CAS after the first burn is staged, and owned
+recovery from the reserved binding. This is component-level storage evidence,
+not authenticated distributed execution or a new SQL inventory credit.
+
+Qualification passes all six focused gates in Debug and ReleaseFast: nine
+native candidate/private-addition tests, fourteen native catalog tests, six
+metadata candidate tests, six FK tests, ten publication tests plus the decoder
+floor test, and fifty namespace/recovery tests. Each mode completed 92 build
+steps with zero skips, failures or leaks. Formatting, diff and generated control
+catalog checks pass. Shared cases execute in multiple contexts; this is not a
+full-suite or public distributed-activation claim. SQL inventory dispositions
+remain unchanged.

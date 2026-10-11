@@ -417,6 +417,7 @@ pub const PrivateAddition = struct {
     candidate: Prepared,
     plan: plans.View,
     index: native.RelationalIndexId,
+    definition_digest: Digest,
 
     pub fn deinit(self: *PrivateAddition) void {
         self.plan.release();
@@ -496,8 +497,9 @@ pub const PrivateAddition = struct {
         // must retain this head revision; subsequent attempts allocate above it.
         reservation.head.revision = candidate.head.revision;
         candidate.expected = reservation.head;
+        const definition_digest = try native.definitionDigest(addition.definition);
         const plan = try bindWritePlan(alloc, after, &next);
-        return .{ .reservation = reservation, .candidate = candidate, .plan = plan, .index = addition.id() };
+        return .{ .reservation = reservation, .candidate = candidate, .plan = plan, .index = addition.id(), .definition_digest = definition_digest };
     }
 };
 
@@ -650,6 +652,7 @@ pub const Controller = struct {
 
     pub fn isReservedMetadataKey(key: []const u8) bool {
         return std.mem.eql(u8, key, head_key) or std.mem.startsWith(u8, key, blob_prefix) or
+            std.mem.eql(u8, key, @import("relational_index_owner_job.zig").key) or
             std.mem.eql(u8, key, @import("relational_constraint_jobs.zig").progress_key) or
             std.mem.startsWith(u8, key, @import("relational_index_jobs.zig").progress_prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_maintenance_contract.zig").control_prefix) or

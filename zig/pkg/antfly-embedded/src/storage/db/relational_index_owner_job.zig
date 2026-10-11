@@ -1,0 +1,235 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+
+//! Native owner-local private index admission. These transaction primitives do
+//! not authenticate metadata, commit, emit receipts, or enable a public producer.
+//! The ordered owner must first attest the metadata plan and local identity, then
+//! stage its durable outbox with these effects and abort on every error.
+const std = @import("std");
+const topology = @import("relational_integrity_topology.zig");
+const physical_catalog = @import("relational_index_catalog.zig");
+const integrity_catalog = @import("relational_integrity_catalog.zig");
+const candidate_mod = @import("relational_index_candidate.zig");
+const schema = @import("../schema.zig");
+const records = @import("relational_index_records.zig");
+const transactions = @import("../transactions.zig");
+const Digest = [32]u8;
+pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
+pub const Phase = enum(u8) { fencing, reserved };
+
+fn digest(bytes: []const u8) Digest {
+    var result: Digest = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &result, .{});
+    return result;
+}
+fn nonzero(bytes: []const u8) bool {
+    return !std.mem.allEqual(u8, bytes, 0);
+}
+fn optional(txn: anytype, physical_key: []const u8) !?[]const u8 {
+    return txn.get(physical_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+}
+
+/// One fixed-size binding per owner. Full job IDs are retained; the topology
+/// transition number alone never authenticates retries. Hashes are identity,
+/// not proof of metadata authority. Admission and reserve are independently CASed.
+pub const Binding = struct {
+    pub const encoded_len = 656;
+    id: [16]u8,
+    plan_digest: Digest,
+    owner_digest: Digest,
+    fence: topology.Fence,
+    ordinal: u16,
+    phase: Phase = .fencing,
+    integrity_before: Digest,
+    integrity_reserved: Digest,
+    integrity_candidate: Digest,
+    schema_before: Digest,
+    physical_before: ?physical_catalog.Head,
+    physical_reserved: physical_catalog.Head,
+    physical_candidate: physical_catalog.Head,
+    index: records.Id,
+
+    pub fn encode(self: Binding) ![encoded_len]u8 {
+        if (!nonzero(&self.id) or !nonzero(&self.plan_digest) or !nonzero(&self.owner_digest) or
+            self.ordinal >= @import("relational_index_publication_progress.zig").max_owners or
+            self.fence.role != .index_build or !nonzero(&self.integrity_before) or
+            self.fence.namespace.shard_id == 0 or self.fence.namespace.range_id == 0 or
+            !nonzero(&self.integrity_reserved) or !nonzero(&self.integrity_candidate) or !nonzero(&self.schema_before) or
+            !std.mem.eql(u8, &self.integrity_before, &self.fence.catalog_digest) or
+            self.physical_reserved.revision <= 1 or self.physical_candidate.revision != self.physical_reserved.revision or
+            self.index.generation != self.physical_reserved.revision or
+            self.physical_candidate.schema_version != (std.math.add(u32, self.physical_reserved.schema_version, 1) catch return error.InvalidPrivateIndexOwnerJob))
+            return error.InvalidPrivateIndexOwnerJob;
+        if (self.physical_before) |before| {
+            if (before.revision == 0 or (std.math.add(u64, before.revision, 1) catch return error.InvalidPrivateIndexOwnerJob) != self.physical_reserved.revision or
+                before.schema_version != self.physical_reserved.schema_version or
+                !std.mem.eql(u8, &before.blob_digest, &self.physical_reserved.blob_digest)) return error.InvalidPrivateIndexOwnerJob;
+        } else if (self.physical_reserved.revision != 2) return error.InvalidPrivateIndexOwnerJob;
+        var out: [encoded_len]u8 = @splat(0);
+        @memcpy(out[0..4], "AIOJ");
+        std.mem.writeInt(u32, out[4..8], 1, .little);
+        @memcpy(out[8..24], &self.id);
+        @memcpy(out[24..56], &self.plan_digest);
+        @memcpy(out[56..88], &self.owner_digest);
+        @memcpy(out[88..224], &try self.fence.encode());
+        std.mem.writeInt(u16, out[224..226], self.ordinal, .little);
+        out[226] = @backingInt(self.phase);
+        out[227] = @intFromBool(self.physical_before != null);
+        @memcpy(out[232..264], &self.integrity_before);
+        @memcpy(out[264..296], &self.integrity_reserved);
+        @memcpy(out[296..328], &self.integrity_candidate);
+        @memcpy(out[328..360], &self.schema_before);
+        if (self.physical_before) |before| @memcpy(out[360..444], &before.encode());
+        @memcpy(out[444..528], &self.physical_reserved.encode());
+        @memcpy(out[528..612], &self.physical_candidate.encode());
+        @memcpy(out[612..624], &self.index.encode());
+        @memcpy(out[624..656], &digest(out[0..624]));
+        return out;
+    }
+
+    pub fn decode(bytes: []const u8) !Binding {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIOJ") or
+            std.mem.readInt(u32, bytes[4..8], .little) != 1 or bytes[227] > 1 or
+            !std.mem.allEqual(u8, bytes[228..232], 0) or
+            !std.mem.eql(u8, bytes[624..656], &digest(bytes[0..624]))) return error.InvalidPrivateIndexOwnerJob;
+        if (bytes[227] == 0 and !std.mem.allEqual(u8, bytes[360..444], 0)) return error.InvalidPrivateIndexOwnerJob;
+        const result: Binding = .{
+            .id = bytes[8..24].*,
+            .plan_digest = bytes[24..56].*,
+            .owner_digest = bytes[56..88].*,
+            .fence = try topology.Fence.decode(bytes[88..224]),
+            .ordinal = std.mem.readInt(u16, bytes[224..226], .little),
+            .phase = std.enums.fromInt(Phase, bytes[226]) orelse return error.InvalidPrivateIndexOwnerJob,
+            .integrity_before = bytes[232..264].*,
+            .integrity_reserved = bytes[264..296].*,
+            .integrity_candidate = bytes[296..328].*,
+            .schema_before = bytes[328..360].*,
+            .physical_before = if (bytes[227] == 1) try physical_catalog.Head.decode(bytes[360..444]) else null,
+            .physical_reserved = try physical_catalog.Head.decode(bytes[444..528]),
+            .physical_candidate = try physical_catalog.Head.decode(bytes[528..612]),
+            .index = try records.Id.decode(bytes[612..624]),
+        };
+        _ = try result.encode();
+        return result;
+    }
+};
+
+pub fn prepare(id: [16]u8, plan_digest: Digest, owner_digest: Digest, ordinal: u16, fence: topology.Fence, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition) !Binding {
+    const before = candidate.reservation.expected orelse return error.InvalidPrivateIndexOwnerJob;
+    const binding: Binding = .{
+        .id = id,
+        .plan_digest = plan_digest,
+        .owner_digest = owner_digest,
+        .ordinal = ordinal,
+        .fence = fence,
+        .integrity_before = digest(before),
+        .integrity_reserved = digest(candidate.reservation.value),
+        .integrity_candidate = digest(candidate.next.value),
+        .schema_before = physical.reservation.schema_digest,
+        .physical_before = physical.reservation.expected,
+        .physical_reserved = physical.reservation.head,
+        .physical_candidate = physical.candidate.head,
+        .index = physical.index,
+    };
+    const incarnation = try integrity_catalog.incarnationFromTableId(fence.namespace.table_id);
+    if (!std.mem.eql(u8, &candidate.next.catalog.incarnation, &incarnation) or
+        !std.mem.eql(u8, &candidate.definition_digest, &physical.definition_digest) or
+        !std.mem.eql(u8, &candidate.reservation.catalog.schema_digest, &physical.reservation.schema_digest) or
+        !std.mem.eql(u8, &candidate.next.catalog.schema_digest, &physical.candidate.schema_digest) or
+        candidate.reservation.catalog.schema_version != physical.reservation.head.schema_version or
+        candidate.next.catalog.schema_version != physical.candidate.head.schema_version)
+        return error.InvalidPrivateIndexOwnerJob;
+    _ = try binding.encode();
+    return binding;
+}
+
+pub fn load(txn: anytype) !?Binding {
+    return if (try optional(txn, key)) |bytes| try Binding.decode(bytes) else null;
+}
+
+pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
+    const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    if (binding.phase != .fencing or !binding.fence.eql(fence)) return error.PrivateIndexOwnerJobChanged;
+}
+
+pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
+    const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    if (!binding.fence.eql(fence)) return error.PrivateIndexOwnerJobChanged;
+}
+
+/// Cold owner recovery retains the originally absent/existing predecessor from
+/// the durable binding. An empty bootstrap catalog must not be mistaken for a
+/// catalog that existed before the job's admission.
+pub fn reopenPhysical(alloc: std.mem.Allocator, txn: anytype, before: @import("schema_registry.zig").SchemaView, after: @import("schema_registry.zig").SchemaView, name: []const u8) !physical_catalog.PrivateAddition {
+    const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    if (binding.phase != .reserved) return error.PrivateIndexOwnerJobChanged;
+    const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+    const raw = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+    if (!std.mem.eql(u8, &digest(raw), &binding.integrity_reserved)) return error.IntegrityCatalogChanged;
+    var physical = try physical_catalog.PrivateAddition.reopen(alloc, txn, before, after, binding.physical_reserved, binding.physical_candidate, name);
+    errdefer physical.deinit();
+    if (physical.index.mapKey() != binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged;
+    physical.reservation.expected = binding.physical_before;
+    return physical;
+}
+
+/// Metadata authority and local range identity must already be independently
+/// attested by the ordered owner. Fence and binding commit atomically; old
+/// participants may finish but no new participants may enter after this commit.
+pub fn stageBegin(txn: anytype, binding: Binding) !bool {
+    if (binding.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
+    const encoded = try binding.encode();
+    if (try load(txn)) |existing| {
+        var original = existing;
+        original.phase = .fencing;
+        if (!std.mem.eql(u8, &try original.encode(), &encoded)) return error.PrivateIndexOwnerJobChanged;
+        const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+        if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+        return false;
+    }
+    const integrity = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+    if (!std.mem.eql(u8, &digest(integrity), &binding.integrity_before)) return error.IntegrityCatalogChanged;
+    const physical = if (try optional(txn, physical_catalog.head_key)) |bytes| try physical_catalog.Head.decode(bytes) else null;
+    if (binding.physical_before) |expected| {
+        if (physical == null or !physical.?.eql(expected)) return error.PreparedGenerationChanged;
+    } else if (physical != null) return error.PreparedGenerationChanged;
+    const schema_bytes = (try optional(txn, schema.schema_key)) orelse return error.RelationalIndexCatalogSchemaMismatch;
+    if (!std.mem.eql(u8, &digest(schema_bytes), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+    try txn.put(key, &encoded);
+    try topology.stagePrivateIndexBegin(txn, binding.fence);
+    return true;
+}
+
+/// Require the exact durable fence AND drained predecessor transactions before
+/// burning either allocation. Both catalogs, private definitions and job phase
+/// share the caller's single-writer transaction and durable outbox.
+pub fn stageReservation(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition) !bool {
+    const expected = try prepare(binding.id, binding.plan_digest, binding.owner_digest, binding.ordinal, binding.fence, candidate, physical);
+    var original = binding;
+    original.phase = .fencing;
+    if (!std.mem.eql(u8, &try original.encode(), &try expected.encode())) return error.PrivateIndexOwnerJobChanged;
+    const current = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    var predecessor = current;
+    predecessor.phase = .fencing;
+    if (!std.mem.eql(u8, &try predecessor.encode(), &try expected.encode())) return error.PrivateIndexOwnerJobChanged;
+    try topology.requireDrained(txn, manager, binding.fence);
+    if (current.phase == .reserved) {
+        const raw = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
+        if (!std.mem.eql(u8, &digest(raw), &binding.integrity_reserved)) return error.IntegrityCatalogChanged;
+        const head = try physical_catalog.Head.decode(try txn.get(physical_catalog.head_key));
+        if (!head.eql(binding.physical_reserved)) return error.PreparedGenerationChanged;
+        const blob = try txn.get(&physical_catalog.blobKey(binding.physical_candidate.blob_digest));
+        if (!std.mem.eql(u8, blob, physical.candidate.blob)) return error.ImmutableRelationalIndexDefinitionConflict;
+        return false;
+    }
+    try candidate.reservation.stage(txn);
+    _ = try physical.stageReservation(txn);
+    var next = expected;
+    next.phase = .reserved;
+    try txn.put(key, &try next.encode());
+    return true;
+}

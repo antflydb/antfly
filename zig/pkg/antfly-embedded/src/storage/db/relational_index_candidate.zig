@@ -20,6 +20,7 @@ pub const max_schema_bytes = 2 * 1024 * 1024;
 pub const Candidate = struct {
     next: catalog.Update,
     reservation: catalog.Update,
+    definition_digest: [32]u8,
 
     pub fn deinit(self: *Candidate) void {
         self.reservation.deinit();
@@ -43,7 +44,7 @@ pub const Candidate = struct {
             before.external_base_source != null or after.external_base_source != null or
             after.version != (std.math.add(u32, before.version, 1) catch return error.InvalidIndexPublicationCandidate))
             return error.InvalidIndexPublicationCandidate;
-        try validatePhysicalPair(alloc, after, name);
+        const definition_digest = try validatePhysicalPair(alloc, after, name);
         var current = try compiler.compileCatalog(alloc, before, table_id, predecessor);
         defer current.deinit();
         if (!std.mem.eql(u8, current.value, predecessor)) return error.IntegrityCatalogChanged;
@@ -51,7 +52,7 @@ pub const Candidate = struct {
         errdefer next.deinit();
         _ = try catalog.indexAddition(current.catalog, next.catalog, name);
         const reservation = try catalog.prepareIndexReservation(alloc, predecessor, next.catalog, name);
-        return .{ .next = next, .reservation = reservation };
+        return .{ .next = next, .reservation = reservation, .definition_digest = definition_digest };
     }
 };
 
@@ -59,7 +60,7 @@ pub const Candidate = struct {
 /// partial membership than the UNIQUE rule being published. Compare independently
 /// compiled equality keys/predicates; sort direction and covering columns are
 /// presentation/storage choices, not uniqueness semantics.
-fn validatePhysicalPair(alloc: Allocator, schema: schema_api.ParsedTableSchema, name: []const u8) !void {
+fn validatePhysicalPair(alloc: Allocator, schema: schema_api.ParsedTableSchema, name: []const u8) ![32]u8 {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -89,6 +90,7 @@ fn validatePhysicalPair(alloc: Allocator, schema: schema_api.ParsedTableSchema, 
     const physical_where = try predicateIdentity(alloc, runtime, &layout, index.where);
     const logical_where = try predicateIdentity(alloc, runtime, &layout, rule.where);
     if (!std.mem.eql(u8, &physical_where, &logical_where)) return error.InvalidIndexPublicationCandidate;
+    return native_index.definitionDigest(index);
 }
 
 fn predicateIdentity(alloc: Allocator, schema: native_schema.TableSchema, layout: *const rows.PhysicalLayout, conditions: []const native_index.UniquePredicate) ![32]u8 {
@@ -189,6 +191,164 @@ test "relational index candidate owns its native catalogs after request memory i
 const test_after =
     \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
 ;
+
+fn testOwnerJobAdmission(comptime Backend: type) !void {
+    const a = std.testing.allocator;
+    const jobs = @import("relational_index_owner_job.zig");
+    const physical = @import("relational_index_catalog.zig");
+    const registry = @import("schema_registry.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const DocStore = @import("../docstore.zig").DocStore;
+    var before = try schema_api.parseValidatedTableSchema(a, test_before);
+    defer before.deinit(a);
+    var after = try schema_api.parseValidatedTableSchema(a, test_after);
+    defer after.deinit(a);
+    var prior = try compiler.compileCatalog(a, before, 101, null);
+    defer prior.deinit();
+    var candidate = try Candidate.prepare(a, 101, test_before, test_after, prior.value, "email_idx");
+    defer candidate.deinit();
+    const before_schema = try schema_api.deriveRuntimeTableSchema(a, before);
+    defer native_schema.freeSchema(a, before_schema);
+    const after_schema = try schema_api.deriveRuntimeTableSchema(a, after);
+    defer native_schema.freeSchema(a, after_schema);
+    var before_registry = try registry.Registry.initCloned(a, std.testing.io, before_schema);
+    defer before_registry.deinit();
+    var before_view = before_registry.acquire().?;
+    defer before_view.release();
+    var after_registry = try registry.Registry.initCloned(a, std.testing.io, after_schema);
+    defer after_registry.deinit();
+    var after_view = after_registry.acquire().?;
+    defer after_view.release();
+    var declaration_arena = std.heap.ArenaAllocator.init(a);
+    defer declaration_arena.deinit();
+    const definitions = (try after.relationalIndexDefinitions(declaration_arena.allocator())).?;
+    var private_addition = try physical.PrivateAddition.init(a, before_view, after_view, null, definitions, "email_idx");
+    defer private_addition.deinit();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(prior.value, &hash, .{});
+    const fence: topology.Fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .catalog_digest = hash };
+    const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &private_addition);
+    var substituted_definitions = try declaration_arena.allocator().dupe(native_index.RelationalIndexDefinition, definitions);
+    substituted_definitions[0].keys = &.{.{ .column = "id" }};
+    var substituted = try physical.PrivateAddition.init(a, before_view, after_view, null, substituted_definitions, "email_idx");
+    defer substituted.deinit();
+    try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, &candidate, &substituted));
+    const encoded = try binding.encode();
+    try std.testing.expectEqualSlices(u8, &encoded, &try (try jobs.Binding.decode(&encoded)).encode());
+    var damaged = encoded;
+    damaged[88] ^= 1;
+    try std.testing.expectError(error.InvalidPrivateIndexOwnerJob, jobs.Binding.decode(&damaged));
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "private-owner" });
+    defer runtime.deinit();
+    var store = try DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    _ = try native_schema.saveSchema(&store, a, before_schema);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(catalog.key, prior.value);
+        try txn.commit();
+    }
+    var manager = try @import("../transactions.zig").TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransaction(@splat(9), 1);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.PrivateIndexJobRequired, topology.stageBegin(&txn, fence));
+        try std.testing.expect(try jobs.stageBegin(&txn, binding));
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(try jobs.load(&txn) == null);
+        try std.testing.expect(try topology.current(&txn) == null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try jobs.stageBegin(&txn, binding));
+        try std.testing.expect(!try jobs.stageBegin(&txn, binding));
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.TransactionTopologyBusy, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expectError(error.IntegrityTopologyBusy, topology.requireUnfenced(&txn));
+        try std.testing.expectError(error.PrivateIndexPublicationRequired, topology.stageRelease(&txn, fence));
+        try std.testing.expectError(error.PrivateIndexCancellationRequired, topology.stageCancel(&txn, fence));
+        var foreign = binding;
+        foreign.id[0] ^= 1;
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.stageBegin(&txn, foreign));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, jobs.stageReservation(&txn, &manager, foreign, &candidate, &private_addition));
+        try std.testing.expectEqual(jobs.Phase.fencing, (try jobs.load(&txn)).?.phase);
+        try std.testing.expectEqualSlices(u8, prior.value, try txn.get(catalog.key));
+        try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
+    }
+    try manager.resolveIntents(@splat(9), .aborted, 2);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(jobs.key);
+        try std.testing.expectError(error.PrivateIndexJobRequired, topology.current(&txn));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var foreign = binding;
+        foreign.fence.attempt += 1;
+        try txn.put(jobs.key, &try foreign.encode());
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, topology.current(&txn));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        // The integrity burn is attempted first; a later physical CAS failure
+        // must roll it back with the entire caller-owned transaction.
+        var empty = try physical.Prepared.init(a, before_view, null, &.{});
+        defer empty.deinit();
+        try txn.put(physical.head_key, &empty.head.encode());
+        try std.testing.expectError(error.PreparedGenerationChanged, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(jobs.Phase.fencing, (try jobs.load(&txn)).?.phase);
+        try std.testing.expectEqualSlices(u8, prior.value, try txn.get(catalog.key));
+        try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
+        try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expect(!try jobs.stageBegin(&txn, binding));
+        try txn.commit();
+    }
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(jobs.Phase.reserved, (try jobs.load(&txn)).?.phase);
+    try std.testing.expectEqualSlices(u8, candidate.reservation.value, try txn.get(catalog.key));
+    var active = (try physical.load(a, &txn)).?;
+    defer active.deinit();
+    try std.testing.expectEqual(@as(usize, 0), active.entries().len);
+    try std.testing.expectEqual(before_view.version(), active.head.schema_version);
+    var recovered = try jobs.reopenPhysical(a, &txn, before_view, after_view, "email_idx");
+    defer recovered.deinit();
+    try std.testing.expectEqual(binding.index.mapKey(), recovered.index.mapKey());
+    try std.testing.expect(recovered.reservation.expected == null);
+    try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &recovered));
+    try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.key));
+}
+
+test "relational index candidate owner binding fences drains and reserves both catalogs atomically on memory and LSM" {
+    try testOwnerJobAdmission(@import("../mem_backend.zig").Backend);
+    try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend);
+}
 
 test "relational index candidate preserves CHECK coverage and reserves without public schema change" {
     const a = std.testing.allocator;
