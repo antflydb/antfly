@@ -501,6 +501,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi SQL",
         "storage owner runtime status",
         "capi relational expression errors preserve public status semantics",
+        "bounded Lite retirement admission is retryable while uncertain publication is not",
         "capi artifact decode and lookup json",
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
