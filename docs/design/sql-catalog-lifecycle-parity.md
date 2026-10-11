@@ -844,3 +844,33 @@ on an empty test selection rather than appearing green without testing it.
 The broader coordinator gate now passes all 29 tests in both Debug and
 ReleaseFast, with no skips or leaks. Full activation remains unpublished until
 the data-owner recovery/visibility campaign passes.
+
+### Qualified recovery and main integration checkpoint
+
+The final mounted primary-key campaign passes with zero skips, failures or
+leaks. All six explicit/anonymous success, NULL and duplicate cases verify
+complete source or successor postimages, enforcement and cold data-owner
+restart. Pure-read retries are restricted to typed retryable availability;
+each HTTP request is bounded by the remaining read deadline. Mutations are
+not replayed.
+
+The native SQL read-admission gate passes both Debug and ReleaseFast. Its real
+adapter fault coverage includes compound statement capture, a retained single
+scan and delayed guarded snapshot opening. Availability is normalized only at
+read admission; unknown mutation outcomes, malformed responses and missing
+range protection retain their original failure semantics.
+
+The generated initial-FK three-voter campaign passes twice in Debug, and the
+broader coordinator gate passes all 29 tests in both build modes. The PostgreSQL
+18 lifecycle oracle passes all 14 cases. These are scoped qualification results:
+the original inventory remains 478 implemented, 136 rejected, 73 superseded
+and 899 unresolved, with no additional original-case completion claimed.
+
+Main's standalone pgwire DDL publication/ownership fix (PR #1070) is being
+integrated before publication of this follow-up. Its separate result and scratch
+allocators must be preserved through DDL dispatch, schema alteration and FK
+plan validation. Generated names remain compiler provenance until native
+owner-bound preparation and atomic admission; the older SQL-side name chooser
+is superseded, not run as a second independent naming authority. The combined
+SQL/catalog/standalone regression gates must pass on the resolved merge before
+it is pushed.

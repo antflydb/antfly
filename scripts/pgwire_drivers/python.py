@@ -21,6 +21,8 @@ import os
 import asyncpg
 import psycopg
 
+from ddl import exercise_ddl
+
 url = os.environ["ANTFLY_PGWIRE_URL"]
 with psycopg.connect(url, autocommit=True) as conn:
     assert conn.execute("SELECT 1").fetchone() == (1,)
@@ -42,6 +44,7 @@ with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(sql, prepare=True)
     with conn.transaction():
         assert conn.execute("SELECT 1").fetchone() == (1,)
+    exercise_ddl(conn)
 print("psycopg: PASS")
 
 

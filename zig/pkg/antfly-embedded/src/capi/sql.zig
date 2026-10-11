@@ -49,7 +49,7 @@ pub fn Adapter(comptime native: type) type {
             return self.*;
         }
 
-        fn ddl(ptr: *anyopaque, alloc: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
+        fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.read_only) return error.SqlReadOnlyTransaction;
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
@@ -69,7 +69,7 @@ pub fn Adapter(comptime native: type) type {
                         else => return err,
                     };
                 },
-                .catalog_ddl => |change| return self.alterSchema(alloc, change),
+                .catalog_ddl => |change| return self.alterSchema(allocators, change),
                 else => return error.UnsupportedSqlExecution,
             }
             return .{};
@@ -83,7 +83,8 @@ pub fn Adapter(comptime native: type) type {
             return false;
         }
 
-        fn alterSchema(self: *Self, alloc: std.mem.Allocator, ddl_request: ast.CatalogDdl) !catalog.DdlOutcome {
+        fn alterSchema(self: *Self, allocators: catalog.DdlAllocators, ddl_request: ast.CatalogDdl) !catalog.DdlOutcome {
+            const alloc = allocators.result;
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
             const tables = @import("tables.zig");
             try tables.requireDatabase(handle);
@@ -104,7 +105,7 @@ pub fn Adapter(comptime native: type) type {
                 ddl_value.action = .alter_schema;
             }
             if (ddl_value.kind != .table or ddl_value.action != .alter_schema or ddl_value.schema_change == null) return error.UnsupportedSqlExecution;
-            var arena = std.heap.ArenaAllocator.init(alloc);
+            var arena = std.heap.ArenaAllocator.init(allocators.scratch);
             defer arena.deinit();
             const a = arena.allocator();
             if (ddl_value.name.table.len == 0) {

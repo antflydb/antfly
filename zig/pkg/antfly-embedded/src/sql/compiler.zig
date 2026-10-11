@@ -3468,3 +3468,17 @@ test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
     try std.testing.expectEqualStrings("threads", scoped.statement.catalog_ddl.name.table);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX recency", .{}));
 }
+
+test "compiler leaves anonymous constraint identities for native admission" {
+    var first = try compile(std.testing.allocator, "CREATE TABLE p1 (id TEXT PRIMARY KEY)", .{});
+    defer first.deinit();
+    try std.testing.expect(first.statement.create_table.constraints[0].generatedConstraintName() != null);
+    try std.testing.expect(!first.statement.create_table.columns[0].nullable);
+    var explicit = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT CONSTRAINT exact_name PRIMARY KEY)", .{});
+    defer explicit.deinit();
+    try std.testing.expect(explicit.statement.create_table.constraints[0].generatedConstraintName() == null);
+    try std.testing.expectEqualStrings("exact_name", explicit.statement.create_table.constraints[0].add_unique.name);
+    var table_key = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT, PRIMARY KEY(id))", .{});
+    defer table_key.deinit();
+    try std.testing.expect(!table_key.statement.create_table.columns[0].nullable);
+}

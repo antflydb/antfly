@@ -106,6 +106,23 @@ be accepted on loopback by default; remote binding requires explicit deployment
 acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
 
+## DDL admission and readiness
+
+`53300` with `retryable:true` for relation catalog publication means no schema
+change was admitted. Wait briefly and retry the complete DDL. Standalone's
+metadata control loop advances the same bounded relation publication protocol
+as clustered metadata; publication is asynchronous after catalog changes.
+
+`55000` with a DDL receipt in `DETAIL` means the declaration committed and
+activation is pending. For an initial FK table, poll for the table to become
+visible, then use it. For changes to an existing table, inspect its schema and
+constraint status. Retain the receipt and do not replay the DDL.
+
+`40003` means the admission or mutation outcome is unknown. Retain the receipt,
+including any FK publication ID, and inspect durable status before deciding
+what to do next. This is not a retry signal. A failed operation before admission
+does not reserve a hidden table or parent publication lock.
+
 ## Resource and lifecycle contract
 
 `start(allocator, Config)` borrows the owner's `std.Io` and backend. The owner

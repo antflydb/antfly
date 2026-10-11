@@ -122,12 +122,38 @@ pub fn build(
     target: domain.Target,
     request: tables.CreateTableRequest,
 ) !publication.InitialCreatePlan {
-    return buildWithGeneratedNames(server, alloc, context, identity, target, request, &.{});
+    return buildWithScratch(server, alloc, alloc, context, identity, target, request);
+}
+
+pub fn buildWithScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+) !publication.InitialCreatePlan {
+    return buildWithGeneratedNamesAndScratch(server, alloc, scratch, context, identity, target, request, &.{});
 }
 
 pub fn buildWithGeneratedNames(
     server: *server_mod.ApiHttpServer,
     alloc: std.mem.Allocator,
+    context: operation.RequestContext,
+    identity: ?server_mod.AuthenticatedIdentity,
+    target: domain.Target,
+    request: tables.CreateTableRequest,
+    generated_constraint_names: []const []const u8,
+) !publication.InitialCreatePlan {
+    return buildWithGeneratedNamesAndScratch(server, alloc, alloc, context, identity, target, request, generated_constraint_names);
+}
+
+/// Durable plan values use alloc; validation and projections use reclaiming scratch.
+pub fn buildWithGeneratedNamesAndScratch(
+    server: *server_mod.ApiHttpServer,
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     context: operation.RequestContext,
     identity: ?server_mod.AuthenticatedIdentity,
     target: domain.Target,
@@ -167,7 +193,7 @@ pub fn buildWithGeneratedNames(
     // Calculate support definitions against this settled read cut, but do
     // not publish any parent here. Begin owns each exact before/after pair in
     // one metadata transaction with the hidden child/name reservation.
-    var witness = try @import("relational_witness_ddl.zig").prepare(alloc, snapshot.tables, child.name, child.schema_json, "");
+    var witness = try @import("relational_witness_ddl.zig").prepare(scratch, snapshot.tables, child.name, child.schema_json, "");
     defer witness.deinit();
     child.schema_json = try alloc.dupe(u8, witness.schema_json);
     const derived = try publication.deriveInitialTransitions(alloc, child.table_id, child.name, child.schema_json);
@@ -184,7 +210,7 @@ pub fn buildWithGeneratedNames(
     for (derived) |item| {
         if (std.mem.eql(u8, item.parent_table_name, child.name)) {
             if (!self_target_checked) {
-                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child.schema_json, child.name, child.schema_json);
+                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(scratch, child.schema_json, child.name, child.schema_json);
                 self_target_checked = true;
             }
             try self_transitions.append(alloc, item.transition);
@@ -262,7 +288,7 @@ pub fn buildWithGeneratedNames(
     };
     var named_plan = plan;
     named_plan.constraint_name_admission = prepared.constraint_name_admission;
-    try named_plan.validate(alloc);
+    try named_plan.validate(scratch);
     return named_plan;
 }
 
