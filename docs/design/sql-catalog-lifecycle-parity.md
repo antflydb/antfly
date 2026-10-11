@@ -2499,9 +2499,44 @@ caught the shared intent equality method's visibility; exposing that exact
 identity comparison fixes the boundary without duplicating its field list.
 Final Debug qualification passes 59/59 build steps and all 21 tests (20
 publication/receiver contracts and one decoder-floor contract), with no skips,
-failures or leaks. Optimized qualification is pending. Metadata decoder floor
+failures or leaks. Final ReleaseFast qualification also passes 59/59 steps and
+all 21 tests, with no skips, failures or leaks. Metadata decoder floor
 36 and runtime-status V19 are not substitutes
 for intent-aware compiled-owner execution and standby-envelope readiness. Those
 rollout barriers, cleanup/release, actual enrolled-root attestation and the
 public failed-build atomicity gate remain unfinished. Original SQL dispositions
 remain unchanged.
+
+### Shared cancellation artifact retirement (in qualification)
+
+After exact persisted cancellation intent, transaction drain and both allocation
+burns, a private generation can enter the existing forward/ownership GC state
+machine. A single fixed-size cleanup-admission slot binds the full immutable
+intent and a real native cut newer than both cancellation and reservation.
+Admission, queue insertion and cut advance share the caller's transaction and
+must share its durable outbox. Duplicate admission retains the original cut and
+never resets the GC cursor or requeues a completed generation. Recovery checks
+the slot even after physical deletion, rejects forged cuts/identity, and permits
+an old slot only after its epoch was durably consumed.
+
+Ordinary churn is bounded by the existing retirement limit; the sole active
+private job owns one additional cancellation-only slot. This avoids deadlock
+when that public queue is full without adding a second cleanup engine or an
+unbounded admission scan. The existing GC keeps its 256-record, byte and time
+budgets. Final physical verification uses fixed point reads and two generation
+prefix seeks, not a primary-table scan. Extra-metadata mutation cannot forge or
+delete the cleanup-admission slot.
+
+Memory and LSM tests for never-visited, admitted and reserved cancellation now
+seed 300 forward/ownership/reverse companions, require multiple bounded pages,
+verify all reverse deletions and retain an unrelated generation. They cover
+full public-queue headroom, rollback, replay gaps, exact duplicate admission,
+cold structural recovery, corrupt cleanup cuts/identity and preservation of
+the source fence. This new gate is running, not yet qualified.
+
+This is physical artifact retirement, NOT full canceled publication proof.
+Generation-local GC pages still need authenticated durable owner/standby
+delivery; global UNIQUE claims, private manifest/blob and binding retirement,
+final completion cuts, epoch release and coordinated intent-aware capability
+barriers remain unfinished. No canceled ACK is emitted and the public producer
+remains disabled. No original SQL case is reclassified by this component work.

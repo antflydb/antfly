@@ -27,6 +27,10 @@ const Allocator = std.mem.Allocator;
 pub const prefix = "\x00\x00__metadata__:relational_index_retired:";
 const max_cursor = 1024 * 1024;
 pub const max_pending_generations: usize = 2 * catalog.max_index_count;
+// One extra generation may be queued by the sole canceled private owner job.
+// Its exact intent, burned binding and durable admission marker guard retries;
+// ordinary churn cannot consume this cancellation-only headroom.
+pub const max_total_pending_generations: usize = max_pending_generations + 1;
 
 /// Admission is bounded independently of table size. The caller's catalog
 /// transaction owns the queue decision and its insertions atomically. Refuse

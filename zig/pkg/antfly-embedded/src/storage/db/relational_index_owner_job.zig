@@ -33,6 +33,12 @@ const cancellation = @import("relational_index_cancellation_intent.zig");
 const Digest = [32]u8;
 pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
 pub const Phase = enum(u8) { fencing, reserved };
+pub const cancellation_cleanup_key = key ++ ":cancel-gc";
+
+/// One reusable cleanup-admission slot, not a publication acknowledgement.
+/// Public retirement admission leaves a single reserved slot for the active
+/// private job, so cancellation cannot deadlock behind a full churn queue.
+pub const CancellationCleanup = struct { position: positions.Native, duplicate: bool };
 
 fn digest(bytes: []const u8) Digest {
     var result: Digest = undefined;
@@ -448,6 +454,7 @@ fn requireReservedState(txn: anytype, binding: Binding) !void {
 pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const physical_catalog.Loaded) !void {
     const binding = try load(txn);
     try cancellation.verifyRecovery(txn, binding);
+    _ = try loadCancellationCleanup(txn, binding);
     const fence = if (try optional(txn, topology.fence_key)) |bytes| try topology.Fence.decode(bytes) else null;
     if (binding == null) {
         if (fence) |value| if (value.role == .index_build) {
@@ -648,4 +655,71 @@ pub fn stageCancellationIntentWithReplay(txn: anytype, intent: cancellation.Inte
     const binding = try load(txn);
     if (binding) |current| _ = try requireNativeJob(txn, current);
     return cancellation.stage(txn, intent, binding, replay);
+}
+
+fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?cancellation.Record {
+    // Decode before any subsequent store read invalidates borrowed bytes.
+    const record = try cancellation.Record.decode((try optional(txn, cancellation_cleanup_key)) orelse return null);
+    const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.intent.fence.namespace));
+    if (record.position.sequence > authority.sequence) return error.InvalidPrivateIndexCancellation;
+    if (binding) |current| if (record.intent.eql(cancellation.Intent.fromBinding(current))) {
+        if (current.phase != .reserved) return error.InvalidPrivateIndexCancellation;
+        try cancellation.requireCanceled(txn, current);
+        const intent = (try cancellation.load(txn)).?;
+        const reserved = try requireNativeCut(txn, current, .reserved);
+        if (record.position.sequence <= intent.position.sequence or record.position.sequence <= reserved.position.sequence)
+            return error.InvalidPrivateIndexCancellation;
+        return record;
+    };
+    // An old slot is inert only after its exact epoch has been consumed.
+    const completed = (try topology.completed(txn)) orelse return error.InvalidPrivateIndexCancellation;
+    if (completed.admission_epoch < record.intent.fence.admission_epoch or
+        (completed.admission_epoch == record.intent.fence.admission_epoch and !completed.eql(record.intent.fence)))
+        return error.InvalidPrivateIndexCancellation;
+    if (binding) |current| if (current.fence.admission_epoch <= record.intent.fence.admission_epoch)
+        return error.PrivateIndexOwnerJobChanged;
+    return null;
+}
+
+/// Queue only this canceled, drained and burned generation in the shared GC
+/// state machine. The caller must commit its outbox atomically and abort on
+/// every error. Neither queue admission nor its cut is a canceled owner ACK.
+pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !CancellationCleanup {
+    try validateReplay(binding, replay);
+    try cancellation.requireCanceled(txn, binding);
+    try requireReservedState(txn, binding);
+    try topology.requireDrained(txn, manager, binding.fence);
+    const gc = @import("relational_index_gc.zig");
+    const queue_key = gc.key(binding.index);
+    if (try loadCancellationCleanup(txn, try load(txn))) |record| {
+        try requireReplay(.{ .position = record.position, .evidence = @splat(0) }, replay);
+        if (try optional(txn, &queue_key)) |bytes| _ = try gc.decode(binding.index, bytes);
+        return .{ .position = record.position, .duplicate = true };
+    }
+    if (try optional(txn, &queue_key) != null) return error.InvalidPrivateIndexCancellation;
+    const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.sequence else null) };
+    const record: cancellation.Record = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position };
+    try txn.put(cancellation_cleanup_key, &try record.encode());
+    try txn.put(&queue_key, &gc.initial(binding.index));
+    return .{ .position = position, .duplicate = false };
+}
+
+/// Bounded physical-artifact verification only. Global claims, final binding
+/// retirement and epoch release still need independent completion; callers
+/// must not turn this check into a signed canceled publication receipt.
+pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void {
+    try cancellation.requireCanceled(txn, binding);
+    try requireReservedState(txn, binding);
+    _ = (try loadCancellationCleanup(txn, try load(txn))) orelse return error.PrivateIndexCancellationRequired;
+    const gc = @import("relational_index_gc.zig");
+    if (try optional(txn, &gc.key(binding.index)) != null or
+        try optional(txn, &@import("relational_index_jobs.zig").progressKey(binding.index)) != null or
+        try optional(txn, &@import("relational_index_maintenance_contract.zig").controlKey(binding.index)) != null)
+        return error.PrivateIndexCancellationPending;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    for ([_][records.forward_prefix_len]u8{ try records.forwardPrefix(binding.index), try records.ownershipPrefix(binding.index) }) |prefix| {
+        if (try cursor.seekAtOrAfter(&prefix)) |entry| if (std.mem.startsWith(u8, entry.key, &prefix))
+            return error.PrivateIndexCancellationPending;
+    }
 }

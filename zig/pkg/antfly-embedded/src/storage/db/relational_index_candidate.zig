@@ -1003,6 +1003,9 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
     try std.testing.expect(physical.Controller.isReservedMetadataKey(cancellation.key));
     try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{.{ .key = cancellation.key, .value = "forged" }}, &.{}));
     try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{}, &.{cancellation.key}));
+    try std.testing.expect(physical.Controller.isReservedMetadataKey(jobs.cancellation_cleanup_key));
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{.{ .key = jobs.cancellation_cleanup_key, .value = "forged" }}, &.{}));
+    try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{}, &.{jobs.cancellation_cleanup_key}));
     var backend = Backend.init(a, .{});
     defer backend.close();
     var runtime = try backend.runtimeStore(a, .{ .name = "cancel-intent" });
@@ -1045,6 +1048,9 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         }
         pub fn acquireSchemaVersionView(self: *@This(), version: u32) !?registry.SchemaView {
             return if (version == self.before.version()) self.before.clone() else null;
+        }
+        pub fn initTxnManager(self: *@This()) !@import("../transactions.zig").TxnManager {
+            return @import("../transactions.zig").TxnManager.init(self.alloc, self.store);
         }
     };
     var page_core: ?PageCore = if (prior_phase == .reserved) .{ .alloc = a, .store = &store, .relational_indexes = try physical.Controller.init(a, std.testing.io, &store, before_view), .identity_namespace = fence.namespace, .before = before_view } else null;
@@ -1137,6 +1143,120 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         // remains closed, and no canceled publication ACK has been fabricated.
         try std.testing.expect(try topology.completed(&txn) == null);
         try std.testing.expect((try topology.current(&txn)).?.eql(fence));
+    }
+    const gc = @import("relational_index_gc.zig");
+    const records = @import("relational_index_records.zig");
+    var cleanup_core: PageCore = .{ .alloc = a, .store = &store, .relational_indexes = try physical.Controller.init(a, std.testing.io, &store, before_view), .identity_namespace = fence.namespace, .before = before_view };
+    defer cleanup_core.relational_indexes.deinit();
+    var sequence: u64 = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        sequence = (try authority.load(&txn)).?.sequence;
+        try std.testing.expectError(error.PrivateIndexCancellationRequired, jobs.requireCancellationArtifactsRetired(&txn, binding));
+        try std.testing.expectError(error.OnlineSourceScopeChanged, jobs.stageCancellationCleanupWithReplay(&txn, &manager, binding, .{ .namespace = fence.namespace, .sequence = sequence + 2 }));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        // Public admission's full-queue behavior is covered by GC's capacity
+        // fixture. Cancellation must be independent of that inventory: fail
+        // immediately if it ever tries to scan the queue. This avoids building
+        // 8,192 unrelated retirement records in every physical-owner scenario.
+        const PointOnly = struct {
+            inner: *@import("../docstore.zig").DocStore.Txn,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.inner.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                try self.inner.put(key, value);
+            }
+            pub fn openCursor(_: *@This()) !@import("../docstore.zig").DocStore.Txn.CursorAdapter {
+                return error.UnexpectedCancellationAdmissionScan;
+            }
+        };
+        var points: PointOnly = .{ .inner = &txn };
+        const queued = try jobs.stageCancellationCleanupWithReplay(&points, &manager, binding, null);
+        try std.testing.expectEqual(sequence + 1, queued.position.sequence);
+    }
+    var queued: jobs.CancellationCleanup = undefined;
+    const forward_prefix = try records.forwardPrefix(binding.index);
+    const unrelated = records.Id{ .generation = binding.index.generation + 1000, .slot = 0 };
+    const unrelated_key = try records.forwardPrefix(unrelated);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(&gc.key(binding.index)));
+        try std.testing.expectEqual(sequence, (try authority.load(&txn)).?.sequence);
+        // More than one GC page, with atomic reverse/ownership companions.
+        // No forward value decoding is needed to retire a canceled generation.
+        for (0..300) |offset| {
+            var forward: [records.forward_prefix_len + 2]u8 = undefined;
+            @memcpy(forward[0..records.forward_prefix_len], &forward_prefix);
+            std.mem.writeInt(u16, forward[records.forward_prefix_len..], @intCast(offset), .big);
+            try txn.put(&forward, "private");
+            var document_buffer: [32]u8 = undefined;
+            const document = try std.fmt.bufPrint(&document_buffer, "doc-{d}", .{offset});
+            var reverse = std.ArrayList(u8).empty;
+            defer reverse.deinit(a);
+            var ownership = std.ArrayList(u8).empty;
+            defer ownership.deinit(a);
+            try records.appendReverseKey(a, &reverse, binding.index, document);
+            try records.appendOwnershipFromReverse(a, &ownership, reverse.items);
+            try txn.put(reverse.items, "private");
+            try txn.put(ownership.items, "");
+        }
+        try txn.put(&unrelated_key, "keep");
+        queued = try jobs.stageCancellationCleanupWithReplay(&txn, &manager, binding, .{ .namespace = fence.namespace, .sequence = sequence + 1 });
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const retry = try jobs.stageCancellationCleanupWithReplay(&txn, &manager, binding, queued.position);
+        try std.testing.expect(retry.duplicate);
+        try std.testing.expectEqual(queued.position, retry.position);
+        try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&txn, binding));
+        try testOwnerRecoveryAllocations(a, &txn);
+        var invalid_cleanup: cancellation.Record = .{ .intent = intent, .position = committed.position };
+        try txn.put(jobs.cancellation_cleanup_key, &try invalid_cleanup.encode());
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
+        invalid_cleanup.position = queued.position;
+        invalid_cleanup.intent.owner_digest[0] ^= 1;
+        try txn.put(jobs.cancellation_cleanup_key, &try invalid_cleanup.encode());
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
+    }
+    var cleanup_pages: usize = 0;
+    while (try gc.Page.prepare(a, std.testing.io, &cleanup_core)) |prepared_gc| {
+        var page = prepared_gc;
+        defer page.deinit();
+        cleanup_pages += 1;
+        try std.testing.expect(cleanup_pages <= 8);
+        try std.testing.expect(page.records_scanned <= 256);
+        try page.commit(&cleanup_core);
+    }
+    try std.testing.expect(cleanup_pages >= 4);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try jobs.requireCancellationArtifactsRetired(&txn, binding);
+        const retry = try jobs.stageCancellationCleanupWithReplay(&txn, &manager, binding, queued.position);
+        try std.testing.expect(retry.duplicate);
+        try std.testing.expectError(error.NotFound, txn.get(&gc.key(binding.index)));
+        try std.testing.expectEqualStrings("keep", try txn.get(&unrelated_key));
+        for (0..300) |offset| {
+            var document_buffer: [32]u8 = undefined;
+            const document = try std.fmt.bufPrint(&document_buffer, "doc-{d}", .{offset});
+            var reverse = std.ArrayList(u8).empty;
+            defer reverse.deinit(a);
+            try records.appendReverseKey(a, &reverse, binding.index, document);
+            try std.testing.expectError(error.NotFound, txn.get(reverse.items));
+        }
+        try std.testing.expectEqual(queued.position.sequence, (try authority.load(&txn)).?.sequence);
+        // Physical cleanup does not consume the epoch or acknowledge cancel.
+        try std.testing.expect(try topology.completed(&txn) == null);
+        try std.testing.expect((try topology.current(&txn)).?.eql(fence));
+        try testOwnerRecoveryAllocations(a, &txn);
     }
     {
         var txn = try store.beginWriteTxn();
