@@ -23,6 +23,7 @@ The pod is removed in finally and has a hard lifetime if the caller disconnects.
 
 import argparse
 import hashlib
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -66,6 +67,45 @@ def compare_runs(reports):
         for name, result in expected_filters.items():
             if report["metadata_filters"][name]["total"] != result["total"]:
                 raise ValueError(f"Exact filter total differs for {name}")
+
+
+def fresh_bearer_for_lifetime(invoke, project, required_seconds, *, now=None):
+    """Keep one admitted token in memory for the worker's bounded lifetime."""
+    completed = invoke(
+        [
+            "gcloud",
+            "config",
+            "config-helper",
+            "--force-auth-refresh",
+            "--project",
+            project,
+            "--format=json(credential.access_token,credential.token_expiry)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        credential = json.loads(completed.stdout)["credential"]
+        token = credential["access_token"]
+        expiry = datetime.fromisoformat(
+            credential["token_expiry"].replace("Z", "+00:00")
+        )
+        if (
+            not isinstance(token, str)
+            or not 0 < len(token) <= 65536
+            or expiry.tzinfo is None
+        ):
+            raise ValueError("Invalid credential metadata")
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise RuntimeError("Cannot admit bounded credential lifetime") from None
+    remaining = (expiry - (now or datetime.now(timezone.utc))).total_seconds()
+    if remaining < required_seconds:
+        raise RuntimeError("Credential expires before the worker hard deadline")
+    return token, {
+        "expires_at": expiry.isoformat(),
+        "remaining_seconds": round(remaining, 2),
+        "required_seconds": round(required_seconds, 2),
+    }
 
 
 def main():
@@ -232,6 +272,21 @@ def main():
             ]
         )
         run(kubectl + ["exec", pod_name, "--", "chmod", "+x", "/workspace/antfly"])
+        worker_start = datetime.fromisoformat(
+            worker["status"]["startTime"].replace("Z", "+00:00")
+        )
+        remaining_lifetime = max(
+            0,
+            args.lifetime - (datetime.now(timezone.utc) - worker_start).total_seconds(),
+        )
+        token, credential_admission = fresh_bearer_for_lifetime(
+            run, args.project, remaining_lifetime + 30
+        )
+        (args.output / "credential-admission.json").write_text(
+            json.dumps(credential_admission, indent=2) + "\n"
+        )
+        # Reuse this admitted token across cycles. Rotating a bearer also changes
+        # the publication's credential identity and would force a rebuild.
         reports = {}
         for mode in args.modes:
             command = kubectl + [
@@ -275,12 +330,6 @@ def main():
             reports[mode] = []
             for cycle in range(args.cycles):
                 label = mode + "-" + str(cycle + 1)
-                # Refresh for each cycle; OAuth credentials stay in memory.
-                token = run(
-                    ["gcloud", "auth", "print-access-token", "--project", args.project],
-                    capture_output=True,
-                    text=True,
-                ).stdout.strip()
                 with (args.output / (label + ".log")).open("w") as log:
                     completed = subprocess.run(
                         command,
@@ -347,6 +396,7 @@ def main():
             "node": worker["spec"]["nodeName"],
             "resources": worker["spec"]["containers"][0]["resources"],
             "image": SDK_IMAGE,
+            "credential_admission": credential_admission,
             "revision": args.revision,
             "binary_sha256": digest.hexdigest(),
             "runs": reports,

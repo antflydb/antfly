@@ -677,3 +677,12 @@ before searches. The harness now records transient timeout observations and
 waits for queued checkpoint recovery under the original build deadline.
 Permanent admission errors still fail immediately. Neither result establishes
 archive latency.
+
+The fifth full-archive attempt used the predicate-capacity fix, but stopped at
+`Unauthorized` after 670.2 seconds (218.9 MiB peak RSS), before searches.
+Cached credential expiration is plausible; original expiry evidence is unavailable.
+The regional harness now forces one fresh token per pod, checks its lifetime
+against the remaining pod deadline, and reuses it across cycles. Only expiry
+metadata is persisted. All five pods and 22,946 failed derived objects are
+removed; $125 remains reserved in the shared ledger. The final reserved attempt
+is a separately labelled one-file search diagnostic, not archive qualification.

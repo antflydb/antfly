@@ -53,9 +53,10 @@
     "note": "Reservations are conservative allowances, not measured cloud billing.",
     "third_attempt_reserved_usd": 20,
     "fourth_diagnostic_reserved_usd": 20,
-    "total_reserved_usd": 105,
+    "total_reserved_usd": 125,
     "max_planned_reserved_usd": 145,
-    "max_attempts": 6
+    "max_attempts": 6,
+    "fifth_attempt_reserved_usd": 20
   },
   "rerun": {
     "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
@@ -76,9 +77,9 @@
     "derived_bytes_deleted": 144166
   },
   "next_blocker": {
-    "shape": "Complete optimized archive construction and search qualification after the predicate spill-capacity fix.",
-    "diagnosis": "Per-file temporary data is released, but the bounded archive attempt encountered another shared SqlProgramLimitExceeded; exact runtime admission site remains unconfirmed.",
-    "required_work": "Use admission diagnostics on the fixed-binary rerun; retain resource bounds and completed checkpoints; measure throughput and search latency before deployment."
+    "shape": "Complete a fresh-credential search diagnostic, then full-archive construction qualification.",
+    "diagnosis": "The fifth archive attempt stopped at Unauthorized before search; cached token expiry is plausible but not proven. No full-archive latency evidence exists.",
+    "required_work": "Use the final reserved diagnostic attempt with admitted credential lifetime and bounded recovery; retain actual failure or timing evidence. Further cloud attempts require budget reconciliation."
   },
   "bounded_construction": {
     "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
@@ -108,7 +109,7 @@
     "before": "SqlProgramLimitExceeded",
     "after": "passed",
     "cloud_failure_attribution": "The constrained-capacity regression demonstrates a remaining risk; the previous cloud error does not identify its exact limit site.",
-    "optimized_archive_rerun": "pending",
+    "optimized_archive_rerun": "failed_before_queries_with_Unauthorized",
     "lake_regressions_passed": 84
   },
   "search_diagnostic": {
@@ -134,5 +135,30 @@
     "shape": "Record Timeout/DeadlineExceeded observations and allow the engine queued checkpoint recovery within the original absolute build deadline; permanent admission errors fail immediately.",
     "tests_passed": 4,
     "note": "The first diagnostic aborted at its first timeout; it did not wait for the already queued engine retry."
+  },
+  "predicate_capacity_rerun": {
+    "revision": "a71048bc20cf5550bfeb48315db651a564f92cb1",
+    "binary_sha256": "aa572a6b010e958629e9ca55b772e2c762a867105749ea3f7e03fde3844a3e58",
+    "scope": "Full 47,717,307-row archive",
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "Unauthorized",
+    "table_registration_ms": 20480.62,
+    "elapsed_since_build_start_seconds": 670.21,
+    "build_peak_rss_bytes": 229490688,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 7131,
+    "derived_bytes_deleted": 168950869,
+    "credential_diagnosis": "Consistent with cached bearer expiration; original token expiry was not recorded, so attribution is unconfirmed."
+  },
+  "credential_lifetime_admission": {
+    "shape": "Force refresh once per pod, require expiry beyond its remaining hard deadline, reuse the admitted token across cycles, persist only nonsecret expiry evidence.",
+    "live_check": {
+      "expires_at": "2026-10-11T00:59:42+00:00",
+      "remaining_seconds": 3598.01,
+      "required_seconds": 3400
+    },
+    "qualification_regional_recovery_tests_passed": 22
   }
 }

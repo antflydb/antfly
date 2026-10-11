@@ -74,7 +74,7 @@ may depend on this expiring bucket.
 ## October 10 measured blockers
 
 The [recorded results](../../examples/hackernews/archive-results-20261010.json)
-contain two attempts over the same raw archive. Merged main rejected a large
+contain the initial attempts over the same raw archive. Merged main rejected a large
 Parquet page with `ParquetRowGroupTooLarge`. The decoder fix eliminates redundant
 per-column row-reference arrays while retaining the existing materialization
 bounds; 132 Parquet and 31 lake SQL tests pass.
@@ -107,8 +107,22 @@ with 260.4 MiB peak RSS. The engine queues a fresh fenced retry, but the origina
 harness aborted at the transient readiness state. The harness now records
 `Timeout`/`DeadlineExceeded` observations and waits for checkpoint recovery
 under its original absolute deadline. It still fails permanent admission
-errors immediately. Both owned pods and 15,701 derived objects were deleted;
+errors immediately. Those two owned pods and 15,701 derived objects were deleted;
 the unchanged source copy is retained only for the next diagnostic attempt.
+
+The fifth attempt used the predicate-capacity fix against the full archive.
+Registration took 20.5 seconds, then construction stopped with `Unauthorized`
+after 670.2 seconds, at 218.9 MiB peak RSS. Cached bearer expiration is consistent
+with this failure, but the original expiry was not recorded and attribution is
+unconfirmed. All five pods and 22,946 derived objects are removed. The ledger
+retains $125 in reservations; the final $20 diagnostic fits the $150 ceiling.
+
+The regional harness now forces a fresh bearer once per pod and admits it only
+when its expiry exceeds the remaining hard pod deadline by 30 seconds. It reuses
+that token across cycles, avoiding credential-identity changes that invalidate
+publication reuse. Reports contain expiry evidence only. This is a bounded
+qualification credential flow; a durable service still needs workload identity
+and refresh support. The live admission check and 22 harness tests pass.
 
 ## Bounded, resumable construction
 

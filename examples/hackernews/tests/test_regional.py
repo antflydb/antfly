@@ -16,6 +16,9 @@
 """Prevent comparative qualification from accepting inconsistent exact results."""
 
 from copy import deepcopy
+from datetime import datetime, timezone
+import json
+from types import SimpleNamespace
 import importlib.util
 from pathlib import Path
 import unittest
@@ -79,6 +82,73 @@ class ComparativeResultsTest(unittest.TestCase):
         other["metadata_filters"] = {}
         with self.assertRaisesRegex(ValueError, "Filter coverage"):
             regional.compare_runs([self.report, other])
+
+
+class CredentialLifetimeTest(unittest.TestCase):
+    def test_refreshes_and_admits_full_remaining_worker_lifetime(self):
+        calls = []
+
+        def invoke(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "credential": {
+                            "access_token": "test-token",
+                            "token_expiry": "2026-10-10T13:00:00Z",
+                        }
+                    }
+                )
+            )
+
+        token, evidence = regional.fresh_bearer_for_lifetime(
+            invoke,
+            "test-project",
+            3400,
+            now=datetime(2026, 10, 10, 12, tzinfo=timezone.utc),
+        )
+        self.assertEqual(token, "test-token")
+        self.assertIn("--force-auth-refresh", calls[0][0])
+        self.assertEqual(evidence["remaining_seconds"], 3600)
+        self.assertNotIn(token, json.dumps(evidence))
+
+    def test_rejects_nearly_expired_cached_token(self):
+        def invoke(*args, **kwargs):
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "credential": {
+                            "access_token": "test-token",
+                            "token_expiry": "2026-10-10T12:10:00Z",
+                        }
+                    }
+                )
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "worker hard deadline"):
+            regional.fresh_bearer_for_lifetime(
+                invoke,
+                "test-project",
+                3400,
+                now=datetime(2026, 10, 10, 12, tzinfo=timezone.utc),
+            )
+
+    def test_invalid_expiry_does_not_leak_credential(self):
+        def invoke(*args, **kwargs):
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {
+                        "credential": {
+                            "access_token": "test-token",
+                            "token_expiry": "bad-test-token",
+                        }
+                    }
+                )
+            )
+
+        with self.assertRaises(RuntimeError) as caught:
+            regional.fresh_bearer_for_lifetime(invoke, "test-project", 3400)
+        self.assertNotIn("test-token", str(caught.exception))
 
 
 if __name__ == "__main__":
