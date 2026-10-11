@@ -767,6 +767,62 @@ test "lite reclamation counts retired inodes until pinned readers release" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite reclamation externally locked refresh defers debt to its maintenance owner" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reclamation-connection-refresh.aflite");
+    defer alloc.free(path);
+    const policy: reclamation.Options = .{ .enabled = false, .retirement_work_pages = 1 };
+    var initial = try Store.createWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+        .reclamation = policy,
+    });
+    initial.file.releaseWriterOwnership();
+    var lease = try native.lockWriterPathWithIo(alloc, std.testing.io, path);
+    defer lease.close();
+    {
+        defer initial.close();
+        for (0..32) |version| {
+            var value: [32]u8 = undefined;
+            var write = try initial.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", try std.fmt.bufPrint(&value, "version-{d}", .{version}));
+            try write.commit();
+        }
+        try std.testing.expect(try initial.file.retirementNeedsService());
+    }
+    for (0..3) |_| {
+        var probe = try native.NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        const checkpoint = probe.activeCheckpoint();
+        var connection = try Store.openWithOptions(alloc, path, .{
+            .io = std.testing.io,
+            .no_sync = true,
+            .externally_locked = true,
+            .reclamation = policy,
+        });
+        defer connection.close();
+        try std.testing.expect(std.meta.eql(checkpoint, connection.file.activeCheckpoint()));
+        var read = try connection.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("version-31", try read.get("doc"));
+    }
+    var owner = try Store.openWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+        .reclamation = policy,
+    });
+    defer owner.close();
+    const before = owner.file.activeCheckpoint().commit_sequence;
+    try owner.maintainOnce(false);
+    try std.testing.expect(owner.file.activeCheckpoint().commit_sequence > before);
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
+}
+
 test "lite reclamation writable reopen services debt and read only reopen does not" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1249,15 +1305,19 @@ pub const Store = struct {
             .maintenance_start_suppressed = true,
         };
         errdefer result.close();
-        // An owner may live for only one CLI invocation. Reopen services debt
-        // synchronously so repeated short sessions cannot starve reclamation.
+        // A standalone owner may live for only one CLI invocation, so it
+        // services debt on reopen. Externally locked connections instead have
+        // a lease-scoped maintenance owner: refreshing a cached generation
+        // must not reclaim pages and publish another checkpoint on every
+        // foreground handoff. That publication invalidates the other
+        // connections and makes their next calls repeat this work.
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
         if (!opts.read_only and opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
             _ = try result.vacuumWithCancel(null);
         }
-        if (!opts.read_only) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
+        if (!opts.read_only and !opts.externally_locked) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
         result.maintenance_start_suppressed = opts.externally_locked;
         return result;
     }
@@ -1517,7 +1577,12 @@ pub const Store = struct {
         // transactions hold the inode lock, including streams between calls.
         if (generation.scoped_reader_lock and pin.kernel_reader) {
             if (generation.kernel_readers == 0) {
-                if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.FileBusy;
+                // Own publication is excluded by the store mutex during pin
+                // admission. A forked child can retain a completed writer's
+                // inode fence until exec/close, even after its parent closed
+                // the descriptor. Wait for that fence instead of failing an
+                // otherwise uncontended same-owner read.
+                try generation.file.file.lock(generation.file.runtime(), .shared);
             }
             generation.kernel_readers += 1;
         }
@@ -2757,17 +2822,25 @@ pub const Txn = struct {
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);
+        // Scoped inode pins share the complete native publication mutex.
+        // Keep it while waiting for the kernel fence, so an own writer cannot
+        // wait for read_mutex in its checkpoint observer behind that wait.
+        // Lifetime-owned readers already retain an inode fence and preserve
+        // admission during commit fsync.
+        const serialized_admission = store.file.externally_locked;
+        if (serialized_admission) lockStore(store);
+        defer if (serialized_admission) store.mutex.unlock();
         const pin = try store.readMetadataAllocator().create(ReadPin);
         errdefer store.readMetadataAllocator().destroy(pin);
         store.read_mutex.lockUncancelable(io);
         if (store.read_generation == null) {
             store.read_mutex.unlock(io);
-            lockStore(store);
+            if (!serialized_admission) lockStore(store);
             store.initializeReadGenerationAssumeLocked() catch |err| {
-                store.mutex.unlock();
+                if (!serialized_admission) store.mutex.unlock();
                 return err;
             };
-            store.mutex.unlock();
+            if (!serialized_admission) store.mutex.unlock();
             store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
@@ -4395,6 +4468,191 @@ test "lite native docstore persists replay lanes across reopen and truncation" {
         const stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &empty_ctx, EmptyContext.handle);
         try std.testing.expectEqual(@as(u64, 0), stats.matched_entries);
     }
+}
+
+test "lite externally locked artifact capture publishes under its generation lease" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "artifact-publication-admission.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    try store.file.putIndexCatalogRecord("index/run", "contents");
+    var source = try store.openArtifactSource("index/run");
+    defer source.close();
+    var bytes: [8]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("contents", &bytes);
+}
+
+test "lite externally locked read pins wait for catalog and document publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "publication-read-admission.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    var seed = try store.beginWrite();
+    try seed.put("doc", "before");
+    try seed.commit();
+    const Writer = struct {
+        store: *Store,
+        publishing: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocument("doc", "after");
+            try file.putCatalogRecord("index-metadata", "after");
+            self.publishing.store(true, .release);
+            while (!self.release.load(.acquire))
+                file.runtime().sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        fn run(self: *@This()) void {
+            self.store.submitMutationWithDurability(self, apply, false) catch |err| {
+                self.failure = err;
+                self.publishing.store(true, .release);
+            };
+        }
+    };
+    const Reader = struct {
+        store: *Store,
+        started: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.read() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn read(self: *@This()) !void {
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("after", try txn.get("doc"));
+        }
+    };
+    var writer = Writer{ .store = &store };
+    const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&writer});
+    defer {
+        writer.release.store(true, .release);
+        writer_thread.join();
+    }
+    while (!writer.publishing.load(.acquire)) std.atomic.spinLoopHint();
+    if (writer.failure) |err| return err;
+    var reader = Reader{ .store = &store };
+    const reader_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Reader.run, .{&reader});
+    var reader_joined = false;
+    defer if (!reader_joined) {
+        writer.release.store(true, .release);
+        reader_thread.join();
+    };
+    while (!reader.started.load(.acquire)) std.atomic.spinLoopHint();
+    // The writer retains its native reuse lock across this interval. A read
+    // arriving here must queue, not turn an internal collision into FileBusy.
+    try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    writer.release.store(true, .release);
+    reader_thread.join();
+    reader_joined = true;
+    if (reader.failure) |err| return err;
+}
+
+test "lite externally locked read pins wait for fork-inherited publication fences" {
+    const os = @import("builtin").os.tag;
+    if (os != .macos and os != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "inherited-publication-fence.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{
+        .io = io,
+        .no_sync = true,
+        .externally_locked = true,
+    });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var seed = try store.beginWrite();
+    try seed.put("doc", "committed");
+    try seed.commit();
+    store.file.releaseWriterOwnership();
+
+    var pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+    const fence = try std.Io.Dir.cwd().openFile(io, path, .{
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    var parent_fence_open = true;
+    defer if (parent_fence_open) fence.close(io);
+    const child = std.c.fork();
+    if (child == 0) {
+        // Only async-signal-safe calls after fork: the child inherits the
+        // writer's open file description, just as a concurrent process spawn
+        // does until exec closes its CLOEXEC descriptors.
+        var byte: [1]u8 = undefined;
+        const received = std.c.read(pipe[0], &byte, 1);
+        _ = std.c.close(fence.handle);
+        std.c._exit(if (received == 1) 0 else 1);
+    }
+    try std.testing.expect(child > 0);
+    fence.close(io);
+    parent_fence_open = false;
+    var child_released = false;
+    defer {
+        if (!child_released) _ = std.c.write(pipe[1], "x", 1);
+        var status: c_int = undefined;
+        _ = std.c.waitpid(child, &status, 0);
+    }
+
+    const Reader = struct {
+        store: *Store,
+        started: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.read() catch |err| {
+                self.failure = err;
+            };
+            self.finished.store(true, .release);
+        }
+        fn read(self: *@This()) !void {
+            var txn = try self.store.beginRead();
+            defer txn.abort();
+            try std.testing.expectEqualStrings("committed", try txn.get("doc"));
+        }
+    };
+    var reader = Reader{ .store = &store };
+    const thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Reader.run, .{&reader});
+    defer {
+        if (!child_released) {
+            _ = std.c.write(pipe[1], "x", 1);
+            child_released = true;
+        }
+        thread.join();
+    }
+    while (!reader.started.load(.acquire)) std.atomic.spinLoopHint();
+    try io.sleep(.fromMilliseconds(20), .awake);
+    // The parent has no exclusive descriptor left, but the child still
+    // fences the inode. Read admission must wait instead of returning busy.
+    try std.testing.expect(!reader.finished.load(.acquire));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(pipe[1], "x", 1));
+    child_released = true;
+    while (!reader.finished.load(.acquire)) std.atomic.spinLoopHint();
+    if (reader.failure) |err| return err;
 }
 
 test "lite native docstore reserves one writer until abort or commit" {

@@ -30,7 +30,7 @@ pub const Diagnostic = struct {
         if (std.mem.eql(u8, self.code, "38000")) return 502;
         if (std.mem.eql(u8, self.code, "0A000")) return 501;
         if (std.mem.eql(u8, self.code, "42501")) return 403;
-        if (std.mem.eql(u8, self.code, "53300")) return 503;
+        if (std.mem.eql(u8, self.code, "53300") or std.mem.eql(u8, self.code, "55P03")) return 503;
         if (std.mem.startsWith(u8, self.code, "40")) return 409;
         if (std.mem.eql(u8, self.code, "XX000") or std.mem.eql(u8, self.code, "53200")) return 500;
         return 400;
@@ -205,6 +205,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.Timeout => .{ .code = "57014", .message = "The SQL operation was canceled or its deadline expired.", .hint = "Reduce the operation's work or choose a suitable deadline." },
         error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.GenerationRetired, error.IntegrityCatalogChanged => .{ .code = "40001", .message = "The table definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema.", .retryable = true },
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
+        error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
         error.SqlWriteCapacityUnavailable, error.SqlPlanCacheBusy, error.Backpressured, error.DenseRepairBackpressure => .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .hint = "Retry after a bounded delay; reduce concurrent requests.", .retryable = true },
         error.SqlStatementReadUnavailable => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
@@ -225,12 +226,15 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
 
 test "SQL diagnostics retain definite constraints conflicts and unknown outcomes" {
     try std.testing.expectEqual(@as(u16, 503), describe(error.SqlStatementReadUnavailable).httpStatus());
+    try std.testing.expectEqual(@as(u16, 503), describe(error.FileBusy).httpStatus());
     for ([_]struct { err: anyerror, code: []const u8, retryable: ?bool }{
         .{ .err = error.UniqueConstraintViolation, .code = "23505", .retryable = false },
         .{ .err = error.ForeignKeyParentMissing, .code = "23503", .retryable = false },
         .{ .err = error.RelationalCheckViolation, .code = "23514", .retryable = false },
         .{ .err = error.SqlNotNullViolation, .code = "23502", .retryable = false },
         .{ .err = error.PreparedReadSetChanged, .code = "40001", .retryable = true },
+        .{ .err = error.FileBusy, .code = "55P03", .retryable = true },
+        .{ .err = error.WouldBlock, .code = "55P03", .retryable = true },
         .{ .err = error.SqlStatementReadUnavailable, .code = "53300", .retryable = true },
         .{ .err = error.TableTopologyProtocolUpgradeRequired, .code = "53300", .retryable = true },
         .{ .err = error.SettingAuthorityUnavailable, .code = "53300", .retryable = false },

@@ -245,6 +245,11 @@ closed handle before crossing the ABI.
 
 Lite embedded handles are independent connections. Any number of writable,
 read-only, and status-only connections may remain open to the same file.
+Compatible connections share one process storage owner, catalog/index caches,
+and, when enabled, a maintenance worker per canonical path. SQL sessions, cursor
+IDs, and child handle ownership remain connection-local; closing one connection preserves the
+others. Busy timeouts remain per connection. Distinct storage settings use
+separate owners under the same file gate.
 Opening an existing file does not reserve its writer. Complete native operations
 queue on a canonical file gate within a process, and a kernel path lease
 coordinates operations between processes. A writable operation owns the lease
@@ -259,12 +264,16 @@ every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
 journals of all tables and resume it under their connection lease.
 
-After an external commit or atomic file replacement, a connection reopens its
-cached runtime before the next operation. Streaming SQL cursors retain the
+After an external commit or atomic file replacement, the shared owner reopens
+its cached runtime before the next operation. An in-process handoff between
+compatible connections reuses the live runtime. Streaming SQL cursors retain the
 runtime and immutable pages they originally pinned; retiring that runtime
 releases caches without flushing them over a newer generation. Read-only
 connections observe new commits at operation boundaries. Automatic enrichment,
-TTL, and reclamation maintenance run under the same connection lease.
+TTL, and reclamation maintenance run under the same file gate and kernel lease.
+Foreground refresh defers reclamation to that owner. Lease-scoped publication
+fences new read pins until page reuse and checkpoint publication finish; temporary
+lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
 This follows SQLite's separation of connection lifetime from writer ownership;
 it does not claim SQLite WAL concurrency or change Antfly SQL's existing

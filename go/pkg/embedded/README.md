@@ -249,9 +249,11 @@ _, err = db.Exec("INSERT INTO people (id,name) VALUES ($1,$2)", int64(1), "Ada")
 rows, err := db.Query("SELECT id,name FROM people")
 ```
 
-Pooled connections have independent native handles and SQL sessions. Native
-operations coordinate writer ownership; `busy_timeout_ms` in the DSN defaults
-to 5000. `BeginTx` uses READ COMMITTED; stronger isolation returns an error.
+Pooled connections have independent SQL sessions. Compatible connections to the
+same canonical file path share a process storage owner, caches, and maintenance
+worker. Native operations coordinate writer ownership; `busy_timeout_ms` in the
+DSN defaults to 5000. `BeginTx` uses READ COMMITTED; stronger isolation returns
+an error.
 Rows use native streaming cursors, so queries continue beyond 128 rows. Signed
 64-bit integers remain `int64`; SQL NULL becomes nil. JSON parameters can use
 `json.RawMessage`, JSON results use `[]byte`, and byte parameters represent
