@@ -651,6 +651,15 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     const jobs = @import("relational_index_owner_job.zig");
     const first: integrity.Claim = .{ .tuple = "first", .parent_table = "articles", .parent_key = "a", .schema_version = binding.physical_candidate.schema_version };
     const second: integrity.Claim = .{ .tuple = "second", .parent_table = "articles", .parent_key = "b", .schema_version = binding.physical_candidate.schema_version };
+    const retained = @import("../retained_effects.zig");
+    if (restart.path != null) {
+        // The cold profile retains ordinary public integrity effects. Private
+        // batches and derived GC must not enter this tail or advance it again.
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained.admit(&txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), 42, @splat(7), retained.default_limit);
+        try txn.commit();
+    }
     const foreign_address = try integrity.Address.init(@splat(238), first.tuple);
     const foreign_value = try first.encode(a, foreign_address);
     defer a.free(foreign_value);
@@ -666,6 +675,12 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         try txn.put(&foreign_address.claimKey(), foreign_value);
         try txn.commit();
     }
+    const retained_start = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk if (try retained.load(&read)) |value| value.latest else @as(?u64, null);
+    };
+    if (restart.path != null) try std.testing.expectEqual(@as(?u64, 1), retained_start);
     var prepared = blk: {
         var read = try store.beginReadTxn();
         defer read.abort();
@@ -698,6 +713,12 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         try std.testing.expectEqual(@as(usize, 2), result.claims_added);
         try std.testing.expectEqual(original_cut, result.position.sequence);
         try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(original_cut, (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectEqual(retained_start, if (try retained.load(&read)) |value| value.latest else @as(?u64, null));
     }
     const allocation = blk: {
         var read = try store.beginReadTxn();
@@ -944,6 +965,7 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             var read = try store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqual(cleanup_clock, (try @import("../source_authority.zig").load(&read)).?.sequence);
+            try std.testing.expectEqual(retained_start, if (try retained.load(&read)) |value| value.latest else @as(?u64, null));
             try std.testing.expectEqualSlices(u8, foreign_value, try read.get(&foreign_address.claimKey()));
             var reserved_binding = binding;
             reserved_binding.phase = .reserved;

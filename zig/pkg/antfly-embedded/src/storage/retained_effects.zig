@@ -800,7 +800,7 @@ pub const Capture = struct {
                 if (try namespace(txn)) |current| try @import("source_pin_state.zig").requireNoPrepared(txn, current);
             }
         }
-        if (integrity.isKey(key)) {
+        if ((self.private_claim_generation != null or self.private_claim_context_revoked) and integrity.isKey(key)) {
             const parsed = try integrity.parseKey(key);
             if (self.private_claim_context_revoked) return error.RetainedEffectsMixedControl;
             if (self.private_claim_generation) |generation| {
