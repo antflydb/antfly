@@ -30,8 +30,31 @@ const lifecycle = @import("table_lifecycle_lock.zig");
 const Allocator = std.mem.Allocator;
 pub const Id = progress.Id;
 pub const Digest = progress.Digest;
+pub const RootProof = @import("owner_root_attestation.zig").Proof("antfly/index-build-owner-receipt/v1");
+
+/// Signature verification alone is not authority. The metadata apply adapter
+/// must also check the enrolled current root/reporter and exact live placement
+/// in the SAME transaction as its progress CAS. Never accept a service ACK or
+/// caller-supplied verification boolean in place of those reads.
+pub const SignedReceipt = struct {
+    receipt: progress.Receipt,
+    proof: RootProof,
+
+    pub fn verifySignature(self: SignedReceipt) !void {
+        const logical_digest = self.receipt.digest() catch return error.InvalidIndexOwnerReceipt;
+        self.proof.verify(logical_digest) catch return error.InvalidIndexOwnerReceipt;
+    }
+};
 pub const max_bytes = 8 * 1024 * 1024;
 pub const max_command_bytes = max_bytes + 16 * 1024;
+pub const max_ack_bytes = 4096;
+/// A planless, bounded owner acknowledgement. The admitted head and ordinal
+/// directory, not request fields, determine the records that may change.
+pub const Ack = struct {
+    table_id: u64,
+    expected_revision: u64,
+    signed: SignedReceipt,
+};
 const prefix = "\x00\x00__metadata__:relational_index_publication:v1:";
 pub fn allGroupsPrefix() []const u8 {
     return prefix;
@@ -212,6 +235,7 @@ pub const Owner = struct {
     namespace: local.storage_db_doc_identity.Namespace,
     admission_epoch: u64,
     catalog_digest: Digest,
+    receipt_authority: progress.Authority,
 };
 
 /// Call only for an owner from a bounded, validated frame. Hash directly into
@@ -294,7 +318,8 @@ pub const Plan = struct {
                 .plan_digest = plan_digest,
                 .ordinal = @intCast(ordinal),
                 .group_id = owner.range.group_id,
-                .range_id = owner.namespace.range_id,
+                .namespace = owner.namespace,
+                .authority = owner.receipt_authority,
                 .fence_digest = try ownerFenceDigest(owner),
             } };
             try state.validate();
@@ -550,6 +575,7 @@ fn testPlan(a: Allocator) !Plan {
         .range = .{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" },
         .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 },
         .admission_epoch = 7,
+        .receipt_authority = .raft,
         .catalog_digest = digest(compiled.value),
     };
     return .{
@@ -567,6 +593,59 @@ fn testPlan(a: Allocator) !Plan {
 pub const testing = if (@import("builtin").is_test) struct {
     pub const plan = testPlan;
 } else struct {};
+
+test "relational index publication signatures bind owner authority position and root generation" {
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    inline for (.{ progress.Authority.raft, progress.Authority.native }) |authority| {
+        const namespace: local.storage_db_doc_identity.Namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 401 };
+        const receipt: progress.Receipt = .{
+            .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = 0, .group_id = 301, .namespace = namespace, .authority = authority, .fence_digest = @splat(3) },
+            .action = .fenced,
+            .position = if (authority == .native) .{ .native = .{ .namespace = namespace, .sequence = 5 } } else .{ .raft = .{ .term = 2, .index = 5 } },
+            .candidate_digest = @splat(4),
+            .reservation_digest = @splat(5),
+            .evidence_digest = @splat(6),
+        };
+        const signed: SignedReceipt = .{ .receipt = receipt, .proof = try (RootProof{
+            .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
+            .reporter_incarnation = 4,
+            .replica_id = 5,
+            .root_generation = 6,
+            .signature = undefined,
+        }).sign(root, try receipt.digest()) };
+        try signed.verifySignature();
+        var altered = signed;
+        altered.receipt.owner.namespace.shard_id += 1;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        if (authority == .native) altered.receipt.position.native.sequence += 1 else altered.receipt.position.raft.index += 1;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.receipt.candidate_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.receipt.action = .reserved;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.proof.root_generation += 1;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        altered = signed;
+        altered.proof.reporter_incarnation += 1;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+        const foreign = try (@import("initial_child_root_attestation.zig").Attestation{
+            .identity = signed.proof.identity,
+            .reporter_incarnation = signed.proof.reporter_incarnation,
+            .replica_id = signed.proof.replica_id,
+            .root_generation = signed.proof.root_generation,
+            .signature = undefined,
+        }).sign(root, try receipt.digest());
+        altered = signed;
+        altered.proof.signature = foreign.signature;
+        try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());
+    }
+}
 
 test "relational index publication prepares owned immutable head owner and reserved name postimages" {
     const a = std.testing.allocator;

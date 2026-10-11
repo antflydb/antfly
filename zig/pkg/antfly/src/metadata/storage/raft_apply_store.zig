@@ -4067,7 +4067,7 @@ test "relational index publication reverse cohort verification uses three fixed 
         }
     };
     var head: index_progress.Head = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .table_id = 101, .owner_count = 1 };
-    const owner: index_progress.OwnerState = .{ .owner = .{ .plan_id = head.plan_id, .plan_digest = head.plan_digest, .ordinal = 0, .group_id = 301, .range_id = 301, .fence_digest = @splat(5) } };
+    const owner: index_progress.OwnerState = .{ .owner = .{ .plan_id = head.plan_id, .plan_digest = head.plan_digest, .ordinal = 0, .group_id = 301, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .authority = .raft, .fence_digest = @splat(5) } };
     var reader: Reader = .{ .head = try head.encode(), .owner = try owner.encode() };
     var value: [16]u8 = undefined;
     std.mem.writeInt(u64, value[0..8], 301, .little);
@@ -4117,6 +4117,165 @@ test "relational index publication range enumeration stops before excess allocat
     try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, ids);
     cursor = .{ .fail = true };
     try std.testing.expectError(error.StorageReadFailed, readTableRangeIdsBounded(std.testing.failing_allocator, &cursor, "range:", 0));
+}
+
+test "relational index publication authenticated owner ACKs persist both positions and reject stale authority without namespace churn" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const incarnation = "11111111111111111111111111111111".*;
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key };
+    inline for (.{ index_progress.Authority.raft, index_progress.Authority.native }) |authority| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-ack", .{tmp.sub_path});
+        defer a.free(path);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var plan = try index_publication.testing.plan(arena.allocator());
+        var owners = [_]index_publication.Owner{plan.owners[0]};
+        owners[0].receipt_authority = authority;
+        plan.owners = &owners;
+        var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
+        var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 6 }};
+        const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
+        const placement: raft_reconciler.PlacementIntent = .{ .record = .{ .group_id = owners[0].range.group_id, .replica_id = 5, .local_node_id = 2 }, .store_id = 3, .peer_node_ids = &.{2} };
+        var ack: index_publication.Ack = undefined;
+        {
+            var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+            defer store.deinit();
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .upsert_table = plan.before });
+            try store.applyStandaloneCommand(group, .{ .upsert_range = owners[0].range });
+            try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+            try store.applyStandaloneCommand(group, .{ .register_store = current });
+            try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
+            const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_admission_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+            defer a.free(activation);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+            try adoptRelationWriterForTest(&store, a, group);
+            _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+                plan.table_guard = .{ .target = .{ .name = plan.before.name }, .logical_table = plan.before.name, .owner = (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?, .incarnation = live.root.epoch.incarnation };
+            }
+            const begin = try std.json.Stringify.valueAlloc(a, index_publication.Begin{ .plan = plan }, .{});
+            defer a.free(begin);
+            try store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = begin });
+            var prepared = try plan.prepare(a);
+            defer prepared.deinit();
+            const receipt: index_progress.Receipt = .{
+                .owner = prepared.owners[0].owner,
+                .action = .fenced,
+                .position = if (authority == .native) .{ .native = .{ .namespace = owners[0].namespace, .sequence = 5 } } else .{ .raft = .{ .term = 2, .index = 5 } },
+                .candidate_digest = prepared.head.candidate_digest,
+                .reservation_digest = prepared.head.reservation_digest,
+                .evidence_digest = @splat(8),
+            };
+            ack = .{ .table_id = plan.before.table_id, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (index_publication.RootProof{ .identity = identity, .reporter_incarnation = 4, .replica_id = 5, .root_generation = 6, .signature = undefined }).sign(root, try receipt.digest()) } };
+            const bytes = try std.json.Stringify.valueAlloc(a, ack, .{});
+            defer a.free(bytes);
+            try std.testing.expect(bytes.len <= index_publication.max_ack_bytes);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+            const enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{});
+            defer a.free(enrollment);
+            try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
+            try store.validateRelationalIndexOwnerAck(group, bytes);
+            const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, range_namespace, active_job, lifecycle };
+            inline for (std.meta.tags(Fault)) |fault| {
+                // Each fault has its own aborted storage cut. No simulated
+                // verification boolean can substitute for real durable reads.
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var buf: [192]u8 = undefined;
+                var changed = current;
+                var changed_runtime = runtimes;
+                var changed_groups = groups;
+                var changed_placement = placement;
+                switch (fault) {
+                    .reporter => changed.reporter_incarnation += 1,
+                    .root_identity => changed.replica_root_incarnation += 1,
+                    .root_generation => changed_runtime[0].lsm_root_generation += 1,
+                    .placement_replica => changed_placement.record.replica_id += 1,
+                    .placement_store => changed_placement.store_id += 1,
+                    .placement_state => changed_placement.serving_state = .planned,
+                    .observed_position => changed_groups[0].raft_applied_index = 0,
+                    .range_namespace => {
+                        var changed_range = owners[0].range;
+                        changed_range.doc_identity_shard_id += 1;
+                        const range_bytes = try encodeRangeRecord(a, changed_range);
+                        defer a.free(range_bytes);
+                        try txn.put(try rangeKeyForGroup(&buf, group, changed_range.group_id), range_bytes);
+                    },
+                    .active_job => try txn.put(try index_publication.activeKey(&buf, group, ack.table_id), &@as([16]u8, @splat(9))),
+                    .lifecycle => try txn.delete(try @import("../table_lifecycle_lock.zig").key(&buf, group, ack.table_id)),
+                }
+                changed.runtime_statuses = &changed_runtime;
+                changed.group_statuses = &changed_groups;
+                _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed);
+                const placement_bytes = try encodePlacementIntent(a, changed_placement);
+                defer a.free(placement_bytes);
+                try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
+                if (fault == .active_job or fault == .lifecycle) {
+                    try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
+                } else if (fault == .observed_position and authority == .native) {
+                    // Native sequence 5 remains valid even when Raft index is
+                    // zero: comparing these domains would invent authority.
+                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                } else {
+                    try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
+                }
+                try std.testing.expectEqualSlices(u8, &try prepared.head.encode(), try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
+                try std.testing.expectEqualSlices(u8, &try prepared.owners[0].encode(), try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+            }
+            const source = blk: {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
+            };
+            const encoded = try encodeTransitionCommand(a, .{ .ack_relational_index_publication = bytes });
+            defer a.free(encoded);
+            var decoded = (try decodeTransitionCommand(a, encoded)).?;
+            defer decoded.deinit(a);
+            try std.testing.expectEqualSlices(u8, bytes, decoded.ack_relational_index_publication);
+            try store.applyStandaloneCommand(group, decoded);
+            // Original revision lost: committed replay is a no-op, not a log
+            // poison. Preflight still reports the conflict to its caller.
+            try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+            try store.applyStandaloneCommand(group, decoded);
+            ack.expected_revision = 2;
+            const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
+            defer a.free(replay);
+            try store.validateRelationalIndexOwnerAck(group, replay);
+            try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = replay });
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect(source.eql(try RaftApplyStore.relationSourceEpochTxn(&read, group)));
+                const head = try index_publication.verifyJob(a, &read, group, ack.table_id);
+                try std.testing.expectEqual(@as(u64, 2), head.revision);
+                try std.testing.expectEqual(index_progress.Phase.reserving, head.phase);
+            }
+            try verifyRelationRecoveryForTest(&store, a, group);
+        }
+        {
+            var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+            defer store.deinit();
+            try verifyRelationRecoveryForTest(&store, a, group);
+            const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
+            defer a.free(replay);
+            try store.validateRelationalIndexOwnerAck(group, replay);
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var buf: [192]u8 = undefined;
+            const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+            try std.testing.expectEqualDeep(ack.signed.receipt.position, owner.position.?);
+        }
+    }
 }
 
 test "relational index publication admission reserves names atomically and survives recovery with fault verification" {
@@ -4444,7 +4603,7 @@ test "relational index publication terminal replacement bounds owner retention a
                 const ack = try index_progress.PreparedAck.prepare(&try head.encode(), &try owner.encode(), head.revision, .{
                     .owner = owner.owner,
                     .action = action,
-                    .applied_index = head.revision + 100,
+                    .position = .{ .raft = .{ .term = 1, .index = head.revision + 100 } },
                     .candidate_digest = head.candidate_digest,
                     .reservation_digest = head.reservation_digest,
                     .evidence_digest = @splat(7),
@@ -6884,6 +7043,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 
 pub const TransitionCommand = union(enum) {
     begin_relational_index_publication: []const u8,
+    ack_relational_index_publication: []const u8,
     apply_relation_reconciliation: []const u8,
     apply_restore_staging: []const u8,
     /// Versioned system catalog request, applied atomically with any table topology.
@@ -7050,7 +7210,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .ack_relational_index_publication, .begin_relational_index_publication, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -7178,6 +7338,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .apply_restore_staging => |bytes| if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging,
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .begin_relational_index_publication => |bytes| if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication,
+        .ack_relational_index_publication => |bytes| if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.InvalidGenerationPublication,
         .apply_fk_initial_create => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_store_root_enrollment, .ack_initial_fk_retirement => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.InvalidStoreRootEnrollment,
         .upsert_store, .upsert_store_heartbeat, .register_store => |record| {
@@ -15127,6 +15288,111 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    /// A preflight is only a hint. Committed apply repeats every check against
+    /// its own transaction before staging either progress record.
+    pub fn validateRelationalIndexOwnerAck(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.prepareRelationalIndexOwnerAckTxn(&txn, group_id, bytes);
+    }
+
+    const IndexOwnerAck = struct {
+        table_id: u64,
+        ordinal: u16,
+        update: @import("antfly_local_sources").storage_db_relational_index_publication_progress.PreparedAck,
+    };
+
+    fn prepareRelationalIndexOwnerAckTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !IndexOwnerAck {
+        const progress = @import("antfly_local_sources").storage_db_relational_index_publication_progress;
+        if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.InvalidGenerationPublication;
+        const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_admission_version);
+        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        var parsed = try std.json.parseFromSlice(index_publication.Ack, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        const ack = parsed.value;
+        try ack.signed.verifySignature();
+        if (ack.table_id == 0 or ack.signed.receipt.owner.namespace.table_id != ack.table_id) return error.InvalidIndexOwnerReceipt;
+        const lifecycle = @import("../table_lifecycle_lock.zig");
+        const lock = (try lifecycle.read(txn, group_id, ack.table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &ack.signed.receipt.owner.plan_id)) return error.GenerationPublicationChanged;
+        var buf: [192]u8 = undefined;
+        const active = (try stagingGet(txn, try index_publication.activeKey(&buf, group_id, ack.table_id))) orelse return error.GenerationPublicationChanged;
+        if (!std.mem.eql(u8, active, &lock.id)) return error.GenerationPublicationChanged;
+        const ordinal = index_publication.ownerOrdinal(txn, group_id, ack.table_id, ack.signed.receipt.owner.group_id) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationChanged,
+            else => return err,
+        };
+        if (ordinal != ack.signed.receipt.owner.ordinal) return error.InvalidIndexOwnerReceipt;
+        // Copy the fixed head before another get can reuse its borrowed buffer.
+        const head_bytes = (try stagingGet(txn, try index_publication.headKey(&buf, group_id, ack.table_id))) orelse return error.InvalidCatalogRecord;
+        if (head_bytes.len != progress.Head.encoded_len) return error.InvalidCatalogRecord;
+        const owned_head = head_bytes[0..progress.Head.encoded_len].*;
+        const owner_bytes = (try stagingGet(txn, try index_publication.ownerKey(&buf, group_id, ack.table_id, ordinal))) orelse return error.InvalidCatalogRecord;
+        const update = try progress.PreparedAck.prepare(&owned_head, owner_bytes, ack.expected_revision, ack.signed.receipt);
+        try self.requireIndexOwnerRootReceiptTxn(txn, group_id, ack.signed);
+        return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update };
+    }
+
+    fn ackRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        const prepared = self.prepareRelationalIndexOwnerAckTxn(txn, group_id, bytes) catch |err| switch (err) {
+            // A valid proposer can lose its preflight cut to another ACK or
+            // owner replacement. These checks have staged NO writes. Never
+            // swallow errors from stage(), where a storage write can fail.
+            error.GenerationPublicationChanged, error.IndexOwnerReceiptChanged => return,
+            else => return err,
+        };
+        var head_buf: [192]u8 = undefined;
+        var owner_buf: [192]u8 = undefined;
+        try prepared.update.stage(txn, try index_publication.headKey(&head_buf, group_id, prepared.table_id), try index_publication.ownerKey(&owner_buf, group_id, prepared.table_id, prepared.ordinal));
+    }
+
+    fn requireIndexOwnerRootReceiptTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedReceipt) !void {
+        const proof = signed.proof;
+        self.requireStoreRootEnrollmentTxn(txn, group_id, proof.identity) catch |err| switch (err) {
+            error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged => return error.IndexOwnerReceiptChanged,
+            else => return err,
+        };
+        const current = (try self.loadStoreHeaderTxn(txn, group_id, proof.identity.store_id)) orelse return error.IndexOwnerReceiptChanged;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (!current.live or current.node_id != proof.identity.node_id or current.reporter_incarnation != proof.reporter_incarnation or
+            current.replica_root_incarnation != proof.identity.root_incarnation or !std.mem.eql(u8, &current.replica_root_public_key, &proof.identity.public_key))
+            return error.IndexOwnerReceiptChanged;
+        var buf: [256]u8 = undefined;
+        const cluster = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.IndexOwnerReceiptChanged;
+        if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(cluster)).incarnation, &proof.identity.metadata_incarnation)) return error.IndexOwnerReceiptChanged;
+        const owner = signed.receipt.owner;
+        const range_bytes = (try stagingGet(txn, try rangeKeyForGroup(&buf, group_id, owner.group_id))) orelse return error.IndexOwnerReceiptChanged;
+        const range = try decodeRangeRecord(self.alloc, range_bytes);
+        defer metadata_table_manager.freeRange(self.alloc, range);
+        if (range.group_id != owner.group_id or range.table_id != owner.namespace.table_id or
+            metadata_table_manager.rangeDocIdentityShardId(range) != owner.namespace.shard_id or
+            metadata_table_manager.rangeDocIdentityRangeId(range) != owner.namespace.range_id) return error.IndexOwnerReceiptChanged;
+        const placement = (try self.loadPlacementIntentTxn(txn, try placementKeyForGroup(&buf, group_id, owner.group_id, proof.identity.node_id))) orelse return error.IndexOwnerReceiptChanged;
+        defer raft_reconciler.freeIntentOwned(self.alloc, placement);
+        if (placement.store_id != proof.identity.store_id or placement.record.group_id != owner.group_id or
+            placement.record.local_node_id != proof.identity.node_id or placement.record.replica_id != proof.replica_id or
+            placement.serving_state != .serving) return error.IndexOwnerReceiptChanged;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const address = try ReportAddress.active(a, txn, group_id, current.store_id);
+        const report = (try readStoreGroupReportTxn(a, txn, group_id, address, owner.group_id, true)) orelse return error.IndexOwnerReceiptChanged;
+        if (report.runtime_statuses.len != 1) return error.IndexOwnerReceiptChanged;
+        const runtime = report.runtime_statuses[0];
+        if (runtime.table_id != owner.namespace.table_id or runtime.store_id != current.store_id or runtime.node_id != current.node_id or
+            runtime.lsm_root_generation != proof.root_generation or runtime.lsm_root_generation == 0) return error.IndexOwnerReceiptChanged;
+        // Raft cuts require the owner observation to have caught up; a native
+        // commit sequence is deliberately never compared to a Raft index.
+        switch (signed.receipt.position) {
+            .raft => |position| {
+                if (report.group_statuses.len != 1) return error.IndexOwnerReceiptChanged;
+                const status = report.group_statuses[0];
+                if (status.raft_applied_index < position.index or status.raft_term < position.term) return error.IndexOwnerReceiptChanged;
+            },
+            .native => {},
+        }
+    }
+
     fn beginRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.InvalidGenerationPublication;
         const activation = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_admission_version);
@@ -17473,31 +17739,40 @@ pub const RaftApplyStore = struct {
         var runtimes: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
         var iterator = ids.keyIterator();
         while (iterator.next()) |id| {
-            const reference = txn.get(try listingReportKey(a, group_id, address, id.*)) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            if (reference.len != 16) return error.InvalidCatalogRecord;
-            if (std.mem.readInt(u64, reference[0..8], .little) != record.store_id) return error.InvalidCatalogRecord;
-            const slot = std.mem.readInt(u64, reference[8..16], .little);
-            for ([_]bool{ false, true }) |runtime| {
-                if (runtime and !include_runtime) continue;
-                const component: usize = if (runtime) 0 else 2;
-                const bytes = try txn.get(try reportComponentKey(a, group_id, address, slot / report_page_slots, component));
-                var decoded = try decodeReportComponent(a, try reportPageEntry(bytes, slot), runtime);
-                for (decoded.group_statuses) |item| if (item.group_id != id.*) return error.InvalidCatalogRecord;
-                for (decoded.runtime_statuses) |item| if (item.group_id != id.*) return error.InvalidCatalogRecord;
-                const clocks = try txn.get(try reportComponentKey(a, group_id, address, slot / report_page_slots, component + 1));
-                try applyReportClocks(&decoded, try reportPageEntry(clocks, slot));
-                try groups.appendSlice(a, decoded.group_statuses);
-                try runtimes.appendSlice(a, decoded.runtime_statuses);
-            }
+            const decoded = (try readStoreGroupReportTxn(a, &txn, group_id, address, id.*, include_runtime)) orelse continue;
+            try groups.appendSlice(a, decoded.group_statuses);
+            try runtimes.appendSlice(a, decoded.runtime_statuses);
         }
         // Restore the header's owned slices before its deferred destruction.
         var selected = record;
         selected.group_statuses = groups.items;
         selected.runtime_statuses = runtimes.items;
         return try metadata_table_manager.cloneStore(alloc, selected);
+    }
+
+    /// One directory lookup and at most four page reads, independent of the
+    /// store's replica count. Decode only the addressed slot, not its siblings.
+    /// Returned slices belong to the caller's arena.
+    fn readStoreGroupReportTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, address: ReportAddress, owner_group: u64, include_runtime: bool) !?ReportComponent {
+        const reference = txn.get(try listingReportKey(a, group_id, address, owner_group)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (reference.len != 16 or std.mem.readInt(u64, reference[0..8], .little) != address.store_id) return error.InvalidCatalogRecord;
+        const slot = std.mem.readInt(u64, reference[8..16], .little);
+        var result: ReportComponent = .{};
+        for ([_]bool{ false, true }) |runtime| {
+            if (runtime and !include_runtime) continue;
+            const component: usize = if (runtime) 0 else 2;
+            const bytes = try txn.get(try reportComponentKey(a, group_id, address, slot / report_page_slots, component));
+            var decoded = try decodeReportComponent(a, try reportPageEntry(bytes, slot), runtime);
+            for (decoded.group_statuses) |item| if (item.group_id != owner_group) return error.InvalidCatalogRecord;
+            for (decoded.runtime_statuses) |item| if (item.group_id != owner_group) return error.InvalidCatalogRecord;
+            const clocks = try txn.get(try reportComponentKey(a, group_id, address, slot / report_page_slots, component + 1));
+            try applyReportClocks(&decoded, try reportPageEntry(clocks, slot));
+            if (runtime) result.runtime_statuses = decoded.runtime_statuses else result.group_statuses = decoded.group_statuses;
+        }
+        return result;
     }
 
     const BaselineUpload = struct {
@@ -19009,6 +19284,7 @@ pub const RaftApplyStore = struct {
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
             .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
+            .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -21482,6 +21758,7 @@ pub const RaftApplyStore = struct {
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
             .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
             .begin_relational_index_publication => |bytes| try self.beginRelationalIndexPublicationTxn(txn, group_id, bytes),
+            .ack_relational_index_publication => |bytes| try self.ackRelationalIndexPublicationTxn(txn, group_id, bytes),
             .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
             .apply_store_root_enrollment => |bytes| self.applyStoreRootEnrollmentTxn(txn, group_id, bytes) catch |err| switch (err) {
                 error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.UnknownStore => {},
@@ -26260,6 +26537,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    ack_relational_index_publication = 79,
     begin_relational_index_publication = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
@@ -26432,6 +26710,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .begin_relational_index_publication => |bytes| {
             if (bytes.len == 0 or bytes.len > index_publication.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.begin_relational_index_publication));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .ack_relational_index_publication => |bytes| {
+            if (bytes.len == 0 or bytes.len > index_publication.max_ack_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.ack_relational_index_publication));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_fk_initial_create => |bytes| {
@@ -26863,6 +27146,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .begin_relational_index_publication => blk: {
             if (encoded.len > index_publication.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .begin_relational_index_publication = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .ack_relational_index_publication => blk: {
+            if (encoded.len > index_publication.max_ack_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .ack_relational_index_publication = try readRequiredString(alloc, encoded, &pos) };
         },
         .apply_fk_initial_create => blk: {
             if (encoded.len > fk_generation_publication.max_bytes + 16) return error.CatalogCommandTooLarge;

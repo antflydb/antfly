@@ -1728,3 +1728,66 @@ candidate tests and fourteen catalog tests, with zero failures, skips or leaks.
 These component selections overlap and are not new SQL case credits or a
 full-suite qualification. Formatting, diff and control-catalog freshness checks
 also pass; latest fetched `origin/main` remains included.
+
+### Typed, root-authenticated metadata owner acknowledgements
+
+The private progress contract now pins the entire document-identity namespace
+and receipt authority (native or Raft) in each admitted owner. Native receipts
+carry a namespace-bound commit sequence; replicated receipts carry term/index.
+The first receipt cannot choose its own authority, and subsequent transitions
+reject namespace changes, mixed position domains, non-increasing positions and
+regressing Raft terms. Exact action replay preserves the latest position.
+
+The new PR-local owner codec is AIPO v2, 424 bytes, including an explicitly
+encoded position and checked zero padding. The 184-byte head is unchanged.
+This replaces the earlier 376-byte private format described above; there is no
+deployed-main migration or legacy decoder. The public producer is still disabled.
+
+`ack_relational_index_publication` is a bounded, planless metadata log command
+(tag 79, coordinated decoder floor 36, maximum JSON payload 4 KiB). Preflight
+and committed apply independently verify the admitted active job, table lock,
+owner-group ordinal directory, head revision and exact owner descriptor. A
+domain-separated root signature binds the logical receipt, root enrollment,
+reporter incarnation, replica identity and physical root generation. Apply
+also point-reads the enrolled root, current store header, metadata incarnation,
+live range namespace, serving placement and addressed store-report slot. Raft
+receipts require an observed applied cut; native sequences are never compared
+with Raft indices. Report selection reuses the sparse report machinery: one
+directory lookup and at most four page reads, decoding only that owner's slot.
+This is a code-path bound, not a measured end-to-end latency improvement.
+
+Only head and owner progress records change. Both exact predecessors pass
+before either write, and storage errors during staging abort the transaction.
+Losing pre-write revision/job or current-owner checks are safe committed no-ops;
+preflight exposes the conflict. Malformed commands, missing decoder barriers,
+corrupt records and I/O errors are not suppressed. The immutable plan, public
+schema and namespace source revision are not rewritten per receipt.
+
+Initial-child FK root attestations use the same signing implementation with
+their original signature domain and unchanged byte transcript. An independent
+reference-transcript test protects that existing contract; cross-domain replay
+is rejected.
+
+The new real-metadata campaign covers both position domains, enrollment,
+reporter/root/placement/range substitutions, unchanged progress on rejection,
+stale-CAS replay, exact retry, command encode/decode, unchanged namespace source,
+and persisted receipt positions after reopen. This is metadata-adapter evidence,
+not proof that a native worker actually fenced/built/cleaned an index. Native
+ordered command execution, global UNIQUE claims, publication/cancellation
+continuations, public SQL activation and distributed fault qualification remain
+unfinished. The original SQL inventory is unchanged.
+
+Qualification completed on the frozen implementation in Debug and ReleaseFast.
+The focused Debug build passed 89/89 steps; the separate full catalog/store
+gate passed 204/204 tests. The optimized combined build passed 95/95 steps,
+including that full catalog/store gate and all thirteen typed-progress tests.
+Its standard-runner summary is 217/217 tests; the custom-runner artifacts also
+report twelve publication tests, one decoder-floor test, nineteen initial-FK
+tests, one placement test and fifty namespace/recovery tests, with no skips,
+failures or leaks. These overlapping selections are not SQL inventory credits.
+Formatting, diff, control-catalog freshness, license headers and the Apache
+boundary pass; the boundary/header unit suites pass 35 and 11 tests respectively.
+The inventory integrity checker still reports 478 implemented, 136 rejected,
+73 superseded and 899 unresolved original cases. Latest fetched `origin/main`
+at `2afbdd306c` is fully included. The public SQL atomicity gate was not rerun
+for this metadata-only checkpoint and remains an open activation requirement.

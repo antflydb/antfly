@@ -20,10 +20,13 @@
 //! owner operation at its durable applied cut; hashes are not authentication.
 //! This module does not admit plans, grant owner authority, or publish schemas.
 const std = @import("std");
+const positions = @import("receipt_position.zig");
+const Namespace = @import("doc_identity_namespace.zig").Namespace;
 
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const max_owners = 4096;
+pub const Authority = enum(u8) { raft = 1, native = 2 };
 /// Verified owner evidence must have these semantics:
 /// fenced: exact source fence is durable and predecessor participants drained;
 /// reserved: exact allocation high-water burn is committed, no schema exposed;
@@ -58,41 +61,47 @@ pub const Owner = struct {
     plan_digest: Digest,
     ordinal: u16,
     group_id: u64,
-    range_id: u64,
+    namespace: Namespace,
+    authority: Authority,
     fence_digest: Digest,
 
     fn validate(self: Owner) !void {
         if (!nonzero(&self.plan_id) or !nonzero(&self.plan_digest) or !nonzero(&self.fence_digest) or
-            self.ordinal >= max_owners or self.group_id == 0 or self.range_id == 0)
+            self.ordinal >= max_owners or self.group_id == 0 or self.namespace.table_id == 0 or
+            self.namespace.shard_id == 0 or self.namespace.range_id == 0)
             return error.InvalidGenerationPublication;
     }
     fn eql(a: Owner, b: Owner) bool {
         return std.mem.eql(u8, &a.plan_id, &b.plan_id) and equal(a.plan_digest, b.plan_digest) and
-            a.ordinal == b.ordinal and a.group_id == b.group_id and a.range_id == b.range_id and equal(a.fence_digest, b.fence_digest);
+            a.ordinal == b.ordinal and a.group_id == b.group_id and a.namespace.eql(b.namespace) and a.authority == b.authority and equal(a.fence_digest, b.fence_digest);
     }
 };
 
 pub const Receipt = struct {
     owner: Owner,
     action: Action,
-    applied_index: u64,
+    position: positions.Position,
     candidate_digest: Digest,
     reservation_digest: Digest,
     /// Owner-bound validation/cleanup/install evidence, not just an HTTP ACK.
     evidence_digest: Digest,
 
-    fn digest(self: Receipt) Digest {
+    pub fn digest(self: Receipt) !Digest {
         var hasher = std.crypto.hash.Blake3.init(.{});
-        hasher.update("antfly:index-publication-receipt:v1");
+        hasher.update("antfly:index-publication-receipt:v2");
         hasher.update(&self.owner.plan_id);
         hasher.update(&self.owner.plan_digest);
-        var numbers: [27]u8 = undefined;
+        var numbers: [36]u8 = undefined;
         std.mem.writeInt(u16, numbers[0..2], self.owner.ordinal, .little);
         std.mem.writeInt(u64, numbers[2..10], self.owner.group_id, .little);
-        std.mem.writeInt(u64, numbers[10..18], self.owner.range_id, .little);
-        std.mem.writeInt(u64, numbers[18..26], self.applied_index, .little);
-        numbers[26] = @backingInt(self.action);
+        std.mem.writeInt(u64, numbers[10..18], self.owner.namespace.table_id, .little);
+        std.mem.writeInt(u64, numbers[18..26], self.owner.namespace.shard_id, .little);
+        std.mem.writeInt(u64, numbers[26..34], self.owner.namespace.range_id, .little);
+        numbers[34] = @backingInt(self.action);
+        numbers[35] = @backingInt(self.owner.authority);
         hasher.update(&numbers);
+        try self.position.requireNamespace(self.owner.namespace);
+        hasher.update(&try self.position.encode());
         hasher.update(&self.owner.fence_digest);
         hasher.update(&self.candidate_digest);
         hasher.update(&self.reservation_digest);
@@ -226,10 +235,10 @@ pub const Head = struct {
 };
 
 pub const OwnerState = struct {
-    pub const encoded_len = 376;
+    pub const encoded_len = 424;
     owner: Owner,
     flags: u8 = 0,
-    applied_index: u64 = 0,
+    position: ?positions.Position = null,
     receipts: [7]Digest = @splat(@splat(0)),
 
     fn has(self: OwnerState, action: Action) bool {
@@ -237,7 +246,9 @@ pub const OwnerState = struct {
     }
     pub fn validate(self: OwnerState) !void {
         try self.owner.validate();
-        if (self.flags & 0x80 != 0 or (self.flags == 0) != (self.applied_index == 0)) return error.InvalidGenerationPublication;
+        if (self.flags & 0x80 != 0 or (self.flags == 0) != (self.position == null)) return error.InvalidGenerationPublication;
+        if (self.position) |position| position.requireNamespace(self.owner.namespace) catch return error.InvalidGenerationPublication;
+        if (self.position) |position| if (!matchesAuthority(self.owner.authority, position)) return error.InvalidGenerationPublication;
         for (self.receipts, 0..) |digest, i| {
             const action: Action = @fromBackingInt(@intCast(i));
             // Cancellation synthesizes fenced/reserved progress: the cleanup
@@ -256,37 +267,46 @@ pub const OwnerState = struct {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPO");
-        bytes[4] = 1;
+        bytes[4] = 2;
         bytes[5] = self.flags;
+        bytes[6] = @backingInt(self.owner.authority);
         @memcpy(bytes[8..24], &self.owner.plan_id);
         @memcpy(bytes[24..56], &self.owner.plan_digest);
         std.mem.writeInt(u16, bytes[56..58], self.owner.ordinal, .little);
         std.mem.writeInt(u64, bytes[64..72], self.owner.group_id, .little);
-        std.mem.writeInt(u64, bytes[72..80], self.owner.range_id, .little);
-        @memcpy(bytes[80..112], &self.owner.fence_digest);
-        std.mem.writeInt(u64, bytes[112..120], self.applied_index, .little);
-        for (self.receipts, 0..) |digest, i| @memcpy(bytes[120 + i * 32 ..][0..32], &digest);
-        @memcpy(bytes[344..376], &checksum(bytes[0..344]));
+        std.mem.writeInt(u64, bytes[72..80], self.owner.namespace.table_id, .little);
+        std.mem.writeInt(u64, bytes[80..88], self.owner.namespace.shard_id, .little);
+        std.mem.writeInt(u64, bytes[88..96], self.owner.namespace.range_id, .little);
+        @memcpy(bytes[96..128], &self.owner.fence_digest);
+        if (self.position) |position| @memcpy(bytes[128..161], &try position.encode());
+        for (self.receipts, 0..) |digest, i| @memcpy(bytes[168 + i * 32 ..][0..32], &digest);
+        @memcpy(bytes[392..424], &checksum(bytes[0..392]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !OwnerState {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 1 or
-            !std.mem.allEqual(u8, bytes[6..8], 0) or !std.mem.allEqual(u8, bytes[58..64], 0) or
-            !std.mem.eql(u8, &checksum(bytes[0..344]), bytes[344..376])) return error.InvalidGenerationPublication;
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 2 or
+            bytes[7] != 0 or !std.mem.allEqual(u8, bytes[58..64], 0) or
+            !std.mem.allEqual(u8, bytes[161..168], 0) or
+            !std.mem.eql(u8, &checksum(bytes[0..392]), bytes[392..424])) return error.InvalidGenerationPublication;
         var result: OwnerState = .{
             .owner = .{
                 .plan_id = bytes[8..24].*,
                 .plan_digest = bytes[24..56].*,
                 .ordinal = std.mem.readInt(u16, bytes[56..58], .little),
                 .group_id = std.mem.readInt(u64, bytes[64..72], .little),
-                .range_id = std.mem.readInt(u64, bytes[72..80], .little),
-                .fence_digest = bytes[80..112].*,
+                .namespace = .{
+                    .table_id = std.mem.readInt(u64, bytes[72..80], .little),
+                    .shard_id = std.mem.readInt(u64, bytes[80..88], .little),
+                    .range_id = std.mem.readInt(u64, bytes[88..96], .little),
+                },
+                .authority = std.enums.fromInt(Authority, bytes[6]) orelse return error.InvalidGenerationPublication,
+                .fence_digest = bytes[96..128].*,
             },
             .flags = bytes[5],
-            .applied_index = std.mem.readInt(u64, bytes[112..120], .little),
+            .position = if (std.mem.allEqual(u8, bytes[128..161], 0)) null else positions.Position.decode(bytes[128..161]) catch return error.InvalidGenerationPublication,
         };
-        for (&result.receipts, 0..) |*digest, i| digest.* = bytes[120 + i * 32 ..][0..32].*;
+        for (&result.receipts, 0..) |*digest, i| digest.* = bytes[168 + i * 32 ..][0..32].*;
         try result.validate();
         return result;
     }
@@ -297,6 +317,13 @@ pub const Update = struct {
     owner: OwnerState,
     changed: bool,
 };
+
+fn matchesAuthority(authority: Authority, position: positions.Position) bool {
+    return switch (authority) {
+        .raft => position == .raft,
+        .native => position == .native,
+    };
+}
 
 /// Owned, fixed-size staging buffers. The metadata apply transaction must also
 /// stage its outbox/receipt before commit, and abort on any staging error.
@@ -358,15 +385,26 @@ pub fn acknowledge(head: Head, owner: OwnerState, expected_revision: u64, receip
     if (!Owner.eql(owner.owner, receipt.owner) or !std.mem.eql(u8, &head.plan_id, &owner.owner.plan_id) or
         !equal(head.plan_digest, owner.owner.plan_digest) or owner.owner.ordinal >= head.owner_count or
         !equal(head.candidate_digest, receipt.candidate_digest) or !equal(head.reservation_digest, receipt.reservation_digest) or
-        !nonzero(&receipt.evidence_digest) or receipt.applied_index == 0) return error.InvalidGenerationPublication;
-    const digest = receipt.digest();
+        owner.owner.namespace.table_id != head.table_id or
+        !nonzero(&receipt.evidence_digest)) return error.InvalidGenerationPublication;
+    receipt.position.requireNamespace(owner.owner.namespace) catch return error.InvalidGenerationPublication;
+    if (!matchesAuthority(owner.owner.authority, receipt.position)) return error.InvalidGenerationPublication;
+    const digest = try receipt.digest();
     const action = receipt.action;
     const index = @backingInt(action);
     if (owner.has(action)) {
         if (!equal(owner.receipts[index], digest)) return error.GenerationPublicationChanged;
         return .{ .head = head, .owner = owner, .changed = false };
     }
-    if (receipt.applied_index <= owner.applied_index) return error.GenerationPublicationChanged;
+    if (owner.position) |previous| {
+        if (std.meta.activeTag(previous) != std.meta.activeTag(receipt.position)) return error.GenerationPublicationChanged;
+        switch (previous) {
+            .raft => |value| if (receipt.position.raft.index <= value.index or receipt.position.raft.term < value.term)
+                return error.GenerationPublicationChanged,
+            .native => |value| if (receipt.position.native.sequence <= value.sequence)
+                return error.GenerationPublicationChanged,
+        }
+    }
     const allowed = switch (action) {
         .fenced => head.phase == .fencing,
         .reserved => head.phase == .reserving and owner.has(.fenced),
@@ -386,7 +424,7 @@ pub fn acknowledge(head: Head, owner: OwnerState, expected_revision: u64, receip
     };
     next.owner.flags |= bit(action);
     next.owner.receipts[index] = digest;
-    next.owner.applied_index = receipt.applied_index;
+    next.owner.position = receipt.position;
     next.head.counts[index] += 1;
     if (next.head.counts[index] == next.head.owner_count) next.head.phase = switch (action) {
         .fenced => .reserving,
@@ -407,10 +445,18 @@ fn testHead(count: u16) Head {
     return .{ .plan_id = @splat(1), .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .table_id = 9, .owner_count = count };
 }
 fn testOwner(ordinal: u16) OwnerState {
-    return .{ .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = ordinal, .group_id = @as(u64, ordinal) + 100, .range_id = @as(u64, ordinal) + 200, .fence_digest = @splat(5) } };
+    return .{ .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = ordinal, .group_id = @as(u64, ordinal) + 100, .namespace = .{ .table_id = 9, .shard_id = @as(u64, ordinal) + 100, .range_id = @as(u64, ordinal) + 200 }, .authority = .raft, .fence_digest = @splat(5) } };
 }
 fn testReceipt(head: Head, owner: OwnerState, action: Action) Receipt {
-    return .{ .owner = owner.owner, .action = action, .applied_index = owner.applied_index + 1, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(6) };
+    const next = if (owner.position) |position| switch (position) {
+        .raft => position.raft.index + 1,
+        .native => position.native.sequence + 1,
+    } else 1;
+    const position: positions.Position = if (owner.position != null and owner.position.? == .native)
+        .{ .native = .{ .namespace = owner.owner.namespace, .sequence = next } }
+    else
+        .{ .raft = .{ .term = if (owner.position) |previous| previous.raft.term else 1, .index = next } };
+    return .{ .owner = owner.owner, .action = action, .position = position, .candidate_digest = head.candidate_digest, .reservation_digest = head.reservation_digest, .evidence_digest = @splat(6) };
 }
 fn testAck(head: *Head, owner: *OwnerState, action: Action) !void {
     const update = try acknowledge(head.*, owner.*, head.revision, testReceipt(head.*, owner.*, action));
@@ -472,14 +518,96 @@ test "index receipts reject stale revisions conflicting replay and owner or cand
     altered.evidence_digest[0] ^= 1;
     try std.testing.expectError(error.GenerationPublicationChanged, acknowledge(head, owner, head.revision, altered));
     altered = testReceipt(head, owner, .reserved);
-    altered.owner.range_id += 1;
+    altered.owner.namespace.range_id += 1;
     try std.testing.expectError(error.InvalidGenerationPublication, acknowledge(head, owner, head.revision, altered));
     altered = testReceipt(head, owner, .reserved);
     altered.reservation_digest[0] ^= 1;
     try std.testing.expectError(error.InvalidGenerationPublication, acknowledge(head, owner, head.revision, altered));
     altered = testReceipt(head, owner, .reserved);
-    altered.applied_index = owner.applied_index;
+    altered.position = owner.position.?;
     try std.testing.expectError(error.GenerationPublicationChanged, acknowledge(head, owner, head.revision, altered));
+}
+
+test "index native and Raft owners publish and cancel without mixing receipt domains" {
+    for ([_]bool{ false, true }) |cancel| {
+        var head = testHead(2);
+        var owners = [_]OwnerState{ testOwner(0), testOwner(1) };
+        owners[0].owner.authority = .native;
+        var native = testReceipt(head, owners[0], .fenced);
+        native.position = .{ .native = .{ .namespace = owners[0].owner.namespace, .sequence = 1 } };
+        const first = try acknowledge(head, owners[0], head.revision, native);
+        head = try Head.decode(&try first.head.encode());
+        owners[0] = try OwnerState.decode(&try first.owner.encode());
+        try testAck(&head, &owners[1], .fenced);
+        for ([_]Action{ .reserved, .validated }) |action| for (&owners) |*owner| try testAck(&head, owner, action);
+        if (cancel) {
+            head = try head.cancel(head.revision, .requested);
+            for ([_]Action{ .canceled, .cancel_released }) |action| for (&owners) |*owner| try testAck(&head, owner, action);
+            try std.testing.expectEqual(Phase.canceled, head.phase);
+        } else {
+            head = try head.decidePublish(head.revision);
+            for ([_]Action{ .installed, .released }) |action| for (&owners) |*owner| try testAck(&head, owner, action);
+            try std.testing.expectEqual(Phase.published, head.phase);
+        }
+        try std.testing.expect(owners[0].position.? == .native);
+        try std.testing.expect(owners[1].position.? == .raft);
+        try std.testing.expect(owners[0].position.?.native.namespace.eql(owners[0].owner.namespace));
+    }
+}
+
+test "index receipts reject authority namespace and regressing Raft term substitutions" {
+    inline for (.{ false, true }) |native| {
+        var head = testHead(1);
+        var owner = testOwner(0);
+        owner.owner.authority = if (native) .native else .raft;
+        var first = testReceipt(head, owner, .fenced);
+        first.position = if (native) .{ .native = .{ .namespace = owner.owner.namespace, .sequence = 1 } } else .{ .raft = .{ .term = 2, .index = 1 } };
+        const accepted = try acknowledge(head, owner, head.revision, first);
+        head = accepted.head;
+        owner = accepted.owner;
+        var next = testReceipt(head, owner, .reserved);
+        next.position = if (native) .{ .raft = .{ .term = 2, .index = 2 } } else .{ .native = .{ .namespace = owner.owner.namespace, .sequence = 2 } };
+        try std.testing.expectError(error.InvalidGenerationPublication, acknowledge(head, owner, head.revision, next));
+        next = testReceipt(head, owner, .reserved);
+        if (native) {
+            next.position.native.namespace.shard_id += 1;
+            try std.testing.expectError(error.InvalidGenerationPublication, acknowledge(head, owner, head.revision, next));
+            next = testReceipt(head, owner, .reserved);
+            next.position.native.sequence = owner.position.?.native.sequence;
+        } else {
+            next.position.raft.term = 1;
+            try std.testing.expectError(error.GenerationPublicationChanged, acknowledge(head, owner, head.revision, next));
+            next = testReceipt(head, owner, .reserved);
+            next.position.raft.term += 1;
+            next.position.raft.index = owner.position.?.raft.index;
+        }
+        try std.testing.expectError(error.GenerationPublicationChanged, acknowledge(head, owner, head.revision, next));
+        next = testReceipt(head, owner, .reserved);
+        next.owner.namespace.shard_id += 1;
+        try std.testing.expectError(error.InvalidGenerationPublication, acknowledge(head, owner, head.revision, next));
+        try testAck(&head, &owner, .reserved);
+        const replay = try acknowledge(head, owner, head.revision, first);
+        try std.testing.expect(!replay.changed);
+        try std.testing.expectEqualDeep(owner.position, replay.owner.position);
+    }
+}
+
+test "index owner codec rejects legacy layout and checksummed position padding" {
+    const owner = testOwner(0);
+    const bytes = try owner.encode();
+    var malformed = bytes;
+    malformed[4] = 1;
+    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
+    malformed = bytes;
+    malformed[161] = 1;
+    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
+    malformed = bytes;
+    const position: positions.Position = .{ .native = .{ .namespace = owner.owner.namespace, .sequence = 1 } };
+    @memcpy(malformed[128..161], &try position.encode());
+    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
 }
 
 test "index cancellation recovers every prepublication cut without releasing an unburned owner" {
