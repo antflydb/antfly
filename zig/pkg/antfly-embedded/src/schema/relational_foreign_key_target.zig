@@ -60,10 +60,10 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    var child = try schema.parseValidatedTableSchema(owned, child_json);
-    defer child.deinit(owned);
-    var parent = try schema.parseValidatedTableSchema(owned, parent_json);
-    defer parent.deinit(owned);
+    var child = try schema.parseValidatedTableSchema(alloc, child_json);
+    defer child.deinit(alloc);
+    var parent = try schema.parseValidatedTableSchema(alloc, parent_json);
+    defer parent.deinit(alloc);
     if (child.storage_mode != .relational or parent.storage_mode != .relational)
         return error.ForeignKeyTargetNotUnique;
     const child_layout = try schema.deriveRelationalCheckLayout(owned, child);

@@ -844,7 +844,7 @@ const Job = struct {
             var describe_backend = guarded.backend();
             describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
-            var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
+            var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
             for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
@@ -862,7 +862,7 @@ const Job = struct {
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var execution_backend = guarded.backend();
         execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
+        var result = native_adapter.execute(self.request.scratch_allocator orelse self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -1271,18 +1271,18 @@ const GuardedCatalog = struct {
         return .{ .ptr = owner, .cursors = cursors, .close = StatementRead.close };
     }
 
-    fn ddl(raw: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
+    fn ddl(raw: *anyopaque, allocators: catalog.DdlAllocators, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         const dispatch_ddl = self.native.vtable.ddl orelse return error.UnsupportedSqlExecution;
         // Refresh current grants before native DDL authorizes resource, rename
         // destination and tablespace. Prepared metadata never grants authority.
-        var current = try self.authority.credential.identity(alloc);
-        defer current.deinit(alloc);
+        var current = try self.authority.credential.identity(allocators.scratch);
+        defer current.deinit(allocators.scratch);
         const prior = self.authority.identity.*;
         self.authority.identity.* = current;
         defer self.authority.identity.* = prior;
-        return dispatch_ddl(self.native.ptr, alloc, input);
+        return dispatch_ddl(self.native.ptr, allocators, input);
     }
 };
 
