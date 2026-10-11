@@ -129,7 +129,7 @@ fn sqlInteger(value: std.json.Value) !i64 {
     };
 }
 
-fn expectRewrittenSqlRows(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !void {
+fn expectSqlPostimage(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !void {
     const statement = try std.fmt.allocPrint(alloc, "SELECT id, note FROM {s} ORDER BY id", .{name});
     defer alloc.free(statement);
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
@@ -147,7 +147,7 @@ fn expectRewrittenSqlRows(alloc: std.mem.Allocator, io: std.Io, transport: http.
                     continue;
                 }
             }
-            std.debug.print("PK rewritten SELECT table={s} status={d} body={s}\n", .{ name, response.status, response.body });
+            std.debug.print("PK SQL postimage table={s} status={d} body={s}\n", .{ name, response.status, response.body });
             return error.UnexpectedRewrittenSqlResponse;
         }
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
@@ -387,32 +387,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
                 std.debug.print("PK source GET key={s} status={d} body={s}\n", .{ key, fetched.status, fetched.body });
                 if (fetched.status != 200) return error.UnexpectedSourceLookup;
             }
-            const select_sql = try std.fmt.allocPrint(alloc, "SELECT id FROM {s} ORDER BY id", .{case.name});
-            defer alloc.free(select_sql);
-            var selected = try sql(alloc, transport, &headers, base, select_sql);
-            defer selected.deinit(alloc);
-            if (selected.status != 200) {
-                std.debug.print("PK source SELECT status={d} body={s}\n", .{ selected.status, selected.body });
-                var metadata_selected = try sql(alloc, transport, &headers, metadata_uri, select_sql);
-                defer metadata_selected.deinit(alloc);
-                std.debug.print("PK metadata SELECT status={d} body={s}\n", .{ metadata_selected.status, metadata_selected.body });
-                return error.UnexpectedSqlResponse;
-            }
-            var selected_json = try std.json.parseFromSlice(std.json.Value, alloc, selected.body, .{});
-            defer selected_json.deinit();
-            const rows = try field(selected_json.value, "rows");
-            const first = if (rows == .array and rows.array.items.len == 2 and rows.array.items[0] == .array and rows.array.items[0].array.items.len == 1)
-                sqlInteger(rows.array.items[0].array.items[0]) catch null
-            else
-                null;
-            const second = if (rows == .array and rows.array.items.len == 2 and rows.array.items[1] == .array and rows.array.items[1].array.items.len == 1)
-                sqlInteger(rows.array.items[1].array.items[0]) catch null
-            else
-                null;
-            if (first != 1 or second != 2) {
-                std.debug.print("PK source SELECT unexpected rows body={s}\n", .{selected.body});
-                return error.UnexpectedSqlRows;
-            }
+            try expectSqlPostimage(alloc, io_impl.io(), transport, &headers, base, case.name);
         }
         const alter = if (case.generated)
             try std.fmt.allocPrint(alloc, "ALTER TABLE {s} ADD PRIMARY KEY (id)", .{case.name})
@@ -497,7 +472,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
             defer duplicate.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 409), duplicate.status);
             try std.testing.expect(std.mem.indexOf(u8, duplicate.body, "UniqueConstraintViolation") != null);
-            try expectRewrittenSqlRows(alloc, io_impl.io(), transport, &headers, base, case.name);
+            try expectSqlPostimage(alloc, io_impl.io(), transport, &headers, base, case.name);
         } else {
             const keys: []const []const u8 = if (case.has_null) &.{"row-null"} else &.{ "row-a", "row-b" };
             for (keys, 0..) |key, key_index| {
@@ -567,7 +542,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
             defer duplicate.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 409), duplicate.status);
             try std.testing.expect(std.mem.indexOf(u8, duplicate.body, "UniqueConstraintViolation") != null);
-            try expectRewrittenSqlRows(alloc, io_impl.io(), transport, &headers, restarted_base, case.name);
+            try expectSqlPostimage(alloc, io_impl.io(), transport, &headers, restarted_base, case.name);
         } else if (!case.has_null) {
             var second = try document(alloc, transport, &headers, restarted_base, case.name, "row-b");
             defer second.deinit(alloc);
