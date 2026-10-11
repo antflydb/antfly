@@ -1184,20 +1184,33 @@ pub const Adapter = struct {
         return err;
     }
 
-    fn validateReadReceiptBinding(raw: *anyopaque, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
+    fn validateReadReceiptBinding(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const receipt = self.read_requirements.after_write orelse return;
         if (binding.relation) |relation| {
-            for (relation.scans) |scan_request| if (scan_request.table.id == receipt.table_id) return self.validateReceiptTable(scan_request.table);
-        } else if (binding.table) |table| if (table.id == receipt.table_id) return self.validateReceiptTable(table);
+            for (relation.scans) |scan_request| if (scan_request.table.id == receipt.table_id) return self.validateReceiptTable(alloc, scan_request.table);
+        } else if (binding.table) |table| if (table.id == receipt.table_id) return self.validateReceiptTable(alloc, table);
         return error.ReadReceiptGenerationMismatch;
     }
 
-    fn validateReceiptTable(self: *Adapter, table: catalog.Table) !void {
+    fn validateReceiptTable(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         const source = table.external_base_source orelse return error.UnsupportedReadVisibility;
         if (source.binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
         const generation = if (table.external_indexes) |indexes| indexes.object_generation else 0;
         if (self.read_requirements.after_write.?.object_generation != generation) return error.ReadReceiptGenerationMismatch;
+        // A zero-row plan can finish without opening any scan. Enforce the
+        // receipt here too; actual scans still verify their selected read cut.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        try self.checkLakeRead(a, table);
+        if (self.lake_visibility == .accepted and self.active_transaction != null) {
+            if (try self.loadSqlLakeCut(a, table)) |cut| {
+                try self.read_requirements.requireCoverage(table.id, cut.object_generation, cut.pending.lsn, true);
+                return;
+            }
+        }
+        _ = try self.awaitSqlReceipt(a, alloc, table);
     }
 
     fn fillLakeStatement(self: *Adapter, alloc: std.mem.Allocator, owner: *LakeStatement, requests: []const catalog.StatementScan) !catalog.StatementRead {

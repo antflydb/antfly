@@ -570,7 +570,7 @@ pub const Backend = struct {
     /// a cursor or fallback. Child plans inherit the already validated policy.
     execution_binding_validator: ?struct {
         ptr: *anyopaque,
-        validate: *const fn (*anyopaque, @import("describe.zig").BoundStatement) anyerror!void,
+        validate: *const fn (*anyopaque, std.mem.Allocator, @import("describe.zig").BoundStatement) anyerror!void,
     } = null,
     /// mutate retains predicate-only entries in the same atomic commit.
     predicate_only_mutations: bool = false,
