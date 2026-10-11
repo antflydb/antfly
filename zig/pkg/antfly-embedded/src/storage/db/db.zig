@@ -114523,23 +114523,18 @@ test "db text compaction preserves ordinal filters across reopen" {
     }
 }
 
-test "db provisioning reopen preserves an older encoding of the same schema epoch" {
+test "db v02 provisioning binds released epoch with missing local public metadata" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db-schema-format-retry");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
-    const schema_json =
-        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"}}}}}
-    ;
+    const schema_json = @embedFile("../testdata/v02-server/schema.json");
     var parsed = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed);
     defer schema_mod.freeSchema(alloc, runtime_schema);
-    // The text projection still uses the deployed document-schema format.
-    // This default schema has no capability-only fields to exclude.
-    const original = try schema_mod.serializeTextProjectionSchema(alloc, runtime_schema);
-    defer alloc.free(original);
+    const original = @embedFile("../testdata/v02-server/schema.asch");
     const versioned_key = try schema_mod.schemaVersionKeyAlloc(alloc, 0);
     defer alloc.free(versioned_key);
     const active_key = "\x00\x00__metadata__:schema";
@@ -114549,6 +114544,10 @@ test "db provisioning reopen preserves an older encoding of the same schema epoc
         try db.setSchemaJson(alloc, schema_json);
         try db.core.store.put(active_key, original);
         try db.core.store.put(versioned_key, original);
+        try db.core.store.delete(public_schema_json_key);
+        const public_version_key = try public_table_schema.versionedSchemaKeyAlloc(alloc, 0);
+        defer alloc.free(public_version_key);
+        try db.core.store.delete(public_version_key);
     }
     for (0..3) |_| {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -114557,12 +114556,15 @@ test "db provisioning reopen preserves an older encoding of the same schema epoc
         });
         defer db.close();
         try std.testing.expect(try schema_mod.schemasEqual(alloc, runtime_schema, db.core.schema.?));
+        var view = db.core.acquireSchemaView().?;
+        defer view.release();
+        try std.testing.expect(view.validator() != null);
         for ([_][]const u8{ active_key, versioned_key }) |key| {
             const actual = try db.core.store.get(alloc, key);
             defer alloc.free(actual);
             try std.testing.expectEqualSlices(u8, original, actual);
         }
-        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"text\":\"still writable\"}" }} });
+        try db.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"_type\":\"doc\",\"body\":\"still writable\",\"count\":7}" }} });
     }
 }
 

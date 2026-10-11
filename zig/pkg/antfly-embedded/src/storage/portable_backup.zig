@@ -2607,7 +2607,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
                 };
                 const derived = try public_table_schema.deriveRuntimeTableSchema(alloc, validator.schema);
                 defer storage_schema.freeSchema(alloc, derived);
-                if (!try storage_schema.schemasEqual(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
+                if (!try storage_schema.schemasEqualForPublicBinding(alloc, epoch.layout.schema, derived)) return error.InvalidBackupRequest;
             } else if (epoch.layout.schema.requires_public_schema or state.phase == .public_layouts) return error.InvalidBackupRequest;
             state.cursor = try owned.dupe(u8, kv.key);
             count += 1;
@@ -2931,7 +2931,7 @@ fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, c
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, schema, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, schema, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -3140,6 +3140,7 @@ fn validateAndImportPortableStagingAfterHeader(
         .snapshot_alloc = alloc,
     };
     defer archive.deinit(alloc);
+    const metadata_primed = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, store);
     var imported_identity = false;
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
@@ -3158,7 +3159,7 @@ fn validateAndImportPortableStagingAfterHeader(
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (block.block_type == .metadata_batch and archive.saw_document_block)
+        if (!metadata_primed and block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
         switch (block.block_type) {
             .document_batch => {
@@ -3174,7 +3175,7 @@ fn validateAndImportPortableStagingAfterHeader(
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .metadata_batch => try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
+            .metadata_batch => if (!metadata_primed) try validateAndImportMetadataBatchPayload(alloc, store, block.payload, &archive),
             .chunk_batch => if (opts.import_derived_indexes) try importChunkBatch(alloc, store, block.payload),
             .artifact_batch => if (opts.import_derived_indexes) try importPublicArtifactBatch(alloc, store, block.payload, .asset),
             .resolution_batch => if (opts.import_derived_indexes) try importResolutionArtifactBatch(alloc, store, block.payload),
@@ -3284,6 +3285,7 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         .source_copy = opts.source_copy,
     };
     defer archive.deinit(alloc);
+    const metadata_primed = try primeReleasedPortableMetadata(alloc, reader, opts, &archive, null);
     var block_index: usize = 0;
     var saw_bundle_manifest = false;
     while (reader.hasRemaining()) {
@@ -3299,16 +3301,57 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
             archive.min_afb_reader = manifest.value.compatibility.min_afb_reader;
             saw_bundle_manifest = true;
         }
-        if (header.format_version == backup_codec.format_version and
+        if (!metadata_primed and header.format_version == backup_codec.format_version and
             block.block_type == .metadata_batch and archive.saw_document_block)
             return error.InvalidBackupManifest;
-        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
+        if (!metadata_primed or block.block_type != .metadata_batch)
+            try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts, &archive);
         if (block.block_type == .document_batch) archive.saw_document_block = true;
         block_index += 1;
     }
     if (header.format_version == backup_codec.format_version and !saw_bundle_manifest)
         return error.InvalidBackupManifest;
     try archive.finish(alloc);
+}
+
+// Released v0.2.1+ AFB2 writers place documents before their schema metadata.
+// Authenticate a bounded streaming metadata pass first, then reset the same
+// source and validate every row with its schema. Reader.reset also checks the
+// archive fingerprint across passes; newer reader levels retain strict ordering.
+fn primeReleasedPortableMetadata(
+    alloc: Allocator,
+    reader: anytype,
+    opts: ImportOptions,
+    archive: *PortableArchiveValidation,
+    store: ?*DocStore,
+) !bool {
+    if (archive.format_version != backup_codec.format_version) return false;
+    if (!reader.hasRemaining()) return error.InvalidBackupManifest;
+    const first = try reader.readBlock(alloc);
+    defer alloc.free(first.payload);
+    if (first.block_type != .bundle_manifest) return error.InvalidBackupManifest;
+    var manifest = try backup_bundle.parseManifest(alloc, first.payload);
+    defer manifest.deinit();
+    if (manifest.value.representation != .portable) return error.BackupArtifactFormatMismatch;
+    if (manifest.value.compatibility.min_afb_reader != backup_bundle.base_afb_reader_version) {
+        try reader.reset(alloc);
+        return false;
+    }
+    while (reader.hasRemaining()) {
+        try opts.cancellation.check();
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type == .bundle_manifest) return error.InvalidBackupManifest;
+        if (block.block_type == .metadata_batch) {
+            if (store) |staging| {
+                try validateAndImportMetadataBatchPayload(alloc, staging, block.payload, archive);
+            } else {
+                try validateMetadataBatchPayload(alloc, block.payload, archive);
+            }
+        }
+    }
+    try reader.reset(alloc);
+    return true;
 }
 
 const ArchiveSchemaLayout = struct {
@@ -3657,7 +3700,7 @@ const PortableArchiveValidation = struct {
                     else => return error.InvalidBackupRequest,
                 };
                 defer storage_schema.freeSchema(alloc, derived);
-                const schemas_match = storage_schema.schemasEqual(alloc, runtime_schema, derived) catch |err| switch (err) {
+                const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, runtime_schema, derived) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return error.InvalidBackupRequest,
                 };
@@ -3677,7 +3720,7 @@ const PortableArchiveValidation = struct {
                 else => return error.InvalidBackupRequest,
             };
             defer storage_schema.freeSchema(alloc, derived);
-            const schemas_match = storage_schema.schemasEqual(alloc, layout.schema.*, derived) catch |err| switch (err) {
+            const schemas_match = storage_schema.schemasEqualForPublicBinding(alloc, layout.schema.*, derived) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
             };
@@ -7170,4 +7213,27 @@ test "portable graph retirements are primary and require reader version four" {
             }
         }
     }
+}
+
+test "portable backup v02 released AFB2 validates imports and binds public schemas" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("testdata/v02-server/portable.afb");
+    try validatePortable(alloc, bytes);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try openTestStore(alloc, &tmp);
+    defer store.close();
+    try importPortable(alloc, &store, bytes);
+    try validateCompleteDatabaseImageAlloc(alloc, &store);
+    const runtime = (try storage_schema.loadSchema(&store, alloc)).?;
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(u32, 12), runtime.decoded_format_version);
+    try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+    const key = try internal_keys.documentKeyAlloc(alloc, "a");
+    defer alloc.free(key);
+    const row = try store.get(alloc, key);
+    defer alloc.free(row);
+    try std.testing.expect(std.mem.indexOf(u8, row, "zebrafish") != null);
+    try store.put("\x00\x00__metadata__:schema_json", "{\"version\":0,\"default_type\":\"conflicting\"}");
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, validateCompleteDatabaseImageAlloc(alloc, &store));
 }
