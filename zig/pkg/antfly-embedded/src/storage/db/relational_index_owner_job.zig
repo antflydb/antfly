@@ -33,6 +33,7 @@ const cancellation = @import("relational_index_cancellation_intent.zig");
 const Digest = [32]u8;
 pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
 pub const Phase = enum(u8) { fencing, reserved };
+pub const private_claims = @import("relational_index_private_claims.zig");
 pub const cancellation_cleanup_key = key ++ ":cancel-gc";
 
 /// One reusable cleanup-admission slot, not a publication acknowledgement.
@@ -331,6 +332,7 @@ pub const CancellationState = struct {
     cleanup: ?positions.Native = null,
     claim_allocation: ?u64 = null,
     artifacts_retired: bool = false,
+    claims_retired: bool = false,
 
     /// Validate a decoded inspection before dispatching another owner effect.
     /// Structural validity is not metadata permission or root attestation.
@@ -364,6 +366,7 @@ pub const CancellationState = struct {
                 return error.InvalidPrivateIndexCancellation;
         } else if (self.claim_allocation != null) return error.InvalidPrivateIndexCancellation;
         if (self.artifacts_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
+        if (self.claims_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
     }
 };
 
@@ -398,6 +401,12 @@ pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
         result.claim_allocation = record.claim_allocation;
         if (requireCancellationArtifactsRetired(txn, current)) |_| {
             result.artifacts_retired = true;
+        } else |err| switch (err) {
+            error.PrivateIndexCancellationPending => {},
+            else => return err,
+        }
+        if (private_claims.requireRetired(txn, current)) |_| {
+            result.claims_retired = true;
         } else |err| switch (err) {
             error.PrivateIndexCancellationPending => {},
             else => return err,

@@ -91,6 +91,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.collectNativeIndexOwnerClaimGarbage(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.admitCanceledNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyCanceledNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerCancellationState(std.testing.allocator, 7, "rows", identity, context));
@@ -3729,14 +3730,38 @@ pub const ProvisionedKernelOwnerSource = struct {
         identity: native_index_control.Identity,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(native_index_control.CleanupMaintenanceOutcome) {
+        return self.collectNativeIndexOwnerDerivedGarbage(alloc, group_id, table_name, identity, context, false);
+    }
+
+    pub fn collectNativeIndexOwnerClaimGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.ClaimCleanupMaintenanceOutcome) {
+        return self.collectNativeIndexOwnerDerivedGarbage(alloc, group_id, table_name, identity, context, true);
+    }
+
+    fn collectNativeIndexOwnerDerivedGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+        comptime claims: bool,
+    ) !std.json.Parsed(if (claims) native_index_control.ClaimCleanupMaintenanceOutcome else native_index_control.CleanupMaintenanceOutcome) {
+        const Outcome = if (claims) native_index_control.ClaimCleanupMaintenanceOutcome else native_index_control.CleanupMaintenanceOutcome;
         var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
         defer lease.deinit();
         const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
         defer alloc.free(encoded);
         try context.ensureActive();
-        var response = try lease.owner().nativeIndexOwnerGcJson(table_name, encoded);
+        var response = if (claims) try lease.owner().nativeIndexOwnerClaimGcJson(table_name, encoded) else try lease.owner().nativeIndexOwnerGcJson(table_name, encoded);
         defer response.deinit();
-        return std.json.parseFromSlice(native_index_control.CleanupMaintenanceOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        return std.json.parseFromSlice(Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     /// Persist intent at the leased physical owner; this is not a canceled ACK.

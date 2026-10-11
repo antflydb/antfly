@@ -4039,7 +4039,7 @@ pub fn storageOwnerNativeIndexControlJson(
         defer prepared.deinit();
         return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
     }
-    if (request.operation == .cancel_gc_page) {
+    if (request.operation == .cancel_gc_page or request.operation == .cancel_claim_gc_page) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
             return storageOwnerStatusFromError(err);
@@ -4047,6 +4047,11 @@ pub fn storageOwnerNativeIndexControlJson(
         if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
         var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
         defer response.deinit();
+        if (request.operation == .cancel_claim_gc_page) {
+            const outcome = handle.db.collectCanceledNativeIndexClaimsStep(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+            return response.finish(outcome, out_response);
+        }
         const outcome = handle.db.collectCanceledNativeIndexGarbageStep(parsed.value) catch |err|
             return storageOwnerStatusFromError(err);
         return response.finish(outcome, out_response);

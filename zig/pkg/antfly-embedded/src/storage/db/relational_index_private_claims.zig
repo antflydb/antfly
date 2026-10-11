@@ -226,6 +226,17 @@ pub const TransferView = struct {
     }
 };
 
+/// Local emptiness only; metadata must still prove complete cohort retirement
+/// and persist the final cancellation cut before any owner acknowledgement.
+pub fn requireRetired(txn: anytype, binding: jobs.Binding) !void {
+    _ = try jobs.requireCancellationCleanup(txn, binding);
+    const allocation = try requireRegistered(txn, binding);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const start = generationPrefix(allocation.generation);
+    if (try cursor.seekAtOrAfter(&start)) |entry| if (std.mem.startsWith(u8, entry.key, &start)) return error.PrivateIndexCancellationPending;
+}
+
 /// Deleting the first bounded inventory page is itself the durable continuation:
 /// abort leaves every pair present, commit advances both keys atomically. No
 /// whole-claim scan, RAM cursor or generation-global rewrite is required.

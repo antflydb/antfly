@@ -3366,6 +3366,49 @@ pub const DB = struct {
         return .{ .advanced = false, .artifacts_retired = true };
     }
 
+    pub const NativeIndexClaimCleanupMaintenanceOutcome = native_index_control.ClaimCleanupMaintenanceOutcome;
+
+    /// Standby-safe derived cleanup. Scope and the held cancellation fence are
+    /// revalidated in the deletion transaction; no source cut/ACK is invented.
+    pub fn collectCanceledNativeIndexClaimsStep(self: *DB, identity: NativeIndexOwnerIdentity) !NativeIndexClaimCleanupMaintenanceOutcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforcePortableRuntimeGate();
+        const claims = @import("relational_index_private_claims.zig");
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        var replay_mutation = try self.acquireSnapshotReplayMutation();
+        defer replay_mutation.release();
+        var page = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try claims.GcPage.prepare(self.alloc, self.backend_runtime.io(), &read, binding);
+        };
+        defer if (page) |*value| value.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (page) |*value| {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try value.stage(&txn);
+            const retired = if (claims.requireRetired(&txn, binding)) |_| true else |err| switch (err) {
+                error.PrivateIndexCancellationPending => false,
+                else => return err,
+            };
+            try txn.commit();
+            return .{ .advanced = true, .claims_retired = retired };
+        }
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        try claims.requireRetired(&read, binding);
+        return .{ .advanced = false, .claims_retired = true };
+    }
+
     /// Retry only the observed failed generation. Healthy/building retries
     /// are idempotent; an old admin request cannot reset a replacement index.
     pub fn retryRelationalIndexBuild(self: *DB, name: []const u8, generation: u64) !bool {
