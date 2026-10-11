@@ -9711,6 +9711,22 @@ test "lite prepared query result combined routes preserve duplicate and absent c
     for (columns[1][1..]) |value| try std.testing.expectEqual(@as(?f64, 9), value);
     for (columns[2]) |value| try std.testing.expect(value == null);
     try std.testing.expectEqualSlices(?f64, &columns[0], &columns[3]);
+    var view = try session.readPreparedView(alloc, &prepared);
+    defer view.deinit();
+    const Check = struct {
+        columns: []const []?f64,
+        valid: bool = true,
+        count: usize = 0,
+        fn write(ctx: *anyopaque, col: usize, row: usize, value: ?f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.columns[col][row] != value) self.valid = false;
+            self.count += 1;
+        }
+    };
+    var check = Check{ .columns = &output };
+    view.visit(.{ .context = &check, .write = Check.write });
+    try std.testing.expect(check.valid);
+    try std.testing.expectEqual(@as(usize, 20000), check.count);
 }
 
 test "lite prepared query results fence mutations of borrowed transaction namespaces" {
@@ -9744,4 +9760,249 @@ test "lite prepared query results fence mutations of borrowed transaction namesp
     try std.testing.expect(prepared.results.?.handle.disabled);
     try std.testing.expectEqual(@as(usize, 0), prepared.results.?.handle.values.len);
     try std.testing.checkAllAllocationFailures(a, resultAllocationFailureCase, .{ &prepared.request, &session.txn });
+}
+
+test "lite prepared leased views preserve routing bypass and owner lifetimes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "leased-views.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const count = 5000;
+    const storage = try a.alloc([10]u8, count);
+    defer a.free(storage);
+    const nodes = try a.alloc([]const u8, count);
+    defer a.free(nodes);
+    const docs = try a.alloc(native.DocumentMutation, count);
+    defer a.free(docs);
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (storage, docs, 0..) |*key, *doc, i| {
+        _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(docs);
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const column = try a.alloc(?f64, count);
+    defer a.free(column);
+    const seen = try a.alloc(bool, count * 2);
+    defer a.free(seen);
+    const Check = struct {
+        nodes: []const []const u8,
+        seen: []bool,
+        valid: bool = true,
+        fn write(ctx: *anyopaque, col: usize, row: usize, value: ?f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (col >= 2 or row >= self.nodes.len) {
+                self.valid = false;
+                return;
+            }
+            const expected: ?f64 = if (std.mem.eql(u8, self.nodes[row], "missing")) null else 3;
+            if (value != expected or self.seen[col * self.nodes.len + row]) self.valid = false;
+            self.seen[col * self.nodes.len + row] = true;
+        }
+    };
+    for (0..4) |mode| {
+        const rows: usize = if (mode == 0) 3 else count;
+        for (nodes[0..rows], 0..) |*node, i| node.* = storage[if (mode == 2) rows - i - 1 else if (mode == 3) i % 7 else i][0..8];
+        nodes[rows - 1] = "missing";
+        var session = try testResultSession(alloc, &graph, &store);
+        var prepared = try session.prepareColumns(alloc, &.{ "metric", "metric" }, nodes[0..rows]);
+        var lease = try session.readPreparedView(alloc, &prepared);
+        const before = counter.alloc_attempts;
+        var second = try session.readPreparedView(alloc, &prepared);
+        try std.testing.expectEqual(before, counter.alloc_attempts);
+        @memset(seen[0 .. rows * 2], false);
+        var check = Check{ .nodes = nodes[0..rows], .seen = seen[0 .. rows * 2] };
+        lease.visit(.{ .context = &check, .write = Check.write });
+        try std.testing.expect(check.valid);
+        for (check.seen) |visited| try std.testing.expect(visited);
+        if (mode == 1) {
+            const dense = lease.denseColumn(0).?;
+            try std.testing.expectEqual(rows, dense.len());
+            try std.testing.expectEqual(@as(?f64, 3), dense.at(0));
+            try std.testing.expect(dense.at(rows - 1) == null);
+            try std.testing.expectEqual(dense.values.ptr, lease.denseColumn(1).?.values.ptr);
+        } else if (mode >= 2) try std.testing.expect(lease.denseColumn(0) == null);
+        // Exact shared output storage is also safe on the cached production path.
+        try session.readPreparedColumns(alloc, &prepared, &.{ column[0..rows], column[0..rows] });
+        try std.testing.expect(column[rows - 1] == null);
+        var pinned = try Txn.openRead(&store);
+        const file = try pinned.readFile();
+        file.page_cache_bypass.store(1, .monotonic);
+        try std.testing.expectError(error.Unsupported, session.readPreparedView(alloc, &prepared));
+        try session.readPreparedColumns(alloc, &prepared, &.{ column[0..rows], column[0..rows] });
+        file.page_cache_bypass.store(0, .monotonic);
+        // Recapture must not overwrite active leases after bypass invalidation.
+        try std.testing.expectError(error.Unsupported, session.readPreparedView(alloc, &prepared));
+        pinned.abort();
+        prepared.deinit();
+        session.deinit();
+        @memset(check.seen, false);
+        lease.visit(.{ .context = &check, .write = Check.write });
+        try std.testing.expect(check.valid);
+        for (check.seen) |visited| try std.testing.expect(visited);
+        second.deinit();
+        lease.deinit();
+    }
+}
+
+test "lite prepared leased views retain old namespace through invalidation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "leased-namespace.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [2][8]u8 = undefined;
+    std.mem.writeInt(u64, &raw[0], @bitCast(@as(f64, 3)), .little);
+    std.mem.writeInt(u64, &raw[1], @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocumentBatch(&.{ .{ .key = "p\x00a\x00\x00", .value = &raw[0] }, .{ .key = "q\x00a\x00\x00", .value = &raw[1] } });
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var session = try testResultSession(a, &graph, &store);
+    session.txn.abort();
+    var namespace: [2]u8 = .{ 'p', 0 };
+    session.txn = try backend_erased.readTxnFrom(a, try Txn.openReadWithPrefix(&store, &namespace));
+    var prepared = try session.prepareColumns(a, &.{"metric"}, &.{"a"});
+    var lease = try session.readPreparedView(a, &prepared);
+    const old = lease.denseColumn(0).?;
+    try std.testing.expectEqual(@as(?f64, 3), old.at(0));
+    namespace[0] = 'q';
+    try std.testing.expectError(error.Unsupported, session.readPreparedView(a, &prepared));
+    var column: [1]?f64 = undefined;
+    try session.readPreparedColumns(a, &prepared, &.{&column});
+    try std.testing.expectEqual(@as(?f64, 9), column[0]);
+    try std.testing.expectEqual(@as(?f64, 3), old.at(0));
+    prepared.deinit();
+    session.deinit();
+    try std.testing.expectEqual(@as(?f64, 3), old.at(0));
+    lease.deinit();
+}
+
+test "lite prepared leased dense view measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "view-measurement.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const count = 50000;
+    const storage = try a.alloc([10]u8, count);
+    defer a.free(storage);
+    const nodes = try a.alloc([]const u8, count);
+    defer a.free(nodes);
+    const docs = try a.alloc(native.DocumentMutation, count);
+    defer a.free(docs);
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (storage, nodes, docs, 0..) |*key, *node, *doc, i| {
+        _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        key[8] = 0;
+        key[9] = 0;
+        node.* = key[0..8];
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(docs);
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var session = try testResultSession(alloc, &graph, &store);
+    defer session.deinit();
+    var prepared = try session.prepareColumns(alloc, &.{"metric"}, nodes);
+    defer prepared.deinit();
+    const has_view = @hasDecl(Graph.GraphMetricReadSession, "readPreparedView");
+    for (0..2) |mode| {
+        const use_view = has_view and mode == 1;
+        const column: []?f64 = if (!use_view) try a.alloc(?f64, count) else &.{};
+        defer a.free(column);
+        if (has_view) {
+            if (use_view) {
+                var view = try session.readPreparedView(alloc, &prepared);
+                view.deinit();
+            } else try session.readPreparedColumns(alloc, &prepared, &.{column});
+        } else try session.readPreparedColumns(alloc, &prepared, &.{column});
+        var checksum: f64 = 0;
+        const before = counter.alloc_calls;
+        const started = std.posix.getrusage(0);
+        for (0..100) |_| {
+            if (has_view) {
+                if (use_view) {
+                    var view = try session.readPreparedView(alloc, &prepared);
+                    const dense = view.denseColumn(0).?;
+                    for (0..dense.len()) |row| checksum += dense.at(row) orelse 0;
+                    view.deinit();
+                } else {
+                    try session.readPreparedColumns(alloc, &prepared, &.{column});
+                    for (column) |value| checksum += value orelse 0;
+                }
+            } else {
+                try session.readPreparedColumns(alloc, &prepared, &.{column});
+                for (column) |value| checksum += value orelse 0;
+            }
+        }
+        const ended = std.posix.getrusage(0);
+        const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+        try std.testing.expectEqual(@as(f64, 15000000), checksum);
+        std.debug.print("DENSE_VIEW mode={d} cpu_us={d} allocations={d} output_bytes={d}\n", .{ mode, cpu, counter.alloc_calls - before, column.len * @sizeOf(?f64) });
+    }
+}
+
+test "lite prepared fresh review unsorted construction ownership and mapping" {
+    const a = std.testing.allocator;
+    const count = 50000;
+    const storage = try a.alloc([8]u8, count);
+    defer a.free(storage);
+    const nodes = try a.alloc([]const u8, count);
+    defer a.free(nodes);
+    const column = try a.alloc(?f64, count);
+    defer a.free(column);
+    const missing = try a.alloc(?f64, count);
+    defer a.free(missing);
+    const duplicate = try a.alloc(?f64, count);
+    defer a.free(duplicate);
+    for (storage, 0..) |*bytes, i| _ = try std.fmt.bufPrint(bytes, "{d:0>8}", .{i});
+    for (0..3) |mode| {
+        for (nodes, 0..) |*node, i| node.* = &storage[
+            switch (mode) {
+                0 => i,
+                1 => count - i - 1,
+                2 => (i * 7919) % count,
+                else => unreachable,
+            }
+        ];
+        var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        const started = std.posix.getrusage(0);
+        var request = try @import("../prepared_score_request.zig").PreparedScoreChunks.init(counter.allocator(), &.{ "p/", null, "p/" }, nodes);
+        defer request.deinit();
+        const ended = std.posix.getrusage(0);
+        const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+        std.debug.print("REVIEW_UNSORTED mode={d} build_cpu_us={d} owned_bytes={d} peak_bytes={d} allocations={d}\n", .{ mode, cpu, counter.live, counter.peak, counter.alloc_calls });
+        const scores = try a.alloc(f64, 4096);
+        defer a.free(scores);
+        request.clearAbsentColumns(&.{ column, missing, duplicate });
+        for (request.chunkPlans()) |*chunk| {
+            const length = chunk.request.readKeys().len;
+            for (scores[0..length], 0..) |*score, i| score.* = @floatFromInt(chunk.first + i);
+            var output = @import("../prepared_score_request.zig").PreparedScoreChunks.Output{ .owner = &request, .chunk = chunk, .columns = &.{ column, missing, duplicate } };
+            output.sink().deliverDecoded(scores[0..length]);
+        }
+        request.finishColumns(&.{ column, missing, duplicate });
+        for (nodes, column) |node, value| try std.testing.expectEqual(@as(?f64, @floatFromInt(try std.fmt.parseInt(usize, node, 10))), value);
+        for (missing) |value| try std.testing.expect(value == null);
+        try std.testing.expectEqualSlices(?f64, column, duplicate);
+    }
 }

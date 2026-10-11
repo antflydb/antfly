@@ -56,6 +56,8 @@ pub const PreparedResults = struct {
         namespace: []u8,
         ready: bool = false,
         disabled: bool = false,
+        references: usize = 1,
+        leases: usize = 0,
     };
 
     pub fn init(a: std.mem.Allocator, request: *const PreparedChunks, txn: *const @import("../storage/backend_erased.zig").ReadTxn) !@This() {
@@ -75,21 +77,101 @@ pub const PreparedResults = struct {
 
     pub fn deinit(self: *@This()) void {
         const state = self.handle;
+        self.* = undefined;
+        release(state);
+    }
+
+    fn release(state: *State) void {
+        state.references -= 1;
+        if (state.references != 0) return;
         const a = state.allocator;
         a.free(state.values);
         a.free(state.namespace);
         a.destroy(state);
-        self.* = undefined;
     }
 
     fn disable(self: *const @This()) void {
         const state = self.handle;
+        if (state.leases == 0) freeDisabled(state);
+        state.ready = false;
+        state.disabled = true;
+    }
+
+    fn freeDisabled(state: *State) void {
         state.allocator.free(state.values);
         state.allocator.free(state.namespace);
         state.namespace = &.{};
         state.values = &.{};
-        state.ready = false;
-        state.disabled = true;
+    }
+
+    /// Move-only lease. The cached values and immutable routing remain alive
+    /// even after PreparedColumns or its read session is destroyed. Session
+    /// access and lease operations are exclusive, like existing prepared reads.
+    pub const View = struct {
+        state: *State,
+        request: PreparedChunks,
+        pub const DenseColumn = struct {
+            values: []const f64,
+            pub fn len(self: @This()) usize {
+                return self.values.len;
+            }
+            pub fn at(self: @This(), row: usize) ?f64 {
+                const value = self.values[row];
+                return if (std.math.isNan(value)) null else value;
+            }
+        };
+        /// Contiguous logical-row view for sorted unique inputs. Arbitrary
+        /// permutations and duplicate fanout use visit() without inverse maps.
+        pub fn denseColumn(self: *const @This(), column: usize) ?DenseColumn {
+            const range = self.request.denseColumnRange(column) orelse return null;
+            return .{ .values = self.state.values[range.first..][0..range.count] };
+        }
+        pub fn visit(self: *const @This(), visitor: PreparedChunks.ScoreVisitor) void {
+            self.request.visitDecoded(self.state.values, visitor);
+        }
+        pub fn deinit(self: *@This()) void {
+            const state = self.state;
+            self.request.deinit();
+            state.leases -= 1;
+            if (state.leases == 0 and state.disabled) freeDisabled(state);
+            release(state);
+            self.* = undefined;
+        }
+    };
+    pub const ViewRead = struct { view: View, stats: Stats };
+
+    /// Optional ownership must already be admitted at preparation. Unsupported
+    /// or invalidated caches retain the ordinary bounded readColumns path.
+    pub fn readView(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks) !ViewRead {
+        const state = self.handle;
+        if (state.txn_identity != @intFromPtr(txn.ptr) or state.request_identity != @intFromPtr(request.handle)) return error.InvalidBatch;
+        if (state.disabled) return error.Unsupported;
+        const namespace = txn.decodedResultsNamespace() orelse {
+            state.ready = false;
+            return error.Unsupported;
+        };
+        if (!std.mem.eql(u8, namespace, state.namespace)) {
+            self.disable();
+            return error.Unsupported;
+        }
+        var stats = Stats{ .keys = state.values.len };
+        if (!state.ready) {
+            // Existing leases are immutable snapshots: never overwrite their slab.
+            if (state.leases != 0) return error.Unsupported;
+            stats = self.capture(a, txn, request) catch |err| {
+                self.disable();
+                return err;
+            };
+            const after = txn.decodedResultsNamespace() orelse return error.Unsupported;
+            if (!std.mem.eql(u8, after, state.namespace)) {
+                self.disable();
+                return error.Unsupported;
+            }
+            state.ready = true;
+        }
+        state.references += 1;
+        state.leases += 1;
+        return .{ .view = .{ .state = state, .request = request.retain() }, .stats = stats };
     }
 
     pub fn populate(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks, columns: []const []?f64) !Stats {
@@ -116,6 +198,7 @@ pub const PreparedResults = struct {
         errdefer for (columns) |column| @memset(column, null);
         var stats = Stats{ .keys = state.values.len };
         if (!state.ready) {
+            if (state.leases != 0) return populateChunks(a, txn, request, columns);
             stats = self.capture(a, txn, request) catch |err| {
                 // Drop optional residency before the bounded streaming retry.
                 // A failed capture is never visible to subsequent cache hits.

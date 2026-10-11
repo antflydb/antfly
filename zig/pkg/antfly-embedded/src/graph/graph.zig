@@ -20127,6 +20127,18 @@ pub const GraphIndex = struct {
             self.reads.batches += read_stats.batches;
         }
 
+        /// Consume cached scores through a lease without caller-owned output
+        /// columns. The lease survives prepared-owner/session teardown; close it
+        /// before releasing the allocator used to prepare the columns.
+        pub fn readPreparedView(self: *@This(), alloc: Allocator, prepared: *const PreparedColumns) !score_read.PreparedResults.View {
+            if (self.prepared_identity == 0 or prepared.session_identity != self.prepared_identity) return error.InvalidQueryRequest;
+            const results = prepared.results orelse return error.Unsupported;
+            const read = try results.readView(alloc, &self.txn, &prepared.request);
+            self.reads.keys += read.stats.keys;
+            self.reads.batches += read.stats.batches;
+            return read.view;
+        }
+
         /// Opt in only when the caller knows this session will repeat reads.
         /// Ordinary staged and short-lived sessions keep the warmed mutable plan.
         pub fn enablePreparedReuse(self: *@This()) void {

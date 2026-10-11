@@ -18,6 +18,21 @@
 const std = @import("std");
 const Plan = @import("prepared_score_plan.zig").PreparedScorePlan;
 
+// Borrowed only while encoding; indexed inputs avoid a second descriptor slab.
+const NodeView = struct {
+    nodes: []const []const u8,
+    order: ?[]const usize = null,
+    fn len(self: @This()) usize {
+        return if (self.order) |order| order.len else self.nodes.len;
+    }
+    fn at(self: @This(), i: usize) []const u8 {
+        return self.nodes[if (self.order) |order| order[i] else i];
+    }
+    fn range(self: @This(), first: usize, count: usize) @This() {
+        return if (self.order) |order| .{ .nodes = self.nodes, .order = order[first..][0..count] } else .{ .nodes = self.nodes[first..][0..count] };
+    }
+};
+
 pub const PreparedScoreRequest = struct {
     // The pointee is immutable outside this owner. Moving the handle is fine;
     // copying it does not transfer ownership and must not produce two deinits.
@@ -44,13 +59,14 @@ pub const PreparedScoreRequest = struct {
 
     /// A compact owner has no mutable input matching or output fanout. Only
     /// this constructor can create its sorted, unique canonical identity.
-    fn initCanonical(a: std.mem.Allocator, prefix: []const u8, nodes: []const []const u8) !PreparedScoreRequest {
+    fn initCanonical(a: std.mem.Allocator, prefix: []const u8, nodes: NodeView) !PreparedScoreRequest {
         const encoding = @import("internal_keys.zig");
-        if (nodes.len == 0 or nodes.len > Plan.max_keys) return error.GraphMetricQueryBudgetExceeded;
-        var size = try std.math.mul(usize, nodes.len, @sizeOf([]const u8));
+        if (nodes.len() == 0 or nodes.len() > Plan.max_keys) return error.GraphMetricQueryBudgetExceeded;
+        var size = try std.math.mul(usize, nodes.len(), @sizeOf([]const u8));
         const descriptors = size;
-        for (nodes, 0..) |node, i| {
-            if (i != 0 and std.mem.order(u8, nodes[i - 1], node) != .lt) return error.InvalidBatch;
+        for (0..nodes.len()) |i| {
+            const node = nodes.at(i);
+            if (i != 0 and std.mem.order(u8, nodes.at(i - 1), node) != .lt) return error.InvalidBatch;
             size = std.math.add(usize, size, prefix.len) catch return error.GraphMetricQueryBudgetExceeded;
             size = std.math.add(usize, size, encoding.encodedComponentLen(node)) catch return error.GraphMetricQueryBudgetExceeded;
             if (size > Plan.max_bytes) return error.GraphMetricQueryBudgetExceeded;
@@ -59,9 +75,10 @@ pub const PreparedScoreRequest = struct {
         errdefer a.destroy(state);
         const bytes = try a.alloc(u8, size - descriptors);
         errdefer a.free(bytes);
-        const keys = try a.alloc([]const u8, nodes.len);
+        const keys = try a.alloc([]const u8, nodes.len());
         var offset: usize = 0;
-        for (nodes, keys) |node, *key| {
+        for (keys, 0..) |*key, i| {
+            const node = nodes.at(i);
             const len = prefix.len + encoding.encodedComponentLen(node);
             key.* = bytes[offset..][0..len];
             @memcpy(bytes[offset..][0..prefix.len], prefix);
@@ -75,15 +92,16 @@ pub const PreparedScoreRequest = struct {
     // Global row/column deduplication has already happened. Retain one bounded
     // canonical identity and compact routes for all eligible metric columns.
     // Overlapping prefixes are sorted and coalesced, preserving every route.
-    fn initCanonicalColumns(a: std.mem.Allocator, prefixes: []const ?[]const u8, columns: []const usize, nodes: []const []const u8) !PreparedScoreRequest {
+    fn initCanonicalColumns(a: std.mem.Allocator, prefixes: []const ?[]const u8, columns: []const usize, nodes: NodeView) !PreparedScoreRequest {
         const encoding = @import("internal_keys.zig");
-        const count = std.math.mul(usize, columns.len, nodes.len) catch return error.GraphMetricQueryBudgetExceeded;
+        const count = std.math.mul(usize, columns.len, nodes.len()) catch return error.GraphMetricQueryBudgetExceeded;
         if (count == 0 or count > Plan.max_keys) return error.GraphMetricQueryBudgetExceeded;
         var byte_count: usize = 0;
         for (columns) |column| {
             if (column > std.math.maxInt(u32)) return error.GraphMetricQueryBudgetExceeded;
             const prefix = prefixes[column] orelse return error.InvalidBatch;
-            for (nodes) |node| {
+            for (0..nodes.len()) |i| {
+                const node = nodes.at(i);
                 byte_count = std.math.add(usize, byte_count, prefix.len) catch return error.GraphMetricQueryBudgetExceeded;
                 byte_count = std.math.add(usize, byte_count, encoding.encodedComponentLen(node)) catch return error.GraphMetricQueryBudgetExceeded;
                 if (byte_count > Plan.max_bytes) return error.GraphMetricQueryBudgetExceeded;
@@ -104,7 +122,8 @@ pub const PreparedScoreRequest = struct {
         var index: usize = 0;
         for (columns) |column| {
             const prefix = prefixes[column].?;
-            for (nodes, 0..) |node, row| {
+            for (0..nodes.len()) |row| {
+                const node = nodes.at(row);
                 const len = prefix.len + encoding.encodedComponentLen(node);
                 @memcpy(bytes[offset..][0..prefix.len], prefix);
                 _ = encoding.encodeComponent(bytes[offset + prefix.len ..][0 .. len - prefix.len], node);
@@ -226,6 +245,7 @@ pub const PreparedScoreChunks = struct {
         chunks: []const Chunk,
         combined: ?PreparedScoreRequest = null,
         unique_rows: usize = 0,
+        references: usize = 1,
     };
     const absent = std.math.maxInt(usize);
     pub const Chunk = struct {
@@ -279,16 +299,12 @@ pub const PreparedScoreChunks = struct {
             }
             break :blk true;
         };
-        const next: []usize = if (row_order_identity) &.{} else try a.alloc(usize, nodes.len);
+        var order: []usize = if (row_order_identity) &.{} else try a.alloc(usize, nodes.len);
+        errdefer a.free(order);
+        var next: []usize = &.{};
         errdefer a.free(next);
-        const order: []usize = if (row_order_identity) &.{} else try a.alloc(usize, nodes.len);
-        defer a.free(order);
-        var unique: std.ArrayList([]const u8) = .empty;
-        defer unique.deinit(a);
-        var heads: std.ArrayList(usize) = .empty;
-        errdefer heads.deinit(a);
+        var unique_count = nodes.len;
         if (!row_order_identity) {
-            @memset(next, absent);
             for (order, 0..) |*row, i| row.* = i;
             std.mem.sort(usize, order, nodes, struct {
                 fn less(inputs: []const []const u8, x: usize, y: usize) bool {
@@ -296,17 +312,32 @@ pub const PreparedScoreChunks = struct {
                     return cmp == .lt or (cmp == .eq and x < y);
                 }
             }.less);
-            for (order) |row| {
-                if (unique.items.len == 0 or !std.mem.eql(u8, unique.items[unique.items.len - 1], nodes[row])) {
-                    try unique.append(a, nodes[row]);
-                    try heads.append(a, absent);
+            var duplicates = false;
+            for (order[1..], order[0 .. order.len - 1]) |right, left| {
+                if (std.mem.eql(u8, nodes[left], nodes[right])) {
+                    duplicates = true;
+                    break;
                 }
-                const head = &heads.items[heads.items.len - 1];
-                next[row] = head.*;
-                head.* = row;
+            }
+            if (duplicates) {
+                next = try a.alloc(usize, nodes.len);
+                @memset(next, absent);
+                unique_count = 0;
+                // Compact canonical heads in the sort allocation itself. Reads
+                // only touch the unconsumed suffix, so no descriptor copy is needed.
+                for (order) |row| {
+                    if (unique_count == 0 or !std.mem.eql(u8, nodes[order[unique_count - 1]], nodes[row])) {
+                        order[unique_count] = row;
+                        unique_count += 1;
+                    } else {
+                        next[row] = order[unique_count - 1];
+                        order[unique_count - 1] = row;
+                    }
+                }
             }
         }
-        const unique_nodes = if (row_order_identity) nodes else unique.items;
+        if (order.len != unique_count and !row_order_identity) order = try a.realloc(order, unique_count);
+        const unique_nodes = NodeView{ .nodes = nodes, .order = if (row_order_identity) null else order[0..unique_count] };
         var chunks: std.ArrayList(Chunk) = .empty;
         errdefer {
             for (chunks.items) |*chunk| chunk.request.deinit();
@@ -325,10 +356,10 @@ pub const PreparedScoreChunks = struct {
         }
         if (chunks.items.len == 0) for (columns.items) |column| {
             var first: usize = 0;
-            while (first < unique_nodes.len) {
-                var count = @min(Plan.max_keys, unique_nodes.len - first);
+            while (first < unique_nodes.len()) {
+                var count = @min(Plan.max_keys, unique_nodes.len() - first);
                 const request = while (true) {
-                    const candidate = PreparedScoreRequest.initCanonical(a, prefixes[column].?, unique_nodes[first..][0..count]) catch |err| switch (err) {
+                    const candidate = PreparedScoreRequest.initCanonical(a, prefixes[column].?, unique_nodes.range(first, count)) catch |err| switch (err) {
                         error.GraphMetricQueryBudgetExceeded => {
                             if (count == 1) return err;
                             count = @max(1, count / 2);
@@ -350,19 +381,19 @@ pub const PreparedScoreChunks = struct {
         // target budget yet deduplicate to one canonical batch. It can reuse
         // decoded scores just like a combined full plan.
         if (chunks.items.len == 1) @constCast(chunks.items[0].request.handle).payload.canonical.retain_decoded = true;
-        const unique_rows = unique_nodes.len;
-        const owned_heads = try heads.toOwnedSlice(a);
-        errdefer a.free(owned_heads);
-        state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .row_heads = if (row_order_identity) &.{} else owned_heads, .duplicate_next = if (row_order_identity) &.{} else next, .chunks = try chunks.toOwnedSlice(a), .unique_rows = unique_rows };
-        if (row_order_identity) {
-            a.free(next);
-            a.free(owned_heads);
-        }
+        state.* = .{ .allocator = a, .rows = nodes.len, .row_order_identity = row_order_identity, .column_owners = owners, .row_heads = order, .duplicate_next = next, .chunks = try chunks.toOwnedSlice(a), .unique_rows = unique_count };
         return .{ .handle = state };
     }
 
+    pub fn retain(self: *const @This()) @This() {
+        @constCast(self.handle).references += 1;
+        return self.*;
+    }
     pub fn deinit(self: *@This()) void {
-        const state = self.handle;
+        const state = @constCast(self.handle);
+        self.* = undefined;
+        state.references -= 1;
+        if (state.references != 0) return;
         if (@constCast(state).combined) |*request| request.deinit();
         for (@constCast(state.chunks)) |*chunk| chunk.request.deinit();
         const a = state.allocator;
@@ -448,7 +479,7 @@ pub const PreparedScoreChunks = struct {
             var row = self.owner.handle.row_heads[i];
             while (row != absent) {
                 self.columns[column][row] = score;
-                row = self.owner.handle.duplicate_next[row];
+                row = if (self.owner.handle.duplicate_next.len == 0) absent else self.owner.handle.duplicate_next[row];
             }
         }
         fn write(ctx: *anyopaque, i: usize, score: ?f64) void {
@@ -464,6 +495,80 @@ pub const PreparedScoreChunks = struct {
         }
     };
 
+    pub fn denseColumnRange(self: *const @This(), column: usize) ?struct { first: usize, count: usize } {
+        if (self.combinedRequest()) |request| {
+            const plan = request.plan();
+            if (!plan.dense_columns or !plan.row_order_identity) return null;
+            for (plan.column_sorted[0..plan.column_count], 0..) |col, ordinal| {
+                if ((if (plan.column_order_identity) col else plan.column_remap[col]) == column)
+                    return .{ .first = ordinal * self.handle.rows, .count = self.handle.rows };
+            }
+            return null;
+        }
+        if (!self.handle.row_order_identity or column >= self.handle.column_owners.len) return null;
+        const owner = self.handle.column_owners[column];
+        if (owner == absent) return null;
+        var offset: usize = 0;
+        var first: ?usize = null;
+        var count: usize = 0;
+        for (self.handle.chunks) |chunk| {
+            if (chunk.request.hasRoutes()) return null;
+            const len = chunk.request.readKeys().len;
+            if (chunk.column == owner) {
+                if (first == null) first = offset;
+                count += len;
+            }
+            offset += len;
+        }
+        return if (first) |start| .{ .first = start, .count = count } else null;
+    }
+
+    pub const ScoreVisitor = struct {
+        context: *anyopaque,
+        write: *const fn (*anyopaque, usize, usize, ?f64) void,
+    };
+
+    /// Visit every logical cell exactly once without materializing output slabs.
+    /// Order is canonical, not input-row order. NaN is an internal missing sentinel.
+    pub fn visitDecoded(self: *const @This(), scores: []const f64, visitor: ScoreVisitor) void {
+        if (self.combinedRequest()) |request| {
+            const plan = request.plan();
+            for (plan.prefixes, 0..) |prefix, column| if (prefix == null) {
+                const col = if (plan.column_order_identity) column else plan.column_remap[column];
+                for (0..self.handle.rows) |row| visitor.write(visitor.context, col, row, null);
+            };
+            var first: usize = 0;
+            for (scores, plan.ends) |score, end| {
+                const value: ?f64 = if (std.math.isNan(score)) null else score;
+                for (plan.targets[first..end]) |target| visitor.write(visitor.context, if (plan.column_order_identity) target.column else plan.column_remap[target.column], if (plan.row_order_identity) target.row else plan.row_remap[target.row], value);
+                first = end;
+            }
+            return;
+        }
+        for (self.handle.column_owners, 0..) |owner, column| if (owner == absent) {
+            for (0..self.handle.rows) |row| visitor.write(visitor.context, column, row, null);
+        };
+        var offset: usize = 0;
+        for (self.handle.chunks) |*chunk| {
+            const count = chunk.request.readKeys().len;
+            for (scores[offset..][0..count], 0..) |score, i| {
+                const value: ?f64 = if (std.math.isNan(score)) null else score;
+                if (chunk.request.hasRoutes()) {
+                    for (chunk.request.routes(i)) |target| self.visitRow(visitor, target.column, target.row, value);
+                } else self.visitRow(visitor, chunk.column, chunk.first + i, value);
+            }
+            offset += count;
+        }
+    }
+    fn visitRow(self: *const @This(), visitor: ScoreVisitor, column: usize, canonical_row: usize, value: ?f64) void {
+        var row = if (self.handle.row_order_identity) canonical_row else self.handle.row_heads[canonical_row];
+        while (row != absent) {
+            // Duplicate columns share the canonical value, never a copied slab.
+            for (self.handle.column_owners, 0..) |owner, col| if (owner == column) visitor.write(visitor.context, col, row, value);
+            row = if (self.handle.row_order_identity or self.handle.duplicate_next.len == 0) absent else self.handle.duplicate_next[row];
+        }
+    }
+
     pub fn clearAbsentColumns(self: *const @This(), columns: []const []?f64) void {
         for (self.handle.column_owners, columns) |owner, column| if (owner == absent) {
             @memset(column, null);
@@ -472,7 +577,7 @@ pub const PreparedScoreChunks = struct {
 
     pub fn finishColumns(self: *const @This(), columns: []const []?f64) void {
         for (self.handle.column_owners, 0..) |owner, column| {
-            if (owner != absent and owner != column) @memcpy(columns[column], columns[owner]);
+            if (owner != absent and owner != column and columns[column].ptr != columns[owner].ptr) @memcpy(columns[column], columns[owner]);
         }
     }
 };
@@ -572,7 +677,7 @@ test "prepared score chunks enforce byte bounds and skip empty dependencies" {
 fn canonicalAllocationFailureCase(a: std.mem.Allocator) !void {
     var node: [3]u8 = .{ 'a', 0, 'b' };
     var prefix: [2]u8 = .{ 'p', '/' };
-    var request = try PreparedScoreRequest.initCanonical(a, &prefix, &.{ "", &node, "z" });
+    var request = try PreparedScoreRequest.initCanonical(a, &prefix, .{ .nodes = &.{ "", &node, "z" } });
     defer request.deinit();
     node[0] = 'x';
     prefix[0] = 'q';
@@ -586,8 +691,8 @@ fn canonicalAllocationFailureCase(a: std.mem.Allocator) !void {
 
 test "prepared score canonical ownership validates keys and allocation cleanup" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, canonicalAllocationFailureCase, .{});
-    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", &.{ "b", "a" }));
-    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", &.{ "a", "a" }));
+    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", .{ .nodes = &.{ "b", "a" } }));
+    try std.testing.expectError(error.InvalidBatch, PreparedScoreRequest.initCanonical(std.testing.allocator, "p/", .{ .nodes = &.{ "a", "a" } }));
 }
 
 fn largeChunkAllocationFailureCase(a: std.mem.Allocator) !void {
@@ -612,7 +717,7 @@ test "prepared score compact chunks release partial ownership under allocation f
 }
 
 fn canonicalColumnsFailureCase(a: std.mem.Allocator) !void {
-    var request = try PreparedScoreRequest.initCanonicalColumns(a, &.{ "p", "pa" }, &.{ 0, 1 }, &.{ "", "a" });
+    var request = try PreparedScoreRequest.initCanonicalColumns(a, &.{ "p", "pa" }, &.{ 0, 1 }, .{ .nodes = &.{ "", "a" } });
     defer request.deinit();
     // p + a and pa + empty produce the same physical key, with two routes.
     try std.testing.expectEqual(@as(usize, 3), request.readKeys().len);
@@ -649,4 +754,38 @@ fn duplicateColumnsFailureCase(a: std.mem.Allocator) !void {
 
 test "prepared score duplicate multi column routes preserve fanout under construction failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, duplicateColumnsFailureCase, .{});
+}
+
+test "prepared score duplicate columns accept shared output storage" {
+    const nodes: [5000][]const u8 = @splat("a");
+    var request = try PreparedScoreChunks.init(std.testing.allocator, &.{ "p/", "p/" }, &nodes);
+    defer request.deinit();
+    var column: [5000]?f64 = @splat(3);
+    const columns = [_][]?f64{ &column, &column };
+    try request.validateColumns(&columns);
+    request.finishColumns(&columns);
+    for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+}
+
+fn permutationAllocationFailureCase(a: std.mem.Allocator) !void {
+    var stable = StableAllocator{ .backing = a };
+    var nodes: [4097][]const u8 = undefined;
+    var storage: [4097][8]u8 = undefined;
+    for (&storage, 0..) |*bytes, i| _ = try std.fmt.bufPrint(bytes, "{d:0>8}", .{i});
+    for (&nodes, 0..) |*node, i| node.* = &storage[nodes.len - i - 1];
+    var request = try PreparedScoreChunks.init(stable.allocator(), &.{"p/"}, &nodes);
+    defer request.deinit();
+    try std.testing.expectEqual(nodes.len, request.uniqueRowCount());
+    try std.testing.expectEqual(nodes.len, request.handle.row_heads.len);
+    try std.testing.expectEqual(@as(usize, 0), request.handle.duplicate_next.len);
+    var scores: [4097]?f64 = undefined;
+    for (request.chunkPlans()) |*chunk| {
+        var output = PreparedScoreChunks.Output{ .owner = &request, .chunk = chunk, .columns = &.{&scores} };
+        for (chunk.request.readKeys(), 0..) |_, i| output.sink().write(output.sink().context, i, @floatFromInt(chunk.first + i));
+    }
+    for (scores, 0..) |score, i| try std.testing.expectEqual(@as(?f64, @floatFromInt(nodes.len - i - 1)), score);
+}
+
+test "prepared score unique permutations omit duplicate chains and release allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, permutationAllocationFailureCase, .{});
 }
