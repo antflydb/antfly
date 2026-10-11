@@ -20069,8 +20069,12 @@ pub const GraphIndex = struct {
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
         reads: score_read.Stats = .{},
+        // Query/session-owned only. Prepare after a plan is reused so one-shot
+        // reads incur no extra ownership; release before retrying under pressure.
+        prepared_request: ?score_read.PreparedRequest = null,
 
         pub fn deinit(self: *@This()) void {
+            if (self.prepared_request) |*request| request.deinit();
             self.txn.abort();
             for (self.statuses) |*status| status.deinit(self.alloc);
             self.alloc.free(self.statuses);
@@ -20082,16 +20086,47 @@ pub const GraphIndex = struct {
         pub fn readColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8, columns: []const []?f64) !void {
             if (names.len != columns.len) return error.InvalidQueryRequest;
             for (columns) |column| if (column.len != nodes.len) return error.InvalidQueryRequest;
-            const prefixes = try alloc.alloc(?[]const u8, names.len);
-            defer alloc.free(prefixes);
+            var prefix_buffer: [32]?[]const u8 = undefined;
+            const prefixes = if (names.len <= prefix_buffer.len) prefix_buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > prefix_buffer.len) alloc.free(prefixes);
             for (names, prefixes) |name, *prefix| {
                 prefix.* = for (self.statuses, self.prefixes) |status, value| {
                     if (std.mem.eql(u8, status.name, name)) break value;
                 } else return error.InvalidQueryRequest;
             }
+            if (self.prepared_request) |*request| {
+                const plan = request.plan();
+                const equal_inputs = plan.matches(prefixes, nodes);
+                if (equal_inputs) {
+                    const prepared_stats = score_read.populatePrepared(alloc, &self.txn, request, columns) catch |err| switch (@as(anyerror, err)) {
+                        error.OutOfMemory, error.ResourceBudgetExceeded => {
+                            // The optional owned plan must not raise the floor
+                            // of a query that can still stream its original inputs.
+                            request.deinit();
+                            self.prepared_request = null;
+                            const retry_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
+                            self.reads.keys += retry_stats.keys;
+                            self.reads.batches += retry_stats.batches;
+                            return;
+                        },
+                        else => return err,
+                    };
+                    self.reads.keys += prepared_stats.keys;
+                    self.reads.batches += prepared_stats.batches;
+                    return;
+                }
+                request.deinit();
+                self.prepared_request = null;
+            }
             const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
+            if (read_stats.reused_plan) {
+                self.prepared_request = score_read.PreparedRequest.init(self.alloc, prefixes, nodes) catch |err| switch (@as(anyerror, err)) {
+                    error.OutOfMemory, error.ResourceBudgetExceeded, error.GraphMetricQueryBudgetExceeded => null,
+                    else => return err,
+                };
+            }
         }
 
         /// Query-seeded personalized PageRank column. Computed fresh from the

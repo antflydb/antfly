@@ -3033,9 +3033,14 @@ pub const Txn = struct {
         }
 
         /// Caller-owned requests remain immutable for this call. The native
-        /// cache copies identity and keys; it never retains the request pointer.
+        /// cache owns its identity and decoded scores; it never retains the
+        /// request pointer.
         pub fn visitPreparedRequest(self: *@This(), request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
             if (!request.plan().valid) return error.InvalidBatch;
+            if (request.plan().read_keys.len == 0) return;
+            if (self.workspace) |w| if (w.score_plan.storage != null) {
+                w.score_plan.deinit();
+            };
             const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
             self.readPreparedScores(request.plan(), sink) catch |err| {
                 if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
@@ -7089,11 +7094,13 @@ test "lite prepared namespaced prepared fallback memory floor" {
             return .{ .inner = try self.inner.openReadScope(allocator) };
         }
     };
+    var request = try @import("../../graph/score_read.zig").PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
     var regressions: usize = 0;
     for (24..81) |step| {
         const limit = step * 2048;
-        var successes: [2]bool = undefined;
-        for (0..2) |mode| {
+        var successes: [3]bool = undefined;
+        for (0..3) |mode| {
             const name = try std.fmt.allocPrint(a, "ns-{d}-{d}.aflite", .{ limit, mode });
             defer a.free(name);
             const path = try testPath(a, tmp, name);
@@ -7111,16 +7118,29 @@ test "lite prepared namespaced prepared fallback memory floor" {
             defer txn.abort();
             var columns: [512]?f64 = undefined;
             var plain = PlainTxn{ .inner = &txn };
-            const result = if (mode == 0) @import("../../graph/score_read.zig").populate(query.allocator(), &plain, &.{""}, &nodes, &.{&columns}) else @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+            const result = if (mode == 0) @import("../../graph/score_read.zig").populate(query.allocator(), &plain, &.{""}, &nodes, &.{&columns}) else if (mode == 1) @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns}) else @import("../../graph/score_read.zig").populatePrepared(query.allocator(), &txn, &request, &.{&columns});
             successes[mode] = if (result) |_| true else |err| switch (err) {
                 error.OutOfMemory, error.ResourceBudgetExceeded => false,
                 else => return err,
             };
+            if (successes[mode] and mode == 2) {
+                // Exercise compact staging as well as cold reads. Optional
+                // residency must not increase the streaming memory floor.
+                for (0..2) |_| {
+                    _ = @import("../../graph/score_read.zig").populatePrepared(query.allocator(), &txn, &request, &.{&columns}) catch |err| switch (@as(anyerror, err)) {
+                        error.OutOfMemory, error.ResourceBudgetExceeded => {
+                            successes[mode] = false;
+                            break;
+                        },
+                        else => return err,
+                    };
+                }
+            }
             if (successes[mode]) for (columns) |score| try std.testing.expectEqual(@as(?f64, 3), score);
         }
-        if (successes[0] and !successes[1]) {
+        if (successes[0] and (!successes[1] or !successes[2])) {
             regressions += 1;
-            std.debug.print("FRESH_NS_FLOOR limit={d} baseline_ok=true prepared_ok=false\n", .{limit});
+            std.debug.print("FRESH_NS_FLOOR limit={d} baseline_ok=true mutable_ok={any} owned_ok={any}\n", .{ limit, successes[1], successes[2] });
         }
     }
     try std.testing.expectEqual(@as(usize, 0), regressions);
@@ -8271,4 +8291,266 @@ test "lite prepared changing checkpoint measurement" {
         for (column[1..]) |value| try std.testing.expectEqual(@as(?f64, 3), value);
     }
     std.debug.print("LITE_CHANGING queries=200 keys=512 cpu_us={d} allocations={d}\n", .{ cpu_us, allocations });
+}
+
+test "lite prepared empty owned requests need no query allocations" {
+    const a = std.testing.allocator;
+    const reader = @import("../../graph/score_read.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "empty-owned-request.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    try store.file.putDocument("doc", "value");
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    var request = try reader.PreparedRequest.init(a, &.{null}, &.{"node"});
+    defer request.deinit();
+    var empty_request = try reader.PreparedRequest.init(a, &.{"p/"}, &.{});
+    defer empty_request.deinit();
+    inline for (.{ false, true }) |erased| {
+        const raw = try Txn.openRead(&store);
+        var txn = if (erased) try backend_erased.readTxnFrom(a, raw) else raw;
+        defer txn.abort();
+        var values = [_]?f64{123};
+        const stats = try reader.populatePrepared(budget.allocator(), &txn, &request, &.{&values});
+        try std.testing.expectEqual(@as(?f64, null), values[0]);
+        try std.testing.expectEqual(@as(usize, 0), stats.keys);
+        var empty: [0]?f64 = .{};
+        _ = try reader.populatePrepared(budget.allocator(), &txn, &empty_request, &.{&empty});
+        try std.testing.expectError(error.InvalidBatch, reader.populatePrepared(budget.allocator(), &txn, &request, &.{&empty}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_attempts);
+}
+
+test "lite prepared compact decoded cache covers large namespaced batches" {
+    const a = std.testing.allocator;
+    const reader = @import("../../graph/score_read.zig");
+    const count = 2500;
+    const namespace = "a long namespace for compact scores\x00";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "compact-owned-request.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_bytes: [count][namespace.len + 10]u8 = undefined;
+    var nodes: [count][]const u8 = undefined;
+    var docs: [count - 1]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 7)), .little);
+    for (&key_bytes, &nodes, 0..) |*key, *node, i| {
+        @memcpy(key[0..namespace.len], namespace);
+        node.* = try std.fmt.bufPrint(key[namespace.len..][0..8], "{d:0>8}", .{i});
+        @memset(key[namespace.len + 8 ..], 0);
+        if (i < docs.len) docs[i] = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var request = try reader.PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
+    var columns: [count]?f64 = undefined;
+    var txn = try Txn.openReadWithPrefix(&store, namespace);
+    defer txn.abort();
+    for (0..3) |_| _ = try reader.populatePrepared(alloc, &txn, &request, &.{&columns});
+    const before = counter.alloc_attempts;
+    for (0..8) |_| _ = try reader.populatePrepared(alloc, &txn, &request, &.{&columns});
+    try std.testing.expectEqual(before, counter.alloc_attempts);
+    for (columns[0 .. count - 1]) |score| try std.testing.expectEqual(@as(?f64, 7), score);
+    try std.testing.expectEqual(@as(?f64, null), columns[count - 1]);
+    const cache = &store.workspaces[0].?.resolved_scores;
+    try std.testing.expect(cache.compact and cache.decoded_ready);
+    try std.testing.expectEqual(@as(usize, count), cache.decoded.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.keys.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.references.len);
+    try std.testing.expect(cache.order == null);
+    try std.testing.expect(cache.storage.?.len <= 32 * 1024);
+    // Receivers without the bulk callback still get exactly one delivery/key.
+    const Output = struct {
+        counts: [count]u8 = @splat(0),
+        fn write(ctx: *anyopaque, i: usize, score: ?f64) void {
+            const out: *@This() = @ptrCast(@alignCast(ctx));
+            out.counts[i] += 1;
+            std.debug.assert(score == (if (i == count - 1) @as(?f64, null) else 7));
+        }
+    };
+    var output = Output{};
+    var scope = try txn.openReadScope(alloc);
+    defer scope.close();
+    try scope.visitPreparedRequest(&request, .{ .context = &output, .write = Output.write });
+    for (output.counts) |deliveries| try std.testing.expectEqual(@as(u8, 1), deliveries);
+}
+
+test "lite prepared production metric sessions reuse owned inputs and recover optional denial" {
+    const a = std.testing.allocator;
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-owned-session.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    try store.file.putDocument("p/a\x00\x00", &score);
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocument("p/b\x00\x00", &score);
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+    statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+    const prefixes = try alloc.alloc(?[]const u8, 1);
+    prefixes[0] = try alloc.dupe(u8, "p/");
+    var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openRead(&store)), .statuses = statuses, .prefixes = prefixes };
+    defer session.deinit();
+    var node = [_]u8{'a'};
+    var column: [1]?f64 = undefined;
+    try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+    try std.testing.expect(session.prepared_request == null);
+    // Optional request construction is denied; the completed read stays valid.
+    counter.limit = counter.live;
+    try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+    try std.testing.expectEqual(@as(?f64, 3), column[0]);
+    try std.testing.expect(session.prepared_request == null);
+    counter.limit = std.math.maxInt(usize);
+    for (0..5) |_| try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+    try std.testing.expect(session.prepared_request != null);
+    const before = counter.alloc_attempts;
+    for (0..8) |_| try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+    try std.testing.expectEqual(before, counter.alloc_attempts);
+    // Mutating caller inputs selects the new request; ownership is independent.
+    node[0] = 'b';
+    try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
+    try std.testing.expectEqual(@as(?f64, 9), column[0]);
+    try std.testing.expectError(error.InvalidQueryRequest, session.readColumns(alloc, &.{"other"}, &.{&node}, &.{&column}));
+}
+
+test "lite prepared compact staging retries without duplicate delivery after page cache eviction" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-retention.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var nodes: [512][]const u8 = undefined;
+    for (keys, &nodes) |key, *node| node.* = key[0..8];
+    var request = try @import("../../graph/score_read.zig").PreparedRequest.init(a, &.{""}, &nodes);
+    defer request.deinit();
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var buffer: [8]u8 = undefined;
+    for (keys) |key| _ = try txn.getInto(key, &buffer);
+    var scope = try txn.openReadScope(query.allocator());
+    defer scope.close();
+    var scores: [512]?f64 = undefined;
+    var initial_output = @import("../prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = request.plan(), .columns = &.{&scores} };
+    try scope.visitPreparedRequest(&request, initial_output.completeSink());
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    try std.testing.expect(w.native_state.window.bytes == null);
+    // Exercise the supported offset-only cache path, independently of the
+    // decoded hit that intentionally requires no reader growth.
+    w.resolved_scores.decoded_ready = false;
+    const file = try txn.readFile();
+    try std.testing.expect(file.page_cache.total_bytes > 0);
+
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
+    const Output = struct {
+        manager: *resource_manager_mod.ResourceManager,
+        counts: [512]u8 = @splat(0),
+        scores: *[512]?f64,
+        first: bool = true,
+        fn write(ctx: *anyopaque, index: usize, score: ?f64) void {
+            const out: *@This() = @ptrCast(@alignCast(ctx));
+            out.counts[index] += 1;
+            out.scores[index] = score;
+            if (out.first) {
+                out.first = false;
+                out.manager.slices[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].budget.hard_limit_bytes = 1;
+            }
+        }
+    };
+    var output = Output{ .manager = &manager, .scores = &scores };
+    const result = scope.visitPreparedRequest(&request, .{ .context = &output, .write = Output.write });
+    try result;
+    for (output.counts) |count| try std.testing.expectEqual(@as(u8, 1), count);
+    try std.testing.expect(!w.allocation_failed);
+    try std.testing.expect(!scope.discard_workspace);
+    for (scores) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+    // Restore normal admission before measuring warm reuse. The tight limit
+    // above only guarantees the required record read, not cache residency.
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = 0;
+    for (0..3) |_| try scope.visitPreparedRequest(&request, initial_output.completeSink());
+    const before = counter.alloc_calls;
+    try scope.visitPreparedRequest(&request, initial_output.completeSink());
+    try std.testing.expectEqual(before, counter.alloc_calls);
+}
+
+test "lite prepared production metric session measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+    statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+    const prefixes = try alloc.alloc(?[]const u8, 1);
+    prefixes[0] = try alloc.dupe(u8, "");
+    var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openReadWithPrefix(&store, "ns\x00")), .statuses = statuses, .prefixes = prefixes };
+    defer session.deinit();
+    var column: [512]?f64 = undefined;
+    for (0..10) |_| try session.readColumns(alloc, &.{"metric"}, &nodes, &.{&column});
+    const before = counter.alloc_calls;
+    const started = std.posix.getrusage(0);
+    for (0..5000) |_| {
+        try session.readColumns(alloc, &.{"metric"}, &nodes, &.{&column});
+        for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+    }
+    const ended = std.posix.getrusage(0);
+    const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+    std.debug.print("LITE_PRODUCTION cpu_us={d} allocations={d} cache_bytes={d}\n", .{ cpu, counter.alloc_calls - before, store.workspaces[0].?.resolved_scores.storage.?.len });
 }

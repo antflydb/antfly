@@ -1128,9 +1128,10 @@ pub fn decodeScore(raw: []const u8) !f64 {
     return score;
 }
 
-/// Independently owned offsets for one exact request at one pinned snapshot.
-/// No reader, descriptor, cache pin, or caller key is retained. Opportunistic
-/// construction is bounded; failure leaves the streaming resolver available.
+/// Independently owned scores/offsets for one request at one pinned snapshot.
+/// Prepared requests retain only decoded scores and an owned identity; generic
+/// requests also own keys and offsets. No reader, descriptor, or cache pin is
+/// retained. Bounded optional construction leaves streaming reads available.
 pub const ResolvedScoreBatch = struct {
     const Binding = struct { owner: u64, generation: u64 };
     storage: ?[]u8 = null,
@@ -1145,6 +1146,8 @@ pub const ResolvedScoreBatch = struct {
     recovered_optional_failure: bool = false,
     promotion_allocator: ?Allocator = null,
     prepared_identity: ?ReadIdentity = null,
+    prepared_count: usize = 0,
+    compact: bool = false,
 
     pub fn deinit(self: *@This(), a: Allocator) void {
         const promotion = self.promotion_allocator;
@@ -1154,7 +1157,7 @@ pub const ResolvedScoreBatch = struct {
     }
 
     fn matches(self: *const @This(), binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8) bool {
-        if (self.binding == null or !std.meta.eql(self.binding.?, binding) or
+        if (self.compact or self.binding == null or !std.meta.eql(self.binding.?, binding) or
             !std.meta.eql(self.checkpoint, checkpoint) or self.keys.len != keys.len) return false;
         for (self.keys, keys) |owned, key| if (!std.mem.eql(u8, owned, key)) return false;
         return true;
@@ -1163,13 +1166,37 @@ pub const ResolvedScoreBatch = struct {
     fn matchesPrepared(self: *const @This(), binding: Binding, checkpoint: CheckpointSlot, identity: ReadIdentity, count: usize) bool {
         const owned = self.prepared_identity orelse return false;
         return self.binding != null and std.meta.eql(self.binding.?, binding) and
-            std.meta.eql(self.checkpoint, checkpoint) and self.keys.len == count and
+            std.meta.eql(self.checkpoint, checkpoint) and self.prepared_count == count and
             owned.canonical == identity.canonical and std.mem.eql(u8, owned.namespace, identity.namespace);
+    }
+
+    // Prepared identities uniquely prove canonical key ownership. Offset and
+    // key copies are unnecessary once these scores are ready. Stage only this
+    // bounded array after required reads; the next read fills it opportunistically.
+    fn rememberPrepared(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, identity: ReadIdentity, count: usize) bool {
+        self.deinit(a);
+        if (count > 4096) return false;
+        const required = std.math.add(usize, count * @sizeOf(f64) + 8, identity.namespace.len) catch return false;
+        if (required > 128 * 1024) return false;
+        const capacity = std.math.ceilPowerOfTwo(usize, required) catch return false;
+        const storage = (self.promotion_allocator orelse a).alloc(u8, capacity) catch return false;
+        var arena = std.heap.FixedBufferAllocator.init(storage);
+        const alloc = arena.allocator();
+        self.decoded = alloc.alloc(f64, count) catch unreachable;
+        const namespace = alloc.dupe(u8, identity.namespace) catch unreachable;
+        self.storage = storage;
+        self.prepared_identity = .{ .canonical = identity.canonical, .namespace = namespace };
+        self.prepared_count = count;
+        self.compact = true;
+        self.binding = binding;
+        self.checkpoint = checkpoint;
+        return true;
     }
 
     fn remember(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8, references: []const u64, order: ?[]const usize, prepared: ?ReadIdentity) !bool {
         if (prepared) |identity| {
             if (self.matchesPrepared(binding, checkpoint, identity, keys.len)) return true;
+            return self.rememberPrepared(a, binding, checkpoint, identity, keys.len);
         } else if (self.matches(binding, checkpoint, keys)) return true;
         self.binding = null;
         if (keys.len > 4096) {
@@ -1179,7 +1206,6 @@ pub const ResolvedScoreBatch = struct {
         var required = std.math.mul(usize, keys.len, @sizeOf([]const u8) + @sizeOf(u64) + @sizeOf(usize)) catch return false;
         required = std.math.add(usize, required, 32) catch return false;
         for (keys) |key| required = std.math.add(usize, required, key.len) catch return false;
-        if (prepared) |identity| required = std.math.add(usize, required, identity.namespace.len) catch return false;
         if (required > 128 * 1024) {
             self.deinit(a);
             return false;
@@ -1203,7 +1229,9 @@ pub const ResolvedScoreBatch = struct {
         self.decoded_ready = false;
         for (owned, keys) |*copy, key| copy.* = try alloc.dupe(u8, key);
         self.keys = owned;
-        self.prepared_identity = if (prepared) |identity| .{ .canonical = identity.canonical, .namespace = try alloc.dupe(u8, identity.namespace) } else null;
+        self.prepared_identity = null;
+        self.prepared_count = 0;
+        self.compact = false;
         @memcpy(self.references, references);
         self.order = if (order != null) positions else null;
         if (order) |indices| @memcpy(positions, indices);
@@ -6152,7 +6180,7 @@ pub const NativeFile = struct {
                 resolved.borrowed = true;
                 defer resolved.borrowed = false;
                 resolved.recovered_optional_failure = false;
-                for (resolved.decoded, 0..) |score, i| sink.write(sink.context, i, if (std.math.isNan(score)) null else score);
+                sink.deliverDecoded(resolved.decoded);
                 return;
             }
         };
@@ -6206,16 +6234,20 @@ pub const NativeFile = struct {
         if (cached and state.resolved.?.decoded_ready) {
             state.resolved.?.borrowed = true;
             defer state.resolved.?.borrowed = false;
-            for (state.resolved.?.decoded, 0..) |score, i| {
-                if (complete) {
-                    scores.?.write(scores.?.context, i, if (std.math.isNan(score)) null else score);
-                } else if (!std.math.isNan(score)) scores.?.write(scores.?.context, i, score);
+            if (complete) {
+                scores.?.deliverDecoded(state.resolved.?.decoded);
+            } else for (state.resolved.?.decoded, 0..) |score, i| {
+                if (!std.math.isNan(score)) scores.?.write(scores.?.context, i, score);
             }
             return;
         }
+        const staged = scores != null and prepared != null and state.binding != null and state.resolved != null and use_cache and
+            state.resolved.?.compact and state.resolved.?.matchesPrepared(state.binding.?, checkpoint, prepared.?, keys.len);
+        if (staged and !state.resolved.?.decoded_ready) cached = false;
+        var recovered = false;
         // Release old residency on a miss so resolution keeps the uncached
         // memory floor. Promote offsets only after required reads succeed.
-        if (!cached and scores != null) if (state.resolved) |resolved| {
+        if (!cached and !staged and scores != null) if (state.resolved) |resolved| {
             resolved.deinit(state.allocator.?);
         };
         // Mandatory growth may evict optional offsets only when not borrowed.
@@ -6223,21 +6255,32 @@ pub const NativeFile = struct {
         defer if (state.resolved) |resolved| {
             resolved.borrowed = false;
         };
-        var references = if (cached) state.resolved.?.references else try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+        var references = if (cached) state.resolved.?.references else self.resolveBatchReferences(temporary, checkpoint, keys, &state.path) catch |err| retry: {
+            if (!staged or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
+            state.resolved.?.deinit(state.allocator.?);
+            recovered = true;
+            break :retry try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+        };
         defer if (!cached) temporary.free(references);
-        var order = if (cached) state.resolved.?.order else try batchReferenceOrder(temporary, references);
+        var order = if (cached) state.resolved.?.order else batchReferenceOrder(temporary, references) catch |err| retry: {
+            if (!staged or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
+            state.resolved.?.deinit(state.allocator.?);
+            recovered = true;
+            break :retry try batchReferenceOrder(temporary, references);
+        };
         defer if (!cached) {
             if (order) |positions| temporary.free(positions);
         };
-        // Collect decoded values only into an existing borrowed offset cache.
-        // Cold reads never raise their required allocation floor, even with a
-        // caller allocator that cannot evict optional residency automatically.
-        var capture = cached and state.resolved.?.decoded.len == keys.len;
+        // Fill only previously staged storage. Borrow after required reference
+        // resolution, which can evict it. Cold reads never reserve a capture
+        // buffer; even opaque allocators can discard staging before a retry.
+        var capture = scores != null and state.resolved != null and state.resolved.?.decoded.len == keys.len and
+            (cached or (staged and state.resolved.?.matchesPrepared(state.binding.?, checkpoint, prepared.?, keys.len)));
+        if (state.resolved) |resolved| resolved.borrowed = cached or capture;
         errdefer if (scores != null) if (state.resolved) |resolved| {
             resolved.decoded_ready = false;
         };
         var captured: usize = 0;
-        var recovered = false;
         const reader = &state.reader;
         const window = &state.window;
         const optional_allocator = blk: {
@@ -6261,15 +6304,24 @@ pub const NativeFile = struct {
             }
             const ahead = if (reader.page_id == physicalPage(reference) or window.contains(self, physicalPage(reference))) 1 else recordRunAhead(references, order, position);
             const bytes = reader.readWithWindowAllocators(true, window, self, state.allocator.?, optional_allocator, checkpoint, reference, .document, ahead) catch |err| {
-                if (!cached or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
+                if ((!cached and !capture) or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
                 // No borrowed offsets survive their eviction. Resolve again at
                 // this same pinned checkpoint and resume the failed position;
                 // already delivered scores are never replayed to the sink.
                 const resolved = state.resolved.?;
                 resolved.borrowed = false;
                 resolved.deinit(state.allocator.?);
-                cached = false;
                 capture = false;
+                if (!cached) {
+                    // Compact staging owns only decoded values. Required
+                    // references/order already belong to this read, so retain
+                    // them and retry the failed record without resolution or
+                    // replaying any deliveries.
+                    state.reset();
+                    recovered = true;
+                    continue;
+                }
+                cached = false;
                 references = &.{};
                 order = null;
                 state.reset();

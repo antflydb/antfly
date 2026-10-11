@@ -272,7 +272,8 @@ pub const PreparedScorePlan = struct {
         return true;
     }
 
-    fn matches(self: *const @This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
+    /// Exact logical input comparison, respecting current row/column remaps.
+    pub fn matches(self: *const @This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
         return self.prefixesMatch(prefixes) and self.nodesMatch(nodes);
     }
 
@@ -362,7 +363,41 @@ pub const PreparedScorePlan = struct {
             return .{ .context = self, .write = if (self.plan.column_order_identity)
                 (if (self.plan.row_order_identity) completeCanonical else completeRemapped)
             else
-                (if (self.plan.row_order_identity) completeColumns else completeBoth) };
+                (if (self.plan.row_order_identity) completeColumns else completeBoth), .write_decoded = if (self.plan.column_order_identity)
+                (if (self.plan.row_order_identity) decodedCanonical else decodedRemapped)
+            else
+                (if (self.plan.row_order_identity) decodedColumns else decodedBoth) };
+        }
+        fn decodedCanonical(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, false, false);
+        }
+        fn decodedRemapped(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, true, false);
+        }
+        fn decodedColumns(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, false, true);
+        }
+        fn decodedBoth(ctx: *anyopaque, scores: []const f64) void {
+            writeDecoded(ctx, scores, true, true);
+        }
+        fn writeDecoded(ctx: *anyopaque, scores: []const f64, comptime remapped: bool, comptime columns_remapped: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(scores.len == self.plan.read_keys.len);
+            // Lift the unique-target decision out of the per-score delivery.
+            if (scores.len == self.plan.targets.len) {
+                for (scores, self.plan.targets) |score, target| {
+                    self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = if (std.math.isNan(score)) null else score;
+                }
+            } else {
+                var start: usize = 0;
+                for (scores, self.plan.ends) |score, end| {
+                    const value: ?f64 = if (std.math.isNan(score)) null else score;
+                    for (self.plan.targets[start..end]) |target| {
+                        self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = value;
+                    }
+                    start = end;
+                }
+            }
         }
         fn completeCanonical(ctx: *anyopaque, index: usize, score: ?f64) void {
             writeRows(ctx, index, score, false, false);
@@ -514,4 +549,29 @@ test "prepared score plan identity survives permutations and changes after rebui
     plan.deinit();
     try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"q"}, &.{ "a", "b" }));
     try std.testing.expect(plan.identity != rebuilt);
+}
+
+test "prepared score bulk delivery preserves null duplicate and permutation fanout" {
+    const a = std.testing.allocator;
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    const prefixes = [_]?[]const u8{ "p/", null, "q/", "p/" };
+    const reordered = [_]?[]const u8{ "q/", "p/", null, "p/" };
+    const nodes = [_][]const u8{ "a", "b", "a" };
+    const permuted = [_][]const u8{ "b", "a", "a" };
+    for (0..4) |mode| {
+        try std.testing.expect(try plan.prepare(a, if (mode & 1 == 0) &prefixes else &reordered, if (mode & 2 == 0) &nodes else &permuted));
+        var expected: [4][3]?f64 = @splat(@splat(null));
+        var actual: [4][3]?f64 = @splat(@splat(null));
+        var first = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &expected[0], &expected[1], &expected[2], &expected[3] } };
+        var second = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &actual[0], &actual[1], &actual[2], &actual[3] } };
+        var values: [4]f64 = undefined;
+        for (values[0..plan.read_keys.len], 0..) |*score, i| {
+            score.* = if (i == 1) std.math.nan(f64) else @floatFromInt(i);
+            const sink = first.completeSink();
+            sink.write(sink.context, i, if (std.math.isNan(score.*)) null else score.*);
+        }
+        second.completeSink().deliverDecoded(values[0..plan.read_keys.len]);
+        for (expected, actual) |want, got| try std.testing.expectEqualSlices(?f64, &want, &got);
+    }
 }
