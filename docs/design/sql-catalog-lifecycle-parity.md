@@ -2291,3 +2291,11 @@ work, missing admission and allocation-failure cleanup. Execution qualification
 is pending. This layer is not yet wired to an authenticated RPC/root-attestation
 producer. Durable cancellation/late-admission tombstones, all later phases and
 the distributed fault/public atomicity gates remain required before activation.
+
+A composed provisioned-source fixture now samples the real LSM owner's catalog
+and admission epoch, runs staged admission/fencing/reservation through the actual
+private ABI, checks that the public schema is still the predecessor, and fully
+closes/reopens the source before recovering the original reserved receipt. It
+also checks that large admission inputs are requested only once. Metadata phase
+progression is simulated in this fixture; it does not stand in for root-signed
+ACK/enrollment or distributed fault qualification. Execution remains pending.

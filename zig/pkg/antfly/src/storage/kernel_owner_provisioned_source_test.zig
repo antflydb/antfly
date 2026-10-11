@@ -99,6 +99,150 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     }
 }
 
+test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const execution = @import("../api/relational_index_owner_execution.zig");
+    const progress = local.storage_db_relational_index_publication_progress;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var plan = try publication.testing.plan(scratch);
+    @constCast(plan.owners)[0].receipt_authority = .native;
+    const Catalog = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+        ranges: [1]metadata_table_manager.RangeRecord,
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 13, .metadata_incarnation = @splat('1'), .metrics = .{} },
+                .tables = &self.tables,
+                .ranges = &self.ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+            var current = try snapshot(ptr);
+            return contract.matches(&current);
+        }
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{
+                .admin_snapshot = snapshot,
+                .free_admin_snapshot = free,
+                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
+                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
+                .validate_publication = validate,
+            } };
+        }
+    };
+    const Metadata = struct {
+        value: publication.OwnerDecision,
+        admission_reads: usize = 0,
+        pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try std.testing.expect(context.index_publication_authority);
+            var value = self.value;
+            if (call.relational_index_owner_decision.projection == .permission)
+                value.inputs = null
+            else
+                self.admission_reads += 1;
+            return std.json.Stringify.valueAlloc(a, value, .{});
+        }
+    };
+    var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range} };
+    const group = plan.owners[0].range.group_id;
+    const request: execution.Request = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .operation = .fence };
+    var prepared: ?publication.Prepared = null;
+    defer if (prepared) |*value| value.deinit();
+    var metadata: Metadata = undefined;
+    var reserved_receipt: progress.Receipt = undefined;
+    {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        defer owners.deinit();
+        // Read the actual newly provisioned owner's epoch and catalog instead
+        // of guessing them from the metadata fixture's synthetic defaults.
+        var catalog_response = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_integrity_catalog = true }, .stale)).?;
+        defer catalog_response.deinit(alloc);
+        const observed = try std.json.parseFromSliceLeaky(struct { catalog: []const u8, schema_version: u32, table_id: []const u8 }, scratch, catalog_response.json, .{ .allocate = .alloc_always });
+        try std.testing.expectEqual(@as(u32, 1), observed.schema_version);
+        var identity_response = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .stale)).?;
+        defer identity_response.deinit(alloc);
+        const identity = try std.json.parseFromSliceLeaky(local.storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{});
+        const predecessor = try scratch.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(observed.catalog));
+        try std.base64.standard.Decoder.decode(predecessor, observed.catalog);
+        var predecessor_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(predecessor, &predecessor_digest, .{});
+        try std.testing.expectEqual(identity.catalog_digest, predecessor_digest);
+        @constCast(plan.owners)[0].admission_epoch = identity.next_epoch;
+        @constCast(plan.owners)[0].catalog_digest = identity.catalog_digest;
+        plan.catalog_before_b64 = observed.catalog;
+        prepared = try plan.prepare(alloc);
+        metadata = .{ .value = .{
+            .metadata_group_id = 13,
+            .metadata_incarnation = @splat('1'),
+            .head = prepared.?.head,
+            .owner = prepared.?.owners[0],
+            .disposition = .execute,
+            .dispatch = try std.json.parseFromSliceLeaky(publication.Dispatch, scratch, prepared.?.dispatch[0], .{ .allocate = .alloc_always }),
+            .inputs = try std.json.parseFromSliceLeaky(publication.Inputs, scratch, prepared.?.inputs, .{ .allocate = .alloc_always }),
+        } };
+        var admitted = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer admitted.deinit();
+        try std.testing.expect(admitted == .applied);
+        try std.testing.expect(admitted.outcome().?.receipt == null);
+        try std.testing.expect(!admitted.outcome().?.replication_pending);
+        var fenced = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer fenced.deinit();
+        const fence_receipt = fenced.outcome().?.receipt.?;
+        try std.testing.expectEqual(.fenced, fence_receipt.action);
+        try std.testing.expect(fence_receipt.position == .native);
+        var recovered_fence = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
+        defer recovered_fence.deinit();
+        try std.testing.expect(recovered_fence == .recovered);
+        try std.testing.expectEqual(try fence_receipt.digest(), try recovered_fence.outcome().?.receipt.?.digest());
+        // This metadata driver simulates permission progression only. Root
+        // signature/enrollment verification is not bypassed in production.
+        const next = try progress.acknowledge(metadata.value.head, metadata.value.owner, metadata.value.head.revision, fence_receipt);
+        metadata.value.head = next.head;
+        metadata.value.owner = next.owner;
+        var reserve_request = request;
+        reserve_request.operation = .reserve;
+        var reserved = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
+        defer reserved.deinit();
+        reserved_receipt = reserved.outcome().?.receipt.?;
+        try std.testing.expectEqual(.reserved, reserved_receipt.action);
+        try std.testing.expect(reserved_receipt.position.native.sequence > fence_receipt.position.native.sequence);
+        var public_schema = (try owners.readSource().lookupGroupLocal(alloc, group, plan.before.name, "", .{ .relational_topology_json = "{\"mode\":\"public_schema\"}" }, .stale)).?;
+        defer public_schema.deinit(alloc);
+        const schema_json = try std.json.parseFromSliceLeaky([]const u8, scratch, public_schema.json, .{ .allocate = .alloc_always });
+        const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, schema_json, .{});
+        try std.testing.expectEqual(@as(i64, 1), schema_value.object.get("version").?.integer);
+    }
+    {
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        owners.online_source_authority = .native;
+        defer owners.deinit();
+        var reserve_request = request;
+        reserve_request.operation = .reserve;
+        var recovered = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
+        defer recovered.deinit();
+        try std.testing.expect(recovered == .recovered);
+        try std.testing.expect(recovered.outcome().?.duplicate);
+        try std.testing.expectEqual(try reserved_receipt.digest(), try recovered.outcome().?.receipt.?.digest());
+        try std.testing.expectEqual(reserved_receipt.position.native.sequence, recovered.outcome().?.position.sequence);
+        try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+    }
+}
+
 test "cold warmup reopens transient owners without disturbing resident siblings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
