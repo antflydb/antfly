@@ -1053,6 +1053,8 @@ pub const RuntimeGroupStatusReport = struct {
     /// storage-owner observation as index and identity facts. Zero is unknown
     /// for older runtime-status wire profiles, not proof of an empty schema.
     schema_epoch: u32 = 0,
+    /// Same-root durable owner observation; null is an unknown legacy fact.
+    source_authority: ?@import("antfly_local_sources").storage_source_authority.State = null,
     doc_count: u64 = 0,
     disk_bytes: u64 = 0,
     disk_bytes_known: bool = false,
@@ -2694,6 +2696,7 @@ pub fn cloneRuntimeGroupStatusReport(alloc: std.mem.Allocator, record: RuntimeGr
         .target_observation_revision = record.target_observation_revision,
         .target_observation_complete = record.target_observation_complete,
         .schema_epoch = record.schema_epoch,
+        .source_authority = record.source_authority,
         .doc_count = record.doc_count,
         .disk_bytes = record.disk_bytes,
         .disk_bytes_known = record.disk_bytes_known,

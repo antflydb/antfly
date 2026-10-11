@@ -2319,3 +2319,42 @@ Combined with the three native-owner tests above, the Debug gate completes all
 136 rejected, 73 superseded and 899 unresolved out of 1,586 original cases.
 The Apache/server boundary checker passes for 2,028 source files. None of these
 component gates changes an original SQL disposition.
+
+### Same-root native source observations (in qualification)
+
+Native index ACK verification now requires a durable owner report containing
+native source authority, the exact namespace, and a commit sequence at least as
+large as the receipt's native cut. Unknown observations and Raft-mode owners
+cannot stand in for a native cut. Existing root enrollment, reporter, replica
+placement, root-generation and lifecycle checks still apply; Raft indexes and
+native sequences are never compared.
+
+The compiled owner samples this fixed-size source state while holding the same
+nonblocking apply-shared guard as its runtime stats. It validates the durable
+namespace and rejects mixed native/Raft markers. Status-only observations remain
+unknown. The optional state crosses the private JSON boundary, immutable status
+cache, cloned reports and a named V19 status codec; V18 schema-epoch framing is
+unchanged. Full-record profile selection preserves the strongest sibling fact.
+Report deduplication now includes both schema epochs and source watermarks, so
+an epoch-only or native-cut-only change cannot disappear as a heartbeat no-op.
+
+Senders include the new observation only after all metadata decoders report V19
+readiness. Proposal admission independently rechecks that coordinated barrier;
+the first durable report can then activate the codec. Requiring prior activation
+on the sender would deadlock that first report. Mandatory authority facts are
+never silently stripped to downgrade a proposal, and unknown future profiles
+cannot satisfy readiness. The public index producer remains disabled.
+
+The first Debug authority gate passes 59/59 build steps and 33 tests, including
+wire corruption/truncation, downgrade refusal, root-receipt observation faults,
+cloning/deduplication and service readiness. A combined Debug repeat passes
+94/94 steps and 36 tests, including the real compiled-owner observation after
+LSM restart. Review then extended monotone readiness retention to historical
+profiles: a late weaker probe cannot erase a stronger proof for the same
+membership, while replacement membership discards the old proof. All three
+standalone protocol tests pass for that final change. The final combined repeat,
+C-ABI contention/cleanup and optimized runs remain in qualification.
+Authenticated producer/signing integration, cancellation
+tombstones, later publication phases and distributed fault/public atomicity
+gates are still unfinished. No original SQL case receives credit from this
+component work.

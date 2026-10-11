@@ -34723,17 +34723,36 @@ pub const DB = struct {
     }
 
     pub fn runtimeStatusStatsConsistentIfAvailable(self: *DB, alloc: Allocator) !?types.DBStats {
+        const observation = (try self.runtimeStatusObservationConsistentIfAvailable(alloc)) orelse return null;
+        return observation.stats;
+    }
+
+    pub const RuntimeStatusObservation = struct {
+        stats: types.DBStats,
+        source_authority: ?@import("../source_authority.zig").State = null,
+    };
+
+    /// Never wait for an apply writer while retaining a shared owner lease.
+    /// Sample the durable source cut under the same apply guard as the stats;
+    /// a later mutation may advance it, but cannot make this cut optimistic.
+    pub fn runtimeStatusObservationConsistentIfAvailable(self: *DB, alloc: Allocator) !?RuntimeStatusObservation {
         if (self.open_mode == .status_only) {
-            return try self.statusOnlyStats(alloc);
+            return .{ .stats = try self.statusOnlyStats(alloc) };
         }
 
         if (!self.core.tryLockApplyShared()) return null;
-        var result = self.statsLocked(alloc) catch |err| {
-            self.core.unlockApplyShared();
-            return err;
+        var result: RuntimeStatusObservation = blk: {
+            defer self.core.unlockApplyShared();
+            const stats_value = try self.statsLocked(alloc);
+            errdefer types.freeDBStats(alloc, stats_value);
+            var txn = try self.core.store.beginReadTxn();
+            defer txn.abort();
+            const authority = @import("../source_authority.zig");
+            const state = try authority.load(&txn);
+            if (state) |value| _ = try authority.require(&txn, value.kind, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            break :blk .{ .stats = stats_value, .source_authority = state };
         };
-        self.core.unlockApplyShared();
-        self.overlayRuntimeStatusRuntimeBestEffort(&result);
+        self.overlayRuntimeStatusRuntimeBestEffort(&result.stats);
         return result;
     }
 
