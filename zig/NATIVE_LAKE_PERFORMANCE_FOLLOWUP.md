@@ -1781,7 +1781,7 @@ The independent artifact-integrity E2E stops publication/GC before inspecting
 all matching aggregate cohorts and makes both RAM and persistent caches cold
 before testing damaged source objects. Valid cached immutable bytes are not
 mistaken for scan fallback, and restoration does not resurrect collected old
-artifacts. Timestamp DDL retries only the explicit idle, retryable 53300 response
+artifacts. Ordered and timestamp DDL fixtures retry only the explicit idle, retryable 53300 response
 introduced by main's relation-catalog publication fence.
 
 
@@ -1808,3 +1808,78 @@ Qualification after merging main through `7d6b35000d` (Zig 0.17.0, Debug):
 - Canonical license headers, the Apache dependency boundary (2,019 source files),
   Zig formatting across all 38 changed Zig files, Python lint/format and diff
   checks pass.
+
+### Byte-bounded partial delivery and incremental manifest admission
+
+Partial join delivery retains packed typed inputs and a reducer-slot reader per
+matched compact pair. It no longer expands all reducers for every pair in a
+row-count-only page. Pages stop at the smaller of the SQL page byte allowance
+and one sixteenth of retained memory; one large pair may cross that boundary to
+ensure progress. The consumer materializes reducers in a separate arena reset
+for each partial, borrows existing typed partial arrays when possible, and copies
+states only when aggregate FILTER needs to replace a slot. Checked signed SUM
+multiplicity, NULL behavior, and versioned durable aggregate cells are unchanged.
+A real independently written Parquet regression uses 8,192 rows, 128 SUM columns,
+multiple row groups and a duplicate-key join. Every result is checked against
+Python integer arithmetic and ordinary join execution.
+
+Grace partition selection now estimates compact build volume from observed
+packed bytes and group cardinality instead of passing zero. Resident cardinality
+is exact; an externally grouped input supplies a conservative input-row bound.
+Partition fanout retains the existing cap of sixteen and bounded skew fallback.
+Transferring the resident build prefix reclaims materialization scratch after
+each row. Variable-sized grouping keys and extrema contribute to observed widths.
+
+Both serial and parallel Boolean segment planning use immutable physical
+metadata. Coarse hierarchy bounds and exact leaf refinements run before acquiring
+query-bound segment readers. A missing metadata summary binds only the reader
+needed for the legacy payload fallback. Surviving scoring work still binds its
+current reader capability before opening payloads. Tests cover sparse candidates,
+10,000 broad candidates, parallel planning, and exact-bound pruning with zero
+query reader bindings, including current-authority checks on cached refinements.
+
+Text source acquisition caches the authenticated root directory independently
+from its file inventory. A ready physical corpus skips inventory expansion.
+Cold corpus admission borrows independently cached file manifests on up to four
+shared I/O lanes, preserving publication order and joining workers on errors or
+cancellation. Unchanged file manifests can reuse their parsed values across
+publications. Directory decoding finishes before child decode acquisition, which
+avoids nested exclusive decode admission. Manifest leases remain pinned until
+the corpus has copied all retained metadata; cache eviction cannot invalidate a
+borrowed file descriptor.
+
+Serving admits at most 64 MiB of pinned decoded manifest capacity and uses a
+separate 64 MiB ceiling for inventory assembly. Active decode work remains under
+the shared decoded-cache admission budget, while physical corpus metadata stays
+under its existing process budget. Legacy/maintenance root expansion now bounds
+actual parse allocations by 64 MiB instead of rejecting a sum of more than
+32 MiB of encoded manifests. Per-artifact authentication and 4 MiB wire limits,
+publication binding and file/segment count limits continue to apply. Warm corpus
+admission is lazy; a cold corpus still requires the complete file inventory for
+its global statistics and physical row identities. Skipping unrelated manifests
+on a cold query would require a persisted global inventory/statistics contract.
+
+
+Qualification for byte-bounded delivery and manifest admission (Zig 0.17.0,
+Debug, main through `7d6b35000d`):
+
+- All 323 lake integration tests pass after the final source rebuild, with no
+  allocator leaks. This includes forced compact join spilling, allocation-failure
+  unwinding, and independent manifest reuse, warm admission and expired reads.
+- All 50 focused ranking tests pass with no leaks; one optimized-only benchmark
+  is skipped in Debug. The broad planning and exact-pruning regression verifies
+  zero bindings across a 10,000-segment inventory.
+- The production server builds from the final source. All 15 selected real-data
+  E2Es pass across the final affected runs: the 128-SUM wide join, four Parquet
+  page-version/dictionary attachment variants, two native ordered index variants,
+  remote text/highlights, two signed timestamp variants, incremental generations,
+  sparse ranking, independent Iceberg commits/deletes/restart, and fragmented
+  hierarchy ranking for both Parquet and Iceberg.
+- The initial broad E2E run exposed the ordered fixture's missing DDL-publication
+  retry and one timestamp publication timeout. Ordered and timestamp fixtures
+  now share the same explicit idle/retryable 53300 policy. Both ordered and both
+  timestamp cases pass together against the final server; SQL query failures
+  remain immediate assertions.
+- Zig formatting, Python lint/format, license headers, the authored embedded
+  production import boundary, and diff checks pass. Archive-scale latency,
+  traffic and RSS measurements remain pending.

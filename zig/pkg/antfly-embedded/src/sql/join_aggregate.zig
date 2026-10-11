@@ -219,23 +219,34 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.build = try operators.HashJoin.create(self.a, .{ .rows = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
+            var packed_bytes: u64 = 0;
+            var packed_groups: u64 = 0;
             while (true) {
                 _ = scratch.reset(.free_all);
                 try self.engine.checkpoint();
                 const group = try groups.nextTypedPartialResult(scratch.allocator()) orelse break;
                 const values = try self.pack(scratch.allocator(), group);
                 const keys = group.keys[0..self.plan.join_count];
+                packed_bytes +|= try packedBytes(values);
+                packed_groups += 1;
                 if (self.partitions) |owner| {
                     try owner.add(true, values, keys, @intCast(group.ordinal));
                 } else {
                     const admitted = try self.build.?.addBatchUntilFull(scratch.allocator(), .{ .rows = &.{values} }, &.{keys});
                     if (admitted == 0) {
                         const manager = context.spill orelse return error.SqlProgramLimitExceeded;
-                        const owner = try @import("partition_join.zig").Join.create(self.a, manager, context.limits.retained_bytes / 4, context.limits.scan_rows, 0, false, false);
+                        // Exact cardinality for resident groups; spilled groups
+                        // expose an input-row upper bound. Observed compact
+                        // widths include variable-sized keys and MIN/MAX values.
+                        const estimated_bytes = (packed_bytes / packed_groups + 1) *| @as(u64, @intCast(groups.groupCount()));
+                        const owner = try @import("partition_join.zig").Join.create(self.a, manager, context.limits.retained_bytes / 4, context.limits.scan_rows, estimated_bytes, false, false);
                         self.partitions = owner;
+                        var transfer = std.heap.ArenaAllocator.init(self.a);
+                        defer transfer.deinit();
                         var position: usize = 0;
                         while (try self.build.?.unmatched(&position)) |match| {
-                            const stored = try match.materializeValues(scratch.allocator());
+                            _ = transfer.reset(.free_all);
+                            const stored = try match.materializeValues(transfer.allocator());
                             try owner.add(true, stored, stored[0..self.plan.join_count], position - 1);
                         }
                         self.build.?.deinit();
@@ -327,23 +338,46 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             state.count = count;
             return state;
         }
-        fn combine(self: *@This(), out: A, built: []const Datum, probed: []const Datum) !operators.GroupResult {
-            const left = if (self.build_side == 0) built else probed;
-            const right = if (self.build_side == 1) built else probed;
-            const left_count = try countAt(left, self.plan.keys[0].len);
-            const right_count = try countAt(right, self.plan.keys[1].len);
-            const keys = try out.alloc(Datum, self.plan.output_keys.len);
-            for (self.plan.output_keys, keys) |key, *value| value.* = try operators.cloneDatum(out, if (key.side == 0) left[key.index] else right[key.index]);
-            const states = try out.alloc(operators.Aggregate, self.plan.inputs.len);
-            for (self.plan.inputs, states, 0..) |input, *state, slot| {
-                state.* = if (input) |source| try self.stateAt(out, source.side, self.input_slots[source.side][slot], if (source.side == 0) left else right) else try operators.Aggregate.init(out, .count, null);
-                if (input) |source| {
+        const Owner = @This();
+        const Compact = struct {
+            owner: *Owner,
+            sides: [2][]const Datum,
+            fn read(raw: *const anyopaque, a_: A, slot: usize) !operators.Aggregate {
+                const self: *const Compact = @ptrCast(@alignCast(raw));
+                const owner = self.owner;
+                if (slot >= owner.plan.inputs.len) return error.InvalidSqlBackendResponse;
+                const left_count = try countAt(self.sides[0], owner.plan.keys[0].len);
+                const right_count = try countAt(self.sides[1], owner.plan.keys[1].len);
+                if (owner.plan.inputs[slot]) |source| {
+                    var state = try owner.stateAt(a_, source.side, owner.input_slots[source.side][slot], self.sides[source.side]);
                     const multiple = if (source.side == 0) right_count else left_count;
                     state.count = std.math.mul(u64, state.count, multiple) catch return error.SqlNumericOutOfRange;
                     if (state.kind == .sum) state.integer_sum = std.math.mul(i128, state.integer_sum, multiple) catch return error.SqlNumericOutOfRange;
-                } else state.count = std.math.mul(u64, left_count, right_count) catch return error.SqlNumericOutOfRange;
+                    return state;
+                }
+                var state = try operators.Aggregate.init(a_, .count, null);
+                state.count = std.math.mul(u64, left_count, right_count) catch return error.SqlNumericOutOfRange;
+                return state;
             }
-            const result: operators.GroupResult = .{ .keys = keys, .aggregates = &.{}, .typed_states = states, .ordinal = self.ordinal };
+        };
+        fn packedBytes(values: []const Datum) !usize {
+            var bytes: usize = 0;
+            for (values) |value| bytes +|= try operators.datumBytes(value);
+            return bytes;
+        }
+        fn clonePacked(out: A, values: []const Datum) ![]const Datum {
+            const owned = try out.alloc(Datum, values.len);
+            for (values, owned) |value, *cell| cell.* = try operators.cloneDatum(out, value);
+            return owned;
+        }
+        fn combine(self: *@This(), out: A, built: []const Datum, probed: []const Datum) !operators.GroupResult {
+            const compact = try out.create(Compact);
+            compact.* = .{ .owner = self, .sides = undefined };
+            compact.sides[self.build_side] = try clonePacked(out, built);
+            compact.sides[1 - self.build_side] = try clonePacked(out, probed);
+            const keys = try out.alloc(Datum, self.plan.output_keys.len);
+            for (self.plan.output_keys, keys) |key, *value| value.* = compact.sides[key.side][key.index];
+            const result: operators.GroupResult = .{ .keys = keys, .aggregates = &.{}, .state_reader = .{ .ptr = compact, .count = self.plan.inputs.len, .read = Compact.read }, .ordinal = self.ordinal };
             self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
             return result;
         }
@@ -353,18 +387,27 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             if (self.done) return null;
             if (!self.ready) try self.prepare();
             var results: std.ArrayList(operators.GroupResult) = .empty;
-            while (results.items.len < maximum) {
+            const budget = @max(1, @min(self.engine.context.limits.page_bytes, self.engine.context.limits.retained_bytes / 16));
+            var bytes: usize = 0;
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            // At most one compact pair may cross the byte boundary, preserving
+            // progress for a single large key without retaining a second page.
+            while (results.items.len < maximum and bytes < budget) {
+                _ = scratch.reset(.free_all);
                 try self.engine.checkpoint();
                 if (self.partitions) |owner| {
                     const pair = try owner.next() orelse {
                         self.done = true;
                         break;
                     };
+                    bytes +|= @sizeOf(Compact) + @sizeOf(operators.GroupResult) + self.plan.output_keys.len * @sizeOf(Datum) + try packedBytes(pair.right.?) + try packedBytes(pair.left.?);
                     try results.append(out, try self.combine(out, pair.right.?, pair.left.?));
                     continue;
                 }
                 if (self.probe) |*probe| if (try probe.next()) |match| {
-                    const built = try match.materializeValues(out);
+                    const built = try match.materializeValues(scratch.allocator());
+                    bytes +|= @sizeOf(Compact) + @sizeOf(operators.GroupResult) + self.plan.output_keys.len * @sizeOf(Datum) + try packedBytes(built) + try packedBytes(self.current_values);
                     try results.append(out, try self.combine(out, built, self.current_values));
                     continue;
                 };

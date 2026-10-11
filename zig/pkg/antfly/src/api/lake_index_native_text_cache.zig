@@ -84,7 +84,7 @@ pub const Cache = struct {
             };
         }
     }
-    fn acquireOnce(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, root: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
+    fn acquireOnce(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, directory: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
         try context.ensureActive();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-text-snapshot-cache-v1");
@@ -106,6 +106,14 @@ pub const Cache = struct {
             }
         };
         self.mutex.unlock();
+        // Directory decoding finishes before acquiring child cache flights.
+        // A large manifest can safely request exclusive decode admission.
+        var metadata_budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+        var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
+        defer metadata_arena.deinit();
+        const inventory = try corpus.admitInventory(metadata_arena.allocator(), directory, store, cached, cancellation);
+        defer inventory.deinit();
+        const root = inventory.root;
         try root.validate();
         var bytes: u64 = root_ref.byte_len;
         for (root.segments) |segment| bytes = std.math.add(u64, bytes, segment.byte_len) catch return error.NativeLakeTextCorpusTooLarge;

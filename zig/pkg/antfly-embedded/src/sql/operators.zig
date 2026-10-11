@@ -561,9 +561,18 @@ pub const GroupBatch = struct {
     ordinals: []const u64,
 };
 pub const GroupResult = struct {
+    /// Compact in-process partials materialize one reducer at a time. The
+    /// reader and its packed inputs live until the provider's next page;
+    /// allocations made by read belong to the consumer's per-partial scratch.
+    pub const StateReader = struct {
+        ptr: *const anyopaque,
+        count: usize,
+        read: *const fn (*const anyopaque, Allocator, usize) anyerror!Aggregate,
+    };
     /// In-process partials borrow typed reducers from the page arena. Durable
     /// and backend interchange continues to use versioned aggregate cells.
     typed_states: ?[]const Aggregate = null,
+    state_reader: ?StateReader = null,
     keys: []const Datum,
     aggregates: []const Datum,
     ordinal: u64,

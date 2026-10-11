@@ -569,9 +569,9 @@ const Execution = struct {
         };
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
-        const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Root, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadRoot);
+        const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
-        const root = metadata.value.*;
+        const root = metadata.value.root;
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
         const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});

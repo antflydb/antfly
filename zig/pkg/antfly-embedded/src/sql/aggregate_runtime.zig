@@ -276,9 +276,12 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
         pages += 1;
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
         groups += partials.len;
+        var merge_arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer merge_arena.deinit();
         for (partials) |partial| {
+            _ = merge_arena.reset(.free_all);
             if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
-            const a = arena.allocator();
+            const a = merge_arena.allocator();
             const cells = try a.alloc(Datum, bound.input.columns.len);
             @memset(cells, .{});
             for (reuse.key_columns, partial.keys) |column, key| {
@@ -286,11 +289,17 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
                 cells[column] = key;
             }
             if (!try bound.input.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
-            const partial_count = if (partial.typed_states) |states| states.len else partial.aggregates.len;
+            if (partial.typed_states != null and partial.state_reader != null) return error.InvalidSqlBackendResponse;
+            const partial_count = if (partial.state_reader) |reader| reader.count else if (partial.typed_states) |states| states.len else partial.aggregates.len;
             if (partial.aggregate_slots) |slots| {
                 if (slots.len != partial_count) return error.InvalidSqlBackendResponse;
             } else if (partial_count != bound.specs.len) return error.InvalidSqlBackendResponse;
-            const typed = if (partial.typed_states) |states| try a.dupe(operators.Aggregate, states) else null;
+            var typed: ?[]const operators.Aggregate = if (partial.state_reader) |reader| materialize: {
+                const states = try a.alloc(operators.Aggregate, reader.count);
+                for (states, 0..) |*state, index| state.* = try reader.read(reader.ptr, a, index);
+                break :materialize states;
+            } else partial.typed_states;
+            var adjusted: ?[]operators.Aggregate = null;
             const aggregates: []Datum = if (typed != null) &.{} else try a.dupe(Datum, partial.aggregates);
             for (0..partial_count) |i| {
                 const slot = if (partial.aggregate_slots) |slots| slots[i] else i;
@@ -304,7 +313,11 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
                         defer if (typed == null) empty.deinit();
                         empty.distinct = spec.distinct;
                         if (typed) |states| {
-                            states[i] = empty;
+                            if (adjusted == null) {
+                                adjusted = try a.dupe(operators.Aggregate, states);
+                                typed = adjusted.?;
+                            }
+                            adjusted.?[i] = empty;
                         } else aggregates[i] = try @import("aggregate_partial.zig").cell(a, empty);
                     }
                 }

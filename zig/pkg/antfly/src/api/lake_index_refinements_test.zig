@@ -161,6 +161,36 @@ test "external lake overlapping text generations share every physical segment on
     try std.testing.expectEqual(@as(usize, 3), full.segments.len);
     var read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer read_cache.deinit();
+    {
+        const native = @import("lake_index_native_text.zig");
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &read_cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+        const directory_root = try native.loadRootDirectory(ca, store, declaration.artifact, .none, cached);
+        try std.testing.expectEqual(@as(usize, 0), directory_root.segments.len);
+        const first = try native.admitInventory(ca, directory_root, store, cached, .none);
+        defer first.deinit();
+        const second = try native.admitInventory(ca, directory_root, store, cached, .none);
+        defer second.deinit();
+        try std.testing.expectEqual(full.segments.len, second.root.segments.len);
+        for (first.manifests, second.manifests) |left, right| try std.testing.expect(left.?.value == right.?.value);
+        var directory_cache: @import("lake_index_native_text_cache.zig").Cache = .{};
+        defer directory_cache.deinit();
+        var cold = try directory_cache.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
+        defer cold.deinit();
+        // A resident corpus must not revisit even a missing file manifest.
+        // Root authentication remains the caller's prerequisite; this sentinel
+        // exercises the cache-hit admission path rather than serving a root.
+        var missing = directory_root.manifests[0];
+        missing.byte_len = 0;
+        var sentinel = directory_root;
+        sentinel.manifests = &.{missing};
+        var warm = try directory_cache.acquire(std.testing.io, store, declaration.artifact, sentinel, schema_json, cached, cached.context, .none);
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(u32, 3), warm.snapshot.liveDocCount());
+        try std.testing.expect(cold.snapshot.segments[0].shared == warm.snapshot.segments[0].shared);
+        var expired = cached;
+        expired.context.deadline_ns = 1;
+        try std.testing.expectError(error.DeadlineExceeded, native.admitInventory(ca, directory_root, store, expired, .none));
+    }
     var cache: @import("lake_index_native_text_cache.zig").Cache = .{};
     defer cache.deinit();
     var held: [3]?local.storage_db_query_search_exec.PinnedTextSource = @splat(null);

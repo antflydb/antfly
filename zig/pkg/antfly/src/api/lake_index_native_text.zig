@@ -159,6 +159,11 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
+/// Directory-only metadata has a distinct cache type from expanded roots.
+pub const Directory = struct { root: Root };
+pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Directory {
+    return .{ .root = try loadRootDirectory(a, store, ref, cancellation, cache) };
+}
 /// One independently admitted immutable file manifest. Share validation with
 /// serving while allowing GC to checkpoint between file jobs.
 pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
@@ -171,19 +176,106 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
     try group.validate(domain);
     return group;
 }
+/// Cold corpus admission borrows independently cached manifests. Leases end
+/// after the corpus has copied its metadata; warm corpora need only a directory.
+pub const Inventory = struct {
+    root: Root,
+    manifests: []?@import("lake_index_decoded_metadata.zig").Owned(FileGroup),
+    pub fn deinit(self: Inventory) void {
+        for (self.manifests) |manifest| if (manifest) |owned| owned.release();
+    }
+};
+fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    return loadFileManifest(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, scope.domain, cancellation, cache);
+}
+pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    const Owned = @import("lake_index_decoded_metadata.zig").Owned(FileGroup);
+    const manifests = try a.alloc(?Owned, directory.manifests.len);
+    @memset(manifests, null);
+    var inventory: Inventory = .{ .root = directory, .manifests = manifests };
+    errdefer inventory.deinit();
+    if (manifests.len == 0 or directory.file_groups.len != 0) return inventory;
+    const Work = struct {
+        directory: Root,
+        store: stores.ArtifactStore,
+        cached: artifacts.CachedRead,
+        cancellation: Cancellation,
+        manifests: []?Owned,
+        next: std.atomic.Value(usize) = .init(0),
+        bytes: std.atomic.Value(usize) = .init(0),
+        fn run(self: *@This()) anyerror!void {
+            while (true) {
+                try self.cancellation.check();
+                try self.cached.context.ensureActive();
+                const index = self.next.fetchAdd(1, .monotonic);
+                if (index >= self.manifests.len) return;
+                const manifest = self.directory.manifests[index];
+                const owned = try @import("lake_index_decoded_metadata.zig").acquire(FileGroup, self.cached, self.store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len }, self.cancellation, loadCachedFile);
+                errdefer owned.release();
+                try owned.value.validate(self.directory.domain);
+                // Bound actual decoded capacity, independently of active decode
+                // admission. No arbitrary aggregate wire-byte cutoff is needed.
+                const bytes = owned.lease.item.budget.live;
+                var retained = self.bytes.load(.monotonic);
+                while (true) {
+                    if (bytes > 64 * 1024 * 1024 -| retained) return error.NativeLakeTextCorpusTooLarge;
+                    retained = self.bytes.cmpxchgWeak(retained, retained + bytes, .monotonic, .monotonic) orelse break;
+                }
+                self.manifests[index] = owned;
+            }
+        }
+    };
+    var work: Work = .{ .directory = directory, .store = store, .cached = cached, .cancellation = cancellation, .manifests = manifests };
+    const scheduler = local.sql_parallel_scheduler;
+    var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
+    // Join before output leases or borrowed request data can be released.
+    defer if (cached.context.io) |io| for (&tasks) |*slot| if (slot.*) |*task| {
+        task.cancel(io) catch {};
+    };
+    if (cached.context.io) |io| for (tasks[0..@min(3, manifests.len - 1)]) |*slot| {
+        slot.* = scheduler.global().submitIo(io, 8 * 1024 * 1024, Work.run, .{&work});
+    };
+    try work.run();
+    if (cached.context.io) |io| for (&tasks) |*slot| if (slot.*) |*task| {
+        try task.await(io);
+        slot.* = null;
+    };
+    var count: usize = 0;
+    for (manifests) |manifest| {
+        const group = manifest.?.value;
+        if (group.segments.len > max_segments -| count) return error.InvalidNativeLakeTextCorpus;
+        count += group.segments.len;
+    }
+    const groups = try a.alloc(FileGroup, manifests.len);
+    const segments = try a.alloc(artifacts.ChunkRef, count);
+    var offset: usize = 0;
+    for (manifests, groups) |manifest, *group| {
+        group.* = manifest.?.value.*;
+        @memcpy(segments[offset..][0..group.segments.len], group.segments);
+        offset += group.segments.len;
+    }
+    inventory.root.file_groups = groups;
+    inventory.root.segments = segments;
+    try inventory.root.validate();
+    return inventory;
+}
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    var root = try loadRootDirectory(a, store, ref, cancellation, cache);
+    // Legacy/maintenance callers own the returned plain descriptors in their
+    // allocator. Bound parse allocations (including unreclaimed arena scratch)
+    // without imposing an unrelated sum of encoded artifact lengths.
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024, .monotonic = true };
+    const bounded = budget.allocator();
+    var root = try loadRootDirectory(bounded, store, ref, cancellation, cache);
     if (root.manifests.len != 0) {
         var groups: std.ArrayList(FileGroup) = .empty;
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
-        var metadata_budget: u64 = 32 * 1024 * 1024;
         for (root.manifests) |manifest| {
             try cancellation.check();
-            try stores.chargeReadBudget(&metadata_budget, manifest.byte_len);
-            const group = try loadFileManifest(a, store, manifest, root.domain, cancellation, cache);
+            const group = try loadFileManifest(bounded, store, manifest, root.domain, cancellation, cache);
             if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
-            try groups.append(a, group);
-            try segments.appendSlice(a, group.segments);
+            try groups.append(bounded, group);
+            try segments.appendSlice(bounded, group.segments);
         }
         root.file_groups = groups.items;
         root.segments = segments.items;

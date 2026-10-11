@@ -38,6 +38,30 @@ from conftest import (
 pytestmark = pytest.mark.fresh_antfly_process
 
 
+def _request_with_idle_ddl_retry(server, method, path, body, *, retry_ddl=False):
+    """Replay only an explicitly unadmitted DDL while its catalog publishes."""
+    deadline = time.monotonic() + 30
+    while True:
+        response = requests.request(
+            method,
+            server.api_url + path,
+            json=body,
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=60,
+        )
+        if response.ok or not retry_ddl or response.status_code != 503:
+            return response
+        error = response.json()
+        if (
+            error.get("code") != "53300"
+            or error.get("retryable") is not True
+            or error.get("transaction_status") != "idle"
+        ):
+            return response
+        assert time.monotonic() < deadline, response.text + server.debug_logs()
+        time.sleep(0.1)
+
+
 @pytest.mark.parametrize("dictionary", [False, True])
 @pytest.mark.parametrize("page_version", ["1.0", "2.0"])
 def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
@@ -1006,13 +1030,9 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
     failed = True
     try:
 
-        def call(method, path, body=None, lines=False):
-            response = requests.request(
-                method,
-                server.api_url + path,
-                json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                timeout=60,
+        def call(method, path, body=None, lines=False, retry_ddl=False):
+            response = _request_with_idle_ddl_retry(
+                server, method, path, body, retry_ddl=retry_ddl
             )
             assert response.ok, response.text + "\n" + server.debug_logs()
             if lines:
@@ -1042,6 +1062,7 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
                 "statement": "CREATE INDEX amount_idx ON lake_ordered (amount)"
                 + (" INCLUDE (label)" if covering else "")
             },
+            retry_ddl=True,
         )
         deadline = time.monotonic() + 60
         while True:
@@ -1838,28 +1859,9 @@ def test_native_remote_signed_timestamp_index(tmp_path, covering):
     failed = True
 
     def call(method, path, body=None, lines=False, retry_ddl=False):
-        deadline = time.monotonic() + 30
-        while True:
-            response = requests.request(
-                method,
-                server.api_url + path,
-                json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                timeout=60,
-            )
-            if response.ok or not retry_ddl or response.status_code != 503:
-                break
-            error = response.json()
-            # Main's relation-catalog fence explicitly guarantees this DDL
-            # admitted no schema change and can be replayed in its entirety.
-            if (
-                error.get("code") != "53300"
-                or error.get("retryable") is not True
-                or error.get("transaction_status") != "idle"
-            ):
-                break
-            assert time.monotonic() < deadline, response.text + server.debug_logs()
-            time.sleep(0.1)
+        response = _request_with_idle_ddl_retry(
+            server, method, path, body, retry_ddl=retry_ddl
+        )
         assert response.ok, response.text + server.debug_logs()
         return (
             [json.loads(line) for line in response.text.splitlines() if line]
@@ -3765,6 +3767,90 @@ def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tm
         assert [(h["_id"], h["_score"]) for h in ranged] == [
             (h["_id"], h["_score"]) for h in reopened
         ]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
+    """Wide reducers stream compact states instead of retaining page-sized arrays."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count, width = 8192, 128
+    data = tmp_path / "wide.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "k": pa.array([i // 2 for i in range(count)], type=pa.int64()),
+                **{
+                    f"v{j}": pa.array([i + j for i in range(count)], type=pa.int64())
+                    for j in range(width)
+                },
+            }
+        ),
+        data,
+        compression="snappy",
+        row_group_size=1000,
+    )
+    payload = data.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(path, body):
+            response = requests.post(
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call(
+            "/tables/wide_join",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "wide-join",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+            },
+        )
+        query = (
+            "SELECT "
+            + ",".join(f"SUM(l.v{j})" for j in range(width))
+            + " FROM wide_join l JOIN wide_join r ON l.k=r.k"
+        )
+        # Each source row has exactly two matches. Python integer arithmetic
+        # supplies an independent reference for every reducer and orientation.
+        expected = [[str(count * (count - 1) + 2 * count * j) for j in range(width)]]
+        assert call("/sql", {"statement": query})["rows"] == expected
+        assert (
+            call(
+                "/sql",
+                {"statement": query + " AND (l.v0 IS NOT DISTINCT FROM l.v0)"},
+            )["rows"]
+            == expected
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)
