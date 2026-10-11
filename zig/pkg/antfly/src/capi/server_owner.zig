@@ -3977,6 +3977,17 @@ pub fn storageOwnerNativeIndexControlJson(
     // Headers/bindings contain only fixed-size identities. Large schema inputs
     // remain raw borrowed bytes rather than another JSON/base64 representation.
     if (request.request_json.len == 0 or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.operation == .receipt) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerReceiptRequest, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.identity.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const state = handle.db.nativeIndexOwnerReceipt(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+        const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, state, .{}) catch |err| return storageOwnerStatusFromError(err);
+        out_response.* = .{ .ptr = response.ptr, .len = response.len };
+        return .ok;
+    }
     if (request.operation == .inspect) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|

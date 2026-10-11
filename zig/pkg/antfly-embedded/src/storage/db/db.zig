@@ -7878,6 +7878,7 @@ pub const DB = struct {
     pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
     pub const NativeIndexOwnerOutcome = native_index_control.Outcome;
     pub const NativeIndexOwnerIdentity = native_index_control.Identity;
+    pub const NativeIndexOwnerReceiptRequest = native_index_control.ReceiptRequest;
 
     pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational_index_owner_job.zig").Binding {
         try expected.validate();
@@ -7885,6 +7886,49 @@ pub const DB = struct {
         var txn = try self.core.store.beginReadTxn();
         defer txn.abort();
         return @import("relational_index_owner_job.zig").inspectNative(&txn, expected);
+    }
+
+    /// Receipt recovery never recompiles a candidate or creates another source
+    /// cut. Publication waits precede the immutable read snapshot; its outbox
+    /// check closes the flush-versus-new-commit race without an apply lock.
+    pub fn nativeIndexOwnerReceipt(self: *DB, request: NativeIndexOwnerReceiptRequest) !?NativeIndexOwnerOutcome {
+        try request.identity.validate();
+        if (!request.identity.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        // Reject foreign jobs and non-native authority before triggering any
+        // recovery. Recheck in the final snapshot after the publication wait.
+        if (try self.nativeIndexOwnerState(request.identity) == null) return null;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        var recovery_error: ?[]const u8 = null;
+        self.ensureDurableReplicationStartupBarrier() catch |err| {
+            recovery_error = @errorName(err);
+        };
+        if (recovery_error == null) self.flushDurableReplicationOutboxes() catch |err| {
+            recovery_error = @errorName(err);
+        };
+        var needs_recovery = false;
+        defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
+        try self.enforceReplicationWriteGate();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const jobs = @import("relational_index_owner_job.zig");
+        const binding = (try jobs.inspectNative(&txn, request.identity)) orelse return null;
+        const effect: jobs.NativeEffect = switch (request.effect) {
+            .fenced => .fenced,
+            .reserved => .reserved,
+        };
+        const position = (try jobs.nativeEffectPosition(&txn, binding, effect)) orelse return null;
+        var outcome: NativeIndexOwnerOutcome = .{ .binding = binding, .position = position, .duplicate = true };
+        if (recovery_error != null or try durable_outbox_store.hasPendingTxn(&txn)) {
+            outcome.replication_pending = true;
+            outcome.error_name = recovery_error orelse "ReplicationOutboxPending";
+            // The snapshot, not a possibly stale hint, establishes this debt.
+            self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+            needs_recovery = true;
+            return outcome;
+        }
+        outcome.receipt = try jobs.nativeReceipt(&txn, binding, effect);
+        return outcome;
     }
 
     pub fn prepareNativeIndexOwnerAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerControl {

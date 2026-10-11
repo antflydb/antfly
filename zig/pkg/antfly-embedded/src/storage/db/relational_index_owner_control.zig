@@ -71,6 +71,13 @@ pub const Command = struct {
     }
 };
 
+/// Recover only a previously committed publication effect. No physical binding,
+/// candidate digest or replay position is accepted from a receipt caller.
+pub const ReceiptRequest = struct {
+    identity: Identity,
+    effect: enum { fenced, reserved },
+};
+
 pub const Frame = struct {
     command: Command,
     position: Native,

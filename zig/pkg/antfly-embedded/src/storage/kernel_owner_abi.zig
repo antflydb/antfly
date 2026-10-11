@@ -1188,7 +1188,7 @@ pub const NativeFkGenerationControlRequest = extern struct {
 /// Private compiled-owner entry point. The receiving server independently
 /// authenticates the coordinator and obtains a fresh metadata owner decision.
 /// Admission supplies raw immutable inputs; physical IDs are chosen locally.
-pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, _ };
+pub const NativeIndexOwnerOperation = enum(u32) { admit = 1, fence = 2, reserve = 3, inspect = 4, receipt = 5, _ };
 pub const NativeIndexOwnerControlRequest = extern struct {
     version: u32 = abi_version,
     operation: NativeIndexOwnerOperation,

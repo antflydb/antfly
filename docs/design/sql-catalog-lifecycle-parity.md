@@ -2180,3 +2180,40 @@ owner, rejects a foreign namespace without damaging subsequent inspection,
 then closes and reopens the whole source on the same LSM root. Both focused
 tests pass with no skips, failures or leaks. Optimized qualification remains
 pending. This does not activate public publication or change SQL credits.
+
+### Committed native index receipt recovery (in qualification)
+
+Native owner receipt recovery accepts only the immutable owner identity and a
+fenced/reserved action. It reads the actual durable binding and effect cut;
+callers cannot supply a physical allocation, candidate digest, source position
+or logical digest to certify. Unlike repeating reservation, recovery does not
+compile candidates or decode schema-sized worker inputs. It validates the
+stored manifest checksum, native authority, fence, catalogs and source cuts.
+
+Replication recovery and acknowledgement waits precede the immutable read
+snapshot; receipt hashing does not hold the global apply lock. Crucially, that
+snapshot also probes all durable outbox
+forms using point-presence checks and one prefix seek, without copying their
+payloads. A successful earlier flush or clear in-memory scheduling hint alone
+cannot prove that a concurrently visible effect is acknowledged. Pending
+obligations suppress the logical receipt, repair the scheduling hint and return
+an explicit pending result;
+foreign/non-native jobs reject before initiating recovery. The private ABI,
+client and provisioned source expose typed recovery while retaining the actual
+owner lease. No new native cut or public schema publication is performed.
+
+Focused qualification covers C-ABI equality with committed effect proofs,
+cold-source absence, canceled/expired dispatch, LSM restart recovery, and a
+deliberately stale pending hint with a real retained outbox. The latter must
+return pending without a proof or another publication attempt. Combined Debug
+qualification passes all 99 steps with two C-ABI, two provisioned-source, five
+system/page and eleven candidate/private-addition tests and no skips, failures
+or leaks. Final lock-free snapshot/hint-repair qualification passes all 99 steps,
+with three C-ABI, two provisioned-source, five system/page and eleven
+candidate/private-addition tests, no skips, failures or leaks. The additional
+LSM snapshot test covers every legacy/versioned obligation, including empty
+payloads, and verifies that concurrent commit/clear cannot change an existing
+snapshot's decision. Optimized receipt-recovery qualification is pending.
+These remain unsigned logical receipts, not
+metadata authorization, root attestation or public activation. The original
+SQL inventory is unchanged.

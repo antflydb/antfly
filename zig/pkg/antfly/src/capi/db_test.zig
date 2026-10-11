@@ -1124,6 +1124,39 @@ test "storage owner native index rejects prior ABI before dereferencing request 
     try std.testing.expectEqual(@as(u64, 0), response.len);
 }
 
+test "storage owner native index receipt snapshot guards every durable outbox form" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const outboxes = local.storage_db_durable_outbox;
+    const pending = local.storage_db_durable_outbox_store;
+    var directory = try TestDirectory.init("native-index-receipt-snapshot");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+    });
+    defer db.close();
+    const versioned = try outboxes.durableReplicationOutboxKeyAlloc(a, .restore_batch, 7, 1, "pending");
+    defer a.free(versioned);
+    for ([_][]const u8{ outboxes.replication_batch_outbox_key, outboxes.replication_replay_outbox_key, outboxes.replication_schema_outbox_key, versioned }) |key| {
+        var before = try db.core.store.beginReadTxn();
+        defer before.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        // Even corrupt/empty obligations fail closed; presence must not require
+        // allocating or decoding the potentially schema-sized payload.
+        try db.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
+        try std.testing.expect(!try pending.hasPendingTxn(&before));
+        var during = try db.core.store.beginReadTxn();
+        defer during.abort();
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        try db.core.store.putBatch(&.{}, &.{key});
+        try std.testing.expect(try pending.hasPendingTxn(&during));
+        var after = try db.core.store.beginReadTxn();
+        defer after.abort();
+        try std.testing.expect(!try pending.hasPendingTxn(&after));
+    }
+}
+
 test "storage owner native index raw admission and bounded controls preserve local allocation and committed proofs" {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");
@@ -1263,6 +1296,24 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer observed.deinit();
         try std.testing.expectEqual(if (operation == .fence) local.storage_db_relational_index_owner_job.Phase.fencing else .reserved, observed.value.?.phase);
         try std.testing.expectEqual(binding.inputs_digest, observed.value.?.inputs_digest);
+        const receipt_json = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerReceiptRequest{
+            .identity = identity,
+            .effect = if (operation == .fence) .fenced else .reserved,
+        }, .{});
+        defer a.free(receipt_json);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &.{
+            .operation = .receipt,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(receipt_json),
+        }, &response));
+        const recovered_response = response;
+        defer freeRawBuffer(recovered_response.ptr, recovered_response.len);
+        var recovered = try std.json.parseFromSlice(?db_mod.DB.NativeIndexOwnerOutcome, a, recovered_response.slice(), .{});
+        defer recovered.deinit();
+        try std.testing.expect(recovered.value.?.duplicate);
+        try std.testing.expect(!recovered.value.?.replication_pending);
+        try std.testing.expectEqual(outcome.value.position, recovered.value.?.position);
+        try std.testing.expectEqual(try outcome.value.receipt.?.digest(), try recovered.value.?.receipt.?.digest());
         request.manifest = .fromSlice(candidate.inputs.bytes);
     }
     var foreign = identity;

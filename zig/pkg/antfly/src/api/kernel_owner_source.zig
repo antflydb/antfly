@@ -84,6 +84,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
     inline for (.{ cancelled, expired }) |context| {
         const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
     }
@@ -3624,6 +3625,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().nativeIndexOwnerStateJson(table_name, encoded);
         defer response.deinit();
         return std.json.parseFromSlice(?index_owner_job.Binding, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    pub fn nativeIndexOwnerReceipt(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: native_index_control.ReceiptRequest,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(?native_index_control.Outcome) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerReceiptJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     pub fn admitNativeIndexOwner(

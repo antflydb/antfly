@@ -87,6 +87,9 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var state = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
         defer state.deinit();
         try std.testing.expect(state.value == null);
+        var receipt = try owners.nativeIndexOwnerReceipt(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
+        defer receipt.deinit();
+        try std.testing.expect(receipt.value == null);
         var foreign = identity;
         foreign.namespace.range_id += 1;
         try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerState(alloc, 7501, "items", foreign, .{}));

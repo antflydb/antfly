@@ -136,6 +136,14 @@ test "relational index build pages native owner control preserves committed cuts
     }, candidate.inputs.bytes);
     defer prepared.deinit();
     const binding = prepared.command.binding;
+    const receipt_identity: db_mod.DB.NativeIndexOwnerIdentity = .{
+        .id = binding.id,
+        .plan_digest = binding.plan_digest,
+        .owner_digest = binding.owner_digest,
+        .ordinal = binding.ordinal,
+        .namespace = binding.fence.namespace,
+        .owner_group_id = binding.fence.owner_group_id,
+    };
     for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
         var control = if (effect == .admitted)
             try primary.prepareNativeIndexOwnerControl(prepared.command)
@@ -175,6 +183,21 @@ test "relational index build pages native owner control preserves committed cuts
             var pending = try outbox_store.readPending(alloc, primary.core.store);
             defer pending.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+            {
+                // A stale clear hint (or a commit racing the flush) cannot
+                // certify an effect whose outbox is present in its snapshot.
+                const maybe = primary.local_execution.durable_replication_outbox_maybe.swap(false, .acq_rel);
+                defer primary.local_execution.durable_replication_outbox_maybe.store(maybe, .release);
+                const primary_pending = primary.async_context.primary_replication_outbox_pending.swap(false, .acq_rel);
+                defer primary.async_context.primary_replication_outbox_pending.store(primary_pending, .release);
+                const proof = (try primary.nativeIndexOwnerReceipt(.{ .identity = receipt_identity, .effect = .fenced })).?;
+                try std.testing.expect(proof.replication_pending);
+                try std.testing.expect(proof.receipt == null);
+                try std.testing.expectEqualStrings("ReplicationOutboxPending", proof.error_name.?);
+                try std.testing.expectEqual(outcome.position, proof.position);
+                try std.testing.expectEqual(@as(usize, 1), publisher.attempts);
+                try std.testing.expect(primary.local_execution.durable_replication_outbox_maybe.load(.acquire));
+            }
             var txn = try primary.core.store.beginReadTxn();
             defer txn.abort();
             try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
@@ -233,6 +256,13 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expect(primary_retry.duplicate);
         try std.testing.expectEqual(outcome.position, primary_retry.position);
         try std.testing.expectEqual(effect != .admitted, primary_retry.receipt != null);
+        if (effect != .admitted) {
+            const recovered = (try primary.nativeIndexOwnerReceipt(.{ .identity = receipt_identity, .effect = if (effect == .fenced) .fenced else .reserved })).?;
+            try std.testing.expect(!recovered.replication_pending);
+            try std.testing.expect(recovered.duplicate);
+            try std.testing.expectEqual(outcome.position, recovered.position);
+            try std.testing.expectEqual(try primary_retry.receipt.?.digest(), try recovered.receipt.?.digest());
+        }
         if (effect == .reserved) {
             try std.testing.expectEqual(@as(usize, 3), publisher.attempts);
             try std.testing.expectEqual(@as(usize, 2), publisher.completed);
