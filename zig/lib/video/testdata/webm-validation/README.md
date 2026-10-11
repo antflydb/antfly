@@ -74,6 +74,7 @@ zig build --build-file zig/lib/video/build.zig install-video-tests \
 
 Execute `/tmp/video-linux/bin/video-tests` on the target Linux host. Test binaries
 are static; native builds require no codec C compilation or source downloads.
-Broader AV1 profiles/Annex B/layers, field/partition and timestamp/window model
-policies, device normalization, cross-request scheduling, isolated performance
-and DASH/HLS expansion remain work in the active plan.
+Expanded AV1 profiles, Annex B and layer selection have subsequent
+[qualification receipts](../av1-extended/README.md). Field/partition and
+timestamp/window model policies, device normalization, cross-request scheduling,
+isolated performance and DASH/HLS expansion remain work in the active plan.

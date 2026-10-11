@@ -472,8 +472,9 @@ The caller supplies clock synchronization and selects the representation upstrea
 WebM packet indexing now feeds `antfly_video.vp8.Session` for pure Zig stateful
 VP8 reconstruction, including invisible reference pictures. Packet ordering and
 visibility remain transport metadata; the decoder independently checks coded
-frame tags and updates references in coded order. WebM model ingestion remains
-unsupported; the VP9/AV1 decoder consumers are documented below.
+frame tags and updates references in coded order. WebM model ingestion uses
+logical visible-picture indexing and bounded replay; the VP9/AV1 decoder
+consumers are documented below.
 
 MP4 orthogonal display matrices and pixel aspect ratios now reach the
 EmbeddingGemma 2 presentation renderer. AVC VUI primaries are retained alongside
@@ -490,16 +491,18 @@ The WebM VP9/AV1 index now has a native consumer in
 have no reconstruction route are superseded by this implementation. Antfly
 maintains checked-in Zig source ports, with no runtime codec-library dependency.
 VP9 fixtures cover profiles 0–3 at 8/10/12-bit across 4:2:0/4:2:2/4:4:4. AV1's
-qualified public route is Main profile, 8/10-bit 4:2:0 low-overhead OBU packets,
-including film grain and reference updates.
+qualified public route includes profiles 0–2, 8/10/12-bit and
+monochrome/4:2:0/4:2:2/4:4:4, including film grain and reference updates.
+Native elementary AV1 additionally accepts explicit Annex B framing and
+operating-point selection; WebM itself continues to supply low-overhead OBUs.
 
 The consumer leases packets through the existing source interface, applies
 session/reader control checks, and handles AV1 configuration OBUs from WebM
 CodecPrivate. Decode remains sequential; seek recovery must create a new decoder
 and replay coded dependencies from a synchronization point. Output is a bounded,
 independently owned picture batch. Multiple pictures in one container packet
-retain that packet's timestamp; this does not invent a logical-picture timeline
-or add model WebM ingestion. See [VIDEO.md](../video/VIDEO.md) and the
+retain that packet's timestamp. Model ingestion assigns stable logical IDs to
+visible decoder outputs and applies its separately documented sampling policy. See [VIDEO.md](../video/VIDEO.md) and the
 [maintained port contract](../video/src/codecs/PORTING.md) for support and failure
 semantics.
 

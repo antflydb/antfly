@@ -23,6 +23,7 @@ const vp9 = @import("vp9/vpx_decoder.zig");
 const vp9_iface = @import("vp9/vp9_dx_iface.zig");
 const header = @import("vp9_header.zig");
 const frame = @import("frame.zig");
+const annex_b = @import("annex_b.zig");
 comptime {
     _ = @import("av1/root.zig");
     _ = @import("vp9/root.zig");
@@ -30,7 +31,12 @@ comptime {
 pub const Frame = frame.Frame;
 pub const Batch = frame.Batch;
 pub const Codec = enum { vp9, av1 };
+pub const Av1Framing = enum { low_overhead, annex_b };
 pub const Options = struct {
+    av1_framing: Av1Framing = .low_overhead,
+    av1_operating_point: u5 = 0,
+    av1_all_layers: bool = true,
+    max_annex_b_frame_units: usize = 256,
     max_packet_bytes: usize = 16 * 1024 * 1024,
     max_pixels: usize = 16 * 1024 * 1024,
     max_decode_bytes: usize = 256 * 1024 * 1024,
@@ -71,6 +77,8 @@ pub const Session = struct {
             .av1 => block: {
                 var settings: av1.Dav1dSettings = undefined;
                 av1.antfly_av1_dav1d_default_settings(&settings);
+                settings.operating_point = options.av1_operating_point;
+                settings.all_layers = @intFromBool(options.av1_all_layers);
                 settings.n_threads = 1;
                 settings.max_frame_delay = 1;
                 settings.strict_std_compliance = 1;
@@ -105,6 +113,8 @@ pub const Session = struct {
         if (packet.len > self.options.max_packet_bytes or packet.len > std.math.maxInt(c_uint)) return error.ResourceLimitExceeded;
         var parts: header.Parts = .{};
         var references = self.references;
+        var normalized: ?annex_b.Units = null;
+        defer if (normalized) |*units| units.deinit();
         if (self.codec == .vp9) {
             parts = try header.split(packet);
             for (parts.packets[0..parts.len]) |part| try header.preflight(part, &references, self.options.max_pixels);
@@ -112,6 +122,16 @@ pub const Session = struct {
             parts.packets[0] = packet;
             parts.len = 1;
         }
+        if (self.codec == .av1 and self.options.av1_framing == .annex_b) {
+            normalized = annex_b.normalize(self.owner.budget.allocator(), packet, self.options.max_packet_bytes, self.options.max_annex_b_frame_units, self.options.control) catch |err| {
+                if (self.owner.budget.denied) {
+                    self.owner.budget.denied = false;
+                    return error.ResourceLimitExceeded;
+                }
+                return err;
+            };
+        }
+        const coded_parts = if (normalized) |units| units.packets else parts.packets[0..parts.len];
         var frames: std.array_list.Managed(Frame) = .init(self.allocator);
         errdefer {
             for (frames.items) |*item| item.deinit();
@@ -120,8 +140,13 @@ pub const Session = struct {
         var output_bytes: usize = 0;
         const scope = runtime.Scope.enter(&self.owner);
         defer scope.deinit();
-        errdefer self.invalidate();
-        for (parts.packets[0..parts.len]) |part| switch (self.codec) {
+        errdefer {
+            // Drop normalization storage before releasing shared core admission.
+            if (normalized) |*units| units.deinit();
+            normalized = null;
+            self.invalidate();
+        }
+        for (coded_parts) |part| switch (self.codec) {
             .av1 => {
                 var input: av1.Dav1dData = .{};
                 const buffer = av1.antfly_av1_dav1d_data_create(&input, part.len);
@@ -144,11 +169,13 @@ pub const Session = struct {
                     if (status != 0) return error.InvalidVideoData;
                     defer av1.antfly_av1_dav1d_picture_unref(&picture);
                     if (picture.p.w <= 0 or picture.p.h <= 0 or picture.stride[0] < 0 or picture.stride[1] < 0) return error.InvalidVideoData;
-                    // Initial AV1 qualification covers Main profile, 8/10-bit
-                    // 4:2:0. Do not advertise other profiles from core breadth.
-                    if (picture.seq_hdr.*.profile != 0 or picture.p.layout != 1 or (picture.p.bpc != 8 and picture.p.bpc != 10)) return error.UnsupportedVideoProfile;
+                    if (picture.seq_hdr.*.profile > 2 or picture.p.layout < 0 or picture.p.layout > 3 or (picture.p.bpc != 8 and picture.p.bpc != 10 and picture.p.bpc != 12)) return error.UnsupportedVideoProfile;
+                    const y = picture.data[0] orelse return error.InvalidVideoData;
+                    const u = if (picture.p.layout == 0) y else picture.data[1] orelse return error.InvalidVideoData;
+                    const v = if (picture.p.layout == 0) y else picture.data[2] orelse return error.InvalidVideoData;
                     const seq = picture.seq_hdr.*;
-                    var copy = try frame.copy(self.allocator, self.options.admission_pool, @intCast(picture.p.w), @intCast(picture.p.h), @intCast(picture.p.bpc), @intCast(picture.p.layout), .{ .full_range = seq.color_range != 0, .primaries = @intCast(seq.pri), .transfer = @intCast(seq.trc), .matrix = @intCast(seq.mtrx) }, .{ @ptrCast(picture.data[0].?), @ptrCast(picture.data[1].?), @ptrCast(picture.data[2].?) }, .{ @intCast(picture.stride[0]), @intCast(picture.stride[1]), @intCast(picture.stride[1]) }, self.options.max_output_bytes - output_bytes);
+                    if (self.options.av1_operating_point >= seq.num_operating_points) return error.InvalidDecodeOptions;
+                    var copy = try frame.copy(self.allocator, self.options.admission_pool, @intCast(picture.p.w), @intCast(picture.p.h), @intCast(picture.p.bpc), @intCast(picture.p.layout), .{ .full_range = seq.color_range != 0, .primaries = @intCast(seq.pri), .transfer = @intCast(seq.trc), .matrix = @intCast(seq.mtrx) }, .{ @ptrCast(y), @ptrCast(u), @ptrCast(v) }, .{ @intCast(picture.stride[0]), @intCast(picture.stride[1]), @intCast(picture.stride[1]) }, self.options.max_output_bytes - output_bytes);
                     errdefer copy.deinit();
                     try self.append(&frames, &copy, &output_bytes, pts_ns, duration_ns);
                 }
@@ -192,6 +219,7 @@ pub const Session = struct {
     }
     pub fn decodeWebmPacket(self: *Session, reader: *media.webm.Reader, index: usize) !Batch {
         try reader.input.control.check();
+        if (self.codec == .av1 and self.options.av1_framing != .low_overhead) return error.InvalidDecodeOptions;
         if (index >= reader.packets.len) return error.InvalidPacketIndex;
         if ((self.codec == .av1 and reader.track.codec != .av1) or (self.codec == .vp9 and reader.track.codec != .vp9)) return error.UnsupportedVideoCodec;
         const packet = reader.packets[index];

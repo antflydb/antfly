@@ -1007,7 +1007,8 @@ optimization, not a decoding dependency.
 174 displayed pictures and three hidden alt-reference pictures, multiple token
 partitions, keyframe resets, versions 0–3, and a real Sintel excerpt. These are
 qualification examples, not exhaustive codec conformance. Runtime reconstruction
-links no codec libraries. Model WebM ingestion remains unimplemented. The
+links no codec libraries. WebM model ingestion is implemented with pretrained
+CPU/Metal/Linux ARM64 reference-preservation receipts below. The
 maintained VP9/AV1 routes below expose their qualified capabilities explicitly.
 
 The EmbeddingGemma 2 model now honors orthogonal rotation and SAR metadata.
@@ -1049,11 +1050,27 @@ Ownership, pinned origins and port-specific changes are recorded in
 [src/codecs/PORTING.md](src/codecs/PORTING.md).
 
 The qualified VP9 fixtures cover profiles 0–3, 8/10/12-bit 4:2:0, 4:2:2 and
-4:4:4, interframes, superframes and odd geometry. The AV1 public route is Main
-profile at 8/10-bit 4:2:0, including interframes, hidden/show-existing updates,
-film grain and odd geometry, using low-overhead OBU packets. Other AV1 profiles,
-12-bit/monochrome/chroma formats, Annex B and scalable-layer policy remain
-unqualified. Capabilities expose both routes and their qualified subsets.
+4:4:4, interframes, superframes and odd geometry. AV1 now accepts profiles 0–2,
+8/10/12-bit monochrome/4:2:0/4:2:2/4:4:4, including interframes,
+hidden/show-existing updates and film grain. Independently decoded fixtures
+qualify the additional formats, odd dimensions, Annex B and spatial/temporal
+operating points; this is bounded coverage, not complete codec conformance.
+See [the expanded AV1 receipts](testdata/av1-extended/README.md).
+
+`Options.av1_framing` selects low-overhead OBU packets (default) or Annex B.
+Annex B validates nested temporal/frame/OBU sizes, redundant payload sizes,
+headers, delimiter placement and frame-unit structure before core entry. It
+normalizes complete temporal units within the shared decode allocation budget;
+`max_annex_b_frame_units` also bounds framing work. Framing failures remain
+retryable. WebM requires low-overhead framing and rejects Annex B options.
+
+`av1_operating_point` explicitly selects an index (default 0); unavailable
+indices fail instead of silently falling back. `av1_all_layers` defaults to true,
+retaining every visible spatial-layer output. False selects the highest spatial
+layer within the chosen operating point. Supply complete temporal units for
+that policy: separately drained spatial-frame packets do not establish a complete
+temporal unit. Output timestamps remain caller-owned; selecting a temporal
+operating point drops excluded layers without inventing timestamps.
 
 Create one Session per sequential coded stream. `decode` returns an owned Batch
 containing every visible picture; hidden updates retain references without

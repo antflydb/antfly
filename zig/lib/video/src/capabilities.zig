@@ -30,4 +30,4 @@ pub const nvdec_decode = false;
 pub const cuda_preparation = false;
 
 pub const portable_vp9_subset = "qualified-profiles-0to3-8to12bit-420-422-444-interframes-superframes";
-pub const portable_av1_subset = "qualified-main-profile-8to10bit-420-low-overhead-obus-interframes-film-grain";
+pub const portable_av1_subset = "qualified-profiles0to2-8to12bit-mono-420-422-444-low-overhead-annexb-operating-points-interframes-film-grain";

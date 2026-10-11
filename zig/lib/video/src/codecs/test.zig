@@ -14,9 +14,12 @@
 // limitations under the License.
 
 const std = @import("std");
+test {
+    _ = @import("annex_b.zig");
+}
 const decoder = @import("decoder.zig");
 const media = @import("antfly_media");
-const Golden = struct { name: []const u8, codec: decoder.Codec, width: u32, height: u32, depth: u8, chroma: u8, packet_sha256: []const u8, frame_sha256: [][]const u8 };
+const Golden = struct { framing: decoder.Av1Framing = .low_overhead, name: []const u8, codec: decoder.Codec, width: u32, height: u32, depth: u8, chroma: u8, packet_sha256: []const u8, frame_sha256: [][]const u8 };
 const fixtures = .{ "av1", "av1-10", "av1-grain", "av1-odd", "vp9", "vp9-yuv420p", "vp9-yuv420p10le", "vp9-yuv420p12le", "vp9-yuv422p", "vp9-yuv422p12le", "vp9-yuv444p", "vp9-yuv444p10le" };
 fn first(comptime name: []const u8) []const u8 {
     const b = @embedFile("../../testdata/vpx-av1/" ++ name ++ ".ivf");
@@ -330,4 +333,230 @@ test "VP9 AV1 real Sintel WebM pictures match independent reference hashes" {
         }
         try std.testing.expectEqual(golden.frame_sha256.len, displayed);
     }
+}
+
+fn leb(out: *std.array_list.Managed(u8), size: usize) !void {
+    var value = size;
+    while (true) {
+        const byte: u8 = @intCast(value & 127);
+        value >>= 7;
+        try out.append(byte | @as(u8, if (value == 0) 0 else 128));
+        if (value == 0) break;
+    }
+}
+fn annexPacket(a: std.mem.Allocator, packet: []const u8) ![]u8 {
+    var obu: std.array_list.Managed(u8) = .init(a);
+    defer obu.deinit();
+    var frame_unit: std.array_list.Managed(u8) = .init(a);
+    defer frame_unit.deinit();
+    var has_frame_header = false;
+    var at: usize = 0;
+    while (at < packet.len) {
+        const start = at;
+        const kind = (packet[start] >> 3) & 15;
+        if (kind == 3 or kind == 6) {
+            if (has_frame_header) {
+                try leb(&frame_unit, obu.items.len);
+                try frame_unit.appendSlice(obu.items);
+                obu.clearRetainingCapacity();
+            }
+            has_frame_header = true;
+        }
+        at += 1 + @as(usize, if (packet[start] & 4 != 0) 1 else 0);
+        var size: usize = 0;
+        var shift: u6 = 0;
+        while (true) {
+            const byte = packet[at];
+            at += 1;
+            size |= @as(usize, byte & 127) << shift;
+            if (byte & 128 == 0) break;
+            shift += 7;
+        }
+        const header_length: usize = if (packet[start] & 4 != 0) 2 else 1;
+        try leb(&obu, header_length + size);
+        try obu.append(packet[start] & ~@as(u8, 2));
+        if (header_length == 2) try obu.append(packet[start + 1]);
+        try obu.appendSlice(packet[at..][0..size]);
+        at += size;
+    }
+    try leb(&frame_unit, obu.items.len);
+    try frame_unit.appendSlice(obu.items);
+    var temporal: std.array_list.Managed(u8) = .init(a);
+    defer temporal.deinit();
+    try leb(&temporal, frame_unit.items.len);
+    try temporal.appendSlice(frame_unit.items);
+    return temporal.toOwnedSlice();
+}
+test "AV1 Annex B session matches low-overhead and preflight errors are retryable" {
+    const a = std.testing.allocator;
+    const reference = try decoder.Session.create(a, .av1, .{});
+    defer reference.destroy();
+    const session = try decoder.Session.create(a, .av1, .{ .av1_framing = .annex_b });
+    defer session.destroy();
+    const live = session.owner.budget.live;
+    try std.testing.expectError(error.InvalidVideoData, session.decode(&.{ 3, 2, 1, 0x08 }, 0, null));
+    try std.testing.expect(!session.failed);
+    try std.testing.expectEqual(live, session.owner.budget.live);
+    const coded = @embedFile("../../testdata/vpx-av1/av1.ivf");
+    var at: usize = 32;
+    var count: usize = 0;
+    while (at < coded.len) {
+        const size = std.mem.readInt(u32, coded[at..][0..4], .little);
+        at += 12;
+        const packet = coded[at..][0..size];
+        at += size;
+        const framed = try annexPacket(a, packet);
+        defer a.free(framed);
+        var expected = try reference.decode(packet, 11, 17);
+        defer expected.deinit();
+        var actual = try session.decode(framed, 11, 17);
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.frames.len, actual.frames.len);
+        for (expected.frames, actual.frames) |left, right| {
+            try std.testing.expectEqualSlices(u8, &hashFrame(left), &hashFrame(right));
+            try std.testing.expectEqual(@as(i64, 11), right.pts_ns);
+            try std.testing.expectEqual(@as(?u64, 17), right.duration_ns);
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), count);
+}
+
+test "AV1 profiles native-depth monochrome and chroma match AOM reference hashes" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice([]Golden, a, @embedFile("../../testdata/av1-extended/golden.json"), .{});
+    defer parsed.deinit();
+    inline for (.{ "av1-c0-8", "av1-c0-12", "av1-c1-12", "av1-c2-8", "av1-c2-10", "av1-c2-12", "av1-c3-8", "av1-c3-10", "av1-c3-12", "av1-annex-b" }) |name| {
+        const coded = @embedFile("../../testdata/av1-extended/" ++ name ++ ".ivf");
+        var golden: ?Golden = null;
+        for (parsed.value) |g| {
+            if (std.mem.eql(u8, g.name, name)) golden = g;
+        }
+        const g = golden.?;
+        var coded_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(coded, &coded_hash, .{});
+        var expected: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected, g.packet_sha256);
+        try std.testing.expectEqualSlices(u8, &expected, &coded_hash);
+        const session = try decoder.Session.create(a, .av1, .{ .av1_framing = g.framing });
+        defer session.destroy();
+        var at: usize = 32;
+        var displayed: usize = 0;
+        while (at < coded.len) {
+            const size = std.mem.readInt(u32, coded[at..][0..4], .little);
+            at += 12;
+            var batch = try session.decode(coded[at..][0..size], @intCast(displayed), null);
+            defer batch.deinit();
+            at += size;
+            for (batch.frames) |item| {
+                try std.testing.expect(displayed < g.frame_sha256.len);
+                try std.testing.expectEqual(g.width, item.width);
+                try std.testing.expectEqual(g.height, item.height);
+                try std.testing.expectEqual(g.depth, item.bit_depth);
+                try std.testing.expectEqual(g.chroma, item.chroma_format);
+                try item.host().validate();
+                _ = try std.fmt.hexToBytes(&expected, g.frame_sha256[displayed]);
+                try std.testing.expectEqualSlices(u8, &expected, &hashFrame(item));
+                displayed += 1;
+            }
+        }
+        try std.testing.expectEqual(g.frame_sha256.len, displayed);
+    }
+}
+
+const LayerGolden = struct {
+    packet_sha256: []const u8,
+    cases: []struct {
+        operating_point: u5,
+        all_layers: bool,
+        frames: []struct { width: u32, height: u32, sha256: []const u8 },
+    },
+};
+test "AV1 spatial temporal operating points match independent AOM outputs" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(LayerGolden, a, @embedFile("../../testdata/av1-extended/layers.json"), .{});
+    defer parsed.deinit();
+    const coded = @embedFile("../../testdata/av1-extended/av1-svc.ivf");
+    var actual_hash: [32]u8 = undefined;
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(coded, &actual_hash, .{});
+    _ = try std.fmt.hexToBytes(&expected, parsed.value.packet_sha256);
+    try std.testing.expectEqualSlices(u8, &expected, &actual_hash);
+    for (parsed.value.cases) |g| {
+        inline for (.{ decoder.Av1Framing.low_overhead, decoder.Av1Framing.annex_b }) |framing| {
+            const session = try decoder.Session.create(a, .av1, .{ .av1_framing = framing, .av1_operating_point = g.operating_point, .av1_all_layers = g.all_layers });
+            defer session.destroy();
+            var at: usize = 32;
+            var displayed: usize = 0;
+            while (at < coded.len) {
+                const size = std.mem.readInt(u32, coded[at..][0..4], .little);
+                at += 12;
+                const packet = coded[at..][0..size];
+                const framed: ?[]u8 = if (framing == .annex_b) try annexPacket(a, packet) else null;
+                defer if (framed) |bytes| a.free(bytes);
+                var batch = try session.decode(framed orelse packet, @intCast(displayed), null);
+                defer batch.deinit();
+                at += size;
+                for (batch.frames) |item| {
+                    try std.testing.expect(displayed < g.frames.len);
+                    try std.testing.expectEqual(g.frames[displayed].width, item.width);
+                    try std.testing.expectEqual(g.frames[displayed].height, item.height);
+                    _ = try std.fmt.hexToBytes(&expected, g.frames[displayed].sha256);
+                    try std.testing.expectEqualSlices(u8, &expected, &hashFrame(item));
+                    displayed += 1;
+                }
+            }
+            try std.testing.expectEqual(g.frames.len, displayed);
+        }
+    }
+}
+
+test "AV1 Annex B normalization uses shared decode budget and survives denial" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    const session = try decoder.Session.create(a, .av1, .{ .av1_framing = .annex_b, .max_decode_bytes = 16 * 1024 * 1024, .admission_pool = &pool });
+    defer session.destroy();
+    const live = session.owner.budget.live;
+    const limit = session.owner.budget.limit;
+    session.owner.budget.limit = live + 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.decode(&.{ 3, 2, 1, 0x10 }, 0, null));
+    try std.testing.expect(!session.failed);
+    try std.testing.expectEqual(live, session.owner.budget.live);
+    session.owner.budget.limit = limit;
+    const packet = try annexPacket(a, first("av1"));
+    defer a.free(packet);
+    var batch = try session.decode(packet, 0, null);
+    defer batch.deinit();
+    try std.testing.expectEqual(@as(usize, 1), batch.frames.len);
+}
+test "AV1 explicit unavailable operating point fails without silent fallback" {
+    const session = try decoder.Session.create(std.testing.allocator, .av1, .{ .av1_operating_point = 31 });
+    defer session.destroy();
+    try std.testing.expectError(error.InvalidDecodeOptions, session.decode(first("av1"), 0, null));
+    try std.testing.expect(session.failed);
+    try std.testing.expectEqual(@as(usize, 0), session.owner.budget.live);
+}
+
+test "AV1 Annex B cancellation and post-entry denial release normalization" {
+    const a = std.testing.allocator;
+    const packet = try annexPacket(a, first("av1"));
+    defer a.free(packet);
+    var cancellation = Cancellation{};
+    const session = try decoder.Session.create(a, .av1, .{ .av1_framing = .annex_b, .control = .{ .context = &cancellation, .check_fn = Cancellation.check } });
+    defer session.destroy();
+    const live = session.owner.budget.live;
+    cancellation.limit = cancellation.calls + 3;
+    try std.testing.expectError(error.Cancelled, session.decode(packet, 0, null));
+    try std.testing.expect(!session.failed);
+    try std.testing.expectEqual(live, session.owner.budget.live);
+    cancellation.limit = std.math.maxInt(usize);
+    var batch = try session.decode(packet, 0, null);
+    defer batch.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    const denied = try decoder.Session.create(a, .av1, .{ .av1_framing = .annex_b, .max_decode_bytes = 16 * 1024 * 1024, .max_output_bytes = 1, .admission_pool = &pool });
+    defer denied.destroy();
+    try std.testing.expectError(error.ResourceLimitExceeded, denied.decode(packet, 0, null));
+    try std.testing.expect(denied.failed);
+    try std.testing.expectEqual(@as(usize, 0), denied.owner.budget.live);
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
 }

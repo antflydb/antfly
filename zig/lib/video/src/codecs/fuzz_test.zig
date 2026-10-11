@@ -24,10 +24,11 @@ const Guard = struct {
         if (self.calls > 10000) return error.DeadlineExceeded;
     }
 };
-fn run(codec: decoder.Codec, bytes: []const u8) !void {
+fn runFramed(codec: decoder.Codec, bytes: []const u8, framing: decoder.Av1Framing) !void {
     if (bytes.len == 0 or bytes.len > 128 * 1024) return;
     var guard = Guard{};
     const session = decoder.Session.create(std.testing.allocator, codec, .{
+        .av1_framing = framing,
         .max_pixels = 512 * 512,
         .max_packet_bytes = 128 * 1024,
         .max_decode_bytes = 32 * 1024 * 1024,
@@ -38,6 +39,9 @@ fn run(codec: decoder.Codec, bytes: []const u8) !void {
     var batch = session.decode(bytes, 0, null) catch return;
     defer batch.deinit();
     for (batch.frames) |frame| try frame.host().validate();
+}
+fn run(codec: decoder.Codec, bytes: []const u8) !void {
+    try runFramed(codec, bytes, .low_overhead);
 }
 fn seed(comptime name: []const u8) []const u8 {
     return comptime blk: {
@@ -69,5 +73,28 @@ test "video fuzz AV1 reconstruction and native allocation cleanup" {
             try run(.av1, bytes[0..length]);
         }
     };
-    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ seed("av1"), seed("av1-10"), seed("av1-grain"), seed("av1-odd") } });
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ seed("av1"), seed("av1-10"), seed("av1-grain"), seed("av1-odd"), extendedSeed("av1-c0-12"), extendedSeed("av1-c2-12"), extendedSeed("av1-c3-12"), extendedSeed("av1-svc") } });
+}
+
+fn extendedSeed(comptime name: []const u8) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        const ivf = @embedFile("../../testdata/av1-extended/" ++ name ++ ".ivf");
+        const size = std.mem.readInt(u32, ivf[32..36], .little);
+        var encoded: [4 + size]u8 = undefined;
+        std.mem.writeInt(u32, encoded[0..4], size, .little);
+        @memcpy(encoded[4..], ivf[44..][0..size]);
+        const frozen = encoded;
+        break :blk &frozen;
+    };
+}
+test "video fuzz AV1 Annex B framing reconstruction and cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var bytes: [128 * 1024]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0xA17FAB01);
+            try runFramed(.av1, bytes[0..length], .annex_b);
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{extendedSeed("av1-annex-b")} });
 }

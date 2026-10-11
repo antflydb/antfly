@@ -108,7 +108,9 @@ pub export fn antfly_codec_afz_posix_memalign(out: *?*anyopaque, alignment: usiz
     return if (out.* == null) 12 else 0;
 }
 pub export fn antfly_codec_afz_memcpy(out: ?*anyopaque, source: ?*const anyopaque, n: usize) ?*anyopaque {
-    if (n != 0) @memcpy(@as([*]u8, @ptrCast(out.?))[0..n], @as([*]const u8, @ptrCast(source.?))[0..n]);
+    // Scalar reference code sometimes copies a restoration record to itself.
+    // Treat identical ranges as a no-op; partial overlap remains invalid.
+    if (n != 0 and out != source) @memcpy(@as([*]u8, @ptrCast(out.?))[0..n], @as([*]const u8, @ptrCast(source.?))[0..n]);
     return out;
 }
 pub export fn antfly_codec_afz_memmove(out: ?*anyopaque, source: ?*const anyopaque, n: usize) ?*anyopaque {

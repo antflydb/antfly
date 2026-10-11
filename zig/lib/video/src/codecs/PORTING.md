@@ -65,3 +65,10 @@ in Debug and ReleaseSafe, compare additional streams with a pinned reference,
 and compile/link both Linux architectures without libc or codec libraries.
 Broader corpus/fuzz qualification and throughput tuning remain work; generated
 fixtures do not establish complete codec conformance.
+
+Expanded AV1 qualification exercises profiles 0–2, additional native bit depths,
+monochrome and chroma layouts, Annex B framing and operating points. The runtime
+copy shim treats identical source/destination ranges as a no-op: the scalar
+restoration path can copy a retained parameter record to itself. Partial overlap
+still fails Zig's checked `@memcpy` contract. See the independent AOM fixtures and
+execution receipts in `../../testdata/av1-extended`.
