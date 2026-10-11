@@ -3317,10 +3317,7 @@ pub const DB = struct {
         return true;
     }
 
-    pub const NativeIndexCleanupMaintenanceOutcome = struct {
-        advanced: bool,
-        artifacts_retired: bool,
-    };
+    pub const NativeIndexCleanupMaintenanceOutcome = native_index_control.CleanupMaintenanceOutcome;
 
     /// Derived private-generation cleanup may run on a standby without opening
     /// ordinary write admission. Exact durable cancellation, allocation burns
@@ -3349,11 +3346,15 @@ pub const DB = struct {
         if (page) |*value| {
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
+            try manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(binding.index));
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             _ = try jobs.requireCancellationCleanup(&txn, binding);
-            try @import("relational_integrity_topology.zig").requireDrained(&txn, &manager, binding.fence);
-            try value.stage(self.core, &manager, &txn);
+            // Admission proved drain before persisting its cut. The exact
+            // still-active source fence prevents new topology-sensitive work;
+            // rechecking the durable proof above avoids a transaction scan on
+            // every bounded page while retaining the same committing guard.
+            try value.stage(self.core, &txn);
             const retired = value.next == null;
             if (retired) try jobs.requireCancellationArtifactsRetired(&txn, binding);
             try txn.commit();

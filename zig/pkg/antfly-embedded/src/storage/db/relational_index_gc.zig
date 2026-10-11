@@ -205,20 +205,21 @@ pub const Page = struct {
     pub fn commit(self: *Page, core: anytype) !void {
         var manager = try core.initTxnManager();
         defer manager.deinit();
+        try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.id));
         var txn = try core.store.beginWriteTxn();
         errdefer txn.abort();
-        try self.stage(core, &manager, &txn);
+        try self.stage(core, &txn);
         try txn.commit();
     }
 
     /// Compose deletion with the caller's authority checks in one transaction.
-    /// The caller must abort the transaction on every staging error.
-    pub fn stage(self: *Page, core: anytype, manager: anytype, txn: anytype) !void {
+    /// Caller owns apply-exclusive, checks maintenance intent conflicts before
+    /// opening the writer, and aborts the transaction on every staging error.
+    pub fn stage(self: *Page, core: anytype, txn: anytype) !void {
         if (self.consumed) return error.RelationalIndexPageConsumed;
         self.consumed = true;
         if (core.schemaNamespaceGeneration() != self.namespace or !core.relational_indexes.isCurrent(self.pinned))
             return error.PreparedGenerationChanged;
-        try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.id));
         if (!std.mem.eql(u8, &self.owner, &(try jobs.ownership(txn)))) return error.PreparedGenerationChanged;
         const record_key = key(self.id);
         const actual = txn.get(&record_key) catch |err| switch (err) {

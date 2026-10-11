@@ -4004,6 +4004,18 @@ pub fn storageOwnerNativeIndexControlJson(
         out_response.* = .{ .ptr = response.ptr, .len = response.len };
         return .ok;
     }
+    if (request.operation == .cancel_gc_page) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+        defer response.deinit();
+        const outcome = handle.db.collectCanceledNativeIndexGarbageStep(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        return response.finish(outcome, out_response);
+    }
     if (request.operation == .cancel_cleanup) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
@@ -4053,12 +4065,36 @@ pub fn storageOwnerNativeIndexControlJson(
     return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
 }
 
+/// All bounded native-index mutation responses reserve ownership before commit.
+/// Serialization and transfer do not allocate after the durable mutation.
+const NativeIndexResponse = struct {
+    buffer: ?[]u8,
+
+    fn init() !NativeIndexResponse {
+        return .{ .buffer = try std.heap.c_allocator.alloc(u8, 32 * 1024) };
+    }
+
+    fn deinit(self: *NativeIndexResponse) void {
+        if (self.buffer) |buffer| std.heap.c_allocator.free(buffer);
+        self.* = undefined;
+    }
+
+    fn finish(self: *NativeIndexResponse, outcome: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
+        const buffer = self.buffer.?;
+        var writer: std.Io.Writer = .fixed(buffer);
+        std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
+        // The C allocator guarantees in-place shrink, unlike general allocators.
+        const resized = std.heap.c_allocator.resize(buffer, writer.end);
+        std.debug.assert(resized);
+        out_response.* = .{ .ptr = buffer.ptr, .len = writer.end };
+        self.buffer = null;
+        return .ok;
+    }
+};
+
 fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
-    // Reserve response storage before committing. The bounded fixed-identity
-    // outcome does not require an allocator call during serialization.
-    const buffer = std.heap.c_allocator.alloc(u8, 32 * 1024) catch |err| return storageOwnerStatusFromError(err);
-    var owned = true;
-    defer if (owned) std.heap.c_allocator.free(buffer);
+    var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+    defer response.deinit();
     const outcome = (if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCleanup)
         handle.db.applyPreparedNativeIndexOwnerCleanup(prepared, null)
     else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellation)
@@ -4066,14 +4102,7 @@ fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_resp
     else
         handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
         return storageOwnerStatusFromError(err);
-    var writer: std.Io.Writer = .fixed(buffer);
-    std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
-    // The C allocator guarantees in-place shrink, unlike general allocators.
-    const resized = std.heap.c_allocator.resize(buffer, writer.end);
-    std.debug.assert(resized);
-    out_response.* = .{ .ptr = buffer.ptr, .len = writer.end };
-    owned = false;
-    return .ok;
+    return response.finish(outcome, out_response);
 }
 
 pub fn storageOwnerNativeFkGenerationControlJson(

@@ -473,7 +473,9 @@ test "relational index build pages native owner control preserves committed cuts
     } };
     defer follower.local_execution.replication_write_gate = null;
     const gc = @import("relational_index_gc.zig");
-    const unrelated: records.Id = .{ .generation = binding.index.generation + 1, .slot = binding.index.slot };
+    try std.testing.expect(binding.index.generation > 1);
+    const unrelated: records.Id = .{ .generation = binding.index.generation - 1, .slot = binding.index.slot };
+    try std.testing.expect(std.mem.order(u8, &gc.key(unrelated), &gc.key(binding.index)) == .lt);
     try follower.core.store.putBatch(&.{.{ .key = &gc.key(unrelated), .value = &gc.initial(unrelated) }}, &.{});
     try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
     const first_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);

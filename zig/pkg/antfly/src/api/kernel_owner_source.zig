@@ -90,6 +90,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
+        try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, source.nativeIndexOwnerState(std.testing.allocator, 8, "rows", identity, .{}));
     try std.testing.expectError(error.InvalidPrivateIndexInputs, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "", .{}));
@@ -3695,6 +3696,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().nativeIndexOwnerCleanupJson(table_name, encoded);
         defer response.deinit();
         return std.json.parseFromSlice(native_index_control.CleanupOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    /// One bounded derived-artifact page at the exact leased physical owner.
+    /// A committed page is not converted into a request-cancellation failure.
+    pub fn collectNativeIndexOwnerGarbage(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CleanupMaintenanceOutcome) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerGcJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(native_index_control.CleanupMaintenanceOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     /// Persist intent at the leased physical owner; this is not a canceled ACK.
