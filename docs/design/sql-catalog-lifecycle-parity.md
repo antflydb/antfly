@@ -2367,6 +2367,11 @@ owner, fifty namespace/restore and twenty publication/decoder tests). The
 authority change itself still requires optimized qualification; the baseline
 does not establish that result.
 
+The data-server integration Debug gate also completes 91/91 build steps and
+both selected `runRound` regressions without skips, failures or leaks. This
+compiles the reporting integration rather than relying only on metadata codec
+and storage adapter component roots.
+
 ### Physical-root-bound native receipt recovery (in qualification)
 
 Receipt recovery now returns the generation of the exact owner lease that
@@ -2395,3 +2400,12 @@ checks. Native standalone ownership must not borrow a synthetic replica ID or
 Raft position, nor perform a full replica-catalog scan for each receipt. That
 integration, authenticated delivery, cancellation, later lifecycle phases and
 the public failed-build atomicity gate remain required before activation.
+
+The shared Antfly replica catalog in `raft/storage/catalog.zig` already exposes
+revisioned `readReplica` point reads backed by the resident record map. Native
+provisioning and attestation should share that borrowed catalog instance and
+its durable placement admission, just as the Raft host does. Reopening
+`FileReplicaCatalog` from its path per receipt would reload the whole file and
+defeat the point-read boundary. The engine-level generic Raft catalog is not
+the relevant serving-owner interface. Missing native placement remains unknown
+authority, never permission to invent a replica ID from a group or node number.
