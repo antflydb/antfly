@@ -63,6 +63,8 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_media": ("zig/lib/media/src/mod.zig",),
+    "antfly_video": ("zig/lib/video/src/mod.zig",),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "onnx_c": ("zig/pkg/inference/src/backends/onnx_c.h",),
