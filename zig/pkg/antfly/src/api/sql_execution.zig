@@ -25,6 +25,22 @@ const wire = @import("antfly_metadata_openapi").types;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 
+/// Normalize only snapshot admission failures, before the adapter publishes
+/// rows or prepares writes. Never apply this to an unknown mutation outcome.
+fn statementReadAdmissionError(err: anyerror) anyerror {
+    return switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
+        error.ReadUnavailable, error.DistributedQueryUnavailable => error.SqlStatementReadUnavailable,
+        else => |unchanged| unchanged,
+    };
+}
+
+test "SQL statement read admission distinguishes availability from corruption and unknown outcomes" {
+    for ([_]anyerror{ error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.TopologyChanged, error.ReadIndexTimeout, error.ReadUnavailable, error.ConnectionRefused, error.StorageReadTemporarilyUnavailable }) |err|
+        try std.testing.expectEqual(error.SqlStatementReadUnavailable, statementReadAdmissionError(err));
+    for ([_]anyerror{ error.DeadlineExceeded, error.Cancelled, error.Forbidden, error.InvalidRetainedReadQuery, error.SqlRangeTrackingRequired, error.SqlMutationOutcomeUnknown, error.OutOfMemory, error.InternalFailure }) |err|
+        try std.testing.expectEqual(err, statementReadAdmissionError(err));
+}
+
 const SettingOverlaySource = enum { durable_session, connection };
 
 fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_catalog.OverlayEntry, durable: []const setting_catalog.OverlayEntry) ![]const setting_catalog.OverlayEntry {
@@ -461,8 +477,9 @@ pub const Adapter = struct {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     })).deadline_ns) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
+                        const read_err = statementReadAdmissionError(zig017_err);
+                        zig017_return_error = read_err;
+                        return read_err;
                     });
                     if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
                         zig017_return_error = error.SqlRangeTrackingRequired;
@@ -1395,7 +1412,7 @@ pub const Adapter = struct {
                 const writes = self.server.table_writes orelse return err;
                 try writes.activateRangeTracking(temporary, bound_table, self.context);
                 const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
-                const replacement = try reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns);
+                const replacement = reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |read_err| return statementReadAdmissionError(read_err);
                 snapshot.deinit();
                 snapshot.* = replacement;
                 break :blk try snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts });
@@ -1458,7 +1475,7 @@ pub const Adapter = struct {
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
-            if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return err;
+            if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return statementReadAdmissionError(err);
             const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
             // Activation is a replicated, idempotent capability transition.
             // Try native capture first: an already active table needs no new
@@ -1469,7 +1486,7 @@ pub const Adapter = struct {
                 try self.verify(temporary, request.table);
                 try writes.activateRangeTracking(temporary, request.table.physical_name, self.context);
             }
-            break :blk try read_source.openRelationalStatement(alloc, scans, .read_index);
+            break :blk read_source.openRelationalStatement(alloc, scans, .read_index) catch |read_err| return statementReadAdmissionError(read_err);
         };
         errdefer native.deinit();
         if (native.views.len != requests.len) return error.InvalidSqlBackendResponse;

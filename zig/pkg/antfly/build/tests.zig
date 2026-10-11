@@ -403,6 +403,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    const sql_read_admission_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"SQL statement read admission"} });
+    b.step("antfly-sql-read-admission-test", "Verify SQL read admission availability without weakening error or mutation semantics")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_read_admission_tests).step);
     const sql_index_ddl_run = addFilteredTestRunArtifact(b, sql_index_ddl_tests);
     const sql_index_ddl_inventory = b.addRunArtifact(sql_index_ddl_tests);
     sql_index_ddl_inventory.addArg("--list-tests");

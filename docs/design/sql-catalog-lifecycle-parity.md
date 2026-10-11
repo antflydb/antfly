@@ -829,3 +829,18 @@ wait within a bounded interval; no mutation replay or suppression of other
 errors is introduced. The expanded rerun remains pending, including the
 post-publication SQL visibility check; it has not yet established that the
 observed rewritten-owner read unavailability is transient.
+
+The expanded PK check exposes a post-publication SELECT returning internal
+`GroupLeaderUnavailable` as HTTP 500 even while duplicate writes are correctly
+rejected by the new owner. SQL snapshot admission now reuses the shared
+distributed-read availability classifier and translates only pre-write capture
+availability into `SqlStatementReadUnavailable` (`53300`/503, retryable). It
+does not classify unknown mutation outcomes as retryable or hide malformed
+requests, authorization, cancellation, allocation failures or internal defects.
+The dedicated `antfly-sql-read-admission-test` passes its Debug regression;
+the optimized regression and mounted PK convergence rerun remain pending.
+The discovery root explicitly imports the execution module, so this gate fails
+on an empty test selection rather than appearing green without testing it.
+The broader coordinator gate now passes all 29 tests in both Debug and
+ReleaseFast, with no skips or leaks. Full activation remains unpublished until
+the data-owner recovery/visibility campaign passes.
