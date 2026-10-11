@@ -5,3 +5,7 @@ zig/pkg/antfly/antfarm/assets/*.js whitespace=-trailing-space
 
 # PDF fixtures are binary test assets; xref entries contain required padding.
 *.pdf binary
+
+# Raw video fixture bytes can resemble text; preserve and review them as binary.
+zig/lib/video/testdata/*.yuv binary
+zig/lib/video/testdata/*.rgba binary

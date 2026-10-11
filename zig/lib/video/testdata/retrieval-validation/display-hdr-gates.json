@@ -64,10 +64,10 @@
     "display-hdr-model-policy-metal.json": "779b3e1a61d8b1af4a899f3f7cfde2be2b5603d0b4212863bebd5eeccd05666c",
     "render-pytorch-cpu.json": "074db91cc7d1b91374858630b355ef09cbf1eb27562413dcaaacc0c5afb6e21c",
     "render-pytorch-mps.json": "fd083a6c591fa8f4fcc150d30daa9d428379e3e80da565f5fdbf4b21328f3372",
-    "display-hdr-video-tests.txt": "f4a0dfdb66a41d1adc3af1325373d0c29941890a3472ad9a87db37e606802882",
-    "display-hdr-model-tests.txt": "d43db1334ab5e45026be7e51b40d8a01462c98f428626e58fc27d6ed0616d9ba",
-    "display-hdr-linux-video.txt": "a5672d47aff5f5abb899710674645865d16fcc524fe2571c8da02fd4bdca6e45",
-    "display-hdr-linux-model.txt": "a59c7b1d6a829bde3d1f55739d4e6bc000e368eb5428958a26d659a1a5062aa3",
+    "display-hdr-video-tests.txt": "65a13e3c46b07b79f077edd9d7f9d68c37fd2c7df8af94d74d46b766bcde17be",
+    "display-hdr-model-tests.txt": "ecbd4bb0adb5768b4178efa209bd73726b7b1bab8c576bddc602f5ec980687dd",
+    "display-hdr-linux-video.txt": "548730d9432db6c8dcc1e87726a3b98c27b2766987d4aad950dd2ea9bc29a674",
+    "display-hdr-linux-model.txt": "c702d0ce7a03118bc6575f9efcebb872b7f333671ff3abd3cf9bcf5f1b660c4b",
     "display-hdr-python-tests.txt": "a845184b1ee38769e3a3ce6ba63a1195adcce071389ab343352c078bca01ed21"
   },
   "limitations": [

@@ -13,4 +13,3 @@ check-video-model success
       |  +- compile exe protoc-zig safe native success 9s MaxRSS:326M
       |     +- WriteFile macos-sdk-libc.txt (reused)
       +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
-
