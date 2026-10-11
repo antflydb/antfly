@@ -26,7 +26,7 @@ const Json = std.json.Value;
 test "SQL DDL description has no fabricated table or mutation side effects" {
     const Backend = struct {
         fn checkpoint(_: *anyopaque) !void {}
-        fn ddl(_: *anyopaque, _: std.mem.Allocator, _: catalog.Ddl) !catalog.DdlOutcome {
+        fn ddl(_: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
             return error.UnexpectedMutation;
         }
     };

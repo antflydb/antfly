@@ -5625,8 +5625,8 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const plan = try @import("fk_initial_create_plan_builder.zig").build(self, a, context, identity, target, request);
-        return self.submitFkInitialCreatePlan(a, context, plan);
+        const plan = try @import("fk_initial_create_plan_builder.zig").buildWithScratch(self, a, alloc, context, identity, target, request);
+        return self.submitFkInitialCreatePlan(alloc, context, plan);
     }
 
     /// SQL preallocates its public receipt from this immutable plan before the
@@ -5652,6 +5652,8 @@ pub const ApiHttpServer = struct {
         trusted.setting_admin = true;
         trusted.fk_generation_publication_authority = true;
         const response = self.source.systemCatalog(alloc, trusted, .{ .fk_initial_create_begin = plan }) catch |err| switch (err) {
+            error.MetadataAdmissionMemoryUnavailable => return error.OutOfMemory,
+            error.GenerationPublicationChanged => return error.CatalogGenerationChanged,
             error.MetadataMutationOutcomeUnknown, error.OutOfMemory => {
                 var unknown = result;
                 unknown.state = .admission_unknown;
@@ -5659,11 +5661,14 @@ pub const ApiHttpServer = struct {
             },
             else => return err,
         };
-        const accepted = std.json.parseFromSliceLeaky(@import("../metadata/fk_generation_publication.zig").InitialPublication, alloc, response, .{ .allocate = .alloc_always }) catch {
+        defer alloc.free(response);
+        var parsed = std.json.parseFromSlice(@import("../metadata/fk_generation_publication.zig").InitialPublication, alloc, response, .{ .allocate = .alloc_always }) catch {
             var unknown = result;
             unknown.state = .admission_unknown;
             return unknown;
         };
+        defer parsed.deinit();
+        const accepted = parsed.value;
         if (!std.mem.eql(u8, &accepted.plan.id, &plan.id) or !std.mem.eql(u8, &accepted.plan_digest, &expected_digest) or
             accepted.plan.catalog_id != plan.catalog_id or
             accepted.plan.child.table_id != plan.child.table_id)

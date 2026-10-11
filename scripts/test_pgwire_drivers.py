@@ -72,7 +72,7 @@ def main():
     failed = False
     try:
         run_clients(
-            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/antfly",
+            f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
             args.drivers,
         )
     except BaseException:
