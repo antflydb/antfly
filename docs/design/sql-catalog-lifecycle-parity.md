@@ -1383,3 +1383,39 @@ fault set now includes seventeen variants. Reverse verification of *all* live
 ranges, native owner activation and the public SQL atomicity fix remain separate
 unfinished work; this checkpoint does not claim those capabilities or inventory
 credits.
+
+### Complete current-range recovery membership
+
+The forward owner proof alone did not establish that the immutable cohort was
+the complete current range set. A new fault regression first reproduced a
+checkpoint accepting an additional live range while every declared owner still
+matched its descriptor.
+
+Recovery now performs a reverse range-stream pass when a nonterminal private
+index job exists. Each range belonging to a live job must resolve through the
+fixed-size directory to an owner with the same group, ordinal, plan ID and plan
+digest. Canonical range key/value identity is checked as well. The existing
+forward proof continues to compare full range descriptors. Together they reject
+missing, changed, extra and aliased live ranges without storing a whole-catalog
+map or decoding a publication plan per current range.
+
+The reverse operation takes no allocator and performs three fixed-size reads
+for a live owner. A scratch-buffer-reusing reader regression checks that each
+borrowed result is consumed before the next read and that storage failures stay
+visible. Terminal history requires only its head read and does not pin later
+topology. Snapshots/checkpoints without active private jobs skip the extra pass;
+snapshot cancellation is checked during it. This is offline metadata recovery
+verification, not a user-row scan or a new request-path operation.
+
+The recovery fault campaign now includes nineteen variants. Native owner
+capability/epoch attestation, live namespace/incarnation recovery binding,
+private builders, distributed uniqueness claims and atomic public publication
+remain unfinished. No inventory disposition changes are claimed.
+
+Qualification passes both targeted gates in Debug and ReleaseFast: ten
+publication tests, one decoder-floor test and fifty namespace/recovery tests,
+with zero skips/failures/leaks. The added extra-range regression failed against
+the predecessor implementation and passes with the reverse proof; the aliased
+range fault also passes in both checkpoint and incoming-snapshot verification.
+Formatting, diff and control-source catalog freshness checks pass. These are
+metadata recovery results, not public SQL atomicity or full-suite qualification.

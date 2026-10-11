@@ -4036,6 +4036,60 @@ test "initial child root receipt requires enrollment current reporter and exact 
     }
 }
 
+test "relational index publication reverse cohort verification uses three fixed reads and consumes borrowed buffers" {
+    const Reader = struct {
+        head: [index_progress.Head.encoded_len]u8,
+        owner: [index_progress.OwnerState.encoded_len]u8,
+        scratch: [index_progress.OwnerState.encoded_len]u8 = undefined,
+        calls: usize = 0,
+        fail: bool = false,
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            self.calls += 1;
+            if (self.fail) return error.StorageReadFailed;
+            var buf: [160]u8 = undefined;
+            const bytes: []const u8 = switch (self.calls) {
+                1 => blk: {
+                    try std.testing.expectEqualStrings(try index_publication.headKey(&buf, 13, 101), key);
+                    break :blk &self.head;
+                },
+                2 => blk: {
+                    try std.testing.expectEqualStrings(try index_publication.ownerGroupKey(&buf, 13, 101, 301), key);
+                    break :blk &.{ 0, 0 };
+                },
+                3 => blk: {
+                    try std.testing.expectEqualStrings(try index_publication.ownerKey(&buf, 13, 101, 0), key);
+                    break :blk &self.owner;
+                },
+                else => return error.UnexpectedRead,
+            };
+            @memcpy(self.scratch[0..bytes.len], bytes);
+            return self.scratch[0..bytes.len];
+        }
+    };
+    var head: index_progress.Head = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .table_id = 101, .owner_count = 1 };
+    const owner: index_progress.OwnerState = .{ .owner = .{ .plan_id = head.plan_id, .plan_digest = head.plan_digest, .ordinal = 0, .group_id = 301, .range_id = 301, .fence_digest = @splat(5) } };
+    var reader: Reader = .{ .head = try head.encode(), .owner = try owner.encode() };
+    var value: [16]u8 = undefined;
+    std.mem.writeInt(u64, value[0..8], 301, .little);
+    std.mem.writeInt(u64, value[8..16], 101, .little);
+    var buf: [160]u8 = undefined;
+    try IndexPublicationVerification.verifyRange(&reader, 13, try rangeKeyForGroup(&buf, 13, 301), &value);
+    try std.testing.expectEqual(@as(usize, 3), reader.calls);
+    reader.calls = 0;
+    try std.testing.expectError(error.InvalidCatalogRecord, IndexPublicationVerification.verifyRange(&reader, 13, try rangeKeyForGroup(&buf, 13, 302), &value));
+    try std.testing.expectEqual(@as(usize, 1), reader.calls);
+    reader.calls = 0;
+    reader.fail = true;
+    try std.testing.expectError(error.StorageReadFailed, IndexPublicationVerification.verifyRange(&reader, 13, try rangeKeyForGroup(&buf, 13, 301), &value));
+    reader.fail = false;
+    reader.calls = 0;
+    head.phase = .published;
+    head.counts = .{ 1, 1, 1, 1, 1, 0, 0 };
+    reader.head = try head.encode();
+    try IndexPublicationVerification.verifyRange(&reader, 13, try rangeKeyForGroup(&buf, 13, 302), &value);
+    try std.testing.expectEqual(@as(usize, 1), reader.calls);
+}
+
 test "relational index publication range enumeration stops before excess allocation or unbounded scanning" {
     const Cursor = struct {
         visits: usize = 0,
@@ -4189,7 +4243,7 @@ test "relational index publication admission reserves names atomically and survi
             defer metadata_table_manager.freeTable(a, current);
             try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(current, plan.before));
         }
-        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory };
+        const Fault = enum { head_missing, owner_missing, active_missing, active_substituted, extra_owner, lock_missing, wrong_counter, orphan_group, owner_substituted, plan_substituted, orphan_index_lock, orphan_lock_group, table_substituted, range_substituted, directory_missing, directory_substituted, extra_directory, extra_range, aliased_range };
         inline for (std.meta.tags(Fault)) |fault| {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -4242,6 +4296,13 @@ test "relational index publication admission reserves names atomically and survi
                 .directory_missing => try txn.delete(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, plan.owners[0].range.group_id)),
                 .directory_substituted => try txn.put(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, plan.owners[0].range.group_id), &.{ 0, 1 }),
                 .extra_directory => try txn.put(try index_publication.ownerGroupKey(&buf, group, plan.before.table_id, 999), &.{ 0, 0 }),
+                .extra_range, .aliased_range => {
+                    var changed = plan.owners[0].range;
+                    if (fault == .extra_range) changed.group_id += 1;
+                    const encoded = try encodeRangeRecord(a, changed);
+                    defer a.free(encoded);
+                    try txn.put(try rangeKeyForGroup(&buf, group, plan.owners[0].range.group_id + 1), encoded);
+                },
             }
             try std.testing.expectError(error.InvalidMetadataHACheckpoint, verifyRelationCheckpointTxn(a, &txn));
             if (fault != .orphan_group and fault != .orphan_lock_group) {
@@ -30666,6 +30727,13 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         };
     }
     try reconciliation.finish();
+    if (index_jobs.expected[3] != 0) {
+        const ranges = try rangePrefixForGroup(&buf, group_id);
+        for (rows) |row| {
+            if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            if (std.mem.startsWith(u8, row.key, ranges)) try IndexPublicationVerification.verifyRange(&reader, group_id, row.key, row.value);
+        }
+    }
     try index_jobs.finish();
     if (writer == null) {
         if (index_jobs.has_records) return error.InvalidMetadataSnapshot;
@@ -30760,6 +30828,30 @@ const IndexPublicationVerification = struct {
     received: [5]usize = @splat(0),
     has_records: bool = false,
 
+    /// Reverse cohort proof: each current range of a live job must resolve to
+    /// its admitted owner. Forward proof checks the full descriptor separately.
+    /// Consume borrowed results before the next read; no plan decode/allocation.
+    fn verifyRange(reader: anytype, group: u64, key: []const u8, value: []const u8) !void {
+        var pos: usize = 0;
+        const range_group = readInt(value, &pos, u64) catch return error.InvalidCatalogRecord;
+        const table = readInt(value, &pos, u64) catch return error.InvalidCatalogRecord;
+        var buf: [160]u8 = undefined;
+        const canonical = std.mem.eql(u8, key, try rangeKeyForGroup(&buf, group, range_group));
+        const head_bytes = reader.get(try index_publication.headKey(&buf, group, table)) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const head = index_progress.Head.decode(head_bytes) catch return error.InvalidCatalogRecord;
+        if (head.phase == .published or head.phase == .canceled) return;
+        if (head.table_id != table or !canonical) return error.InvalidCatalogRecord;
+        const ordinal = try index_publication.ownerOrdinal(reader, group, table, range_group);
+        if (ordinal >= head.owner_count) return error.InvalidCatalogRecord;
+        const owner = index_progress.OwnerState.decode(try reader.get(try index_publication.ownerKey(&buf, group, table, ordinal))) catch return error.InvalidCatalogRecord;
+        if (owner.owner.ordinal != ordinal or owner.owner.group_id != range_group or
+            !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id) or
+            !std.mem.eql(u8, &owner.owner.plan_digest, &head.plan_digest)) return error.InvalidCatalogRecord;
+    }
+
     fn verifyTableCut(a: std.mem.Allocator, reader: anytype, group: u64, id: u64) !index_progress.Head {
         var proof = try index_publication.verifyOwned(a, reader, group, id);
         defer proof.deinit();
@@ -30839,6 +30931,14 @@ fn verifyIndexPublicationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocSt
         while (row) |item| : (row = try cursor.next()) {
             if (!std.mem.startsWith(u8, item.key, owned)) break;
             try verification.feed(alloc, txn, group_id, item.key, item.value);
+        }
+    }
+    if (verification.expected[3] != 0) {
+        const ranges = try rangePrefixForGroup(&buf, group_id);
+        var row = try cursor.seekAtOrAfter(ranges);
+        while (row) |item| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, ranges)) break;
+            try IndexPublicationVerification.verifyRange(txn, group_id, item.key, item.value);
         }
     }
     try verification.finish();
