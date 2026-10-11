@@ -53,7 +53,12 @@ pub fn closeSession(handle: *h.Handle, id: u64) void {
 pub fn diagnostic(err: anyerror, out: *h.capi.Buffer) h.capi.ErrorCode {
     const description = dependencies.sql_errors.describe(err);
     out.* = api.stringifyJson(.{ .@"error" = description }) catch return .internal;
+    return diagnosticCode(description);
+}
+
+pub fn diagnosticCode(description: dependencies.sql_errors.Diagnostic) h.capi.ErrorCode {
     if (std.mem.eql(u8, description.code, "0A000")) return .unsupported;
+    if (std.mem.eql(u8, description.code, "55P03")) return .busy;
     if (std.mem.eql(u8, description.code, "40001")) return .version_conflict;
     if (std.mem.eql(u8, description.code, "40003")) return .outcome_unknown;
     if (std.mem.eql(u8, description.code, "XX000") or std.mem.eql(u8, description.code, "53200")) return .internal;

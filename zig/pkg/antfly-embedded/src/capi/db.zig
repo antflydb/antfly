@@ -725,6 +725,7 @@ pub const HandleGuard = struct {
     access: HandleAccess,
     connection: ?*@import("lite_connection.zig").Connection = null,
     path_lease: ?lite_backend.native.PathWriterLock = null,
+    connection_gate_held: bool = false,
     entry_error: ?capi.ErrorCode = null,
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
@@ -742,12 +743,15 @@ pub const HandleGuard = struct {
                     if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
                 }
             }
-            connection.collectRetired();
+            if (self.connection_gate_held) {
+                connection.detach();
+                connection.collectRetired();
+            }
             if (self.path_lease) |lease| {
                 var owned = lease;
                 owned.close();
-                connection.gate.mutex.unlock(io);
             }
+            if (self.connection_gate_held) connection.gate.mutex.unlock(io);
             connection.mutex.unlock(io);
             if (self.parent_slot) |slot| HandleRegistry.leave(slot);
             HandleRegistry.leave(self.slot);
@@ -802,11 +806,9 @@ fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?Ha
                 guard.entry_error = capi.mapError(err);
                 return guard;
             };
-        }
-        const root = if (pinned) connection.current orelse {
-            guard.entry_error = .invalid_argument;
-            return guard;
-        } else connection.refresh() catch |err| {
+        } else connection.gate.mutex.lockUncancelable(handleLockIo());
+        guard.connection_gate_held = true;
+        const root = (if (pinned) connection.pin() else connection.refresh()) catch |err| {
             guard.entry_error = capi.mapError(err);
             return guard;
         };
@@ -5195,11 +5197,7 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
         if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("Embedded SQL execution internal failure err={s}", .{@errorName(err)});
         if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch return .internal;
-        if (std.mem.eql(u8, diagnostic.code, "40003")) return .outcome_unknown;
-        if (std.mem.eql(u8, diagnostic.code, "0A000")) return .unsupported;
-        if (std.mem.eql(u8, diagnostic.code, "40001")) return .version_conflict;
-        if (std.mem.eql(u8, diagnostic.code, "XX000") or std.mem.eql(u8, diagnostic.code, "53200")) return .internal;
-        return .invalid_argument;
+        return @import("sql_cursor.zig").diagnosticCode(diagnostic);
     };
     return .ok;
 }
@@ -7450,4 +7448,89 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
     spawned = 0;
     defer for (workers[0..joined]) |worker| alloc.free(worker.path);
     for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}
+
+test "capi SQL connections share storage while session IDs and close remain independent" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("shared-lite-owner");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db.aflite", .{directory.path()}, 0);
+    defer alloc.free(path);
+    const options: LiteResolvedOpenOptions = .{ .no_sync = true, .profile = .hosted, .busy_timeout_ms = 5000 };
+    const first = try openLiteHandleAlloc(path, options, true);
+    const first_id = try publishHandle(first);
+    defer antfly_db_close(first_id);
+    var second_options = options;
+    second_options.busy_timeout_ms = 30000;
+    const second = try openLiteHandleAlloc(path, second_options, false);
+    const second_id = try publishHandle(second);
+    defer antfly_db_close(second_id);
+    try std.testing.expect(first.lite_connection.?.owner == second.lite_connection.?.owner);
+    const generation = first.lite_connection.?.current.?;
+    var first_session: u64 = 0;
+    var second_session: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(first_id, &first_session));
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("sql_session.zig").antfly_db_sql_session_open(second_id, &second_session));
+    try std.testing.expectEqual(@as(u64, 1), first_session);
+    try std.testing.expectEqual(first_session, second_session);
+    for ([_][]const u8{
+        \\{"statement":"CREATE TABLE numbers (n BIGINT)","session_id":1}
+        ,
+        \\{"statement":"BEGIN","session_id":1}
+        ,
+        \\{"statement":"INSERT INTO numbers (_id,n) VALUES ('row',7)","session_id":1}
+        ,
+    }) |request| {
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(first_id, .fromSlice(request), &output));
+    }
+    const select =
+        \\{"statement":"SELECT n FROM numbers","session_id":1}
+    ;
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(second_id, .fromSlice(select), &output));
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output.ptr.?[0..output.len], .{});
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("rows").?.array.items.len);
+    parsed.deinit();
+    antfly_buffer_free(&output);
+    const commit =
+        \\{"statement":"COMMIT","session_id":1}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(first_id, .fromSlice(commit), &output));
+    antfly_buffer_free(&output);
+    try std.testing.expect(second.lite_connection.?.current.? == generation);
+    var cursor: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, @import("sql_cursor.zig").antfly_db_sql_open_cursor_json(second_id, .fromSlice(select), &cursor, &output));
+    antfly_buffer_free(&output);
+    {
+        defer _ = @import("sql_cursor.zig").antfly_db_sql_close_cursor(second_id, cursor);
+        const guard = enterHandle(first_id, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        // A durable DROP recovery must not retire another stream's runtime.
+        try std.testing.expectError(error.SqlStatementReadUnavailable, @import("tables.zig").finishDrop(guard.handle, "numbers"));
+    }
+    antfly_db_close(first_id);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(second_id, .fromSlice(select), &output));
+    defer antfly_buffer_free(&output);
+    parsed = try std.json.parseFromSlice(std.json.Value, alloc, output.ptr.?[0..output.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("rows").?.array.items.len);
+}
+
+test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
+    for ([_]struct { err: anyerror, code: capi.ErrorCode, state: []const u8 }{
+        .{ .err = error.FileBusy, .code = .busy, .state = "55P03" },
+        .{ .err = error.WouldBlock, .code = .busy, .state = "55P03" },
+        .{ .err = error.OutcomeUnknown, .code = .outcome_unknown, .state = "40003" },
+    }) |case| {
+        var output: capi.Buffer = .{};
+        defer antfly_buffer_free(&output);
+        try std.testing.expectEqual(case.code, @import("sql_cursor.zig").diagnostic(case.err, &output));
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+    }
 }
