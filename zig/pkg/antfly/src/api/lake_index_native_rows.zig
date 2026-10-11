@@ -27,6 +27,13 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const cohort_files = @import("lake_index_cohort_files.zig");
+// Share the existing 4 MiB sort workspace between two builders. Reserving
+// 24 runs each leaves room for pending runs, merge outputs and shared replay
+// within the manager's 64-file limit, without repeatedly compacting a large
+// run into a four-slot directory on every subsequent flush.
+const cohort_size = 2;
+const sort_memory_bytes = 2 * 1024 * 1024;
+const sort_run_limit = 24;
 
 pub fn logicalName(a: A, name: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
@@ -117,7 +124,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var planned_roots: ?[]?ordered.Root = null;
     var planned_files: ?[]const cohort_files.File = null;
     var replay_files: ?[]const bool = null;
-    if (input.replay == null and definitions.len > 8) {
+    if (input.replay == null and definitions.len > cohort_size) {
         const roots = try ca.alloc(?ordered.Root, definitions.len);
         @memset(roots, null);
         const requirements = try ca.alloc(cohort_files.Requirement, definitions.len);
@@ -159,9 +166,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     const orders = [_]local.sql_operators.Order{.{}};
     var first: usize = 0;
     while (first < definitions.len) {
-        // Reserve four retained runs per fused sort plus pending/merge files
-        // within the shared 64-file manager, without enlarging its budget.
-        const end = @min(first + 8, definitions.len);
+        const end = @min(first + cohort_size, definitions.len);
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
         defer {
@@ -227,8 +232,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (slot_names.items, slot_hashes.items) |file, *digest| if (!files.contains(file)) {
                 digest.* = @splat(0);
             };
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
-            entries.items[entries.items.len - 1].sort.run_limit = 4;
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            entries.items[entries.items.len - 1].sort.run_limit = sort_run_limit;
         }
         if (entries.items.len == 0) continue;
         var names: std.ArrayList([]const u8) = .empty;

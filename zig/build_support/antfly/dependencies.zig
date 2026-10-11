@@ -363,7 +363,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
         .target = target,
         .optimize = optimize,
-    }) });
+    }), .filters = selectTestFilters(b, &.{"relation_reconciliation.test."}) });
     relation_reconciliation_tests.root_module.addImport("antfly_platform", platform_mod);
     const run_relation_reconciliation_tests = b.addRunArtifact(relation_reconciliation_tests);
     b.step("system-catalog-reconciliation-test", "Test resumable, fenced relation ownership reconciliation")

@@ -300,6 +300,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
         error.InvalidArgument,
+        error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,
         error.RelationalExpressionBudgetExceeded,
@@ -417,7 +418,13 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.InferenceRuntimeStartupFailed,
         => .unsupported,
         error.InferenceProviderCallCapacityExhausted => .busy,
-        error.DurabilityOutcomeUnknown => .outcome_unknown,
+        error.DurabilityOutcomeUnknown,
+        error.OutcomeUnknown,
+        error.WriteOutcomeUnknown,
+        error.SqlTransactionOutcomeUnknown,
+        error.SqlMutationOutcomeUnknown,
+        error.CommitDecisionUnknown,
+        => .outcome_unknown,
         error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
@@ -459,5 +466,7 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
 test "bounded Lite retirement admission is retryable while uncertain publication is not" {
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
-    try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(error.OutcomeUnknown));
+    inline for (.{ error.DurabilityOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.CommitDecisionUnknown }) |err| {
+        try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(err));
+    }
 }

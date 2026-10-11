@@ -1287,6 +1287,46 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer alloc.free(token);
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
 
+    if (!lost_replies and !restart_after_ack and !leader_transfer and !snapshot_probe) {
+        // Exercise the real imported storage owner: a caller clock with a
+        // different epoch must retain its budget across the compiled boundary.
+        const Clock = struct {
+            fn readTimestamp(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                return .{ .nanoseconds = 10 };
+            }
+        };
+        var vtable = io.vtable.*;
+        vtable.now = Clock.readTimestamp;
+        const shifted_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const read_context: @import("antfly_local_sources").api_operation.RequestContext = .{
+            .deadline_ns = 10 + std.time.ns_per_s,
+            .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&shifted_io),
+        };
+        const projected = metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+        const lookup: @import("antfly_local_sources").system_catalog_domain.ResolveMany = .{
+            .relations = &.{.{ .name = "nodes_pkey" }},
+            .name_allocation = true,
+        };
+        const names = try projected.resolveSystemCatalogIdentitiesWithContext(alloc, metadata.server.svc.metadata_group_id, lookup, read_context);
+        defer names.deinit(alloc);
+        try names.validateRelations(lookup);
+        try std.testing.expect(names.relations[0] == null);
+        const Cancellation = struct {
+            calls: usize = 0,
+            fn cancelled(raw: *const anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                self.calls += 1;
+                // Admit in the facade, cancel after entering the owner.
+                return self.calls >= 3;
+            }
+        };
+        var cancellation: Cancellation = .{};
+        var canceled = read_context;
+        canceled.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancellation.cancelled };
+        try std.testing.expectError(error.Canceled, projected.resolveSystemCatalogIdentitiesWithContext(alloc, metadata.server.svc.metadata_group_id, lookup, canceled));
+        try std.testing.expect(cancellation.calls >= 3);
+    }
+
     var create = try sql(alloc, transport, &headers, base, if (snapshot_probe)
         "CREATE TABLE usage_records (id TEXT PRIMARY KEY, status TEXT, organization_id TEXT)"
     else

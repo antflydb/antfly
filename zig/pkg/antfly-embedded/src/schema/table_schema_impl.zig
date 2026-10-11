@@ -6947,13 +6947,16 @@ test "write validation rejects values that cannot populate explicit physical map
     defer parsed.deinit(std.testing.allocator);
 
     try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20T12:00:00Z\",\"created_ns\":0,\"location\":{\"lat\":37.7,\"lon\":-122.4}}" }});
+    // Physical datetime columns use signed nanoseconds, including dates
+    // before the Unix epoch. Fractional nanoseconds cannot populate them.
+    try validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"1969-12-31T23:59:59Z\",\"created_ns\":-1,\"location\":{\"lat\":0,\"lon\":0}}" }});
     try std.testing.expectError(
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"not-a-date\",\"created_ns\":0,\"location\":{\"lat\":0,\"lon\":0}}" }}),
     );
     try std.testing.expectError(
         error.InvalidBatchRequest,
-        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":-1,\"location\":{\"lat\":0,\"lon\":0}}" }}),
+        validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"created_at\":\"2026-08-20\",\"created_ns\":0.5,\"location\":{\"lat\":0,\"lon\":0}}" }}),
     );
     try std.testing.expectError(
         error.InvalidBatchRequest,
