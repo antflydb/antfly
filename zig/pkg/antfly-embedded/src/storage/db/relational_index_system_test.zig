@@ -143,6 +143,18 @@ test "relational index build pages native owner control preserves committed cuts
             try primary.prepareNativeIndexOwnerControl(.{ .effect = effect, .binding = binding });
         defer control.deinit();
         try control.preparePayload();
+        if (effect == .fenced) {
+            const input_key = @import("relational_index_inputs.zig").key;
+            const saved = try primary.core.store.get(alloc, input_key);
+            defer alloc.free(saved);
+            try primary.core.store.putBatch(&.{}, &.{input_key});
+            try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.applyPreparedNativeIndexOwnerControl(&control, null));
+            var txn = try primary.core.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try authority.load(&txn)).?.sequence);
+            try std.testing.expect(try jobs.nativeEffectPosition(&txn, binding, .fenced) == null);
+            try primary.core.store.putBatch(&.{.{ .key = input_key, .value = saved }}, &.{});
+        }
         if (effect == .reserved) {
             // A distinct effect has its own transport LSN and payload. Its
             // successful foreground ACK exercises lease release in apply,

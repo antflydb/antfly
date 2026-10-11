@@ -257,6 +257,21 @@ pub fn nativeEffectPosition(txn: anytype, binding: Binding, action: NativeEffect
     return if (try readNativeCut(txn, binding, action)) |cut| cut.position else null;
 }
 
+/// Bounded local status for a receiver which independently obtains current
+/// metadata permission. Absence is not a cancellation fence or an ACK proof.
+pub fn inspectNative(txn: anytype, expected: anytype) !?Binding {
+    try expected.validate();
+    _ = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(expected.namespace));
+    const binding = (try load(txn)) orelse return null;
+    if (binding.authority != .native or !std.mem.eql(u8, &binding.id, &expected.id) or
+        !std.mem.eql(u8, &binding.plan_digest, &expected.plan_digest) or
+        !std.mem.eql(u8, &binding.owner_digest, &expected.owner_digest) or binding.ordinal != expected.ordinal or
+        !binding.fence.namespace.eql(expected.namespace) or binding.fence.owner_group_id != expected.owner_group_id)
+        return error.PrivateIndexOwnerJobChanged;
+    _ = try requireNativeJob(txn, binding);
+    return binding;
+}
+
 /// Shared by live page admission, receipt production and cold recovery. Read
 /// the clock once, then validate only the three fixed slots; never scan history.
 fn requireNativeCuts(txn: anytype, job: Binding) !void {
@@ -359,6 +374,9 @@ pub fn stageNativeFenced(txn: anytype, manager: *transactions.TxnManager, bindin
 pub fn stageNativeFencedWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !publication.Receipt {
     try validateReplay(binding, replay);
     const current = try requireNativeJob(txn, binding);
+    // Integrity must fail before staging a new cut, not only when the caller
+    // subsequently reconstructs its receipt after commit.
+    try inputs_mod.require(txn, current.inputs_digest);
     _ = try requireNativeCut(txn, binding, .admitted);
     if (try readNativeCut(txn, binding, .fenced)) |existing| {
         try requireReplay(existing, replay);

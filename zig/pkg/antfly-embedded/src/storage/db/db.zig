@@ -7877,6 +7877,15 @@ pub const DB = struct {
     pub const NativeIndexOwnerCommand = native_index_control.Command;
     pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
     pub const NativeIndexOwnerOutcome = native_index_control.Outcome;
+    pub const NativeIndexOwnerIdentity = native_index_control.Identity;
+
+    pub fn nativeIndexOwnerState(self: *DB, expected: NativeIndexOwnerIdentity) !?@import("relational_index_owner_job.zig").Binding {
+        try expected.validate();
+        if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_index_owner_job.zig").inspectNative(&txn, expected);
+    }
 
     pub fn prepareNativeIndexOwnerAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerControl {
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;

@@ -2089,7 +2089,7 @@ and cleanup, and distributed fault qualification. The public producer remains
 disabled until those requirements and the public failed-build atomicity gate are
 proved, not merely because the private component campaign passes.
 
-### Private native index compiled-owner boundary (in qualification)
+### Private native index compiled-owner boundary
 
 The private server-owner ABI now separates raw-manifest admission from bounded
 fence/reserve commands. Admission accepts the small typed header and borrowed
@@ -2116,7 +2116,8 @@ distinct from `embedded-capi-check`, which only qualifies the public independent
 C-API owner. Apache boundary validation passes for 2028 sources. Final guards and
 negative tests for the actual handle owner group pass the combined direct C-ABI
 and private storage-kernel Debug gate, all 56 steps and both tests with no skips,
-failures or leaks. Optimized qualification remains in progress.
+failures or leaks. ReleaseFast qualification passes all 51 direct C-ABI gate
+steps and both tests, with no skips, failures or leaks.
 
 The independent authenticated RPC receiver, capability admission, worker
 dispatch/root-attested ACK integration, Raft effect-cut implementation, global UNIQUE
@@ -2124,3 +2125,33 @@ validation and terminal publish/cancel/cleanup remain required. A fresh metadata
 read is not a lease: cancellation must also fence late admission on previously
 unvisited owners, rather than merely acknowledging absence. Public activation
 and the original SQL inventory remain unchanged.
+
+### Native owner inspection and pre-fence input integrity (in qualification)
+
+Receivers can now inspect a local native job using only its immutable metadata
+identity: plan ID/digest, owner digest/ordinal, namespace and owner group. The
+read validates persisted native authority even when the job is absent; absence
+in a Raft-owned namespace must not masquerade as native eligibility. An existing
+job must match the complete identity and pass the same local fence/catalog/cut
+guards used for execution. The snapshot returns the computed physical binding
+without reconstructing schema-sized worker inputs or compiling candidates. This
+is information, not an execution lease, receipt or cancellation tombstone.
+
+The private ABI/client expose this inspection alongside admission and control,
+without adding an ordinary batch or public route. C-ABI tests cover pre-admission
+absence, both durable phases, retained input identity and foreign job/namespace
+rejection. Fencing now verifies the immutable manifest before staging a new cut,
+not merely while reconstructing a receipt after commit. The LSM campaign deletes
+the admitted manifest and requires the fence attempt to fail without advancing
+the native clock or writing its cut; restoring the exact inputs permits normal
+execution. Combined Debug qualification passes all 69 steps, with two C-ABI,
+five system/page and eleven candidate/private-addition tests and no skips,
+failures or leaks. The additional pre-admission Raft-mode rejection assertion
+passes the 51-step direct C-ABI gate, both tests with no skips, failures or leaks.
+Apache boundary validation passes for 2028 sources. Raw-manifest byte budgets
+are now checked at the ABI boundary before slicing/dereferencing; empty and
+max-u64-length invalid-pointer requests reject before admission. The final
+bounded-input C-ABI/private-kernel Debug gate passes all 56 steps and both tests
+without skips, failures or leaks. Optimized qualification for inspection and
+pre-fence integrity remains in progress. No SQL inventory credits or public
+activation claim are made.

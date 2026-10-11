@@ -1174,7 +1174,39 @@ test "storage owner native index raw admission and bounded controls preserve loc
     };
     const json = try std.json.Stringify.valueAlloc(a, header, .{});
     defer a.free(json);
+    const identity: db_mod.DB.NativeIndexOwnerIdentity = .{
+        .id = header.id,
+        .plan_digest = header.plan_digest,
+        .owner_digest = header.owner_digest,
+        .ordinal = header.ordinal,
+        .namespace = header.fence.namespace,
+        .owner_group_id = header.fence.owner_group_id,
+    };
+    const identity_json = try std.json.Stringify.valueAlloc(a, identity, .{});
+    defer a.free(identity_json);
     var response: kernel_owner_abi.OwnedBytes = .{};
+    const inspection: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+        .operation = .inspect,
+        .table_name = .fromSlice("items"),
+        .request_json = .fromSlice(identity_json),
+    };
+    // An absent job cannot attest native mode in a Raft-owned namespace.
+    {
+        const authority = local.storage_source_authority;
+        var txn = try handle.db.core.store.beginReadTxn();
+        const original = (try authority.load(&txn)).?;
+        txn.abort();
+        var raft = original;
+        raft.kind = .raft;
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &raft.encode() }}, &.{});
+        try std.testing.expectError(error.OnlineSourceScopeChanged, handle.db.nativeIndexOwnerState(identity));
+        try std.testing.expect(server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response) != .ok);
+        try std.testing.expect(response.ptr == null);
+        try handle.db.core.store.putBatch(&.{.{ .key = authority.key, .value = &original.encode() }}, &.{});
+    }
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+    try std.testing.expectEqualStrings("null", response.slice());
+    freeRawBuffer(response.ptr, response.len);
     var request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
         .operation = .admit,
         .table_name = .fromSlice("wrong-table"),
@@ -1186,6 +1218,12 @@ test "storage owner native index raw admission and bounded controls preserve loc
     request.operation = @fromBackingInt(@intCast(99));
     try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
     request.operation = .admit;
+    const manifest = request.manifest;
+    request.manifest = .{ .ptr = @ptrFromInt(1), .len = std.math.maxInt(u64) };
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = manifest;
     handle.storage_owner_group_id = 99;
     try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
     handle.storage_owner_group_id = 11;
@@ -1210,14 +1248,29 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
         handle.storage_owner_group_id = 11;
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
-        defer freeRawBuffer(response.ptr, response.len);
+        const effect_response = response;
+        defer freeRawBuffer(effect_response.ptr, effect_response.len);
         var outcome = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerOutcome, a, response.slice(), .{});
         defer outcome.deinit();
         try std.testing.expect(!outcome.value.duplicate);
         try std.testing.expectEqual(@as(u64, sequence), outcome.value.position.sequence);
         try std.testing.expect(outcome.value.receipt != null);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &inspection, &response));
+        const state_response = response;
+        defer freeRawBuffer(state_response.ptr, state_response.len);
+        const Binding = @TypeOf(binding);
+        var observed = try std.json.parseFromSlice(?Binding, a, response.slice(), .{});
+        defer observed.deinit();
+        try std.testing.expectEqual(if (operation == .fence) local.storage_db_relational_index_owner_job.Phase.fencing else .reserved, observed.value.?.phase);
+        try std.testing.expectEqual(binding.inputs_digest, observed.value.?.inputs_digest);
         request.manifest = .fromSlice(candidate.inputs.bytes);
     }
+    var foreign = identity;
+    foreign.id[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, handle.db.nativeIndexOwnerState(foreign));
+    foreign = identity;
+    foreign.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, handle.db.nativeIndexOwnerState(foreign));
     try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
 }
 
