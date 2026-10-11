@@ -231,6 +231,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const deinitOwnedGraphEdgeDelete = materialization.deinitOwnedGraphEdgeDelete;
         pub const deinitOwnedGraphEdgeWrite = materialization.deinitOwnedGraphEdgeWrite;
         pub const deleteDocumentArtifactChildRangeOutboxEntry = materialization.deleteDocumentArtifactChildRangeOutboxEntry;
+        pub const deleteDocumentArtifactChildRangeOutboxEntryWithRoot = materialization.deleteDocumentArtifactChildRangeOutboxEntryWithRoot;
         pub const denseArtifactCounterBootstrapKeyAlloc = materialization.denseArtifactCounterBootstrapKeyAlloc;
         pub const denseArtifactNameForEntry = materialization.denseArtifactNameForEntry;
         pub const denseArtifactTargetCounterKeyAlloc = materialization.denseArtifactTargetCounterKeyAlloc;
@@ -241,6 +242,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const dense_artifact_target_counter_prefix = materialization.dense_artifact_target_counter_prefix;
         pub const derivedCoverageAppliesToIndex = materialization.derivedCoverageAppliesToIndex;
         pub const drainDocumentArtifactChildRangeOutbox = materialization.drainDocumentArtifactChildRangeOutbox;
+        pub const drainDocumentArtifactChildRangeOutboxWithRoot = materialization.drainDocumentArtifactChildRangeOutboxWithRoot;
         pub const encodeDenseArtifactCounterBootstrap = materialization.encodeDenseArtifactCounterBootstrap;
         pub const enforcePortableRuntimeGate = commit.enforcePortableRuntimeGate;
         pub const enforceReplicationWriteGate = commit.enforceReplicationWriteGate;
@@ -816,8 +818,10 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const clearLiveDocSetCache = Implementation.clearLiveDocSetCache;
             pub const clearNonVisibleDocSetCache = Implementation.clearNonVisibleDocSetCache;
             pub const deleteDocumentArtifactChildRangeOutboxEntry = Implementation.deleteDocumentArtifactChildRangeOutboxEntry;
+            pub const deleteDocumentArtifactChildRangeOutboxEntryWithRoot = Implementation.deleteDocumentArtifactChildRangeOutboxEntryWithRoot;
             pub const denseRepairWriteBackpressured = Implementation.denseRepairWriteBackpressured;
             pub const drainDocumentArtifactChildRangeOutbox = Implementation.drainDocumentArtifactChildRangeOutbox;
+            pub const drainDocumentArtifactChildRangeOutboxWithRoot = Implementation.drainDocumentArtifactChildRangeOutboxWithRoot;
             pub const enforcePortableRuntimeGate = Implementation.enforcePortableRuntimeGate;
             pub const enforceReplicationWriteGate = Implementation.enforceReplicationWriteGate;
             pub const enforceRowPolicyMutationLocked = Implementation.enforceRowPolicyMutationLocked;

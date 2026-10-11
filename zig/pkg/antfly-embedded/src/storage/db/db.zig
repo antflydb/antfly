@@ -7087,10 +7087,12 @@ pub const DB = struct {
     pub const projectedBatchLsmAdmissionBytes = local_mutation.projectedBatchLsmAdmissionBytes;
 
     pub const drainDocumentArtifactChildRangeOutbox = local_mutation.drainDocumentArtifactChildRangeOutbox;
+    pub const drainDocumentArtifactChildRangeOutboxWithRoot = local_mutation.drainDocumentArtifactChildRangeOutboxWithRoot;
 
     pub const childRangeManifestReader = local_mutation.childRangeManifestReader;
 
     pub const deleteDocumentArtifactChildRangeOutboxEntry = local_mutation.deleteDocumentArtifactChildRangeOutboxEntry;
+    pub const deleteDocumentArtifactChildRangeOutboxEntryWithRoot = local_mutation.deleteDocumentArtifactChildRangeOutboxEntryWithRoot;
 
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
         try self.batchInternal(req, null, .{ .validate_range_ownership = false });

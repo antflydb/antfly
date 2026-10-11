@@ -4425,3 +4425,105 @@ test "db transaction outbox retirement preserves partial acknowledgement and fen
         }
     }
 }
+
+test "db child range outbox retires capture admission and retains reply loss or fenced debt" {
+    const outbox = @import("antfly_local_sources").storage_db_document_child_range_outbox;
+    const contract = @import("antfly_local_sources").storage_db_replication_contract;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Fixture = struct {
+        db: *DB,
+        barrier: *Barrier,
+        root: ?*Barrier.RootSharedLease,
+        failure: enum { reply_loss, fence, none },
+        calls: usize = 0,
+        closed: bool = false,
+        captured: bool = false,
+        fn capture(self: *@This()) void {
+            if (self.barrier.tryAcquireExclusive()) |lease| {
+                var owned = lease;
+                owned.release();
+                self.captured = true;
+            }
+        }
+        fn select(_: *anyopaque, _: engine.test_support.types.DocumentArtifactChildRange) ?u64 {
+            return 7;
+        }
+        fn apply(raw: *anyopaque, _: Allocator, dispatch: outbox.DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 7), dispatch.owner_group_id);
+            if (self.root) |root| try std.testing.expect(!root.held);
+            try std.testing.expect(self.db.core.apply_mutex.tryLockShared());
+            self.db.core.apply_mutex.unlockShared();
+            self.captured = false;
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            try std.testing.expect(self.captured);
+            self.calls += 1;
+            if (self.calls == 2) {
+                if (self.failure == .reply_loss) return error.CommitCompletionPending;
+                if (self.failure == .fence) self.closed = true;
+            }
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.closed) return error.Forbidden;
+        }
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: @import("antfly_local_sources").storage_db_durable_outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedChildOutboxPublish;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: @import("antfly_local_sources").storage_db_durable_outbox.Kind, _: @import("antfly_local_sources").storage_db_durable_outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedChildOutboxRecovery;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedChildOutboxComplete;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |explicit_root| {
+        inline for (.{ .reply_loss, .fence }) |failure| {
+            var directory = try TestDirectory.init("child-outbox-retirement");
+            defer directory.cleanup();
+            var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer db.close();
+            const first = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, 1, 0);
+            defer alloc.free(first);
+            const second = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, 1, 1);
+            defer alloc.free(second);
+            const value = try outbox.encodeDocumentChildRangeOutboxRecordAlloc(alloc, .{ .owner_group_id = 7, .doc_key = "doc", .artifact_name = "units", .child_batch = .{} });
+            defer alloc.free(value);
+            try db.core.store.putBatch(&.{ .{ .key = first, .value = value }, .{ .key = second, .value = value } }, &.{});
+            var barrier: Barrier = .{};
+            var root = Barrier.RootSharedLease.initRetired(&barrier);
+            defer root.release();
+            var fixture: Fixture = .{ .db = &db, .barrier = &barrier, .root = if (explicit_root) &root else null, .failure = failure };
+            db.local_execution.replication_async_effect_mirror = .{ .publisher = .{ .ptr = &fixture, .vtable = &.{ .next_lsn = Fixture.next, .identity = Fixture.identity, .publish = Fixture.publish, .recover = Fixture.recover, .preflight = Fixture.preflight, .complete = Fixture.complete } }, .mutation_barrier = &barrier };
+            db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &fixture, .check_fn = Fixture.check } };
+            defer {
+                db.local_execution.replication_async_effect_mirror = null;
+                db.local_execution.replication_write_gate = null;
+            }
+            const dispatcher: outbox.DocumentArtifactChildRangeDispatcher = .{ .ptr = &fixture, .select_destination = Fixture.select, .apply = Fixture.apply };
+            try std.testing.expectError(if (failure == .reply_loss) error.CommitCompletionPending else error.Forbidden, db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root));
+            try std.testing.expect(!root.held);
+            try std.testing.expect((try db.core.store.get(alloc, first)) == null);
+            const debt = (try db.core.store.get(alloc, second)) orelse return error.ChildOutboxDebtLost;
+            defer alloc.free(debt);
+            fixture.failure = .none;
+            fixture.closed = false;
+            fixture.calls = 0;
+            const retried = try db.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, fixture.root);
+            try std.testing.expectEqual(@as(usize, 1), retried.deleted);
+            try std.testing.expect((try db.core.store.get(alloc, second)) == null);
+            try std.testing.expect(!root.held);
+            var after = barrier.tryAcquireExclusive() orelse return error.ChildOutboxCaptureLeaked;
+            after.release();
+        }
+    }
+}

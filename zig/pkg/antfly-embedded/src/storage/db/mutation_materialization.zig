@@ -829,11 +829,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
-            var replication_mutation = self.acquireReplicationMutationShared();
+            try deleteDocumentArtifactChildRangeOutboxEntryWithRoot(self, key, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn deleteDocumentArtifactChildRangeOutboxEntryWithRoot(self: anytype, key: []const u8, root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease) !void {
+            var replication_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
+            try self.enforceReplicationWriteGate();
             const deletes = [_][]const u8{key};
             try self.core.store.putBatch(&.{}, deletes[0..]);
         }
@@ -889,8 +894,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dispatcher: DocumentArtifactChildRangeDispatcher,
             limit: usize,
         ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
+            return drainDocumentArtifactChildRangeOutboxWithRoot(self, dispatcher, limit, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn drainDocumentArtifactChildRangeOutboxWithRoot(
+            self: anytype,
+            dispatcher: DocumentArtifactChildRangeDispatcher,
+            limit: usize,
+            root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
+        ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
             if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-            var replication_mutation = self.acquireReplicationMutationShared();
+            var replication_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
 
@@ -906,12 +920,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
 
             const Removal = struct {
+                owner: @TypeOf(self),
+                root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
                 fn remove(ptr: *anyopaque, key: []const u8) !void {
-                    const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
-                    return owner.deleteDocumentArtifactChildRangeOutboxEntry(key);
+                    const context: *@This() = @ptrCast(@alignCast(ptr));
+                    return deleteDocumentArtifactChildRangeOutboxEntryWithRoot(context.owner, key, context.root);
                 }
             };
-            return document_child_range_outbox.drain(self.alloc, scanned, dispatcher, limit, self, Removal.remove);
+            var removal: Removal = .{ .owner = self, .root = root };
+            return document_child_range_outbox.drainWithRetirement(self.alloc, scanned, dispatcher, limit, &removal, Removal.remove, .{ .current = &replication_mutation });
         }
 
         pub fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {

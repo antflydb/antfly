@@ -2776,3 +2776,25 @@ and strict no-skip runner independently of the full pgwire service gate. Native
 focused validation passes, including exact integers, NULLs, array dimensions and
 allocation-failure cleanup. Full portal lifetime and service/session regressions
 remain required by the inherited pgwire integration gate.
+
+### Child-range outbox dispatch capture retirement
+
+Child-range delivery now finishes the owned local scan and releases its mutation
+reader before decoding or invoking the external dispatcher. A removal callback
+keeps the invocation root, opens a fresh local phase only after acknowledgement,
+and rechecks write authority after obtaining apply admission before deletion.
+Batch completion passes its options root into this path. Existing resident and
+recovery entry points retain their signatures and delegate to scoped variants.
+Reply loss, decoding/allocation failure, or rejected deletion preserves remaining
+delivery debt while final defers release every local phase.
+
+The actual drain helper's twelfth root consumer check verifies joined C1/H1
+capture during dispatch with the original operation and 23 retained bytes intact,
+partial acknowledgement, uncertain reply and fenced deletion, and healthy retry.
+The fixture distinguishes a parked reply failure from a resumed cleanup failure;
+its initial double-resume error was corrected without changing production behavior.
+This is a physical-retirement helper proof, not adoption of production CPU lending.
+New server DB cases exercise the real scan/removal methods with legacy and explicit
+retired roots and persisted remaining debt. Those generic instantiations and DB
+cases still require cumulative integration. The complete nested-holder graph,
+ordinary outer fresh-root entry, CPU lending, and pooling defaults remain pending.

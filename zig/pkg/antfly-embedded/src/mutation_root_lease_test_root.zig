@@ -554,3 +554,117 @@ test "mutation root lease mandatory phase remains independent of another legacy 
     var capture = barrier.tryAcquireExclusive() orelse return error.MandatoryPhaseBlockedCapture;
     capture.release();
 }
+
+test "mutation root lease child outbox dispatch retires before capture and preserves unacknowledged debt" {
+    const outbox = @import("storage/db/document_child_range_outbox.zig");
+    const store = @import("storage/docstore.zig");
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: Apply = .{ .io = std.testing.io } } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    const Fixture = struct {
+        owner: *Owner,
+        root: *Barrier.RootSharedLease,
+        scheduler: *native.Scheduler,
+        original: *native.Execution,
+        failure: enum { none, reply_loss, fence } = .none,
+        calls: usize = 0,
+        deleted: [2]bool = .{ false, false },
+        captured: bool = false,
+        capture_failure: ?anyerror = null,
+        fn capture(self: *@This()) void {
+            self.captureImpl() catch |err| {
+                self.capture_failure = err;
+            };
+        }
+        fn captureImpl(self: *@This()) !void {
+            var health: native.Execution = .{};
+            defer health.finish();
+            try health.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            var lease = self.owner.barrier.tryAcquireExclusive() orelse return error.ChildDispatchBlockedCapture;
+            lease.release();
+            self.captured = true;
+        }
+        fn select(_: *anyopaque, _: @import("storage/db/types.zig").DocumentArtifactChildRange) ?u64 {
+            return 7;
+        }
+        fn apply(raw: *anyopaque, _: std.mem.Allocator, dispatch: outbox.DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 7), dispatch.owner_group_id);
+            try std.testing.expect(!self.root.held);
+            try std.testing.expectEqual(@as(usize, 0), self.root.borrowers.load(.acquire));
+            try self.original.park(.resource_blocked);
+            self.captured = false;
+            const worker = try std.Thread.spawn(.{}, capture, .{self});
+            worker.join();
+            if (self.capture_failure) |err| return err;
+            try std.testing.expect(self.captured);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            self.calls += 1;
+            if (self.failure == .reply_loss and self.calls == 2) return error.CommitCompletionPending;
+        }
+        fn remove(raw: *anyopaque, key: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The original execution resumes before fresh local admission.
+            try self.original.enter(.write);
+            var local = (try admission.acquireReplicationMutationSharedScoped(self.owner, null, self.root)).?;
+            defer local.release();
+            try std.testing.expect(local.phase_owner and self.root.held);
+            if (self.failure == .fence and self.calls == 2) return error.Forbidden;
+            self.deleted[if (std.mem.eql(u8, key, "first")) 0 else 1] = true;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const value = try outbox.encodeDocumentChildRangeOutboxRecordAlloc(alloc, .{ .owner_group_id = 7, .doc_key = "doc", .artifact_name = "units", .child_batch = .{} });
+    defer alloc.free(value);
+    const first = try alloc.dupe(u8, "first");
+    defer alloc.free(first);
+    const second = try alloc.dupe(u8, "second");
+    defer alloc.free(second);
+    const pairs = [_]store.OwnedKVPair{ .{ .key = first, .value = value }, .{ .key = second, .value = value } };
+    inline for (.{ .none, .reply_loss, .fence }) |failure| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var original: native.Execution = .{};
+        defer original.finish();
+        try original.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+        var barrier: Barrier = .{};
+        var root = Barrier.RootSharedLease.initRetired(&barrier);
+        defer root.release();
+        var owner: Owner = .{ .barrier = &barrier };
+        var local = try admission.acquireReplicationMutationSharedScoped(&owner, null, &root);
+        defer if (local) |*lease| lease.release();
+        var fixture: Fixture = .{ .owner = &owner, .root = &root, .scheduler = &scheduler, .original = &original, .failure = failure };
+        const dispatcher: outbox.DocumentArtifactChildRangeDispatcher = .{ .ptr = &fixture, .select_destination = Fixture.select, .apply = Fixture.apply };
+        const result = outbox.drainWithRetirement(alloc, &pairs, dispatcher, 0, &fixture, Fixture.remove, .{ .current = &local });
+        if (failure == .none) {
+            const completed = try result;
+            try std.testing.expectEqual(@as(usize, 2), completed.deleted);
+        } else {
+            try std.testing.expectError(if (failure == .reply_loss) error.CommitCompletionPending else error.Forbidden, result);
+            try std.testing.expect(!fixture.deleted[1]);
+        }
+        try std.testing.expect(fixture.deleted[0]);
+        try std.testing.expect(local == null and !root.held);
+        if (failure != .none) {
+            fixture.failure = .none;
+            fixture.calls = 0;
+            // Reply loss exits while parked; fenced deletion has already
+            // resumed the same execution before its local rejection.
+            if (failure == .reply_loss) try original.enter(.write);
+            local = try admission.acquireReplicationMutationSharedScoped(&owner, null, &root);
+            const retried = try outbox.drainWithRetirement(alloc, pairs[1..], dispatcher, 0, &fixture, Fixture.remove, .{ .current = &local });
+            try std.testing.expectEqual(@as(usize, 1), retried.deleted);
+            try std.testing.expect(fixture.deleted[1]);
+        }
+        try std.testing.expect(local == null and !root.held);
+        var after = barrier.tryAcquireExclusive() orelse return error.ChildOutboxLeakedMutationReader;
+        after.release();
+    }
+}

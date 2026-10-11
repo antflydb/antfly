@@ -3012,7 +3012,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
-                _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
+                _ = try self.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             }
             if (append_derived_replay) {
                 var pressure_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
