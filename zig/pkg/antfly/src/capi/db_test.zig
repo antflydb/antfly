@@ -1375,6 +1375,41 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(@as(u64, 5), cleanup.value.position.sequence);
         try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
     }
+    const Denied = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var denied_context: u8 = 0;
+    handle.db.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    defer handle.db.local_execution.replication_write_gate = null;
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..3) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const gc_response = response;
+        defer freeRawBuffer(gc_response.ptr, gc_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexCleanupMaintenanceOutcome, a, gc_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt < 2, progress.value.advanced);
+        try std.testing.expectEqual(attempt > 0, progress.value.artifacts_retired);
+    }
+    try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        const authority = local.storage_source_authority;
+        const clock = try authority.require(&read, .native, local.storage_db_online_source_contract.namespaceBytes(header.fence.namespace));
+        try std.testing.expectEqual(@as(u64, 5), clock.sequence);
+    }
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

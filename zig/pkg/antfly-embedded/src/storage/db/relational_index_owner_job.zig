@@ -707,10 +707,15 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
 /// Bounded physical-artifact verification only. Global claims, final binding
 /// retirement and epoch release still need independent completion; callers
 /// must not turn this check into a signed canceled publication receipt.
-pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void {
+pub fn requireCancellationCleanup(txn: anytype, binding: Binding) !positions.Native {
     try cancellation.requireCanceled(txn, binding);
     try requireReservedState(txn, binding);
-    _ = (try loadCancellationCleanup(txn, try load(txn))) orelse return error.PrivateIndexCancellationRequired;
+    const record = (try loadCancellationCleanup(txn, try load(txn))) orelse return error.PrivateIndexCancellationRequired;
+    return record.position;
+}
+
+pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void {
+    _ = try requireCancellationCleanup(txn, binding);
     const gc = @import("relational_index_gc.zig");
     if (try optional(txn, &gc.key(binding.index)) != null or
         try optional(txn, &@import("relational_index_jobs.zig").progressKey(binding.index)) != null or

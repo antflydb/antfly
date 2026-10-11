@@ -141,6 +141,12 @@ pub const Outcome = struct {
     receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
 };
 
+/// Physical progress only, not a canceled publication receipt or source cut.
+pub const CleanupMaintenanceOutcome = struct {
+    advanced: bool,
+    artifacts_retired: bool,
+};
+
 const Artifacts = struct {
     candidate: candidate_mod.Candidate,
     addition: physical.PrivateAddition,

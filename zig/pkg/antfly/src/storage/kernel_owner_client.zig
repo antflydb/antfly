@@ -564,6 +564,16 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeIndexOwnerGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .cancel_gc_page,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(identity_json),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeIndexOwnerCancellationJson(self: *Owner, table_name: []const u8, intent_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

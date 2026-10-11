@@ -457,6 +457,55 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&read, binding));
         try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
     }
+
+    // Standby-local derived cleanup must not weaken ordinary admission. An
+    // unrelated queued generation is untouched by the targeted worker.
+    const Denied = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var denied_context: u8 = 0;
+    follower.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    defer follower.local_execution.replication_write_gate = null;
+    const gc = @import("relational_index_gc.zig");
+    try std.testing.expect(binding.index.generation > 1);
+    const unrelated: records.Id = .{ .generation = binding.index.generation - 1, .slot = binding.index.slot };
+    try std.testing.expect(std.mem.order(u8, &gc.key(unrelated), &gc.key(binding.index)) == .lt);
+    try follower.core.store.putBatch(&.{.{ .key = &gc.key(unrelated), .value = &gc.initial(unrelated) }}, &.{});
+    try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
+    const first_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(first_page.advanced);
+    try std.testing.expect(!first_page.artifacts_retired);
+    // Resume the admitted generation after a restart between bounded phases.
+    follower.local_execution.replication_write_gate = null;
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    follower.local_execution.replication_write_gate = .{ .borrowed = .{
+        .ptr = &denied_context,
+        .check_fn = Denied.check,
+        .allows_background_work = false,
+    } };
+    const final_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(final_page.advanced);
+    try std.testing.expect(final_page.artifacts_retired);
+    const duplicate_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
+    try std.testing.expect(!duplicate_page.advanced);
+    try std.testing.expect(duplicate_page.artifacts_retired);
+    try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
+    try std.testing.expectEqual(@as(u64, 2), try follower.replicationAppliedSequence());
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireCancellationArtifactsRetired(&read, binding);
+        try std.testing.expectEqualSlices(u8, &gc.initial(unrelated), try read.get(&gc.key(unrelated)));
+        try std.testing.expectEqual(@as(u64, 5), (try authority.require(&read, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace))).sequence);
+        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+    }
 }
 
 test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {
