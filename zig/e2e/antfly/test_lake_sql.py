@@ -261,10 +261,12 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 {"statement": "SELECT SUM(amount) FROM lake_events WHERE amount >= 0"},
             )["rows"] == [[str(amount_sum)]]
         finally:
+            server.pause()
             for artifact_path, original in originals:
                 # Do not resurrect obsolete generations collected after resume.
                 if artifact_path.exists():
                     artifact_path.write_bytes(original)
+            server.resume()
         assert request(
             "POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events"}
         )["rows"] == [[str(amount_sum)]]
