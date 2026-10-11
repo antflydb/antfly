@@ -677,8 +677,10 @@ test "relational integrity transfer validates borrowed action jobs before compan
         claim: []const u8,
         job: []const u8,
         scratch: [2048]u8 = undefined,
+        fail_reads: bool = false,
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.fail_reads) return error.BackendReadFailed;
             const raw = if (std.mem.eql(u8, key, &self.address.claimKey())) self.claim else if (std.mem.eql(u8, key, &self.address.jobKey())) self.job else return error.NotFound;
             @memcpy(self.scratch[0..raw.len], raw);
             return self.scratch[0..raw.len];
@@ -692,6 +694,8 @@ test "relational integrity transfer validates borrowed action jobs before compan
     defer alloc.free(foreign);
     txn.job = foreign;
     try std.testing.expectError(error.ForeignKeyActionMismatch, validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey())));
+    txn.fail_reads = true;
+    try std.testing.expectError(error.BackendReadFailed, validateTransferredCompanions(&txn, &address.jobKey(), job_bytes));
 }
 
 test "relational integrity keys are generation bound explicitly routed and checksummed" {
