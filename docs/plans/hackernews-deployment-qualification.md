@@ -397,12 +397,15 @@ attempt; a new $20 reservation fits the unchanged $150 ceiling. Original run
 history and allowances remain, and posted gross billing supersedes these bounds,
 including an overrun. The failed registration attempt measured no search latency.
 
-Colony's separate storage preparation provides a dedicated protected bucket,
-one exact Workload Identity principal and retained catalog disk. The application
-renderer can omit these Pulumi-owned prerequisites with `--foundation-exists`.
-An approved current infrastructure preview, credential-refresh/replacement-pod
-qualification and the actual archive gate are still required before public
-serving. A full-archive attempt must budget GCS operations and retain partial
+The real deployment target is an organization-owned Antfly Cloud instance.
+Colony PR #762 consolidates the optional standalone storage proposal; it is
+disabled by default. Its initial 20 GiB disk is not a Cloud storage requirement,
+and its example service-account grant does not authorize a managed tenant. The
+application renderer can omit separately provisioned prerequisites with
+`--foundation-exists`, but is not the managed provisioning path. Qualify the
+released runtime, actual tenant identity, credential refresh, replacement-pod
+recovery and authenticated managed API before public serving. See
+[deployment guidance](../../examples/hackernews/DEPLOYMENT.md). A full-archive attempt must budget GCS operations and retain partial
 catalog/checkpoint state; do not multiply a one-file timing into a proven bound
 or discard an interrupted build's catalog after its pod deadline.
 
@@ -416,9 +419,13 @@ Native indexed range predicates also translate safe pointer paths.
 Sorted page publication now admits batches of at most eight immutable uploads.
 All children finish before roots can be returned or owners released, including
 failure and cancellation. Memory admission is synchronized across workers;
-format, page identities, attempt scope and publication fences stay intact. This
-reduces serial request latency but does not reduce object counts or prove full
-archive throughput. Repeated remote reads during statistics reduction and full
+the page format, attempt scope and publication fences stay intact. Default
+32 KiB builders retain their page identities. Initial bulk ordered trees and
+text-statistics trees now target 256 KiB pages to reduce object counts, while
+keeping the existing 1 MiB page ceiling. A 1,000-row regression compares complete
+forward/reverse and bounded reads, verifies more than a fourfold reduction in
+page writes, and rejects invalid targets before reading or uploading. Neither
+batching nor this fixture establishes full archive throughput. Repeated remote reads during statistics reduction and full
 archive object-request costs remain measurement targets.
 
 The harness keeps the last nonempty deep page for restart replay, rejects

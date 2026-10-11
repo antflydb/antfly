@@ -655,13 +655,13 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
         }
     };
     const files: []const local.serverless_external_source_types.FileEntry = &.{
-        .{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = 2048, .row_groups = &.{} },
+        .{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = 16384, .row_groups = &.{} },
         .{ .file_id = @constCast("b"), .object_uri = @constCast("file://b"), .byte_len = 1, .row_count = 1, .row_groups = &.{} },
     };
     var inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files[0..1]) };
-    var first = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
+    var first = local.sql_spill.Sort.init(a, &manager, &.{.{}}, tree.bulk_target_page_bytes * 4);
     defer first.deinit();
-    for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
+    for (0..16384) |n| try Make.add(&first, @intCast(n), 0, n);
     const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
     const root = try loadRoot(ca, store, ref, .none, null);
     // Physical reverse traversal applies tuple bounds without hydration.
@@ -677,7 +677,7 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
             return .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = n } };
         }
     };
-    for ([_]u64{ 102, 99, 100, 103, 101, 2048 }) |n| try std.testing.expectEqual(n >= 100 and n < 103, try predicate_reader.containsPhysical(Probe.row(n), &lower_key, &upper_key));
+    for ([_]u64{ 102, 99, 100, 103, 101, 16384 }) |n| try std.testing.expectEqual(n >= 100 and n < 103, try predicate_reader.containsPhysical(Probe.row(n), &lower_key, &upper_key));
     var wrong = Probe.row(100);
     wrong.external.snapshot_id = "changed";
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate_reader.containsPhysical(wrong, &lower_key, &upper_key));
@@ -721,10 +721,10 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     store.upload_scope.?.attempt = @splat(2);
     var append = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
     defer append.deinit();
-    try Make.add(&append, 5000, 1, 0);
+    try Make.add(&append, 20000, 1, 0);
     const appended = try publishIncremental(a, ca, &store, &append, "ordered", @splat(3), inventory, &.{}, .none, .{ .previous = root, .keep = &.{true}, .files = &.{ "a", "b" }, .fingerprints = &.{ @splat(1), @splat(2) } });
     const next = try loadRoot(ca, store, appended, .none, null);
-    try std.testing.expectEqual(@as(u64, 2049), next.page.?.records);
+    try std.testing.expectEqual(@as(u64, 16385), next.page.?.records);
     try std.testing.expectEqual(next.page.?.records, next.reverse.?.records);
     var after: Pages = .{ .alloc = a };
     defer after.refs.deinit(a);
@@ -736,7 +736,7 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     store.upload_scope.?.attempt = @splat(3);
     var replacement = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
     defer replacement.deinit();
-    try Make.add(&replacement, 9000, 0, 0);
+    try Make.add(&replacement, 30000, 0, 0);
     const replaced = try publishIncremental(a, ca, &store, &replacement, "ordered", @splat(3), inventory, &.{}, .none, .{ .previous = next, .keep = &.{ false, true }, .files = &.{ "a", "b" }, .fingerprints = &.{ @splat(3), @splat(2) } });
     const final = try loadRoot(ca, store, replaced, .none, null);
     try std.testing.expectEqual(@as(u64, 2), final.page.?.records);

@@ -462,14 +462,14 @@ test "external lake text statistics spill sorted deltas and reuse untouched page
         }
         fn checkpoint(_: *anyopaque) !void {}
     };
-    var source: Source = .{ .count = 8000 };
+    var source: Source = .{ .count = 16000 };
     const summaries = try tree.buildSorted(a, backing.store(), &source);
     var dummy: u8 = 0;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Source.checkpoint };
     defer manager.deinit();
     var initial = Builder.init(a, &manager);
     defer initial.deinit();
-    initial.sort.memory_bytes = 64 * 1024;
+    initial.sort.memory_bytes = tree.bulk_target_page_bytes;
     initial.sort.parallel_runs = false;
     try initial.add(backing.store(), summaries, 1);
     try initial.add(backing.store(), summaries, 1);
@@ -484,9 +484,9 @@ test "external lake text statistics spill sorted deltas and reuse untouched page
     try update.add(backing.store(), removed, -1);
     const changed = (try update.finish(backing.store(), global)).?;
     // A one-term change rewrites its path, not the entire vocabulary.
-    try std.testing.expect(backing.written_bytes - written < 64 * 1024);
+    try std.testing.expect(backing.written_bytes - written < tree.bulk_target_page_bytes * 2);
     try std.testing.expectEqual(global.records, changed.records);
-    for ([_]u64{ 0, 1, 7999 }) |ordinal| {
+    for ([_]u64{ 0, 1, 15999 }) |ordinal| {
         var key: [16]u8 = undefined;
         std.mem.writeInt(u32, key[0..4], 4, .big);
         @memcpy(key[4..8], "body");
@@ -501,7 +501,7 @@ test "external lake text statistics spill sorted deltas and reuse untouched page
     defer remove_again.deinit();
     try remove_again.add(backing.store(), removed, -1);
     const without = (try remove_again.finish(backing.store(), changed)).?;
-    try std.testing.expectEqual(@as(u64, 7999), without.records);
+    try std.testing.expectEqual(@as(u64, 15999), without.records);
     var invalid = Builder.init(a, &manager);
     defer invalid.deinit();
     try invalid.add(backing.store(), removed, -1);
