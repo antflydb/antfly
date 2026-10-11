@@ -2352,9 +2352,46 @@ cloning/deduplication and service readiness. A combined Debug repeat passes
 LSM restart. Review then extended monotone readiness retention to historical
 profiles: a late weaker probe cannot erase a stronger proof for the same
 membership, while replacement membership discards the old proof. All three
-standalone protocol tests pass for that final change. The final combined repeat,
-C-ABI contention/cleanup and optimized runs remain in qualification.
+standalone protocol tests pass for that final change. The final Debug result is
+recorded below; optimized authority qualification remains pending.
 Authenticated producer/signing integration, cancellation
 tombstones, later publication phases and distributed fault/public atomicity
 gates are still unfinished. No original SQL case receives credit from this
 component work.
+
+The final Debug repeat completes 105/105 build steps and 44 tests, including
+the six private C-ABI native-index/runtime-status contention and cleanup cases,
+with no skips, failures or leaks. Separately, the pre-authority main-merged
+baseline completes 103/103 optimized build steps and 73 tests (three native
+owner, fifty namespace/restore and twenty publication/decoder tests). The
+authority change itself still requires optimized qualification; the baseline
+does not establish that result.
+
+### Physical-root-bound native receipt recovery (in qualification)
+
+Receipt recovery now returns the generation of the exact owner lease that
+recovered the durable native cut. The receiver retains that generation with its
+owned recovered outcome. It cannot safely recover a cut, release the owner and
+then attach a generation obtained from a separate current-root lookup: a root
+replacement between those operations would relabel evidence from the old root.
+This adds no scan, additional physical RPC or schema-sized allocation. Pending
+replication outcomes remain pending and do not gain a publishable receipt.
+
+The composed LSM fixture now provisions a non-default descriptor generation,
+fully closes/reopens it, recovers the original reserved cut and observes the
+same generation from the compiled owner's runtime status. A subsequent routing
+generation change must not change the generation already attached to the
+recovered result. Empty-job, foreign-namespace and pre-acquisition cancellation
+checks cover the new adapter. The combined Debug gate passes 94/94 build steps
+and all 23 tests (three physical-owner, nineteen publication and one decoder
+floor), with no skips, failures or leaks. Optimized qualification is pending;
+these are physical receipt/lease tests, not enrollment or distributed placement
+evidence. Inventory integrity and the 2,028-source licensing boundary pass;
+the original SQL dispositions remain unchanged.
+
+Signing still needs actual durable replica placement, the enrolled store root,
+the current reporter incarnation and metadata's matching root-generation
+checks. Native standalone ownership must not borrow a synthetic replica ID or
+Raft position, nor perform a full replica-catalog scan for each receipt. That
+integration, authenticated delivery, cancellation, later lifecycle phases and
+the public failed-build atomicity gate remain required before activation.

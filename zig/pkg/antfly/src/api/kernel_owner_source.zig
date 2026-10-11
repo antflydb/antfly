@@ -85,6 +85,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         const expected = if (context.deadline_ns != null) error.DeadlineExceeded else error.Canceled;
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
     }
@@ -3627,6 +3628,41 @@ pub const ProvisionedKernelOwnerSource = struct {
         return std.json.parseFromSlice(?index_owner_job.Binding, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
+    /// The generation is observed from the same pinned physical owner that
+    /// recovered the cut, never from a later routing/status lookup. This is not
+    /// an attestation: pending outcomes still carry no publishable receipt, and
+    /// enrollment, replica placement and signing remain the receiver's duties.
+    pub const RootedNativeIndexOwnerReceipt = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(?native_index_control.Outcome),
+
+        pub fn deinit(self: *RootedNativeIndexOwnerReceipt) void {
+            self.outcome.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn nativeIndexOwnerReceiptAtRoot(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: native_index_control.ReceiptRequest,
+        context: request_operation.RequestContext,
+    ) !RootedNativeIndexOwnerReceipt {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerReceiptJson(table_name, encoded);
+        defer response.deinit();
+        return .{
+            .root_generation = lease.entry.generation,
+            .outcome = try std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false }),
+        };
+    }
+
     pub fn nativeIndexOwnerReceipt(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -3635,14 +3671,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         request: native_index_control.ReceiptRequest,
         context: request_operation.RequestContext,
     ) !std.json.Parsed(?native_index_control.Outcome) {
-        var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
-        defer lease.deinit();
-        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
-        defer alloc.free(encoded);
-        try context.ensureActive();
-        var response = try lease.owner().nativeIndexOwnerReceiptJson(table_name, encoded);
-        defer response.deinit();
-        return std.json.parseFromSlice(?native_index_control.Outcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        // Transfer the parsed response; this observational caller does not
+        // sign it and must not reconstruct a generation from another lookup.
+        return (try self.nativeIndexOwnerReceiptAtRoot(alloc, group_id, table_name, request, context)).outcome;
     }
 
     pub fn admitNativeIndexOwner(

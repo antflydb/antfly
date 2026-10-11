@@ -90,9 +90,14 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var receipt = try owners.nativeIndexOwnerReceipt(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
         defer receipt.deinit();
         try std.testing.expect(receipt.value == null);
+        var rooted = try owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = identity, .effect = .fenced }, .{});
+        defer rooted.deinit();
+        try std.testing.expect(rooted.outcome.value == null);
+        try std.testing.expectEqual(table_reads.backend_current_root_generation, rooted.root_generation);
         var foreign = identity;
         foreign.namespace.range_id += 1;
         try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerState(alloc, 7501, "items", foreign, .{}));
+        try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeIndexOwnerReceiptAtRoot(alloc, 7501, "items", .{ .identity = foreign, .effect = .fenced }, .{}));
         var after_rejection = try owners.nativeIndexOwnerState(alloc, 7501, "items", identity, .{});
         defer after_rejection.deinit();
         try std.testing.expect(after_rejection.value == null);
@@ -159,6 +164,14 @@ test "native index owner adapter executes fresh permission stages and recovers r
     };
     var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range} };
     const group = plan.owners[0].range.group_id;
+    const RootGeneration = struct {
+        fn read(ptr: *anyopaque, _: u64) u64 {
+            return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    // Choose a non-default descriptor generation, then recover the actual
+    // persisted cut from that root after all process-local owners are closed.
+    var root_generation: u64 = 7;
     const request: execution.Request = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .operation = .fence };
     var prepared: ?publication.Prepared = null;
     defer if (prepared) |*value| value.deinit();
@@ -167,6 +180,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
     {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
+        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
         defer owners.deinit();
         // Read the actual newly provisioned owner's epoch and catalog instead
         // of guessing them from the metadata fixture's synthetic defaults.
@@ -208,6 +222,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var recovered_fence = try execution.step(alloc, &owners, &metadata, plan.before.name, request, .{});
         defer recovered_fence.deinit();
         try std.testing.expect(recovered_fence == .recovered);
+        try std.testing.expectEqual(root_generation, recovered_fence.recovered.root_generation);
         try std.testing.expectEqual(try fence_receipt.digest(), try recovered_fence.outcome().?.receipt.?.digest());
         // This metadata driver simulates permission progression only. Root
         // signature/enrollment verification is not bypassed in production.
@@ -230,12 +245,14 @@ test "native index owner adapter executes fresh permission stages and recovers r
     {
         var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
         owners.online_source_authority = .native;
+        owners.group_visible_root_generation = .{ .ptr = &root_generation, .visible_root_generation_for_group = RootGeneration.read };
         defer owners.deinit();
         var reserve_request = request;
         reserve_request.operation = .reserve;
         var recovered = try execution.step(alloc, &owners, &metadata, plan.before.name, reserve_request, .{});
         defer recovered.deinit();
         try std.testing.expect(recovered == .recovered);
+        try std.testing.expectEqual(root_generation, recovered.recovered.root_generation);
         try std.testing.expect(recovered.outcome().?.duplicate);
         try std.testing.expectEqual(try reserved_receipt.digest(), try recovered.outcome().?.receipt.?.digest());
         try std.testing.expectEqual(reserved_receipt.position.native.sequence, recovered.outcome().?.position.sequence);
@@ -245,8 +262,12 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(.native, authority.kind);
         try std.testing.expectEqualSlices(u8, &local.storage_db_online_source_contract.namespaceBytes(reserved_receipt.owner.namespace), &authority.namespace);
         try std.testing.expect(authority.sequence >= reserved_receipt.position.native.sequence);
-        try std.testing.expectEqual(table_reads.backend_current_root_generation, observed.metadata.lsm_root_generation);
+        try std.testing.expectEqual(root_generation, observed.metadata.lsm_root_generation);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+        // A subsequent routing/root switch must not relabel the already
+        // recovered receipt as belonging to the replacement physical root.
+        root_generation += 1;
+        try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
     }
 }
 

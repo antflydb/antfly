@@ -50,7 +50,16 @@ pub const Request = struct {
 /// outcome without a receipt is durable progress, not a fenced/reserved ACK.
 pub const Result = union(enum) {
     acknowledged,
-    recovered: std.json.Parsed(?native.Outcome),
+    recovered: struct {
+        /// Copied from the lease that recovered the committed physical cut;
+        /// never substitute a later current-root observation when signing.
+        root_generation: u64,
+        outcome: std.json.Parsed(?native.Outcome),
+
+        pub fn deinit(self: @This()) void {
+            self.outcome.deinit();
+        }
+    },
     applied: std.json.Parsed(native.Outcome),
 
     pub fn deinit(self: *Result) void {
@@ -66,7 +75,7 @@ pub const Result = union(enum) {
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
             .acknowledged => null,
-            .recovered => |value| value.value,
+            .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
         };
     }
@@ -113,11 +122,11 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
             .fence => .fenced,
             .reserve => .reserved,
         };
-        var recovered = try source.nativeIndexOwnerReceipt(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
-        if (recovered.value) |value| {
+        var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
+        if (recovered.outcome.value) |value| {
             errdefer recovered.deinit();
             _ = try permission.value.nativeControl(hot_request, value.binding);
-            return .{ .recovered = recovered };
+            return .{ .recovered = .{ .root_generation = recovered.root_generation, .outcome = recovered.outcome } };
         }
         recovered.deinit();
         const command = try permission.value.nativeControl(hot_request, binding);
@@ -150,6 +159,7 @@ const TestDriver = struct {
     admission_reads: usize = 0,
     inspections: usize = 0,
     recoveries: usize = 0,
+    root_generation: u64 = 9,
     admissions: usize = 0,
     controls: usize = 0,
     cancel_admission: bool = false,
@@ -185,9 +195,9 @@ const TestDriver = struct {
         return parsed(?jobs.Binding, alloc, self.binding);
     }
 
-    pub fn nativeIndexOwnerReceipt(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.ReceiptRequest, _: operation.RequestContext) !std.json.Parsed(?native.Outcome) {
+    pub fn nativeIndexOwnerReceiptAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.ReceiptRequest, _: operation.RequestContext) !@FieldType(Result, "recovered") {
         self.recoveries += 1;
-        return parsed(?native.Outcome, alloc, self.receipt_result);
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(?native.Outcome, alloc, self.receipt_result) };
     }
 
     pub fn admitNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, header: native.Admission, manifest: []const u8, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -290,6 +300,9 @@ test "relational index publication native receiver stages one effect recovers pe
         defer result.deinit();
         @memset(&pending_name, 'x');
         try std.testing.expect(result == .recovered);
+        try std.testing.expectEqual(@as(u64, 9), result.recovered.root_generation);
+        driver.root_generation = 10;
+        try std.testing.expectEqual(@as(u64, 9), result.recovered.root_generation);
         try std.testing.expect(result.outcome().?.replication_pending);
         try std.testing.expectEqualStrings("ReplicationOutboxPending", result.outcome().?.error_name.?);
         try std.testing.expectEqual(@as(usize, 1), driver.controls);
