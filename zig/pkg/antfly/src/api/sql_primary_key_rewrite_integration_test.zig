@@ -85,12 +85,15 @@ fn dataControl(ptr: *anyopaque) !void {
 }
 
 fn request(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8) !http.HttpResponse {
+    return requestWithTimeout(alloc, transport, headers, base, suffix, method, body, if (method == .GET) 1_000 else null);
+}
+fn requestWithTimeout(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, suffix: []const u8, method: http.Method, body: ?[]const u8, timeout_ms: ?u32) !http.HttpResponse {
     const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, suffix });
     defer alloc.free(uri);
     // The transport owns Authorization separately and strips it from ordinary
     // headers; keep the Basic credential on its canonical request field.
     const authorization = if (headers.len > 0 and std.ascii.eqlIgnoreCase(headers[0].name, "authorization")) headers[0].value else null;
-    return transport.execute(alloc, .{ .method = method, .uri = uri, .authorization = authorization, .headers = if (authorization != null) headers[1..] else headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = if (method == .GET) 1_000 else null });
+    return transport.execute(alloc, .{ .method = method, .uri = uri, .authorization = authorization, .headers = if (authorization != null) headers[1..] else headers, .content_type = if (body == null) null else "application/json", .body = body orelse "", .timeout_ms = timeout_ms });
 }
 fn sql(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, statement: []const u8) !http.HttpResponse {
     const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
@@ -132,9 +135,14 @@ fn sqlInteger(value: std.json.Value) !i64 {
 fn expectSqlPostimage(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, name: []const u8) !void {
     const statement = try std.fmt.allocPrint(alloc, "SELECT id, note FROM {s} ORDER BY id", .{name});
     defer alloc.free(statement);
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+    defer alloc.free(body);
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     while (true) {
-        var response = try sql(alloc, transport, headers, base, statement);
+        const remaining_ns = deadline -| platform.time.monotonicNs();
+        if (remaining_ns == 0) return error.SqlPostimageReadTimeout;
+        const timeout_ms: u32 = @intCast(@max(1, remaining_ns / std.time.ns_per_ms));
+        var response = try requestWithTimeout(alloc, transport, headers, base, "/db/v1/sql", .POST, body, timeout_ms);
         defer response.deinit(alloc);
         if (response.status != 200) {
             // Repeating this pure read is safe, but only tolerate the
