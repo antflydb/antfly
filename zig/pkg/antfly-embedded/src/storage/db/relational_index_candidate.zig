@@ -938,6 +938,24 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         if (page.receipts.len != 0) {
             var txn = try store.beginWriteTxn();
             defer txn.abort();
+            const receipt = page.receipts[0];
+            const future = try a.dupe(u8, receipt.value);
+            defer a.free(future);
+            const canceled = (try @import("relational_index_cancellation_intent.zig").load(&txn)).?;
+            std.mem.writeInt(u64, future[4..12], canceled.position.sequence, .little);
+            // Re-sign the physical checksum to isolate cut-order validation
+            // from the preceding ordinary checksum-corruption regression.
+            var checksum = std.crypto.hash.Blake3.init(.{});
+            checksum.update("antfly private claim receipt v1");
+            checksum.update(receipt.key);
+            checksum.update(future[0..76]);
+            checksum.final(future[76..108]);
+            try txn.put(receipt.key, future);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, claims.GcPage.prepare(a, std.testing.io, &txn, binding));
+        }
+        if (page.receipts.len != 0) {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
             const restored = try first.encode(a, address);
             defer a.free(restored);
             // Inject a physical drift without binding a legitimate writer.

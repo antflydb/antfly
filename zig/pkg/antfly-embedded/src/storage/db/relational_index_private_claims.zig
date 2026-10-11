@@ -157,14 +157,14 @@ fn encodeReceipt(key: []const u8, binding: jobs.Binding, digest: integrity.Diges
     return result;
 }
 
-fn decodeReceipt(key: []const u8, value: []const u8, binding_digest: integrity.Digest, reserved: u64, current: u64) !u64 {
+fn decodeReceipt(key: []const u8, value: []const u8, binding_digest: integrity.Digest, reserved: u64, maximum: u64) !u64 {
     if (key.len != receipt_key_len or !std.mem.startsWith(u8, key, receipt_prefix) or
         value.len != receipt_value_len or !std.mem.eql(u8, value[0..4], "AICR") or
         !std.mem.eql(u8, value[12..44], &binding_digest) or
         !std.mem.eql(u8, value[44..76], key[receipt_prefix.len + 16 ..]) or
         !std.mem.eql(u8, value[76..], &receiptChecksum(key, value[0..76]))) return error.InvalidPrivateIndexClaimReceipt;
     const sequence = std.mem.readInt(u64, value[4..12], .little);
-    if (sequence <= reserved or sequence > current) return error.InvalidPrivateIndexClaimReceipt;
+    if (sequence <= reserved or sequence > maximum) return error.InvalidPrivateIndexClaimReceipt;
     return sequence;
 }
 
@@ -389,7 +389,7 @@ pub const GcPage = struct {
             if (raw.len > integrity.max_record_bytes or !std.mem.eql(u8, &expected_hash, &hash(raw))) return error.InvalidPrivateIndexClaimInventory;
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
-            if (claim.state != .live) return error.InvalidPrivateIndexClaimInventory;
+            if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
             try entries.append(owned, .{ .address = address, .value = value, .expected = value });
             bytes +|= value.len + key_len;
             if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
@@ -399,7 +399,7 @@ pub const GcPage = struct {
             // source cuts are self-contained, so this phase never scans rows
             // or attempts to decode claims that earlier pages retired.
             const digest = try bindingDigest(binding);
-            const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+            const canceled = (try @import("relational_index_cancellation_intent.zig").load(txn)) orelse return error.PrivateIndexCancellationRequired;
             const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
             var receipts: std.ArrayList(ReceiptEntry) = .empty;
             const receipt_start = receiptKey(allocation.generation, @splat(0));
@@ -408,7 +408,10 @@ pub const GcPage = struct {
             while (next) |entry| : (next = try cursor.next()) {
                 if (!std.mem.startsWith(u8, entry.key, selected)) break;
                 if (io) |runtime| try runtime.checkCancel();
-                _ = try decodeReceipt(entry.key, entry.value, digest, reserved.sequence, current.sequence);
+                // Every claim cut precedes cancellation, not merely today's
+                // potentially newer source clock. A checksummed post-intent
+                // receipt cannot acquire legitimacy during restoration/GC.
+                _ = try decodeReceipt(entry.key, entry.value, digest, reserved.sequence, canceled.position.sequence -| 1);
                 try receipts.append(owned, .{ .key = try owned.dupe(u8, entry.key), .value = try owned.dupe(u8, entry.value) });
                 if (receipts.items.len >= 256 or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
             }
@@ -431,10 +434,20 @@ pub const GcPage = struct {
             const start = generationPrefix(allocation.generation);
             if (try cursor.seekAtOrAfter(&start)) |entry| if (std.mem.startsWith(u8, entry.key, &start)) return error.VersionConflict;
         }
-        for (self.receipts) |receipt| {
-            if (!optionalEqual(try optional(txn, receipt.key), receipt.value)) return error.VersionConflict;
+        if (self.receipts.len != 0) {
+            const canceled = (try @import("relational_index_cancellation_intent.zig").load(txn)) orelse return error.PrivateIndexCancellationRequired;
+            const reserved = (try jobs.nativeEffectPosition(txn, self.binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
+            const digest = try bindingDigest(self.binding);
+            const receipt_start = receiptKey(allocation.generation, @splat(0));
+            const selected = receipt_start[0 .. receipt_prefix.len + 16];
+            for (self.receipts) |receipt| {
+                if (!std.mem.startsWith(u8, receipt.key, selected)) return error.InvalidPrivateIndexClaimReceipt;
+                if (!optionalEqual(try optional(txn, receipt.key), receipt.value)) return error.VersionConflict;
+                _ = try decodeReceipt(receipt.key, receipt.value, digest, reserved.sequence, canceled.position.sequence -| 1);
+            }
         }
         for (self.entries) |entry| {
+            if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
             if (!optionalEqual(try optional(txn, &entry.address.claimKey()), entry.expected)) return error.VersionConflict;
             try checkInventory(txn, entry.address, entry.expected);
             if (try optional(txn, &entry.address.jobKey()) != null) return error.InvalidPrivateIndexClaimInventory;
