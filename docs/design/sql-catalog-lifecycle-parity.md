@@ -1117,6 +1117,43 @@ ports, projected private builders/unique claims and atomic public publication
 still need integration. The native failed-build atomicity gate remains red;
 there is no original-case disposition credit or claim of public SQL parity.
 
+### Independent private UNIQUE candidate validation
+
+`metadata/relational_index_candidate.zig` now prepares owned candidate and
+reservation catalogs only after independently validating the entire schema
+delta. Exactly one index and one `origin: index` UNIQUE rule may be added. All
+other schema fields, including unknown future fields, CHECKs, defaults, generated
+columns and existing declarations, must remain structurally unchanged. Object
+key order is irrelevant; unrelated numerical/array rewrites are not authorized.
+The schema epoch must advance exactly once, and external/document tables are
+rejected before catalog preparation.
+
+Physical and logical keys are independently compiled and compared using typed
+equality identity, including expression/collation identity. Sort direction and
+covering columns do not change uniqueness. Partial membership must have the
+same compiled predicate identity on both sides. A matching name alone is not
+sufficient. The supplied predecessor is independently reconciled against its
+schema and required to remain byte-identical, retaining CHECK coverage, retired
+bindings and previously burned generation allocations. The private reservation
+changes neither the public schema epoch nor the active constraint bindings.
+
+Four focused tests pass in Debug and ReleaseFast with zero skips/failures/leaks,
+covering independent CHECK preservation, exact publication CAS preparation,
+unrelated row/CHECK changes, incomplete pairs, constraint/PRIMARY/deferred
+substitution, mismatched physical keys/predicates, stale predecessors, wrong
+incarnations and generation non-reuse after cancellation. The focused gate is
+also a dependency of `antfly-unit-test`; this does not claim that the full unit
+aggregate has run. Inputs are length-bounded before parsing, and compilation is
+per candidate, not per row. No SQL latency or throughput improvement is claimed.
+
+This candidate validator is not yet called by production index admission.
+The durable plan, complete owner cut, table/name locks, private projected build,
+global uniqueness claims and atomic public publication still require integration.
+The original SQL inventory is unchanged. The post-main native FK rerun passed
+three of four cases: DROP reached ADD FOREIGN KEY but received HTTP 500 from
+`MetadataLinearizableReadTimeout`. Thus the native gate remains intermittently
+red; neither these component tests nor the main merge resolve that timeout.
+
 ### Versioned CHECK catalog identities for regular FK publication
 
 The fail-first metadata regression reproduced a compiler mismatch: the owner
