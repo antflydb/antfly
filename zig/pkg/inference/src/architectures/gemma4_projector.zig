@@ -51,6 +51,23 @@ pub const ProjectedImages = struct {
     }
 };
 
+/// Owned projected rows in input order. The creating backend must outlive this value.
+pub const ResidentProjectedImages = struct {
+    allocator: std.mem.Allocator,
+    backend: *const ComputeBackend,
+    embeddings: CT,
+    tokens_per_image: []usize,
+    hidden_size: usize,
+    batches_executed: usize,
+    max_batch_executed: usize,
+
+    pub fn deinit(self: *ResidentProjectedImages) void {
+        self.backend.free(self.embeddings);
+        self.allocator.free(self.tokens_per_image);
+    }
+};
+const ResidentImage = struct { embeddings: CT, tokens: usize };
+
 pub const ProjectedAudio = struct {
     allocator: std.mem.Allocator,
     embeddings: []f32,
@@ -1360,6 +1377,14 @@ pub fn prepareEmbeddingGemma2Image(allocator: std.mem.Allocator, bytes: []const 
     return .{ .allocator = allocator, .geometry = geometry, .pixels = try image.preprocessImageViewRectScaledWithResample(allocator, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 }, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .torchvision_bicubic) };
 }
 
+pub fn prepareEmbeddingGemma2Raster(a: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment) !PreparedImage {
+    const view = try raster.imageView();
+    try image.DecodeLimits.inference_default.validate(view.width, view.height);
+    const cfg = embeddingGemma2ImageConfig();
+    const geometry = targetGeometry(cfg, view.width, view.height);
+    return .{ .allocator = a, .geometry = geometry, .pixels = try image.preprocessImageViewRectScaledWithResample(a, view, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .torchvision_bicubic) };
+}
+
 /// Bound the supplied image cohort; no queue or cross-request wait is added.
 pub const ImageBatchOptions = struct {
     max_batch: usize = 4,
@@ -1442,6 +1467,62 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
     return .{ .allocator = allocator, .embeddings = try embeddings.toOwnedSlice(allocator), .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
 }
 
+fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
+    try options.validate();
+    if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
+    // Joining heterogeneous cohorts must never invoke the download fallback.
+    if (cb.vtable.concatRows2D == null) return error.ResidentImageOperationUnavailable;
+    const lengths = try a.alloc(usize, prepared.len);
+    errdefer a.free(lengths);
+    var tensor: ?CT = null;
+    errdefer if (tensor) |t| cb.free(t);
+    var rows: usize = 0;
+    var offset: usize = 0;
+    var batches: usize = 0;
+    var maximum: usize = 0;
+    while (offset < prepared.len) {
+        try cb.checkExecutionControl();
+        const count = try imageBatchCount(cfg, prepared[offset..], options);
+        const result = try encodePreparedImageBatchResident(cb, a, weights, cfg, prepared[offset..][0..count]);
+        const added = count * result.tokens;
+        if (tensor) |old_tensor| {
+            defer cb.free(result.embeddings);
+            const joined = try cb.concatRows2D(a, old_tensor, result.embeddings, rows, added, cfg.text_hidden);
+            cb.free(old_tensor);
+            tensor = joined;
+        } else tensor = result.embeddings;
+        @memset(lengths[offset..][0..count], result.tokens);
+        rows += added;
+        offset += count;
+        batches += 1;
+        maximum = @max(maximum, count);
+    }
+    return .{ .allocator = a, .backend = cb, .embeddings = tensor.?, .tokens_per_image = lengths, .hidden_size = cfg.text_hidden, .batches_executed = batches, .max_batch_executed = maximum };
+}
+
+pub fn encodePreparedEmbeddingGemma2ImagesResident(cb: *const ComputeBackend, a: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
+    var weights = ProjectorWeights.initHuggingFace(cb, a);
+    defer weights.deinit();
+    return encodePreparedImagesResidentWithWeights(cb, a, &weights, embeddingGemma2ImageConfig(), prepared, options);
+}
+
+pub fn encodeEmbeddingGemma2RastersResident(cb: *const ComputeBackend, a: std.mem.Allocator, rasters: []const antfly_image.BorrowedRasterAttachment, options: ImageBatchOptions) !ResidentProjectedImages {
+    if (rasters.len == 0 or rasters.len > 8) return error.InvalidImageBatch;
+    var weights = ProjectorWeights.initHuggingFace(cb, a);
+    defer weights.deinit();
+    var prepared: [8]PreparedImage = undefined;
+    var initialized: usize = 0;
+    defer for (prepared[0..initialized]) |item| item.deinit();
+    for (rasters) |raster| {
+        try cb.checkExecutionControl();
+        const view = try raster.imageView();
+        try image.DecodeLimits.inference_default.validate(view.width, view.height);
+        prepared[initialized] = try prepareImageView(a, &weights, embeddingGemma2ImageConfig(), view);
+        initialized += 1;
+    }
+    return encodePreparedImagesResidentWithWeights(cb, a, &weights, embeddingGemma2ImageConfig(), prepared[0..initialized], options);
+}
+
 pub fn encodePreparedEmbeddingGemma2Images(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: []const PreparedImage, options: ImageBatchOptions) !ProjectedImages {
     var weights = ProjectorWeights.initHuggingFace(cb, allocator);
     defer weights.deinit();
@@ -1480,9 +1561,15 @@ fn encodePreparedImage(cb: *const ComputeBackend, allocator: std.mem.Allocator, 
 }
 
 fn encodePreparedImageBatch(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !EncodedImage {
+    const result = try encodePreparedImageBatchResident(cb, allocator, store, cfg, prepared);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !ResidentImage {
     if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
     for (prepared) |item| try validatePreparedImage(cfg, item);
-    if (cfg.direct_unified) return encodePreparedUnifiedBatch(cb, allocator, store, cfg, prepared);
+    if (cfg.direct_unified) return encodePreparedUnifiedBatchResident(cb, allocator, store, cfg, prepared);
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
     const pixel_count = geometry.width * geometry.height * 3;
@@ -1525,11 +1612,11 @@ fn encodePreparedImageBatch(cb: *const ComputeBackend, allocator: std.mem.Alloca
     const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
-    defer cb.free(projected);
+    errdefer cb.free(projected);
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
-        .embeddings = try cb.toFloat32(projected, allocator),
+        .embeddings = projected,
         .tokens = geometry.tokenCount(),
     };
 }
@@ -1550,6 +1637,12 @@ fn encodeUnifiedDirectImage(
 }
 
 fn encodePreparedUnifiedBatch(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !EncodedImage {
+    const result = try encodePreparedUnifiedBatchResident(cb, allocator, store, cfg, prepared);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, allocator), .tokens = result.tokens };
+}
+
+fn encodePreparedUnifiedBatchResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage) !ResidentImage {
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
     const stride = geometry.tokenCount() * cfg.patch_size * cfg.patch_size * 3;
@@ -1585,10 +1678,10 @@ fn encodePreparedUnifiedBatch(cb: *const ComputeBackend, allocator: std.mem.Allo
     const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
-    defer cb.free(projected);
+    errdefer cb.free(projected);
 
     return .{
-        .embeddings = try cb.toFloat32(projected, allocator),
+        .embeddings = projected,
         .tokens = geometry.tokenCount(),
     };
 }
@@ -4441,6 +4534,16 @@ fn checkGemma4ImageBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
         // once per cohort; activation transfers are only the final output.
         if (cb.kind() == .cuda) try std.testing.expectEqual(@as(u64, @intCast(actual.embeddings.len * 4 + 192 * 4)), after.cuda_bytes - before.cuda_bytes);
         defer actual.deinit();
+        // Reject activation exports during projection, including multi-cohort
+        // assembly. The host compatibility API above remains independently checked.
+        var resident_vtable = cb.vtable.*;
+        resident_vtable.toFloat32 = rejectGemma4VisionReadback;
+        const resident_cb = ComputeBackend{ .ptr = cb.ptr, .vtable = &resident_vtable };
+        var resident = try encodePreparedImagesResidentWithWeights(&resident_cb, a, &weights, cfg, prepared[0..batch], .{ .max_batch = @min(batch, 2) });
+        defer resident.deinit();
+        const exported = try cb.toFloat32(resident.embeddings, a);
+        defer a.free(exported);
+        for (actual.embeddings, exported) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-4);
         try std.testing.expectEqual(batch, actual.max_batch_executed);
         try std.testing.expectEqual(@as(usize, 1), actual.batches_executed);
         for (prepared[0..batch], actual.tokens_per_image, 0..) |item, length, b| {

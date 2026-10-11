@@ -723,6 +723,63 @@ measurements. Relative baseline parity does not replace an independent model
 quality oracle. GPU-assisted decode/resize and cross-request scheduling remain
 separate future work; this phase reuses existing broker cohorts.
 
+### Gemma4 PDF measurement and resident embedding handoff
+
+Image-only EmbeddingGemma 2 cohorts now keep the projected Gemma4 visual rows
+resident through prompt assembly, the embedding encoder, and masked pooling.
+Metal/CUDA use backend row concatenation and copy operations to assemble the
+prompt; CPU tokenization produces only IDs and masks. Each result downloads
+its pooled vector, rather than visual soft tokens and the full encoder output.
+The CT owner retains its creating backend until cleanup. Existing model gates,
+preprocessing admission, scratch limits, geometry subdivision, cancellation,
+and original item indexes still apply. Native and backends without the required
+row operations retain the host path. `Options.resident_images = false` selects
+that path for a same-binary comparison. Mixed text/media groups and audio keep
+their existing handoff; this change covers `embedImages` and `embedRasters`.
+
+`antfly-gemma4-pdf-bench` measures actual PDF bytes through the existing parser,
+exact renderer, borrowed RGBA rasters, image processor, projector, and embedding
+encoder. It selects pages round-robin across documents and preserves explicit
+document/page IDs. A wave retains at most four pages, 256 MiB of output rasters,
+and four CPU render workers, each with a private 256 MiB scratch ceiling and
+immutable render-fork template. Pages have an eight-million-pixel ceiling and
+an adaptive DPI/dimension bound. Model loading and initial document parsing are
+reported separately from warm wave timings. No PNG/JPEG encode/decode round trip
+is introduced between rendering and inference.
+
+The accompanying Metal PDF painter is a benchmark-only prototype. It batches
+eligible pages in one command buffer; supported content is opaque, closed polygon
+fills and axis-aligned opaque nearest-sampled images. Parsing, codec decoding,
+image sample-index tables, and model-exact bicubic preprocessing remain on CPU.
+Text, strokes, groups/transparency, complex clipping, shading, patterns, rotated
+pages, and other unsupported content reject the entire page before submission
+and use the exact CPU renderer. Lossy f32 polygon coordinates also fall back.
+The prototype copies GPU raster output to host to share the existing processor;
+it does not establish a resident GPU PDF-to-model pipeline. The first iteration
+compares every GPU-painted page with native pixels, rejects any byte error above
+one, and reports both maximum error and MAE. This gate is outside measured wave
+boundaries. Warm up at least once to exclude its cache effects from measurement.
+
+The campaign compares CPU render/host handoff, CPU render/resident handoff,
+and GPU render/resident handoff, plus separate render-only runs at each batch
+size. It saves input/checkpoint/binary hashes, ordered vectors, raw samples,
+p50/p95, throughput, fallback counts, per-stage observations, retained raster
+bytes, worker scratch, and available Metal transfer/device counters. All vectors
+must be finite, have 768 dimensions, retain page identity, and match the serial
+reference at cosine >= 0.9999. Stage durations measure CPU enqueue time and may
+include implicit synchronization; only final readback closes the model timing
+boundary. They are not isolated GPU kernel times. Device-owned tensor peaks
+exclude weights and provider pools; scratch observations are not total RSS.
+
+[The PDF benchmark guide and local evidence](../../../docs/design/inference/gemma4-pdf-performance.md)
+contain commands, corpus provenance, validation, and the limits of the results.
+Production PDF rendering remains on the exact CPU path. Promote GPU rendering
+only after representative supported pages show an end-to-end benefit, adequate
+coverage, and cancellation/admission behavior with owned device rasters. A future
+resident raster interface must carry strides, device/runtime identity, completion
+events, allocation ownership and its admission lease through preprocessing.
+Benchmark an overlapped CPU-render/GPU-inference baseline before choosing it.
+
 ### Further implementation and measurement
 
 1. Profile decode/render, resize/feature preparation, H2D, encoder, D2H,

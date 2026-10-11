@@ -54,6 +54,13 @@ token slots. Masks isolate attention and mean pooling by page. Projections are
 released after each cohort, and observed execution reports native batching only
 when every cohort contains multiple pages. Model identity pins, reduced
 dimensions, deadlines and cancellation also apply to this raster path.
+On qualified Metal/CUDA row-operation paths, image-only cohorts retain visual
+soft tokens, prompt embeddings and encoder activations on the backend through
+masked pooling. Only final vectors are downloaded. CPU codec decoding and
+model-exact resizing still precede upload; Native keeps the host execution path.
+The [real-PDF benchmark](../design/inference/gemma4-pdf-performance.md) compares
+host/resident handoffs and an experimental GPU painter with the exact CPU renderer.
+Production PDF rendering uses the CPU renderer.
 For example, post this body to `/ai/v1/embed`:
 
 ```json
