@@ -3288,6 +3288,9 @@ fn stripRuntimeDenseNativeStatus(record: *metadata_table_manager.StoreRecord) vo
 
 fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
     for (record.runtime_statuses) |status| {
+        if (status.source_authority != null) return metadata_runtime_status_protocol.source_authority_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0) return metadata_runtime_status_protocol.framed_index_record_version;
@@ -3311,6 +3314,9 @@ fn runtimeStatusRequiredRecordVersion(record: metadata_table_manager.StoreRecord
 /// and cannot be erased merely to cross an older proposal boundary. Embedding
 /// activity is deliberately absent: it is an ephemeral observability overlay.
 fn runtimeStatusMandatoryRecordVersion(record: metadata_table_manager.StoreRecord) u16 {
+    for (record.runtime_statuses) |status| {
+        if (status.source_authority != null) return metadata_runtime_status_protocol.source_authority_record_version;
+    }
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return metadata_runtime_status_protocol.schema_epoch_record_version;
     }
@@ -3378,17 +3384,16 @@ fn runtimeStatusProtocolVersionReady(service: anytype, required_version: u16) bo
 }
 
 fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16) u16 {
-    if (required_version == metadata_runtime_status_protocol.v0_2_0_record_version)
-        return required_version;
-    if (runtimeStatusProtocolVersionReady(service, required_version)) return required_version;
-    if (required_version == metadata_runtime_status_protocol.current_record_version and
-        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.framed_index_record_version))
-        return metadata_runtime_status_protocol.framed_index_record_version;
-    if (metadata_runtime_status_protocol.profileSatisfies(required_version, metadata_runtime_status_protocol.framed_index_record_version) and
-        runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.inference_diagnostics_record_version))
-        return metadata_runtime_status_protocol.inference_diagnostics_record_version;
-    if (runtimeStatusProtocolVersionReady(service, metadata_runtime_status_protocol.positional_record_version))
-        return metadata_runtime_status_protocol.positional_record_version;
+    const candidates = [_]u16{
+        metadata_runtime_status_protocol.current_record_version,
+        metadata_runtime_status_protocol.schema_epoch_record_version,
+        metadata_runtime_status_protocol.framed_index_record_version,
+        metadata_runtime_status_protocol.inference_diagnostics_record_version,
+        metadata_runtime_status_protocol.positional_record_version,
+    };
+    for (candidates) |candidate| {
+        if (metadata_runtime_status_protocol.profileSatisfies(required_version, candidate) and runtimeStatusProtocolVersionReady(service, candidate)) return candidate;
+    }
     return metadata_runtime_status_protocol.v0_2_0_record_version;
 }
 
@@ -9494,11 +9499,7 @@ pub const MetadataHttpService = struct {
             &membership_fingerprint,
         );
         self.runtime_status_protocol_ready_fingerprint = membership_fingerprint;
-        self.runtime_status_protocol_ready_version = if (same_membership and
-            self.runtime_status_protocol_ready_version == metadata_runtime_status_protocol.current_record_version)
-            metadata_runtime_status_protocol.current_record_version
-        else
-            ready_version;
+        self.runtime_status_protocol_ready_version = metadata_runtime_status_protocol.mergeReadyVersion(same_membership, self.runtime_status_protocol_ready_version, ready_version);
     }
 
     fn probeRuntimeStatusProtocol(
@@ -13911,6 +13912,37 @@ test "metadata service transition commands negotiate runtime status payload vers
     );
 }
 
+test "runtime status source authority requires V19 without regressing schema epoch negotiation" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        ready: u16,
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            return metadata_runtime_status_protocol.profileSatisfies(self.ready, required);
+        }
+    };
+    var statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .schema_epoch = 7,
+        .source_authority = .{ .kind = .native, .namespace = @splat(1), .sequence = 9 },
+    }};
+    const record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 2, .runtime_statuses = &statuses };
+    inline for (.{ @as(u16, 17), @as(u16, 18), @as(u16, 20) }) |version| {
+        var service: FakeService = .{ .ready = version };
+        var owned: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned));
+        try std.testing.expect(owned == null);
+    }
+    var service: FakeService = .{ .ready = metadata_runtime_status_protocol.current_record_version };
+    var owned: ?metadata_table_manager.StoreRecord = null;
+    defer if (owned) |value| metadata_table_manager.freeStore(std.testing.allocator, value);
+    const accepted = try runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned);
+    try std.testing.expectEqualDeep(statuses[0].source_authority, accepted.upsert_store.runtime_statuses[0].source_authority);
+    try std.testing.expectEqual(metadata_runtime_status_protocol.schema_epoch_record_version, highestSupportedRuntimeStatusVersion(&service, metadata_runtime_status_protocol.schema_epoch_record_version));
+    statuses[0].source_authority = null;
+    service.ready = metadata_runtime_status_protocol.schema_epoch_record_version;
+    _ = try runtimeStatusProtocolSafeCommand(&service, .{ .upsert_store = record }, &owned);
+}
+
 test "runtime status native authority cannot downgrade to inference-only V16" {
     const FakeService = struct {
         alloc: std.mem.Allocator = std.testing.allocator,
@@ -15539,19 +15571,25 @@ fn reportStoreStatusesWithCapabilities(
     const framed_profile_required = vector_projection_transition_possible or
         native_storage_transition_possible or relational_topology_transition_possible;
     var schema_epoch_required = false;
+    var source_authority_required = false;
     for (reports) |report| {
         for (report.runtime_statuses) |status| {
             if (status.schema_epoch != 0) schema_epoch_required = true;
+            if (status.source_authority != null) source_authority_required = true;
         }
     }
-    const native_required_version = if (schema_epoch_required)
+    const native_required_version = if (source_authority_required)
+        metadata_runtime_status_protocol.source_authority_record_version
+    else if (schema_epoch_required)
         metadata_runtime_status_protocol.schema_epoch_record_version
     else if (framed_profile_required)
         metadata_runtime_status_protocol.framed_index_record_version
     else
         required_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, native_required_version);
-    if (schema_epoch_required and supported_version != metadata_runtime_status_protocol.schema_epoch_record_version)
+    if (source_authority_required and !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.source_authority_record_version))
+        return error.RuntimeStatusProtocolUnavailable;
+    if (schema_epoch_required and !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.schema_epoch_record_version))
         return error.RuntimeStatusProtocolUnavailable;
     if (framed_profile_required and
         !metadata_runtime_status_protocol.profileSatisfies(supported_version, metadata_runtime_status_protocol.framed_index_record_version))

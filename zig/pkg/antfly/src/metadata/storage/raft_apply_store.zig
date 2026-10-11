@@ -4226,6 +4226,11 @@ test "relational index publication authenticated owner ACKs persist both positio
         plan.owners = &owners;
         var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
         var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 6 }};
+        runtimes[0].source_authority = .{
+            .kind = if (authority == .native) .native else .raft,
+            .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = plan.before.table_id, .shard_id = 301, .range_id = 301 }),
+            .sequence = if (authority == .native) 10 else 0,
+        };
         const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
         const placement: raft_reconciler.PlacementIntent = .{ .record = .{ .group_id = owners[0].range.group_id, .replica_id = 5, .local_node_id = 2 }, .store_id = 3, .peer_node_ids = &.{2} };
         var ack: index_publication.Ack = undefined;
@@ -4290,7 +4295,7 @@ test "relational index publication authenticated owner ACKs persist both positio
             defer a.free(enrollment);
             try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
             try store.validateRelationalIndexOwnerAck(group, bytes);
-            const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, range_namespace, active_job, lifecycle };
+            const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle };
             inline for (std.meta.tags(Fault)) |fault| {
                 // Each fault has its own aborted storage cut. No simulated
                 // verification boolean can substitute for real durable reads.
@@ -4309,6 +4314,15 @@ test "relational index publication authenticated owner ACKs persist both positio
                     .placement_store => changed_placement.store_id += 1,
                     .placement_state => changed_placement.serving_state = .planned,
                     .observed_position => changed_groups[0].raft_applied_index = 0,
+                    .source_mode => {
+                        changed_runtime[0].source_authority.?.kind = if (authority == .native) .raft else .native;
+                        changed_runtime[0].source_authority.?.sequence = 0;
+                    },
+                    .source_namespace => changed_runtime[0].source_authority.?.namespace[0] ^= 1,
+                    .source_cut => if (authority == .native) {
+                        changed_runtime[0].source_authority.?.sequence = 4;
+                    },
+                    .source_unknown => changed_runtime[0].source_authority = null,
                     .range_namespace => {
                         var changed_range = owners[0].range;
                         changed_range.doc_identity_shard_id += 1;
@@ -4330,6 +4344,10 @@ test "relational index publication authenticated owner ACKs persist both positio
                 } else if (fault == .observed_position and authority == .native) {
                     // Native sequence 5 remains valid even when Raft index is
                     // zero: comparing these domains would invent authority.
+                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                } else if ((fault == .source_cut or fault == .source_unknown) and authority == .raft) {
+                    // Legacy Raft observations retain their actual watermark;
+                    // absence never substitutes for a native observation.
                     _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
                 } else {
                     try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
@@ -15525,11 +15543,20 @@ pub const RaftApplyStore = struct {
         // commit sequence is deliberately never compared to a Raft index.
         switch (signed.receipt.position) {
             .raft => |position| {
+                if (runtime.source_authority) |state| {
+                    if (state.kind != .raft or !std.mem.eql(u8, &state.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(owner.namespace)))
+                        return error.IndexOwnerReceiptChanged;
+                }
                 if (report.group_statuses.len != 1) return error.IndexOwnerReceiptChanged;
                 const status = report.group_statuses[0];
                 if (status.raft_applied_index < position.index or status.raft_term < position.term) return error.IndexOwnerReceiptChanged;
             },
-            .native => {},
+            .native => |position| {
+                const state = runtime.source_authority orelse return error.IndexOwnerReceiptChanged;
+                if (state.kind != .native or state.sequence < position.sequence or
+                    !std.mem.eql(u8, &state.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(position.namespace)))
+                    return error.IndexOwnerReceiptChanged;
+            },
         }
     }
 
@@ -26797,6 +26824,9 @@ fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
+        if (status.source_authority != null) return runtime_status_protocol.source_authority_record_version;
+    }
+    for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
     if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
@@ -28729,6 +28759,10 @@ fn appendRuntimeGroupStatusRecord(
     if (record.schema_epoch != 0 and
         !runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.schema_epoch_record_version))
         return error.InvalidMetadataTransitionEncoding;
+    if (record.source_authority != null and
+        !runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.source_authority_record_version))
+        return error.InvalidMetadataTransitionEncoding;
+    if (record.source_authority) |state| _ = @import("antfly_local_sources").storage_source_authority.State.decode(&state.encode()) catch return error.InvalidMetadataTransitionEncoding;
     try appendInt(alloc, out, u16, version);
     try appendInt(alloc, out, u64, record.table_id);
     try appendRequiredString(alloc, out, record.table_name);
@@ -28750,6 +28784,10 @@ fn appendRuntimeGroupStatusRecord(
     }
     if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.schema_epoch_record_version))
         try appendInt(alloc, out, u32, record.schema_epoch);
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.source_authority_record_version)) {
+        try out.append(alloc, @intFromBool(record.source_authority != null));
+        if (record.source_authority) |state| try out.appendSlice(alloc, &state.encode());
+    }
     try appendInt(alloc, out, u64, record.doc_count);
     try appendInt(alloc, out, u64, record.disk_bytes);
     try out.append(alloc, if (record.disk_bytes_known) 1 else 0);
@@ -28767,6 +28805,7 @@ fn appendRuntimeGroupStatusRecord(
 }
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
+    if (record.source_authority != null) return runtime_status_protocol.source_authority_record_version;
     var version = runtime_status_protocol.legacy_record_version;
     if (record.schema_epoch != 0)
         version = runtime_status_protocol.schema_epoch_record_version;
@@ -29020,6 +29059,19 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
         try readInt(encoded, pos, u32)
     else
         0;
+    const source_authority: ?@import("antfly_local_sources").storage_source_authority.State = if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.source_authority_record_version)) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const present = encoded[pos.*];
+        pos.* += 1;
+        if (present > 1) return error.InvalidMetadataTransitionEncoding;
+        if (present == 0) break :blk null;
+        const State = @import("antfly_local_sources").storage_source_authority.State;
+        if (encoded.len - pos.* < @import("antfly_local_sources").storage_source_authority.encoded_size) return error.InvalidMetadataTransitionEncoding;
+        const end = pos.* + @import("antfly_local_sources").storage_source_authority.encoded_size;
+        const state = State.decode(encoded[pos.*..end]) catch return error.InvalidMetadataTransitionEncoding;
+        pos.* = end;
+        break :blk state;
+    } else null;
     const doc_count = try readInt(encoded, pos, u64);
     const disk_bytes = try readInt(encoded, pos, u64);
     if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
@@ -29065,6 +29117,7 @@ fn readRuntimeGroupStatusRecordWithMaxVersion(
         .target_observation_revision = target_observation_revision,
         .target_observation_complete = target_observation_complete,
         .schema_epoch = schema_epoch,
+        .source_authority = source_authority,
         .doc_count = doc_count,
         .disk_bytes = disk_bytes,
         .disk_bytes_known = disk_bytes_known,
@@ -37682,6 +37735,53 @@ test "current runtime status profile preserves convergence authority" {
     try std.testing.expect(legacy.target_observation_complete);
 }
 
+test "runtime status V19 preserves native cuts rejects corrupt framing and refuses silent downgrade" {
+    const a = std.testing.allocator;
+    const Authority = @import("antfly_local_sources").storage_source_authority;
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(a);
+    inline for (.{ Authority.Kind.raft, Authority.Kind.native }) |kind| {
+        const state: Authority.State = .{ .kind = kind, .namespace = @splat(1), .sequence = if (kind == .native) std.math.maxInt(u64) else 0 };
+        const status: metadata.RuntimeGroupStatusReport = .{ .table_id = 1, .schema_epoch = 7, .source_authority = state };
+        encoded.clearRetainingCapacity();
+        try appendRuntimeGroupStatusRecord(a, &encoded, status, runtime_status_protocol.source_authority_record_version);
+        var pos: usize = 0;
+        const decoded = try readRuntimeGroupStatusRecord(a, encoded.items, &pos);
+        defer metadata_table_manager.freeRuntimeGroupStatusReport(a, decoded);
+        try std.testing.expectEqual(encoded.items.len, pos);
+        try std.testing.expectEqual(@as(u32, 7), decoded.schema_epoch);
+        try std.testing.expectEqualDeep(state, decoded.source_authority.?);
+        try std.testing.expectEqual(runtime_status_protocol.source_authority_record_version, runtimeGroupStatusRecordVersion(status));
+        var runtimes = [_]metadata.RuntimeGroupStatusReport{ .{ .schema_epoch = 7 }, status };
+        try std.testing.expectEqual(runtime_status_protocol.source_authority_record_version, storeRuntimeStatusRecordVersion(.{ .store_id = 1, .node_id = 2, .runtime_statuses = &runtimes }).?);
+        // Older decoders reject rather than reinterpret the native sequence.
+        pos = 0;
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeGroupStatusRecordWithMaxVersion(a, encoded.items, &pos, runtime_status_protocol.schema_epoch_record_version));
+        for (0..encoded.items.len) |end| {
+            pos = 0;
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeGroupStatusRecord(a, encoded.items[0..end], &pos));
+        }
+        // The durable fixed state owns its checksum, never a caller's digest.
+        const state_offset = std.mem.indexOf(u8, encoded.items, "ASA1").?;
+        encoded.items[state_offset + 40] ^= 1;
+        pos = 0;
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeGroupStatusRecord(a, encoded.items, &pos));
+        encoded.items[state_offset + 40] ^= 1;
+        encoded.items[state_offset - 1] = 2;
+        pos = 0;
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeGroupStatusRecord(a, encoded.items, &pos));
+        encoded.clearRetainingCapacity();
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, appendRuntimeGroupStatusRecord(a, &encoded, status, runtime_status_protocol.schema_epoch_record_version));
+        try std.testing.expectEqual(@as(usize, 0), encoded.items.len);
+    }
+    // A shipped V18 record still decodes as unknown authority, never native.
+    try appendRuntimeGroupStatusRecord(a, &encoded, .{ .schema_epoch = 7 }, runtime_status_protocol.schema_epoch_record_version);
+    var pos: usize = 0;
+    const legacy = try readRuntimeGroupStatusRecord(a, encoded.items, &pos);
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(a, legacy);
+    try std.testing.expect(legacy.source_authority == null);
+}
+
 test "runtime status V18 carries schema epoch without changing V17 layout" {
     const alloc = std.testing.allocator;
     var encoded = std.ArrayListUnmanaged(u8).empty;
@@ -37694,13 +37794,13 @@ test "runtime status V18 carries schema epoch without changing V17 layout" {
         .node_id = 4,
         .schema_epoch = 9,
     };
-    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.current_record_version);
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.schema_epoch_record_version);
     var pos: usize = 0;
     const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
     defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(u32, 9), decoded.schema_epoch);
-    try std.testing.expectEqual(runtime_status_protocol.current_record_version, runtimeGroupStatusRecordVersion(status));
+    try std.testing.expectEqual(runtime_status_protocol.schema_epoch_record_version, runtimeGroupStatusRecordVersion(status));
 
     encoded.clearRetainingCapacity();
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, appendRuntimeGroupStatusRecord(

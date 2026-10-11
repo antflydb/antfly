@@ -239,6 +239,13 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(recovered.outcome().?.duplicate);
         try std.testing.expectEqual(try reserved_receipt.digest(), try recovered.outcome().?.receipt.?.digest());
         try std.testing.expectEqual(reserved_receipt.position.native.sequence, recovered.outcome().?.position.sequence);
+        var observed = (try owners.writeSource().localRuntimeStatusGroupLocal(alloc, group, plan.before.name)) orelse return error.MissingOwnerObservation;
+        defer observed.deinit(alloc);
+        const authority = observed.metadata.source_authority orelse return error.MissingOwnerObservation;
+        try std.testing.expectEqual(.native, authority.kind);
+        try std.testing.expectEqualSlices(u8, &local.storage_db_online_source_contract.namespaceBytes(reserved_receipt.owner.namespace), &authority.namespace);
+        try std.testing.expect(authority.sequence >= reserved_receipt.position.native.sequence);
+        try std.testing.expectEqual(table_reads.backend_current_root_generation, observed.metadata.lsm_root_generation);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
     }
 }

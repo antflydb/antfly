@@ -312,6 +312,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     index_publication_step.dependOn(&addFilteredTestRunArtifact(b, index_publication_barrier_tests).step);
+    const owner_authority_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const owner_authority_step = b.step("antfly-native-owner-authority-test", "Verify durable source observations, wire profiles and root receipt authority");
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_tests).step);
+    const owner_authority_service_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "runtime status source authority", "runtime status exposes only released compatibility profiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    owner_authority_step.dependOn(&addFilteredTestRunArtifact(b, owner_authority_service_tests).step);
     const lifecycle_lock_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "table lifecycle lock", "generation lock freezes the table cut", "index build lock freezes the table cut" },

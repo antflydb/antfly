@@ -18845,6 +18845,10 @@ pub const DataServer = struct {
             registration,
         );
         defer antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
+        // Publish the new observation only after coordinated decoder readiness.
+        // Metadata rechecks that barrier before proposing its first V19 report;
+        // requiring prior activation here would prevent that first report.
+        metadata_runtime_status_protocol.projectSourceAuthority(runtime_statuses, snapshot.status.runtime_status_protocol_ready_version);
         overlayLiveRuntimeGroupFacts(group_statuses, runtime_statuses);
         try self.annotateLocalPlacementStatus(
             group_statuses,
@@ -28869,6 +28873,7 @@ fn runtimeStatusReportFromLocalStatus(
         .target_observation_revision = status.metadata.target_observation_revision,
         .target_observation_complete = status.metadata.target_observation_complete,
         .schema_epoch = if (try antfly.metadata.table_provisioner.indexlessSchemaEpochRequired(alloc, table)) status.stats.schema_epoch else 0,
+        .source_authority = status.metadata.source_authority,
         .doc_count = controlPlaneDocumentCount(status.stats),
         .disk_bytes = status.disk_bytes,
         .disk_bytes_known = status.disk_bytes_known,

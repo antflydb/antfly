@@ -560,7 +560,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     if (options.server_integration_tests) {
         const native_index_owner_tests = b.addTest(.{
             .root_module = capi_root_mod,
-            .filters = &.{"storage owner native index"},
+            .filters = &.{ "storage owner native index", "storage owner runtime status" },
             .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         });
         b.step("native-index-owner-capi-test", "Verify private native index admission and committed owner proofs through the C ABI")

@@ -5848,6 +5848,11 @@ pub fn storageOwnerRuntimeStatusJson(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerOperationTableName(handle, request) orelse return .invalid_argument;
 
+    const observation = (handle.db.runtimeStatusObservationConsistentIfAvailable(handle.alloc) catch |err|
+        return storageOwnerStatusFromError(err)) orelse return .busy;
+    var observation_owned = true;
+    defer if (observation_owned) db_mod.types.freeDBStats(handle.alloc, observation.stats);
+
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
         .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
@@ -5860,8 +5865,7 @@ pub fn storageOwnerRuntimeStatusJson(
         // consistency barrier. Never retain the shared owner lease while
         // waiting for an apply writer: structural reconciliation may need its
         // exclusive lease to advance the exact work holding that writer.
-        .stats = (handle.db.runtimeStatusStatsConsistentIfAvailable(handle.alloc) catch |err|
-            return storageOwnerStatusFromError(err)) orelse return .busy,
+        .stats = observation.stats,
         .lsm_storage_stats = .{
             .maintenance = handle.db.snapshotLsmMaintenanceStats(),
             .write = handle.db.snapshotLsmWriteStats(),
@@ -5869,6 +5873,7 @@ pub fn storageOwnerRuntimeStatusJson(
             .maintenance_debt_hint = handle.db.lsmMaintenanceDebtHint(),
         },
     };
+    observation_owned = false;
     defer status.deinit(handle.alloc);
     status.replaceMetadata(.{
         .updated_at_ns = antfly.platform_time.monotonicNs(),
@@ -5877,6 +5882,7 @@ pub fn storageOwnerRuntimeStatusJson(
         .lsm_root_generation = handle.storage_owner_root_generation,
         .target_observation_revision = runtime_status.observedSourceTargetSequence(status.stats),
         .target_observation_complete = true,
+        .source_authority = observation.source_authority,
     });
     const response = std.json.Stringify.valueAlloc(handle.alloc, status, .{
         .emit_null_optional_fields = false,
