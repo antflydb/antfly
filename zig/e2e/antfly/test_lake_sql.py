@@ -3840,6 +3840,16 @@ def test_wide_partial_join_keeps_delivery_memory_bounded(tmp_path):
             + ",".join(f"SUM(l.v{j})" for j in range(width))
             + " FROM wide_join l JOIN wide_join r ON l.k=r.k"
         )
+        # The dedicated COUNT compiler path must consume the same typed partial
+        # protocol as a query containing multiple aggregate expressions.
+        assert call(
+            "/sql",
+            {"statement": "SELECT COUNT(*) FROM wide_join l JOIN wide_join r ON l.k=r.k"},
+        )["rows"] == [[str(2 * count)]]
+        assert call(
+            "/sql",
+            {"statement": "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k"},
+        )["rows"] == [["4"]]
         # Each source row has exactly two matches. Python integer arithmetic
         # supplies an independent reference for every reducer and orientation.
         expected = [[str(count * (count - 1) + 2 * count * j) for j in range(width)]]

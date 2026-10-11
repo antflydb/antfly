@@ -70,7 +70,12 @@ pub const Directory = struct {
         }
     }
 };
+pub const Descriptor = struct { manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize };
+pub const Descriptors = std.StringHashMapUnmanaged(Descriptor);
 pub const Read = struct {
+    /// Generation-owned descriptor routing. Shared physical sources never
+    /// decide which generation's file manifest a reader must retain.
+    descriptors: ?*const Descriptors = null,
     store: stores.ArtifactStore,
     cache: ?artifacts.CachedRead,
     context: local.serverless_query_lake_read_context.Context,
@@ -433,6 +438,8 @@ const Owner = struct {
     directory: Directory,
     directory_bytes: usize = 0,
     directory_ref: ?Ref = null,
+    manifest_ref: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+    manifest_ordinal: usize = 0,
     fallback: ?Read,
     query_scoped: bool = false,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
@@ -797,6 +804,42 @@ pub fn loadAdmitted(a: A, read: Read, ref: Ref, metadata: local.segment.SegmentR
     errdefer Owner.release(owner);
     owner.directory_ref = .{ .artifact_id = try owner.arena.allocator().dupe(u8, ref.artifact_id), .checksum = try owner.arena.allocator().dupe(u8, ref.checksum), .byte_len = ref.byte_len };
     return .fromNative(owner.source());
+}
+
+/// Only the compact route is retained by a corpus. The selected query admits
+/// its full file descriptor through the scope-fenced shared metadata cache.
+pub fn loadRouted(a: A, read: Read, ref: Ref, bytes: u64, manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize) !local.index.SegmentData {
+    if (bytes == 0 or bytes > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
+    try read.check();
+    const owner = try a.create(Owner);
+    owner.* = .{ .a = a, .arena = .init(a), .directory = .{ .bytes = @intCast(bytes), .metadata = &.{}, .blocks = &.{}, .terms = &.{} }, .directory_bytes = @intCast(bytes), .loaded = &.{}, .fallback = read, .query_scoped = true, .resource_manager = read.resource_manager, .manifest_ordinal = ordinal };
+    errdefer Owner.release(owner);
+    owner.directory_ref = .{ .artifact_id = try owner.arena.allocator().dupe(u8, ref.artifact_id), .checksum = try owner.arena.allocator().dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+    var owned = manifest;
+    owned.artifact_id = try owner.arena.allocator().dupe(u8, manifest.artifact_id);
+    owned.checksum = try owner.arena.allocator().dupe(u8, manifest.checksum);
+    owner.manifest_ref = owned;
+    return .fromNative(owner.source());
+}
+pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.SegmentReader {
+    if (source != .ranges) return error.InvalidNativeLakeTextCorpus;
+    const query: *Owner.Query = @ptrCast(@alignCast(source.ranges.ptr));
+    const owner = query.owner;
+    const read = query.capability.*;
+    try read.check();
+    const descriptor = if (read.descriptors) |routes| routes.get(owner.directory_ref.?.artifact_id) orelse return error.InvalidNativeLakeTextCorpus else Descriptor{ .manifest = owner.manifest_ref orelse return error.InvalidNativeLakeTextCorpus, .ordinal = owner.manifest_ordinal };
+    const manifest = descriptor.manifest;
+    const corpus = @import("lake_index_native_text.zig");
+    const lease: ?decoded.Owned(corpus.FileGroup) = if (read.cache) |cached| try decoded.acquire(corpus.FileGroup, cached, read.store, manifest, read.cancellation, corpus.loadCachedFile) else null;
+    defer if (lease) |owned| owned.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const group = if (lease) |owned| owned.value.* else try corpus.loadCachedFile(arena.allocator(), read.store, manifest, read.cancellation, null);
+    const index = descriptor.ordinal;
+    if (index >= group.segments.len or group.admissions.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+    const ref = owner.directory_ref.?;
+    if (!std.mem.eql(u8, group.segments[index].artifact_id, ref.artifact_id) or !std.mem.eql(u8, group.segments[index].checksum, ref.checksum) or group.segments[index].byte_len != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
+    return local.segment.SegmentReader.initAuthenticated(a, source, group.admissions[index]);
 }
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     const owner = try a.create(Owner);

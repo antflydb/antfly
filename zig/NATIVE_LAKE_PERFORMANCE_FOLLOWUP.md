@@ -1960,3 +1960,63 @@ Qualification for shared admission, paged inventory and range planning
 - Formatting and license checks pass for all 39 Zig files changed against main.
   The embedded production boundary (816 sources), Apache product boundary
   (2,019 sources), and diff checks pass.
+
+
+### Compact serving routes, incremental inventory, and fused spill reduction
+
+The follow-up review found that the dedicated `COUNT(*)` consumer assumed
+serialized aggregate cells even when an exact join provider returned an
+in-process state reader. All partial consumers now share representation and
+signature validation. Plain COUNT, multiple reducers, and durable aggregate
+cells use the same contract; typed readers and serialized cells cannot be
+mixed in one partial. Resident and forced-spill joins cover plain COUNT,
+including empty matches and the public SQL endpoint over real Parquet input.
+
+New publications use serving inventory version 2. Keys are the SHA-256 identity
+of an immutable file manifest followed by a chunk offset, rather than the
+file's current ordinal. File insertion, removal, replacement, and inventory
+reordering therefore do not rename unrelated keys. Compatible unchanged file
+manifests retain their original scoped artifact references. Publication applies
+only removed and added descriptor chunks to copy-on-write page trees, while a
+first publication bulk-builds sorted trees. Maintenance continues to authenticate
+complete descriptors against the original manifest digest. Version 1 inventories
+and independently cached legacy manifests remain readable.
+
+A second authenticated tree contains compact scoring routes: file identity,
+segment references, physical segment length, document count, field collection
+statistics, section-presence masks, and summary references. Cold serving reads
+these routes instead of all section descriptors and physical-row maps. Physical
+snapshot entries retain compact scoring metadata; selected query readers load
+their detailed file manifest through the bounded, credential-scoped metadata
+cache and validate it against their route before binding native sections.
+Provider capabilities remain query-owned. Descriptor lookup belongs to the
+pinned generation, so a shared physical reader never substitutes an earlier
+generation's manifest reference after GC. A failed or canceled descriptor load
+installs no query reader. Metadata-only text-field and ordinal-coverage checks
+use the section mask without acquiring detailed descriptors.
+
+Physical-to-native and native-to-physical lookup similarly admit only selected
+file manifests. A query retains at most four manifest leases alongside its
+existing bounded bitmap slots; file identity and live row count are checked
+before binary-search/rank conversion. Delete holes continue to use authenticated
+physical block bitmaps. GC marks both serving trees, all reused manifest objects,
+and their children while publication or reader leases retain the generation.
+
+Spilled exact aggregate joins now feed borrowed partition pairs directly into
+bounded typed group columns. They no longer clone packed pair payloads into
+provider result pages for a subsequent reduction. The fused reducer retains the
+existing checked multiplicity and wide integer SUM rules, null and extreme-value
+semantics, cancellation checkpoints, and bounded grouping spill fallback.
+Only reduced partials cross the join/group consumer boundary when output keys
+omit join keys. When every join key survives, compact pairs already identify
+distinct final groups; a structural proof keeps them streaming and avoids a
+redundant hash reduction. Durable spill frames still use the versioned aggregate
+interchange format.
+
+This shape still retains compact metadata proportional to the number of files,
+segments, and indexed fields. Full descriptor admission is selective; the
+compact corpus inventory is not a sublinear routing structure. Incremental
+publication still enumerates file identities to find the changed set, and
+maintenance may expand complete manifests. The page-reuse regression measures
+changed-path writes and reader retention; archive-scale cold/warm latency,
+provider bytes, RSS, and skewed-join measurements remain separate qualification.

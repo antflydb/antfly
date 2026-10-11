@@ -94,6 +94,17 @@ pub const Plan = struct {
         errdefer a.free(left);
         return .{ .recipe = recipe, .join_count = join.left_keys.len, .keys = .{ left, try keys[1].toOwnedSlice(a) }, .output_keys = outputs, .inputs = inputs };
     }
+    /// When every join key survives in the output, each compact matched pair
+    /// already identifies a final group. Another hash reduction cannot help.
+    fn canReducePairs(self: Plan) bool {
+        for (0..self.join_count) |index| {
+            const present = for (self.output_keys) |key| {
+                if (key.index == index) break true;
+            } else false;
+            if (!present) return true;
+        }
+        return false;
+    }
     fn equijoin(program: scalar.Program, index: u32, left: []const scalar.Program, right: []const scalar.Program, width: usize, depth: usize) bool {
         if (depth >= 128 or index >= program.instructions.len) return false;
         const operation = program.instructions[index].operation;
@@ -133,6 +144,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         build_side: u1 = 1,
         build: ?*operators.HashJoin = null,
         partitions: ?*@import("partition_join.zig").Join = null,
+        reduced: ?*operators.Grouped = null,
         current_values: []const Datum = &.{},
         state_offsets: [2][]usize = .{ &.{}, &.{} },
         side_inputs: [2][]usize = .{ &.{}, &.{} },
@@ -150,6 +162,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             if (self.probe_groups) |groups| groups.deinit();
             if (self.build) |build| build.deinit();
             if (self.partitions) |partitions| partitions.close();
+            if (self.reduced) |groups| groups.deinit();
             self.probe_arena.deinit();
             self.arena.deinit();
             self.a.destroy(self);
@@ -381,11 +394,39 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
             return result;
         }
+        /// Consume borrowed partition pairs directly into typed group columns.
+        /// No pair page, packed payload clone or interchange cell crosses the
+        /// join/group boundary. The reducer owns its bounded spill fallback.
+        fn reducePartitions(self: *@This()) !void {
+            const context = self.engine.context;
+            const specs = try self.arena.allocator().alloc(operators.AggregateSpec, self.plan.recipe.inputs.len);
+            for (specs, self.plan.recipe.inputs) |*spec, input| spec.* = input.spec;
+            self.reduced = try operators.Grouped.create(self.a, specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4, .spill = context.spill });
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            while (try self.partitions.?.next()) |pair| {
+                _ = scratch.reset(.free_all);
+                try self.engine.checkpoint();
+                const a_ = scratch.allocator();
+                var compact: Compact = .{ .owner = self, .sides = undefined };
+                compact.sides[self.build_side] = pair.right.?;
+                compact.sides[1 - self.build_side] = pair.left.?;
+                const keys = try a_.alloc(Datum, self.plan.output_keys.len);
+                for (self.plan.output_keys, keys) |key, *value| value.* = compact.sides[key.side][key.index];
+                const states = try a_.alloc(operators.Aggregate, specs.len);
+                for (states, 0..) |*state, slot| state.* = try Compact.read(&compact, a_, slot);
+                try self.reduced.?.importTypedPartialMapped(keys, states, null, self.ordinal);
+                self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
+            }
+            self.partitions.?.close();
+            self.partitions = null;
+        }
         fn next(raw: *anyopaque, out: A, maximum: u32) anyerror!?[]const operators.GroupResult {
             const self = from(raw);
             if (maximum == 0) return error.InvalidSqlBackendResponse;
             if (self.done) return null;
             if (!self.ready) try self.prepare();
+            if (self.partitions != null and self.reduced == null and self.plan.canReducePairs()) try self.reducePartitions();
             var results: std.ArrayList(operators.GroupResult) = .empty;
             const budget = @max(1, @min(self.engine.context.limits.page_bytes, self.engine.context.limits.retained_bytes / 16));
             var bytes: usize = 0;
@@ -403,6 +444,19 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                     };
                     bytes +|= @sizeOf(Compact) + @sizeOf(operators.GroupResult) + self.plan.output_keys.len * @sizeOf(Datum) + try packedBytes(pair.right.?) + try packedBytes(pair.left.?);
                     try results.append(out, try self.combine(out, pair.right.?, pair.left.?));
+                    continue;
+                }
+                if (self.reduced) |groups| {
+                    const result = try groups.nextTypedPartialResult(out) orelse {
+                        self.done = true;
+                        break;
+                    };
+                    bytes +|= @sizeOf(operators.GroupResult) + try packedBytes(result.keys);
+                    for (result.typed_states.?) |state| {
+                        bytes +|= @sizeOf(operators.Aggregate);
+                        if (state.selected) |selected| bytes +|= try operators.datumBytes(selected.row.values[0]);
+                    }
+                    try results.append(out, result);
                     continue;
                 }
                 if (self.probe) |*probe| if (try probe.next()) |match| {

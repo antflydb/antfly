@@ -64,6 +64,14 @@ test "external lake stored source recipe attests production without changing sou
     try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
 }
 pub const physical = @import("lake_index_physical_ordinals.zig");
+pub const SegmentRouting = struct {
+    pub const Field = local.segment.SegmentReader.RoutingField;
+    ref: artifacts.ChunkRef,
+    summary: ?statistics.Ref,
+    bytes: u64,
+    doc_count: u32,
+    fields: []const Field,
+};
 pub const FileGroup = struct {
     file: state.File,
     segments: []const artifacts.ChunkRef,
@@ -105,6 +113,10 @@ pub const Root = struct {
     manifests: []const artifacts.ChunkRef = &.{},
     /// Authenticated paged serving inventory; file manifests remain maintenance units.
     serving_inventory: ?statistics.Ref = null,
+    inventory_version: u8 = 1,
+    serving_routes: ?statistics.Ref = null,
+    /// Expanded serving view only; never accepted in a persisted directory.
+    routing: []const []const SegmentRouting = &.{},
     admission_version: u8 = 0,
     statistics_version: u8 = 0,
     term_statistics: ?statistics.Ref = null,
@@ -118,6 +130,8 @@ pub const Root = struct {
         if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
         if (self.serving_inventory) |ref| try ref.validate();
+        if (self.serving_routes) |ref| try ref.validate();
+        if (self.inventory_version < 1 or self.inventory_version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
         if ((self.term_directory.branches == null) != (self.term_directory.leaves == null)) return error.InvalidNativeLakeTextCorpus;
@@ -160,6 +174,7 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
+    if (root.routing.len != 0) return error.InvalidNativeLakeTextCorpus;
     if (root.manifests.len != 0 and (root.segments.len != 0 or root.file_groups.len != 0)) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
@@ -191,7 +206,7 @@ pub const Inventory = struct {
         for (self.manifests) |manifest| if (manifest) |owned| owned.release();
     }
 };
-fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
+pub fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     return loadFileManifest(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, scope.domain, cancellation, cache);
 }
@@ -201,6 +216,7 @@ pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached
 pub fn admitInventoryBounded(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
     try cached.context.ensureActive();
     try cancellation.check();
+    if (directory.inventory_version == 2 and directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, false), .manifests = &.{} };
     if (directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try readServingInventory(a, scratch_backing, directory, store, cached, cancellation), .manifests = &.{} };
     const Owned = @import("lake_index_decoded_metadata.zig").Owned(FileGroup);
     const manifests = try a.alloc(?Owned, directory.manifests.len);
@@ -275,6 +291,11 @@ pub fn admitInventoryBounded(a: A, scratch_backing: A, directory: Root, store: s
     try inventory.root.validateAlloc(scratch_backing);
     return inventory;
 }
+
+pub fn admitServingInventory(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    if (directory.inventory_version == 2 and directory.serving_routes != null and directory.file_groups.len == 0) return .{ .root = try @import("lake_index_serving_inventory.zig").load(a, scratch_backing, directory, store, cached, cancellation, true), .manifests = &.{} };
+    return admitInventoryBounded(a, scratch_backing, directory, store, cached, cancellation);
+}
 // Serving records are bounded chunks of one file descriptor, ordered by file
 // and byte offset. This preserves the existing validated descriptor contract
 // while packing many small files into ordinary 32 KiB authenticated pages.
@@ -282,41 +303,6 @@ pub fn admitInventoryBounded(a: A, scratch_backing: A, directory: Root, store: s
 const inventory_chunk_bytes = 16 * 1024;
 const inventory_tree = @import("../serverless/graph_segment/page_tree.zig");
 const inventory_pages = @import("../serverless/graph_segment/page_store.zig");
-fn writeServingInventory(a: A, store: *stores.ArtifactStore, groups: []const FileGroup, cancellation: Cancellation) !?statistics.Ref {
-    const Source = struct {
-        a: A,
-        groups: []const FileGroup,
-        file: usize = 0,
-        offset: usize = 0,
-        bytes: ?[]u8 = null,
-        key: [8]u8 = undefined,
-        pub fn next(self: *@This()) !?inventory_tree.Cursor.Record {
-            if (self.bytes) |bytes| if (self.offset == bytes.len) {
-                self.a.free(bytes);
-                self.bytes = null;
-                self.file += 1;
-                self.offset = 0;
-            };
-            if (self.file == self.groups.len) return null;
-            if (self.bytes == null) self.bytes = try std.json.Stringify.valueAlloc(self.a, self.groups[self.file], .{});
-            const bytes = self.bytes.?;
-            if (bytes.len == 0 or bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-            std.mem.writeInt(u32, self.key[0..4], @intCast(self.file), .big);
-            std.mem.writeInt(u32, self.key[4..8], @intCast(self.offset), .big);
-            const end = @min(bytes.len, self.offset + inventory_chunk_bytes);
-            const value = bytes[self.offset..end];
-            self.offset = end;
-            return .{ .key = &self.key, .value = value };
-        }
-    };
-    var source: Source = .{ .a = a, .groups = groups };
-    defer if (source.bytes) |bytes| a.free(bytes);
-    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    var reads: u64 = 0;
-    var writes: u64 = 128 * 1024 * 1024;
-    var pages: inventory_pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-    return inventory_tree.buildSorted(a, pages.store(), &source);
-}
 fn readServingInventory(a: A, scratch_backing: A, directory: Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Root {
     const Read = struct {
         cached: artifacts.CachedRead,
@@ -667,8 +653,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // Publish one immutable manifest per file. Large corpora do not put
         // every native segment reference (twice) into the root artifact.
         const manifests = try ca.alloc(artifacts.ChunkRef, groups.len);
+        var previous_manifests: std.StringHashMapUnmanaged(artifacts.ChunkRef) = .empty;
+        defer previous_manifests.deinit(a);
+        if (seed) |old| if (old.manifests.len == old.file_groups.len) {
+            for (old.file_groups, old.manifests) |old_group, ref| try previous_manifests.put(a, old_group.file.id, ref);
+        };
         for (groups, manifests) |group, *manifest| {
             try cancellation.check();
+            if (seed) |old| {
+                if (!plan.changed[plan.by_id.get(group.file.id).?] and old.admission_version == 1 and old.statistics_version == 2 and old.manifests.len == old.file_groups.len) {
+                    manifest.* = previous_manifests.get(group.file.id) orelse return error.InvalidNativeLakeTextCorpus;
+                    continue;
+                }
+            }
             const page = try std.json.Stringify.valueAlloc(a, group, .{});
             defer a.free(page);
             if (page.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -677,7 +674,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const ref = try page_upload.putWithCancellation(page, cancellation);
             manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         }
-        root.serving_inventory = try writeServingInventory(a, store, groups, cancellation);
+        const inventory = try @import("lake_index_serving_inventory.zig").publish(a, store, groups, manifests, seed, cancellation);
+        root.serving_inventory = inventory.full;
+        root.serving_routes = inventory.routes;
+        root.inventory_version = 2;
         root.manifests = manifests;
         root.file_groups = &.{};
         root.segments = &.{};

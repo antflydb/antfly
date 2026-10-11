@@ -177,7 +177,7 @@ pub const Cache = struct {
         var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
         var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
         defer metadata_arena.deinit();
-        const inventory = corpus.admitInventoryBounded(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation) catch |err| {
+        const inventory = corpus.admitServingInventory(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation) catch |err| {
             if (err == error.OutOfMemory and self.inventory_budget.isExhausted()) return error.NativeLakeTextCacheBusy;
             return err;
         };
@@ -409,6 +409,7 @@ const Entry = struct {
     statistics_ordinals: []const corpus.statistics.IdentityOrdinal = &.{},
     statistics_routing: []const local.index.IndexSnapshot.TextCandidate = &.{},
     domain: [32]u8 = @splat(0),
+    descriptors: @import("lake_index_seekable_text.zig").Descriptors = .empty,
     identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
     selected_field: ?[]const u8 = null,
@@ -459,6 +460,16 @@ const Entry = struct {
         defer additions.deinit(self.allocator);
         var admission_by_id: std.StringHashMapUnmanaged(local.segment.SegmentReader.Admission) = .empty;
         defer admission_by_id.deinit(self.allocator);
+        const Route = struct { segment: corpus.SegmentRouting, manifest: local.serverless_manifest_artifact_ref.ArtifactRef, ordinal: usize };
+        var routing_by_id: std.StringHashMapUnmanaged(Route) = .empty;
+        defer routing_by_id.deinit(self.allocator);
+        if (root.manifests.len == root.file_groups.len) for (root.file_groups, root.manifests) |group, manifest| {
+            const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, manifest.artifact_id), .checksum = try a.dupe(u8, manifest.checksum), .byte_len = manifest.byte_len };
+            for (group.segments, 0..) |segment, ordinal| try self.descriptors.put(a, try a.dupe(u8, segment.artifact_id), .{ .manifest = ref, .ordinal = ordinal });
+        };
+        if (root.routing.len != 0) for (root.routing, root.manifests) |routes, manifest| {
+            for (routes, 0..) |route, ordinal| try routing_by_id.put(self.allocator, route.ref.artifact_id, .{ .segment = route, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len }, .ordinal = ordinal });
+        };
         for (root.file_groups) |group| if (group.admissions.len != 0) {
             for (group.segments, group.admissions) |ref, metadata| try admission_by_id.put(self.allocator, ref.artifact_id, metadata);
         };
@@ -509,6 +520,15 @@ const Entry = struct {
             for (position..end) |ordinal| {
                 const ref = additions.items[ordinal];
                 try cancellation.check();
+                if (routing_by_id.get(ref.artifact_id)) |route| {
+                    const seekable = @import("lake_index_seekable_text.zig");
+                    var data = try seekable.loadRouted(self.allocator, .{ .store = store, .cache = cached, .context = cached.context, .cancellation = cancellation, .resource_manager = self.resource_manager }, ref, route.segment.bytes, route.manifest, route.ordinal);
+                    errdefer data.deinit(self.allocator);
+                    const reader = try local.segment.SegmentReader.initRouting(self.allocator, route.segment.doc_count, route.segment.fields, seekable.routedReader);
+                    replacements[loaded] = .{ .id = ids.items[ordinal], .data = data, .prepared_reader = reader };
+                    loaded += 1;
+                    continue;
+                }
                 // Descriptor admission performs no artifact reads. Do not
                 // charge unvisited directory payloads or queue an I/O-sized
                 // CPU job for these small, bounded metadata copies.
@@ -618,7 +638,7 @@ const Entry = struct {
         if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
-        lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
+        lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager, .descriptors = if (self.descriptors.count() != 0) &self.descriptors else null } };
         const snapshot = self.writer.?.acquireSnapshotWithReadCapability(.{ .ptr = &lease.read, .check = QueryLease.checkRead, .io = context.io }) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
         if (self.statistics_version >= 1) {
             lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .routing = self.statistics_routing, .allocator = self.allocator };

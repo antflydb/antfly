@@ -289,14 +289,17 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
                 cells[column] = key;
             }
             if (!try bound.input.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
-            if (partial.typed_states != null and partial.state_reader != null) return error.InvalidSqlBackendResponse;
-            const partial_count = if (partial.state_reader) |reader| reader.count else if (partial.typed_states) |states| states.len else partial.aggregates.len;
+            const partial_count = try @import("aggregate_partial.zig").partialCount(partial);
             if (partial.aggregate_slots) |slots| {
                 if (slots.len != partial_count) return error.InvalidSqlBackendResponse;
             } else if (partial_count != bound.specs.len) return error.InvalidSqlBackendResponse;
             var typed: ?[]const operators.Aggregate = if (partial.state_reader) |reader| materialize: {
                 const states = try a.alloc(operators.Aggregate, reader.count);
-                for (states, 0..) |*state, index| state.* = try reader.read(reader.ptr, a, index);
+                for (states, 0..) |*state, index| {
+                    const slot = if (partial.aggregate_slots) |slots| slots[index] else index;
+                    if (slot >= bound.specs.len) return error.InvalidSqlBackendResponse;
+                    state.* = try @import("aggregate_partial.zig").read(a, partial, index, bound.specs[slot]);
+                }
                 break :materialize states;
             } else partial.typed_states;
             var adjusted: ?[]operators.Aggregate = null;

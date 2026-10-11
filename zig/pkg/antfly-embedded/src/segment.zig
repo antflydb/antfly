@@ -690,6 +690,43 @@ pub const SegmentReader = struct {
     fields: []FieldInfo,
 
     native: ?*Native = null,
+    deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
+
+    pub const RoutingField = struct { name: []const u8, stats: ?InvertedFieldStats, section_mask: u16 = 0 };
+    /// Compact immutable scoring inventory. Full navigation is admitted under
+    /// the selected query's capability, never by the corpus publication loop.
+    pub fn initRouting(a: Allocator, doc_count: u32, route: []const RoutingField, load: *const fn (Allocator, SegmentSource) anyerror!SegmentReader) !SegmentReader {
+        if (route.len > std.math.maxInt(u16)) return error.InvalidSegment;
+        for (route, 0..) |field, i| {
+            if (field.name.len > std.math.maxInt(u16) or field.section_mask >> @typeInfo(SectionType).@"enum".field_names.len != 0) return error.InvalidSegment;
+            if (i != 0 and std.mem.order(u8, route[i - 1].name, field.name) != .lt) return error.InvalidSegment;
+            if (field.stats) |stats| if (stats.doc_count > doc_count) return error.InvalidSegment;
+        }
+        const fields = try a.alloc(FieldInfo, route.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |field| {
+                a.free(field.name);
+                a.free(field.sections);
+            }
+            a.free(fields);
+        }
+        for (fields, route) |*field, route_field| {
+            const name = try a.dupe(u8, route_field.name);
+            errdefer a.free(name);
+            const sections = try a.alloc(SectionInfo, @popCount(route_field.section_mask));
+            var position: usize = 0;
+            inline for (@typeInfo(SectionType).@"enum".field_values) |kind| {
+                if (route_field.section_mask & (@as(u16, 1) << kind) != 0) {
+                    sections[position] = .{ .section_type = @fromBackingInt(@intCast(kind)), .offset = 0, .length = 0 };
+                    position += 1;
+                }
+            }
+            field.* = .{ .name = name, .sections = sections, .inverted_stats = route_field.stats };
+            initialized += 1;
+        }
+        return .{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load };
+    }
 
     const Native = struct {
         range: RangeSegmentReader,
@@ -930,10 +967,27 @@ pub const SegmentReader = struct {
         return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields };
     }
 
+    pub fn hasSection(self: *const SegmentReader, name: []const u8, kind: SectionType) bool {
+        for (self.fields) |field| if (std.mem.eql(u8, field.name, name)) {
+            for (field.sections) |section| if (section.section_type == kind) return true;
+        };
+        return false;
+    }
+
     /// The enclosing snapshot pins this reader's physical segment. Reuse its
     /// admitted navigation without rereading metadata under every query. Only
     /// query-local cache state and the capability-bound source are allocated.
     pub fn bindSource(self: *const SegmentReader, alloc: Allocator, input_source: SegmentSource) !SegmentReader {
+        if (self.deferred) |load| {
+            var reader = try load(alloc, input_source);
+            errdefer reader.deinit();
+            if (reader.doc_count != self.doc_count or reader.fields.len != self.fields.len) return error.InvalidSegment;
+            for (reader.fields, self.fields) |actual, expected| {
+                if (!std.mem.eql(u8, actual.name, expected.name) or !std.meta.eql(actual.inverted_stats, expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
+                for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
+            }
+            return reader;
+        }
         const base = self.native orelse return error.InvalidSegment;
         if (input_source.len() != base.range.source.len()) return error.InvalidSegment;
         const native = try alloc.create(Native);
@@ -957,7 +1011,12 @@ pub const SegmentReader = struct {
     }
 
     pub fn nativeNavigationBytes(self: *const SegmentReader) usize {
-        const native = self.native orelse return 0;
+        const native = self.native orelse {
+            if (self.deferred == null) return 0;
+            var bytes: usize = self.fields.len * @sizeOf(FieldInfo);
+            for (self.fields) |field| bytes += field.name.len + field.sections.len * @sizeOf(SectionInfo);
+            return bytes;
+        };
         @import("antfly_platform").sync.lockYielding(&native.identity_mutex);
         defer native.identity_mutex.unlock();
         var bytes = @sizeOf(Native) + native.identity_bytes + native.metadata_cache.?.retainedBytes() +
@@ -1195,7 +1254,10 @@ pub const SegmentReader = struct {
             self.alloc.destroy(native);
             return;
         }
-        for (self.fields) |*f| self.alloc.free(f.sections);
+        for (self.fields) |*f| {
+            if (self.deferred != null) self.alloc.free(f.name);
+            self.alloc.free(f.sections);
+        }
         self.alloc.free(self.fields);
         if (self.stored_block_validations) |validations| self.alloc.free(validations);
     }
@@ -1360,7 +1422,7 @@ pub const SegmentReader = struct {
     /// Collection statistics preserve lazy payload checksum validation. Native
     /// admission reads only field descriptors, as the mapped path does.
     pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?InvertedFieldStats {
-        if (self.native != null) {
+        if (self.native != null or self.deferred != null) {
             // Immutable admission metadata survives cache capability sealing.
             for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) return info.inverted_stats;
             return null;
@@ -12041,4 +12103,24 @@ test "external lake authenticated native admission avoids ranges validates metad
     invalid = metadata;
     invalid.bytes += 1;
     try std.testing.expectError(error.InvalidSegment, SegmentReader.initAuthenticated(a, source.source(), invalid));
+}
+
+test "external lake compact routing readers unwind allocation failures and preserve scoring totals" {
+    const Sweep = struct {
+        fn load(_: Allocator, _: SegmentSource) !SegmentReader {
+            return error.InvalidSegment;
+        }
+        fn run(a: Allocator) !void {
+            var reader = try SegmentReader.initRouting(a, 4, &.{
+                .{ .name = "body", .stats = .{ .doc_count = 4, .total_field_len = 12 }, .section_mask = 1 },
+                .{ .name = "id", .stats = null },
+            }, load);
+            defer reader.deinit();
+            try std.testing.expectEqual(@as(u64, 12), (try reader.invertedFieldStats("body")).?.total_field_len);
+            try std.testing.expectEqual(null, try reader.invertedFieldStats("id"));
+            try std.testing.expect(reader.nativeNavigationBytes() > 0);
+            try std.testing.expectError(error.InvalidSegment, reader.bindSource(a, .{ .contiguous = &.{} }));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
 }

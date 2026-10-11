@@ -277,6 +277,20 @@ test "external lake overlapping text generations share every physical segment on
             defer paged.deinit();
             try std.testing.expectEqual(full.segments.len, paged.root.segments.len);
             try std.testing.expectEqual(@as(usize, 0), paged.manifests.len);
+            // Cold compact admission never touches missing detailed manifests.
+            // Only selecting a segment requires its full descriptor; a failed
+            // admission must not install a broken reader in the query facade.
+            var selective_cache: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer selective_cache.deinit();
+            var selective = try selective_cache.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, fresh, fresh.context, .none);
+            defer selective.deinit();
+            try std.testing.expectEqual(@as(usize, 0), selective.snapshot.bound_segments.count());
+            for (selective.snapshot.segments) |segment| {
+                try std.testing.expect(segment.reader.deferred != null);
+                try std.testing.expect(segment.reader.native == null);
+            }
+            try std.testing.expectError(error.FileNotFound, selective.snapshot.readSegment(0));
+            try std.testing.expectEqual(@as(usize, 0), selective.snapshot.bound_segments.count());
             for (full.segments, paged.root.segments) |expected, actual| try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
         }
         {
@@ -301,6 +315,45 @@ test "external lake overlapping text generations share every physical segment on
         defer warm.deinit();
         try std.testing.expectEqual(@as(u32, 3), warm.snapshot.liveDocCount());
         try std.testing.expect(cold.snapshot.segments[0].shared == warm.snapshot.segments[0].shared);
+        {
+            // Reissued manifests may have the same digest in a new upload
+            // attempt. Physical reader reuse must route through the current
+            // generation, whose reader lease retains that exact object.
+            const scope = try stores.UploadScope.forPublication(directory_root.domain, 55, std.testing.io);
+            const original = directory_root.manifests[0];
+            const manifest_bytes = try store.getAlloc(original.artifact_id);
+            defer a.free(manifest_bytes);
+            var reissued = try store.putScoped(scope, manifest_bytes, .none);
+            defer reissued.deinit(a);
+            var alias_root = directory_root;
+            const refs = try ca.dupe(@import("lake_index_aggregate_artifact.zig").ChunkRef, directory_root.manifests);
+            refs[0] = .{ .artifact_id = reissued.artifact_id, .checksum = reissued.checksum, .byte_len = reissued.byte_len };
+            alias_root.manifests = refs;
+            const root_bytes = try std.json.Stringify.valueAlloc(ca, alias_root, .{});
+            var uploaded_root = try store.putScoped(scope, root_bytes, .none);
+            defer uploaded_root.deinit(a);
+            var alias_ref = declaration.artifact;
+            alias_ref.artifact_id = uploaded_root.artifact_id;
+            alias_ref.checksum = uploaded_root.checksum;
+            alias_ref.byte_len = uploaded_root.byte_len;
+            var alias = try directory_cache.acquire(std.testing.io, store, alias_ref, alias_root, schema_json, cached, cached.context, .none);
+            defer alias.deinit();
+            try std.testing.expect(alias.snapshot.segments[0].shared == cold.snapshot.segments[0].shared);
+            try store.delete(reissued.artifact_id);
+            var restored = false;
+            defer if (!restored) {
+                var replacement = store.putScoped(scope, manifest_bytes, .none) catch unreachable;
+                replacement.deinit(a);
+            };
+            // The original descriptor is still available. Binding must fail
+            // rather than silently inherit the physical owner's old manifest.
+            try std.testing.expectError(error.FileNotFound, alias.snapshot.readSegment(0));
+            try std.testing.expectEqual(@as(usize, 0), alias.snapshot.bound_segments.count());
+            var replacement = try store.putScoped(scope, manifest_bytes, .none);
+            replacement.deinit(a);
+            restored = true;
+            try std.testing.expectEqual(@as(u32, 1), (try alias.snapshot.readSegment(0)).reader.doc_count);
+        }
         var expired = cached;
         expired.context.deadline_ns = 1;
         try std.testing.expectError(error.DeadlineExceeded, native.admitInventory(ca, directory_root, store, expired, .none));

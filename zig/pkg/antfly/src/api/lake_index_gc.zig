@@ -280,6 +280,7 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
                     try self.markPages(a, root.domain, root.serving_inventory, false);
+                    try self.markPages(a, root.domain, root.serving_routes, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);
                     try self.markPages(a, root.domain, root.term_directory.leaves, false);
@@ -462,6 +463,10 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const serving_inventory = (try tree.buildSorted(a, stats_pages.store(), &serving_source)).?;
     var old_serving_source: StatisticsSource = .{ .value = "old reader serving inventory" };
     const old_serving_inventory = (try tree.buildSorted(a, stats_pages.store(), &old_serving_source)).?;
+    var route_source: StatisticsSource = .{ .value = "compact scoring routes" };
+    const serving_routes = (try tree.buildSorted(a, stats_pages.store(), &route_source)).?;
+    var old_route_source: StatisticsSource = .{ .value = "old reader compact scoring routes" };
+    const old_serving_routes = (try tree.buildSorted(a, stats_pages.store(), &old_route_source)).?;
     const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
         .file = .{ .id = "part", .digest = @splat(7) },
         .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
@@ -470,11 +475,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
-    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = old_serving_inventory, .statistics_version = 2, .term_statistics = old_statistics, .term_directory = .{ .branches = old_term_branches, .leaves = old_term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = old_serving_inventory, .serving_routes = old_serving_routes, .statistics_version = 2, .term_statistics = old_statistics, .term_directory = .{ .branches = old_term_branches, .leaves = old_term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var old_text_upload = try store.put(old_text_bytes);
     defer old_text_upload.deinit(a);
     var old_text_ref = text_ref;
@@ -579,16 +584,19 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer a.free(retained_old_statistics);
     const retained_old_inventory = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_inventory));
     defer a.free(retained_old_inventory);
+    const retained_old_routes = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes));
+    defer a.free(retained_old_routes);
     harness.state = try harness.state.release(ca, @splat(9));
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
-    for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, term_branches, term_leaves }) |ref| {
+    for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);
         try std.testing.expectEqual(ref.bytes, retained_statistics.len);
     }
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_inventory)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes)));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics)));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_branches)));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_leaves)));

@@ -5275,6 +5275,45 @@ test "external lake SQL exact join partial aggregation preserves fanout NULLs fi
     try std.testing.expectError(error.SqlProgramLimitExceeded, execute(a, backend.iface(), &baseline, &.{}, .{ .scan_rows = 64 }));
 }
 
+test "external lake SQL plain count consumes resident and spilled typed join partials" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k",
+        "SELECT COUNT(*) FROM (VALUES (NULL),(NULL)) l(k) JOIN (VALUES (NULL),(NULL)) r(k) ON l.k=r.k",
+    }, 0..) |sql, index| {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(if (index == 0) "4" else "0", result.output.rows[0][0].string);
+    }
+    var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };
+    var backend = source.coordinated();
+    backend.execution_io = std.testing.io;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+    defer manager.deinit();
+    backend.spill_manager = &manager;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*) FROM things l JOIN things r ON l.id=r.id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
+    defer result.deinit();
+    try std.testing.expect(manager.written_bytes > 0);
+    try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+    // Retaining every join key proves that compact pairs are already distinct
+    // final groups. Keep those streaming rather than doing a second reduction.
+    var keyed = try compiler.compile(a, "SELECT l.id, COUNT(*) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id LIMIT 3", .{});
+    defer keyed.deinit();
+    var groups = try execute(a, backend, &keyed, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
+    defer groups.deinit();
+    try std.testing.expectEqual(@as(usize, 3), groups.output.rows.len);
+    for (groups.output.rows, 0..) |row, index| {
+        var expected: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{index}), row[0].string);
+        try std.testing.expectEqualStrings("16", row[1].string);
+    }
+}
+
 test "external lake SQL join partial state spills and unwinds allocation failures" {
     const a = std.testing.allocator;
     var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };

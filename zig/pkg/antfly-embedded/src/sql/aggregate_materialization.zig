@@ -201,10 +201,9 @@ pub fn countFromProvider(context: anytype, table: catalog.Table) !?u64 {
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| records) return error.SqlProgramLimitExceeded;
         records += partials.len;
         for (partials) |partial| {
-            if (partial.keys.len != 0 or partial.aggregates.len != 1) return error.InvalidSqlBackendResponse;
+            if (partial.keys.len != 0 or try @import("aggregate_partial.zig").partialCount(partial) != 1) return error.InvalidSqlBackendResponse;
             if (partial.aggregate_slots) |slots| if (slots.len != 1 or slots[0] != 0) return error.InvalidSqlBackendResponse;
-            var state = try @import("aggregate_partial.zig").decode(a, partial.aggregates[0], spec);
-            defer state.deinit();
+            const state = try @import("aggregate_partial.zig").read(a, partial, 0, spec);
             count = std.math.add(u64, count, state.count) catch return error.SqlNumericOutOfRange;
             if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
         }

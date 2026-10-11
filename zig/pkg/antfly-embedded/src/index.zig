@@ -1560,7 +1560,9 @@ pub const IndexSnapshot = struct {
     pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) !bool {
         for (self.segments) |*seg| {
             if (seg.reader.doc_count == 0) continue;
-            if (seg.reader.native) |native| {
+            if (seg.reader.deferred != null) {
+                if (!seg.reader.hasSection(segment_mod.doc_ordinals_field, .doc_ordinals)) return false;
+            } else if (seg.reader.native) |native| {
                 if (native.range.findSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
             } else if ((try seg.reader.sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
         }
@@ -1569,7 +1571,9 @@ pub const IndexSnapshot = struct {
 
     pub fn hasInvertedField(self: *const IndexSnapshot, field: []const u8) !bool {
         for (self.segments) |*seg| {
-            if (seg.reader.native) |native| {
+            if (seg.reader.deferred != null) {
+                if (seg.reader.hasSection(field, .inverted_text)) return true;
+            } else if (seg.reader.native) |native| {
                 if (native.range.findSection(field, .inverted_text) != null) return true;
             } else if (try seg.reader.invertedIndex(field) != null) return true;
         }

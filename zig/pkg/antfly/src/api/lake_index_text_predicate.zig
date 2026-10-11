@@ -29,6 +29,18 @@ const Compiled = Graph.CompiledPatternFilter;
 /// request allocator is an arena. Each slot uses a fixed buffer, not an arena
 /// whose freed objects would remain resident in the request's parent arena.
 pub const LiveRowsCache = struct {
+    const decoded = @import("lake_index_decoded_metadata.zig");
+    const FileSlot = struct {
+        digest: [32]u8 = @splat(0),
+        group: ?corpus.FileGroup = null,
+        row_count: u64 = 0,
+        shared: ?decoded.Owned(corpus.FileGroup) = null,
+        used: u64 = 0,
+        fn clear(self: *@This()) void {
+            if (self.shared) |owned| owned.release();
+            self.* = .{};
+        }
+    };
     const slot_bytes = 1024 * 1024;
     const Slot = struct {
         buffer: ?[]u8 = null,
@@ -38,11 +50,37 @@ pub const LiveRowsCache = struct {
         used: u64 = 0,
         byte_len: u64 = 0,
     };
+    files: [4]FileSlot = @splat(.{}),
     slots: [4]Slot = @splat(.{}),
     clock: u64 = 0,
     pub fn deinit(self: *@This(), a: A) void {
+        for (&self.files) |*entry| entry.clear();
         for (&self.slots) |*slot| if (slot.buffer) |buffer| a.free(buffer);
         self.* = .{};
+    }
+    fn file(self: *@This(), store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !*const FileSlot {
+        try cached.context.ensureActive();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&cached.scope);
+        hash.update(ref.artifact_id);
+        hash.update(ref.checksum);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        self.clock += 1;
+        var victim: *FileSlot = &self.files[0];
+        for (&self.files) |*slot| {
+            if (slot.group != null and std.mem.eql(u8, &slot.digest, &digest)) {
+                slot.used = self.clock;
+                return slot;
+            }
+            if (slot.used < victim.used) victim = slot;
+        }
+        victim.clear();
+        const owned = try decoded.acquire(corpus.FileGroup, cached, store, ref, .none, corpus.loadCachedFile);
+        errdefer owned.release();
+        const count = try corpus.physical.validate(owned.value.rows);
+        victim.* = .{ .digest = digest, .group = owned.value.*, .row_count = count, .shared = owned, .used = self.clock };
+        return victim;
     }
     fn load(self: *@This(), a: A, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
         const ref = block.bitmap orelse return error.InvalidNativeLakeTextCorpus;
@@ -81,7 +119,19 @@ pub const LiveRowsCache = struct {
 /// Version 8 maps compressed physical rows directly to pinned native ordinals.
 /// Directory storage scales with files/groups/blocks and compressed delete holes.
 pub const Identities = struct {
-    const Span = struct { lower: u32, upper: u32, rows: []const corpus.physical.Block };
+    const Span = struct {
+        lower: u32,
+        upper: u32,
+        rows: []const corpus.physical.Block,
+        manifest: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+        fn blocks(self: @This(), cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, file_id: []const u8) ![]const corpus.physical.Block {
+            const ref = self.manifest orelse return self.rows;
+            const held = try cache.file(store, cached, ref);
+            const group = held.group.?;
+            if (!std.mem.eql(u8, group.file.id, file_id) or held.row_count != self.upper - self.lower) return error.InvalidNativeLakeTextCorpus;
+            return group.rows;
+        }
+    };
     const FileSpan = struct { file: []const u8, span: Span };
     files: std.StringHashMapUnmanaged(Span) = .empty,
     spans: []const FileSpan = &.{},
@@ -100,13 +150,17 @@ pub const Identities = struct {
             if (segment > snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
             const entry = try result.files.getOrPut(a, try a.dupe(u8, group.file.id));
             if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
-            if (try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
+            if (root.routing.len == 0 and try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
             const physical_rows = try a.dupe(corpus.physical.Block, group.rows);
             for (physical_rows) |*block| if (block.bitmap) |*ref| {
                 ref.artifact_id = try a.dupe(u8, ref.artifact_id);
                 ref.checksum = try a.dupe(u8, ref.checksum);
             };
             entry.value_ptr.* = .{ .lower = offsets[start], .upper = offsets[segment], .rows = physical_rows };
+            if (root.routing.len != 0) {
+                const ref = root.manifests[group_index];
+                entry.value_ptr.manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = try a.dupe(u8, ref.artifact_id), .checksum = try a.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+            }
             spans[group_index] = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
@@ -118,8 +172,9 @@ pub const Identities = struct {
     }
     fn addBlock(self: Identities, a: A, temporary: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, selected: @import("lake_index_predicate_blocks.zig").Block, result: *Bitmap) !void {
         const file = self.files.get(selected.file) orelse return error.ExternalLakeSnapshotMismatch;
-        const index = corpus.physical.find(file.rows, selected.group, selected.base) orelse return;
-        const block = file.rows[index];
+        const blocks = try file.blocks(cache, store, cached, selected.file);
+        const index = corpus.physical.find(blocks, selected.group, selected.base) orelse return;
+        const block = blocks[index];
         const base = try std.math.add(u32, file.lower, block.base);
         switch (selected.selection) {
             .interval => |span| {
@@ -158,8 +213,9 @@ pub const Identities = struct {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         const ref = row.external;
         const span = self.files.get(ref.file_id) orelse return error.ExternalLakeSnapshotMismatch;
-        const index = corpus.physical.find(span.rows, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
-        const block = span.rows[index];
+        const blocks = try span.blocks(cache, store, cached, ref.file_id);
+        const index = corpus.physical.find(blocks, ref.row_group_ordinal, ref.row_ordinal) orelse return null;
+        const block = blocks[index];
         const low: u32 = @intCast(ref.row_ordinal & ((1 << corpus.physical.shift) - 1));
         const rank: u32 = if (block.bitmap) |artifact| blk: {
             _ = artifact;
@@ -183,17 +239,18 @@ pub const Identities = struct {
         }
         if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
         const file = self.spans[lo];
+        const blocks = try file.span.blocks(cache, store, cached, file.file);
         if (ordinal_value < file.span.lower) return error.InvalidNativeLakeTextCorpus;
         const relative = ordinal_value - file.span.lower;
         lo = 0;
-        hi = file.span.rows.len;
+        hi = blocks.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const block = file.span.rows[mid];
+            const block = blocks[mid];
             if (@as(u64, block.base) + block.count <= relative) lo = mid + 1 else hi = mid;
         }
-        if (lo == file.span.rows.len) return error.InvalidNativeLakeTextCorpus;
-        const block = file.span.rows[lo];
+        if (lo == blocks.len) return error.InvalidNativeLakeTextCorpus;
+        const block = blocks[lo];
         if (relative < block.base) return error.InvalidNativeLakeTextCorpus;
         const rank = relative - block.base;
         const low = if (block.bitmap != null) blk: {
@@ -213,7 +270,7 @@ pub const Identities = struct {
         while (files.next()) |file| {
             const span = file.value_ptr.*;
             if (selected.rangeCardinality(span.lower, span.upper) == 0) continue;
-            for (span.rows) |block| {
+            for (try span.blocks(&cache, store, cached, file.key_ptr.*)) |block| {
                 const lower = try std.math.add(u32, span.lower, block.base);
                 const upper = @as(u64, lower) + block.count;
                 if (selected.rangeCardinality(lower, upper) == 0) continue;
