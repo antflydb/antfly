@@ -204,7 +204,74 @@ const test_after =
     \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"email":{"type":"string"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_idx","keys":[{"column":"email"}]}],"unique_constraints":[{"name":"email_idx","origin":"index","columns":["email"]}]}
 ;
 
-fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void {
+fn stageNativeReplayForTest(
+    txn: *@import("../docstore.zig").DocStore.Txn,
+    manager: *@import("../transactions.zig").TxnManager,
+    binding: @import("relational_index_owner_job.zig").Binding,
+    candidate: *const Candidate,
+    physical: *const @import("relational_index_catalog.zig").PrivateAddition,
+    effect: @import("relational_index_owner_job.zig").NativeEffect,
+    position: @import("receipt_position.zig").Native,
+) !void {
+    const jobs = @import("relational_index_owner_job.zig");
+    switch (effect) {
+        .admitted => _ = try jobs.stageBeginWithReplay(txn, binding, position),
+        .fenced => _ = try jobs.stageNativeFencedWithReplay(txn, manager, binding, position),
+        .reserved => _ = try jobs.stageReservationWithReplay(txn, manager, binding, candidate, physical, position),
+    }
+}
+
+fn testRejectedNativeReplay(
+    store: *@import("../docstore.zig").DocStore,
+    manager: *@import("../transactions.zig").TxnManager,
+    binding: @import("relational_index_owner_job.zig").Binding,
+    candidate: *const Candidate,
+    physical: *const @import("relational_index_catalog.zig").PrivateAddition,
+    effect: @import("relational_index_owner_job.zig").NativeEffect,
+    sequence: u64,
+    duplicate: bool,
+) !void {
+    const Native = @import("receipt_position.zig").Native;
+    var foreign = binding.fence.namespace;
+    foreign.range_id += 1;
+    const invalid = [_]struct { position: Native, err: anyerror }{
+        .{ .position = .{ .namespace = binding.fence.namespace, .sequence = 0 }, .err = error.InvalidControlReceiptPosition },
+        .{ .position = .{ .namespace = foreign, .sequence = sequence + 1 }, .err = error.IdentityNamespaceMismatch },
+        .{ .position = .{ .namespace = binding.fence.namespace, .sequence = sequence + 2 }, .err = if (duplicate) error.InvalidControlReceiptPosition else error.OnlineSourceScopeChanged },
+    };
+    for (invalid) |case| {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(case.err, stageNativeReplayForTest(&txn, manager, binding, candidate, physical, effect, case.position));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var raft = binding;
+        raft.authority = .raft;
+        try std.testing.expectError(error.InvalidControlReceiptPosition, stageNativeReplayForTest(&txn, manager, raft, candidate, physical, effect, .{ .namespace = binding.fence.namespace, .sequence = sequence + 1 }));
+    }
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(sequence, (try @import("../source_authority.zig").load(&txn)).?.sequence);
+    const job = try @import("relational_index_owner_job.zig").load(&txn);
+    if (sequence == 0) {
+        try std.testing.expect(job == null);
+        try std.testing.expect(try @import("relational_integrity_topology.zig").current(&txn) == null);
+    } else {
+        try std.testing.expectEqual(if (sequence < 3) @import("relational_index_owner_job.zig").Phase.fencing else .reserved, job.?.phase);
+    }
+    // A gap at reservation may stage both catalog burns before the clock
+    // rejects it. Aborting must preserve the exact old catalog on both stores.
+    try std.testing.expectEqualSlices(u8, if (sequence < 3) candidate.reservation.expected.? else candidate.reservation.value, try txn.get(catalog.key));
+    if (sequence < 3) {
+        if (binding.physical_before) |before| {
+            try std.testing.expect((try @import("relational_index_catalog.zig").Head.decode(try txn.get(@import("relational_index_catalog.zig").head_key))).eql(before));
+        } else try std.testing.expectError(error.NotFound, txn.get(@import("relational_index_catalog.zig").head_key));
+    }
+}
+
+fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool, comptime replayed: bool) !void {
     const a = std.testing.allocator;
     const jobs = @import("relational_index_owner_job.zig");
     const physical = @import("relational_index_catalog.zig");
@@ -289,6 +356,10 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     }
     const authority = @import("../source_authority.zig");
     const namespace_bytes = @import("online_source_contract.zig").namespaceBytes(fence.namespace);
+    const Native = @import("receipt_position.zig").Native;
+    const admission_replay: ?Native = if (replayed) .{ .namespace = fence.namespace, .sequence = 1 } else null;
+    const fenced_replay: ?Native = if (replayed) .{ .namespace = fence.namespace, .sequence = 2 } else null;
+    const reserved_replay: ?Native = if (replayed) .{ .namespace = fence.namespace, .sequence = 3 } else null;
     {
         // Provision authority after loading rows, never by mixing a control
         // mutation with raw primary writes in a captured source transaction.
@@ -300,11 +371,12 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     var manager = try @import("../transactions.zig").TxnManager.init(a, &store);
     defer manager.deinit();
     try manager.initTransaction(@splat(9), 1);
+    if (replayed) try testRejectedNativeReplay(&store, &manager, binding, &candidate, &private_addition, .admitted, 0, false);
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expectError(error.PrivateIndexJobRequired, topology.stageBegin(&txn, fence));
-        try std.testing.expect(try jobs.stageBegin(&txn, binding));
+        try std.testing.expect(try jobs.stageBeginWithReplay(&txn, binding, admission_replay));
     }
     {
         var txn = try store.beginReadTxn();
@@ -317,7 +389,8 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expect(try jobs.stageBegin(&txn, binding));
+        try std.testing.expect(try jobs.stageBeginWithReplay(&txn, binding, admission_replay));
+        try std.testing.expect(!try jobs.stageBeginWithReplay(&txn, binding, admission_replay));
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
         try std.testing.expectEqual(@as(u64, 1), (try authority.load(&txn)).?.sequence);
         try txn.commit();
@@ -343,12 +416,13 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         } else try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
     }
     try manager.resolveIntents(@splat(9), .aborted, 2);
+    if (replayed) try testRejectedNativeReplay(&store, &manager, binding, &candidate, &private_addition, .fenced, 1, false);
     try testOwnerRecovery(a, &store, before_view, binding, false);
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
-        _ = try jobs.stageNativeFenced(&txn, &manager, binding);
+        _ = try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, fenced_replay);
         try std.testing.expectEqual(@as(u64, 2), (try authority.load(&txn)).?.sequence);
     }
     {
@@ -360,8 +434,9 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        const receipt = try jobs.stageNativeFenced(&txn, &manager, binding);
+        const receipt = try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, fenced_replay);
         try std.testing.expectEqual(@as(u64, 2), receipt.position.native.sequence);
+        try std.testing.expectEqualDeep(receipt, try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, fenced_replay));
         try std.testing.expectEqualDeep(receipt, try jobs.stageNativeFenced(&txn, &manager, binding));
         try txn.commit();
     }
@@ -379,6 +454,7 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         try txn.put(jobs.key, &try foreign.encode());
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, topology.current(&txn));
     }
+    if (replayed) try testRejectedNativeReplay(&store, &manager, binding, &candidate, &private_addition, .reserved, 2, false);
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
@@ -392,7 +468,7 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
-        try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expect(try jobs.stageReservationWithReplay(&txn, &manager, binding, &candidate, &private_addition, reserved_replay));
     }
     {
         var txn = try store.beginWriteTxn();
@@ -402,11 +478,22 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool) !void 
         if (initial) |value| {
             try std.testing.expect((try physical.Head.decode(try txn.get(physical.head_key))).eql(value.head));
         } else try std.testing.expectError(error.NotFound, txn.get(physical.head_key));
-        try std.testing.expect(try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
+        try std.testing.expect(try jobs.stageReservationWithReplay(&txn, &manager, binding, &candidate, &private_addition, reserved_replay));
+        try std.testing.expect(!try jobs.stageReservationWithReplay(&txn, &manager, binding, &candidate, &private_addition, reserved_replay));
         try std.testing.expect(!try jobs.stageReservation(&txn, &manager, binding, &candidate, &private_addition));
         try std.testing.expect(!try jobs.stageBegin(&txn, binding));
         try std.testing.expectEqual(@as(u64, 3), (try authority.load(&txn)).?.sequence);
         try txn.commit();
+    }
+    if (replayed) {
+        inline for (std.enums.values(jobs.NativeEffect)) |effect| try testRejectedNativeReplay(&store, &manager, binding, &candidate, &private_addition, effect, 3, true);
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        // Admission/fence retries retain their original cuts after reservation
+        // has advanced the clock. They must not require the clock to move back.
+        try std.testing.expect(!try jobs.stageBeginWithReplay(&txn, binding, admission_replay));
+        try std.testing.expectEqualDeep(fenced_replay.?, (try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, fenced_replay)).position.native);
+        try std.testing.expect(!try jobs.stageReservationWithReplay(&txn, &manager, binding, &candidate, &private_addition, reserved_replay));
     }
     {
         var txn = try store.beginReadTxn();
@@ -779,8 +866,15 @@ fn testPrivateBuildPages(a: Allocator, store: *@import("../docstore.zig").DocSto
 
 test "relational index candidate owner binding fences drains and reserves both catalogs atomically on memory and LSM" {
     inline for (.{ false, true }) |existing| {
-        try testOwnerJobAdmission(@import("../mem_backend.zig").Backend, existing);
-        try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend, existing);
+        try testOwnerJobAdmission(@import("../mem_backend.zig").Backend, existing, false);
+        try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend, existing, false);
+    }
+}
+
+test "relational index candidate native replay preserves original cuts and rejects clock gaps on memory and LSM" {
+    inline for (.{ false, true }) |existing| {
+        try testOwnerJobAdmission(@import("../mem_backend.zig").Backend, existing, true);
+        try testOwnerJobAdmission(@import("../lsm_backend.zig").Backend, existing, true);
     }
 }
 

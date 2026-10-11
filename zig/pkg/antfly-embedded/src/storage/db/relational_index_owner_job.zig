@@ -245,9 +245,25 @@ fn requireNativeCuts(txn: anytype, job: Binding) !void {
     } else if (reserved != null) return error.InvalidPrivateIndexNativeReceipt;
 }
 
-fn stageNativeCut(txn: anytype, binding: Binding, action: NativeEffect) !NativeCut {
-    if (try readNativeCut(txn, binding, action)) |existing| return existing;
-    const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), null) };
+fn validateReplay(binding: Binding, replay: ?positions.Native) !void {
+    if (replay) |position| {
+        if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        try position.validate();
+        if (!position.namespace.eql(binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+    }
+}
+
+fn requireReplay(cut: NativeCut, replay: ?positions.Native) !void {
+    if (replay) |position| if (!std.meta.eql(cut.position, position)) return error.InvalidControlReceiptPosition;
+}
+
+fn stageNativeCut(txn: anytype, binding: Binding, action: NativeEffect, replay: ?positions.Native) !NativeCut {
+    try validateReplay(binding, replay);
+    if (try readNativeCut(txn, binding, action)) |existing| {
+        try requireReplay(existing, replay);
+        return existing;
+    }
+    const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.sequence else null) };
     const evidence = try nativeEvidence(binding, action);
     var bytes: [native_effect_len]u8 = @splat(0);
     @memcpy(bytes[0..4], "AIN1");
@@ -307,12 +323,23 @@ fn requireNativeJob(txn: anytype, binding: Binding) !Binding {
 /// Admission is not a drained-fence proof. Seal that proof in a separate
 /// transaction only after every predecessor participant has resolved.
 pub fn stageNativeFenced(txn: anytype, manager: *transactions.TxnManager, binding: Binding) !publication.Receipt {
+    return stageNativeFencedWithReplay(txn, manager, binding, null);
+}
+
+/// Replay positions must originate in the authenticated standby frame, never
+/// in a coordinator's effect request. A retry must match the original cut even
+/// when the native clock has subsequently advanced.
+pub fn stageNativeFencedWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !publication.Receipt {
+    try validateReplay(binding, replay);
     const current = try requireNativeJob(txn, binding);
     _ = try requireNativeCut(txn, binding, .admitted);
-    if (try readNativeCut(txn, binding, .fenced)) |existing| return logicalReceipt(binding, .fenced, existing);
+    if (try readNativeCut(txn, binding, .fenced)) |existing| {
+        try requireReplay(existing, replay);
+        return logicalReceipt(binding, .fenced, existing);
+    }
     if (current.phase != .fencing) return error.InvalidPrivateIndexNativeReceipt;
     try topology.requireDrained(txn, manager, binding.fence);
-    return logicalReceipt(binding, .fenced, try stageNativeCut(txn, binding, .fenced));
+    return logicalReceipt(binding, .fenced, try stageNativeCut(txn, binding, .fenced, replay));
 }
 
 pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
@@ -434,6 +461,14 @@ pub fn reopenPhysical(alloc: std.mem.Allocator, txn: anytype, before: @import("s
 /// attested by the ordered owner. Fence and binding commit atomically; old
 /// participants may finish but no new participants may enter after this commit.
 pub fn stageBegin(txn: anytype, binding: Binding) !bool {
+    return stageBeginWithReplay(txn, binding, null);
+}
+
+/// The ordered owner stages the forwarded clock and admitted job in the same
+/// transaction. Errors require aborting that transaction, including when the
+/// forwarded clock is not the exact successor of the local durable clock.
+pub fn stageBeginWithReplay(txn: anytype, binding: Binding, replay: ?positions.Native) !bool {
+    try validateReplay(binding, replay);
     if (binding.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
     const encoded = try binding.encode();
     try requireNamespace(txn, binding);
@@ -444,6 +479,7 @@ pub fn stageBegin(txn: anytype, binding: Binding) !bool {
         const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
         if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
         try requireNativeCuts(txn, existing);
+        if (replay != null) try requireReplay(try requireNativeCut(txn, binding, .admitted), replay);
         return false;
     }
     const integrity = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
@@ -456,7 +492,7 @@ pub fn stageBegin(txn: anytype, binding: Binding) !bool {
     if (!std.mem.eql(u8, &digest(schema_bytes), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
     try txn.put(key, &encoded);
     try topology.stagePrivateIndexBegin(txn, binding.fence);
-    if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .admitted);
+    if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .admitted, replay);
     return true;
 }
 
@@ -464,6 +500,13 @@ pub fn stageBegin(txn: anytype, binding: Binding) !bool {
 /// burning either allocation. Both catalogs, private definitions and job phase
 /// share the caller's single-writer transaction and durable outbox.
 pub fn stageReservation(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition) !bool {
+    return stageReservationWithReplay(txn, manager, binding, candidate, physical, null);
+}
+
+/// Both allocation burns and the forwarded native cut share the caller's
+/// transaction/outbox. Duplicate replay never allocates a new generation.
+pub fn stageReservationWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition, replay: ?positions.Native) !bool {
+    try validateReplay(binding, replay);
     const expected = try prepare(binding.id, binding.plan_digest, binding.owner_digest, binding.ordinal, binding.fence, binding.authority, candidate, physical);
     var original = binding;
     original.phase = .fencing;
@@ -483,7 +526,7 @@ pub fn stageReservation(txn: anytype, manager: *transactions.TxnManager, binding
         if (!head.eql(binding.physical_reserved)) return error.PreparedGenerationChanged;
         const blob = try txn.get(&physical_catalog.blobKey(binding.physical_candidate.blob_digest));
         if (!std.mem.eql(u8, blob, physical.candidate.blob)) return error.ImmutableRelationalIndexDefinitionConflict;
-        if (binding.authority == .native) _ = try requireNativeCut(txn, binding, .reserved);
+        if (binding.authority == .native) try requireReplay(try requireNativeCut(txn, binding, .reserved), replay);
         return false;
     }
     try candidate.reservation.stage(txn);
@@ -491,6 +534,6 @@ pub fn stageReservation(txn: anytype, manager: *transactions.TxnManager, binding
     var next = expected;
     next.phase = .reserved;
     try txn.put(key, &try next.encode());
-    if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .reserved);
+    if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .reserved, replay);
     return true;
 }

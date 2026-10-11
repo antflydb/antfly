@@ -1897,8 +1897,8 @@ failure cleanup, typed candidate fingerprint substitution, and permission
 versus acknowledged retries on native and Raft owner cohorts. A structural
 size test uses a 64 KiB table description: shared inputs exceed 128 KiB while
 the owner dispatch stays below 4 KiB. This is a representation/read-work bound,
-not a measured distributed throughput or latency result. Qualification is still
-in progress for this checkpoint; the public producer remains disabled.
+not a measured distributed throughput or latency result. Component qualification
+passes for this checkpoint; the public producer remains disabled.
 
 Final Debug qualification passes 92/92 build steps and 606/606 standard-runner
 tests across the publication, namespace/recovery, catalog store, catalog API
@@ -1908,7 +1908,9 @@ namespace/native selections without skips, failures or leaks. The transport
 gate includes the actual metadata handler's exact-body owner-grant test:
 missing service/read grants and reusing a fence grant for a cancellation body
 are rejected before the callback, while the valid grant sets only the private
-index authority. ReleaseFast qualification is running on this frozen source.
+index authority. ReleaseFast also passes 92/92 build steps and 606/606
+standard-runner tests on the same frozen checkpoint, with all custom artifact
+selections passing without skips, failures or leaks.
 The earlier narrow mock error-set compile failure and sandbox-denied socket
 binds are not counted as passing runs; storage error propagation and loopback
 tests were retained rather than weakened. Formatting, diff checks, license
@@ -1922,3 +1924,41 @@ Public admission must also independently attest each owner's actual native or
 Raft receipt authority, rather than letting a proposed plan choose it. Worker
 activation must preserve ordinary read availability through pinned schema
 views while write/intent fencing and final publication enforce the index cut.
+
+### Exact native effect positions on standby replay
+
+Native private admission, drained-fence sealing and dual-catalog reservation
+now accept a typed forwarded native position through dedicated replay staging
+entry points. The ordinary primary entry points continue to derive their cut
+from the durable local source clock. Replay requires native authority, the
+exact owner namespace and a nonzero sequence before staging effects. A fresh
+effect must consume exactly the next durable clock position. An existing
+effect must match its original recorded position, not the current clock; this
+allows older admission/fence retries after reservation has advanced the clock.
+Neither path fabricates a Raft position or advances the clock on a duplicate.
+
+Forwarded positions are internal standby-frame data, not authority supplied by
+a SQL caller or coordinator. The receiving worker still needs its independent
+metadata permission and local identity checks. These transaction primitives
+neither authenticate a frame nor commit or sign a receipt. The eventual ordered
+DB entry point must stage the real outbox/frame with the effect in the same
+transaction, and abort the transaction on every error.
+
+Memory and LSM tests cover fresh replay and exact duplicates for all three
+effects, both absent and existing physical catalogs. Zero/foreign positions,
+gaps and incorrect retry positions are rejected. Tests deliberately exercise
+a rejected reservation after catalog writes have been staged, then verify that
+aborting preserves both catalogs, the durable job/fence and the native clock.
+Raft bindings cannot accept forwarded native positions. The existing three
+136-byte receipt slots and their durable representation are unchanged; replay
+adds no per-retry or per-page history. This is component replay qualification,
+not evidence of complete standby transport or public SQL activation.
+
+Debug qualification of these replay changes passes 65/65 build steps across
+`antfly-relational-index-candidate-test`, `antfly-relational-index-pages-test`
+and `relational-index-catalog-test`. Custom artifacts pass seven candidate,
+ten candidate/private-addition, four system/page and fourteen catalog tests,
+with no skips, failures or leaks; these overlapping selections are not summed
+as independent SQL cases. ReleaseFast qualification is running. The original
+SQL inventory remains unchanged, and the remaining activation requirements
+above still apply.
