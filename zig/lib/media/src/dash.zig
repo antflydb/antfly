@@ -13,11 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Bounded single-representation fMP4 DASH list/template and live clock parsing.
-//! Explicit references borrow the MPD; expanded template URIs are playlist-owned.
-//! DTDs/entities, DRM and unsupported timing/addressing fail explicitly.
+//! Bounded fMP4 DASH representation selection, inherited addressing and clocks.
+//! All returned references are playlist-owned. XML predefined/numeric entities
+//! are supported; DTDs, custom entities and DRM fail explicitly.
 const std = @import("std");
 const hls = @import("hls.zig");
+pub const document = @import("dash_xml.zig");
+const hierarchy = @import("dash_hierarchy.zig");
+pub const Selection = hierarchy.Selection;
 pub const Limits = hls.Limits;
 pub const Playlist = hls.Playlist;
 const Attribute = struct { name: []const u8, value: []const u8 };
@@ -40,6 +43,7 @@ fn nameChar(c: u8) bool {
 }
 const Xml = struct {
     bytes: []const u8,
+    allocator: std.mem.Allocator,
     cursor: usize = 0,
     fn spaces(self: *Xml) void {
         while (self.cursor < self.bytes.len and whitespace(self.bytes[self.cursor])) self.cursor += 1;
@@ -90,11 +94,10 @@ const Xml = struct {
             self.cursor += 1;
             const start = self.cursor;
             while (self.cursor < self.bytes.len and self.bytes[self.cursor] != quote) : (self.cursor += 1) {
-                if (self.bytes[self.cursor] == '&') return error.UnsupportedDash;
                 if (self.bytes[self.cursor] == '<' or self.bytes[self.cursor] < 0x20) return error.MalformedDash;
             }
             if (self.cursor == self.bytes.len) return error.MalformedDash;
-            tag.attrs[tag.count] = .{ .name = key, .value = self.bytes[start..self.cursor] };
+            tag.attrs[tag.count] = .{ .name = key, .value = try document.decodeAttribute(self.allocator, self.bytes[start..self.cursor]) };
             tag.count += 1;
             self.cursor += 1;
         }
@@ -132,6 +135,7 @@ pub const ReaderOptions = struct {
     playlist: Limits = .{},
     ingest: @import("live_mp4.zig").Options = .{},
     clock: ?Clock = null,
+    selection: Selection = .{},
 };
 
 // ISO 8601 elapsed durations. Calendar years/months cannot define sample clocks.
@@ -334,15 +338,23 @@ const Expansion = struct {
     }
 };
 
-/// Single video representation, explicit list or representation-level template.
+/// Select a video representation with inherited list/template addressing.
 /// Dynamic manifests require a supplied synchronized UTC clock; no guessed AST.
 pub fn parse(a: std.mem.Allocator, bytes: []const u8, limits: Limits) !Playlist {
     return parseAt(a, bytes, limits, null);
 }
 pub fn parseAt(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64) !Playlist {
+    return parseAtWithSelection(a, bytes, limits, now_unix_ms, .{});
+}
+pub fn parseAtWithSelection(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64, selection: Selection) !Playlist {
+    return hierarchy.parse(a, bytes, limits, now_unix_ms, selection, parseRepresentation);
+}
+fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64) !Playlist {
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.MalformedDash;
-    var xml = Xml{ .bytes = bytes };
+    // Decoded attributes must survive until the hierarchy planner has copied
+    // explicit segment references into the returned playlist.
+    var xml = Xml{ .bytes = bytes, .allocator = scratch };
     if (std.mem.startsWith(u8, bytes, "<?xml ")) {
         const end = std.mem.indexOf(u8, bytes, "?>") orelse return error.MalformedDash;
         if (std.mem.indexOfScalar(u8, bytes[1..end], '<') != null or std.mem.indexOfScalar(u8, bytes[0..end], '&') != null) return error.MalformedDash;
@@ -584,7 +596,11 @@ test "DASH elapsed and UTC reject invalid calendar ambiguous and overflowing clo
     try std.testing.expectError(error.MalformedDash, elapsed("PT18446744073709551615S"));
     try std.testing.expectError(error.MalformedDash, elapsed("PT1S2H"));
 }
-fn templateAllocationRun(a: std.mem.Allocator) !void {
+fn templateAllocationRun(backing: std.mem.Allocator) !void {
+    // Arena growth may resize in place depending on heap placement. Exercise
+    // deterministic allocation fallbacks at every failure position instead.
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
     var playlist = try parse(a, template_fixture, .{});
     defer playlist.deinit();
     var live_playlist = try parseAt(a, live_fixture, .{}, try dateTime("2026-01-01T00:00:10Z"));
@@ -592,6 +608,99 @@ fn templateAllocationRun(a: std.mem.Allocator) !void {
 }
 test "DASH template expansion releases allocations on every failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, templateAllocationRun, .{});
+}
+
+const inherited_fixture =
+    "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>https://media.example/root/</BaseURL>" ++
+    "<Period id='p' duration='PT4S'><BaseURL>period/</BaseURL>" ++
+    "<SegmentTemplate timescale='1000' duration='2000' startNumber='7' initialization='init-$RepresentationID$.mp4' media='$RepresentationID$-$Number$.m4s?key=a&amp;sig=b'/>" ++
+    "<AdaptationSet id='audio' contentType='audio'><Representation id='a'/></AdaptationSet>" ++
+    "<AdaptationSet id='video' contentType='video'><BaseURL>video/</BaseURL><SegmentTemplate startNumber='9'/>" ++
+    "<Representation id='high' bandwidth='2000'><BaseURL>hi/</BaseURL></Representation>" ++
+    "<Representation id='low' bandwidth='500'><BaseURL>lo/</BaseURL></Representation>" ++
+    "</AdaptationSet></Period></MPD>";
+test "DASH inherited templates select representations and resolve signed BaseURL chains" {
+    const a = std.testing.allocator;
+    var playlist = try parseAtWithSelection(a, inherited_fixture, .{}, null, .{ .max_bandwidth = 1000 });
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 2), playlist.segments.len);
+    try std.testing.expectEqual(@as(u64, 9), playlist.segments[0].sequence);
+    try std.testing.expectEqualStrings("https://media.example/root/period/video/lo/low-9.m4s?key=a&sig=b", playlist.segments[0].uri);
+    try std.testing.expectEqualStrings("https://media.example/root/period/video/lo/init-low.mp4", playlist.segments[0].initialization.uri);
+    var high = try parseAtWithSelection(a, inherited_fixture, .{}, null, .{ .adaptation_id = "video", .representation_id = "high" });
+    defer high.deinit();
+    try std.testing.expectEqualStrings("https://media.example/root/period/video/hi/high-10.m4s?key=a&sig=b", high.segments[1].uri);
+    try std.testing.expectError(error.DashSelectionNotFound, parseAtWithSelection(a, inherited_fixture, .{}, null, .{ .representation_id = "missing" }));
+    try std.testing.expectError(error.DashSelectionNotFound, parseAtWithSelection(a, inherited_fixture, .{}, null, .{ .max_bandwidth = 100 }));
+}
+test "DASH explicit escaped references remain owned after parsing" {
+    const a = std.testing.allocator;
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period><AdaptationSet><Representation><SegmentList duration='2'><Initialization sourceURL='init.mp4?x=1&amp;y=2'/><SegmentURL media='seg.m4s?x=3&amp;y=4'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+    const input = try a.dupe(u8, mpd);
+    var playlist = try parse(a, input, .{});
+    defer playlist.deinit();
+    @memset(input, 0);
+    a.free(input);
+    try std.testing.expectEqualStrings("init.mp4?x=1&y=2", playlist.segments[0].initialization.uri);
+    try std.testing.expectEqualStrings("seg.m4s?x=3&y=4", playlist.segments[0].uri);
+}
+test "DASH BaseURL alternatives relative manifests and invalid absolute URLs" {
+    const a = std.testing.allocator;
+    const prefix = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>first/</BaseURL><BaseURL>second/</BaseURL>";
+    const suffix = "<Period duration='PT2S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    const manifest = prefix ++ suffix;
+    try std.testing.expectError(error.DashManifestUrlRequired, parse(a, manifest, .{}));
+    var playlist = try parseAtWithSelection(a, manifest, .{}, null, .{ .manifest_url = "https://media.example/live/index.mpd", .base_url_index = 1 });
+    defer playlist.deinit();
+    try std.testing.expectEqualStrings("https://media.example/live/second/seg-1.m4s", playlist.segments[0].uri);
+    try std.testing.expectError(error.DashSelectionNotFound, parseAtWithSelection(a, manifest, .{}, null, .{ .manifest_url = "https://media.example/live/index.mpd", .base_url_index = 2 }));
+    for ([_][]const u8{ "file:///root/", "https://user@media.example/", "https://media.example/#fragment", "https://media.example/bad\\path/" }) |url| {
+        const bad = try std.fmt.allocPrint(a, "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>{s}</BaseURL>{s}", .{ url, suffix });
+        defer a.free(bad);
+        try std.testing.expectError(error.InvalidMediaUrl, parse(a, bad, .{}));
+    }
+}
+test "DASH namespace prefixes and selection identity are stable across descriptive XML edits" {
+    const a = std.testing.allocator;
+    const prefixed = "<d:MPD xmlns:d='urn:mpeg:dash:schema:mpd:2011' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='ignored'><d:Period duration='PT2S'><d:AdaptationSet><d:Representation id='v'><d:SegmentTemplate duration='2' initialization='init.mp4' media='seg-$Number$.m4s'/></d:Representation></d:AdaptationSet></d:Period></d:MPD>";
+    var first = try parse(a, prefixed, .{});
+    defer first.deinit();
+    const changed = try std.mem.replaceOwned(u8, a, prefixed, "id='v'", "id='other'");
+    defer a.free(changed);
+    var second = try parse(a, changed, .{});
+    defer second.deinit();
+    try std.testing.expect(!std.meta.eql(first.timing_identity, second.timing_identity));
+    const spoof = try std.mem.replaceOwned(u8, a, prefixed, "http://www.w3.org/2001/XMLSchema-instance", "urn:wrong");
+    defer a.free(spoof);
+    try std.testing.expectError(error.UnsupportedDash, parse(a, spoof, .{}));
+}
+test "DASH bandwidth ceiling chooses the largest eligible representation" {
+    var playlist = try parseAtWithSelection(std.testing.allocator, inherited_fixture, .{}, null, .{ .max_bandwidth = 3000 });
+    defer playlist.deinit();
+    try std.testing.expectEqualStrings("https://media.example/root/period/video/hi/high-9.m4s?key=a&sig=b", playlist.segments[0].uri);
+}
+test "DASH inherited timeline children override nearer levels and reject critical features" {
+    const a = std.testing.allocator;
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period duration='PT4S'><SegmentTemplate initialization='init.mp4' media='seg-$Time$.m4s'><SegmentTimeline><S t='0' d='2' r='1'/></SegmentTimeline></SegmentTemplate><AdaptationSet><Representation id='v'><SegmentTemplate><SegmentTimeline><S t='0' d='1' r='3'/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet></Period></MPD>";
+    var playlist = try parse(a, mpd, .{});
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 4), playlist.segments.len);
+    try std.testing.expectEqualStrings("seg-3.m4s", playlist.segments[3].uri);
+    for ([_][]const u8{ "<ContentProtection/>", "<EssentialProperty schemeIdUri='urn:unknown'/>", "<SegmentBase/>" }) |feature| {
+        const replacement = try std.fmt.allocPrint(a, "<Representation id='v'>{s}", .{feature});
+        defer a.free(replacement);
+        const bad = try std.mem.replaceOwned(u8, a, mpd, "<Representation id='v'>", replacement);
+        defer a.free(bad);
+        try std.testing.expectError(error.UnsupportedDash, parse(a, bad, .{}));
+    }
+}
+fn inheritedAllocationRun(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    var playlist = try parseAtWithSelection(no_resize.allocator(), inherited_fixture, .{}, null, .{ .representation_id = "low" });
+    defer playlist.deinit();
+}
+test "DASH inherited addressing releases allocations on every failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, inheritedAllocationRun, .{});
 }
 
 test "DASH explicit timeline repeats start offsets and validates unavailable templates" {

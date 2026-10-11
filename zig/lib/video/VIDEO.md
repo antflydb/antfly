@@ -1232,3 +1232,21 @@ twenty Metal dimension cases plus default-dimension reset, and the six original
 mixed/video cases with admission and damaged-frame retries. See the new
 [resident normalization receipt](../../../tools/embeddinggemma2/testdata/resident-normalization/README.md). Cross-request scheduling, cross-group frame
 reuse and isolated performance measurements remain separate work.
+
+
+## Inherited DASH addressing and native transport
+
+The native media layer selects MP4 video representations from multiple
+adaptations and inherits SegmentTemplate/SegmentList addressing across Period,
+AdaptationSet and Representation. BaseURL chains resolve against the actual
+manifest URL supplied by the live reader. Returned references, including escaped
+signed query parameters, are playlist-owned. Authenticated HTTP still pins the
+origin before fetching initialization or media bytes; changing overlapping
+descriptors fails transactionally. Representation/configuration identity is
+stable across reloads, and transport failures preserve the next sequence.
+
+This extends the native streaming library rather than changing the pretrained
+model's rendering recipe. Automatic multi-period playback and stable live
+period cursors remain implementation work, along with broader HLS coverage.
+See [MEDIA.md](../media/MEDIA.md#dash-template-and-live-ingestion) for selection
+options, timing requirements and unsupported addressing features.

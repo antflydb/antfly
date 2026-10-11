@@ -102,8 +102,8 @@ test "production live HLS HTTP ingestion reloads configuration without invalidat
     try serving.await(std.testing.io);
 }
 
-test "production DASH SegmentList uses authenticated fMP4 transport and owned packets" {
-    const manifest = "<?xml version='1.0'?><MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period><AdaptationSet mimeType='video/mp4'><Representation id='v'><SegmentList duration='2'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.m4s'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+test "production DASH inherited SegmentList selects representation with authenticated BaseURL transport" {
+    const manifest = "<?xml version='1.0'?><MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>media/</BaseURL><Period><SegmentList duration='2'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.m4s'/></SegmentList><AdaptationSet mimeType='video/mp4'><Representation id='other'/><Representation id='v'/></AdaptationSet></Period></MPD>";
     const original = @embedFile("testdata/fragmented.mp4");
     var offset: usize = 0;
     while (offset < original.len) {
@@ -113,8 +113,8 @@ test "production DASH SegmentList uses authenticated fMP4 transport and owned pa
     }
     var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
         .{ .path = "/dash/manifest.mpd", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
-        .{ .path = "/dash/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..offset] } },
-        .{ .path = "/dash/seg.m4s", .assert_request = Verify.auth, .respond = .{ .body = original[offset..] } },
+        .{ .path = "/dash/media/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..offset] } },
+        .{ .path = "/dash/media/seg.m4s", .assert_request = Verify.auth, .respond = .{ .body = original[offset..] } },
     });
     defer server.deinit();
     var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
@@ -122,7 +122,7 @@ test "production DASH SegmentList uses authenticated fMP4 transport and owned pa
     const url = try std.fmt.allocPrint(a, "{s}/dash/manifest.mpd", .{server.baseUrl()});
     defer a.free(url);
     var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
-    var reader = try media.dash_live.Reader(http).init(a, &transport, url, .{});
+    var reader = try media.dash_live.Reader(http).init(a, &transport, url, .{ .selection = .{ .representation_id = "v" } });
     defer reader.deinit();
     var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 3 });
     defer _ = serving.cancel(std.testing.io) catch {};

@@ -391,7 +391,7 @@ boundary. Segment ordinals, ingested bytes and shared admission remain cumulativ
 `max_reconfigurations` bounds repeated initialization changes. Inline initialization
 boxes inside pending media still require the transport to signal the boundary.
 The native HTTP HLS reader below signals these boundaries using map and
-discontinuity changes. DASH list/template snapshots reuse the same transport, including synchronized live availability filtering. Representation selection and broader DASH addressing remain separate work.
+discontinuity changes. DASH list/template snapshots reuse the same transport, including synchronized live availability filtering. Representation selection and inherited DASH addressing are implemented below; automatic multi-period playback remains work.
 
 The media suite covers a real changed SPS/96×48 initialization, invalid replacement
 rollback, replay after discontinuity, outstanding old leases and allocation failures.
@@ -434,15 +434,25 @@ low-latency HLS and broader DASH support remain open.
 
 ## DASH template and live ingestion
 
-`dash.parse` accepts bounded static XML MPDs with one MP4 video representation,
-using explicit `SegmentList` or representation-level `SegmentTemplate`.
+`dash.parse` accepts bounded static XML MPDs and selects one MP4 video
+representation. `dash.parseAtWithSelection` and `dash_live.Options.selection`
+select period/adaptation/representation IDs, a bandwidth ceiling and a BaseURL
+alternative. Without selectors the first eligible video representation is used;
+with a ceiling the highest eligible bandwidth is used. Audio adaptations are
+skipped. `SegmentList` and `SegmentTemplate` attributes and child addressing
+inherit from Period through AdaptationSet to Representation; nearer values
+override inherited values. BaseURL resolution follows the MPD/Period/adaptation/
+representation hierarchy. Relative BaseURLs require `selection.manifest_url`;
+live readers supply the actual manifest URL and retain authenticated origin
+pinning. Multiple Periods currently require an explicit `period_id`; automatic
+multi-period playback and inferred preceding-period timing remain unfinished.
 Templates expand `$RepresentationID$`, `$Bandwidth$`, `$Number$`, `$Time$`,
 `$$` escapes and bounded `%0Nd` decimal widths. `SegmentTimeline` supports
 explicit/implicit starts, nonnegative repeats and `r=-1` bounded by the next
 start, period end or live clock. Duration-based templates use the period duration
 or live clock. Timescales are bounded to 32 bits; XML elapsed durations and UTC
-`Z` timestamps accept millisecond precision. Explicit list references borrow the
-MPD; expanded template references are owned by the playlist. All allocations and
+`Z` timestamps accept millisecond precision. All returned URI references are
+owned by the playlist, including decoded signed-query attributes. All allocations and
 expanded URI bytes are bounded, including allocator-failure cleanup.
 
 `dash.parseAt` and `dash_live.Options.clock` accept synchronized UTC Unix
@@ -452,7 +462,8 @@ complete segments with zero availability offset are exposed. The time-shift
 window drops expired references arithmetically, avoiding historical enumeration;
 early snapshots can be empty. `minimumUpdatePeriod` is exposed by
 `reloadAfterSeconds`; the caller schedules polling. Changes to availability,
-period-start, timescale or offset identity fail during reload. Overlapping
+period-start, timescale, offset or selected representation/configuration identity
+fail during reload. Overlapping
 segment descriptors remain immutable; missing unconsumed sequences report gaps.
 
 `dash_live.Reader(httpx)` reuses authenticated origin-pinned HTTP, exact ranges,
@@ -462,10 +473,13 @@ advancement, retry, gap and production authenticated HTTP tests cover these path
 It is a library API; grouped model requests still accept owned MP4/MOV bytes.
 
 This is a declared subset of [DASH addressing and timing](https://dashif.org/Guidelines-TimingModel/).
-BaseURL, inherited templates, multiple periods/adaptations/representations,
-nonzero availability offsets, incomplete low-latency segments, UTCTiming fetching,
-MPD Patch, DRM, XML entities/DTDs and unsupported attributes fail explicitly.
-The caller supplies clock synchronization and selects the representation upstream.
+Automatic multi-period playback, nonzero availability offsets, incomplete
+low-latency segments, UTCTiming fetching, MPD Patch, DRM, EssentialProperty,
+SegmentBase and unsupported attributes fail explicitly. A bounded native XML
+tree supports namespace prefixes, comments, CDATA and predefined/numeric
+entities; DTDs, external/custom entities and invalid namespace bindings fail.
+The caller supplies clock synchronization. Period/representation selection is
+fixed for a reader rather than adaptive switching.
 
 ### VP8 decoding and display/color metadata consumers
 

@@ -34,7 +34,8 @@ pub const Playlist = struct {
     ended: bool,
     timing_identity: ?[32]u8 = null,
     reload_after_seconds: ?f64 = null,
-    /// Generated manifest references; HLS and explicit DASH references borrow input.
+    /// Playlist-owned manifest references. HLS references borrow its input;
+    /// DASH copies both explicit and expanded references into this owner.
     owned_uris: []const []u8 = &.{},
     pub fn deinit(self: *Playlist) void {
         for (self.owned_uris) |owned| self.allocator.free(owned);

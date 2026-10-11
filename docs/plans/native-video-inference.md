@@ -624,8 +624,9 @@ current receipts are in `zig/lib/video/testdata/webm-validation`. Full completio
   windows are implemented; their current qualification is recorded below.
 - Cross-request scheduling and coordinated preprocessing/model resource budgets;
   final Metal pooling/normalization is implemented and qualified below.
-- DASH inherited templates/BaseURL, multiple periods/representations and broader
-  live/HLS coverage.
+- DASH automatic multi-period playback, stable live period cursors and broader
+  live/HLS coverage. Inherited templates/BaseURL and representation selection
+  are implemented in the continuation below.
 
 CUDA remains outside this execution scope. Passing one implementation gate does
 not close the other items or establish general codec conformance.
@@ -669,3 +670,35 @@ Metal dimension cases and the original mixed/video retry campaign now pass;
 receipts are in `tools/embeddinggemma2/testdata/resident-normalization`.
 This implementation does not close cross-request scheduling, window reuse,
 streaming inheritance or the broader performance/codec qualification scope.
+
+
+### Inherited DASH addressing continuation (2026-10-11)
+
+A bounded native XML tree now preserves MPD hierarchy, resolves namespaces and
+decodes predefined/numeric entities without fetching external resources. DASH
+selects video representations by IDs or a bandwidth ceiling, resolves inherited
+BaseURL chains and merges SegmentTemplate/SegmentList attributes and child
+addressing from Period through AdaptationSet to Representation. Returned URI
+references are owned; decoded signed queries remain valid after the MPD and
+temporary parser storage are released. The existing timing expansion engine
+still computes static/live segment availability. Authenticated HTTP supplies
+the actual manifest URL and preserves origin pinning, immutable reload
+descriptors, cancellation, admission and retry-safe ingestion. Selected
+representation/configuration changes fail during reload.
+
+Automatic multi-period playback, inferred preceding-period timing and stable
+live period cursors remain implementation work. That work must preserve period
+identity as earlier Periods disappear and must handle segment-number resets
+without silently skipping unconsumed media. Broader HLS and the other outstanding
+non-CUDA requirements above remain active.
+
+The final macOS gate passes 67 portable media tests, four production authenticated
+HTTP tests and five object-store/HTTP tests. Actual Linux ARM64 execution passes
+the same 67 portable tests. Signed-query lifetime, BaseURL alternatives, bandwidth
+selection, inherited timeline overrides, unsupported critical features and
+exhaustive allocation-failure cleanup have direct tests. Production HTTP verifies
+inherited SegmentList selection/BaseURL with authentication; the fake-transport
+retry/origin test verifies no cross-origin fetch and preserves the next sequence.
+Source hashes and logs are in
+`zig/lib/media/testdata/dash-inheritance/report.json`. These gates do not close
+the remaining multi-period/live/HLS or broader non-CUDA requirements.

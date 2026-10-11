@@ -15,4 +15,5 @@
 
 test {
     _ = @import("src/mod.zig");
+    _ = @import("src/dash_xml.zig");
 }

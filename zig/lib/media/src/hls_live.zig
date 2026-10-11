@@ -67,7 +67,11 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             try self.transport.control.check();
             var body = try self.transport.fetch(self.url, self.url, null, self.options.playlist.max_bytes);
             errdefer body.deinit();
-            var parsed = if (@hasDecl(manifest_parser, "parseAt"))
+            var parsed = if (@hasDecl(manifest_parser, "parseAtWithSelection")) blk: {
+                var selection = self.options.selection;
+                selection.manifest_url = self.url;
+                break :blk try manifest_parser.parseAtWithSelection(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null, selection);
+            } else if (@hasDecl(manifest_parser, "parseAt"))
                 try manifest_parser.parseAt(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null)
             else
                 try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
@@ -309,4 +313,35 @@ test "live DASH template reload uses refreshed clock retry and gap detection" {
     try std.testing.expectError(error.MediaStreamGap, reader.reload());
     try std.testing.expectEqual(@as(u64, 3), reader.next_sequence.?);
     try std.testing.expect(lease.bytes.len > 0);
+}
+test "live DASH inherited BaseURL keeps authenticated origin pinned and retries safely" {
+    const a = std.testing.allocator;
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>./</BaseURL><Period duration='PT2S'><SegmentTemplate duration='2' initialization='init.mp4' media='seg-$Number$.m4s'/><AdaptationSet><Representation id='v'/></AdaptationSet></Period></MPD>";
+    var client = FakeHttp.Client{ .manifest = mpd };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    const cross_origin = try std.mem.replaceOwned(u8, a, mpd, "<BaseURL>./", "<BaseURL>https://other.test/");
+    defer a.free(cross_origin);
+    client.manifest = cross_origin;
+    try reader.reload();
+    try std.testing.expectError(error.MediaOriginChanged, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    try std.testing.expect(reader.ingest == null);
+    client.manifest = mpd;
+    // No media was consumed and the selected timing/configuration is unchanged.
+    // The overlapping URI change requires a fresh reader rather than mutating
+    // already-admitted immutable descriptors.
+    try std.testing.expectError(error.SourceVersionChanged, reader.reload());
+    var clean = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{});
+    defer clean.deinit();
+    try clean.reload();
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, clean.next());
+    try std.testing.expectEqual(@as(u64, 1), clean.next_sequence.?);
+    client.fail_media = false;
+    var result = (try clean.next()).?;
+    defer result.deinit();
+    try std.testing.expect(clean.ended());
+    try std.testing.expectEqual(@as(usize, 0), result.epoch);
 }
