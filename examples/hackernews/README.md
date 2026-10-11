@@ -686,3 +686,20 @@ against the remaining pod deadline, and reuses it across cycles. Only expiry
 metadata is persisted. All five pods and 22,946 failed derived objects are
 removed; $125 remains reserved in the shared ledger. The final reserved attempt
 is a separately labelled one-file search diagnostic, not archive qualification.
+
+The final raw-file diagnostic stopped at the original 45-minute build deadline,
+after 38 engine `Timeout` events, with 350 MiB peak process RSS. It reached
+generation 39 and reused all five metadata child-tree sets across retries; the
+text index stayed incomplete. SQL count and search timings were never reached.
+The six owned pods, 50,069 failed derived objects and temporary source copy are
+removed; the original full export is preserved. All six allowances total $145
+in reservations, not measured billing.
+
+Native-client probes in the same pod verified full GCS uploads and media reads
+up to 8 MiB, narrowing the failure investigation. Their traffic overlaps build
+network counters and does not qualify search latency. New publication/checkpoint
+and text-stage diagnostics preserve errors without logging source text or
+credentials. Those diagnostics were not in the measured binary. A rebuilt run
+must locate and fix the timeout before search or full-archive qualification;
+reconcile actual cloud charges before further attempts. The 160 lake regressions,
+22 harness tests and keep-alive TLS upload regression pass.

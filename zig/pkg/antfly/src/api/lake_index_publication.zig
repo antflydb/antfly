@@ -227,15 +227,15 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    const native = try @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index);
+    const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
     const native_declarations = native.declarations;
-    for (native_declarations) |declaration| try provider.checkpoint(declaration);
-    const ordered = try @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates);
-    for (ordered) |declaration| try provider.checkpoint(declaration);
-    const text = try @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
-    for (text) |declaration| try provider.checkpoint(declaration);
-    const sparse = try @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
-    const dense = try @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
+    for (native_declarations) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
+    const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
+    for (ordered) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
+    const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
+    for (text) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "text_checkpoint", attempt.generation);
+    const sparse = @import("lake_index_native_sparse.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "sparse_build", attempt.generation);
+    const dense = @import("lake_index_native_dense.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "dense_build", attempt.generation);
     const declarations = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len + ordered.len + text.len + sparse.len + dense.len);
     @memcpy(declarations[0..manifest.artifacts.len], manifest.artifacts);
     @memcpy(declarations[manifest.artifacts.len .. manifest.artifacts.len + native_declarations.len], native_declarations);
@@ -440,4 +440,9 @@ test "external lake native publication builds scoped text artifacts and fences e
     changed.indexes_json = "{}";
     time.now = 101;
     try std.testing.expectError(error.LakeIndexPublicationFenceChanged, build(a, &artifact_store, changed, &source, store_identity, .{}, .none, clock));
+}
+
+fn constructionFailure(err: anyerror, stage: []const u8, generation: u64) anyerror {
+    if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake construction deferred stage={s} generation={d} err={s}", .{ stage, generation, @errorName(err) });
+    return err;
 }

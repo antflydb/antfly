@@ -114,8 +114,8 @@ The fifth attempt used the predicate-capacity fix against the full archive.
 Registration took 20.5 seconds, then construction stopped with `Unauthorized`
 after 670.2 seconds, at 218.9 MiB peak RSS. Cached bearer expiration is consistent
 with this failure, but the original expiry was not recorded and attribution is
-unconfirmed. All five pods and 22,946 derived objects are removed. The ledger
-retains $125 in reservations; the final $20 diagnostic fits the $150 ceiling.
+unconfirmed. All five pods and 22,946 derived objects are removed. At that point the ledger
+retained $125 in reservations; the final $20 diagnostic fit the $150 ceiling.
 
 The regional harness now forces a fresh bearer once per pod and admits it only
 when its expiry exceeds the remaining hard pod deadline by 30 seconds. It reuses
@@ -123,6 +123,34 @@ that token across cycles, avoiding credential-identity changes that invalidate
 publication reuse. Reports contain expiry evidence only. This is a bounded
 qualification credential flow; a durable service still needs workload identity
 and refresh support. The live admission check and 22 harness tests pass.
+
+The sixth attempt ran the separately labelled raw-file diagnostic on the
+merged-main Linux `fast` binary (`f973688f6e`, SHA-256 recorded with the harness
+hashes). Registration took 619.9 ms. It stopped at the original 2,700-second
+build deadline with 350 MiB peak process RSS, after 38 engine `Timeout` events
+and generation 39. It never reached SQL count or search measurements. Retry
+generations shared five completed metadata child-tree reference sets; an
+observation found 16 ordered roots referencing only those five sets. The text
+index remained incomplete. All six pods and 50,069 failed derived objects are
+removed, along with the generation-fenced diagnostic source copy. The original
+334-object export is preserved. All six allowances total $145 in reservations,
+not measured charges; reconcile billing before any additional attempts.
+
+Separate native-client probes in the existing pod verified complete GCS uploads
+and media reads for 24 KiB, 1 MiB and 8 MiB bodies. Upload samples were 105/94/253
+ms; verified media-read samples were 62/76/223 ms. These are transfer diagnostics,
+not search benchmarks. Their traffic overlaps pod-wide construction network
+counters. Basic large-body transfers work; the exact construction timeout stage
+remains unconfirmed. Concurrent artifact collection also remained in its mark
+phase with no eligible deletions; that trace is retained without attributing the
+construction error to maintenance.
+
+Publication and checkpoint phases now have failure diagnostics, with more
+specific text stages for source rows, ordinal pages, segment encoding/packs and
+statistics. They preserve the original error and omit source text and credentials.
+This instrumentation was added after the measured binary, so a rebuilt attempt
+is needed to locate the failure. The 160 lake regressions, 22 harness tests and
+a keep-alive TLS upload regression pass. Archive latency remains unqualified.
 
 ## Bounded, resumable construction
 
