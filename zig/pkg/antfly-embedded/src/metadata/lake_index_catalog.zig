@@ -257,7 +257,9 @@ fn part(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
 /// invalidate an immutable index built for the same target schema.
 pub fn desiredFingerprint(table: anytype) Digest {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("native-lake-index-definition-v9");
+    // v10 rebuilds aggregate publications with the same physical SQL width
+    // identity used by scalar binding (including default integer/float widths).
+    hash.update("native-lake-index-definition-v10");
     var id: [8]u8 = undefined;
     std.mem.writeInt(u64, &id, table.table_id, .little);
     hash.update(&id);
