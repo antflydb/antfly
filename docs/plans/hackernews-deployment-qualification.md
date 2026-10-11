@@ -265,3 +265,11 @@ Further regional qualification requires actual-charge reconciliation or an
 explicit budget extension. Required serving-path measurements remain cold/warm,
 indexed filters, concurrency, deep cursors and restart recovery, followed by the
 complete 47,717,307-row archive.
+
+The subsequent 600-second completion check also hit its local bound before
+publication: 2,265 artifacts, 157,341,017 bytes, no engine timeout logged. A
+one-second stack sample placed remaining work in document-frequency statistics
+reading pages through GCS. Complete GCS publication remains unverified; this
+sample does not attribute all elapsed time or qualify regional performance.
+All 2,265 artifacts were generation-deleted after the builder stopped; the
+original archive source was preserved.

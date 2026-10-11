@@ -721,3 +721,11 @@ and six pod attempts, plus $5 for local GCS diagnostics. Local diagnostic
 reservations count against the same harness budget. Billing exports are still
 too stale to release allowances. Full-archive and search latency remain
 unqualified.
+
+The subsequent 600-second completion check also hit its local bound before
+publication: 2,265 artifacts, 157,341,017 bytes, no engine timeout logged. A
+one-second stack sample placed remaining work in document-frequency statistics
+reading pages through GCS. Complete GCS publication remains unverified; this
+sample does not attribute all elapsed time or qualify regional performance.
+All 2,265 artifacts were generation-deleted after the builder stopped; the
+original archive source was preserved.

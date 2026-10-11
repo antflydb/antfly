@@ -321,6 +321,23 @@
       "optimization": "debug",
       "note": "Testing allocator; correctness diagnostic, not performance qualification."
     },
-    "billing_reconciliation": "Export usage predates the final diagnostic jobs; reservations cannot yet be released."
+    "billing_reconciliation": "Export usage predates the final diagnostic jobs; reservations cannot yet be released.",
+    "fixed_completion_gcs": {
+      "status": "stopped_at_local_600_second_bound_before_publication",
+      "engine_timeout_observed": false,
+      "objects": 2265,
+      "bytes": 157341017,
+      "remaining_work_sample": "Document-frequency statistics Builder.add -> PageStore.get -> GCS getObject -> HTTP socket receive; one-second sample, not a performance attribution.",
+      "complete_publication_verified": false,
+      "search_measurements": null,
+      "cleanup": {
+        "prefix": "hn-poc/local-construction-diagnostic/eb2719bfeabd4314b3c7e538c72ffe11/indexes",
+        "deleted": 2265,
+        "bytes": 157341017,
+        "generation_conditioned": true,
+        "source_preserved": true,
+        "readers_stopped": true
+      }
+    }
   }
 }
