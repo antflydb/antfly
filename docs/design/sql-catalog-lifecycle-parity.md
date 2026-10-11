@@ -2848,3 +2848,36 @@ Public native claim production remains disabled. Authenticated mounted delivery,
 root enrollment/signing/capability barriers, complete activation and retirement,
 restore/adoption and distributed faults remain required. Neither these three
 component tests nor the oracle run close an original SQL case.
+
+### Fresh build-permission claim receiver
+
+Checkpoint `5897dd24ea` connects the internal claim receiver to independently
+read metadata build permission. Its request contains claim values and logical
+table/group/attempt identity, never a physical allocation, binding or cut.
+The receiver obtains the bounded permission projection, inspects the durable
+owner job and derives a command only when that reserved job matches the exact
+admitted owner, fence, candidate/reservation digests and schema versions. It
+shares the existing control-binding checks instead of introducing a weaker
+parallel admission path. Claim values retain the shared 128-record/1-MiB limit.
+
+One invocation applies at most one batch and returns an owned result with the
+root from the applying lease. Pending replication survives cancellation that
+arrives during dispatch; the receiver neither invents an acknowledgement nor
+automatically replays an uncertain write. Completed metadata owners short
+circuit without acquiring storage. The hot path does not request schema-sized
+admission inputs or compile a manifest.
+
+Frozen-source qualification passed 94/94 Debug build steps and 26 targeted
+executions: twenty-two publication, one decoder floor and three actual leased
+owner tests. The optimized publication gate passed 59/59 steps and twenty-three
+executions. Both runs have zero skips, failures or leaks. Synthetic sequencing
+checks cover stale phase/owner/table, missing durable admission, early request
+cancellation, pending progress and root ownership. The actual compiled-owner
+test delivers a duplicate under freshly advanced build permission and verifies
+its unchanged source cut and exact leased root. Formatting, diff, generated
+control-catalog freshness and the 2,034-file source-boundary audit pass.
+
+This is internal receiver integration, not mounted transport authentication,
+root attestation, full build completion or distributed release qualification.
+The public producer stays disabled, the public failed-UNIQUE-build gate remains
+open, and the original inventory stays 478 / 136 / 73 / 899.
