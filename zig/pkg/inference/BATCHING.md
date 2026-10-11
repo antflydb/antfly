@@ -748,12 +748,28 @@ reported separately from warm wave timings. No PNG/JPEG encode/decode round trip
 is introduced between rendering and inference.
 
 The accompanying Metal PDF painter is a benchmark-only prototype. It batches
-eligible pages in one command buffer; supported content is opaque, closed polygon
+eligible pages in each bounded worker group in one command buffer; supported content is opaque, closed polygon
 fills and axis-aligned opaque nearest-sampled images. Parsing, codec decoding,
 image sample-index tables, and model-exact bicubic preprocessing remain on CPU.
 Text, strokes, groups/transparency, complex clipping, shading, patterns, rotated
 pages, and other unsupported content reject the entire page before submission
 and use the exact CPU renderer. Lossy f32 polygon coordinates also fall back.
+Page preparation uses independent render forks in the same bounded worker pool
+as CPU rendering. Classification publishes an owned scene or CPU fallback before
+fallback completes, so the GPU painter can overlap the remaining CPU work.
+Fallback uses its existing private reader instead of a fresh second fork. Parser
+scratch remains charged through worker cleanup; every exit joins workers before
+releasing scenes or rasters. This does not cache prepared pages between passes.
+
+The painter bins commands into 32x32 pixel tiles and retains original paint order
+within each tile. Conservative bounds reject irrelevant commands before polygon
+sampling. Tile lists are capped at four million references (16 MiB/page); dense
+pages use the same bounds-culled kernel without a tile list. Four synchronous
+buffer slots reuse shared Metal storage after command completion, with a 512 MiB
+cached-buffer ceiling. `gpu_cached_buffer_bytes` reports that retained storage
+separately from model tensor counters. Shared buffers still require logical input
+copies and host output copies.
+
 The prototype copies GPU raster output to host to share the existing processor;
 it does not establish a resident GPU PDF-to-model pipeline. The first iteration
 compares every GPU-painted page with native pixels, rejects any byte error above

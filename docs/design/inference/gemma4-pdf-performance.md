@@ -69,6 +69,9 @@ The run is bounded to one render wave and one model cohort at a time; it does
 not overlap the next render wave with GPU inference. CPU workers each instantiate
 an independent reader from an immutable template. Final output IDs follow the
 round-robin page schedule regardless of renderer assignment or geometry splitting.
+The optimized painter prepares GPU scenes in those same bounded workers and
+overlaps GPU painting with CPU fallback within the render wave. No prepared-scene
+or raster cache removes page preparation from the timed boundary.
 
 `preprocess_ns`, `vision_ns`, `pack_ns`, `encoder_ns` and `pool_readback_ns`
 observe CPU boundaries around potentially asynchronous GPU operations. Use them
@@ -77,6 +80,11 @@ command buffer; render wall time additionally includes CPU scene extraction,
 buffer allocation/upload and host output copy. Shared-memory transfer counters
 measure logical copies, not discrete-GPU PCIe traffic. Provider peaks omit model
 weights and runtime pools. Total RSS and CUDA counters are not inferred from these.
+`prepare_seconds_sum` and `cpu_render_seconds_sum` add worker durations and can
+exceed wall time because workers run concurrently. `gpu_wall_seconds` includes
+buffer staging, GPU submission/completion and host output copy.
+`gpu_cached_buffer_bytes` reports retained prototype buffers (at most 512 MiB)
+separately from model-owned tensors and excludes transient allocation overlap.
 
 The strict pixel gate is outside measured wave time and runs once per selected
 GPU page; warmups avoid measuring its effects. The embedding gate rejects missing
@@ -147,6 +155,61 @@ Validation passed 38 focused CPU/Metal tests with three CUDA execution skips,
 three GPU PDF tests, 24 Python tests and six client tests. The resident fixtures
 cross-compiled for Linux CUDA; CUDA hardware was not available for execution.
 The client tests needed local networking outside the filesystem sandbox.
+
+## GPU renderer optimization, 2026-10-11
+
+The original kernel visited every command for every pixel, and the benchmark
+serialized scene preparation, CPU fallback and GPU painting. The revised painter
+bins commands into 32x32 tiles, preserves paint order in each list, and rejects
+commands outside conservative bounds. Tile storage is capped at 16 MiB/page;
+dense pages use the bounds-culled kernel without a tile list. Four synchronous
+Metal buffer slots reuse storage after GPU completion, capped at 512 MiB.
+
+Bounded workers now prepare GPU scenes in parallel using independent readers.
+They publish classification before CPU fallback finishes, allowing the painter
+to overlap that remaining work. Unsupported pages reuse their private reader for
+fallback. Every exit joins workers and releases owned scenes and rasters.
+Scene/raster caching does not remove preparation from the timed boundary.
+
+A preserved baseline binary and the new binary were compared with two warmups
+and 20 measured passes per case, in both process orders. Each GPU-painted selected
+page matched native pixels exactly. CPU control timings remained broadly stable.
+These are local rendering observations under concurrent development activity.
+
+| Input group | Old GPU p50 ms | New GPU p50 ms | Parallel CPU p50 ms |
+| --- | --- | --- | --- |
+| Four-page mixed batch | 61.6–62.0 | 38.0–38.1 | 38.7–39.3 |
+| Three GPU-eligible pages | 44.8 | 38.1–38.2 | 38.9–39.1 |
+| Synthetic fill-grid page | 7.4–7.5 | 0.8–1.0 | 6.6 |
+| Real scanned page | 35.5 | 37.2–37.5 | 38.7–39.0 |
+
+Mixed-batch GPU command-buffer time fell from about 10.4–10.7 ms to 0.66–0.67 ms.
+The new GPU staging/submission/completion/output-copy boundary averaged about
+1.5 ms, and retained prototype buffers occupied 26.1 MiB. The mixed render batch
+is about 1.6x faster than the old GPU version and now roughly matches parallel CPU.
+The much larger fill-grid gain applies to the synthetic vector fixture.
+
+The scan remains CPU-preparation bound: about 36.6–36.7 ms before roughly 0.18 ms
+of GPU painting. Its new GPU total is slightly slower than the old GPU path,
+which retained a main reader across passes; the new path prepares a bounded
+private reader each wave. It remains slightly faster than CPU rendering in this
+sample. A codec/preparation profile is needed before attributing that cost more
+precisely. The result does not establish an all-device PDF decoder.
+
+Four GPU tests passed, covering unsupported content, distinct batched pages,
+fractional origins, tile-boundary clipping/paint order, and buffer reuse/clearing.
+One-worker 150-DPI and two-worker mixed-page checks preserved GPU/CPU fallback order. The mixed real-model
+batch retained exact rendered pixels and matched the previous serial host vectors
+at cosine >= 0.9999999999992. That pass verifies correctness, not an overall
+embedding throughput gain. All 24 Python checks also passed.
+
+[The renderer results report](gemma4-pdf-render-performance.json) records both
+binary hashes, inputs, all 32 cases, GPU versus wall observations, buffer bytes,
+validation and limits. Raw JSON, logs, the preserved baseline and campaign script
+are under `.benchmark-results/gemma4-pdf-render-2026-10-11/`.
+For a render-only comparison, run the benchmark with `--scope render`, identical
+PDF/DPI/dimension/worker arguments, and `--renderer cpu` or `--renderer gpu`.
+Model loading is unnecessary for that scope.
 
 ## Next decision
 

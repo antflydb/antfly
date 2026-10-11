@@ -28,6 +28,7 @@ pub const Command = extern struct {
     antialias: u32,
     image_width: u32,
     image_height: u32,
+    /// Legacy affine slots; the Metal painter fills conservative paint bounds.
     inverse: [6]f32,
     clip: [4]f32,
 };
@@ -44,6 +45,7 @@ const Page = extern struct {
 };
 extern fn antfly_pdf_gpu_create() ?*anyopaque;
 extern fn antfly_pdf_gpu_destroy(*anyopaque) void;
+extern fn antfly_pdf_gpu_cached_bytes(*anyopaque) usize;
 extern fn antfly_pdf_gpu_render(*anyopaque, [*]const Page, usize, *f64) c_int;
 
 pub const Scene = struct {
@@ -66,7 +68,7 @@ pub fn prepare(a: std.mem.Allocator, parsed: *pdf.reader.Reader, request: pdf.Pa
     if (@mod(rotation, 360) != 0) return error.UnsupportedGpuPdfPage;
     const geometry = try pdf.planParsedPageRenderGeometry(parsed, request);
     var runs = try parsed.extractPageRenderRunsForRasterAlloc(request.page_number, geometry.width, geometry.height);
-    defer runs.deinit(a);
+    defer runs.deinit(parsed.allocator());
     if (runs.text_runs.len != 0 or runs.shading_runs.len != 0 or runs.pattern_runs.len != 0) return error.UnsupportedGpuPdfPage;
     return try prepareRuns(a, runs, geometry);
 }
@@ -182,6 +184,10 @@ pub const Renderer = struct {
     pub fn deinit(self: Renderer) void {
         if (comptime enabled) antfly_pdf_gpu_destroy(self.handle);
     }
+    pub fn cachedBytes(self: Renderer) usize {
+        if (comptime !enabled) return 0;
+        return antfly_pdf_gpu_cached_bytes(self.handle);
+    }
     /// One command buffer for up to four pages. Output readback is deliberate
     /// for the CPU-renderer A/B prototype, and included in its timed boundary.
     pub fn renderBatch(self: Renderer, a: std.mem.Allocator, scenes: []const Scene, gpu_seconds: *f64) ![]pdf.RenderedPageRaster {
@@ -282,4 +288,44 @@ test "GPU PDF image samples match snapped fractional-origin pixels and unsupport
     const native = try pdf.render.renderPageContentRgbaInBoxRotatedCancelable(a, snapped, &.{}, &images, &.{}, &.{}, &.{}, .none, .{});
     defer a.free(native.rgba);
     try std.testing.expectEqualSlices(u8, native.rgba, outputs[0].bytes);
+}
+
+test "GPU PDF tiles preserve overlapping paint order clipping and reusable buffers" {
+    const a = std.testing.allocator;
+    const renderer = Renderer.init() catch return error.SkipZigTest;
+    defer renderer.deinit();
+    const box = pdf.reader.PageBox{ .min_x = 0, .min_y = 0, .max_x = 96, .max_y = 80 };
+    const geometry = pdf.PageRenderGeometry{ .effective_dpi = 72, .width = 96, .height = 80, .pixels = 7680 };
+    var triangle = [_][2]f64{ .{ 24, 8 }, .{ 72, 8 }, .{ 48, 72 } };
+    var rectangle = [_][2]f64{ .{ 30, 0 }, .{ 64, 0 }, .{ 64, 80 }, .{ 30, 80 } };
+    var shapes = [_]pdf.reader.ShapeRun{
+        .{ .kind = .fill, .color = .{ 255, 0, 0, 255 }, .stroke_width = 1, .closed = true, .points = &triangle, .antialias = true, .paint_order = 1, .clip_box = .{ .min_x = 32.25, .min_y = 20.25, .max_x = 80.75, .max_y = 64.75 } },
+        .{ .kind = .fill, .color = .{ 0, 255, 0, 255 }, .stroke_width = 1, .closed = true, .points = &rectangle, .paint_order = 2 },
+    };
+    var rgba = [_]u8{ 0, 0, 255, 255, 255, 255, 0, 255, 0, 255, 255, 255, 255, 0, 255, 255 };
+    var images = [_]pdf.reader.ImageRun{.{ .rgba = &rgba, .width = 2, .height = 2, .a = 96, .b = 0, .c = 0, .d = 80, .e = 0, .f = 0, .x = 0, .y = 0, .draw_width = 96, .draw_height = 80 }};
+    var scene = try prepareRuns(a, .{ .page_box = box, .image_runs = &images, .shape_runs = &shapes }, geometry);
+    defer scene.deinit(a);
+    const native = try pdf.render.renderPageContentRgbaInBoxRotatedCancelable(a, box, &.{}, &images, &.{}, &.{}, &shapes, .none, .{});
+    defer a.free(native.rgba);
+    var gpu_seconds: f64 = 0;
+    for (0..2) |_| {
+        const output = try renderer.renderBatch(a, &.{scene}, &gpu_seconds);
+        defer {
+            for (output) |*r| r.deinit(a);
+            a.free(output);
+        }
+        try std.testing.expectEqualSlices(u8, native.rgba, output[0].bytes);
+    }
+    const cached = renderer.cachedBytes();
+    try std.testing.expect(cached > 0 and cached <= 512 * 1024 * 1024);
+    var empty = try prepareRuns(a, .{ .page_box = box }, geometry);
+    defer empty.deinit(a);
+    const cleared = try renderer.renderBatch(a, &.{empty}, &gpu_seconds);
+    defer {
+        for (cleared) |*r| r.deinit(a);
+        a.free(cleared);
+    }
+    try std.testing.expectEqual(cached, renderer.cachedBytes());
+    for (cleared[0].bytes) |v| try std.testing.expectEqual(@as(u8, 255), v);
 }

@@ -24,14 +24,22 @@ const a = std.heap.c_allocator;
 const Document = struct { path: []const u8, bytes: []u8, parsed: pdf.reader.Reader, template: pdf.reader.RenderForkTemplate, count: usize };
 const Item = struct { document: usize, page: usize };
 const Worker = struct {
+    io: std.Io,
     template: *const pdf.reader.RenderForkTemplate,
     item: Item,
     dpi: u16,
     dimension: u32,
+    use_gpu: bool,
+    classified: std.Io.Event = .unset,
+    scene: ?gpu.Scene = null,
     result: ?pdf.RenderedPageRaster = null,
     failure: ?anyerror = null,
     scratch_peak: usize = 0,
+    prepare_ns: u64 = 0,
+    cpu_render_ns: u64 = 0,
     fn run(self: *Worker) void {
+        // Also publish failures before preparation could classify this page.
+        defer self.classified.set(self.io);
         self.render() catch |err| {
             self.failure = err;
         };
@@ -40,14 +48,26 @@ const Worker = struct {
         var bounded = internal.runtime.bounded_allocator.BoundedAllocator{ .backing = a, .limit = 256 * 1024 * 1024 };
         defer std.debug.assert(bounded.live == 0);
         const scratch = bounded.allocator();
+        defer self.scratch_peak = bounded.peak;
+        const started = now();
         var parsed = try self.template.instantiate(scratch, .{});
         defer parsed.deinit();
+        if (self.use_gpu) self.scene = gpu.prepare(a, &parsed, .{ .page_number = self.item.page, .requested_dpi = self.dpi, .max_dimension = self.dimension, .max_pixels = 8_000_000 }) catch |err| switch (err) {
+            error.UnsupportedGpuPdfPage => null,
+            else => return err,
+        };
+        self.prepare_ns = now() - started;
+        // Scene data is owned separately from parser scratch. Publishing an
+        // unsupported page lets the painter run while its CPU fallback continues.
+        self.classified.set(self.io);
+        if (self.scene != null) return;
+        const cpu_started = now();
         var raster = try pdf.renderParsedPageRasterAdaptiveWithProfileAlloc(scratch, &parsed, self.item.page, self.dpi, 8_000_000, self.dimension, .exact);
         defer raster.deinit(scratch);
         const retained = try a.dupe(u8, raster.bytes);
         self.result = raster;
         self.result.?.bytes = retained;
-        self.scratch_peak = bounded.peak;
+        self.cpu_render_ns = now() - cpu_started;
     }
 };
 const PixelParity = struct { document: usize, page: usize, max_error: u8, mean_absolute_error: f64 };
@@ -63,6 +83,10 @@ const WaveSample = struct {
     cpu_pages: usize,
     retained_raster_bytes: usize,
     cpu_scratch_peak_sum: usize,
+    prepare_seconds_sum: f64,
+    cpu_render_seconds_sum: f64,
+    gpu_wall_seconds: f64,
+    gpu_cached_buffer_bytes: usize,
 };
 const SavedVector = struct { document: usize, page: usize, values: []f32 };
 fn now() u64 {
@@ -177,56 +201,66 @@ pub fn main(init: std.process.Init) !void {
             const wave_started = now();
             var rasters: [4]?pdf.RenderedPageRaster = @splat(null);
             defer for (rasters[0..count]) |*r| if (r.*) |*raster| raster.deinit(a);
-            var scenes: [4]gpu.Scene = undefined;
             var gpu_indexes: [4]usize = undefined;
             var gpu_count: usize = 0;
-            defer for (scenes[0..gpu_count]) |*scene| scene.deinit(a);
-            if (use_gpu) for (wave_items, 0..) |item, r| {
-                scenes[gpu_count] = gpu.prepare(a, &documents[item.document].parsed, .{ .page_number = item.page, .requested_dpi = dpi, .max_dimension = dimension, .max_pixels = 8_000_000 }) catch |err| switch (err) {
-                    error.UnsupportedGpuPdfPage => continue,
-                    else => return err,
-                };
-                gpu_indexes[gpu_count] = r;
-                gpu_count += 1;
-            };
             var work: [4]Worker = undefined;
-            var cpu_indexes: [4]usize = undefined;
             var cpu_count: usize = 0;
-            for (wave_items, 0..) |item, r| {
-                var on_gpu = false;
-                for (gpu_indexes[0..gpu_count]) |g| if (g == r) {
-                    on_gpu = true;
-                    break;
-                };
-                if (on_gpu) continue;
-                work[cpu_count] = .{ .template = &documents[item.document].template, .item = item, .dpi = dpi, .dimension = dimension };
-                cpu_indexes[cpu_count] = r;
-                cpu_count += 1;
-            }
-            // Bounded CPU waves; join all owned workers even if spawning fails.
-            var threads: [4]?std.Thread = @splat(null);
+            for (wave_items, 0..) |item, r| work[r] = .{ .io = init.io, .template = &documents[item.document].template, .item = item, .dpi = dpi, .dimension = dimension, .use_gpu = use_gpu };
+            var scratch_sum: usize = 0;
+            var prepare_ns: u64 = 0;
+            var cpu_render_ns: u64 = 0;
+            var gpu_seconds: f64 = 0;
+            var gpu_wall_ns: u64 = 0;
             var worker_offset: usize = 0;
-            while (worker_offset < cpu_count) {
-                const n = @min(workers, cpu_count - worker_offset);
+            while (worker_offset < count) : (worker_offset += @min(workers, count - worker_offset)) {
+                const n = @min(workers, count - worker_offset);
+                var threads: [4]?std.Thread = @splat(null);
+                // On every exit, drain owned workers and attach their output
+                // before outer raster cleanup. Scene scratch never outlives a join.
+                defer for (0..n) |w| {
+                    if (threads[w]) |thread| thread.join();
+                    const r = worker_offset + w;
+                    rasters[r] = work[r].result orelse rasters[r];
+                    scratch_sum += work[r].scratch_peak;
+                    prepare_ns += work[r].prepare_ns;
+                    cpu_render_ns += work[r].cpu_render_ns;
+                    if (work[r].scene) |*scene| scene.deinit(a);
+                };
                 for (0..n) |w| {
                     threads[w] = std.Thread.spawn(.{}, Worker.run, .{&work[worker_offset + w]}) catch null;
                     if (threads[w] == null) work[worker_offset + w].run();
                 }
-                for (threads[0..n]) |t| if (t) |thread| thread.join();
-                worker_offset += n;
-            }
-            // Attach every completed raster before propagating any failure.
-            var scratch_sum: usize = 0;
-            for (work[0..cpu_count], cpu_indexes[0..cpu_count]) |worker, r| {
-                rasters[r] = worker.result;
-                scratch_sum += worker.scratch_peak;
-            }
-            for (work[0..cpu_count]) |worker| if (worker.failure) |err| return err;
-            var gpu_seconds: f64 = 0;
-            if (gpu_count > 0) {
-                const rendered = try gpu_renderer.?.renderBatch(a, scenes[0..gpu_count], &gpu_seconds);
-                defer a.free(rendered);
-                for (rendered, gpu_indexes[0..gpu_count]) |raster, r| rasters[r] = raster;
+                var scenes: [4]gpu.Scene = undefined;
+                var indexes: [4]usize = undefined;
+                var prepared_count: usize = 0;
+                for (0..n) |w| {
+                    const r = worker_offset + w;
+                    work[r].classified.waitUncancelable(init.io);
+                    if (work[r].scene) |scene| {
+                        scenes[prepared_count] = scene;
+                        indexes[prepared_count] = r;
+                        prepared_count += 1;
+                    } else cpu_count += 1;
+                }
+                if (prepared_count > 0) {
+                    const gpu_started = now();
+                    var command_seconds: f64 = 0;
+                    const rendered = try gpu_renderer.?.renderBatch(a, scenes[0..prepared_count], &command_seconds);
+                    defer a.free(rendered);
+                    for (rendered, indexes[0..prepared_count]) |raster, r| {
+                        rasters[r] = raster;
+                        gpu_indexes[gpu_count] = r;
+                        gpu_count += 1;
+                    }
+                    gpu_seconds += command_seconds;
+                    gpu_wall_ns += now() - gpu_started;
+                }
+                // Finish before advancing indexes observed by the drain defer.
+                for (threads[0..n]) |*t| if (t.*) |thread| {
+                    thread.join();
+                    t.* = null;
+                };
+                for (work[worker_offset..][0..n]) |worker| if (worker.failure) |err| return err;
             }
             const render_seconds = seconds(now() - wave_started);
             var views: [4]internal.antfly_image.BorrowedRasterAttachment = undefined;
@@ -245,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
                 if (iteration + 1 == warmups + iterations) for (wave_items, result.vectors) |item, v| try saved.append(out, .{ .document = item.document, .page = item.page, .values = try out.dupe(f32, v) });
             }
             const elapsed = seconds(now() - wave_started);
-            if (iteration >= warmups) try samples.append(out, .{ .iteration = iteration - warmups, .first_item = offset, .pages = count, .seconds = elapsed, .render_seconds = render_seconds, .gpu_paint_seconds = gpu_seconds, .model = timings, .gpu_pages = gpu_count, .cpu_pages = cpu_count, .retained_raster_bytes = retained_bytes, .cpu_scratch_peak_sum = scratch_sum });
+            if (iteration >= warmups) try samples.append(out, .{ .iteration = iteration - warmups, .first_item = offset, .pages = count, .seconds = elapsed, .render_seconds = render_seconds, .gpu_paint_seconds = gpu_seconds, .model = timings, .gpu_pages = gpu_count, .cpu_pages = cpu_count, .retained_raster_bytes = retained_bytes, .cpu_scratch_peak_sum = scratch_sum, .prepare_seconds_sum = seconds(prepare_ns), .cpu_render_seconds_sum = seconds(cpu_render_ns), .gpu_wall_seconds = seconds(gpu_wall_ns), .gpu_cached_buffer_bytes = if (gpu_renderer) |r| r.cachedBytes() else 0 });
             // First-iteration pixel gate is outside wave timing. A separate
             // render-only run provides uncontaminated pipeline totals.
             if (use_gpu and iteration == 0) for (gpu_indexes[0..gpu_count]) |r| {
