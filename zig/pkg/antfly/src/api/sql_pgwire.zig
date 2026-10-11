@@ -2177,20 +2177,45 @@ test "SQL pgwire supervised cleanup retains native stream allocator root and par
     owner.admission = admission.tryAcquireLease().?;
     var diagnostic: compiler.Diagnostic = .{};
     owner.plan = try server.sql_plan_cache.acquire(cache_io, .{ .statement = "SELECT 1" }, &diagnostic);
-    // Construct the native stream's real teardown surface. The page arenas
-    // below borrow this actual stream budget, exactly as next() pages do.
-    owner.stream = try alloc.create(Pull.Stream);
-    owner.stream.* = undefined;
-    owner.stream.budget = .{ .backing = alloc, .limit = 1 << 16 };
-    owner.stream.arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
-    _ = try owner.stream.arena.allocator().alloc(u8, 1024);
-    owner.stream.parallel = null;
-    owner.stream.pending_columns = null;
-    owner.stream.spool = null;
-    owner.stream.cursor = null;
-    owner.stream.after = null;
-    owner.stream.settings = null;
-    owner.stream.stream_manager = null;
+    // Open through production binding so cleanup owns a valid execution
+    // context, typed parameter frame, cursor and regex allocator.
+    const NativeFixture = struct {
+        closed: std.atomic.Value(usize) = .init(0),
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedStatelessScan;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn openScan(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = raw, .next = next, .close = close };
+        }
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{}, .after = null };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.closed.fetchAdd(1, .release);
+        }
+    };
+    var native_fixture: NativeFixture = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs WHERE n = $1", .{});
+    defer compiled.deinit();
+    owner.stream = (try Pull.Stream.open(alloc, native_fixture.backend(), &compiled, &.{.{ .integer = 7 }}, .{ .retained_bytes = 1 << 16 })) orelse return error.UnexpectedMaterializedFallback;
+    try std.testing.expect(owner.stream.cursor != null);
+    const invocation = owner.stream.parameter_invocation orelse return error.MissingParameterFrame;
+    try std.testing.expectEqual(.integer, invocation.descriptors[0].kind.?);
+    try std.testing.expectEqual(.int64, invocation.descriptors[0].element_type.?);
+    try std.testing.expect(invocation.frame != null);
+    var regex_lane = try owner.stream.regex_execution.acquire();
+    regex_lane.deinit();
     var pages: [2]*OwnedRead.PageOwner = undefined;
     for (&pages) |*page| {
         page.* = try alloc.create(OwnedRead.PageOwner);
@@ -2230,6 +2255,7 @@ test "SQL pgwire supervised cleanup retains native stream allocator root and par
         if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
         try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
+    try std.testing.expectEqual(@as(usize, 1), native_fixture.closed.load(.acquire));
     try std.testing.expect(fence.retired_before_release.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), fence.references.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), connection.used.load(.acquire));
