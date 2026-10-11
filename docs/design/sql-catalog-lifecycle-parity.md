@@ -1962,3 +1962,16 @@ with no skips, failures or leaks; these overlapping selections are not summed
 as independent SQL cases. ReleaseFast qualification is running. The original
 SQL inventory remains unchanged, and the remaining activation requirements
 above still apply.
+
+The ordered DB entry point also needs an immutable owner-local input manifest
+committed with admission and carried in the same standby frame. After a fence
+ACK, the metadata permission read intentionally returns no inputs for that
+acknowledged operation; it must not be repurposed into execution authority on
+restart. The local manifest must retain the exact before/after schema bytes,
+predecessor integrity catalog and index identity needed to reconstruct the
+candidate, bound to the durable job fingerprints. Recovery must validate those
+bindings before rebuilding owned schema views outside the apply lock. Standby
+replay must not depend on a fresh metadata network read to reconstruct effects
+already admitted by its authenticated primary. Neither the new replay staging
+entry points nor the existing binding-only component fixtures establish this
+durable input/admission/outbox contract; it remains part of worker activation.
