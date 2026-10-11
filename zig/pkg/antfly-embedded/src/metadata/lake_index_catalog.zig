@@ -214,6 +214,16 @@ pub const State = struct {
         try next.validate();
         return next;
     }
+    /// Discard unusable derived work without releasing the current build lease.
+    pub fn discardCheckpoint(self: State, token: Token, now_ms: u64) !State {
+        try self.validate();
+        const attempt = self.pending orelse return error.LakeIndexPublicationFenceChanged;
+        if (!std.mem.eql(u8, &attempt.token, &token) or now_ms < attempt.started_at_ms or now_ms >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
+        var next = self;
+        next.checkpoint = null;
+        try next.validate();
+        return next;
+    }
     pub fn publish(self: State, publication: Publication, now_ms: u64) !State {
         try self.validate();
         if (!std.meta.eql(self.namespace, publication.namespace)) return error.LakeIndexPublicationFenceChanged;
@@ -358,7 +368,7 @@ pub fn transitionAllowed(a: A, before: anytype, after: anytype) !bool {
                 !std.meta.eql(saved.signature, attempt.signature) or saved.published_at_ms < attempt.started_at_ms or
                 saved.published_at_ms >= attempt.lease_expires_at_ms or saved.reader_protocol != attempt.reader_protocol or
                 !try locatorEqual(a, saved.store_locator, attempt.store_locator)) return false;
-        } else if (replacement.pending != null or replacement.failure != null) return false;
+        } else if (replacement.failure != null) return false;
     }
     if (replacement.pending) |renewed| {
         return renewed.generation == attempt.generation and std.mem.eql(u8, &renewed.token, &attempt.token) and
@@ -434,6 +444,26 @@ test "metadata.lake index publication preserves ready roots and fences changed d
     var building = table;
     building.lake_index_catalog_json = building_bytes;
     try std.testing.expect(try transitionAllowed(a, table, building));
+    const checkpointed = try attempt.saveCheckpoint(publication, 101);
+    const discarded = try checkpointed.discardCheckpoint(attempt.pending.?.token, 102);
+    try std.testing.expect(discarded.checkpoint == null);
+    try std.testing.expectEqualDeep(attempt.pending, discarded.pending);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(@splat(9), 102));
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(attempt.pending.?.token, 99));
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, checkpointed.discardCheckpoint(attempt.pending.?.token, 120));
+    const checkpoint_bytes = try encode(a, checkpointed);
+    defer a.free(checkpoint_bytes);
+    var checkpoint_table = building;
+    checkpoint_table.lake_index_catalog_json = checkpoint_bytes;
+    try std.testing.expect(try transitionAllowed(a, building, checkpoint_table));
+    try std.testing.expect(try transitionAllowed(a, checkpoint_table, building));
+    var stolen = discarded;
+    stolen.pending.?.token = @splat(9);
+    const stolen_bytes = try encode(a, stolen);
+    defer a.free(stolen_bytes);
+    var stolen_table = building;
+    stolen_table.lake_index_catalog_json = stolen_bytes;
+    try std.testing.expect(!try transitionAllowed(a, checkpoint_table, stolen_table));
     const ready = try attempt.publish(publication, 101);
     const ready_bytes = try encode(a, ready);
     defer a.free(ready_bytes);

@@ -85,6 +85,7 @@ pub const Lease = struct {
     ptr: *anyopaque,
     snapshot: *const fn (*anyopaque, A) anyerror!local.common_topology_records.TableRecord,
     save_checkpoint: ?*const fn (*anyopaque, catalog.Publication) anyerror!void = null,
+    discard_checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
 };
 const BuildProgress = struct {
     a: A,
@@ -167,8 +168,21 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
     var candidate_list: std.ArrayList(local.serverless_segment_sidecar_manifest.DeclaredArtifact) = .empty;
     if (current.value.checkpoint) |*saved| {
         if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) {
-            try @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, saved, cancellation, null);
-            try candidate_list.appendSlice(na, saved.declarations);
+            @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, saved, cancellation, null) catch |err| switch (err) {
+                error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => {
+                    // A restored catalog may reference collected derived work.
+                    // Clear authority before rebuilding; transient reads and
+                    // ambiguous CAS outcomes must still stop this attempt.
+                    try context.ensureActive();
+                    try cancellation.check();
+                    const owner = lease orelse return err;
+                    const discard = owner.discard_checkpoint orelse return err;
+                    try discard(owner.ptr);
+                    current.value.checkpoint = null;
+                },
+                else => return err,
+            };
+            if (current.value.checkpoint) |available| try candidate_list.appendSlice(na, available.declarations);
         }
     }
     for (published_candidates) |declaration| {
