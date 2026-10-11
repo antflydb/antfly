@@ -466,3 +466,19 @@ BaseURL, inherited templates, multiple periods/adaptations/representations,
 nonzero availability offsets, incomplete low-latency segments, UTCTiming fetching,
 MPD Patch, DRM, XML entities/DTDs and unsupported attributes fail explicitly.
 The caller supplies clock synchronization and selects the representation upstream.
+
+### VP8 decoding and display/color metadata consumers
+
+WebM packet indexing now feeds `antfly_video.vp8.Session` for pure Zig stateful
+VP8 reconstruction, including invisible reference pictures. Packet ordering and
+visibility remain transport metadata; the decoder independently checks coded
+frame tags and updates references in coded order. WebM model ingestion and
+VP9/AV1 reconstruction remain unsupported.
+
+MP4 orthogonal display matrices and pixel aspect ratios now reach the
+EmbeddingGemma 2 presentation renderer. AVC VUI primaries are retained alongside
+matrix/transfer declarations; model preflight combines VUI and container color
+metadata before selecting the explicit PQ/HLG rendering policy. Color conflicts
+and unsupported transforms fail. These model policies use a new embedding recipe
+identity and have separate positive pretrained rendering oracles; media indexing
+still performs no color conversion itself. See [VIDEO.md](../video/VIDEO.md#stateful-vp8-and-presentationhdr-rendering-continuation).

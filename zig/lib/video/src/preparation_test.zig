@@ -93,7 +93,7 @@ test "video Metal quantized bicubic patch preparation matches CPU with rotation 
     var batch = try apple.decodeSelected(a, &reader, &.{0}, .{ .require_hardware = false });
     defer batch.deinit();
     inline for (std.meta.tags(prep.Rotation)) |rotation| {
-        inline for (std.meta.tags(prep.Matrix)) |matrix| {
+        inline for ([_]prep.Matrix{ .bt601, .bt709 }) |matrix| {
             inline for (std.meta.tags(prep.RgbRounding)) |rounding| {
                 const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .rotation = rotation, .rgb_rounding = rounding };
                 const expected = try prep.reference(a, &batch.frames[0].surface, options, .{});
@@ -217,7 +217,7 @@ test "video Metal borrowed full-range planes match portable reference without de
         .{ .bytes = bytes[0..8], .stride = 4, .width = 4, .height = 2 },
         .{ .bytes = bytes[8..], .stride = 4, .width = 2, .height = 1 },
     } };
-    inline for (std.meta.tags(prep.Matrix)) |matrix| {
+    inline for ([_]prep.Matrix{ .bt601, .bt709 }) |matrix| {
         const options = prep.Options{ .width = 48, .height = 48, .matrix = matrix, .centered = false };
         const expected = try prep.referenceHost(a, host, options, .{});
         defer a.free(expected);
@@ -228,4 +228,100 @@ test "video Metal borrowed full-range planes match portable reference without de
         defer a.free(actual);
         for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1.0 / 255.0 + 1e-6);
     }
+}
+
+test "HDR rendering matches independent float64 RGB8 reference on CPU and Metal" {
+    const bytes = @embedFile("../testdata/hdr-10bit-nv12.bin");
+    const fixtures = [_][]const u8{
+        @embedFile("../testdata/hdr-pq-709-limited.rgba"),   @embedFile("../testdata/hdr-pq-709-full.rgba"),
+        @embedFile("../testdata/hdr-pq-2020-limited.rgba"),  @embedFile("../testdata/hdr-pq-2020-full.rgba"),
+        @embedFile("../testdata/hdr-hlg-709-limited.rgba"),  @embedFile("../testdata/hdr-hlg-709-full.rgba"),
+        @embedFile("../testdata/hdr-hlg-2020-limited.rgba"), @embedFile("../testdata/hdr-hlg-2020-full.rgba"),
+    };
+    for (fixtures, 0..) |expected_rgba, i| {
+        const host = prep.HostSurface{ .width = 48, .height = 48, .bit_depth = 10, .format = if (i % 2 == 0) .nv12_video else .nv12_full, .planes = .{
+            .{ .bytes = bytes[0 .. 48 * 48 * 2], .stride = 96, .width = 48, .height = 48 },
+            .{ .bytes = bytes[48 * 48 * 2 ..], .stride = 96, .width = 24, .height = 24 },
+        } };
+        const options = prep.Options{ .width = 48, .height = 48, .matrix = if ((i / 2) % 2 == 0) .bt709 else .bt2020_ncl, .tone_mapping = if (i < 4) .pq_reinhard_100 else .hlg_reinhard_100, .torchvision = true };
+        var rgb_options = options;
+        rgb_options.matrix = .bt709;
+        rgb_options.tone_mapping = .none;
+        const oracle = try prep.referenceRgba(a, expected_rgba, 48, 48, rgb_options, .{});
+        defer a.free(oracle);
+        const native = try prep.referenceHost(a, host, options, .{});
+        defer a.free(native);
+        try std.testing.expectEqualSlices(f32, oracle, native);
+    }
+    // CPU evidence remains valid on Linux. Device qualification requires a real
+    // Metal device and is run explicitly on the GPU host.
+    if (comptime @import("builtin").os.tag == .macos) {
+        const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+        defer av_test_device_destroy(device);
+        var metal = try prep.Metal.init(device);
+        defer metal.deinit();
+        for (fixtures, 0..) |expected_rgba, i| {
+            const host = prep.HostSurface{ .width = 48, .height = 48, .bit_depth = 10, .format = if (i % 2 == 0) .nv12_video else .nv12_full, .planes = .{
+                .{ .bytes = bytes[0 .. 48 * 48 * 2], .stride = 96, .width = 48, .height = 48 },
+                .{ .bytes = bytes[48 * 48 * 2 ..], .stride = 96, .width = 24, .height = 24 },
+            } };
+            const options = prep.Options{ .width = 48, .height = 48, .matrix = if ((i / 2) % 2 == 0) .bt709 else .bt2020_ncl, .tone_mapping = if (i < 4) .pq_reinhard_100 else .hlg_reinhard_100, .torchvision = true };
+            var rgb_options = options;
+            rgb_options.matrix = .bt709;
+            rgb_options.tone_mapping = .none;
+            const oracle = try prep.referenceRgba(a, expected_rgba, 48, 48, rgb_options, .{});
+            defer a.free(oracle);
+            var prepared = try metal.submitHost(a, host, options, .{});
+            defer prepared.deinit();
+            try prepared.wait(std.testing.io, .{});
+            const result = try prepared.readback(a);
+            defer a.free(result);
+            // GPU fused normalization may differ by a few float32 ULPs.
+            // This tolerance is far smaller than one RGB8 code step.
+            for (oracle, result) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 0.000001);
+            if (i == 0) try std.testing.expect(prepared.coefficient_staging_bytes > 16385 * 4) else try std.testing.expectEqual(@as(usize, if (i == 4) 16385 * 4 else 0), prepared.coefficient_staging_bytes);
+        }
+    }
+}
+
+test "HDR Metal cache admission and submitted output survive preparer teardown" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    const bytes = @embedFile("../testdata/hdr-10bit-nv12.bin");
+    const host = prep.HostSurface{ .width = 48, .height = 48, .bit_depth = 10, .format = .nv12_video, .planes = .{
+        .{ .bytes = bytes[0 .. 48 * 48 * 2], .stride = 96, .width = 48, .height = 48 },
+        .{ .bytes = bytes[48 * 48 * 2 ..], .stride = 96, .width = 24, .height = 24 },
+    } };
+    const options = prep.Options{ .width = 48, .height = 48, .matrix = .bt2020_ncl, .tone_mapping = .pq_reinhard_100, .torchvision = true };
+    var pool = media.admission.Pool{ .limits = .{ .device_bytes = 4096 } };
+    {
+        var bounded = try prep.Metal.init(device);
+        defer bounded.deinit();
+        try bounded.admit(&pool, 4096);
+        var sdr = options;
+        sdr.tone_mapping = .none;
+        sdr.matrix = .bt709;
+        var warm = try bounded.submitHost(a, host, sdr, .{});
+        defer warm.deinit();
+        try warm.wait(std.testing.io, .{});
+        const cached = bounded.coefficient_bytes;
+        try std.testing.expectError(error.ResourceLimitExceeded, bounded.submitHost(a, host, options, .{}));
+        try std.testing.expectEqual(cached, bounded.coefficient_bytes);
+        try std.testing.expectEqual(@as(u64, 4096), pool.snapshot().device_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().device_bytes);
+    var metal = try prep.Metal.init(device);
+    var prepared = metal.submitHost(a, host, options, .{}) catch |err| {
+        metal.deinit();
+        return err;
+    };
+    defer prepared.deinit();
+    metal.deinit();
+    try prepared.wait(std.testing.io, .{});
+    const actual = try prepared.readback(a);
+    defer a.free(actual);
+    const expected = try prep.referenceHost(a, host, options, .{});
+    defer a.free(expected);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.000001);
 }

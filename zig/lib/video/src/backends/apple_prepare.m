@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <string.h>
+#include <math.h>
 // Embedded by the Zig build as a generated header, never loaded from cwd.
 #include "video_prepare_shader.h"
 @interface AVPreparer : NSObject
@@ -27,6 +28,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> horizontalRGBA;
 @property(nonatomic, strong) id<MTLComputePipelineState> horizontalNative;
 @property(nonatomic) void *cache;
+@property(nonatomic, strong) id<MTLBuffer> pqLUT;
+@property(nonatomic, strong) id<MTLBuffer> hlgLUT;
 @end
 @implementation AVPreparer
 - (void)dealloc { av_metal_destroy(_cache); }
@@ -108,6 +111,22 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
         if (params[8] < 8 || params[8] > 14 || params[11] > 16 - params[8] || (params[8] == 8 && params[11] != 0)) return -1;
+        if (params[5] > 2 || params[12] > 2 || (params[5] == 2 && params[12] == 0) || (rgba && params[12] != 0)) return -1;
+        id<MTLBuffer> toneLUT = params[12] == 1 ? p.pqLUT : p.hlgLUT;
+        if (params[12] && !toneLUT) {
+            float table[16385];
+            for (size_t i = 0; i <= 16384; ++i) {
+                double n = (double)i / 16384.0, value;
+                if (params[12] == 1) {
+                    double v = pow(n, 32.0 / 2523.0);
+                    value = 100.0 * pow(fmax(v - 3424.0 / 4096.0, 0.0) / (2413.0 / 128.0 - 2392.0 / 128.0 * v), 16384.0 / 2610.0);
+                } else value = n <= 0.5 ? n * n / 3.0 : (exp((n - 0.55991073) / 0.17883277) + 0.28466892) / 12.0;
+                table[i] = (float)value;
+            }
+            toneLUT = upload(p.device, table, sizeof(table));
+            if (!toneLUT) return -1;
+            if (params[12] == 1) p.pqLUT = toneLUT; else p.hlgLUT = toneLUT;
+        }
         id<MTLTexture> y = nil, uv = nil;
         if (nativeY) {
             if (params[8] < 8 || params[8] > 14 || params[9] > 3 || ((nativeUV == nil) != (params[9] == 0))) return -1;
@@ -149,13 +168,13 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         if (!encoder) return -1;
         [encoder setComputePipelineState:nativeY ? p.horizontalNative : (rgba ? p.horizontalRGBA : p.horizontal)];
         if (rgba) [encoder setBuffer:result.rgba offset:0 atIndex:4];
-        else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; }
-        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:48 atIndex:1];
+        else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; [encoder setBuffer:params[12] ? toneLUT : c.xw offset:0 atIndex:5]; }
+        [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:52 atIndex:1];
         [encoder setBuffer:c.xb offset:0 atIndex:2]; [encoder setBuffer:c.xw offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
-        [encoder setBytes:params length:48 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
+        [encoder setBytes:params length:52 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }
@@ -224,4 +243,9 @@ int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const
         if (params[9] != 0) [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];
         return prepare(handle, NULL, NULL, 0, params, coefficients, out, y, uv);
     }
+}
+
+uint32_t av_preparer_tone_mask(void *handle) {
+    AVPreparer *p = (__bridge AVPreparer *)handle;
+    return (p.pqLUT ? 1u : 0u) | (p.hlgLUT ? 2u : 0u);
 }

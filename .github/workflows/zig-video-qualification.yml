@@ -65,11 +65,22 @@ jobs:
             --binary .benchmark-results/video-linux/install/bin/antfly-inference \
             --backend native --model-dir .benchmark-assets/video-linux/model \
             --verify-capacity-retry --verify-decode-retry --output .benchmark-results/video-linux/pretrained.json
+      - name: Qualify positive pretrained display and HDR rendering
+        run: |
+          python tools/embeddinggemma2/video_render_qualification.py \
+            --backend cpu --model-dir .benchmark-assets/video-linux/model \
+            --output .benchmark-results/video-linux/render-pytorch-cpu.json
+          python tools/embeddinggemma2/video_render_qualification.py \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --backend native --model-dir .benchmark-assets/video-linux/model \
+            --reference .benchmark-results/video-linux/render-pytorch-cpu.json \
+            --output .benchmark-results/video-linux/render-native.json
       - name: Qualify model VFR sampling and display policy
         run: |
           python tools/embeddinggemma2/video_policy_qualification.py \
             --binary .benchmark-results/video-linux/install/bin/antfly-inference \
             --backend native --model-dir .benchmark-assets/video-linux/model \
+            --render-oracle .benchmark-results/video-linux/render-pytorch-cpu.json \
             --output .benchmark-results/video-linux/model-video-policy.json
       - name: Measure matched real-clip PyTorch and native retrieval
         run: |

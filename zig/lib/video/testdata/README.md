@@ -257,3 +257,24 @@ not claimed to be conforming SPS activation within one coded video sequence.
 comparison. `vp8-keyframes.json` records generation/decoding commands, tool
 version, byte sizes and SHA-256 hashes. These generated fixtures contain no
 third-party media and qualify no VP8 interframe tools.
+
+## VP8 interframe and HDR rendering qualification
+
+`vp8-interframes.json` records seven VP8 streams and independent decoded pixel
+or frame-hash oracles: versions 0–3, 174 displayed pictures and three hidden
+alt-reference pictures. Six streams are first-party FFmpeg testsrc2 fixtures.
+`vp8-sintel.webm` is a 192x128 VP8 derivative of the 20-second Sintel excerpt
+in `tools/embeddinggemma2/testdata/retrieval/scene-1-h264.mp4`: Sintel © Blender
+Foundation / durian.blender.org, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
+Retain this attribution. Its receipt records the original URL/hash and encoding
+command. `vp8-sintel.sha256` hashes visible planar Y/U/V pictures, independently
+decoded by FFmpeg/libvpx. No libvpx code or binary is linked into Antfly.
+
+`hdr-10bit-nv12.bin` and eight `hdr-*.rgba` files are first-party synthetic
+48x48 fixtures. `tools/embeddinggemma2/render_reference.py` generates a 10-bit
+integer YUV ramp and independent float64 PQ/HLG RGB8 references covering BT.709
+and BT.2020 NCL, full/limited range, clipping and neutral/extreme samples.
+CPU and actual Metal preparation preserve RGB8 codes exactly; normalized
+Metal patch values allow only `1e-6` for float32 fused arithmetic. Metal
+also tests cache admission, warm reuse and in-flight buffer lifetime after owner
+teardown. Pretrained model oracles live in `tools/embeddinggemma2/testdata/render`.

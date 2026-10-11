@@ -539,3 +539,27 @@ pure Zig reference-picture state, entropy/block reconstruction, filtering and
 independent libvpx/dav1d pixel fixtures; no empty decoder API is substituted for
 that work. Device final normalization and broader qualified model display/field
 policies also remain outstanding.
+
+### Stateful VP8 and positive presentation/HDR qualification
+
+The next implementation adds pure Zig VP8 interframes through a sequential WebM
+session API. Transactional reference/entropy updates, hidden frames, motion modes,
+split prediction, residual/filter reconstruction, budgets, cancellation and retry
+are implemented. Independent generated versions 0–3 and a real Sintel excerpt
+qualify 174 displayed plus three hidden coded pictures. Reference sharing is a
+remaining performance improvement. VP9, AV1 and model WebM ingestion remain
+unimplemented; container support alone is not presented as decoder support.
+
+The model presentation policy now renders orthogonal rotation and uses SAR for
+its target aspect, without an intermediate stretched raster. PQ/HLG YUV has a
+pinned fixed-exposure Reinhard/sRGB policy, with explicit gamut declarations and
+conflict checks. The recipe changes to `embeddinggemma2-f32-mean-v3-display-hdr`.
+CPU uses high-precision transfer before quantization; Metal caches transfer tables
+inside the existing admitted coefficient budget and keeps rendering/resizing on
+GPU. Independent float64 pixel fixtures and positive pretrained CPU/MPS/native/
+Metal comparison campaigns qualify the declared cases. Mastering/dynamic HDR,
+hardware HDR imports and broader real-world HDR qualification remain separate.
+
+The manual Linux workflow now generates its own pinned PyTorch rendering oracle
+and compares the native model against it. Cross-compilation is not Linux runtime
+evidence, and prior runtime receipts remain tied to their earlier source/binary.

@@ -294,7 +294,7 @@ def prepare(model, artifacts, output):
         "version": 1,
         "model": reference.MODEL,
         "revision": reference.REVISION,
-        "recipe": "embeddinggemma2-f32-mean-v2-q13-video",
+        "recipe": "embeddinggemma2-f32-mean-v3-display-hdr",
         "cases": cases,
         "decision": decision,
         "retrieval": {

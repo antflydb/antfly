@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pure Zig VP8 displayed-keyframe decoding. Interframes remain unsupported.
+//! Pure Zig VP8 keyframes and stateful interframe decoding.
 const std = @import("std");
 const media = @import("antfly_media");
 const image = @import("antfly_image");
@@ -65,6 +65,77 @@ pub fn decodeFrame(a: std.mem.Allocator, reader: *media.webm.Reader, index: usiz
     try reservation.resize(.{ .host_bytes = retained });
     return .{ .allocator = a, .planes = planes, .decode_index = index, .pts_ns = packet.pts, .duration_ns = packet.duration_ns, .decode_high_water = budget.peak, .reservation = reservation };
 }
+
+/// Sequential coded-packet decoder, including invisible reference pictures.
+/// Output frames are independently owned and can outlive this session. Decode
+/// order is enforced; errors leave the same packet available for retry.
+pub const Session = struct {
+    allocator: std.mem.Allocator,
+    reader: *media.webm.Reader,
+    options: Options,
+    budget: Budget,
+    decoder: image.webp.Vp8Decoder = .{},
+    next_index: usize = 0,
+    reservation: media.admission.Token,
+
+    pub fn init(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options) !*Session {
+        if (reader.track.codec != .vp8) return error.UnsupportedVideoCodec;
+        if (reader.track.width == 0 or reader.track.height == 0 or reader.track.width > 16384 or reader.track.height > 16384) return error.InvalidVideoGeometry;
+        if (@as(u64, reader.track.width) * reader.track.height > options.max_pixels) return error.ResourceLimitExceeded;
+        const self = try a.create(Session);
+        errdefer a.destroy(self);
+        const reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.max_decode_bytes }) else media.admission.Token{};
+        self.* = .{ .allocator = a, .reader = reader, .options = options, .budget = .{ .backing = a, .limit = options.max_decode_bytes }, .reservation = reservation };
+        return self;
+    }
+    pub fn deinit(self: *Session) void {
+        self.decoder.deinit(self.budget.allocator());
+        std.debug.assert(self.budget.live == 0);
+        self.reservation.deinit();
+        self.allocator.destroy(self);
+    }
+    /// A null result denotes an invisible decoded reference picture; it still
+    /// consumes one coded packet. A null result at EOF consumes nothing.
+    pub fn next(self: *Session) !?Frame {
+        try self.reader.input.control.check();
+        if (self.next_index == self.reader.packets.len) return null;
+        const index = self.next_index;
+        const packet = self.reader.packets[index];
+        if (packet.size > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+        var lease = try self.reader.readPacket(index);
+        defer lease.deinit();
+        if (lease.bytes.len < 3) return error.WebpDecodeFailed;
+        if (lease.bytes[0] & 1 == 0) {
+            if (lease.bytes.len < 10) return error.WebpDecodeFailed;
+            const width = std.mem.readInt(u16, lease.bytes[6..8], .little) & 0x3fff;
+            const height = std.mem.readInt(u16, lease.bytes[8..10], .little) & 0x3fff;
+            if (width != self.reader.track.width or height != self.reader.track.height) return error.UnsupportedDynamicGeometry;
+        }
+        const visible = lease.bytes[0] & 16 != 0 and !packet.invisible;
+        const w: usize = (self.reader.track.width + 15) / 16 * 16;
+        const h: usize = (self.reader.track.height + 15) / 16 * 16;
+        const bytes = w * h * 3 / 2;
+        var reservation = if (visible and self.options.admission_pool != null) try self.options.admission_pool.?.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        var scope = image.work_control.Scope.enter(.{ .context = self.reader.input.control.context, .check_fn = self.reader.input.control.check_fn });
+        defer scope.deinit();
+        self.budget.denied = false;
+        var p = self.decoder.decode(self.budget.allocator(), lease.bytes, .{ .max_pixels = self.options.max_pixels, .max_rgba_bytes = self.options.max_decode_bytes }) catch |err| {
+            return if (err == error.ImageTooLarge or (err == error.OutOfMemory and self.budget.denied)) error.ResourceLimitExceeded else err;
+        };
+        self.next_index += 1;
+        if (!visible) {
+            p.deinit(self.budget.allocator());
+            return null;
+        }
+        const retained = p.y.len + p.u.len + p.v.len;
+        std.debug.assert(retained == bytes);
+        // Transfer the output to the backing allocator and its own admission
+        // token. Only reference pictures remain charged to the session budget.
+        self.budget.live -= retained;
+        return .{ .allocator = self.allocator, .planes = p, .decode_index = index, .pts_ns = packet.pts, .duration_ns = packet.duration_ns, .decode_high_water = self.budget.peak, .reservation = reservation };
+    }
+};
 
 test "VP8 WebM keyframe planes match independent FFmpeg decode and enforce limits" {
     const a = std.testing.allocator;
@@ -138,4 +209,164 @@ test "VP8 cancellation during reconstruction releases workspace and permits retr
     var frame = try decodeFrame(a, &reader, 0, options);
     frame.deinit();
     try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+}
+
+fn differential(bytes: []const u8, expected: []const u8, count: usize) ![5]usize {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-inter", .storage = .{ .borrowed = bytes } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    var decoder = image.webp.Vp8Decoder{};
+    defer decoder.deinit(a);
+    var cursor: usize = 0;
+    try std.testing.expect(reader.packets.len >= count);
+    for (0..reader.packets.len) |index| {
+        var lease = try reader.readPacket(index);
+        defer lease.deinit();
+        var p = try decoder.decode(a, lease.bytes, image.DecodeLimits.inference_default);
+        defer p.deinit(a);
+        if (lease.bytes[0] & 16 == 0) continue;
+        for ([_][]const u8{ p.y, p.u, p.v }, [_]usize{ p.y_stride, p.uv_stride, p.uv_stride }, [_]usize{ p.width, (p.width + 1) / 2, (p.width + 1) / 2 }, [_]usize{ p.height, (p.height + 1) / 2, (p.height + 1) / 2 }) |plane, stride, width, height| {
+            for (0..height) |y| {
+                if (!std.mem.eql(u8, expected[cursor..][0..width], plane[y * stride ..][0..width])) std.debug.print("VP8 differential failure frame={d} row={d} cursor={d} modes={any} split={any}\n", .{ index, y, cursor, decoder.modes, decoder.split_shapes });
+                try std.testing.expectEqualSlices(u8, expected[cursor..][0..width], plane[y * stride ..][0..width]);
+                cursor += width;
+            }
+        }
+    }
+    try std.testing.expectEqual(expected.len, cursor);
+    try std.testing.expect(decoder.modes[0] > 0);
+    try std.testing.expect(decoder.modes[3] > 0);
+    return decoder.modes;
+}
+
+test "VP8 interframes match independent FFmpeg planar pixels" {
+    const modes = try differential(@embedFile("../testdata/vp8-inter.webm"), @embedFile("../testdata/vp8-inter.yuv"), 24);
+    try std.testing.expect(modes[4] > 0);
+    _ = try differential(@embedFile("../testdata/vp8-altref.webm"), @embedFile("../testdata/vp8-altref.yuv"), 48);
+    _ = try differential(@embedFile("../testdata/vp8-bilinear.webm"), @embedFile("../testdata/vp8-bilinear.yuv"), 8);
+    _ = try differential(@embedFile("../testdata/vp8-version2.webm"), @embedFile("../testdata/vp8-version2.yuv"), 8);
+    _ = try differential(@embedFile("../testdata/vp8-version3.webm"), @embedFile("../testdata/vp8-version3.yuv"), 8);
+    _ = try differential(@embedFile("../testdata/vp8-partitions.webm"), @embedFile("../testdata/vp8-partitions.yuv"), 30);
+}
+
+test "VP8 interframe failures retain reference state and permit retry" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-inter", .storage = .{ .borrowed = @embedFile("../testdata/vp8-inter.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    var key = try reader.readPacket(0);
+    defer key.deinit();
+    var inter = try reader.readPacket(1);
+    defer inter.deinit();
+    var baseline = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var state = image.webp.Vp8Decoder{};
+    defer state.deinit(baseline.allocator());
+    var first = try state.decode(baseline.allocator(), key.bytes, image.DecodeLimits.inference_default);
+    first.deinit(baseline.allocator());
+    const key_allocs = baseline.alloc_index;
+    var second = try state.decode(baseline.allocator(), inter.bytes, image.DecodeLimits.inference_default);
+    second.deinit(baseline.allocator());
+    const inter_allocs = baseline.alloc_index - key_allocs;
+    for (0..inter_allocs) |i| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = key_allocs + i, .resize_fail_index = 0 });
+        var decoder = image.webp.Vp8Decoder{};
+        defer decoder.deinit(failing.allocator());
+        var initial = try decoder.decode(failing.allocator(), key.bytes, image.DecodeLimits.inference_default);
+        initial.deinit(failing.allocator());
+        const old = decoder.references[0].?.y.ptr;
+        const retained = decoder.retainedBytes();
+        try std.testing.expectError(error.OutOfMemory, decoder.decode(failing.allocator(), inter.bytes, image.DecodeLimits.inference_default));
+        try std.testing.expectEqual(@as(usize, 1), decoder.decoded);
+        try std.testing.expectEqual(old, decoder.references[0].?.y.ptr);
+        try std.testing.expectEqual(retained, decoder.retainedBytes());
+        failing.fail_index = std.math.maxInt(usize);
+        var retried = try decoder.decode(failing.allocator(), inter.bytes, image.DecodeLimits.inference_default);
+        defer retried.deinit(failing.allocator());
+        try std.testing.expectEqualSlices(u8, state.references[0].?.y, retried.y);
+    }
+    try std.testing.expectError(error.WebpDecodeFailed, state.decode(baseline.allocator(), inter.bytes[0..3], image.DecodeLimits.inference_default));
+    try std.testing.expectEqual(@as(usize, 2), state.decoded);
+    var missing = image.webp.Vp8Decoder{};
+    try std.testing.expectError(error.MissingVp8Reference, missing.decode(a, inter.bytes, image.DecodeLimits.inference_default));
+}
+
+test "VP8 sequential session bounds memory and returned frames outlive it" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-inter", .storage = .{ .borrowed = @embedFile("../testdata/vp8-inter.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 256 * 1024 } };
+    const session = try Session.init(a, &reader, .{ .max_decode_bytes = 128 * 1024, .admission_pool = &pool });
+    var kept = (try session.next()).?;
+    defer kept.deinit();
+    while (session.next_index < reader.packets.len) {
+        if (try session.next()) |value| {
+            var frame = value;
+            frame.deinit();
+        }
+    }
+    try std.testing.expect((try session.next()) == null);
+    session.deinit();
+    try std.testing.expectEqual(kept.planes.y.len + kept.planes.u.len + kept.planes.v.len, pool.snapshot().host_bytes);
+    const tiny = try Session.init(a, &reader, .{ .max_decode_bytes = 1 });
+    defer tiny.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, tiny.next());
+    try std.testing.expectEqual(@as(usize, 0), tiny.next_index);
+    try std.testing.expectEqual(@as(usize, 0), tiny.budget.live);
+}
+
+test "VP8 real Sintel interframes match independent FFmpeg frame hashes" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-sintel", .storage = .{ .borrowed = @embedFile("../testdata/vp8-sintel.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    const session = try Session.init(a, &reader, .{});
+    defer session.deinit();
+    const hashes = @embedFile("../testdata/vp8-sintel.sha256");
+    var displayed: usize = 0;
+    while (session.next_index < reader.packets.len) {
+        var frame = (try session.next()) orelse continue;
+        defer frame.deinit();
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        const p = frame.planes;
+        for ([_][]const u8{ p.y, p.u, p.v }, [_]usize{ p.y_stride, p.uv_stride, p.uv_stride }, [_]usize{ p.width, (p.width + 1) / 2, (p.width + 1) / 2 }, [_]usize{ p.height, (p.height + 1) / 2, (p.height + 1) / 2 }) |plane, stride, width, height| {
+            for (0..height) |y| digest.update(plane[y * stride ..][0..width]);
+        }
+        const actual = std.fmt.bytesToHex(digest.finalResult(), .lower);
+        try std.testing.expectEqualSlices(u8, hashes[displayed * 65 ..][0..64], &actual);
+        displayed += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 48), displayed);
+    try std.testing.expectEqual(displayed * 65, hashes.len);
+}
+
+test "VP8 interframe cancellation preserves packet position and retained references" {
+    var input = media.source.Source{ .allocator = std.testing.allocator, .identity = "vp8-inter", .storage = .{ .borrowed = @embedFile("../testdata/vp8-inter.webm") } };
+    var reader = try media.webm.Reader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const session = try Session.init(std.testing.allocator, &reader, .{});
+    defer session.deinit();
+    var key = (try session.next()).?;
+    defer key.deinit();
+    const old = session.decoder.references[0].?.y.ptr;
+    const live = session.budget.live;
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.calls >= 5) return error.Cancelled;
+        }
+    };
+    var cancel = Cancel{};
+    input.control = .{ .context = &cancel, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, session.next());
+    try std.testing.expectEqual(@as(usize, 1), session.next_index);
+    try std.testing.expectEqual(old, session.decoder.references[0].?.y.ptr);
+    try std.testing.expectEqual(live, session.budget.live);
+    input.control = .{};
+    var retried = (try session.next()).?;
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(usize, 2), session.next_index);
 }

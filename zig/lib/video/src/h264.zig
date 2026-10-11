@@ -22,7 +22,7 @@ pub const Options = struct {
     max_parameter_bytes: usize = 4 * 1024 * 1024,
     max_configurations: usize = 256,
 };
-pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null };
+pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null, primaries: ?u8 = null };
 pub const Config = struct {
     color: Color = .{},
     profile: u32,
@@ -265,7 +265,8 @@ fn vui(bits: *Bits, color: *Color) !bool {
         _ = try bits.read(3);
         full = try bits.read(1) != 0;
         if (try bits.read(1) != 0) {
-            _ = try bits.read(8); // color primaries; no gamut conversion is applied.
+            const primaries: u8 = @intCast(try bits.read(8));
+            if (primaries != 2) color.primaries = primaries;
             const transfer: u8 = @intCast(try bits.read(8));
             const matrix: u8 = @intCast(try bits.read(8));
             if (transfer != 2) color.transfer = transfer;

@@ -281,3 +281,41 @@ unimplemented; template/live DASH is a separately tested bounded library subset.
 preserves all ten vectors and four exact rankings/top-k sets, with sustained
 requests and disconnect/retry. This latest run is macOS ARM64, one timing sample
 per case with no warmup; it does not establish Linux execution or capacity.
+
+## VP8 interframes and presentation/HDR rendering continuation
+
+The VP8 library now decodes persistent reference pictures, all inter prediction
+modes, split motion vectors, versions 0–3, multiple token partitions and hidden
+reference updates. Seven differential streams cover 174 displayed pictures and
+three hidden updates, including real Sintel footage. They match FFmpeg/libvpx
+exactly. The stateful WebM session tests cancellation, malformed packets, memory
+limits and allocation-failure retry. This qualifies the declared fixtures, not
+all VP8 streams. Model WebM ingestion and pure Zig VP9/AV1 reconstruction remain
+open; capabilities explicitly report VP9/AV1 unavailable.
+
+[Display/HDR gates](retrieval-validation/display-hdr-gates.json) bind the new
+production binary, source hashes and receipts. The default model recipe is now
+`embeddinggemma2-f32-mean-v3-display-hdr`; its model identity differs from the
+previous recipe. HTTP accepts orthogonal rotation and SAR-controlled geometry,
+with one direct resize. Explicit BT.709/BT.2020 PQ and HLG AVC signals use a fixed
+100-nit exposure, luminance Reinhard shoulder and sRGB/RGB8 output. HLG uses a
+1000-nit, gamma-1.2, zero-black display assumption. Contradictory or unsupported
+color metadata still fails explicitly.
+
+Independent [PyTorch CPU](../../../../tools/embeddinggemma2/testdata/render/pytorch-cpu.json)
+and [PyTorch MPS](../../../../tools/embeddinggemma2/testdata/render/pytorch-mps.json)
+references extend the pinned processor with the documented presentation and HDR
+policy; this is not a claim about upstream metadata handling. Native CPU and
+Metal compare full pretrained vectors and prompt token counts for rotation, SAR,
+10-bit PQ and HLG. Eight independent RGB8 fixtures cover full/limited range and
+BT.709/BT.2020; CPU and Metal preserve every RGB code, allowing 1e-6 for normalized
+floating-point patch arithmetic. Metal caches transfer tables and accounts for
+them with resize coefficients. Existing VFR, capacity-denial and corrupted-frame
+retry gates also run against the new binary.
+
+The actual Metal video suite passes 124 tests with two platform-specific skips;
+all 14 video-model tests pass. Linux x86-64 musl video and model gates
+cross-compile; no fresh Linux execution is claimed. Mastering/dynamic HDR
+metadata, real-world HDR grading, hardware HDR import and broader HDR format
+qualification remain open. These shared-host runs do not establish a throughput
+speedup or production memory capacity.

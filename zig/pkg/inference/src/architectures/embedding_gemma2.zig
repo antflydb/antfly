@@ -22,7 +22,7 @@ const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 
 pub const checkpoint_revision = "914f7f89142e33e77833254d9c9b90c3cef7303b";
-pub const recipe_version = "embeddinggemma2-f32-mean-v2-q13-video";
+pub const recipe_version = "embeddinggemma2-f32-mean-v3-display-hdr";
 pub const max_tokens: usize = 8192;
 
 pub const Config = struct {

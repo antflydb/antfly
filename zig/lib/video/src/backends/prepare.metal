@@ -15,7 +15,26 @@
 
 #include <metal_stdlib>
 using namespace metal;
-struct Params { uint sw, sh, tw, th, rotation, bt709, full, centered, depth, chroma, rounding, sample_shift; };
+struct Params { uint sw, sh, tw, th, rotation, bt709, full, centered, depth, chroma, rounding, sample_shift, tone; };
+float3 tone_rgb(float3 encoded, constant Params &p, device const float *eotf) {
+    float3 v = clamp(encoded / 255.0f, 0.0f, 1.0f), linear;
+    float3 position = v * 16384.0f;
+    uint3 index = min(uint3(position), uint3(16383));
+    float3 a = float3(eotf[index.x], eotf[index.y], eotf[index.z]);
+    float3 b = float3(eotf[index.x + 1], eotf[index.y + 1], eotf[index.z + 1]);
+    linear = a + (b - a) * (position - float3(index));
+    if (p.tone == 2) {
+        float l = dot(linear, p.bt709 == 2 ? float3(0.2627f, 0.6780f, 0.0593f) : float3(0.2126f, 0.7152f, 0.0722f));
+        linear *= 10.0f * pow(max(l, 0.0f), 0.2f);
+    }
+    if (p.bt709 == 2) {
+        float3 r = linear;
+        linear = float3(dot(r, float3(1.660491f, -0.587641f, -0.072850f)), dot(r, float3(-0.124550f, 1.132900f, -0.008350f)), dot(r, float3(-0.018151f, -0.100579f, 1.118730f)));
+    }
+    linear = clamp(linear / (1.0f + max(dot(linear, float3(0.2126f, 0.7152f, 0.0722f)), 0.0f)), 0.0f, 1.0f);
+    float3 srgb = select(1.055f * pow(linear, float3(1.0f / 2.4f)) - 0.055f, 12.92f * linear, linear <= 0.0031308f);
+    return clamp(floor(srgb * 255.0f + 0.5f), 0.0f, 255.0f);
+}
 float3 rgb_q13(int y, int2 uv, constant Params &p) {
     int4 c = p.bt709 ? (p.full ? int4(12901, -1534, -3835, 15201) : int4(14686, -1747, -4366, 17305))
                     : (p.full ? int4(11485, -2819, -5850, 14516) : int4(13075, -3209, -6660, 16525));
@@ -25,7 +44,7 @@ float3 rgb_q13(int y, int2 uv, constant Params &p) {
                      luma + ((uv.x * c.w) >> 12));
     return float3(clamp((value + 1) >> 1, 0, 255));
 }
-float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read> uvplane, uint2 point, constant Params &p) {
+float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
     uint2 xy = point;
     if (p.rotation == 1) xy = uint2(point.y, p.sh - 1 - point.x);
     else if (p.rotation == 2) xy = uint2(p.sw - 1 - point.x, p.sh - 1 - point.y);
@@ -35,20 +54,22 @@ float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read>
     float stored_scale = float(1u << p.sample_shift);
     float y = floor(round(yplane.read(xy).r * storage_max) / stored_scale) / scale;
     float2 uv = floor(round(uvplane.read(xy / 2).rg * storage_max) / stored_scale) / scale - 128.0f;
-    if (p.rounding && p.depth == 8) return rgb_q13(int(y), int2(uv), p);
+    if (p.rounding && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }
     else if (p.depth != 8) { float factor = 255.0f * scale / float((1u << p.depth) - 1u); y *= factor; uv *= factor; }
-    float3 value = p.bt709 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)
+    float3 value = p.bt709 == 1 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)
+                          : p.bt709 == 2 ? float3(y + 1.4746f * uv.y, y - 0.164553f * uv.x - 0.571353f * uv.y, y + 1.8814f * uv.x)
                           : float3(y + 1.402f * uv.y, y - 0.344136f * uv.x - 0.714136f * uv.y, y + 1.772f * uv.x);
+    if (p.tone != 0) return tone_rgb(value, p, eotf);
     return clamp(floor(value + 0.5f), 0.0f, 255.0f);
 }
 kernel void horizontal(texture2d<float, access::read> yplane [[texture(0)]], texture2d<float, access::read> uvplane [[texture(1)]],
-    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
     uint dh = (p.rotation & 1) ? p.sw : p.sh;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
-    for (uint i = 0; i < count; ++i) sum += int3(rgb(yplane, uvplane, uint2(start + i, gid.y), p)) * weights[offset + i];
+    for (uint i = 0; i < count; ++i) sum += int3(rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf)) * weights[offset + i];
     uchar3 value = uchar3(clamp(sum >> 22, 0, 255));
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
@@ -91,7 +112,7 @@ kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *o
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
 }
 
-float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p) {
+float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
     uint2 xy = point;
     if (p.rotation == 1) xy = uint2(point.y, p.sh - 1 - point.x);
     else if (p.rotation == 2) xy = uint2(p.sw - 1 - point.x, p.sh - 1 - point.y);
@@ -100,20 +121,22 @@ float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::
     float y = float(yplane.read(xy).r >> p.sample_shift) / scale;
     float2 uv = float2(0.0f);
     if (p.chroma != 0) uv = float2(uvplane.read(xy / uint2(p.chroma == 3 ? 1 : 2, p.chroma == 1 ? 2 : 1)).rg >> p.sample_shift) / scale - 128.0f;
-    if (p.rounding && p.depth == 8) return rgb_q13(int(y), int2(uv), p);
+    if (p.rounding && p.depth == 8 && p.tone == 0) return rgb_q13(int(y), int2(uv), p);
     if (!p.full) { y = (y - 16.0f) * (255.0f / 219.0f); uv *= (255.0f / 224.0f); }
     else if (p.depth != 8) { float factor = 255.0f * scale / float((1u << p.depth) - 1u); y *= factor; uv *= factor; }
-    float3 value = p.bt709 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)
+    float3 value = p.bt709 == 1 ? float3(y + 1.5748f * uv.y, y - 0.187324f * uv.x - 0.468124f * uv.y, y + 1.8556f * uv.x)
+                          : p.bt709 == 2 ? float3(y + 1.4746f * uv.y, y - 0.164553f * uv.x - 0.571353f * uv.y, y + 1.8814f * uv.x)
                           : float3(y + 1.402f * uv.y, y - 0.344136f * uv.x - 0.714136f * uv.y, y + 1.772f * uv.x);
+    if (p.tone != 0) return tone_rgb(value, p, eotf);
     return clamp(floor(value + 0.5f), 0.0f, 255.0f);
 }
 kernel void horizontal_native(texture2d<uint, access::read> yplane [[texture(0)]], texture2d<uint, access::read> uvplane [[texture(1)]],
-    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
     uint dh = (p.rotation & 1) ? p.sw : p.sh;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
-    for (uint i = 0; i < count; ++i) sum += int3(native_rgb(yplane, uvplane, uint2(start + i, gid.y), p)) * weights[offset + i];
+    for (uint i = 0; i < count; ++i) sum += int3(native_rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf)) * weights[offset + i];
     uchar3 value = uchar3(clamp(sum >> 22, 0, 255));
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;

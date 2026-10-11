@@ -32,10 +32,12 @@ extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
 extern fn av_prepared_release_source(*anyopaque) c_int;
+extern fn av_preparer_tone_mask(*anyopaque) u32;
 extern fn av_prepared_destroy(*anyopaque) void;
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
-pub const Matrix = enum(u32) { bt601, bt709 };
+pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
+pub const ToneMapping = @import("tone.zig").Policy;
 pub const RgbRounding = enum(u32) { nearest, q13_components };
 pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
@@ -44,6 +46,7 @@ pub const Options = struct {
     /// Required explicit SDR color matrix; range comes from the NV12 surface.
     matrix: Matrix,
     rotation: Rotation = .none,
+    tone_mapping: ToneMapping = .none,
     /// Q13 separately floors Y/U/V products, then rounds the RGB sum.
     /// This pins the 8-bit reference policy independently of host SIMD dispatch.
     rgb_rounding: RgbRounding = .nearest,
@@ -70,6 +73,7 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
     if (source_width > 16_384 or source_height_u32 > 16_384 or options.width > 16_384 or options.height > 16_384) return error.ResourceLimitExceeded;
+    if (options.matrix == .bt2020_ncl and options.tone_mapping == .none) return error.UnsupportedVideoColor;
     if (options.width % 48 != 0 or options.height % 48 != 0) return error.InvalidVideoGeometry;
     const pixels = try std.math.mul(usize, options.width, options.height);
     const source_pixels = try std.math.mul(usize, source_width, source_height_u32);
@@ -96,7 +100,8 @@ fn sourcePoint(x: usize, y: usize, width: usize, height: usize, rotation: Rotati
 fn hostSample(bytes: []const u8, offset: usize, bit_depth: u8) u16 {
     return if (bit_depth == 8) bytes[offset] else std.mem.readInt(u16, bytes[offset..][0..2], .little);
 }
-fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8, rounding: RgbRounding) [3]u8 {
+fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8, rounding: RgbRounding, tone_mapping: ToneMapping) [3]u8 {
+    if (tone_mapping != .none) return rgbHdr(planes, x, y, format, matrix, bit_depth, chroma_format, tone_mapping);
     const bytes: usize = if (bit_depth == 8) 1 else 2;
     const scale: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(bit_depth - 8)));
     var luma: f32 = @as(f32, @floatFromInt((hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth) >> format.sampleShift()))) / scale;
@@ -104,7 +109,7 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
     var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv, bit_depth) >> format.sampleShift()))) / scale - 128;
     var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt((hostSample(planes[1].bytes, uv + bytes, bit_depth) >> format.sampleShift()))) / scale - 128;
-    if (rounding == .q13_components and bit_depth == 8) return rgbQ13(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
+    if (rounding == .q13_components and bit_depth == 8 and tone_mapping == .none) return rgbQ13(@intFromFloat(luma), @intFromFloat(u), @intFromFloat(v), format.fullRange(), matrix);
     if (!format.fullRange()) {
         luma = (luma - 16) * (255.0 / 219.0);
         u *= 255.0 / 224.0;
@@ -118,11 +123,41 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     }
     const values: [3]f32 = if (matrix == .bt709)
         .{ luma + 1.5748 * v, luma - 0.187324 * u - 0.468124 * v, luma + 1.8556 * u }
+    else if (matrix == .bt2020_ncl)
+        .{ luma + 1.4746 * v, luma - 0.164553 * u - 0.571353 * v, luma + 1.8814 * u }
     else
         .{ luma + 1.402 * v, luma - 0.344136 * u - 0.714136 * v, luma + 1.772 * u };
+    if (tone_mapping != .none) return @import("tone.zig").render(values, matrix == .bt2020_ncl, tone_mapping);
     var output: [3]u8 = undefined;
     for (&output, values) |*out, value| out.* = @intFromFloat(std.math.clamp(@floor(value + 0.5), 0, 255));
     return output;
+}
+// Evaluate absolute-light transfer in f64 before RGB8 quantization; small PQ
+// exponent errors can cross a code-value boundary and amplify in the model.
+fn rgbHdr(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, depth: u8, chroma: u8, policy: ToneMapping) [3]u8 {
+    const bytes: usize = if (depth == 8) 1 else 2;
+    const scale: f64 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(depth - 8)));
+    var luma = @as(f64, @floatFromInt(hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, depth) >> format.sampleShift())) / scale;
+    const uv = (y / (if (chroma == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / (if (chroma == 3) @as(usize, 1) else 2)) * 2 * bytes;
+    var u: f64 = if (chroma == 0) 0 else @as(f64, @floatFromInt(hostSample(planes[1].bytes, uv, depth) >> format.sampleShift())) / scale - 128;
+    var v: f64 = if (chroma == 0) 0 else @as(f64, @floatFromInt(hostSample(planes[1].bytes, uv + bytes, depth) >> format.sampleShift())) / scale - 128;
+    if (!format.fullRange()) {
+        luma = (luma - 16) * (255.0 / 219.0);
+        u *= 255.0 / 224.0;
+        v *= 255.0 / 224.0;
+    } else if (depth != 8) {
+        const maximum: f64 = @floatFromInt((@as(u32, 1) << @as(u5, @intCast(depth))) - 1);
+        const factor = 255 * scale / maximum;
+        luma *= factor;
+        u *= factor;
+        v *= factor;
+    }
+    const values: [3]f64 = switch (matrix) {
+        .bt2020_ncl => .{ luma + 1.4746 * v, luma - 0.164553 * u - 0.571353 * v, luma + 1.8814 * u },
+        .bt709 => .{ luma + 1.5748 * v, luma - 0.187324 * u - 0.468124 * v, luma + 1.8556 * u },
+        .bt601 => .{ luma + 1.402 * v, luma - 0.344136 * u - 0.714136 * v, luma + 1.772 * u },
+    };
+    return @import("tone.zig").render64(values, matrix == .bt2020_ncl, policy);
 }
 // Coefficients are independently quantized from the BT.601/BT.709 matrix
 // and range expansion. Signed shifts deliberately floor each component.
@@ -191,7 +226,7 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
         try control.check();
         for (0..width) |x| {
             const point = sourcePoint(x, y, host.width, host.height, options.rotation);
-            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding));
+            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding, options.tone_mapping));
         }
     }
     return prepareRgb(allocator, bytes, width, height, g, options, control);
@@ -201,6 +236,7 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
 pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_width: u32, source_height: u32, options: Options, control: media.source.Control) ![]f32 {
     try control.check();
     const g = try geometry(source_width, source_height, options);
+    if (options.tone_mapping != .none) return error.UnsupportedVideoColor;
     if (bytes.len != @as(usize, source_width) * source_height * 4) return error.InvalidVideoGeometry;
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
     const width = if (rotated) source_height else source_width;
@@ -317,11 +353,21 @@ pub const Metal = struct {
         self.coefficient_build_bound = 0;
     }
     fn ensureCoefficients(self: *Metal, allocator: std.mem.Allocator, width: u32, height: u32, g: Geometry, options: Options, control: media.source.Control) !usize {
+        const mask = av_preparer_tone_mask(self.handle);
+        const requested: u32 = switch (options.tone_mapping) {
+            .none => 0,
+            .pq_reinhard_100 => 1,
+            .hlg_reinhard_100 => 2,
+        };
+        const color_bytes = @as(usize, @popCount(mask | requested)) * 16385 * 4;
+        if (color_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
+        const color_upload: usize = if (requested != 0 and mask & requested == 0) 16385 * 4 else 0;
         const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
         const key: [5]u32 = .{ if (rotated) height else width, if (rotated) width else height, g.width, g.height, @intFromBool(options.torchvision) };
         if (self.coefficients != null and std.mem.eql(u32, &key, &self.coefficient_key)) {
             if (self.coefficient_build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
-            return 0;
+            if (self.coefficient_bytes > self.coefficient_limit - color_bytes) return error.ResourceLimitExceeded;
+            return color_upload;
         }
         var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4, options.torchvision);
         defer xaxis.deinit();
@@ -329,7 +375,7 @@ pub const Metal = struct {
         defer yaxis.deinit();
         try control.check();
         const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;
-        if (byte_count > self.coefficient_limit) return error.ResourceLimitExceeded;
+        if (byte_count > self.coefficient_limit - color_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
         if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &resident) != 0) return error.MetalPreparationFailed;
         if (self.coefficients) |old| av_coefficients_destroy(old);
@@ -337,7 +383,7 @@ pub const Metal = struct {
         self.coefficient_key = key;
         self.coefficient_bytes = byte_count;
         self.coefficient_build_bound = @max(try Axis.bound(key[0], key[2]), try Axis.bound(key[1], key[3]));
-        return self.coefficient_bytes;
+        return self.coefficient_bytes + color_upload;
     }
     pub fn submit(self: *Metal, allocator: std.mem.Allocator, surface: *const apple.Surface, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
@@ -346,7 +392,7 @@ pub const Metal = struct {
         defer scope.deinit();
         const g = try geometry(surface.width, surface.height, options);
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift() };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping) };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -372,7 +418,7 @@ pub const Metal = struct {
         if (surface.sample_shift > 16 - surface.bit_depth or (surface.bit_depth == 8 and surface.sample_shift != 0)) return error.UnsupportedSurfaceFormat;
         const g = try geometry(surface.width, surface.height, options);
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping) };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
@@ -387,7 +433,7 @@ pub const Metal = struct {
         const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift() };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping) };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
@@ -405,7 +451,7 @@ pub const Metal = struct {
         if (bytes.len != size) return error.InvalidVideoGeometry;
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0 };
+        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0 };
         var out: ?*anyopaque = null;
         if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
@@ -482,7 +528,7 @@ test "video Q13 RGB conversion matches independent reference across matrices ran
     for ([_]Matrix{ .bt601, .bt709 }) |matrix| {
         for ([_]apple.Format{ .nv12_video, .nv12_full }) |format| {
             for (0..16) |row| for (0..16) |col| {
-                const actual = rgb(planes, col, row, format, matrix, 8, 1, .q13_components);
+                const actual = rgb(planes, col, row, format, matrix, 8, 1, .q13_components, .none);
                 try std.testing.expectEqualSlices(u8, expected[offset..][0..3], &actual);
                 offset += 3;
             };

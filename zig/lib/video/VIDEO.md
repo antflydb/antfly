@@ -983,3 +983,57 @@ The rebuilt production CPU and Metal routes pass all six pretrained cases,
 Metal short/long-clip campaigns preserve pinned PyTorch vectors and scores;
 the short corpus preserves all four exact rankings/top-k sets. See the
 [composition and scheduling receipts](testdata/video-retrieval-validation.md#device-composition-and-projection-scheduling-continuation).
+
+## Stateful VP8 and presentation/HDR rendering continuation
+
+`vp8.Session` decodes WebM VP8 packets in coded order, including hidden reference
+pictures. `next()` returns independently owned planar Y/U/V frames; null denotes
+an invisible picture or EOF, distinguishable through `next_index`. Frames can
+outlive the session. The existing `decodeFrame` remains the random-access
+keyframe-only entry point. Both paths are pure Zig and portable to Linux.
+
+The shared VP8 reconstruction now handles ZERO/NEAREST/NEAR/NEW/SPLIT motion,
+all four split layouts, intra blocks in interframes, six-tap/bilinear subpixel
+prediction, residuals, normal/simple filtering, reference refresh/copy/sign bias,
+persistent segmentation maps and entropy state. Versions 0–3 are accepted.
+Reference updates commit transactionally after successful reconstruction and
+retained allocations; malformed input, cancellation and allocation failures leave
+state available for retry. Packet/pixel/workspace limits and shared admission
+cover the session and separately owned outputs. The initial implementation keeps
+independent retained reference copies; reference sharing remains a performance
+optimization, not a decoding dependency.
+
+`testdata/vp8-interframes.json` pins seven independent FFmpeg/libvpx oracles:
+174 displayed pictures and three hidden alt-reference pictures, multiple token
+partitions, keyframe resets, versions 0–3, and a real Sintel excerpt. These are
+qualification examples, not exhaustive codec conformance. Runtime reconstruction
+links no codec libraries. Model WebM ingestion, VP9 and AV1 decoding remain
+unimplemented; `capabilities` exposes those distinctions explicitly.
+
+The EmbeddingGemma 2 model now honors orthogonal rotation and SAR metadata.
+SAR controls model target geometry through one direct separable resize; it does
+not materialize an intermediate square-pixel image. Unsupported transforms and
+conflicting color declarations still fail. The recipe identity advances to
+`embeddinggemma2-f32-mean-v3-display-hdr`, keeping different rendering behavior
+out of the preceding recipe's embedding identity.
+
+PQ/HLG YUV uses an explicit fixed policy: [BT.2100 transfer functions](https://www.itu.int/rec/R-REC-BT.2100),
+D65 BT.2020 NCL or BT.709 primaries, 100-nit exposure, a global luminance
+[Reinhard shoulder](https://www-old.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf),
+and sRGB/RGB8 output. HLG assumes a 1000-nit display, gamma 1.2 and zero black.
+This reproducible inference policy ignores mastering/dynamic HDR metadata.
+The model requires explicit, consistent gamut and transfer declarations and
+rejects HDR-tagged MJPEG. Preparation's CPU path evaluates transfer/quantization
+in f64; Metal caches 16,385-entry f64-generated transfer tables per policy, then
+uses device interpolation, gamut/shoulder conversion and existing resize/packing.
+Resize and color tables share the preparer's admitted coefficient budget.
+
+Independent float64 fixtures cover ten-bit 4:2:0, both ranges, both gamuts and
+both transfers. CPU and actual Metal preserve every RGB8 code; normalized Metal
+patches allow `1e-6` for fused float32 arithmetic. Tests also cover table reuse,
+admission denial and in-flight output surviving preparer destruction. Positive
+pretrained qualification scripts and full PyTorch CPU/MPS vectors are in
+`tools/embeddinggemma2/testdata/render`. They explicitly extend the pinned
+processor's presentation policy. Qualification remains bounded to these inputs;
+hardware HDR import, all depths/chroma formats and real-world HDR scenes require
+additional evidence. Earlier dated receipts continue to qualify their own binaries.

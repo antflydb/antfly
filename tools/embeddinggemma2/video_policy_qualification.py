@@ -14,12 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qualify model VFR sampling and display rejection using a pinned pixel oracle.
+"""Qualify VFR sampling and display rendering with pinned independent oracles.
 
-Retiming preserves every compressed frame, frame count and total duration. HF's
-pinned average-FPS index sampler therefore selects the same frames and the
-pretrained oracle remains independent. This does not qualify timestamp sampling,
-rotation/SAR rendering, HDR tone mapping or field-picture model inputs.
+Retiming preserves coded frames and the average-FPS sample indexes. Rotation and
+SAR use separate positive pretrained references for the version-3 rendering
+policy. PQ-tagged MJPEG remains rejected because its RGB decoder is SDR-only.
 """
 
 import argparse
@@ -133,10 +132,10 @@ def variants(encoded):
 
     return {
         "vfr_average_fps": (rewrite(encoded, b"stts", retime), None),
-        "rotation_90": (rewrite(encoded, b"tkhd", rotate), "UnsupportedVideoDisplay"),
+        "rotation_90": (rewrite(encoded, b"tkhd", rotate), None),
         "non_square_pixels": (
             rewrite(encoded, b"stsd", lambda p: sample_entry(p, aspect=True)),
-            "UnsupportedVideoDisplay",
+            None,
         ),
         "pq_hdr": (
             rewrite(encoded, b"stsd", lambda p: sample_entry(p, hdr=True)),
@@ -157,11 +156,19 @@ def run(args):
     expected = next(c for c in oracle["cases"] if c["name"] == "mjpeg_video")
     if expected["selected_frames"] != [[0, 4]]:
         raise ValueError("pinned sample indexes changed")
+    rendering = json.loads(args.render_oracle.read_text())
+    if (
+        rendering.get("status") != "pass"
+        or rendering.get("recipe") != "embeddinggemma2-f32-mean-v3-display-hdr"
+        or rendering.get("revision") != reference.REVISION
+    ):
+        raise ValueError("unqualified display rendering oracle")
     report = dict(
         status="running",
         backend=args.backend,
         binary_sha256=reference.sha256(args.binary),
         oracle_sha256=reference.sha256(args.oracle),
+        render_oracle_sha256=reference.sha256(args.render_oracle),
         source_sha256=asset["sha256"],
         platform=video_compare.conditions(),
         cases={},
@@ -204,10 +211,24 @@ def run(args):
                         raise AssertionError(
                             f"unqualified display input accepted: {name}"
                         )
-                    row["agreement"] = compare.assert_agreement(
-                        response["data"][0]["embedding"], expected["embedding"]
+                    display_case = {
+                        "rotation_90": "rotation_90",
+                        "non_square_pixels": "sar_2_1",
+                    }.get(name)
+                    positive = (
+                        rendering["cases"][display_case] if display_case else expected
                     )
-                    if response["usage"]["prompt_tokens"] != len(expected["token_ids"]):
+                    if display_case and positive["sha256"] != row["sha256"]:
+                        raise ValueError("display rendering fixture changed")
+                    row["agreement"] = compare.assert_agreement(
+                        response["data"][0]["embedding"], positive["embedding"]
+                    )
+                    prompt_tokens = (
+                        positive["prompt_tokens"]
+                        if display_case
+                        else len(expected["token_ids"])
+                    )
+                    if response["usage"]["prompt_tokens"] != prompt_tokens:
                         raise AssertionError("VFR sampling changed model token count")
                     row["sampled_frame_indexes"] = [0, 4]
                 report["cases"][name] = row
@@ -233,6 +254,11 @@ def main():
         "--oracle",
         type=Path,
         default=Path(__file__).parent / "testdata/video/video-oracle.json",
+    )
+    parser.add_argument(
+        "--render-oracle",
+        type=Path,
+        default=Path(__file__).parent / "testdata/render/pytorch-cpu.json",
     )
     run(parser.parse_args())
 

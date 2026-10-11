@@ -62,31 +62,44 @@ fn policy(track: media.mp4.Track, width: u32, height: u32) !video.preparation.Op
     return policySignal(track, width, height, .{});
 }
 fn policySignal(track: media.mp4.Track, width: u32, height: u32, signal: video.h264.Color) !video.preparation.Options {
-    const identity = [9]i32{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 };
-    if (!std.mem.eql(i32, &track.display_matrix, &identity) or track.pixel_aspect.horizontal != track.pixel_aspect.vertical) return error.UnsupportedVideoDisplay;
-    if (signal.transfer) |transfer| if (transfer != 1 and transfer != 2 and transfer != 6 and transfer != 13) return error.UnsupportedVideoColor;
-    var matrix: video.preparation.Matrix = if (signal.matrix) |value| switch (value) {
-        1 => .bt709,
-        5, 6 => .bt601,
-        else => return error.UnsupportedVideoColor,
-    } else .bt601;
+    const display = try video.display.layout(track, width, height, .presentation);
+    var transfer: u16 = signal.transfer orelse 2;
+    var declared_matrix: u16 = signal.matrix orelse 6;
+    var primaries: u16 = signal.primaries orelse 2;
     if (track.color_info.len != 0) {
         const c = track.color_info;
         if (c.len < 10 or (!std.mem.eql(u8, c[0..4], "nclx") and !std.mem.eql(u8, c[0..4], "nclc"))) return error.UnsupportedVideoColor;
         if (std.mem.eql(u8, c[0..4], "nclx") and c.len < 11) return error.UnsupportedVideoColor;
-        const transfer = std.mem.readInt(u16, c[6..8], .big);
-        if (transfer != 1 and transfer != 2 and transfer != 6 and transfer != 13) return error.UnsupportedVideoColor;
-        const declared = std.mem.readInt(u16, c[8..10], .big);
-        if (signal.matrix) |value| if (declared != 2 and value != declared) return error.UnsupportedVideoColor;
-        matrix = switch (declared) {
-            2 => matrix,
-            1 => .bt709,
-            5, 6 => .bt601,
-            else => return error.UnsupportedVideoColor,
-        };
+        const container_primaries = std.mem.readInt(u16, c[4..6], .big);
+        const container_transfer = std.mem.readInt(u16, c[6..8], .big);
+        const container_matrix = std.mem.readInt(u16, c[8..10], .big);
+        if (signal.primaries) |value| if (container_primaries != 2 and value != container_primaries) return error.UnsupportedVideoColor;
+        if (signal.transfer) |value| if (container_transfer != 2 and value != container_transfer) return error.UnsupportedVideoColor;
+        if (signal.matrix) |value| if (container_matrix != 2 and value != container_matrix) return error.UnsupportedVideoColor;
+        if (container_primaries != 2) primaries = container_primaries;
+        if (container_transfer != 2) transfer = container_transfer;
+        if (container_matrix != 2) declared_matrix = container_matrix;
     }
-    const g = projector.embeddingGemma2VideoGeometry(width, height);
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .torchvision = true, .rgb_rounding = .q13_components };
+    const matrix: video.preparation.Matrix = switch (declared_matrix) {
+        1 => .bt709,
+        5, 6 => .bt601,
+        9 => .bt2020_ncl,
+        else => return error.UnsupportedVideoColor,
+    };
+    const tone: video.preparation.ToneMapping = switch (transfer) {
+        1, 2, 6, 13 => .none,
+        16 => .pq_reinhard_100,
+        18 => .hlg_reinhard_100,
+        else => return error.UnsupportedVideoColor,
+    };
+    if (tone != .none) {
+        // Require explicit consistent primaries; never guess an HDR gamut.
+        if (track.codec != .avc or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
+    } else if (matrix == .bt2020_ncl or (primaries != 2 and primaries != 1 and primaries != 5 and primaries != 6)) return error.UnsupportedVideoColor;
+    const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
+    // Apply SAR through target aspect; a single separable resample avoids an
+    // intermediate stretched raster and its additional RGB8 rounding.
+    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = .q13_components };
 }
 
 // Model sampling assumes one progressive access-unit picture per MP4 sample.
@@ -118,7 +131,8 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     var source = media.source.Source{ .allocator = std.heap.page_allocator, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     var reader = try media.mp4.Reader.init(std.heap.page_allocator, &source, .{});
     defer reader.deinit();
-    _ = try policy(reader.track, reader.track.width, reader.track.height);
+    // AVC combines VUI and container declarations in parameterSession below.
+    if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
     const selected = try select(std.heap.page_allocator, &reader);
     defer std.heap.page_allocator.free(selected);
     const configurations = try parameterSession(std.heap.page_allocator, &reader);
@@ -528,7 +542,7 @@ test "embeddinggemma2 video sampling maps presentation order and uniform long cl
     try std.testing.expect(g.tokens <= 140 and g.width % 48 == 0 and g.height % 48 == 0);
     _ = try policy(reader.track, 1920, 1080);
     synthetic.track.pixel_aspect.horizontal = 2;
-    try std.testing.expectError(error.UnsupportedVideoDisplay, policy(synthetic.track, 1920, 1080));
+    _ = try policy(synthetic.track, 1920, 1080);
     try std.testing.expectError(error.Timeout, encode(a, undefined, "x", .{ .deadline_ns = 0 }));
 }
 
@@ -584,15 +598,34 @@ test "embeddinggemma2 model VFR qualification preserves pinned average FPS indic
         defer vfr_packet.deinit();
         try std.testing.expectEqualSlices(u8, cfr_packet.bytes, vfr_packet.bytes);
     }
-    // Rendering helpers exist in lib/video, but the pretrained model recipe
-    // rejects metadata that has no independent orientation/HDR oracle yet.
+    // Orthogonal display metadata now drives rotation and model target aspect.
     var track = vfr.track;
     track.display_matrix = .{ 0, 65536, 0, -65536, 0, 0, 0, 0, 1073741824 };
-    try std.testing.expectError(error.UnsupportedVideoDisplay, policy(track, 640, 480));
+    try std.testing.expectEqual(video.preparation.Rotation.clockwise90, (try policy(track, 640, 480)).rotation);
     track = vfr.track;
     track.pixel_aspect = .{ .horizontal = 2, .vertical = 1 };
-    try std.testing.expectError(error.UnsupportedVideoDisplay, policy(track, 640, 480));
+    const aspect = try policy(track, 640, 480);
+    try std.testing.expect(aspect.width > aspect.height * 2);
     track = vfr.track;
     track.color_info = "nclx\x00\x01\x00\x10\x00\x06\x80";
+    try std.testing.expectError(error.UnsupportedVideoColor, policy(track, 640, 480));
+}
+
+test "embeddinggemma2 video HDR rendering requires consistent gamut and transfer" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/mjpeg.mov") }, .identity = "HDR policy" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var track = reader.track;
+    track.codec = .avc;
+    track.color_info = "nclx\x00\x09\x00\x10\x00\x09\x00";
+    const pq = try policySignal(track, 640, 480, .{ .matrix = 9, .transfer = 16, .primaries = 9 });
+    try std.testing.expectEqual(video.preparation.Matrix.bt2020_ncl, pq.matrix);
+    try std.testing.expectEqual(video.preparation.ToneMapping.pq_reinhard_100, pq.tone_mapping);
+    try std.testing.expectError(error.UnsupportedVideoColor, policySignal(track, 640, 480, .{ .transfer = 18 }));
+    try std.testing.expectError(error.UnsupportedVideoColor, policySignal(track, 640, 480, .{ .primaries = 1 }));
+    track.color_info = "nclx\x00\x09\x00\x12\x00\x09\x00";
+    try std.testing.expectEqual(video.preparation.ToneMapping.hlg_reinhard_100, (try policy(track, 640, 480)).tone_mapping);
+    track.color_info = "nclx\x00\x02\x00\x10\x00\x09\x00";
     try std.testing.expectError(error.UnsupportedVideoColor, policy(track, 640, 480));
 }
