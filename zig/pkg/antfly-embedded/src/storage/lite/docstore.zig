@@ -3017,7 +3017,11 @@ pub const Txn = struct {
         }
 
         pub fn preparedScorePlan(self: *@This()) ?*@import("../prepared_score_plan.zig").PreparedScorePlan {
-            return if (self.workspace) |w| &w.score_plan else null;
+            const w = self.workspace orelse return null;
+            // The exposed plan may supply keys to legacy visitors too. Protect
+            // it for the entire lease, including allocations between reads.
+            w.score_plan_borrowed = true;
+            return &w.score_plan;
         }
 
         pub fn preparedScoreAllocator(self: *@This()) Allocator {
@@ -3111,9 +3115,6 @@ pub const Txn = struct {
         pub fn visitPreparedRequest(self: *@This(), request: *const @import("../prepared_score_request.zig").PreparedScoreRequest, sink: backend_types.CompleteScoreSink) !void {
             if (!request.plan().valid) return error.InvalidBatch;
             if (request.plan().read_keys.len == 0) return;
-            if (self.workspace) |w| if (w.score_plan.storage != null) {
-                w.score_plan.deinit();
-            };
             const previous_failure = if (self.workspace) |w| w.allocation_failed else false;
             self.readPreparedScores(request.plan(), sink) catch |err| {
                 if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
@@ -3300,6 +3301,7 @@ pub const Txn = struct {
                 self.workingAllocator().destroy(state);
             }
             if (self.workspace) |w| {
+                w.score_plan_borrowed = false;
                 if (self.discard_workspace) w.discardRetainedStorage();
                 self.parent.store.?.returnWorkspace(w);
             }
@@ -7659,7 +7661,7 @@ test "lite prepared one store reclaim frees physical workspace" {
     metadata.free(node);
     const w = try ReadWorkspace.create(store.allocator, &manager);
     w.score_plan.backing = w.allocator();
-    w.score_plan.storage = try w.allocator().alloc(u8, 32 * 1024);
+    w.score_plan.storage = try w.allocator().alignedAlloc(u8, .of(usize), 32 * 1024);
     store.workspaces[0] = w;
     _ = backing.releaseUnusedCreditThreadSafe();
     const before = manager.snapshot().memory.used_bytes;
@@ -8664,6 +8666,7 @@ test "lite prepared production metric sessions reuse owned inputs and recover op
     prefixes[0] = try alloc.dupe(u8, "p/");
     var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openRead(&store)), .statuses = statuses, .prefixes = prefixes };
     defer session.deinit();
+    if (comptime @hasDecl(Graph.GraphMetricReadSession, "enablePreparedReuse")) session.enablePreparedReuse();
     var node = [_]u8{'a'};
     var column: [1]?f64 = undefined;
     try session.readColumns(alloc, &.{"metric"}, &.{&node}, &.{&column});
@@ -8800,6 +8803,7 @@ test "lite prepared production metric session measurement" {
     prefixes[0] = try alloc.dupe(u8, "");
     var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openReadWithPrefix(&store, "ns\x00")), .statuses = statuses, .prefixes = prefixes };
     defer session.deinit();
+    if (comptime @hasDecl(Graph.GraphMetricReadSession, "enablePreparedReuse")) session.enablePreparedReuse();
     var column: [512]?f64 = undefined;
     for (0..10) |_| try session.readColumns(alloc, &.{"metric"}, &nodes, &.{&column});
     const before = counter.alloc_calls;
@@ -8979,4 +8983,104 @@ test "lite prepared virtual namespaces preserve overflow keys and pinned snapsho
     try std.testing.expectEqual(@as(?f64, 9), column[0]);
     _ = try @import("../../graph/score_read.zig").populatePrepared(a, &old, &request, &.{&column});
     try std.testing.expectEqual(@as(?f64, 3), column[0]);
+}
+
+test "lite prepared first capture and explicit promotion keep subsequent sessions warm" {
+    const a = std.testing.allocator;
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-owned-session.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    try store.file.putDocument("p/a\x00\x00", &score);
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocument("p/b\x00\x00", &score);
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var column: [1]?f64 = undefined;
+    const file = &store.file;
+    for ([_]bool{ false, true, false }) |enabled| {
+        const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+        statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+        const prefixes = try alloc.alloc(?[]const u8, 1);
+        prefixes[0] = try alloc.dupe(u8, "p/");
+        var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openRead(&store)), .statuses = statuses, .prefixes = prefixes };
+        defer session.deinit();
+        if (enabled) session.enablePreparedReuse();
+        try session.readColumns(alloc, &.{"metric"}, &.{"a"}, &.{&column});
+        const w = store.workspaces[0].?;
+        try std.testing.expect(w.resolved_scores.decoded_ready);
+        const identity = w.score_plan.identity;
+        const before = file.test_index_comparisons.load(.monotonic);
+        for (0..4) |_| try session.readColumns(alloc, &.{"metric"}, &.{"a"}, &.{&column});
+        try std.testing.expectEqual(before, file.test_index_comparisons.load(.monotonic));
+        try std.testing.expectEqual(enabled, session.prepared_request != null);
+        try std.testing.expectEqual(identity, w.score_plan.identity);
+        if (session.prepared_request) |request| try std.testing.expectEqual(identity, request.plan().identity);
+        try std.testing.expectEqual(@as(?f64, 3), column[0]);
+    }
+}
+
+test "lite prepared short sessions promotion measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "production-measure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var column: [512]?f64 = undefined;
+    for ([_]usize{ 2, 3, 5, 8, 32 }) |reads| {
+        for ([_]u8{ 0, 1, 2 }) |mode| {
+            var warm = try Txn.openReadWithPrefix(&store, "ns\x00");
+            for (0..3) |_| _ = try @import("../../graph/score_read.zig").populate(alloc, &warm, &.{""}, &nodes, &.{&column});
+            warm.abort();
+            const before = counter.alloc_calls;
+            const started = std.posix.getrusage(0);
+            for (0..200) |_| {
+                const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+                statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+                const prefixes = try alloc.alloc(?[]const u8, 1);
+                prefixes[0] = try alloc.dupe(u8, "");
+                var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openReadWithPrefix(&store, "ns\x00")), .statuses = statuses, .prefixes = prefixes };
+                defer session.deinit();
+                if (mode == 2) {
+                    if (comptime @hasDecl(Graph.GraphMetricReadSession, "enablePreparedReuse")) session.enablePreparedReuse();
+                }
+
+                for (0..reads) |_| {
+                    if (mode == 0) session.last_plan_identity = 0;
+                    try session.readColumns(alloc, &.{"metric"}, &nodes, &.{&column});
+                }
+                for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const ended = std.posix.getrusage(0);
+            const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+            std.debug.print("SHORT_SESSIONS reads={d} mode={d} cpu_us={d} allocations={d}\n", .{ reads, mode, cpu, counter.alloc_calls - before });
+        }
+    }
 }

@@ -24,6 +24,24 @@ pub const Stats = struct { keys: usize = 0, batches: usize = 0, plan_identity: u
 
 pub const PreparedRequest = @import("../storage/prepared_score_request.zig").PreparedScoreRequest;
 
+/// Explicit callers declare repeated work. Clone a matching exclusively leased
+/// canonical plan, retaining its identity without rebuilding or sorting keys.
+pub fn prepareRequestForReuse(alloc: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8) !PreparedRequest {
+    if (comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope")) {
+        var scope = txn.openReadScope(alloc) catch |err| switch (@as(anyerror, err)) {
+            error.ReadOnly, error.Unsupported => return PreparedRequest.init(alloc, prefixes, nodes),
+            else => return err,
+        };
+        defer scope.close();
+        if (comptime @hasDecl(@TypeOf(scope), "preparedScorePlan")) {
+            if (scope.preparedScorePlan()) |plan| {
+                if (plan.matches(prefixes, nodes)) return PreparedRequest.fromPlan(alloc, plan);
+            }
+        }
+    }
+    return PreparedRequest.init(alloc, prefixes, nodes);
+}
+
 /// Reuse explicitly owned input identity. Resolve freshness before selecting
 /// the request: its physical generation prefixes do not track policy changes.
 /// Existing mutable-input callers keep populate(); unsupported backends retain

@@ -1189,9 +1189,9 @@ pub const ResolvedScoreBatch = struct {
             owned.canonical == identity.canonical and std.mem.eql(u8, owned.namespace, identity.namespace);
     }
 
-    // Prepared identities uniquely prove canonical key ownership. Offset and
-    // key copies are unnecessary once these scores are ready. Stage only this
-    // bounded array after required reads; the next read fills it opportunistically.
+    // Prepared identities prove canonical key ownership. Offset/key copies are
+    // unnecessary. Capture is optional after reference resolution and can be
+    // dropped to preserve required-read admission.
     fn rememberPrepared(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, identity: ReadIdentity, count: usize) bool {
         self.deinit(a);
         if (count > 4096) return false;
@@ -6152,7 +6152,7 @@ pub const NativeFile = struct {
 
     /// Reuse bounded native working storage independently of the result arena.
     pub fn getDocumentsAtCheckpointWithState(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null);
+        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
     }
 
     /// Fixed-width scores are decoded while the authenticated record is borrowed.
@@ -6172,12 +6172,12 @@ pub const NativeFile = struct {
     }
 
     pub fn visitScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, sink: ScoreSink, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?ScoreSink, sink), state, null);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?ScoreSink, sink), state, null, true);
     }
 
     /// Arbitrary complete batches retain sorted-input validation.
     pub fn visitCompleteScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?CompleteScoreSink, sink), state, null);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, keys, null, &.{}, @as(?CompleteScoreSink, sink), state, null, true);
     }
 
     /// Canonical keys come from the owned plan; no caller-supplied validation
@@ -6203,10 +6203,30 @@ pub const NativeFile = struct {
                 return;
             }
         };
-        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity);
+        return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, plan.read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity, true);
     }
 
-    fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: anytype, state: *DocumentBatchReadState, prepared: ?ReadIdentity) !void {
+    // Keep record and external-score reads inside the same recovery boundary.
+    // Optional capture must be discardable before retrying either allocation.
+    inline fn readBatchRecord(self: *NativeFile, state: *DocumentBatchReadState, optional: Allocator, checkpoint: CheckpointSlot, reference: u64, ahead: usize, namespace: []const u8, key: []const u8, comptime wants_score: bool) !struct { entry: DocumentEntry, score: if (wants_score) ?f64 else void } {
+        const bytes = try state.reader.readWithWindowAllocators(true, &state.window, self, state.allocator.?, optional, checkpoint, reference, .document, ahead);
+        const entry = try decodeDocumentEntry(bytes);
+        if (readKeyOrder(entry.key, PrefixedReadKey{ .prefix = namespace, .key = key }) != .eq) return error.InvalidDocumentIndex;
+        if (wants_score) {
+            if (entry.is_delete) return .{ .entry = entry, .score = null };
+            const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            if (length != 8) return error.InvalidGraphMetricScore;
+            var raw: [8]u8 = undefined;
+            const score_bytes = if (entry.external_value_root_page != 0) blk: {
+                try self.readValuePagesRangeInto(entry.external_value_root_page, 8, 0, &raw, checkpoint);
+                break :blk &raw;
+            } else entry.value;
+            return .{ .entry = entry, .score = try decodeScore(score_bytes) };
+        }
+        return .{ .entry = entry, .score = {} };
+    }
+
+    fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: anytype, state: *DocumentBatchReadState, prepared: ?ReadIdentity, comptime score_reads: bool) !void {
         const complete = comptime @TypeOf(scores) == ?CompleteScoreSink;
         const namespace = if (prepared) |identity| identity.namespace else "";
         state.prepare(self);
@@ -6272,11 +6292,17 @@ pub const NativeFile = struct {
         defer if (!cached) {
             if (order) |positions| temporary.free(positions);
         };
-        // Fill only previously staged storage. Borrow after required reference
-        // resolution, which can evict it. Cold reads never reserve a capture
-        // buffer; even opaque allocators can discard staging before a retry.
+        // Resolve required references first, then attempt bounded optional
+        // capture. Record and external-value growth can evict it and resume the
+        // failed position using these independently owned offsets, without replay.
+        if (!cached and scores != null and prepared != null and use_cache and state.binding != null and state.resolved != null) {
+            const resolved = state.resolved.?;
+            if (!resolved.matchesPrepared(state.binding.?, checkpoint, prepared.?, keys.len)) {
+                _ = resolved.rememberPrepared(state.allocator.?, state.binding.?, checkpoint, prepared.?, keys.len);
+            }
+        }
         var capture = scores != null and state.resolved != null and state.resolved.?.decoded.len == keys.len and
-            (cached or (staged and state.resolved.?.matchesPrepared(state.binding.?, checkpoint, prepared.?, keys.len)));
+            (cached or (prepared != null and state.binding != null and use_cache and state.resolved.?.matchesPrepared(state.binding.?, checkpoint, prepared.?, keys.len)));
         if (state.resolved) |resolved| resolved.borrowed = cached or capture;
         errdefer if (scores != null) if (state.resolved) |resolved| {
             resolved.decoded_ready = false;
@@ -6304,7 +6330,7 @@ pub const NativeFile = struct {
                 continue;
             }
             const ahead = if (reader.page_id == physicalPage(reference) or window.contains(self, physicalPage(reference))) 1 else recordRunAhead(references, order, position);
-            const bytes = reader.readWithWindowAllocators(true, window, self, state.allocator.?, optional_allocator, checkpoint, reference, .document, ahead) catch |err| {
+            const record = self.readBatchRecord(state, optional_allocator, checkpoint, reference, ahead, namespace, keys[i], score_reads) catch |err| {
                 if ((!cached and !capture) or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
                 // No borrowed offsets survive their eviction. Resolve again at
                 // this same pinned checkpoint and resume the failed position;
@@ -6333,8 +6359,7 @@ pub const NativeFile = struct {
                 recovered = true;
                 continue;
             };
-            const entry = try decodeDocumentEntry(bytes);
-            if (readKeyOrder(entry.key, PrefixedReadKey{ .prefix = namespace, .key = keys[i] }) != .eq) return error.InvalidDocumentIndex;
+            const entry = record.entry;
             if (entry.is_delete) {
                 if (capture) {
                     state.resolved.?.decoded[i] = std.math.nan(f64);
@@ -6344,15 +6369,9 @@ pub const NativeFile = struct {
                 position += 1;
                 continue;
             }
-            if (scores) |out| {
-                const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
-                if (length != 8) return error.InvalidGraphMetricScore;
-                var raw: [8]u8 = undefined;
-                const bytes_score = if (entry.external_value_root_page != 0) blk: {
-                    try self.readValuePagesRangeInto(entry.external_value_root_page, 8, 0, &raw, checkpoint);
-                    break :blk &raw;
-                } else entry.value;
-                const score = try decodeScore(bytes_score);
+            if (comptime score_reads) {
+                const out = scores.?;
+                const score = record.score.?;
                 if (capture) {
                     state.resolved.?.decoded[i] = score;
                     captured += 1;
@@ -17906,4 +17925,42 @@ test "lite prefixed key comparisons match materialized byte order" {
         for (samples) |indexed| try std.testing.expectEqual(std.mem.order(u8, indexed, joined), wanted.order(indexed));
         for (0..joined.len + 1) |cut| try std.testing.expectEqual(std.mem.order(u8, joined[0..cut], joined), wanted.order(joined[0..cut]));
     };
+}
+
+test "lite decoded first prepared capture preserves opaque reader memory floor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "first-capture-budget.aflite");
+    defer a.free(path);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].soft_limit_bytes = 1;
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)].hard_limit_bytes = 1;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+    defer file.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    try file.putDocument("a\x00\x00", &raw);
+    var request = try @import("../../graph/score_read.zig").PreparedRequest.init(a, &.{""}, &.{"a"});
+    defer request.deinit();
+    var backing = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
+    var resolved = ResolvedScoreBatch{};
+    var state = DocumentBatchReadState{ .allocator = backing.allocator(), .resolved = &resolved, .binding = .{ .owner = 1, .generation = 1 } };
+    defer state.deinit();
+    const Output = struct {
+        count: usize = 0,
+        value: ?f64 = null,
+        fn write(ctx: *anyopaque, _: usize, value: ?f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.value = value;
+        }
+    };
+    var output = Output{};
+    try file.visitPreparedScoresAtCheckpointWithState(a, file.activeCheckpoint(), request.plan(), "", .{ .context = &output, .write = Output.write }, &state);
+    try std.testing.expectEqual(@as(usize, 1), output.count);
+    try std.testing.expectEqual(@as(?f64, 3), output.value);
+    try std.testing.expect(resolved.recovered_optional_failure);
 }

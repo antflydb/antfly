@@ -20072,7 +20072,14 @@ pub const GraphIndex = struct {
         // Promote only after this session repeats the same canonical plan.
         // Shared workspace hits alone do not prove session-local reuse.
         last_plan_identity: u64 = 0,
+        prepared_reuse_enabled: bool = false,
         prepared_request: ?score_read.PreparedRequest = null,
+
+        /// Opt in only when the caller knows this session will repeat reads.
+        /// Ordinary staged and short-lived sessions keep the warmed mutable plan.
+        pub fn enablePreparedReuse(self: *@This()) void {
+            self.prepared_reuse_enabled = true;
+        }
 
         pub fn deinit(self: *@This()) void {
             if (self.prepared_request) |*request| request.deinit();
@@ -20126,8 +20133,8 @@ pub const GraphIndex = struct {
             self.reads.batches += read_stats.batches;
             const repeated = read_stats.plan_identity != 0 and self.last_plan_identity == read_stats.plan_identity;
             self.last_plan_identity = read_stats.plan_identity;
-            if (repeated) {
-                self.prepared_request = score_read.PreparedRequest.init(self.alloc, prefixes, nodes) catch |err| switch (@as(anyerror, err)) {
+            if (self.prepared_reuse_enabled and repeated) {
+                self.prepared_request = score_read.prepareRequestForReuse(self.alloc, &self.txn, prefixes, nodes) catch |err| switch (@as(anyerror, err)) {
                     error.OutOfMemory, error.ResourceBudgetExceeded, error.GraphMetricQueryBudgetExceeded => null,
                     else => return err,
                 };

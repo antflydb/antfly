@@ -36,7 +36,7 @@ pub const PreparedScorePlan = struct {
         }
     };
     backing: ?std.mem.Allocator = null,
-    storage: ?[]u8 = null,
+    storage: ?[]align(@alignOf(usize)) u8 = null,
     nodes: []const []const u8 = &.{},
     prefixes: []const ?[]const u8 = &.{},
     read_keys: []const []const u8 = &.{},
@@ -65,6 +65,45 @@ pub const PreparedScorePlan = struct {
         self.* = .{};
     }
 
+    /// Deep, independently owned snapshot of a valid plan. Canonical bytes and
+    /// their identity are unchanged; all descriptors and mappings are relocated.
+    /// Storage alignment is explicit so offsets remain valid on any allocator.
+    pub fn clone(self: *const @This(), a: std.mem.Allocator) !@This() {
+        if (!self.valid or self.identity == 0) return error.InvalidBatch;
+        const old = self.storage orelse return error.InvalidBatch;
+        const storage = try a.alignedAlloc(u8, .of(usize), old.len);
+        @memcpy(storage, old);
+        var copy = self.*;
+        copy.backing = a;
+        copy.storage = storage;
+        const nodes = relocate([]const u8, self.nodes, old, storage);
+        for (nodes) |*node| node.* = relocate(u8, node.*, old, storage);
+        copy.nodes = nodes;
+        const prefixes = relocate(?[]const u8, self.prefixes, old, storage);
+        for (prefixes) |*prefix| if (prefix.*) |value| {
+            prefix.* = relocate(u8, value, old, storage);
+        };
+        copy.prefixes = prefixes;
+        const keys_copy = relocate([]const u8, self.read_keys, old, storage);
+        for (keys_copy) |*key| key.* = relocate(u8, key.*, old, storage);
+        copy.read_keys = keys_copy;
+        copy.targets = relocate(Target, self.targets, old, storage);
+        copy.ends = relocate(usize, self.ends, old, storage);
+        inline for (.{ "row_remap", "row_identity", "row_heads", "row_cursors", "duplicate_next", "column_remap", "column_identity", "column_consumed" }) |field| {
+            @field(copy, field) = relocate(u16, @field(self, field), old, storage);
+        }
+        copy.column_sorted = relocate(usize, self.column_sorted, old, storage);
+        return copy;
+    }
+
+    fn relocate(comptime T: type, values: []const T, old: []const u8, storage: []u8) []T {
+        if (values.len == 0) return &.{};
+        const offset = @intFromPtr(values.ptr) - @intFromPtr(old.ptr);
+        std.debug.assert(offset <= old.len and values.len * @sizeOf(T) <= old.len - offset);
+        const ptr: [*]T = @ptrCast(@alignCast(storage.ptr + offset));
+        return ptr[0..values.len];
+    }
+
     pub fn prepare(self: *@This(), backing: std.mem.Allocator, prefixes: []const ?[]const u8, nodes: []const []const u8) !bool {
         if (self.matches(prefixes, nodes)) return true;
         if (self.reusePermutation(prefixes, nodes)) return true;
@@ -78,7 +117,7 @@ pub const PreparedScorePlan = struct {
             self.deinit();
             self.backing = backing;
             const capacity = @min(max_bytes, std.math.ceilPowerOfTwo(usize, estimate) catch max_bytes);
-            self.storage = try backing.alloc(u8, capacity);
+            self.storage = try backing.alignedAlloc(u8, .of(usize), capacity);
         }
         self.valid = false;
         var buffer = std.heap.FixedBufferAllocator.init(self.storage.?);
@@ -623,4 +662,36 @@ test "prepared score dense columns preserve missing scores null columns and rema
     try std.testing.expect(!plan.dense_columns);
     try std.testing.expect(try plan.prepare(std.testing.allocator, &prefixes, &.{ "a", "a" }));
     try std.testing.expect(!plan.dense_columns);
+}
+
+test "prepared score plan clone owns remapped descriptors and preserves canonical identity" {
+    const a = std.testing.allocator;
+    var source = PreparedScorePlan{};
+    defer source.deinit();
+    const prefixes = [_]?[]const u8{ "p/", null, "p/", "q/" };
+    const reordered = [_]?[]const u8{ "q/", "p/", null, "p/" };
+    const nodes = [_][]const u8{ "", "a\x00", "b", "a\x00" };
+    const permuted = [_][]const u8{ "b", "a\x00", "", "a\x00" };
+    try std.testing.expect(try source.prepare(a, &prefixes, &nodes));
+    try std.testing.expect(try source.prepare(a, &reordered, &permuted));
+    var copy = try source.clone(a);
+    defer copy.deinit();
+    try std.testing.expectEqual(source.identity, copy.identity);
+    var expected: [4][4]?f64 = @splat(@splat(null));
+    var actual: [4][4]?f64 = @splat(@splat(null));
+    var output = PreparedScorePlan.Output{ .plan = &source, .columns = &.{ &expected[0], &expected[1], &expected[2], &expected[3] } };
+    var values: [6]f64 = undefined;
+    for (&values, 0..) |*value, i| value.* = if (i == 2) std.math.nan(f64) else @floatFromInt(i);
+    output.completeSink().deliverDecoded(&values);
+    source.deinit();
+    try std.testing.expect(copy.matches(&reordered, &permuted));
+    var cloned = PreparedScorePlan.Output{ .plan = &copy, .columns = &.{ &actual[0], &actual[1], &actual[2], &actual[3] } };
+    cloned.completeSink().deliverDecoded(&values);
+    for (expected, actual) |first, second| try std.testing.expectEqualSlices(?f64, &first, &second);
+    // Rebuild the original and mutate the independent copy's mapping.
+    try std.testing.expect(try source.prepare(a, &.{"other"}, &.{"different"}));
+    try std.testing.expect(source.identity != copy.identity);
+    const identity = copy.identity;
+    try std.testing.expect(try copy.prepare(a, &prefixes, &nodes));
+    try std.testing.expectEqual(identity, copy.identity);
 }

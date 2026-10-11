@@ -32,6 +32,14 @@ pub const PreparedScoreRequest = struct {
         if (!try state.plan.prepare(allocator, prefixes, nodes)) return error.GraphMetricQueryBudgetExceeded;
         return .{ .handle = state };
     }
+    /// Clone while the source scope is exclusively leased. Independent lifetime
+    /// ownership preserves its canonical identity and any validated score cache.
+    pub fn fromPlan(allocator: std.mem.Allocator, source: *const Plan) !PreparedScoreRequest {
+        const state = try allocator.create(State);
+        errdefer allocator.destroy(state);
+        state.* = .{ .allocator = allocator, .plan = try source.clone(allocator) };
+        return .{ .handle = state };
+    }
     pub fn plan(self: *const PreparedScoreRequest) *const Plan {
         return &self.handle.plan;
     }
@@ -66,4 +74,18 @@ fn allocationFailureCase(a: std.mem.Allocator) !void {
 
 test "prepared score request allocation failures release ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureCase, .{});
+}
+
+fn cloneFailureCase(a: std.mem.Allocator, source: *const Plan) !void {
+    var request = try PreparedScoreRequest.fromPlan(a, source);
+    defer request.deinit();
+    try std.testing.expectEqual(source.identity, request.plan().identity);
+}
+
+test "prepared score request cloning allocation failures retain source ownership" {
+    var source = Plan{};
+    defer source.deinit();
+    try std.testing.expect(try source.prepare(std.testing.allocator, &.{ "", null, "p/" }, &.{ "", "a", "a" }));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cloneFailureCase, .{&source});
+    try std.testing.expect(source.matches(&.{ "", null, "p/" }, &.{ "", "a", "a" }));
 }
