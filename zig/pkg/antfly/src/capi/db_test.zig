@@ -1327,6 +1327,26 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(try outcome.value.receipt.?.digest(), try recovered.value.?.receipt.?.digest());
         request.manifest = .fromSlice(candidate.inputs.bytes);
     }
+    // Prime a real private claim/inventory pair through the kernel primitive.
+    // This is fixture setup, not evidence of a mounted authenticated producer.
+    {
+        const claims = local.storage_db_relational_index_owner_job.private_claims;
+        var prepared_claims = blk: {
+            var read = try handle.db.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try claims.Prepared.init(a, &read, binding, &.{.{
+                .tuple = "compiled-owner-claim",
+                .parent_table = "items",
+                .parent_key = "claim-owner",
+                .schema_version = binding.physical_candidate.schema_version,
+            }});
+        };
+        defer prepared_claims.deinit();
+        var txn = try handle.db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(usize, 1), try prepared_claims.stage(&txn));
+        try txn.commit();
+    }
     var foreign = identity;
     foreign.id[0] ^= 1;
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, handle.db.nativeIndexOwnerState(foreign));
@@ -1414,6 +1434,20 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(attempt > 0, progress.value.artifacts_retired);
     }
     try std.testing.expectError(error.WriteAdmissionRejected, handle.db.collectRelationalIndexGarbageStep());
+    request.operation = .cancel_claim_gc_page;
+    request.manifest = .fromSlice("not-permitted");
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    try std.testing.expect(response.ptr == null);
+    request.manifest = .{};
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const claim_response = response;
+        defer freeRawBuffer(claim_response.ptr, claim_response.len);
+        var progress = try std.json.parseFromSlice(db_mod.DB.NativeIndexClaimCleanupMaintenanceOutcome, a, claim_response.slice(), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(attempt == 0, progress.value.advanced);
+        try std.testing.expect(progress.value.claims_retired);
+    }
     {
         var read = try handle.db.core.store.beginReadTxn();
         defer read.abort();
@@ -1428,6 +1462,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
     var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
     defer status.deinit();
     try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+    try std.testing.expect(status.value.claims_retired);
     try std.testing.expect(status.value.claim_allocation != null);
     try std.testing.expectEqual(@as(u64, 5), status.value.cleanup.?.sequence);
     try std.testing.expectEqual(cancel_position, status.value.intent.?.position);

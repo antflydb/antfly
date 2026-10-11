@@ -151,6 +151,11 @@ pub const CleanupMaintenanceOutcome = struct {
     artifacts_retired: bool,
 };
 
+pub const ClaimCleanupMaintenanceOutcome = struct {
+    advanced: bool,
+    claims_retired: bool,
+};
+
 const Artifacts = struct {
     candidate: candidate_mod.Candidate,
     addition: physical.PrivateAddition,

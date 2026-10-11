@@ -318,6 +318,9 @@ test "native index owner adapter executes fresh permission stages and recovers r
             try std.testing.expect(gc.gc.value.advanced or gc.gc.value.artifacts_retired);
         }
         try std.testing.expect(retired);
+        var claims = try owners.collectNativeIndexOwnerClaimGarbage(alloc, group, plan.before.name, owner_identity, .{});
+        defer claims.deinit();
+        try std.testing.expect(!claims.value.advanced and claims.value.claims_retired);
         var repeated = try execution.cancelStep(alloc, &owners, &metadata, plan.before.name, cancel_request, .{});
         defer repeated.deinit();
         try std.testing.expect(repeated == .retired);
@@ -327,6 +330,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(cleanup.position, status.value.cleanup.?);
         try std.testing.expectEqual(cleanup.position.sequence, status.value.source.sequence);
         try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+        try std.testing.expect(status.value.claims_retired);
         try std.testing.expect(status.value.claim_allocation != null);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
         // A subsequent routing/root switch must not relabel the already

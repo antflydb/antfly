@@ -92,7 +92,8 @@ pub const CancellationResult = union(enum) {
     reserved: std.json.Parsed(native.CleanupOutcome),
     cleanup: std.json.Parsed(native.CleanupOutcome),
     gc: std.json.Parsed(native.CleanupMaintenanceOutcome),
-    /// Physical artifacts only: global retirement and epoch release are pending.
+    claim_gc: std.json.Parsed(native.ClaimCleanupMaintenanceOutcome),
+    /// Local artifacts/claims only: cohort proof and epoch release are pending.
     retired,
 
     pub fn deinit(self: *CancellationResult) void {
@@ -101,6 +102,7 @@ pub const CancellationResult = union(enum) {
             .intent => |value| value.deinit(),
             .admitted, .fenced, .reserved, .cleanup => |value| value.deinit(),
             .gc => |value| value.deinit(),
+            .claim_gc => |value| value.deinit(),
         }
         self.* = undefined;
     }
@@ -187,7 +189,13 @@ pub fn cancelStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, 
         try requireCancellationProgress(result.value, binding, expected_intent);
         return .{ .cleanup = result };
     }
-    if (state.value.artifacts_retired) return .retired;
+    if (state.value.artifacts_retired) {
+        if (state.value.claims_retired) return .retired;
+        var result = try source.collectNativeIndexOwnerClaimGarbage(alloc, request.group_id, table_name, identity, context);
+        errdefer result.deinit();
+        if (!result.value.advanced and !result.value.claims_retired) return error.InvalidPrivateIndexCancellation;
+        return .{ .claim_gc = result };
+    }
     var result = try source.collectNativeIndexOwnerGarbage(alloc, request.group_id, table_name, identity, context);
     errdefer result.deinit();
     if (!result.value.advanced and !result.value.artifacts_retired) return error.InvalidPrivateIndexCancellation;
@@ -287,6 +295,7 @@ const TestDriver = struct {
     cancel_state: ?jobs.CancellationState = null,
     cleanups: usize = 0,
     gc_pages: usize = 0,
+    claim_gc_pages: usize = 0,
     foreign_cancellation: bool = false,
     cancel_admission: bool = false,
     fail_control: bool = false,
@@ -422,6 +431,7 @@ const TestDriver = struct {
         const position: @FieldType(native.CleanupOutcome, "position") = .{ .namespace = identity.namespace, .sequence = state.source.sequence };
         state.cleanup = position;
         state.claim_allocation = 1;
+        state.claims_retired = true;
         return parsed(native.CleanupOutcome, alloc, .{ .binding = state.binding.?, .position = position, .duplicate = false });
     }
 
@@ -430,6 +440,13 @@ const TestDriver = struct {
         self.gc_pages += 1;
         self.cancel_state.?.artifacts_retired = self.gc_pages == 2;
         return parsed(native.CleanupMaintenanceOutcome, alloc, .{ .advanced = true, .artifacts_retired = self.cancel_state.?.artifacts_retired });
+    }
+
+    pub fn collectNativeIndexOwnerClaimGarbage(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.Identity, context: operation.RequestContext) !std.json.Parsed(native.ClaimCleanupMaintenanceOutcome) {
+        try context.ensureActive();
+        self.claim_gc_pages += 1;
+        self.cancel_state.?.claims_retired = true;
+        return parsed(native.ClaimCleanupMaintenanceOutcome, alloc, .{ .advanced = true, .claims_retired = true });
     }
 
     pub fn applyNativeIndexOwnerControl(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.Command, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -480,6 +497,12 @@ test "relational index publication native cancellation receiver resumes one boun
     try std.testing.expectEqual(@as(usize, 8), driver.permission_reads);
     try std.testing.expectEqual(@as(usize, 1), driver.admission_reads);
     try std.testing.expectEqual(@as(usize, 2), driver.gc_pages);
+    try std.testing.expectEqual(@as(u64, 7), driver.cancel_state.?.source.sequence);
+    driver.cancel_state.?.claims_retired = false;
+    var claim_page = try cancelStep(alloc, &driver, &driver, plan.before.name, request, .{});
+    defer claim_page.deinit();
+    try std.testing.expect(claim_page == .claim_gc);
+    try std.testing.expectEqual(@as(usize, 1), driver.claim_gc_pages);
     try std.testing.expectEqual(@as(u64, 7), driver.cancel_state.?.source.sequence);
     const inspections = driver.inspections;
     driver.cancel_state.?.source.sequence = 6;

@@ -583,9 +583,17 @@ pub const Owner = struct {
     }
 
     pub fn nativeIndexOwnerGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_gc_page);
+    }
+
+    pub fn nativeIndexOwnerClaimGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
+        return self.nativeIndexOwnerDerivedGcJson(table_name, identity_json, .cancel_claim_gc_page);
+    }
+
+    fn nativeIndexOwnerDerivedGcJson(self: *Owner, table_name: []const u8, identity_json: []const u8, comptime operation: abi.NativeIndexOwnerOperation) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
-            .operation = .cancel_gc_page,
+            .operation = operation,
             .table_name = .fromSlice(table_name),
             .request_json = .fromSlice(identity_json),
         }, &response.buffer));

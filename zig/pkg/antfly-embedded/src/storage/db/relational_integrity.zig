@@ -124,16 +124,37 @@ pub const parseKey = @import("relational_integrity_contract.zig").parseKey;
 
 pub const routingKey = @import("relational_integrity_contract.zig").routingKey;
 pub const validateTransferRecord = @import("relational_integrity_contract.zig").validateTransferRecord;
+pub const TransferView = @import("relational_index_private_claims.zig").TransferView;
+
 pub fn validateTransferredCompanions(txn: anytype, key: []const u8, value: []const u8) !void {
-    const address = try validateTransferRecord(key, value);
+    // Capture before metadata/companion reads invalidate borrowed store bytes.
+    _ = try validateTransferRecord(key, value);
     const parsed = try parseKey(key);
+    const value_digest = hash(value);
+    try validateOrdinaryTransferredCompanions(txn, key, value, parsed);
+    const view = try TransferView.init(txn);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+pub fn validateTransferredCompanionsWithView(txn: anytype, key: []const u8, value: []const u8, view: TransferView) !void {
+    _ = try validateTransferRecord(key, value);
+    const parsed = try parseKey(key);
+    const value_digest = if (view.isPrivate(parsed.address.generation)) hash(value) else @as(Digest, @splat(0));
+    try validateOrdinaryTransferredCompanions(txn, key, value, parsed);
+    try view.validateCompanion(txn, parsed, value_digest);
+}
+
+fn validateOrdinaryTransferredCompanions(txn: anytype, key: []const u8, value: []const u8, parsed: ParsedKey) !void {
+    const address = parsed.address;
+    // A point read for the claim may reuse the buffer containing a job passed
+    // by the caller. Copy its fixed identity before that read.
+    const transferred_job = if (parsed.kind == .job) (try Job.decode(key, value)).action_id else null;
     const claim_key = address.claimKey();
     const claim_raw = if (parsed.kind == .claim) value else try optional(txn, &claim_key) orelse return error.IntegrityMissingCompanion;
     const claim = try Claim.decode(&claim_key, claim_raw);
     if (claim.state == .draining) {
-        const job_raw = if (parsed.kind == .job) value else try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion;
-        const job = try Job.decode(&address.jobKey(), job_raw);
-        if (!std.mem.eql(u8, &job.action_id, &claim.action_id)) return error.ForeignKeyActionMismatch;
+        const job_action = transferred_job orelse (try Job.decode(&address.jobKey(), try optional(txn, &address.jobKey()) orelse return error.IntegrityMissingCompanion)).action_id;
+        if (!std.mem.eql(u8, &job_action, &claim.action_id)) return error.ForeignKeyActionMismatch;
     } else if (parsed.kind == .job) return error.InvalidIntegrityRecord;
 }
 
@@ -640,6 +661,41 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     }
     const reference_items = try references.toOwnedSlice(owned);
     return .{ .arena = arena, .claim = claim, .job = job, .next_cursor = next_cursor, .references = reference_items, .complete = complete };
+}
+
+test "relational integrity transfer validates borrowed action jobs before companion reads" {
+    const alloc = std.testing.allocator;
+    const address = try Address.init(@splat(1), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "parent", .parent_key = "p", .schema_version = 1, .state = .draining, .action = .parent_delete, .action_id = @splat(2) };
+    const claim_bytes = try claim.encode(alloc, address);
+    defer alloc.free(claim_bytes);
+    var job: Job = .{ .action_id = @splat(2), .parent_version = 1, .parent_schema_version = 1 };
+    const job_bytes = try job.encode(alloc, address);
+    defer alloc.free(job_bytes);
+    const Borrowed = struct {
+        address: Address,
+        claim: []const u8,
+        job: []const u8,
+        scratch: [2048]u8 = undefined,
+        fail_reads: bool = false,
+
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.fail_reads) return error.BackendReadFailed;
+            const raw = if (std.mem.eql(u8, key, &self.address.claimKey())) self.claim else if (std.mem.eql(u8, key, &self.address.jobKey())) self.job else return error.NotFound;
+            @memcpy(self.scratch[0..raw.len], raw);
+            return self.scratch[0..raw.len];
+        }
+    };
+    var txn: Borrowed = .{ .address = address, .claim = claim_bytes, .job = job_bytes };
+    try validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey()));
+    try validateTransferredCompanionsWithView(&txn, &address.jobKey(), try txn.get(&address.jobKey()), .{});
+    job.action_id = @splat(3);
+    const foreign = try job.encode(alloc, address);
+    defer alloc.free(foreign);
+    txn.job = foreign;
+    try std.testing.expectError(error.ForeignKeyActionMismatch, validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey())));
+    txn.fail_reads = true;
+    try std.testing.expectError(error.BackendReadFailed, validateTransferredCompanions(&txn, &address.jobKey(), job_bytes));
 }
 
 test "relational integrity keys are generation bound explicitly routed and checksummed" {
