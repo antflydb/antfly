@@ -12063,6 +12063,9 @@ fn applyPublicHierarchyControls(
                     !std.mem.eql(u8, root_key, "timeout_ms") and
                     !std.mem.eql(u8, root_key, "order_by") and
                     !std.mem.eql(u8, root_key, "search_after") and
+                    // The retained cut is required to resume child traversal;
+                    // it is capability metadata, not a relevance/filter knob.
+                    !std.mem.eql(u8, root_key, "remote_snapshot") and
                     !isInternalShardFieldName(root_key))
                 {
                     // Sequential traversal has no relevance/filter execution
