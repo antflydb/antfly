@@ -1571,7 +1571,7 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         try std.testing.expect(before.expected_content_digest != null);
         try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
         try std.testing.expectEqual(before.version, try database.getTimestamp(alloc, "a"));
-        try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
+        try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), alloc, table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
         try std.testing.expectError(error.PreparedGenerationChanged, database.batch(.{ .schema_version = 2, .deletes = &.{"a"} }));
         const txn = try database.beginTransactionWithId(@splat(97), 1);
         try std.testing.expectError(error.PreparedGenerationChanged, database.writeTransaction(txn, .{ .schema_version = 2, .deletes = &.{"a"} }));
@@ -1636,7 +1636,7 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     defer winner.deinit();
     var won = try sql.runtime.execute(alloc, backend, &winner, &.{}, .{});
     defer won.deinit();
-    try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
+    try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), alloc, table, &.{mutation}));
     try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
 }
 

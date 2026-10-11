@@ -11,6 +11,7 @@
     },
     "test": {
       "dependsOn": ["build"],
+      "passThroughEnv": ["ANTFLY_LIBRARY", "ANTFLY_LIB_DIR", "ANTFLY_LITE_REQUIRE_LIBRARY"],
       "cache": false
     },
     "typecheck": {

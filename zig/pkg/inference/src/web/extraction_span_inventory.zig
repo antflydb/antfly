@@ -1,7 +1,22 @@
-// Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // GLiNER2 base-v1 split checkpoint inventory. Shapes are precision-independent.
 // gliner2-encoder.Q4_K.gguf: fa098b5a8836da5b3c992c2bfc2ee3e715c58009fefa94cf83c496a8315cc879
 // gliner2-head.Q4_K.gguf: f1a14fd8f7700b885c4b842ee93985efc271bf1094d9229364b85758bbfaeb25
+
 pub const Spec = struct { name: []const u8, shape: []const i64 };
 pub const tensors = [_]Spec{
     .{ .name = "count_embed.gru.bias_hh_l0", .shape = &.{2304} },

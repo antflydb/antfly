@@ -339,7 +339,7 @@ fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, ki
         }
         try clauses.append(pa, try std.json.parseFromSliceLeaky(V, pa, try std.json.Stringify.valueAlloc(pa, .{ .conjuncts = terms.items }, .{}), .{}));
     }
-    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .lake_read = root.object.get("lake_read") }, .{ .emit_null_optional_fields = false });
+    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .read_requirements = root.object.get("read_requirements"), .lake_read = root.object.get("lake_read") }, .{ .emit_null_optional_fields = false });
     try executor.checkpoint(executor.ptr);
     var response = try executor.execute(executor.ptr, response_a, changes.position.table, lookup);
     if (response.status != 200) {
@@ -580,7 +580,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
             const physical = if (identity == .object) identity.object.get("physical") else null;
             leaf.* = .{ .table = position.table, .physical = if (physical) |name| name.string else position.table, .token = position.remote_snapshot orelse return error.UnsupportedQueryRequest, .identity = position.identity };
         }
-        break :graph try graph.execute(scratch, specification, graph_leaves, keys, kinds, tombstone, root.object.get("lake_visibility"), output.items, complete and offset == 0, executor);
+        break :graph try graph.execute(scratch, specification, graph_leaves, keys, kinds, tombstone, root, output.items, complete and offset == 0, executor);
     } else null;
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .status = 200, .took = 0, .hits = .{ .total = .{ .value = exact_total orelse seen, .relation = if (exact_total != null) "exact" else "gte" }, .hits = output.items }, .source_ranking = if (rrf) "rrf" else "ordered", .next_source_cursor = next, .aggregations = computed_aggregations, .graph_results = graph_results }} }, .{ .emit_null_optional_fields = false });
     errdefer a.free(encoded);

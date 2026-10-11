@@ -1609,7 +1609,9 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             subset_hits[1]["_id"]
         ]
         snapshot_token = ordered_first["remote_snapshot"]
-        assert len(snapshot_token) == 64, ordered_first
+        # Retained cut capabilities are opaque; replay below proves their
+        # identity and persistence without assuming a digest representation.
+        assert isinstance(snapshot_token, str) and snapshot_token, ordered_first
         sort_tuple = ordered_first["hits"]["hits"][0]["_sort"]
         ordered_next = call(
             "POST",

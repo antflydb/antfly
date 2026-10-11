@@ -22,7 +22,7 @@ const std = @import("std");
 const Dir = std.Io.Dir;
 const bert = @import("bert.zig");
 const deberta = @import("deberta.zig");
-const modern_bert = @import("../architectures/modern_bert.zig");
+const modern_bert = @import("../architectures/modern_bert_config.zig");
 const gpt = @import("gpt.zig");
 const gliner_boundary = @import("gliner_boundary.zig");
 const gliner_qualification = @import("gliner_boundary_qualification.zig");
@@ -1845,7 +1845,7 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
-    if (@import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch)) {
+    if (@import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch)) {
         if (manifest.model_type != .embedder or manifest.embedding_style != .embedding_gemma2 or
             manifest.pooling != .mean or !manifest.normalize) return error.InvalidEmbeddingTaskProfile;
         // Architecture evidence fixes the primary role even when secondary
@@ -2762,8 +2762,8 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
         }
     }
     if (obj.get("model_type")) |mt| {
-        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
-            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+        if (mt == .string and @import("../architectures/embedding_gemma2_config.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2_config.zig").parseConfig(allocator, json_bytes);
             if (manifest.model_manifest_declarations.embedding_style and manifest.embedding_style != .embedding_gemma2) return error.InvalidEmbeddingTaskProfile;
             manifest.embedding_style = .embedding_gemma2;
             manifest.model_type = .embedder;
@@ -2871,8 +2871,8 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
     }
 
     if (obj.get("model_type")) |mt| {
-        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
-            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+        if (mt == .string and @import("../architectures/embedding_gemma2_config.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2_config.zig").parseConfig(allocator, json_bytes);
             manifest.model_type = .embedder;
             manifest.embedding_style = .embedding_gemma2;
             manifest.hidden_size = 768;
@@ -4180,7 +4180,7 @@ fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id
 fn canSkipEmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir_path: []const u8, tokenizer_json: []const u8) bool {
     if (manifest.model_type != .embedder) return false;
     const gemma2 = manifest.embedding_style == .embedding_gemma2 and
-        @import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch);
+        @import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch);
     const qwen3 = manifest.model_manifest_declarations.model_type and
         manifest.model_manifest_declarations.embedding_style and manifest.embedding_style == .qwen3_embedding;
     if (!gemma2 and !qwen3) return false;

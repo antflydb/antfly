@@ -1,6 +1,21 @@
-// Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Dense activation operations. FP32 activations; packed FP16 weights are handled
 // by matmul_transb_f16. No optional shader-f16 device feature is required.
+
 struct Params { len: u32, mode: u32, dim: u32, stride: u32, offset: u32, seq: u32, theta: f32, pad: u32 };
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> indices: array<u32>;

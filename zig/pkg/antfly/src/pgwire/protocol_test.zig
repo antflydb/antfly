@@ -22,8 +22,11 @@ const Mock = struct {
     catalog_rebind: bool = false,
     cached_shape_change: bool = false,
     executions: usize = 0,
+    receipt_budget_fallback: bool = false,
+    receipt_budget_fallbacks: usize = 0,
     lake_log: [32]@import("session_commands.zig").LakeVisibility = undefined,
     lake_count: usize = 0,
+    read_log: [64]@import("session_commands.zig").ReadRequirements = undefined,
     authentications: usize = 0,
     disconnects: usize = 0,
     releases: usize = 0,
@@ -133,8 +136,17 @@ const Mock = struct {
     fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
+        if (self.receipt_budget_fallback and std.mem.startsWith(u8, request.statement, "SELECT")) {
+            const budget = request.read_receipt_budget orelse return error.InvalidSqlBackendResponse;
+            // A failed streaming admission consumed this statement's budget.
+            try std.testing.expect(budget.deadline_ns == null);
+            budget.deadline_ns = 0;
+            self.receipt_budget_fallbacks += 1;
+            return null;
+        }
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
         try self.checkSettingEpoch(request);
+        self.read_log[self.lake_count] = request.read_requirements;
         self.lake_log[self.lake_count] = request.lake_visibility;
         self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
@@ -220,6 +232,11 @@ const Mock = struct {
         try self.checkSettingEpoch(request);
         self.executions += 1;
         if (std.mem.startsWith(u8, request.statement, "SELECT")) {
+            if (self.receipt_budget_fallback) {
+                const budget = request.read_receipt_budget orelse return error.InvalidSqlBackendResponse;
+                try std.testing.expectEqual(@as(?u64, 0), budget.deadline_ns);
+            }
+            self.read_log[self.lake_count] = request.read_requirements;
             self.lake_log[self.lake_count] = request.lake_visibility;
             self.lake_count += 1;
         }
@@ -2315,6 +2332,48 @@ test "pgwire driver comment-only ping returns EmptyQueryResponse without backend
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "E"));
 }
 
+test "pgwire read requirements retain receipts across savepoints and prepared streaming execution" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET antfly.read_requirements = '{\"visibility\":\"accepted\",\"after_write\":{\"table_id\":2,\"object_generation\":3,\"wal_lsn\":10},\"wait_ms\":0}'\x00",
+        "SELECT n FROM t\x00",
+        "BEGIN\x00",
+        "SAVEPOINT saved\x00",
+        "SET LOCAL antfly.read_requirements = '{\"visibility\":\"committed\",\"wait_ms\":100}'\x00",
+        "SELECT n FROM t\x00",
+        "ROLLBACK TO saved\x00",
+        "SELECT n FROM t\x00",
+        "COMMIT\x00",
+        "SHOW antfly.read_requirements\x00",
+        "SHOW antfly.read_visibility\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "pinned", "SELECT n FROM t", false);
+    try bind(&input.writer, "portal", "pinned", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'Q', "RESET ALL\x00");
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'X', "");
+    for ([_]usize{ 0, 5 }) |stream_rows| {
+        var mock: Mock = .{ .stream_rows = stream_rows };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+        try std.testing.expectEqual(@as(usize, 5), mock.lake_count);
+        for ([_]usize{ 0, 2, 3 }) |i| {
+            try std.testing.expectEqual(@as(u64, 10), mock.read_log[i].after_write.?.wal_lsn);
+            try std.testing.expectEqual(@as(?u32, 0), mock.read_log[i].wait_ms);
+        }
+        try std.testing.expect(mock.read_log[1].after_write == null);
+        try std.testing.expectEqual(@as(?u32, 100), mock.read_log[1].wait_ms);
+        try std.testing.expect(mock.read_log[4].after_write == null);
+        try std.testing.expect(mock.read_log[4].visibility == null);
+    }
+}
+
 test "pgwire cached plans rebind before execution and reject changed row contracts before admission" {
     for ([_]bool{ false, true }) |sql_prepare| {
         for ([_]bool{ false, true }) |shape_change| {
@@ -2344,4 +2403,27 @@ test "pgwire cached plans rebind before execution and reject changed row contrac
             }
         }
     }
+}
+
+test "pgwire receipt budget survives simple SQL prepared and extended streaming fallback" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SET antfly.read_requirements = '{\"visibility\":\"committed\",\"after_write\":{\"table_id\":2,\"object_generation\":3,\"wal_lsn\":10},\"wait_ms\":100}'\x00");
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "PREPARE sql_cached AS SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "EXECUTE sql_cached\x00");
+    try parse(&input.writer, "extended", "SELECT n FROM t", false);
+    try bind(&input.writer, "portal", "extended", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .receipt_budget_fallback = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+    try std.testing.expectEqual(@as(usize, 4), mock.receipt_budget_fallbacks);
 }

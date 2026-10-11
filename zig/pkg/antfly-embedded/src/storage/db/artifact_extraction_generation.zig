@@ -533,7 +533,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.append, .{ &plan, old, @as([]const Entry, entries[1..]) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.append, .{ &plan, old, @as([]const Entry, entries[1..]) });
     try std.testing.expectError(error.InvalidBatchRequest, PreparedAppend.init(alloc, &plan, old, &.{ entries[1], entries[1] }));
     {
         var duplicate = try PreparedAppend.init(alloc, &plan, old, entries[0..1]);
@@ -577,7 +577,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqual(@as(usize, 1), selected_keys.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, InventoryAllocationCheck.run, .{&pinned});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, InventoryAllocationCheck.run, .{&pinned});
     const CaptureCheck = struct {
         fn run(a: std.mem.Allocator, txn: *@import("../docstore.zig").DocStore.Txn, key: []const u8) !void {
             var input = try captureInput(a, txn, key);
@@ -587,7 +587,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqualStrings(input.head_value.?, input.proofValue().?);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, CaptureCheck.run, .{ &pinned, unit_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CaptureCheck.run, .{ &pinned, unit_key });
     {
         var selected_root = try captureInput(alloc, &pinned, root_key);
         defer selected_root.deinit();
@@ -602,7 +602,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
             try std.testing.expectEqualStrings(input.head_key.?, input.proofKey(key));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, RootCaptureCheck.run, .{ &pinned, root_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, RootCaptureCheck.run, .{ &pinned, root_key });
     const ids = @import("artifact_ids.zig");
     var identity = (try ids.decodeArtifactRefAlloc(alloc, unit_key)).?;
     defer identity.deinit(alloc);
@@ -704,7 +704,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
                 defer page.deinit();
             }
         };
-        if (state.retired_through == 0) try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &probe, &plan, authority, state });
+        if (state.retired_through == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &probe, &plan, authority, state });
         var gc = try PreparedRetirement.init(alloc, &probe, &plan, authority, state, 1);
         defer gc.deinit();
         _ = try gc.stage(&plan, &probe);

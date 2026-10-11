@@ -108,8 +108,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
     if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
 }
 
+const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
+
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
+    read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
+    receipt_wait_budget: ReceiptWaitBudget = .{},
+    shared_receipt_wait_budget: ?*ReceiptWaitBudget = null,
     /// A transport may consume borrowed result columns within the same policy,
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
@@ -179,7 +184,12 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        const previous_receipt_wait_budget = self.receipt_wait_budget;
+        self.receipt_wait_budget = .{};
+        defer self.receipt_wait_budget = previous_receipt_wait_budget;
         const previous_visibility = self.lake_visibility;
+        try self.read_requirements.validate(.sql);
+        if (self.read_requirements.visibility) |visibility| self.lake_visibility = if (visibility == .accepted) .accepted else .committed;
         const previous_context = self.context;
         defer self.lake_visibility = previous_visibility;
         defer self.context = previous_context;
@@ -264,6 +274,10 @@ pub const Adapter = struct {
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
         errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
+        if ((compiled.statement == .select or compiled.statement == .explain) and self.read_requirements.visibility == .committed and inherited != null and inherited.?.metadata.accepted_lake_reads) return zig017_failure: {
+            zig017_return_error = error.ReadSnapshotTooOld;
+            break :zig017_failure error.ReadSnapshotTooOld;
+        };
         if (compiled.statement == .set_constraints) {
             if (parameters.len != 0) return zig017_failure: {
                 zig017_return_error = error.InvalidSqlParameters;
@@ -543,7 +557,10 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        // Each new backend starts an execution scope; binding, cursor selection
+        // and fallback execution within that scope share the receipt budget.
+        self.receipt_wait_budget = .{};
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -943,7 +960,7 @@ pub const Adapter = struct {
     };
     fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        if (self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
+        if (self.read_requirements.after_write != null or self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
         const local = @import("antfly_local_sources");
         const artifact_api = @import("lake_index_aggregate_artifact.zig");
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -1128,6 +1145,85 @@ pub const Adapter = struct {
         try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
     }
 
+    /// Wait before opening or persisting a new snapshot. A retained transaction
+    /// cut is immutable and is checked separately without retrying execution.
+    fn awaitSqlReceipt(self: *Adapter, a: std.mem.Allocator, polling_alloc: std.mem.Allocator, table: catalog.Table) !?@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table {
+        const receipt = self.read_requirements.after_write orelse return null;
+        const generation = if (table.external_indexes) |indexes| indexes.object_generation else 0;
+        if (receipt.table_id != table.id) return null;
+        if (receipt.object_generation != generation) return error.ReadReceiptGenerationMismatch;
+        const binding = table.external_base_source.?.binding;
+        if (binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = generation };
+        const normalized = try self.context.platformDeadline();
+        const time = @import("antfly_platform").time;
+        const wait_ms = self.read_requirements.wait_ms orelse 5000;
+        const budget = self.shared_receipt_wait_budget orelse &self.receipt_wait_budget;
+        const wait_deadline = budget.deadline(time.monotonicNs(), wait_ms);
+        const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
+        // Zero permits one readiness check under the statement's I/O budget.
+        // Positive budgets also bound catalog and WAL I/O, not just sleeps.
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = if (wait_ms == 0) normalized.deadline_ns else deadline, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        var first = true;
+        while (true) {
+            try normalized.ensureActive();
+            if (!first and time.monotonicNs() >= deadline) return error.ReadRequirementNotReady;
+            first = false;
+            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+            var attempt = std.heap.ArenaAllocator.init(polling_alloc);
+            defer attempt.deinit();
+            const scratch = attempt.allocator();
+            var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
+            defer current.deinit(scratch);
+            const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
+            const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
+            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+            if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            const now = time.monotonicNs();
+            if (now >= deadline) return error.ReadRequirementNotReady;
+            try context.io.?.sleep(.fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms))), .awake);
+        }
+    }
+
+    fn receiptPollingError(request: operation.RequestContext, deadline: u64, err: anyerror) anyerror {
+        // Caller cancellation and statement expiration retain their SQLSTATE.
+        request.ensureActive() catch |request_err| return request_err;
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) switch (err) {
+            error.DeadlineExceeded, error.Canceled, error.Timeout => return error.ReadRequirementNotReady,
+            else => {},
+        };
+        return err;
+    }
+
+    fn validateReadReceiptBinding(raw: *anyopaque, alloc: std.mem.Allocator, binding: @import("antfly_local_sources").sql_describe.BoundStatement) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const receipt = self.read_requirements.after_write orelse return;
+        if (binding.relation) |relation| {
+            for (relation.scans) |scan_request| if (scan_request.table.id == receipt.table_id) return self.validateReceiptTable(alloc, scan_request.table);
+        } else if (binding.table) |table| if (table.id == receipt.table_id) return self.validateReceiptTable(alloc, table);
+        return error.ReadReceiptGenerationMismatch;
+    }
+
+    fn validateReceiptTable(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        const source = table.external_base_source orelse return error.UnsupportedReadVisibility;
+        if (source.binding.write_policy != .iceberg_writer) return error.UnsupportedReadVisibility;
+        const generation = if (table.external_indexes) |indexes| indexes.object_generation else 0;
+        if (self.read_requirements.after_write.?.object_generation != generation) return error.ReadReceiptGenerationMismatch;
+        // A zero-row plan can finish without opening any scan. Enforce the
+        // receipt here too; actual scans still verify their selected read cut.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        try self.checkLakeRead(a, table);
+        if (self.lake_visibility == .accepted and self.active_transaction != null) {
+            if (try self.loadSqlLakeCut(a, table)) |cut| {
+                try self.read_requirements.requireCoverage(table.id, cut.object_generation, cut.pending.lsn, true);
+                return;
+            }
+        }
+        _ = try self.awaitSqlReceipt(a, alloc, table);
+    }
+
     fn fillLakeStatement(self: *Adapter, alloc: std.mem.Allocator, owner: *LakeStatement, requests: []const catalog.StatementScan) !catalog.StatementRead {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -1147,8 +1243,10 @@ pub const Adapter = struct {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     retained = try self.loadSqlLakeCut(owner.overlay_arena.?.allocator(), request.table);
                 }
+                if (retained) |cut| if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, cut.object_generation, cut.pending.lsn, true);
+                const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else null, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
                 source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
@@ -1174,6 +1272,7 @@ pub const Adapter = struct {
                     if (!std.mem.eql(u8, uuid, try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.str(try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.get(current_root, "table-uuid")))) return error.CatalogGenerationChanged;
                     const cut = try @import("lake_search_overlay.zig").snapshotCoverage(root, source.inventory.snapshot_id);
                     const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
+                    if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, lake_options.catalog_generation, pending.lsn, false);
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
                     if (pending.changes.len != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
                     // Persist the unmodified physical WAL before SQL converts
@@ -3602,4 +3701,29 @@ test "lake SQL failed aggregate admission releases control before its descriptor
         }
     };
     try std.testing.expectError(error.NativeArtifactStorageRequired, FailedOpen.open(std.testing.allocator));
+}
+
+test "SQL receipt polling expiration preserves caller cancellation and statement deadlines" {
+    try std.testing.expectEqual(error.ReadRequirementNotReady, Adapter.receiptPollingError(.{}, 0, error.DeadlineExceeded));
+    try std.testing.expectEqual(error.DeadlineExceeded, Adapter.receiptPollingError(.{ .deadline_ns = 0 }, 0, error.DeadlineExceeded));
+    var signal = std.atomic.Value(bool).init(true);
+    try std.testing.expectEqual(error.Canceled, Adapter.receiptPollingError(.{ .cancellation = operation.CancellationToken.fromAtomic(&signal) }, 0, error.DeadlineExceeded));
+    try std.testing.expectEqual(error.LakeCatalogForbidden, Adapter.receiptPollingError(.{}, 0, error.LakeCatalogForbidden));
+}
+
+test "SQL receipt readiness shares one deadline across preflight and scan checks" {
+    var budget: ReceiptWaitBudget = .{};
+    const start: u64 = 100 * std.time.ns_per_ms;
+    const deadline = budget.deadline(start, 10);
+    try std.testing.expectEqual(start + 10 * std.time.ns_per_ms, deadline);
+    // Time spent obtaining the preflight result remains spent when the scan
+    // checks readiness again, including after the original deadline expires.
+    try std.testing.expectEqual(deadline, budget.deadline(start + 9 * std.time.ns_per_ms, 10));
+    try std.testing.expectEqual(deadline, budget.deadline(start + 11 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start + 30 * std.time.ns_per_ms, budget.deadline(start + 20 * std.time.ns_per_ms, 10));
+    budget = .{};
+    try std.testing.expectEqual(start, budget.deadline(start, 0));
+    try std.testing.expect(budget.deadline_ns == null);
+    try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
 }

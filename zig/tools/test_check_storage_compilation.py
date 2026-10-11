@@ -179,7 +179,10 @@ class BuildFailureEvidence(unittest.TestCase):
         expected = (
             ("cold", set()),
             ("warm", set()),
-            ("read coordination", {"antfly-runtime-distributed"}),
+            (
+                "read coordination",
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+            ),
             ("write coordination", {"antfly-runtime-distributed"}),
             ("physical DB", {"antfly-storage-kernel"}),
             ("physical local query", {"antfly-storage-kernel"}),

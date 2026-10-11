@@ -275,6 +275,31 @@ class ZigValidationScopeTests(unittest.TestCase):
             {path.decode() for path in selected.split(b"\0") if path}, inputs
         )
 
+    def test_ingestion_e2e_uses_checkout_sdk_and_matching_native_artifact(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        full = workflow.split("\n  e2e-full-tests:\n", 1)[1].split(
+            "\n  e2e-full:\n", 1
+        )[0]
+        self.assertIn("name: Download ingestion native library", full)
+        self.assertIn("if: matrix.suite == 'antfly'", full)
+        self.assertIn(
+            "libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}",
+            full,
+        )
+        self.assertIn(
+            "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so", full
+        )
+        manifest = (ROOT / "zig/e2e/antfly/pyproject.toml").read_text()
+        self.assertIn(
+            '"antfly-embedded"', manifest.split("iceberg =", 1)[1].split("\n", 1)[0]
+        )
+        self.assertIn(
+            'antfly-embedded = { path = "../../../py/packages/embedded", editable = true }',
+            manifest,
+        )
+        lock = (ROOT / "zig/e2e/antfly/uv.lock").read_text()
+        self.assertIn('source = { editable = "../../../py/packages/embedded" }', lock)
+
     def test_embedded_sdk_and_driver_inputs_select_the_capi_producer(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         command = workflow.split('if ! "$helper"')[2].split("\n          then", 1)[0]

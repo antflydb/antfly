@@ -16,11 +16,13 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
 import type {
   RelationalScalarExpression,
-  SQLBuiltinType,
   SQLArrayColumnSchema,
   SQLArrayElementType,
+  SQLBuiltinType,
+  SQLColumn,
+  SQLNumericModifier,
+  SQLPreparedResponse,
 } from "../src/index.js";
-import type { SQLPreparedResponse, SQLColumn, SQLNumericModifier } from "../src/index.js";
 
 it("exports generated NUMERIC scalar and array result modifiers", () => {
   const modifier: SQLNumericModifier = { precision: 2, scale: -3 };
@@ -551,4 +553,21 @@ describe("SQL client", () => {
       client.executeSQL({ statement: "SELECT 1" }, { maxResponseBytes: 64 })
     ).rejects.toThrow("exceeded 64 bytes");
   });
+});
+
+it("shares opaque write requirements across SQL, prepared SQL, and queries", async () => {
+  const { readAfterWrite } = await import("../src/index.js");
+  const receipt = { table_id: 2, object_generation: 3, wal_lsn: 10, state: "accepted" };
+  const read = readAfterWrite(receipt, 0);
+  expect(read).toEqual({
+    visibility: "accepted",
+    after_write: { table_id: 2, object_generation: 3, wal_lsn: 10 },
+    wait_ms: 0,
+  });
+  expectTypeOf<{ read_requirements: typeof read; statement: string }>().toExtend<
+    import("../src/index.js").SQLRequest
+  >();
+  expectTypeOf<{ read_requirements: typeof read }>().toExtend<
+    import("../src/index.js").SQLPreparedExecutionRequest
+  >();
 });
