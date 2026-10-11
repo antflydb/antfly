@@ -9024,6 +9024,16 @@ test "lite prepared first capture and explicit promotion keep subsequent session
         try std.testing.expectEqual(identity, w.score_plan.identity);
         if (session.prepared_request) |request| try std.testing.expectEqual(identity, request.plan().identity);
         try std.testing.expectEqual(@as(?f64, 3), column[0]);
+        var owned_node = [_]u8{'a'};
+        var prepared = try session.prepareColumns(alloc, &.{"metric"}, &.{&owned_node});
+        defer prepared.deinit();
+        owned_node[0] = 'b';
+        for (0..3) |_| try session.readPreparedColumns(alloc, &prepared, &.{&column});
+        try std.testing.expectEqual(@as(?f64, 3), column[0]);
+        const handle_identity = prepared.session_identity;
+        prepared.session_identity = 0;
+        try std.testing.expectError(error.InvalidQueryRequest, session.readPreparedColumns(alloc, &prepared, &.{&column}));
+        prepared.session_identity = handle_identity;
     }
 }
 
@@ -9081,6 +9091,132 @@ test "lite prepared short sessions promotion measurement" {
             const ended = std.posix.getrusage(0);
             const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
             std.debug.print("SHORT_SESSIONS reads={d} mode={d} cpu_us={d} allocations={d}\n", .{ reads, mode, cpu, counter.alloc_calls - before });
+        }
+    }
+}
+
+test "lite prepared chunks preserve large namespaced snapshot and global duplicate fanout" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "large-chunks.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const count = 5000;
+    const storage = try a.alloc([13]u8, count);
+    defer a.free(storage);
+    const nodes = try a.alloc([]const u8, count + 2);
+    defer a.free(nodes);
+    const docs = try a.alloc(native.DocumentMutation, count);
+    defer a.free(docs);
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (storage, docs, 0..) |*key, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        _ = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        nodes[count - 1 - i] = key[3..11];
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    nodes[count] = nodes[0];
+    nodes[count + 1] = "missing";
+    try store.file.putDocumentBatch(docs);
+    const reader = @import("../../graph/score_read.zig");
+    var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+    defer txn.abort();
+    var compiled = try reader.PreparedChunks.init(a, &.{ "", null, "" }, nodes);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.chunkPlans().len > 1);
+    try std.testing.expectEqual(@as(usize, count + 1), compiled.uniqueRowCount());
+    const first = try a.alloc(?f64, nodes.len);
+    defer a.free(first);
+    const missing = try a.alloc(?f64, nodes.len);
+    defer a.free(missing);
+    const duplicate = try a.alloc(?f64, nodes.len);
+    defer a.free(duplicate);
+    const stats = try reader.populateChunks(a, &txn, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(usize, count + 1), stats.keys);
+    for (first[0 .. count + 1]) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+    try std.testing.expectEqual(@as(?f64, null), first[count + 1]);
+    for (missing) |score| try std.testing.expectEqual(@as(?f64, null), score);
+    try std.testing.expectEqualSlices(?f64, first, duplicate);
+    // Commit a different score after compilation. The old txn and handle keep
+    // their snapshot, while the same immutable key plan can serve a fresh txn.
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocument(storage[count - 1][0..], &raw);
+    _ = try reader.populateChunks(a, &txn, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(?f64, 3), first[0]);
+    var fresh = try Txn.openReadWithPrefix(&store, "ns\x00");
+    defer fresh.abort();
+    _ = try reader.populateChunks(a, &fresh, &compiled, &.{ first, missing, duplicate });
+    try std.testing.expectEqual(@as(?f64, 9), first[0]);
+    try std.testing.expectEqual(@as(?f64, 9), first[count]);
+}
+
+test "lite prepared immutable handle and large chunks measurement" {
+    const a = std.testing.allocator;
+    const Graph = @import("../../graph/graph.zig").GraphIndex;
+    for ([_]usize{ 512, 8192, 50000 }) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "handle-measure.aflite");
+        defer a.free(path);
+        var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        const alloc = counter.allocator();
+        var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+        defer store.close();
+        const key_storage = try a.alloc([13]u8, count);
+        defer a.free(key_storage);
+        const nodes = try a.alloc([]const u8, count);
+        defer a.free(nodes);
+        const docs = try a.alloc(native.DocumentMutation, count);
+        defer a.free(docs);
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+        for (key_storage, nodes, docs, 0..) |*key, *node, *doc, i| {
+            @memcpy(key[0..3], "ns\x00");
+            node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+            key[11] = 0;
+            key[12] = 0;
+            doc.* = .{ .key = key, .value = &raw };
+        }
+        try store.file.putDocumentBatch(docs);
+        var graph = try Graph.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+        defer graph.close();
+        const column = try a.alloc(?f64, count);
+        defer a.free(column);
+        for ([_]bool{ false, true }) |direct| {
+            const statuses = try alloc.alloc(Graph.GraphMetricStatus, 1);
+            statuses[0] = .{ .name = try alloc.dupe(u8, "metric"), .published_generation = 1 };
+            const prefixes = try alloc.alloc(?[]const u8, 1);
+            prefixes[0] = try alloc.dupe(u8, "");
+            var session = Graph.GraphMetricReadSession{ .alloc = alloc, .graph_index = &graph, .txn = try backend_erased.readTxnFrom(alloc, try Txn.openReadWithPrefix(&store, "ns\x00")), .statuses = statuses, .prefixes = prefixes };
+            defer session.deinit();
+            const has_handle = comptime @hasDecl(Graph.GraphMetricReadSession, "prepareColumns");
+            const setup_before = counter.alloc_calls;
+            const live_before = counter.live;
+            const build_started = std.posix.getrusage(0);
+            var prepared = if (has_handle) (if (direct) try session.prepareColumns(alloc, &.{"metric"}, nodes) else null) else {};
+            defer if (has_handle) if (prepared) |*handle| handle.deinit();
+            const build_ended = std.posix.getrusage(0);
+            const build_cpu = (build_ended.utime.sec - build_started.utime.sec + build_ended.stime.sec - build_started.stime.sec) * 1000000 + build_ended.utime.usec - build_started.utime.usec + build_ended.stime.usec - build_started.stime.usec;
+            const owned_bytes = counter.live - live_before;
+            const setup_allocations = counter.alloc_calls - setup_before;
+            for (0..3) |_| {
+                if (has_handle and direct) try session.readPreparedColumns(alloc, &prepared.?, &.{column}) else try session.readColumns(alloc, &.{"metric"}, nodes, &.{column});
+            }
+            const queries: usize = if (count == 512) 5000 else 20;
+            const before = counter.alloc_calls;
+            const started = std.posix.getrusage(0);
+            for (0..queries) |_| {
+                if (has_handle and direct) try session.readPreparedColumns(alloc, &prepared.?, &.{column}) else try session.readColumns(alloc, &.{"metric"}, nodes, &.{column});
+            }
+            const ended = std.posix.getrusage(0);
+            const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
+            for (column) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            std.debug.print("HANDLE_CHUNKS keys={d} direct={d} queries={d} cpu_us={d} allocations={d} build_cpu_us={d} setup_allocations={d} owned_bytes={d}\n", .{ count, @intFromBool(direct), queries, cpu, counter.alloc_calls - before, build_cpu, setup_allocations, owned_bytes });
         }
     }
 }

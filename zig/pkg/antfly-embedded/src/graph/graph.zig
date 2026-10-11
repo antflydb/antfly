@@ -20059,6 +20059,8 @@ pub const GraphIndex = struct {
         return .{ .status = status, .scores = scores };
     }
 
+    var next_metric_session_identity = std.atomic.Value(u64).init(1);
+
     /// One publication snapshot spanning filter, order and projection reads.
     /// Resolve every policy before reading scores, including dependencies whose
     /// eventual row selection is empty. Never reopen between query stages.
@@ -20069,11 +20071,50 @@ pub const GraphIndex = struct {
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
         reads: score_read.Stats = .{},
+        prepared_identity: u64 = 0,
+
         // Promote only after this session repeats the same canonical plan.
         // Shared workspace hits alone do not prove session-local reuse.
         last_plan_identity: u64 = 0,
         prepared_reuse_enabled: bool = false,
         prepared_request: ?score_read.PreparedRequest = null,
+
+        pub const PreparedColumns = struct {
+            session_identity: u64,
+            request: score_read.PreparedChunks,
+            pub fn deinit(self: *@This()) void {
+                self.request.deinit();
+                self.* = undefined;
+            }
+        };
+
+        /// Compile a query-owned immutable handle once for this publication
+        /// snapshot. Construction is charged to alloc; callers may keep using
+        /// readColumns when their budget cannot admit optional ownership.
+        pub fn prepareColumns(self: *@This(), alloc: Allocator, names: []const []const u8, nodes: []const []const u8) !PreparedColumns {
+            var buffer: [32]?[]const u8 = undefined;
+            const selected = if (names.len <= buffer.len) buffer[0..names.len] else try alloc.alloc(?[]const u8, names.len);
+            defer if (names.len > buffer.len) alloc.free(selected);
+            for (names, selected) |name, *prefix| {
+                prefix.* = for (self.statuses, self.prefixes) |status, value| {
+                    if (std.mem.eql(u8, status.name, name)) break value;
+                } else return error.InvalidQueryRequest;
+            }
+            if (self.prepared_identity == 0) {
+                self.prepared_identity = next_metric_session_identity.fetchAdd(1, .monotonic);
+                if (self.prepared_identity == 0 or self.prepared_identity == std.math.maxInt(u64)) @panic("metric session identity exhausted");
+            }
+            return .{ .session_identity = self.prepared_identity, .request = try score_read.PreparedChunks.init(alloc, selected, nodes) };
+        }
+
+        /// No raw inputs, byte comparisons, name lookup, or automatic copies.
+        /// Shape and session identity keep the handle bound to its pinned txn.
+        pub fn readPreparedColumns(self: *@This(), alloc: Allocator, prepared: *const PreparedColumns, columns: []const []?f64) !void {
+            if (self.prepared_identity == 0 or prepared.session_identity != self.prepared_identity) return error.InvalidQueryRequest;
+            const read_stats = try score_read.populateChunks(alloc, &self.txn, &prepared.request, columns);
+            self.reads.keys += read_stats.keys;
+            self.reads.batches += read_stats.batches;
+        }
 
         /// Opt in only when the caller knows this session will repeat reads.
         /// Ordinary staged and short-lived sessions keep the warmed mutable plan.

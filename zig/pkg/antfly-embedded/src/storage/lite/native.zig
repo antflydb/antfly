@@ -6184,6 +6184,19 @@ pub const NativeFile = struct {
     /// flag or identity can bypass input checks. The plan stays immutable during
     /// delivery. Namespace translation preserves its sorted, unique order.
     pub fn visitPreparedScoresAtCheckpointWithState(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, plan: *const @import("../prepared_score_plan.zig").PreparedScorePlan, namespace: []const u8, sink: CompleteScoreSink, state: *DocumentBatchReadState) !void {
+        // A compiled scan knows it will advance through multiple identities.
+        // Reuse required reader scratch without allocating decoded entries that
+        // would be displaced before their next use. Restore the independently
+        // owned cache pointer before scope cleanup and retention accounting.
+        const retained = state.resolved;
+        if (!plan.retain_decoded) {
+            if (retained) |resolved| {
+                resolved.deinit(state.allocator orelse self.allocator);
+                resolved.recovered_optional_failure = false;
+            }
+            state.resolved = null;
+        }
+        defer state.resolved = retained;
         if (!plan.valid or plan.identity == 0) return error.InvalidBatch;
         const identity = ReadIdentity{ .canonical = plan.identity, .namespace = namespace };
         if (checkpoint.document_index_root_page == 0) {
@@ -17963,4 +17976,34 @@ test "lite decoded first prepared capture preserves opaque reader memory floor" 
     try std.testing.expectEqual(@as(usize, 1), output.count);
     try std.testing.expectEqual(@as(?f64, 3), output.value);
     try std.testing.expect(resolved.recovered_optional_failure);
+}
+
+test "lite decoded streaming plans initialize lazy state ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "streaming-lazy-state.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    try file.putDocument("a\x00\x00", &raw);
+    var compiled = try @import("../prepared_score_request.zig").PreparedScoreChunks.init(a, &.{ "", "q/" }, &.{"a"});
+    defer compiled.deinit();
+    var resolved = ResolvedScoreBatch{};
+    var state = DocumentBatchReadState{ .resolved = &resolved };
+    defer state.deinit();
+    const Output = struct {
+        value: ?f64 = null,
+        fn write(ctx: *anyopaque, _: usize, score: ?f64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.value = score;
+        }
+    };
+    var output = Output{};
+    try file.visitPreparedScoresAtCheckpointWithState(a, file.activeCheckpoint(), compiled.chunkPlans()[0].request.plan(), "", .{ .context = &output, .write = Output.write }, &state);
+    try std.testing.expectEqual(@as(?f64, 3), output.value);
+    try std.testing.expect(state.allocator != null);
+    try std.testing.expect(resolved.storage == null);
 }

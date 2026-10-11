@@ -59,6 +59,9 @@ pub const PreparedScorePlan = struct {
     column_count: usize = 0,
     column_order_identity: bool = true,
     dense_columns: bool = false,
+    // Immutable multi-chunk scans do not churn the single-entry decoded cache.
+    // This is a read admission hint, not part of canonical key identity.
+    retain_decoded: bool = true,
 
     pub fn deinit(self: *@This()) void {
         if (self.storage) |storage| self.backing.?.free(storage);

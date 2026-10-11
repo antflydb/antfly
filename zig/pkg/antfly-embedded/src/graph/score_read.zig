@@ -24,6 +24,23 @@ pub const Stats = struct { keys: usize = 0, batches: usize = 0, plan_identity: u
 
 pub const PreparedRequest = @import("../storage/prepared_score_request.zig").PreparedScoreRequest;
 
+pub const PreparedChunks = @import("../storage/prepared_score_request.zig").PreparedScoreChunks;
+
+pub fn populateChunks(a: std.mem.Allocator, txn: anytype, request: *const PreparedChunks, columns: []const []?f64) !Stats {
+    try request.validateColumns(columns);
+    request.clearAbsentColumns(columns);
+    errdefer for (columns) |column| @memset(column, null);
+    var stats = Stats{};
+    for (request.chunkPlans()) |*chunk| {
+        var output = PreparedChunks.Output{ .owner = request, .chunk = chunk, .columns = columns };
+        const read = try visitPrepared(a, txn, &chunk.request, output.sink());
+        stats.keys += read.keys;
+        stats.batches += read.batches;
+    }
+    request.finishColumns(columns);
+    return stats;
+}
+
 /// Explicit callers declare repeated work. Clone a matching exclusively leased
 /// canonical plan, retaining its identity without rebuilding or sorting keys.
 pub fn prepareRequestForReuse(alloc: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8) !PreparedRequest {
@@ -56,10 +73,25 @@ pub fn populatePrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: 
         for (columns) |column| @memset(column, null);
         return .{};
     }
+    // Clear logical columns, not canonical prefixes: cloned column maps can
+    // place null columns at different logical positions.
+    for (plan.prefixes, 0..) |prefix, column| if (prefix == null) {
+        @memset(columns[if (plan.column_order_identity) column else plan.column_remap[column]], null);
+    };
+    var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+    return visitPrepared(caller_alloc, txn, request, output.completeSink());
+}
+
+/// Read an immutable request without comparing caller inputs or rebuilding keys.
+/// The sink assigns by canonical index; retries may overwrite partial delivery.
+pub fn visitPrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !Stats {
+    const plan = request.plan();
+    if (!plan.valid) return error.InvalidBatch;
+    if (plan.read_keys.len == 0) return .{};
     const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
     if (scoped) {
         var scope = txn.openReadScope(caller_alloc) catch |err| switch (@as(anyerror, err)) {
-            error.ReadOnly, error.Unsupported => return populate(caller_alloc, txn, plan.prefixes, plan.nodes, columns),
+            error.ReadOnly, error.Unsupported => return streamPrepared(caller_alloc, txn, request, sink),
             else => return err,
         };
         var closed = false;
@@ -68,23 +100,81 @@ pub fn populatePrepared(caller_alloc: std.mem.Allocator, txn: anytype, request: 
         if (comptime @hasDecl(Scope, "visitPreparedRequest")) {
             const supported = if (comptime @hasDecl(Scope, "supportsPreparedRequest")) scope.supportsPreparedRequest() else true;
             if (supported) {
-                for (columns, plan.prefixes) |column, prefix| if (prefix == null) {
-                    @memset(column, null);
-                };
-                var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
-                scope.visitPreparedRequest(request, output.completeSink()) catch |err| switch (@as(anyerror, err)) {
+                scope.visitPreparedRequest(request, sink) catch |err| switch (@as(anyerror, err)) {
                     error.OutOfMemory, error.ResourceBudgetExceeded => {
                         scope.close();
                         closed = true;
-                        return populate(caller_alloc, txn, plan.prefixes, plan.nodes, columns);
+                        return streamPrepared(caller_alloc, txn, request, sink);
                     },
                     else => return err,
                 };
-                return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1 };
+                return .{ .keys = plan.read_keys.len, .batches = 1 };
             }
         }
     }
-    return populate(caller_alloc, txn, plan.prefixes, plan.nodes, columns);
+    return streamPrepared(caller_alloc, txn, request, sink);
+}
+
+// Canonical keys and fanout are already owned. Replaying original input arrays
+// loses clone remaps and repeats encoding/sorting. Keep the same pinned txn and
+// stream the owned key spans through a bounded transport instead.
+fn streamPrepared(a: std.mem.Allocator, txn: anytype, request: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !Stats {
+    const read_keys = request.plan().read_keys;
+    const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
+    const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(a))).error_union.payload else void;
+    var scope: ?Scope = if (scoped) txn.openReadScope(a) catch |err|
+        (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
+    defer if (scoped) if (scope) |*active| active.close();
+    var stats = Stats{ .keys = read_keys.len };
+    const visitor = comptime scoped and @hasDecl(Scope, "visitManySortedScores");
+    const use_visitor = visitor and scope != null and (if (comptime scoped and @hasDecl(Scope, "supportsScoreVisitor")) scope.?.supportsScoreVisitor() else true);
+    const capacity: usize = @min(read_keys.len, 256);
+    const values: []?[]const u8 = if (!use_visitor) try a.alloc(?[]const u8, capacity) else &.{};
+    defer if (!use_visitor) a.free(values);
+    var offset: usize = 0;
+    while (offset < read_keys.len) {
+        const count = @min(if (use_visitor) max_keys_per_read else capacity, read_keys.len - offset);
+        const batch = read_keys[offset..][0..count];
+        if (visitor and use_visitor) {
+            const Output = struct {
+                sink: @import("../storage/backend_types.zig").CompleteScoreSink,
+                offset: usize,
+                fn write(ctx: *anyopaque, i: usize, score: f64) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    self.sink.write(self.sink.context, self.offset + i, score);
+                }
+            };
+            // Missing keys must overwrite any partial delivery from an earlier
+            // failed attempt, as must tombstones in an overlay.
+            for (0..count) |i| sink.write(sink.context, offset + i, null);
+            var output = Output{ .sink = sink, .offset = offset };
+            try scope.?.visitManySortedScores(batch, .{ .context = &output, .write = Output.write });
+        } else {
+            @memset(values[0..count], null);
+            if (scoped and scope != null) try scope.?.getManySorted(batch, values[0..count]) else try txn.getManySorted(batch, values[0..count]);
+            for (values[0..count], 0..) |raw, i| {
+                const score = if (raw) |bytes| try decodePreparedScore(bytes) else null;
+                sink.write(sink.context, offset + i, score);
+            }
+        }
+        if (scoped and @hasDecl(Scope, "reset")) if (scope) |*active| {
+            if (@typeInfo(@TypeOf(active.reset())) == .error_union) {
+                active.reset() catch |err| if (err != error.ReadScopeResetUnsupported) {
+                    return err;
+                };
+            } else active.reset();
+        };
+        offset += count;
+        stats.batches += 1;
+    }
+    return stats;
+}
+
+fn decodePreparedScore(bytes: []const u8) !f64 {
+    if (bytes.len != 8) return error.InvalidGraphMetricScore;
+    const score: f64 = @bitCast(std.mem.readInt(u64, bytes[0..8], .little));
+    if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
+    return score;
 }
 
 pub fn populate(
@@ -553,4 +643,82 @@ test "graph metric physical score reads respect erased direct capability" {
     try scope.getManySortedInto(&.{ "a", "b" }, &.{ &slots[0], &slots[1] }, &copied);
     try scope.reset();
     for (copied, &slots) |value, *slot| try std.testing.expectEqual(slot.ptr, value.?.ptr);
+}
+
+test "graph metric physical review cloned permutation fallback preserves logical rows" {
+    const a = std.testing.allocator;
+    const Plan = @import("../storage/prepared_score_plan.zig").PreparedScorePlan;
+    var source = Plan{};
+    defer source.deinit();
+    try std.testing.expect(try source.prepare(a, &.{""}, &.{ "a", "b" }));
+    try std.testing.expect(try source.prepare(a, &.{""}, &.{ "b", "a" }));
+    var request = try PreparedRequest.fromPlan(a, &source);
+    defer request.deinit();
+    const Probe = struct {
+        raw: [2][8]u8 = undefined,
+        pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+            for (requested, values) |key, *value| {
+                const row: usize = if (key[0] == 'a') 0 else 1;
+                std.mem.writeInt(u64, &self.raw[row], @bitCast(@as(f64, if (row == 0) 1 else 2)), .little);
+                value.* = &self.raw[row];
+            }
+        }
+    };
+    var txn = Probe{};
+    var column: [2]?f64 = undefined;
+    _ = try populatePrepared(a, &txn, &request, &.{&column});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 1 }, &column);
+}
+
+test "graph metric physical cloned fallback preserves null column remaps and clears partial pressure reads" {
+    const a = std.testing.allocator;
+    const Plan = @import("../storage/prepared_score_plan.zig").PreparedScorePlan;
+    var source = Plan{};
+    defer source.deinit();
+    try std.testing.expect(try source.prepare(a, &.{ "p/", null, "q/", "p/" }, &.{ "a", "b", "a" }));
+    try std.testing.expect(try source.prepare(a, &.{ null, "q/", "p/", "p/" }, &.{ "b", "a", "a" }));
+    var request = try PreparedRequest.fromPlan(a, &source);
+    defer request.deinit();
+    const Probe = struct {
+        raw: [4][8]u8 = undefined,
+        pressure: bool,
+        closed: usize = 0,
+        const Self = @This();
+        const Scope = struct {
+            parent: *Self,
+            pub fn close(self: *@This()) void {
+                self.parent.closed += 1;
+            }
+            pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+                return self.parent.getManySorted(requested, values);
+            }
+            pub fn supportsPreparedRequest(self: *const @This()) bool {
+                return self.parent.pressure;
+            }
+            pub fn visitPreparedRequest(_: *@This(), _: *const PreparedRequest, sink: @import("../storage/backend_types.zig").CompleteScoreSink) !void {
+                sink.write(sink.context, 0, 99);
+                return error.ResourceBudgetExceeded;
+            }
+        };
+        pub fn openReadScope(self: *@This(), _: std.mem.Allocator) !Scope {
+            return .{ .parent = self };
+        }
+        pub fn getManySorted(self: *@This(), requested: []const []const u8, values: []?[]const u8) !void {
+            for (requested, values) |key, *value| {
+                const index: usize = (if (key[0] == 'p') @as(usize, 0) else 2) + (if (key[2] == 'a') @as(usize, 0) else 1);
+                std.mem.writeInt(u64, &self.raw[index], @bitCast(@as(f64, @floatFromInt(index + 1))), .little);
+                value.* = &self.raw[index];
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |pressure| {
+        var txn = Probe{ .pressure = pressure };
+        var columns: [4][3]?f64 = @splat(@splat(77));
+        _ = try populatePrepared(a, &txn, &request, &.{ &columns[0], &columns[1], &columns[2], &columns[3] });
+        try std.testing.expectEqualSlices(?f64, &.{ null, null, null }, &columns[0]);
+        try std.testing.expectEqualSlices(?f64, &.{ 4, 3, 3 }, &columns[1]);
+        try std.testing.expectEqualSlices(?f64, &.{ 2, 1, 1 }, &columns[2]);
+        try std.testing.expectEqualSlices(?f64, &columns[2], &columns[3]);
+        try std.testing.expectEqual(@as(usize, 2), txn.closed);
+    }
 }
