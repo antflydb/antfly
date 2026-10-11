@@ -806,3 +806,12 @@ or keep the obsolete guard. The three-voter generated-FK campaign qualifies
 this path; the current corrected run remains pending. MATCH PARTIAL is an
 existing native extension, not a claim of PostgreSQL feature parity, and no
 original-case disposition changes follow from enabling this route.
+
+The first corrected mounted generated-FK Debug run passes both tests with no
+skips or leaks. It exercises SQL anonymous-name preparation, atomic initial
+support publication and the real three-voter hidden-child leadership transfer,
+checking the persisted generated name and plan binding before and after
+publication. A second current-source rerun, mounted primary-key qualification
+and optimized coordinator qualification remain pending. This is distributed
+FK-path evidence, not full original SQL-case parity or general activation
+completion.
