@@ -1783,3 +1783,28 @@ before testing damaged source objects. Valid cached immutable bytes are not
 mistaken for scan fallback, and restoration does not resurrect collected old
 artifacts. Timestamp DDL retries only the explicit idle, retryable 53300 response
 introduced by main's relation-catalog publication fence.
+
+
+Qualification after merging main through `7d6b35000d` (Zig 0.17.0, Debug):
+
+- All 323 lake integration tests pass: 132 shared lake/SQL and 191 API, with
+  no allocator leaks. The new scalar-identity comparison and actual native
+  Parquet aggregate consumer both pass; consumer selection uses recipe identity
+  rather than declaration position.
+- All 50 focused ranking tests pass with no leaks. The optimized-only ranking
+  benchmark is skipped in Debug.
+- The Debug production server builds. All 14 selected real-data E2Es pass across
+  the four Parquet page-version/dictionary variants and the ten text, timestamp,
+  Iceberg, sparse and incremental-generation cases. These include cold aggregate
+  integrity, native ordering/highlights/cursors, both typed partial and unique-key
+  joins, pgwire streaming, independently written Iceberg deletes, and restart.
+- Sequential paired HTTP/Parquet checks use 12,000 input rows, three alternating
+  automatic/fallback pairs, exact COUNT/SUM/MIN expectations and fresh servers.
+  Unique-key median: 0.187 s automatic versus 0.192 s forced row execution.
+  With 32 repeated rows per key (375 groups, 384,000 logical pairs), median:
+  0.079 s typed partial execution versus 1.477 s forced row execution.
+  These are small Debug fixtures; they do not establish archive-scale throughput
+  or RSS, and strategy thresholds remain cost hints.
+- Canonical license headers, the Apache dependency boundary (2,019 source files),
+  Zig formatting across all 38 changed Zig files, Python lint/format and diff
+  checks pass.
