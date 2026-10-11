@@ -389,7 +389,19 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         retained_files = list((tmp_path / "data").rglob("query-cut.json"))
         assert retained_files
         for manifest in retained_files:
-            shutil.rmtree(manifest.parent)
+            manifest.unlink(missing_ok=True)
+        partial = response(page)
+        assert [hit["_source"]["amount"] for hit in partial["hits"]["hits"]] == [
+            2,
+            3,
+            4,
+        ], partial
+        assert not list((tmp_path / "data").rglob("query-cut.json"))
+        for manifest in retained_files:
+            try:
+                shutil.rmtree(manifest.parent)
+            except FileNotFoundError:
+                pass
         recovered = response(page)
         assert [hit["_source"]["amount"] for hit in recovered["hits"]["hits"]] == [
             2,

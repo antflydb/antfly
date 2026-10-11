@@ -140,7 +140,6 @@ pub const Repository = struct {
         const bridge: TokenBridge = .{ .token = cancellation };
         var result = self.store.opened.client.getObject(self.store.opened.bucket, try self.key(a, request, namespace), .{ .skip_metadata_probe = true, .max_response_bytes = max_manifest_bytes, .cancellation = bridge.object() }) catch |err| {
             try cancellation.check();
-            std.log.warn("retained native manifest lookup failed err={s} table={d} shard={d} range={d} expires={d}", .{ @errorName(err), namespace.table_id, namespace.shard_id, namespace.range_id, request.expires_ms });
             return switch (err) {
                 error.NotFound, error.ObjectNotFound, error.FileNotFound => error.CatalogGenerationChanged,
                 else => err,
@@ -543,7 +542,11 @@ pub const Repository = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const manifest = checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace) catch |err| {
+        const bytes = self.readManifest(a, request, namespace, cancellation) catch |err| {
+            std.log.warn("retained native manifest lookup failed err={s} table={d} shard={d} range={d} expires={d}", .{ @errorName(err), namespace.table_id, namespace.shard_id, namespace.range_id, request.expires_ms });
+            return err;
+        };
+        const manifest = checkedManifest(a, bytes, request, namespace) catch |err| {
             std.log.warn("retained native manifest validation failed err={s}", .{@errorName(err)});
             return err;
         };
@@ -688,17 +691,73 @@ test "external lake native repository opens retained vector storage after local 
     }
     const pinned = try cut.pathAlloc(a, root, &id);
     defer a.free(pinned);
-    try std.Io.Dir.cwd().deleteTree(io, pinned);
+    const local_manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{pinned});
+    defer a.free(local_manifest);
+    const original_manifest = try local.storage_db_native_backup.readFileAlloc(a, io, local_manifest, max_manifest_bytes);
+    defer a.free(original_manifest);
+    const vector_current = try std.fmt.allocPrint(a, "{s}/source-vectors/CURRENT", .{pinned});
+    defer a.free(vector_current);
     request.create = false;
-    var remote = try db.openQueryCut(request, .none);
-    defer remote.close();
-    const original = (try remote.get(a, "doc")).?;
-    defer a.free(original);
-    try std.testing.expect(std.mem.indexOf(u8, original, "\"amount\":1") != null);
-    var matches = try remote.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
-    defer matches.deinit();
-    try std.testing.expectEqual(@as(u32, 1), matches.total_hits);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pinned, .{}));
+    for (0..3) |loss| {
+        // Preserve the directory while losing metadata or a sealed file.
+        // Neither invalid local bytes nor a partial cache can replace authority.
+        switch (loss) {
+            0 => try std.Io.Dir.cwd().deleteFile(io, local_manifest),
+            1 => _ = try local.storage_db_native_backup.writeFileDurable(io, local_manifest, "{invalid"),
+            2 => {
+                _ = try local.storage_db_native_backup.writeFileDurable(io, local_manifest, original_manifest);
+                try std.Io.Dir.cwd().deleteFile(io, vector_current);
+            },
+            else => unreachable,
+        }
+        var remote = try db.openQueryCut(request, .none);
+        defer remote.close();
+        const original = (try remote.get(a, "doc")).?;
+        defer a.free(original);
+        try std.testing.expect(std.mem.indexOf(u8, original, "\"amount\":1") != null);
+        var matches = try remote.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "retained" } } });
+        defer matches.deinit();
+        try std.testing.expectEqual(@as(u32, 1), matches.total_hits);
+        try std.Io.Dir.accessAbsolute(io, pinned, .{});
+        if (loss == 0) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, local_manifest, .{}));
+        if (loss == 2) try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, vector_current, .{}));
+    }
+    const remote_key = try repository.key(a, request, namespace);
+    defer a.free(remote_key);
+    try repository.store.opened.client.deleteObject(repository.store.opened.bucket, remote_key, .{});
+    try std.testing.expectError(error.CatalogGenerationChanged, db.openQueryCut(request, .none));
+    const latest = (try db.get(a, "doc")).?;
+    defer a.free(latest);
+    try std.testing.expect(std.mem.indexOf(u8, latest, "\"amount\":2") != null);
+}
+
+test "external lake invalid native cache admission protects active readers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cut-cache-admission");
+    defer directory.cleanup();
+    const root = try std.fmt.allocPrint(a, "{s}/db", .{directory.path()});
+    defer a.free(root);
+    const old_id: [64]u8 = @splat('a');
+    const new_id: [64]u8 = @splat('b');
+    const pinned = try cut.pathAlloc(a, root, &old_id);
+    defer a.free(pinned);
+    const manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{pinned});
+    defer a.free(manifest);
+    var guard = try cut.lock(a, io, root, .none);
+    defer guard.deinit();
+    for ([_]bool{ false, true }) |malformed| {
+        try fs.createDirPathPortable(io, pinned);
+        if (malformed) _ = try local.storage_db_native_backup.writeFileDurable(io, manifest, "{invalid");
+        {
+            var reader = try cut.readLease(a, io, root, &old_id, .none);
+            defer reader.deinit();
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, cut.admit(a, io, root, &new_id, .{ .max_cuts = 1, .max_bytes = 1024 }, .none));
+            try std.Io.Dir.accessAbsolute(io, pinned, .{});
+        }
+        try cut.admit(a, io, root, &new_id, .{ .max_cuts = 1, .max_bytes = 1024 }, .none);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, pinned, .{}));
+    }
 }
 
 test "external lake native repository reuses immutable extents and collects expired generations" {

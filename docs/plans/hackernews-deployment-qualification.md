@@ -432,3 +432,31 @@ The harness keeps the last nonempty deep page for restart replay, rejects
 initial duplicate IDs, preserves completed filter/publication measurements on
 failure, and continues baseline restart checks after a composed-source failure.
 Required composed coverage still fails the overall gate when unavailable.
+
+
+## Retained native cache loss
+
+A retained native generation's local directory is a cache, not a completeness
+proof. Resume validates the local manifest and sealed file identities under the
+publication guard before acquiring the local reader lease. Missing or corrupt
+local metadata, or a missing/replaced sealed file, can instead open the same
+authenticated remote generation. Table identity, original range, capability
+expiry, manifest identity, chunk scopes, lengths and checksums remain enforced.
+The engine does not capture current rows to repair an old cursor. The current
+repository opens remote pages without copying a complete generation back to disk.
+Legacy repositories can materialize a missing generation, but do not overwrite
+an invalid existing cache.
+
+Malformed or absent cache manifests also must not prevent new snapshot admission.
+Admission discards these invalid local roots only after obtaining their exclusive
+per-cut lease under the parent guard. Active local readers prevent that cleanup;
+the request fails its existing admission bound instead of deleting their files.
+Remote reader leases do not depend on the discarded local directory.
+
+The recovery regression primes the vector reader, restarts the live database,
+and then preserves the local directory while removing its manifest, corrupting
+its metadata or removing a sealed source-vector file. Each case must return the
+original row and text match from remote storage without recreating missing files.
+Removing remote commit authority must fail closed while fresh live reads still
+return the newer row. The public HTTP matrix also exercises partial cache loss
+before complete cache loss, sorted native filters and cursor restart.
