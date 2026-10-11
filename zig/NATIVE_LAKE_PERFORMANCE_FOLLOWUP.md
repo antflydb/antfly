@@ -1883,3 +1883,80 @@ Debug, main through `7d6b35000d`):
 - Zig formatting, Python lint/format, license headers, the authored embedded
   production import boundary, and diff checks pass. Archive-scale latency,
   traffic and RSS measurements remain pending.
+
+### Shared cold admission, paged serving inventories and broad range planning
+
+Cold native text admission now installs a process-owned flight before expanding
+or validating the inventory. Same-key requests wait under their own deadline,
+cancellation and authority, then acquire the resident corpus. Canceling a waiter
+does not cancel construction; a failed leader permits a waiter to retry under
+its own capability. At most sixteen distinct cold flights run concurrently.
+Inventory assembly and paged-reader scratch share one 64 MiB process budget,
+separate from the retained corpus budget. Admission pressure returns the existing
+retryable cache-busy result and releases both the flight and temporary storage.
+
+New publications include an optional authenticated serving-inventory page-tree
+root. This packs the exact file descriptors used by maintenance into ordinary
+32 KiB pages, with descriptor records chunked at 16 KiB. One encoded descriptor
+is assembled at a time, under an 8 MiB scratch cap; parsed descriptors enter the
+shared admission budget. Each assembled descriptor must match its maintenance
+manifest's length and SHA-256 checksum. Consequently serving and GC cannot
+silently disagree about the segment, statistics or physical-row children.
+Cold serving reads these pages instead of opening one object per source file.
+The existing manifests remain independently reusable maintenance and GC units.
+Old publications without a serving inventory use their previous manifest path;
+an exact maintenance refresh adds the new optional root. Reader-safe collection
+marks serving pages for current publications and leased older publications.
+
+This removes per-file object request overhead, rather than making all cold
+metadata work independent of archive size. Exact global statistics, physical
+row identities and immutable reader admissions still require the complete
+compact inventory. Publication currently streams the serving tree in full;
+it does not yet apply COW deltas to that tree. Content-addressed page verification,
+existing per-descriptor limits, and request authority checks remain mandatory.
+
+Broad text planning can now route by immutable segment identity and fold the
+term directory's authenticated interior score envelopes over an identity range.
+A query-owned page cache retains at most sixteen pages / 512 KiB. Optional range
+reads have a 64 MiB budget; exhaustion returns an unknown infinite ceiling,
+never a partial bound. Corruption and authority failures still fail the query.
+The same lowered Boolean/phrase expression composes range and leaf bounds.
+
+A best-first heap retains at most 4,096 pending ranges and emits at most 64
+segment plans per batch. Scoring retains the shared scheduler, bounded prepared
+reader cache, exact leaf refinement and deterministic global document offsets.
+A competitive cutoff can discard an entire unseen range before query reader
+binding or posting access. Strict score comparisons preserve ties across the
+identity routing order; signed boosts retain conservative infinite bounds.
+Batch workspace is reclaimed between batches, independently of a caller's arena.
+Sparse exact term inventories retain direct candidate planning. Broad exact
+inventories covering at least half of a fragmented corpus use range planning,
+as do unknown broad memberships. Legacy statistics providers keep their previous
+planner.
+
+Regression coverage includes concurrent real-Parquet cold acquisition with a
+canceled waiter, process-budget exhaustion, serving with a missing maintenance
+manifest, reader-leased inventory GC, authenticated interior range folding and
+optional-budget fallback, a 10,000-segment metadata-only pruning case, and real
+postings differential checks for signed scores, ties, filters and pagination.
+Archive-scale latency, provider traffic and peak RSS still need measurement.
+
+Qualification for shared admission, paged inventory and range planning
+(Zig 0.17.0, Debug, main merged through `22eebec31a`):
+
+- All 324 lake integration tests pass (132 shared and 192 API), with no leaks.
+  This includes independent canceled waiters and canceled-leader recovery,
+  shared admission exhaustion, legacy manifest reuse, missing-maintenance-object
+  serving, manifest/inventory consistency checks and reader-leased inventory GC.
+- All 52 focused ranking tests pass, with no leaks; the optimized-only heap
+  benchmark is skipped in Debug. Differential real-postings checks preserve
+  signed scores, ties, exclusions and cursor pages. The synthetic statistics
+  provider uses representable native field norms, matching stored quantization.
+- The production server builds after the clean merge of main. All six selected
+  public E2Es pass on that binary: fragmented text and restart for both Parquet
+  and Iceberg, independently written Iceberg commits/schema IDs/deletes, remote
+  text/highlights/cursors, incremental generations, and main's 4,000-table
+  startup/publication regression.
+- Formatting and license checks pass for all 39 Zig files changed against main.
+  The embedded production boundary (816 sources), Apache product boundary
+  (2,019 sources), and diff checks pass.

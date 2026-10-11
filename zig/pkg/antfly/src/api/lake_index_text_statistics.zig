@@ -368,12 +368,26 @@ pub const Reader = struct {
     directory: directory_mod.Roots = .{},
     identities: []const [32]u8 = &.{},
     ordinals: []const IdentityOrdinal = &.{},
+    routing: []const local.index.IndexSnapshot.TextCandidate = &.{},
+    range_reads: ?*RangeReads = null,
+    range_reductions: u64 = 0,
     candidate_bytes: usize = 0,
     plans: std.StringHashMapUnmanaged([]const directory_mod.Branch) = .empty,
     plan_bytes: usize = 0,
     plan_limit: usize = 4 * 1024 * 1024,
     planning_branch_reads: u64 = 0,
+    const RangeReads = struct {
+        store: stores.ArtifactStore,
+        reads: u64 = 64 * 1024 * 1024,
+        writes: u64 = 0,
+        pages: page_store.PageStore = undefined,
+        cache: tree.Cache = undefined,
+    };
     pub fn deinit(self: *Reader) void {
+        if (self.range_reads) |reads| {
+            reads.cache.deinit();
+            self.allocator.destroy(reads);
+        }
         var it = self.plans.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -382,7 +396,7 @@ pub const Reader = struct {
         self.plans.deinit(self.allocator);
     }
     pub fn interface(self: *Reader) local.index.IndexSnapshot.TextStatistics {
-        return .{ .ptr = self, .check = checkInterface, .frequencies = frequencies, .summary = summary, .prepare = prepare, .planning = planning, .summaries = summaries, .hierarchical = self.directory.leaves != null, .candidates = candidates };
+        return .{ .ptr = self, .check = checkInterface, .frequencies = frequencies, .summary = summary, .prepare = prepare, .planning = planning, .summaries = summaries, .hierarchical = self.directory.leaves != null, .candidates = candidates, .routing = self.routing, .range_summary = if (self.directory.version == 2 and self.directory.leaves != null and self.routing.len == self.segments.len and self.ordinals.len == self.segments.len) rangeSummary else null };
     }
     fn checkInterface(raw: *anyopaque) !void {
         return @as(*Reader, @ptrCast(@alignCast(raw))).check();
@@ -549,6 +563,64 @@ pub const Reader = struct {
         // uses DF=1 for a conservative IDF; scoring binds the true native DF.
         result.frequency = 1;
         return result;
+    }
+    /// Fold authenticated subtree envelopes over a contiguous immutable-ID
+    /// interval. Interior reductions avoid enumerating broad term memberships.
+    /// The coordinator alone uses this bounded, query-owned routing cache.
+    fn rangeSummary(raw: *anyopaque, a: A, first: usize, end: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.check();
+        if (first >= end or end > self.ordinals.len) return error.InvalidNativeLakeTextStatistics;
+        const key = try keyAlloc(a, field, term);
+        defer a.free(key);
+        const prefix = directory_mod.prefixAlloc(a, key) catch |err| switch (err) {
+            error.NativeLakeTermDirectoryKeyTooLarge => return .{ .frequency = 1, .tf_upper = std.math.inf(f32) },
+            else => return err,
+        };
+        defer a.free(prefix);
+        const lower = try std.mem.concat(a, u8, &.{ prefix, &self.ordinals[first].identity });
+        defer a.free(lower);
+        const upper = if (end == self.ordinals.len) try a.dupe(u8, prefix) else try std.mem.concat(a, u8, &.{ prefix, &self.ordinals[end].identity });
+        defer a.free(upper);
+        if (end == self.ordinals.len) upper[upper.len - 1] = 1;
+        if (self.range_reads == null) {
+            const reads = try self.allocator.create(RangeReads);
+            reads.* = .{ .store = self.read.store };
+            reads.pages = .{ .domain = self.domain, .artifacts = &reads.store, .cancellation = self.read.cancellation, .remaining_read_bytes = &reads.reads, .remaining_write_bytes = &reads.writes, .read_cache = .{ .ptr = self, .read = readPage } };
+            reads.cache = .{ .alloc = self.allocator, .underlying = reads.pages.store() };
+            self.range_reads = reads;
+        }
+        const Fold = struct {
+            value: ?Summary = null,
+            reductions: u64 = 0,
+            pub fn aggregate(self_: *@This(), bytes: []const u8, count: u64) !void {
+                const branch = try directory_mod.Branch.decode(bytes);
+                if (branch.count != count) return error.InvalidNativeLakeTermDirectory;
+                self_.merge(branch.envelope);
+                self_.reductions += 1;
+            }
+            pub fn record(self_: *@This(), _: []const u8, bytes: []const u8) !void {
+                self_.merge(try Summary.decode(bytes));
+            }
+            fn merge(self_: *@This(), value: Summary) void {
+                if (self_.value) |*current| current.merge(value) else self_.value = value;
+            }
+        };
+        var fold: Fold = .{};
+        tree.reduceRange(a, self.range_reads.?.cache.store(), self.directory.leaves, lower, upper, &fold) catch |err| switch (err) {
+            // A budget-limited optional bound becomes unknown, never a partial
+            // envelope. Exact leaf scoring still uses its own bounded seeks.
+            error.ArtifactReadBudgetExceeded => return .{ .frequency = 1, .tf_upper = std.math.inf(f32) },
+            else => return err,
+        };
+        self.range_reductions += fold.reductions;
+        try self.check();
+        if (fold.value) |value| {
+            var bound = value.bound(average, config);
+            bound.frequency = 1;
+            return bound;
+        }
+        return .{ .frequency = 0, .tf_upper = 0 };
     }
     const seek_lane_bytes = 16 * 1024 * 1024;
     const SeekBudget = struct {
@@ -1122,4 +1194,67 @@ test "external lake text statistics hierarchy plans rare terms across ten thousa
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&reader});
+}
+
+test "external lake text statistics broad ranges fold authenticated interior envelopes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("term-range-planning");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(6), .attempt = @splat(4) };
+    const key = try keyAlloc(a, "body", "common");
+    defer a.free(key);
+    const prefix = try directory_mod.prefixAlloc(a, key);
+    defer a.free(prefix);
+    const Source = struct {
+        key: []u8,
+        prefix: []const u8,
+        ordinal: u32 = 0,
+        buffer: [Summary.max_bytes]u8 = undefined,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.ordinal == 5000) return null;
+            @memcpy(self.key[0..self.prefix.len], self.prefix);
+            @memset(self.key[self.prefix.len..], 0);
+            std.mem.writeInt(u32, self.key[self.key.len - 4 ..][0..4], self.ordinal, .big);
+            self.ordinal += 1;
+            const value: Summary = .{ .frequency = 1, .max_frequency = if (self.ordinal <= 2500) 1 else 10, .min_norm = 10 };
+            return .{ .key = self.key, .value = value.encode(&self.buffer) };
+        }
+    };
+    const record_key = try a.alloc(u8, prefix.len + 32);
+    defer a.free(record_key);
+    var source: Source = .{ .key = record_key, .prefix = prefix };
+    var reads: u64 = 64 * 1024 * 1024;
+    var writes: u64 = 64 * 1024 * 1024;
+    var pages: page_store.PageStore = .{ .domain = @splat(6), .attempt = @splat(4), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var page_source = pages.store();
+    page_source.reduce = directory_mod.reduce;
+    const root = try tree.buildSorted(a, page_source, &source);
+    const ordinals = try a.alloc(IdentityOrdinal, 5000);
+    defer a.free(ordinals);
+    const segments = try a.alloc(?Ref, 5000);
+    defer a.free(segments);
+    @memset(segments, null);
+    for (ordinals, 0..) |*ordinal, i| {
+        ordinal.* = .{ .identity = @splat(0), .segment_idx = i, .doc_offset = @intCast(i) };
+        std.mem.writeInt(u32, ordinal.identity[28..32], @intCast(i), .big);
+    }
+    var reader: Reader = .{ .allocator = a, .read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, .domain = @splat(6), .global = null, .segments = segments, .ordinals = ordinals, .directory = .{ .version = 2, .leaves = root } };
+    defer reader.deinit();
+    const low = try Reader.rangeSummary(&reader, a, 0, 2500, "body", "common", 10, .{});
+    const high = try Reader.rangeSummary(&reader, a, 2500, 5000, "body", "common", 10, .{});
+    try std.testing.expect(high.tf_upper > low.tf_upper);
+    try std.testing.expect(reader.range_reductions > 0);
+    try std.testing.expect(low.tf_upper >= inverted.bm25ScoreWithIdf(1, 10, 10, 1, .{}));
+    try std.testing.expect(high.tf_upper >= inverted.bm25ScoreWithIdf(10, 10, 10, 1, .{}));
+    try std.testing.expectEqual(@as(u32, 0), (try Reader.rangeSummary(&reader, a, 0, 5000, "body", "absent", 10, .{})).frequency);
+    // An exhausted optional routing budget returns a full unknown ceiling.
+    reader.range_reads.?.cache.deinit();
+    reader.range_reads.?.reads = 0;
+    const unknown = try Reader.rangeSummary(&reader, a, 0, 5000, "body", "common", 10, .{});
+    try std.testing.expect(std.math.isInf(unknown.tf_upper));
+    reader.read.context.deadline_ns = 1;
+    try std.testing.expectError(error.DeadlineExceeded, Reader.rangeSummary(&reader, a, 0, 5000, "body", "common", 10, .{}));
 }

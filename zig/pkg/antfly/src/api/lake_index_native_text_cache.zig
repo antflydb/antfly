@@ -35,12 +35,34 @@ pub const Cache = struct {
     bytes: u64 = 0,
     reservations: std.AutoHashMapUnmanaged([32]u8, Reservation) = .empty,
     tick: u64 = 0,
+    admissions: std.AutoHashMapUnmanaged([32]u8, *Admission) = .empty,
+    inventory_budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 },
+    inventory_builds: std.atomic.Value(u64) = .init(0),
     closing: bool = false,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     // Includes schema arenas, cold segment payloads, decoded native metadata
     // and statistics across every corpus, rather than only encoded file size.
     heap_budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 256 * 1024 * 1024 },
 
+    const Admission = struct {
+        references: usize = 1,
+        finished: std.atomic.Value(bool) = .init(false),
+        ready: std.Io.Event = .unset,
+    };
+    fn releaseAdmission(self: *Cache, flight: *Admission) void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        flight.references -= 1;
+        if (flight.references == 0) std.heap.page_allocator.destroy(flight);
+    }
+    fn finishAdmission(self: *Cache, key: [32]u8, flight: *Admission, io: std.Io) void {
+        platform.sync.lockYielding(&self.mutex);
+        _ = self.admissions.remove(key);
+        flight.finished.store(true, .release);
+        flight.ready.set(io);
+        self.mutex.unlock();
+        self.releaseAdmission(flight);
+    }
     const Charge = struct { key: [32]u8, bytes: u64 };
     const Reservation = struct { references: usize, bytes: u64 };
     fn charge(compatible: [32]u8, id: []const u8, bytes: u64) Charge {
@@ -86,6 +108,7 @@ pub const Cache = struct {
     }
     fn acquireOnce(self: *Cache, io: std.Io, store: stores.ArtifactStore, root_ref: local.serverless_manifest_artifact_ref.ArtifactRef, directory: corpus.Root, schema_json: []const u8, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
         try context.ensureActive();
+        try cancellation.check();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("native-lake-text-snapshot-cache-v1");
         hash.update(&cached.scope);
@@ -101,20 +124,65 @@ pub const Cache = struct {
                 _ = entry.references.fetchAdd(1, .monotonic);
                 self.mutex.unlock();
                 errdefer entry.release();
-                try entry.awaitReady(io, context);
+                entry.awaitReady(io, context) catch |err| {
+                    if (entry.state.load(.acquire) != .failed) return err;
+                    try context.ensureActive();
+                    try cancellation.check();
+                    return error.NativeLakeTextCacheRetry;
+                };
                 return try entry.source(store, cached, context, cancellation);
             }
         };
+        if (self.closing) {
+            self.mutex.unlock();
+            return error.Canceled;
+        }
+        if (self.admissions.get(key)) |flight| {
+            flight.references += 1;
+            self.mutex.unlock();
+            defer self.releaseAdmission(flight);
+            while (!flight.finished.load(.acquire)) {
+                try context.ensureActive();
+                try cancellation.check();
+                flight.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+            }
+            try context.ensureActive();
+            try cancellation.check();
+            // A leader owns only its own authority. Retry the resident entry
+            // (or a failed admission) under this waiter's capability.
+            return error.NativeLakeTextCacheRetry;
+        }
+        if (self.admissions.count() >= 16) {
+            self.mutex.unlock();
+            return error.NativeLakeTextCacheBusy;
+        }
+        const flight = std.heap.page_allocator.create(Admission) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        flight.* = .{};
+        self.admissions.put(std.heap.page_allocator, key, flight) catch |err| {
+            self.mutex.unlock();
+            std.heap.page_allocator.destroy(flight);
+            return err;
+        };
         self.mutex.unlock();
+        defer self.finishAdmission(key, flight, io);
+        _ = self.inventory_builds.fetchAdd(1, .monotonic);
         // Directory decoding finishes before acquiring child cache flights.
         // A large manifest can safely request exclusive decode admission.
-        var metadata_budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+        var metadata_budget: local.sql_memory_budget = .{ .backing = self.inventory_budget.allocator(), .limit = self.inventory_budget.limit };
         var metadata_arena = std.heap.ArenaAllocator.init(metadata_budget.allocator());
         defer metadata_arena.deinit();
-        const inventory = try corpus.admitInventory(metadata_arena.allocator(), directory, store, cached, cancellation);
+        const inventory = corpus.admitInventoryBounded(metadata_arena.allocator(), self.inventory_budget.allocator(), directory, store, cached, cancellation) catch |err| {
+            if (err == error.OutOfMemory and self.inventory_budget.isExhausted()) return error.NativeLakeTextCacheBusy;
+            return err;
+        };
         defer inventory.deinit();
         const root = inventory.root;
-        try root.validate();
         var bytes: u64 = root_ref.byte_len;
         for (root.segments) |segment| bytes = std.math.add(u64, bytes, segment.byte_len) catch return error.NativeLakeTextCorpusTooLarge;
         if (bytes > (if (root.seekable) self.max_seekable_bytes orelse self.max_bytes else self.max_bytes) or self.max_entries == 0) return error.NativeLakeTextCorpusTooLarge;
@@ -143,7 +211,12 @@ pub const Cache = struct {
                 _ = entry.references.fetchAdd(1, .monotonic);
                 self.mutex.unlock();
                 errdefer entry.release();
-                try entry.awaitReady(io, context);
+                entry.awaitReady(io, context) catch |err| {
+                    if (entry.state.load(.acquire) != .failed) return err;
+                    try context.ensureActive();
+                    try cancellation.check();
+                    return error.NativeLakeTextCacheRetry;
+                };
                 return try entry.source(store, cached, context, cancellation);
             }
             if (entry.references.load(.acquire) != 1) {
@@ -290,6 +363,8 @@ pub const Cache = struct {
             entry.*.release();
         }
         entries.deinit(std.heap.page_allocator);
+        std.debug.assert(self.admissions.count() == 0 and self.inventory_budget.live == 0);
+        self.admissions.deinit(std.heap.page_allocator);
         std.debug.assert(self.bytes == 0 and self.reservations.count() == 0);
         self.reservations.deinit(std.heap.page_allocator);
         std.debug.assert(self.heap_budget.live == 0);
@@ -332,6 +407,7 @@ const Entry = struct {
     term_directory: corpus.term_directory.Roots = .{},
     statistics_identities: []const [32]u8 = &.{},
     statistics_ordinals: []const corpus.statistics.IdentityOrdinal = &.{},
+    statistics_routing: []const local.index.IndexSnapshot.TextCandidate = &.{},
     domain: [32]u8 = @splat(0),
     identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
@@ -480,6 +556,9 @@ const Entry = struct {
             }
             std.mem.sort(corpus.statistics.IdentityOrdinal, ordinals, {}, corpus.statistics.identityLess);
             self.statistics_ordinals = ordinals;
+            const routing = try a.alloc(local.index.IndexSnapshot.TextCandidate, ordinals.len);
+            for (routing, ordinals) |*candidate, ordinal| candidate.* = .{ .segment_idx = ordinal.segment_idx, .doc_offset = ordinal.doc_offset };
+            self.statistics_routing = routing;
         }
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
@@ -542,7 +621,7 @@ const Entry = struct {
         lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
         const snapshot = self.writer.?.acquireSnapshotWithReadCapability(.{ .ptr = &lease.read, .check = QueryLease.checkRead, .io = context.io }) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
         if (self.statistics_version >= 1) {
-            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .allocator = self.allocator };
+            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .routing = self.statistics_routing, .allocator = self.allocator };
             snapshot.text_statistics = lease.statistics.interface();
         }
         return .{ .read_context = &lease.read, .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };

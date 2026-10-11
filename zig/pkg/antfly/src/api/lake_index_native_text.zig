@@ -103,15 +103,21 @@ pub const Root = struct {
     recipe: [32]u8 = @splat(0),
     file_groups: []const FileGroup = &.{},
     manifests: []const artifacts.ChunkRef = &.{},
+    /// Authenticated paged serving inventory; file manifests remain maintenance units.
+    serving_inventory: ?statistics.Ref = null,
     admission_version: u8 = 0,
     statistics_version: u8 = 0,
     term_statistics: ?statistics.Ref = null,
     term_directory: term_directory.Roots = .{},
     pub fn validate(self: Root) !void {
+        return self.validateAlloc(std.heap.page_allocator);
+    }
+    fn validateAlloc(self: Root, a: A) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
         if (self.statistics_version > 2 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.serving_inventory) |ref| try ref.validate();
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_version < 2 and (self.term_directory.branches != null or self.term_directory.leaves != null)) return error.InvalidNativeLakeTextCorpus;
         if ((self.term_directory.branches == null) != (self.term_directory.leaves == null)) return error.InvalidNativeLakeTextCorpus;
@@ -138,12 +144,12 @@ pub const Root = struct {
         }
         if (self.file_groups.len != 0 and segment_position != self.segments.len) return error.InvalidNativeLakeTextCorpus;
         var identities: std.StringHashMapUnmanaged(void) = .empty;
-        defer identities.deinit(std.heap.page_allocator);
+        defer identities.deinit(a);
         for (self.segments) |segment| {
             if (segment.byte_len == 0 or segment.byte_len > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(segment.artifact_id, segment.checksum);
             const scope = (try stores.uploadScopeFromArtifactId(segment.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
-            if (!std.mem.eql(u8, &scope.domain, &self.domain) or (try identities.getOrPut(std.heap.page_allocator, segment.artifact_id)).found_existing) return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &self.domain) or (try identities.getOrPut(a, segment.artifact_id)).found_existing) return error.InvalidNativeLakeTextCorpus;
         }
     }
 };
@@ -190,12 +196,21 @@ fn loadCachedFile(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Can
     return loadFileManifest(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, scope.domain, cancellation, cache);
 }
 pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    return admitInventoryBounded(a, std.heap.page_allocator, directory, store, cached, cancellation);
+}
+pub fn admitInventoryBounded(a: A, scratch_backing: A, directory: Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Inventory {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    if (directory.serving_inventory != null and directory.file_groups.len == 0) return .{ .root = try readServingInventory(a, scratch_backing, directory, store, cached, cancellation), .manifests = &.{} };
     const Owned = @import("lake_index_decoded_metadata.zig").Owned(FileGroup);
     const manifests = try a.alloc(?Owned, directory.manifests.len);
     @memset(manifests, null);
     var inventory: Inventory = .{ .root = directory, .manifests = manifests };
     errdefer inventory.deinit();
-    if (manifests.len == 0 or directory.file_groups.len != 0) return inventory;
+    if (manifests.len == 0 or directory.file_groups.len != 0) {
+        try directory.validateAlloc(scratch_backing);
+        return inventory;
+    }
     const Work = struct {
         directory: Root,
         store: stores.ArtifactStore,
@@ -257,8 +272,108 @@ pub fn admitInventory(a: A, directory: Root, store: stores.ArtifactStore, cached
     }
     inventory.root.file_groups = groups;
     inventory.root.segments = segments;
-    try inventory.root.validate();
+    try inventory.root.validateAlloc(scratch_backing);
     return inventory;
+}
+// Serving records are bounded chunks of one file descriptor, ordered by file
+// and byte offset. This preserves the existing validated descriptor contract
+// while packing many small files into ordinary 32 KiB authenticated pages.
+// Only one encoded descriptor is retained while streaming in either direction.
+const inventory_chunk_bytes = 16 * 1024;
+const inventory_tree = @import("../serverless/graph_segment/page_tree.zig");
+const inventory_pages = @import("../serverless/graph_segment/page_store.zig");
+fn writeServingInventory(a: A, store: *stores.ArtifactStore, groups: []const FileGroup, cancellation: Cancellation) !?statistics.Ref {
+    const Source = struct {
+        a: A,
+        groups: []const FileGroup,
+        file: usize = 0,
+        offset: usize = 0,
+        bytes: ?[]u8 = null,
+        key: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?inventory_tree.Cursor.Record {
+            if (self.bytes) |bytes| if (self.offset == bytes.len) {
+                self.a.free(bytes);
+                self.bytes = null;
+                self.file += 1;
+                self.offset = 0;
+            };
+            if (self.file == self.groups.len) return null;
+            if (self.bytes == null) self.bytes = try std.json.Stringify.valueAlloc(self.a, self.groups[self.file], .{});
+            const bytes = self.bytes.?;
+            if (bytes.len == 0 or bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+            std.mem.writeInt(u32, self.key[0..4], @intCast(self.file), .big);
+            std.mem.writeInt(u32, self.key[4..8], @intCast(self.offset), .big);
+            const end = @min(bytes.len, self.offset + inventory_chunk_bytes);
+            const value = bytes[self.offset..end];
+            self.offset = end;
+            return .{ .key = &self.key, .value = value };
+        }
+    };
+    var source: Source = .{ .a = a, .groups = groups };
+    defer if (source.bytes) |bytes| a.free(bytes);
+    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+    var reads: u64 = 0;
+    var writes: u64 = 128 * 1024 * 1024;
+    var pages: inventory_pages.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    return inventory_tree.buildSorted(a, pages.store(), &source);
+}
+fn readServingInventory(a: A, scratch_backing: A, directory: Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Root {
+    const Read = struct {
+        cached: artifacts.CachedRead,
+        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cached.context.ensureActive();
+            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
+            try stores.chargeReadBudget(budget, length);
+            return artifacts.readArtifact(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        }
+    };
+    var reader: Read = .{ .cached = cached };
+    var store = store_value;
+    var reads: u64 = 128 * 1024 * 1024;
+    var writes: u64 = 0;
+    var pages: inventory_pages.PageStore = .{ .domain = directory.domain, .artifacts = &store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &reader, .read = Read.page } };
+    // Cursor pages and encoded descriptor scratch are released immediately;
+    // only the parsed serving descriptors enter the admission allocator.
+    var scratch_budget: local.sql_memory_budget = .{ .backing = scratch_backing, .limit = 8 * 1024 * 1024 };
+    const scratch = scratch_budget.allocator();
+    var cursor = try inventory_tree.Cursor.init(scratch, pages.store(), directory.serving_inventory, "", null);
+    defer cursor.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(scratch);
+    var groups: std.ArrayList(FileGroup) = .empty;
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    while (try cursor.next()) |record| {
+        try cached.context.ensureActive();
+        try cancellation.check();
+        if (record.key.len != 8 or record.value.len == 0 or record.value.len > inventory_chunk_bytes) return error.InvalidNativeLakeTextCorpus;
+        const file = std.mem.readInt(u32, record.key[0..4], .big);
+        const offset = std.mem.readInt(u32, record.key[4..8], .big);
+        if (offset == 0 and bytes.items.len != 0) {
+            try appendServingGroup(a, directory, bytes.items, &groups, &segments, cancellation);
+            bytes.clearRetainingCapacity();
+        }
+        if (file != groups.items.len or offset != bytes.items.len or record.value.len > max_root_bytes -| bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+        try bytes.appendSlice(scratch, record.value);
+    }
+    if (bytes.items.len != 0) try appendServingGroup(a, directory, bytes.items, &groups, &segments, cancellation);
+    if (groups.items.len != directory.manifests.len) return error.InvalidNativeLakeTextCorpus;
+    var root = directory;
+    root.file_groups = groups.items;
+    root.segments = segments.items;
+    try root.validateAlloc(scratch_backing);
+    return root;
+}
+fn appendServingGroup(a: A, directory: Root, bytes: []const u8, groups: *std.ArrayList(FileGroup), segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation) !void {
+    if (groups.items.len >= directory.manifests.len or groups.items.len >= 16384) return error.InvalidNativeLakeTextCorpus;
+    const manifest = directory.manifests[groups.items.len];
+    if (manifest.byte_len != bytes.len) return error.InvalidNativeLakeTextCorpus;
+    // Serving and maintenance/GC must describe exactly the same children.
+    try stores.validatePayloadSha256WithCancellation(bytes, manifest.checksum, cancellation);
+    const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
+    try groups.append(a, group);
+    try segments.appendSlice(a, group.segments);
 }
 pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
     // Legacy/maintenance callers own the returned plain descriptors in their
@@ -405,7 +520,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var exact_seed: ?Root = null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and (root.serving_inventory != null or root.file_groups.len == 0) and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -562,6 +677,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const ref = try page_upload.putWithCancellation(page, cancellation);
             manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         }
+        root.serving_inventory = try writeServingInventory(a, store, groups, cancellation);
         root.manifests = manifests;
         root.file_groups = &.{};
         root.segments = &.{};

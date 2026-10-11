@@ -1011,6 +1011,9 @@ pub const IndexSnapshot = struct {
         ptr: *anyopaque,
         check: *const fn (*anyopaque) anyerror!void,
         hierarchical: bool = false,
+        /// Stable corpus-owned routing order for bounded best-first range planning.
+        routing: []const TextCandidate = &.{},
+        range_summary: ?*const fn (*anyopaque, Allocator, usize, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!TextTermSummary = null,
         candidates: ?*const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!?[]const TextCandidate = null,
         summaries: ?*const fn (*anyopaque, Allocator, usize, []const u8, []const []const u8, f32, inverted.BM25Config, []TextTermSummary) anyerror!void = null,
         prepare: ?*const fn (*anyopaque, Allocator, []const u8, []const []const u8) anyerror!void = null,
