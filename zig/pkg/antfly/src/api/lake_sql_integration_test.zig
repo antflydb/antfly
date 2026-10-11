@@ -282,6 +282,28 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     var committed_result = try committed.execute(a, &compiled, &.{}, .{}, null);
     defer committed_result.deinit();
     try std.testing.expectEqualStrings("1", committed_result.output.rows[0][0].string);
+    // Production preflight and scan polling must retain the same deadline.
+    const BudgetObserver = struct {
+        adapter: *Adapter,
+        observed: ?u64 = null,
+        changed: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            const observer: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (observer.adapter.receipt_wait_budget.deadline_ns) |deadline| {
+                if (observer.observed) |previous| observer.changed = observer.changed or previous != deadline;
+                observer.observed = deadline;
+            }
+            return false;
+        }
+    };
+    var observer: BudgetObserver = .{ .adapter = &committed };
+    committed.context.cancellation = .{ .ptr = &observer, .is_cancelled_fn = BudgetObserver.canceled };
+    committed.read_requirements.wait_ms = 1000;
+    var checked = try committed.execute(a, &compiled, &.{}, .{}, null);
+    defer checked.deinit();
+    try std.testing.expectEqualStrings("1", checked.output.rows[0][0].string);
+    try std.testing.expect(observer.observed != null);
+    try std.testing.expect(!observer.changed);
     // An already covered receipt must not succeed after its positive polling
     // budget expires while the provider performs readiness checkpoints.
     const SlowCheckpoint = struct {
