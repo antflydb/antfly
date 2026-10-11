@@ -230,6 +230,20 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 1 }, .wait_ms = 0 } };
     var compiled = try local.sql_compiler.compile(a, "SELECT SUM(amount) FROM events", .{});
     defer compiled.deinit();
+    // LIMIT 0 must enforce readiness even though no physical scan opens.
+    var empty = try local.sql_compiler.compile(a, "SELECT amount FROM events LIMIT 0", .{});
+    defer empty.deinit();
+    var empty_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .read_requirements = .{ .visibility = .committed, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 1 }, .wait_ms = 0 } };
+    try std.testing.expectError(error.ReadRequirementNotReady, empty_adapter.execute(a, &empty, &.{}, .{}, null));
+    try std.testing.expectError(error.ReadRequirementNotReady, local.sql_read_stream.Stream.open(a, empty_adapter.backend(), &empty, &.{}, .{}));
+    empty_adapter.read_requirements.visibility = .accepted;
+    empty_adapter.lake_visibility = .accepted;
+    var accepted_empty = try empty_adapter.execute(a, &empty, &.{}, .{}, null);
+    defer accepted_empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), accepted_empty.output.rows.len);
+    const accepted_empty_stream = (try local.sql_read_stream.Stream.open(a, empty_adapter.backend(), &empty, &.{}, .{})).?;
+    defer accepted_empty_stream.close();
+    try std.testing.expect(accepted_empty_stream.exhausted);
     var first = try adapter.execute(a, &compiled, &.{}, .{}, null);
     defer first.deinit();
     try std.testing.expectEqualStrings("1", first.output.rows[0][0].string);
@@ -292,7 +306,7 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     defer joined_result.deinit();
     try std.testing.expectEqualStrings("1", joined_result.output.rows[0][0].string);
     var too_new: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 2 }, .wait_ms = 1000 } };
-    try std.testing.expectError(error.ReadSnapshotTooOld, too_new.execute(a, &compiled, &.{}, .{}, null));
+    try std.testing.expectError(error.ReadSnapshotTooOld, too_new.execute(a, &empty, &.{}, .{}, null));
     var fresh: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .lake_visibility = .accepted };
     var latest = try fresh.execute(a, &compiled, &.{}, .{}, null);
     defer latest.deinit();
