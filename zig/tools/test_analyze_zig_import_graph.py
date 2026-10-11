@@ -278,6 +278,9 @@ class ImportGraphTest(unittest.TestCase):
 
         self.assertTrue(analyzer.check_ha_seed_failure_registry(self.root))
 
+    def test_repository_ha_seed_registry_resolves_relocated_owner(self):
+        self.assertTrue(analyzer.check_ha_seed_failure_registry())
+
     def test_ha_seed_failure_registry_rejects_unmapped_domain_error(self):
         self.write_ha_seed_failure_fixture(
             "",
@@ -312,6 +315,13 @@ class ImportGraphTest(unittest.TestCase):
             'pub const storage_db_db = @import("storage/db/db.zig");\n'
             'pub const storage_lite_mod = @import("storage/lite/mod.zig");\n',
         )
+        other = self.write(
+            "embedded/storage/new_plan.zig", "pub const Plan = struct {};\n"
+        )
+        self.write(
+            "embedded/source_catalog.zig",
+            'pub const storage_new_plan = @import("storage/new_plan.zig");\n',
+        )
         direct = self.write(
             "server/direct.zig",
             'const db = @import("antfly_local_sources").storage_db_db;\n',
@@ -326,6 +336,11 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(graph.resolve_source("storage/db/db.zig"), physical)
         self.assertEqual(graph.relative_edges(direct), (physical,))
         self.assertEqual(graph.relative_edges(aliased), (physical,))
+        selected = self.write(
+            "server/physical.zig",
+            'const plan = @import("antfly_local_sources").storage_new_plan;\n',
+        )
+        self.assertEqual(graph.relative_edges(selected), (other,))
         self.assertNotIn(unused, graph.closure([direct]))
         self.assertEqual(
             graph.relative_name(physical), "@antfly-embedded/storage/db/db.zig"
