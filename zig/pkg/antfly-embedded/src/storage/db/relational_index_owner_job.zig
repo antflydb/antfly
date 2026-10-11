@@ -40,6 +40,44 @@ pub const cancellation_cleanup_key = key ++ ":cancel-gc";
 /// private job, so cancellation cannot deadlock behind a full churn queue.
 pub const CancellationCleanup = struct { position: positions.Native, duplicate: bool };
 
+/// Retain claim scope with queue admission, before the large immutable inputs
+/// can be retired. The generation is derived from the table incarnation and
+/// burned allocation, never from a request-selected constraint name or hash.
+pub const CancellationCleanupRecord = struct {
+    pub const encoded_len = 416;
+    intent: cancellation.Intent,
+    position: positions.Native,
+    claim_allocation: u64,
+
+    pub fn claimGeneration(self: CancellationCleanupRecord) !@import("relational_integrity.zig").Generation {
+        return integrity_catalog.privateIndexGeneration(self.intent.fence.namespace.table_id, self.claim_allocation);
+    }
+
+    pub fn encode(self: CancellationCleanupRecord) ![encoded_len]u8 {
+        _ = try self.claimGeneration();
+        const admission: cancellation.Record = .{ .intent = self.intent, .position = self.position };
+        var bytes: [encoded_len]u8 = undefined;
+        @memcpy(bytes[0..8], "AICG\x01\x00\x00\x00");
+        @memcpy(bytes[8..376], &try admission.encode());
+        std.mem.writeInt(u64, bytes[376..384], self.claim_allocation, .little);
+        @memcpy(bytes[384..416], &digest(bytes[0..384]));
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !CancellationCleanupRecord {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICG\x01\x00\x00\x00") or
+            !std.mem.eql(u8, bytes[384..416], &digest(bytes[0..384]))) return error.InvalidPrivateIndexCancellation;
+        const admission = try cancellation.Record.decode(bytes[8..376]);
+        const result: CancellationCleanupRecord = .{
+            .intent = admission.intent,
+            .position = admission.position,
+            .claim_allocation = std.mem.readInt(u64, bytes[376..384], .little),
+        };
+        _ = result.claimGeneration() catch return error.InvalidPrivateIndexCancellation;
+        return result;
+    }
+};
+
 fn digest(bytes: []const u8) Digest {
     var result: Digest = undefined;
     std.crypto.hash.Blake3.hash(bytes, &result, .{});
@@ -291,6 +329,7 @@ pub const CancellationState = struct {
     fenced: ?positions.Native = null,
     reserved: ?positions.Native = null,
     cleanup: ?positions.Native = null,
+    claim_allocation: ?u64 = null,
     artifacts_retired: bool = false,
 
     /// Validate a decoded inspection before dispatching another owner effect.
@@ -320,9 +359,10 @@ pub const CancellationState = struct {
         if (self.fenced) |cut| if (self.admitted == null or cut.sequence <= self.admitted.?.sequence) return error.InvalidPrivateIndexCancellation;
         if (self.reserved) |cut| if (self.fenced == null or cut.sequence <= self.fenced.?.sequence) return error.InvalidPrivateIndexCancellation;
         if (self.cleanup) |cut| {
-            if (self.intent == null or self.reserved == null or cut.sequence <= self.intent.?.position.sequence or cut.sequence <= self.reserved.?.sequence)
+            if (self.intent == null or self.reserved == null or self.claim_allocation == null or self.claim_allocation.? == 0 or
+                cut.sequence <= self.intent.?.position.sequence or cut.sequence <= self.reserved.?.sequence)
                 return error.InvalidPrivateIndexCancellation;
-        }
+        } else if (self.claim_allocation != null) return error.InvalidPrivateIndexCancellation;
         if (self.artifacts_retired and self.cleanup == null) return error.InvalidPrivateIndexCancellation;
     }
 };
@@ -355,6 +395,7 @@ pub fn inspectCancellation(txn: anytype, expected: anytype) !CancellationState {
     if (try loadCancellationCleanup(txn, binding)) |record| {
         const current = binding orelse return error.InvalidPrivateIndexCancellation;
         result.cleanup = record.position;
+        result.claim_allocation = record.claim_allocation;
         if (requireCancellationArtifactsRetired(txn, current)) |_| {
             result.artifacts_retired = true;
         } else |err| switch (err) {
@@ -744,9 +785,9 @@ pub fn stageCancellationIntentWithReplay(txn: anytype, intent: cancellation.Inte
     return cancellation.stage(txn, intent, binding, replay);
 }
 
-fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?cancellation.Record {
+fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?CancellationCleanupRecord {
     // Decode before any subsequent store read invalidates borrowed bytes.
-    const record = try cancellation.Record.decode((try optional(txn, cancellation_cleanup_key)) orelse return null);
+    const record = try CancellationCleanupRecord.decode((try optional(txn, cancellation_cleanup_key)) orelse return null);
     const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.intent.fence.namespace));
     if (record.position.sequence > authority.sequence) return error.InvalidPrivateIndexCancellation;
     if (binding) |current| if (record.intent.eql(cancellation.Intent.fromBinding(current))) {
@@ -756,6 +797,8 @@ fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?cancellation.Recor
         const reserved = try requireNativeCut(txn, current, .reserved);
         if (record.position.sequence <= intent.position.sequence or record.position.sequence <= reserved.position.sequence)
             return error.InvalidPrivateIndexCancellation;
+        const allocation = try integrity_catalog.privateIndexAllocationFromReservation(try txn.get(integrity_catalog.key), current.integrity_reserved, current.fence.namespace.table_id);
+        if (record.claim_allocation != allocation.allocation) return error.InvalidPrivateIndexCancellation;
         return record;
     };
     // An old slot is inert only after its exact epoch has been consumed.
@@ -784,8 +827,9 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
         return .{ .position = record.position, .duplicate = true };
     }
     if (try optional(txn, &queue_key) != null) return error.InvalidPrivateIndexCancellation;
+    const allocation = try integrity_catalog.privateIndexAllocationFromReservation(try txn.get(integrity_catalog.key), binding.integrity_reserved, binding.fence.namespace.table_id);
     const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.sequence else null) };
-    const record: cancellation.Record = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position };
+    const record: CancellationCleanupRecord = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position, .claim_allocation = allocation.allocation };
     try txn.put(cancellation_cleanup_key, &try record.encode());
     try txn.put(&queue_key, &gc.initial(binding.index));
     return .{ .position = position, .duplicate = false };

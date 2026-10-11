@@ -1428,6 +1428,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
     var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
     defer status.deinit();
     try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+    try std.testing.expect(status.value.claim_allocation != null);
     try std.testing.expectEqual(@as(u64, 5), status.value.cleanup.?.sequence);
     try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
 }

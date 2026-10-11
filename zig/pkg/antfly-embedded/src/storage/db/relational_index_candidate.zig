@@ -1000,6 +1000,11 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
     const fence: topology.Fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .catalog_digest = hash };
     const binding = try jobs.prepare(@splat(1), @splat(2), @splat(3), 0, fence, .native, &candidate, &private_addition);
     const intent = cancellation.Intent.fromBinding(binding);
+    const claim_scope = try catalog.privateIndexAllocationFromReservation(candidate.reservation.value, binding.integrity_reserved, fence.namespace.table_id);
+    const added_unique = candidate.next.catalog.find(.unique, "email_idx").?;
+    try std.testing.expectEqual(added_unique.allocation, claim_scope.allocation);
+    try std.testing.expectEqual(added_unique.generation, claim_scope.generation);
+    try std.testing.expectError(error.InvalidIntegrityCatalog, catalog.privateIndexAllocationFromReservation(candidate.reservation.value, binding.integrity_reserved, fence.namespace.table_id + 1));
     try std.testing.expect(physical.Controller.isReservedMetadataKey(cancellation.key));
     try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{.{ .key = cancellation.key, .value = "forged" }}, &.{}));
     try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, physical.Controller.validateExtraMetadata(&.{}, &.{cancellation.key}));
@@ -1218,10 +1223,25 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         try std.testing.expectEqual(queued.position, retry.position);
         try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&txn, binding));
         try testOwnerRecoveryAllocations(a, &txn);
-        var invalid_cleanup: cancellation.Record = .{ .intent = intent, .position = committed.position };
+        const stored_cleanup = try jobs.CancellationCleanupRecord.decode(try txn.get(jobs.cancellation_cleanup_key));
+        try std.testing.expectEqual(claim_scope.allocation, stored_cleanup.claim_allocation);
+        try std.testing.expectEqual(claim_scope.generation, try stored_cleanup.claimGeneration());
+        const cleanup_bytes = try stored_cleanup.encode();
+        for (0..cleanup_bytes.len) |length| try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.CancellationCleanupRecord.decode(cleanup_bytes[0..length]));
+        for ([_]usize{ 0, 5, 375, 376, 415 }) |offset| {
+            var corrupt = cleanup_bytes;
+            corrupt[offset] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.CancellationCleanupRecord.decode(&corrupt));
+        }
+        var invalid_cleanup = stored_cleanup;
+        invalid_cleanup.position = committed.position;
         try txn.put(jobs.cancellation_cleanup_key, &try invalid_cleanup.encode());
         try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
-        invalid_cleanup.position = queued.position;
+        invalid_cleanup = stored_cleanup;
+        invalid_cleanup.claim_allocation += 1;
+        try txn.put(jobs.cancellation_cleanup_key, &try invalid_cleanup.encode());
+        try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
+        invalid_cleanup = stored_cleanup;
         invalid_cleanup.intent.owner_digest[0] ^= 1;
         try txn.put(jobs.cancellation_cleanup_key, &try invalid_cleanup.encode());
         try std.testing.expectError(error.InvalidPrivateIndexCancellation, testOwnerRecoveryAllocations(a, &txn));
