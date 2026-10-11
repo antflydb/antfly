@@ -2815,3 +2815,32 @@ attestation/capability admission, complete build/validation/install/release,
 cohort cancellation and native restore/adoption still require integration and
 distributed fault evidence. The public failed-UNIQUE-build atomicity gate is
 still open. No new original-case credit is claimed: 478 / 136 / 73 / 899.
+
+### Compiled claim delivery and leased-root provenance
+
+Checkpoint `7873b6c95d` adds bounded claim delivery through the existing compiled
+owner control interface, not a separate public index route. Request decoding
+rejects a 129th claim before parsing or allocating it, enforces the shared byte
+budget incrementally and rejects foreign fields. The leased adapter validates
+the returned binding, native position, duplicate count and pending/error state.
+Seventeen distinct control failures now retain their typed identity across the
+compiled boundary; mixed failure/owner ABI versions are rejected explicitly.
+
+Checkpoint `e571659b5d` returns the physical root generation from the same lease
+that applied or recovered the claim result. The owned result is suitable input
+to later authenticated receipt construction; it is not itself an attestation.
+Observational callers may transfer just the parsed result, but signing callers
+must retain its root instead of consulting a later routing/status lookup.
+
+The rooted adapter passed all 48 Debug build steps and three focused compiled
+owner tests, including fresh and duplicate binary claims, recovered owner state,
+foreign-owner rejection and cancellation/deadline checks before acquisition.
+No skips, failures or leaks occurred. The independent PostgreSQL lifecycle
+oracle passed all sixteen tests; the original inventory audit, selected Zig
+formatting, control-catalog freshness and Apache source-boundary checks pass.
+The broader claim-delivery storage gate is still running at this checkpoint.
+
+Public native claim production remains disabled. Authenticated mounted delivery,
+root enrollment/signing/capability barriers, complete activation and retirement,
+restore/adoption and distributed faults remain required. Neither these three
+component tests nor the oracle run close an original SQL case.
