@@ -6031,7 +6031,7 @@ pub fn searchStorageKernelQueryJson(
             request.control.cancellation_fn,
             out_failure,
         ) catch |err| {
-            if (err == error.CatalogGenerationChanged) std.log.warn("local query provider conflict operation={d}", .{out_failure.operation});
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query provider conflict operation={d} provider_error={s}", .{ out_failure.operation, out_failure.boundedErrorName() });
             // A valid provider failure already carries the exact envelope.
             // Consumer-side allocation/protocol failures originate in this
             // outer operation and receive their own identity.
