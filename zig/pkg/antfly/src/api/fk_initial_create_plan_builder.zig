@@ -52,10 +52,10 @@ fn parentsSettled(tables_snapshot: []const records.TableRecord, child_name: []co
     return !pending;
 }
 
-/// The support-index DDL is committed before initial CREATE planning. Its
-/// schema migration can still replace the parent's exact TableRecord while
-/// owner read-index fences are being collected. Pin only a finalized parent
-/// definition; the owner stage separately waits for physical index readiness.
+/// An existing parent migration can still replace its exact TableRecord while
+/// owner read-index fences are being collected. Pin a finalized predecessor;
+/// any new support definitions are staged in the initial publication plan,
+/// not committed here. The owner stage waits for physical index readiness.
 fn settledParentSnapshot(
     server: *server_mod.ApiHttpServer,
     context: operation.RequestContext,
