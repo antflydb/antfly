@@ -80,11 +80,11 @@ test "FK generation pending keys preserve numeric order" {
 }
 
 pub fn tableLockKey(buf: []u8, metadata_group_id: u64, table_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_table_lock:{d}:{d}", .{ metadata_group_id, table_id });
+    return @import("table_lifecycle_lock.zig").key(buf, metadata_group_id, table_id);
 }
 
 pub fn tableLockPrefix(buf: []u8, metadata_group_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:fk_generation_table_lock:{d}:", .{metadata_group_id});
+    return @import("table_lifecycle_lock.zig").prefix(buf, metadata_group_id);
 }
 
 pub const initial_prefix = "\x00\x00__metadata__:fk_initial_create:";
@@ -332,6 +332,11 @@ pub const Plan = struct {
         if (before.storage_mode != .relational or after.storage_mode != .relational or
             after.version != next_version)
             return error.InvalidGenerationPublication;
+        if (self.catalog_coverage == .checks_v1) {
+            const shape = @import("schema_publication_shape.zig");
+            try shape.requireTableImages(alloc, self.child_before, self.child_after);
+            try shape.requireSchemaDelta(alloc, self.child_before.schema_json, self.child_after.schema_json, &.{ "version", "foreign_keys" });
+        }
         if (self.constraint_name_guard) |guard| {
             guard.validate() catch return error.InvalidGenerationPublication;
             const admission = guard.constraint_name_admission orelse return error.InvalidGenerationPublication;
@@ -1835,6 +1840,29 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
         .parents = &.{.{ .table = table, .ranges = &.{range}, .fences = &.{fence}, .transitions = &.{derived[0].transition} }},
     };
     try plan.validate(alloc);
+    // The new coverage contract also binds the whole schema-only postimage,
+    // not just its table ID and FK/index generation digests.
+    var checked = plan;
+    checked.catalog_coverage = .checks_v1;
+    checked.child_after.read_schema_json = before_json;
+    try checked.validate(alloc);
+    var forged_images = checked;
+    forged_images.child_after.description = "unrelated metadata mutation";
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    forged_images = checked;
+    forged_images.child_after.read_schema_json = after_json;
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    forged_images = checked;
+    forged_images.child_after.read_schema_json = "";
+    try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    for ([_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "\"type\":\"integer\"", .to = "\"type\":\"number\"" },
+        .{ .from = "\"foreign_keys\"", .to = "\"checks\":[{\"name\":\"extra\",\"column\":\"id\",\"op\":\"gt\",\"value\":0}],\"foreign_keys\"" },
+    }) |edit| {
+        forged_images = checked;
+        forged_images.child_after.schema_json = try std.mem.replaceOwned(u8, alloc, after_json, edit.from, edit.to);
+        try std.testing.expectError(error.InvalidGenerationPublication, forged_images.validate(alloc));
+    }
     // Adding a nullable field must not change already issued digest inputs.
     const legacy_json = try std.json.Stringify.valueAlloc(alloc, .{ .id = plan.id, .child_before = plan.child_before, .child_after = plan.child_after, .child_catalog_before_b64 = plan.child_catalog_before_b64, .child_ranges = plan.child_ranges, .child_fences = plan.child_fences, .parents = plan.parents }, .{});
     try std.testing.expectEqualStrings(legacy_json, try std.json.Stringify.valueAlloc(alloc, plan, .{}));

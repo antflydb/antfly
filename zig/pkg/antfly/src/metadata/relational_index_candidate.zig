@@ -97,34 +97,7 @@ fn touched(key: []const u8) bool {
     return std.mem.eql(u8, key, "version") or std.mem.eql(u8, key, "relational_indexes") or std.mem.eql(u8, key, "unique_constraints");
 }
 
-/// Compare parsed JSON structurally, independent of object insertion order.
-/// Depth is bounded independently of parser settings. Numeric representations
-/// are intentionally not coerced: this must not authorize unrelated rewrites.
-fn equal(a: Value, b: Value, depth: usize) bool {
-    if (depth > 128 or std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .null => true,
-        .bool => |v| v == b.bool,
-        .integer => |v| v == b.integer,
-        .float => |v| v == b.float,
-        .number_string => |v| std.mem.eql(u8, v, b.number_string),
-        .string => |v| std.mem.eql(u8, v, b.string),
-        .array => |v| blk: {
-            if (v.items.len != b.array.items.len) break :blk false;
-            for (v.items, b.array.items) |left, right| if (!equal(left, right, depth + 1)) break :blk false;
-            break :blk true;
-        },
-        .object => |v| blk: {
-            if (v.count() != b.object.count()) break :blk false;
-            var it = v.iterator();
-            while (it.next()) |entry| {
-                const right = b.object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!equal(entry.value_ptr.*, right, depth + 1)) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
+const equal = @import("schema_publication_shape.zig").equal;
 
 fn entries(schema: Value, key: []const u8) ![]const Value {
     const value = schema.object.get(key) orelse return &.{};

@@ -1201,3 +1201,36 @@ own versioned plan/provisioning/receipt integration before claiming CHECK-aware
 initial-create parity. Already-admitted legacy CHECK-bearing jobs must not be
 silently reinterpreted under new identities. No original SQL dispositions change
 at this checkpoint, and staged UNIQUE publication remains unfinished.
+
+### Shared table-cut exclusion and schema-only publication postimages
+
+`metadata/table_lifecycle_lock.zig` centralizes the existing durable lock format
+and namespace. FK generation reads/acquisition/release now use this shared
+allocation-free point-record primitive; initial-support finalization retains its
+existing exception. Release binds both job ID and lock kind, so another job kind
+cannot release a lock merely by presenting the same ID. Unknown/malformed lock
+values fail closed and storage-read failures propagate without writes.
+
+An index-build lock kind uses that same exclusion key, rather than introducing
+a parallel lock namespace which old schema/topology writers would miss. Real
+metadata writer tests exercise ordinary upsert, compare-and-replace and read
+schema finalization under both FK and index-build locks. This is not evidence of
+index-job admission or checkpoint recovery: no producer admits the new kind yet.
+Admission must first integrate the complete job/owner cut, namespace reservation,
+decoder capability barrier and checkpoint source verification atomically.
+
+Independent schema-only publication checks also now bind new `checks_v1` FK
+plans to their entire table postimage. Table settings may not change, the
+predecessor read schema must remain pinned, and the only schema delta permitted
+is FK declarations plus version. Unknown future schema fields are preserved.
+Legacy durable plans retain their previous validation/identity interpretation.
+The structural JSON comparison is shared with private UNIQUE candidates.
+
+The four lock tests, four candidate tests and six FK admission tests pass in
+Debug and ReleaseFast with zero skips/failures/leaks. FK plan regressions reject
+unrelated table metadata, missing/replaced read layouts, valid but unauthorized
+row-type changes and additional CHECKs. An initial adversarial test incorrectly
+used the invalid JSON-schema type `float`; it was corrected to the valid type
+`number` before qualification. Final mounted qualification is still running;
+no full native-suite or SQL parity claim is made by this checkpoint. The earlier
+native metadata read timeout remains open.

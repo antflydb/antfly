@@ -5787,6 +5787,14 @@ test "system catalog relation namespace transaction FK generation publication in
 }
 
 test "generation lock freezes the table cut while initial support permits exact schema retirement" {
+    try exerciseTableCutLifecycleLock(.generation);
+}
+
+test "index build lock freezes the table cut while initial support permits exact schema retirement" {
+    try exerciseTableCutLifecycleLock(.index_build);
+}
+
+fn exerciseTableCutLifecycleLock(kind: @import("../table_lifecycle_lock.zig").Kind) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5824,7 +5832,7 @@ test "generation lock freezes the table cut while initial support permits exact 
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
-        const generation_lock = RaftApplyStore.fkTableLockValue(.generation, plan_id);
+        const generation_lock = RaftApplyStore.fkTableLockValue(kind, plan_id);
         try txn.put(lock_key, &generation_lock);
         try txn.commit();
     }
@@ -13473,27 +13481,15 @@ pub const RaftApplyStore = struct {
         }
     }
 
-    const FkTableLockKind = enum(u8) { generation = 1, initial_support = 2 };
+    const FkTableLockKind = @import("../table_lifecycle_lock.zig").Kind;
 
     fn fkTableLockValue(kind: FkTableLockKind, plan_id: fk_generation_publication.Id) [1 + @sizeOf(fk_generation_publication.Id)]u8 {
-        var value: [1 + @sizeOf(fk_generation_publication.Id)]u8 = undefined;
-        value[0] = @backingInt(kind);
-        @memcpy(value[1..], &plan_id);
-        return value;
+        return @import("../table_lifecycle_lock.zig").value(kind, plan_id);
     }
 
     fn fkTableLockKindTxn(_: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !?FkTableLockKind {
-        var key_buf: [160]u8 = undefined;
-        const value = txn.get(try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id)) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        if (value.len != 1 + @sizeOf(fk_generation_publication.Id) or std.mem.allEqual(u8, value[1..], 0)) return error.InvalidGenerationPublication;
-        return switch (value[0]) {
-            @backingInt(FkTableLockKind.generation) => .generation,
-            @backingInt(FkTableLockKind.initial_support) => .initial_support,
-            else => error.InvalidGenerationPublication,
-        };
+        const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group_id, table_id)) orelse return null;
+        return lock.kind;
     }
 
     fn fkGenerationTableLockedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !bool {
@@ -13557,7 +13553,8 @@ pub const RaftApplyStore = struct {
     }
 
     fn setFkGenerationTableLocksTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan, acquire: bool) !void {
-        const value = fkTableLockValue(.generation, plan.id);
+        const lifecycle = @import("../table_lifecycle_lock.zig");
+        const lock: lifecycle.Lock = .{ .kind = .generation, .id = plan.id };
         for (0..plan.parents.len + 1) |i| {
             const table_id = if (i == 0) plan.child_before.table_id else plan.parents[i - 1].table.table_id;
             // Dual-role self-FK owners share the child table lock. A second
@@ -13566,16 +13563,10 @@ pub const RaftApplyStore = struct {
             if (i != 0 and table_id == plan.child_before.table_id) continue;
             var key_buf: [160]u8 = undefined;
             const key = try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id);
-            const existing = txn.get(key) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
             if (acquire) {
-                if (existing != null) return error.GenerationPublicationChanged;
-                try txn.put(key, &value);
+                try lifecycle.acquire(txn, group_id, table_id, lock);
             } else {
-                if (existing == null or !std.mem.eql(u8, existing.?, &value)) return error.GenerationPublicationChanged;
-                try txn.delete(key);
+                try lifecycle.release(txn, group_id, table_id, lock);
             }
             self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         }

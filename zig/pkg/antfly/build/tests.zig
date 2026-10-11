@@ -298,6 +298,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const lifecycle_lock_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "table lifecycle lock", "generation lock freezes the table cut", "index build lock freezes the table cut" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const lifecycle_lock_run = addFilteredTestRunArtifact(b, lifecycle_lock_tests);
+    b.step("antfly-table-lifecycle-lock-test", "Verify shared FK/index table locks and metadata writer exclusion")
+        .dependOn(&lifecycle_lock_run.step);
     const index_candidate_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{"relational index candidate"},
@@ -2599,6 +2607,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     unit_test_step.dependOn(&index_candidate_run.step);
+    unit_test_step.dependOn(&lifecycle_lock_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);
     unit_test_step.dependOn(&run_secret_backend_tests.step);
