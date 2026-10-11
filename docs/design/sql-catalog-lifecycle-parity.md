@@ -2724,8 +2724,15 @@ closes and reopens the owner after cleanup admission and after aborted and
 committed pages; it verifies unchanged source clock, retained binding, independent
 generation preservation and final local emptiness. Both completed runs have zero
 skips, failures or leaks. The source-boundary audit covers 2,034 files; the control
-catalog and diff checks pass. Exact merged-head qualification is still required.
-No original-case credit is claimed by these overlapping component selections.
+catalog and diff checks pass.
+
+Exact main-merged checkpoint `9fbd088c03` passed the same five Debug targets:
+127/127 build steps and ninety executions, zero skips/failures/leaks. The
+transfer/candidate gate at `a32af637cd` also passed all 52 ReleaseFast steps and
+fifteen executions, including the cold-restart profile and actual topology
+handoff. A fresh inventory audit and all sixteen isolated PostgreSQL lifecycle
+oracle tests pass. No original-case credit is claimed by these overlapping
+component selections or the independent oracle run.
 
 Still required before public activation: ordered authenticated private claim
 production on the actual hash owners, complete frozen-cohort retirement proofs,
