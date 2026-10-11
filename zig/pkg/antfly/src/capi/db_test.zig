@@ -1353,14 +1353,28 @@ test "storage owner native index raw admission and bounded controls preserve loc
         .identity_namespace = header.fence.namespace,
     });
     try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
-    defer freeRawBuffer(response.ptr, response.len);
-    var recovered_cancel = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, response.slice(), .{});
+    const recovered_cancel_response = response;
+    defer freeRawBuffer(recovered_cancel_response.ptr, recovered_cancel_response.len);
+    var recovered_cancel = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, recovered_cancel_response.slice(), .{});
     defer recovered_cancel.deinit();
     try std.testing.expect(recovered_cancel.value.duplicate);
     try std.testing.expectEqual(cancel_position, recovered_cancel.value.position);
     var late = try handle.db.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
     defer late.deinit();
     try std.testing.expectError(error.PrivateIndexPublicationCanceled, handle.db.applyPreparedNativeIndexOwnerControl(&late, null));
+    request.operation = .cancel_cleanup;
+    request.request_json = .fromSlice(identity_json);
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cleanup_response = response;
+        defer freeRawBuffer(cleanup_response.ptr, cleanup_response.len);
+        var cleanup = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCleanupOutcome, a, cleanup_response.slice(), .{});
+        defer cleanup.deinit();
+        try std.testing.expectEqual(attempt != 0, cleanup.value.duplicate);
+        try std.testing.expect(!cleanup.value.replication_pending);
+        try std.testing.expectEqual(@as(u64, 5), cleanup.value.position.sequence);
+        try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
+    }
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

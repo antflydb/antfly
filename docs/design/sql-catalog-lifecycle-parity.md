@@ -2532,7 +2532,13 @@ seed 300 forward/ownership/reverse companions, require multiple bounded pages,
 verify all reverse deletions and retain an unrelated generation. They cover
 full public-queue headroom, rollback, replay gaps, exact duplicate admission,
 cold structural recovery, corrupt cleanup cuts/identity and preservation of
-the source fence. This new gate is running, not yet qualified.
+the source fence. Debug and ReleaseFast qualification each pass 43/43 build
+steps and all 27 candidate/catalog tests, with no skips, failures or leaks.
+The initial fixture materialized the complete 8,192-entry unrelated public
+queue in each owner scenario; it was replaced by a point-only transaction
+adapter that rejects any admission cursor scan, alongside the existing public
+capacity test. A sampled remaining Debug run was in exhaustive allocation-fault
+recovery and allocator stack-trace collection, not a stuck GC loop.
 
 This is physical artifact retirement, NOT full canceled publication proof.
 Generation-local GC pages still need authenticated durable owner/standby
@@ -2540,3 +2546,32 @@ delivery; global UNIQUE claims, private manifest/blob and binding retirement,
 final completion cuts, epoch release and coordinated intent-aware capability
 barriers remain unfinished. No canceled ACK is emitted and the public producer
 remains disabled. No original SQL case is reclassified by this component work.
+
+### Unified owner effects and durable cleanup admission (in qualification)
+
+The private owner protocol is newly introduced in this PR and absent from main.
+It now carries exactly one tagged effect in the version-22 envelope: ordinary
+control, cancellation intent, or cancellation cleanup admission. Separate
+top-level cancellation fields/version-23 prototypes are removed rather than
+retained as legacy formats. The strict frame rejects mixed tagged effects and
+unknown fields; each effect validates its actual native namespace and has its
+own byte limit. This is one owner-effect transaction contract, not additional
+mutation routes.
+
+Cleanup preparation uses the actual inspected durable job. The private compiled
+owner receives immutable identity only, not caller-chosen physical allocation
+or a replacement manifest. Queue admission goes through the existing shared DB
+commit pipeline and commits its native cut, marker and durable outbox together;
+standby replay stages that same queue effect and transport LSN atomically.
+Its result has no publication receipt and survives committed mirror failure.
+Both C-ABI and leased-owner adapters expose only this internal progress step.
+
+The updated integration gate is running. It adds real primary outbox failure,
+cold reopen, exact pending-payload recovery, duplicate cleanup admission,
+standby clock-gap rejection, replay and standby reopen, plus compiled-owner
+cleanup retries. Fixture setup drains/burns the jobs using the independently
+tested cancellation primitives; it is not proof of authenticated distributed
+drain/burn delivery. GC page delivery, cleanup completion cuts, global claims,
+manifest/blob and binding retirement, epoch release and coordinated rollout
+barriers remain open. Public production stays disabled and no SQL case is
+credited by this protocol consolidation.

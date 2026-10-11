@@ -350,18 +350,35 @@ test "relational index build pages native owner control preserves committed cuts
     defer cancel_decoded.deinit();
     var smuggled = cancel_decoded.value;
     smuggled.request.writes = &.{.{ .key = "smuggled", .value = "{}" }};
-    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexCancellationPayload(smuggled));
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(smuggled));
     smuggled = cancel_decoded.value;
-    smuggled.index_owner_control = .{ .command = prepared.command, .position = canceled.position };
-    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexCancellationPayload(smuggled));
+    smuggled.ordinary_raft_entry = .{ .term = 1, .index = 1 };
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexOwnerPayload(smuggled));
     const extra_field = try std.fmt.allocPrint(alloc, "{s},\"unknown_control\":true}}", .{cancel_payload[0 .. cancel_payload.len - 1]});
     defer alloc.free(extra_field);
     var unknown_cancel = cancel_record;
     unknown_cancel.payload = extra_field;
     try std.testing.expectError(error.InvalidBatchRequest, effects.decodeBatchMutationRequest(alloc, unknown_cancel));
+    const union_boundary = std.mem.indexOf(u8, cancel_payload, "},\"position\":{").?;
+    var cleanup_binding = binding;
+    cleanup_binding.phase = .reserved;
+    const binding_json = try std.json.Stringify.valueAlloc(alloc, cleanup_binding, .{});
+    defer alloc.free(binding_json);
+    const mixed_effects = try std.fmt.allocPrint(alloc, "{s},\"cancel_cleanup\":{s}{s}", .{ cancel_payload[0..union_boundary], binding_json, cancel_payload[union_boundary..] });
+    defer alloc.free(mixed_effects);
+    // Valid JSON, but not one typed effect. Do not accidentally accept the
+    // first arm and silently discard a second operation from the same frame.
+    var valid_json = try std.json.parseFromSlice(std.json.Value, alloc, mixed_effects, .{});
+    defer valid_json.deinit();
+    unknown_cancel.payload = mixed_effects;
+    if (effects.decodeBatchMutationRequest(alloc, unknown_cancel)) |accepted_value| {
+        var accepted = accepted_value;
+        accepted.deinit();
+        return error.MixedNativeIndexEffectsAccepted;
+    } else |err| if (err == error.OutOfMemory) return err;
     var cancel_gap = try replication_ingress.normalizeBatch(cancel_decoded.value);
-    cancel_gap.index_owner_cancellation.?.position.sequence += 1;
-    cancel_gap.receipt = .{ .native = cancel_gap.index_owner_cancellation.?.position };
+    cancel_gap.index_owner_control.?.position.sequence += 1;
+    cancel_gap.receipt = .{ .native = cancel_gap.index_owner_control.?.position };
     try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cancel_gap, 1));
     try std.testing.expectEqual(@as(u64, 0), try follower.replicationAppliedSequence());
     try replication_ingress.applyRecord(&follower, cancel_record);
@@ -380,6 +397,66 @@ test "relational index build pages native owner control preserves committed cuts
     var late_admission = try follower.prepareNativeIndexOwnerAdmission(intent, candidate.inputs.bytes);
     defer late_admission.deinit();
     try std.testing.expectError(error.PrivateIndexPublicationCanceled, follower.applyPreparedNativeIndexOwnerControl(&late_admission, null));
+
+    // Fixture setup uses the independently tested cancellation-specific drain
+    // and burn primitives. Cleanup admission itself must use the real DB
+    // outbox/standby pipeline, not direct writes or a synthetic positive cut.
+    const artifacts = if (prepared.artifacts) |*value| value else unreachable;
+    for ([_]*db_mod.DB{ &cancel_primary, &follower }) |db| {
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try jobs.stageCanceledBeginWithReplay(&write, binding, &artifacts.candidate.inputs, null);
+        _ = try jobs.stageCanceledFencedWithReplay(&write, &manager, binding, null);
+        _ = try jobs.stageCanceledReservationWithReplay(&write, &manager, binding, &artifacts.candidate, &artifacts.addition, null);
+        try write.commit();
+    }
+    alloc.free(cancel_publisher.payload.?);
+    cancel_publisher.payload = null;
+    cancel_publisher.lsn = 2;
+    cancel_publisher.fail = true;
+    var cleanup = try cancel_primary.prepareNativeIndexOwnerCleanup(receipt_identity);
+    defer cleanup.deinit();
+    const admitted_cleanup = try cancel_primary.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    try std.testing.expect(admitted_cleanup.replication_pending);
+    try std.testing.expect(!admitted_cleanup.duplicate);
+    try std.testing.expectEqual(@as(u64, 5), admitted_cleanup.position.sequence);
+    const cleanup_payload = try cleanup.finalizePayload(admitted_cleanup.position);
+    try std.testing.expectEqualSlices(u8, cleanup_payload, cancel_publisher.payload.?);
+    cancel_primary.local_execution.replication_async_batch_mirror = null;
+    cancel_primary.close();
+    cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    cancel_publisher.fail = false;
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    try cancel_primary.flushDurableReplicationOutboxes();
+    const duplicate_cleanup = try cancel_primary.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    try std.testing.expect(duplicate_cleanup.duplicate);
+    try std.testing.expectEqual(admitted_cleanup.position, duplicate_cleanup.position);
+    var cleanup_record = cancel_record;
+    cleanup_record.lsn = 2;
+    cleanup_record.previous_lsn = 1;
+    cleanup_record.payload = cleanup_payload;
+    var decoded_cleanup = try effects.decodeBatchMutationRequest(alloc, cleanup_record);
+    defer decoded_cleanup.deinit();
+    try std.testing.expect(decoded_cleanup.value.index_owner_control.?.effect == .cancel_cleanup);
+    var cleanup_gap = try replication_ingress.normalizeBatch(decoded_cleanup.value);
+    cleanup_gap.index_owner_control.?.position.sequence += 1;
+    cleanup_gap.receipt = .{ .native = cleanup_gap.index_owner_control.?.position };
+    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cleanup_gap, 2));
+    try std.testing.expectEqual(@as(u64, 1), try follower.replicationAppliedSequence());
+    try replication_ingress.applyRecord(&follower, cleanup_record);
+    try replication_ingress.applyRecord(&follower, cleanup_record);
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    try std.testing.expectEqual(@as(u64, 2), try follower.replicationAppliedSequence());
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(admitted_cleanup.position, (try cancellation.Record.decode(try read.get(jobs.cancellation_cleanup_key))).position);
+        try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&read, binding));
+        try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+    }
 }
 
 test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {

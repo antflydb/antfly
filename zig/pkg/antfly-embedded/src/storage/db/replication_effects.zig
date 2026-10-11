@@ -48,7 +48,6 @@ pub const AppendMetadataMutationOptions = struct {
 };
 
 pub const BatchMutationPayload = struct {
-    index_owner_cancellation: ?@import("relational_index_owner_control.zig").CancellationFrame = null,
     index_owner_control: ?@import("relational_index_owner_control.zig").Frame = null,
     /// Original authority for ordinary rows and coordinated resolutions. Input
     /// provenance cannot substitute a standby-local replay sequence.
@@ -821,18 +820,6 @@ pub fn decodeBatchMutationRequest(
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
-    if (parsed.value.index_owner_cancellation != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").cancellation_envelope_version) {
-        const control = @import("relational_index_owner_control.zig");
-        if (record.payload.len > control.max_cancellation_wire_bytes) return error.InvalidBatchRequest;
-        const Strict = struct { schema_version: u32, request: struct {}, index_owner_cancellation: control.CancellationFrame };
-        var strict = std.json.parseFromSlice(Strict, alloc, record.payload, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return error.InvalidBatchRequest,
-        };
-        defer strict.deinit();
-        try validateIndexCancellationPayload(parsed.value);
-        return parsed;
-    }
     if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
         if (record.payload.len > @import("relational_index_owner_control.zig").max_wire_bytes) return error.InvalidBatchRequest;
         // Private control envelopes have exactly these fields. An ignored
@@ -848,6 +835,7 @@ pub fn decodeBatchMutationRequest(
         };
         defer strict.deinit();
         try validateIndexOwnerPayload(parsed.value);
+        if (record.payload.len > parsed.value.index_owner_control.?.effect.wireLimit()) return error.InvalidBatchRequest;
         return parsed;
     }
     try unwrapGraphApplyEnvelope(&parsed.value);
@@ -902,18 +890,6 @@ fn canonicalRequestHash(request: db_types.BatchRequest) ![32]u8 {
     return result;
 }
 
-pub fn validateIndexCancellationPayload(payload: BatchMutationPayload) !void {
-    const control = @import("relational_index_owner_control.zig");
-    if (payload.schema_version != control.cancellation_envelope_version) return error.InvalidBatchRequest;
-    const frame = payload.index_owner_cancellation orelse return error.InvalidBatchRequest;
-    try frame.validate();
-    inline for (comptime std.meta.fieldNames(BatchMutationPayload)) |name| {
-        if (comptime std.mem.eql(u8, name, "schema_version") or std.mem.eql(u8, name, "request") or std.mem.eql(u8, name, "index_owner_cancellation")) continue;
-        if (@field(payload, name) != null) return error.InvalidBatchRequest;
-    }
-    if (!std.mem.eql(u8, &try canonicalRequestHash(payload.request), &try canonicalRequestHash(.{}))) return error.InvalidBatchRequest;
-}
-
 pub fn validateIndexOwnerPayload(payload: BatchMutationPayload) !void {
     const control = @import("relational_index_owner_control.zig");
     if (payload.schema_version != control.envelope_version) return error.InvalidBatchRequest;
@@ -955,7 +931,6 @@ pub fn decodeRestoreFinishForReplay(
     if (record.payload_codec != .json) return error.UnsupportedBatchMutationCodec;
     const Finish = @FieldType(@import("restore_staging_contract.zig").Control, "finish");
     const Projection = struct {
-        index_owner_cancellation: ?struct {} = null,
         index_owner_control: ?struct {} = null,
         schema_version: u32 = 1,
         apply_schema_version: ?u32 = null,
@@ -976,9 +951,7 @@ pub fn decodeRestoreFinishForReplay(
     };
     var parsed = try std.json.parseFromSlice(Projection, alloc, record.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.index_owner_cancellation != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").cancellation_envelope_version or
-        parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version)
-    {
+    if (parsed.value.index_owner_control != null or parsed.value.schema_version == @import("relational_index_owner_control.zig").envelope_version) {
         var control = try decodeBatchMutationRequest(alloc, record);
         defer control.deinit();
         return null;

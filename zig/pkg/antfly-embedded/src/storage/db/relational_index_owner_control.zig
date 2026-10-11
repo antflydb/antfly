@@ -27,7 +27,6 @@ const source_authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
 const Allocator = std.mem.Allocator;
 pub const envelope_version = 22;
-pub const cancellation_envelope_version = 23;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_wire_bytes = max_encoded_inputs + 32 * 1024;
@@ -73,25 +72,45 @@ pub const ReceiptRequest = struct {
     effect: enum { fenced, reserved },
 };
 
-pub const Frame = struct {
-    command: Command,
-    position: Native,
+/// Exactly one owner effect per transaction. This unpublished PR format has
+/// no legacy parallel-field envelopes: mixed effects are not representable.
+pub const Effect = union(enum) {
+    control: Command,
+    cancel_intent: Admission,
+    cancel_cleanup: jobs.Binding,
 
-    pub fn validate(self: Frame) !void {
-        try self.command.validate();
-        try self.position.validate();
-        if (!self.position.namespace.eql(self.command.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+    pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
+        return switch (self) {
+            .control => |value| value.binding.fence.namespace,
+            .cancel_intent => |value| value.fence.namespace,
+            .cancel_cleanup => |value| value.fence.namespace,
+        };
+    }
+
+    pub fn validate(self: Effect) !void {
+        switch (self) {
+            .control => |value| try value.validate(),
+            .cancel_intent => |value| try value.validate(),
+            .cancel_cleanup => |value| {
+                _ = try value.encode();
+                if (value.authority != .native or value.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+            },
+        }
+    }
+
+    pub fn wireLimit(self: Effect) usize {
+        return if (self == .control) max_wire_bytes else max_cancellation_wire_bytes;
     }
 };
 
-pub const CancellationFrame = struct {
-    intent: Admission,
+pub const Frame = struct {
+    effect: Effect,
     position: Native,
 
-    pub fn validate(self: CancellationFrame) !void {
-        try self.intent.validate();
+    pub fn validate(self: Frame) !void {
+        try self.effect.validate();
         try self.position.validate();
-        if (!self.position.namespace.eql(self.intent.fence.namespace)) return error.IdentityNamespaceMismatch;
+        if (!self.position.namespace.eql(self.effect.namespace())) return error.IdentityNamespaceMismatch;
     }
 };
 
@@ -99,6 +118,14 @@ pub const CancellationFrame = struct {
 /// receipt. A pending mirror must not become a canceled owner acknowledgement.
 pub const CancellationOutcome = struct {
     intent: Admission,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+};
+
+pub const CleanupOutcome = struct {
+    binding: jobs.Binding,
     position: Native,
     duplicate: bool,
     replication_pending: bool = false,
@@ -171,7 +198,7 @@ pub const Prepared = struct {
     }
 
     pub fn validateReplay(self: *const Prepared, position: Native) !void {
-        try (Frame{ .command = self.command, .position = position }).validate();
+        try (Frame{ .effect = .{ .control = self.command }, .position = position }).validate();
     }
 
     pub fn replayDuplicateOutcome(self: *const Prepared, position: Native) Outcome {
@@ -260,7 +287,7 @@ pub const Prepared = struct {
     /// Serialize the large immutable prefix off-lock. Only the locally assigned
     /// sequence (at most 20 digits) is filled after transactional staging.
     pub fn preparePayload(self: *Prepared) !void {
-        try prepareNativePayload(self, envelope_version, "index_owner_control", "command", self.command, max_wire_bytes);
+        try prepareNativePayload(self, "control", self.command, max_wire_bytes);
     }
 
     pub fn finalizePayload(self: *Prepared, position: Native) ![]const u8 {
@@ -295,7 +322,7 @@ pub const PreparedCancellation = struct {
         return self.intent.fence.namespace;
     }
     pub fn validateReplay(self: *const PreparedCancellation, position: Native) !void {
-        try (CancellationFrame{ .intent = self.intent, .position = position }).validate();
+        try (Frame{ .effect = .{ .cancel_intent = self.intent }, .position = position }).validate();
     }
 
     pub fn replayDuplicateOutcome(self: *const PreparedCancellation, position: Native) CancellationOutcome {
@@ -313,7 +340,7 @@ pub const PreparedCancellation = struct {
     pub fn populateReceipt(_: *const PreparedCancellation, _: anytype, _: *CancellationOutcome) !void {}
 
     pub fn preparePayload(self: *PreparedCancellation) !void {
-        try prepareNativePayload(self, cancellation_envelope_version, "index_owner_cancellation", "intent", self.intent, max_cancellation_wire_bytes);
+        try prepareNativePayload(self, "cancel_intent", self.intent, max_cancellation_wire_bytes);
     }
 
     pub fn finalizePayload(self: *PreparedCancellation, position: Native) ![]const u8 {
@@ -321,16 +348,63 @@ pub const PreparedCancellation = struct {
     }
 };
 
-fn prepareNativePayload(prepared: anytype, version: u32, comptime field: []const u8, comptime member: []const u8, body: anytype, maximum: usize) !void {
+/// Prepared from the actual inspected durable job, never an API-selected
+/// physical allocation. Stage rechecks intent, drain and both burned catalogs.
+pub const PreparedCleanup = struct {
+    pub const ApplyOutcome = CleanupOutcome;
+    alloc: Allocator,
+    binding: jobs.Binding,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, binding: jobs.Binding) !PreparedCleanup {
+        try (Effect{ .cancel_cleanup = binding }).validate();
+        return .{ .alloc = alloc, .binding = binding };
+    }
+    pub fn deinit(self: *PreparedCleanup) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedCleanup) !void {
+        try (Effect{ .cancel_cleanup = self.binding }).validate();
+    }
+    pub fn namespace(self: *const PreparedCleanup) @FieldType(Native, "namespace") {
+        return self.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedCleanup, position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_cleanup = self.binding }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedCleanup, position: Native) CleanupOutcome {
+        return .{ .binding = self.binding, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *PreparedCleanup, core: anytype, txn: anytype, replay: ?Native) !CleanupOutcome {
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        const result = try jobs.stageCancellationCleanupWithReplay(txn, &manager, self.binding, replay);
+        return .{ .binding = self.binding, .position = result.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedCleanup) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedCleanup, _: anytype, _: *CleanupOutcome) !void {}
+    pub fn preparePayload(self: *PreparedCleanup) !void {
+        try prepareNativePayload(self, "cancel_cleanup", self.binding, max_cancellation_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedCleanup, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+fn prepareNativePayload(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
     try prepared.validate();
     if (prepared.payload != null) return;
     var writer: std.Io.Writer.Allocating = .init(prepared.alloc);
     defer writer.deinit();
     try writer.writer.writeAll("{\"schema_version\":");
-    try std.json.Stringify.value(version, .{}, &writer.writer);
-    try writer.writer.writeAll(",\"request\":{},\"" ++ field ++ "\":{\"" ++ member ++ "\":");
+    try std.json.Stringify.value(envelope_version, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"request\":{},\"index_owner_control\":{\"effect\":{\"" ++ member ++ "\":");
     try std.json.Stringify.value(body, .{}, &writer.writer);
-    try writer.writer.writeAll(",\"position\":{\"namespace\":");
+    try writer.writer.writeAll("},\"position\":{\"namespace\":");
     try std.json.Stringify.value(prepared.namespace(), .{}, &writer.writer);
     try writer.writer.writeAll(",\"sequence\":");
     prepared.prefix_len = writer.written().len;

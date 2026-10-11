@@ -7839,34 +7839,32 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
-        if (mutation.index_owner_cancellation) |frame| {
-            try frame.validate();
-            if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
-            try replication_effects_mod.validateIndexCancellationPayload(.{
-                .schema_version = native_index_control.cancellation_envelope_version,
-                .request = mutation.request,
-                .index_owner_cancellation = frame,
-                .index_owner_control = mutation.index_owner_control,
-            });
-            if (try self.replicationMutationAlreadyApplied(sequence)) return;
-            var prepared = try self.prepareNativeIndexOwnerCancellation(frame.intent);
-            defer prepared.deinit();
-            _ = try self.applyPreparedNativeIndexOwnerCancellation(&prepared, .{ .position = frame.position, .lsn = sequence });
-            return;
-        }
         if (mutation.index_owner_control) |frame| {
             try frame.validate();
             if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
             try replication_effects_mod.validateIndexOwnerPayload(.{ .schema_version = native_index_control.envelope_version, .request = mutation.request, .index_owner_control = frame });
             if (try self.replicationMutationAlreadyApplied(sequence)) return;
-            var prepared = self.prepareNativeIndexOwnerControl(frame.command) catch |err| {
-                // Another replay may retire the inputs/schema while preparation
-                // runs off-lock. A committed transport receipt is authoritative.
-                if (try self.replicationMutationAlreadyApplied(sequence)) return;
-                return err;
-            };
-            defer prepared.deinit();
-            _ = try self.applyPreparedNativeIndexOwnerControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+            switch (frame.effect) {
+                .control => |command| {
+                    var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
+                        // Another replay may retire inputs during preparation.
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .cancel_intent => |intent| {
+                    var prepared = try self.prepareNativeIndexOwnerCancellation(intent);
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellation(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+                .cancel_cleanup => |binding| {
+                    var prepared = try native_index_control.PreparedCleanup.init(self.alloc, binding);
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCleanup(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
+            }
             return;
         }
         var request = mutation.request;
@@ -7968,6 +7966,21 @@ pub const DB = struct {
 
     pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
         return PreparedNativeIndexOwnerCancellation.init(self.alloc, intent);
+    }
+
+    pub const PreparedNativeIndexOwnerCleanup = native_index_control.PreparedCleanup;
+    pub const NativeIndexOwnerCleanupOutcome = native_index_control.CleanupOutcome;
+
+    pub fn prepareNativeIndexOwnerCleanup(self: *DB, identity: NativeIndexOwnerIdentity) !PreparedNativeIndexOwnerCleanup {
+        // Public/private ABI requests supply only immutable identity. Physical
+        // allocations come from this actual owner snapshot and are rechecked
+        // in the shared apply transaction, never selected by the caller.
+        const binding = (try self.nativeIndexOwnerState(identity)) orelse return error.PrivateIndexJobRequired;
+        return PreparedNativeIndexOwnerCleanup.init(self.alloc, binding);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCleanup(self: *DB, prepared: *PreparedNativeIndexOwnerCleanup, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellation(self: *DB, prepared: *PreparedNativeIndexOwnerCancellation, replay: ?NativeIndexReplay) !NativeIndexOwnerCancellationOutcome {
