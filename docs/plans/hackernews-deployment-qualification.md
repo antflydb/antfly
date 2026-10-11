@@ -1,6 +1,6 @@
 # Hacker News deployment qualification
 
-Status: qualification follow-up to merged PR #1025, 2026-10-10.
+Status: publication and serving qualification follow-up to merged PR #1066, 2026-10-11.
 
 The next milestone is reproducible evidence that `hn.antfly.io` can serve useful
 search over the historical archive while keeping recent data fresh. Engine
@@ -273,3 +273,66 @@ reading pages through GCS. Complete GCS publication remains unverified; this
 sample does not attribute all elapsed time or qualify regional performance.
 All 2,265 artifacts were generation-deleted after the builder stopped; the
 original archive source was preserved.
+
+
+## October 11 follow-up sequence
+
+Work starts from `origin/main` after PR #1066, in
+`.worktrees/hackernews-publication-followup` on
+`feat/hackernews-publication-followup`. The initial base is
+`26edb20271407c60e257a583453a711947b4a9ca`. Changes and diagnostics belong to
+that checkout; the main checkout contains independent work.
+
+The updated detailed billing export is captured in
+[`archive-spend-20261011.json`](../../examples/hackernews/archive-spend-20261011.json).
+The six identified qualification pods cost $0.927106 gross. All HN-labelled
+benchmark pods since October 9 cost $7.996654 gross, including those six and
+other HN work. The shared import bucket has $0.277859 in exported charges;
+this is bucket-wide, and its export only reaches October 10 at 23:00 UTC.
+Cloud-program credits cover these posted charges. Project networking is shared
+and the local October 11 storage diagnostics are not fully exported yet, so
+these figures do not establish final all-in HN spend. Account for gross charges
+rather than treating promotional credits as unlimited free usage.
+
+The prior $150 figure was conservative reservations, not actual exhausted
+spend. Preserve attempt IDs and original reservations. First add an explicit
+reconciliation workflow to the admission guard: evidence identifies each run,
+settles its exported compute charges, retains allowances for unexported storage,
+requests and networking, and records released amounts as an append-only audit.
+A reconciliation must not double-count shared bucket costs, erase failed runs,
+refund pending costs, or increase the approved $150 ceiling. Extending the retry
+limit should use reconciled exposure plus new reservations; creating a fresh
+ledger to bypass the existing one is not a valid recovery path.
+
+Then qualify one unchanged 142,577-row raw BigQuery file through the actual
+coordinator and public API in the source bucket's region, `us-central1`.
+Use a new owned artifact namespace and record the current optimized Linux
+binary digest, admitted resources, immutable source generation, stage timings,
+process memory/CPU and provider I/O. Keep the existing build deadline and
+HTTP timeouts. The earlier laptop-to-GCS run sampled statistics page reads;
+it does not establish same-region latency or a need to change engine behavior.
+If the regional run is still slow, measure summary publication, document-frequency
+reduction and final publication separately before changing the algorithm.
+Avoid repeated uploads followed by immediate remote rereads where bounded
+local streaming/spill can supply the same authenticated statistics; preserve
+replacement/removal semantics, cancellation, budgets and fenced checkpoints.
+
+After complete publication, verify SQL count, ranked results, highlights,
+metadata filters, sort/pagination and source provenance. Measure cold/warm,
+concurrent, deep-cursor and post-restart public queries with the existing
+correctness and latency gates. A one-file verdict must remain separately
+labelled; it cannot pass the full-archive gate. Only then build and qualify the
+complete 334-file / 47,717,307-row archive, including interrupted recovery and
+bounded resource use. Durable HN deployment follows those gates.
+
+The existing `antfly-dev` cluster is already Autopilot. The measured pods used
+regular general-purpose capacity, requesting 8 vCPU, 48 GiB RAM and 10 GiB
+storage, about $0.59/hour at the recorded region's list prices. Keep that
+profile for the first comparable regional check; evaluate smaller requests
+as a separately labelled profile with measured headroom, rather than changing
+resources and attributing all improvement to engine changes. Spot can reduce
+compute cost, but eviction loses the current harness's pod-local catalog and
+state directory. Use regular capacity for reproducible timing runs. Before
+using Spot for resumable construction, persist authoritative catalog/checkpoint
+ownership and prove recovery in a replacement pod; remote derived artifacts
+alone are not sufficient.

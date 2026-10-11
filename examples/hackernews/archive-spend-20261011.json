@@ -1,0 +1,67 @@
+{
+  "six_owned_pods_gross_usd": 0.927106,
+  "six_owned_pods_net_usd": -2.0000000000297558e-06,
+  "all_hn_pods_gross_usd": 7.996653999999999,
+  "shared_import_bucket_gross_usd": 0.27785899999999997,
+  "shared_import_bucket_net_usd": 0.0,
+  "last_bucket_usage": "2026-10-10 23:00:00",
+  "scope_start_utc": "2026-10-09T00:00:00Z",
+  "credit_program": "2024 GFS Cloud Program - Ecosystem Partner",
+  "notes": [
+    "All HN pods includes additional HN work beyond the six recorded runs.",
+    "Bucket is shared; object-prefix attribution unavailable.",
+    "Networking is project-wide and not attributable to these pods.",
+    "Storage export does not yet cover local October 11 GCS diagnostics."
+  ],
+  "date": "2026-10-11",
+  "billing_project": "antfly-billing",
+  "usage_project": "antfly-dev-01",
+  "export_table": "antfly-billing.all_billing_data.gcp_billing_export_resource_v1_0144D7_BBC515_65A5C4",
+  "last_export_utc": "2026-10-11 16:00:53",
+  "approved_ceiling_usd": 150,
+  "accounting_policy": "Use gross costs for budget accounting: promotion credits are consumed resources. This evidence does not silently refund reservations or establish final all-in spend.",
+  "owned_qualification_pods": [
+    {
+      "pod": "hackernews-benchmark-4f4f74ebf4d3",
+      "namespace": "default",
+      "gross_usd": 0.049471,
+      "net_usd": 0.0,
+      "last_usage_utc": "2026-10-10 22:00:00"
+    },
+    {
+      "pod": "hackernews-benchmark-73cefb25eb3c",
+      "namespace": "default",
+      "gross_usd": 0.154022,
+      "net_usd": 0.0,
+      "last_usage_utc": "2026-10-11 00:00:00"
+    },
+    {
+      "pod": "hackernews-benchmark-a7a5a0637aee",
+      "namespace": "default",
+      "gross_usd": 0.128462,
+      "net_usd": -1e-06,
+      "last_usage_utc": "2026-10-11 00:00:00"
+    },
+    {
+      "pod": "hackernews-benchmark-379f60e443a1",
+      "namespace": "default",
+      "gross_usd": 0.118734,
+      "net_usd": 0.0,
+      "last_usage_utc": "2026-10-11 00:00:00"
+    },
+    {
+      "pod": "hackernews-benchmark-34404d14305c",
+      "namespace": "default",
+      "gross_usd": 0.019788,
+      "net_usd": 0.0,
+      "last_usage_utc": "2026-10-10 21:00:00"
+    },
+    {
+      "pod": "hackernews-benchmark-a0018f89e88d",
+      "namespace": "default",
+      "gross_usd": 0.456629,
+      "net_usd": -1e-06,
+      "last_usage_utc": "2026-10-11 01:00:00"
+    }
+  ]
+}
