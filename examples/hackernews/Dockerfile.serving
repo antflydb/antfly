@@ -1,0 +1,9 @@
+# The caller supplies an immutable base and the qualified Linux binary.
+ARG BASE_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9
+FROM ${BASE_IMAGE}
+COPY qualification-linux/bin/antfly /app/antfly
+COPY examples/hackernews/serve.py /app/serve.py
+COPY examples/hackernews/web /app/web
+RUN mkdir -p /app/empty-models
+USER 1000:1000
+ENTRYPOINT ["python3", "/app/serve.py", "--host", "0.0.0.0"]
