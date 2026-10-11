@@ -2004,6 +2004,8 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "response_table_name",
     "prepared_read_table_id",
     "native_query_cut",
+    // The public retained capability accompanies the authenticated physical cut.
+    "remote_snapshot",
     "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
@@ -2034,7 +2036,6 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "query",
     "index_name",
     "primary_text_index_name",
-    "remote_snapshot",
     "lake_read",
     "aggregations_json",
     "count_only",
