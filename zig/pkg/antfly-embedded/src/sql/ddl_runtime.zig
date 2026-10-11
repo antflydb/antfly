@@ -27,17 +27,25 @@ pub fn accepts(statement: ast.Statement) bool {
     };
 }
 
-pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: ast.Statement) !Output {
+pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, statement: ast.Statement) !Output {
+    const alloc = allocators.scratch;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
+    var generated_names: std.ArrayList([]const u8) = .empty;
+    defer generated_names.deinit(alloc);
+    if (statement == .create_table) for (statement.create_table.constraints) |constraint| {
+        if (constraint == .add_unique and constraint.add_unique.generated_name)
+            try generated_names.append(alloc, constraint.add_unique.name);
+    };
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names.items } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },
         else => return error.UnsupportedSqlExecution,
     };
-    const outcome = try dispatch(backend.ptr, alloc, request);
+    defer if (request == .create_table) alloc.free(request.create_table.schema_json);
+    const outcome = try dispatch(backend.ptr, allocators, request);
     return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready)) "DDL PENDING" else switch (request) {
         .create_table => "CREATE TABLE",
         .drop_table => "DROP TABLE",
@@ -231,7 +239,7 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
     const Fake = struct {
-        fn ddl(_: *anyopaque, _: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
+        fn ddl(_: *anyopaque, _: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
             const input = request.catalog_ddl;
             try std.testing.expectEqual(@as(usize, 2), input.truncate_tables.len);
             try std.testing.expect(input.cascade and input.restart_identity);
@@ -243,7 +251,7 @@ test "SQL TRUNCATE lowers complete table set and honest durable admission receip
     var sentinel: u8 = 0;
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "TRUNCATE TABLE first, second RESTART IDENTITY CASCADE", .{});
     defer compiled.deinit();
-    const result = try execute(std.testing.allocator, .{ .ptr = &sentinel, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = Fake.ddl, .checkpoint = Fake.checkpoint } }, compiled.statement);
+    const result = try execute(.{ .result = std.testing.allocator, .scratch = std.testing.allocator }, .{ .ptr = &sentinel, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = Fake.ddl, .checkpoint = Fake.checkpoint } }, compiled.statement);
     try std.testing.expectEqualStrings("DDL PENDING", result.command_tag);
     try std.testing.expect(result.mutation_outcome == null);
     try std.testing.expectEqualStrings("42", result.receipt.?.restore_job_id.?);

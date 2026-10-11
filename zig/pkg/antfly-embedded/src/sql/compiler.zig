@@ -1821,6 +1821,38 @@ const Parser = struct {
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
     }
 
+    fn generatedConstraintName(self: *Parser, table: []const u8, columns: []const []const u8, label: []const u8, constraints: []const ast.SchemaChange) Error![]const u8 {
+        const addition = try std.mem.join(self.alloc, "_", columns);
+        // Keep generated PostgreSQL identifiers within 63 UTF-8 bytes, balancing
+        // table/column components and preserving the semantic suffix.
+        for (0..constraints.len + 1) |ordinal| {
+            const suffix = if (ordinal == 0) label else try std.fmt.allocPrint(self.alloc, "{s}{d}", .{ label, ordinal });
+            const separators: usize = if (addition.len == 0) 1 else 2;
+            var table_len = table.len;
+            var addition_len = addition.len;
+            while (table_len + addition_len > 63 - suffix.len - separators) {
+                if (table_len > addition_len) table_len -= 1 else addition_len -= 1;
+            }
+            while (table_len != 0 and table_len < table.len and table[table_len] & 0xc0 == 0x80) table_len -= 1;
+            while (addition_len != 0 and addition_len < addition.len and addition[addition_len] & 0xc0 == 0x80) addition_len -= 1;
+            const generated_name = if (addition.len == 0)
+                try std.fmt.allocPrint(self.alloc, "{s}_{s}", .{ table[0..table_len], suffix })
+            else
+                try std.fmt.allocPrint(self.alloc, "{s}_{s}_{s}", .{ table[0..table_len], addition[0..addition_len], suffix });
+            const used = for (constraints) |constraint| {
+                const prior = switch (constraint) {
+                    .add_unique => |v| v.name,
+                    .add_check => |v| v.name,
+                    .add_foreign_key => |v| v.name,
+                    else => continue,
+                };
+                if (std.mem.eql(u8, generated_name, prior)) break true;
+            } else false;
+            if (!used) return generated_name;
+        }
+        return error.SqlLimitExceeded;
+    }
+
     pub fn createTable(self: *Parser) Error!ast.CreateTable {
         const if_not_exists = self.keyword(.@"if");
         if (if_not_exists) {
@@ -1831,6 +1863,7 @@ const Parser = struct {
         try self.expect(.lparen);
         var columns = std.ArrayList(ast.Column).empty;
         var constraints = std.ArrayList(ast.SchemaChange).empty;
+        var unnamed = std.ArrayList(struct { index: usize, column: ?[]const u8 }).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
             try self.node();
@@ -1840,8 +1873,8 @@ const Parser = struct {
                 continue;
             }
             if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
-                const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_constraint_{d}", .{constraints.items.len});
-                try constraints.append(self.alloc, try self.constraintDefinition(constraint_name));
+                try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = null });
+                try constraints.append(self.alloc, try self.constraintDefinition(""));
                 if (!self.take(.comma)) break;
                 continue;
             }
@@ -1871,21 +1904,39 @@ const Parser = struct {
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
+                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = "", .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
                 } else if (self.keyword(.unique)) {
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}) } }));
+                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = "", .columns = try self.alloc.dupe([]const u8, &.{column}) } }));
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
                 } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES"))) {
-                    const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_inline_{d}", .{constraints.items.len});
-                    try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
+                    try unnamed.append(self.alloc, .{ .index = constraints.items.len, .column = column });
+                    try constraints.append(self.alloc, try self.inlineConstraint("", column));
                 } else break;
             }
             try columns.append(self.alloc, definition);
             if (!self.take(.comma)) break;
         }
         try self.expect(.rparen);
+        // Backing indexes share a namespace across tables. Pick table-based
+        // names after parsing all declarations, including explicit names that
+        // occur later in the statement; generic ordinal names collide as soon
+        // as the authoritative relation catalog is active.
+        for (unnamed.items) |entry| {
+            const constraint = &constraints.items[entry.index];
+            switch (constraint.*) {
+                .add_unique => |*unique| {
+                    unique.name = try self.generatedConstraintName(table.table, if (unique.primary) &.{} else unique.columns, if (unique.primary) "pkey" else "key", constraints.items);
+                    unique.generated_name = true;
+                },
+                .add_foreign_key => |*fk| fk.name = try self.generatedConstraintName(table.table, fk.columns, "fkey", constraints.items),
+                .add_check => |*check| check.name = try self.generatedConstraintName(table.table, if (entry.column) |column| &.{column} else &.{}, "check", constraints.items),
+                else => unreachable,
+            }
+        }
         const tablespace = if (self.keyword(.tablespace)) try self.identifier() else null;
         var has_primary = false;
         for (constraints.items) |constraint| if (constraint == .add_unique and constraint.add_unique.primary) {
@@ -3224,4 +3275,35 @@ test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
     defer scoped.deinit();
     try std.testing.expectEqualStrings("threads", scoped.statement.catalog_ddl.name.table);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX recency", .{}));
+}
+
+test "compiler unnamed constraints use table and column names without declaration collisions" {
+    var first = try compile(std.testing.allocator, "CREATE TABLE p1 (id TEXT PRIMARY KEY)", .{});
+    defer first.deinit();
+    var second = try compile(std.testing.allocator, "CREATE TABLE p2 (id TEXT PRIMARY KEY)", .{});
+    defer second.deinit();
+    try std.testing.expectEqualStrings("p1_pkey", first.statement.create_table.constraints[0].add_unique.name);
+    try std.testing.expect(first.statement.create_table.constraints[0].add_unique.generated_name);
+    try std.testing.expectEqualStrings("p2_pkey", second.statement.create_table.constraints[0].add_unique.name);
+    var child = try compile(std.testing.allocator, "CREATE TABLE child (id TEXT PRIMARY KEY, p TEXT REFERENCES p1(id), n BIGINT CHECK (n > 0), UNIQUE (n), UNIQUE (n), CONSTRAINT child_n_key CHECK (n < 100))", .{});
+    defer child.deinit();
+    const constraints = child.statement.create_table.constraints;
+    try std.testing.expectEqualStrings("child_pkey", constraints[0].add_unique.name);
+    try std.testing.expectEqualStrings("child_p_fkey", constraints[1].add_foreign_key.name);
+    try std.testing.expectEqualStrings("child_n_check", constraints[2].add_check.name);
+    try std.testing.expectEqualStrings("child_n_key1", constraints[3].add_unique.name);
+    try std.testing.expectEqualStrings("child_n_key2", constraints[4].add_unique.name);
+    try std.testing.expectEqualStrings("child_n_key", constraints[5].add_check.name);
+    var explicit = try compile(std.testing.allocator, "CREATE TABLE foo(id TEXT CONSTRAINT exact_name PRIMARY KEY)", .{});
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.statement.create_table.constraints[0].add_unique.generated_name);
+}
+
+test "compiler generated constraint names clip long UTF-8 identifiers at codepoint boundaries" {
+    var declaration = try compile(std.testing.allocator, "CREATE TABLE \"éééééééééééééééééééééééééééééé\" (\"éééééééééééééééééééééééééééééé\" TEXT UNIQUE)", .{});
+    defer declaration.deinit();
+    const name = declaration.statement.create_table.constraints[0].add_unique.name;
+    try std.testing.expect(name.len <= 63);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(name));
+    try std.testing.expect(std.mem.endsWith(u8, name, "_key"));
 }
