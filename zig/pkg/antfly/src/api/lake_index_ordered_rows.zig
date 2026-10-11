@@ -311,7 +311,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         };
         var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .ties = &tie_builder, .arena = .init(a) };
         defer collect.arena.deinit();
-        page = try tree.buildSorted(a, pages.store(), &collect);
+        page = try tree.buildSortedWithOptions(a, pages.store(), &collect, .{ .target_bytes = tree.bulk_target_page_bytes });
         ties = try tie_builder.finish(pages.store());
         var reverse_sorted: Sorted = .{ .sort = &reverse_sort, .store = store, .scope = scope, .cancellation = cancellation, .write_bytes = &write_bytes, .scratch = .init(a) };
         defer reverse_sorted.scratch.deinit();
@@ -323,7 +323,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             }
         };
         var reverse_source: ReverseSource = .{ .sorted = &reverse_sorted };
-        reverse = try tree.buildSorted(a, pages.store(), &reverse_source);
+        reverse = try tree.buildSortedWithOptions(a, pages.store(), &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
     }
     const predicate_root = try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
     const files = try a.alloc([]const u8, inventory.files.len);

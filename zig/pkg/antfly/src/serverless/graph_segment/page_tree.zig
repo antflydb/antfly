@@ -26,6 +26,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 // update amplification. Branch packing always makes progress with >=2 entries.
 pub const max_page_bytes = 1024 * 1024;
 pub const target_page_bytes = 32 * 1024;
+pub const bulk_target_page_bytes = 256 * 1024;
 // Leave room for an ordered u64 prefix without reducing the accepted document
 // identifier size in the document facts index.
 pub const max_key_bytes = 256 * 1024 + 8;
@@ -571,7 +572,18 @@ fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8
 /// record may be invalidated by its next call. Like incremental apply, callers
 /// must account for orphan uploads if source, allocation or storage fails.
 pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
-    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    return buildSortedWithOptions(alloc, store, source, .{});
+}
+
+pub const BuildOptions = struct {
+    target_bytes: usize = target_page_bytes,
+};
+
+/// Bulk publication may pack larger pages to reduce object-store requests.
+/// Decoders, record limits and the maximum durable batch remain unchanged.
+pub fn buildSortedWithOptions(alloc: Allocator, store: Store, source: anytype, options: BuildOptions) !?Ref {
+    if (options.target_bytes < header_bytes + 8 or options.target_bytes > max_page_bytes) return error.InvalidGraphPageSize;
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store, .target_bytes = options.target_bytes };
     defer builder.deinit();
     while (try source.next()) |record| {
         try store.check(store.ptr);
@@ -605,6 +617,7 @@ pub fn buildSorted(alloc: Allocator, store: Store, source: anytype) !?Ref {
 const SortedBuilder = struct {
     alloc: Allocator,
     store: Store,
+    target_bytes: usize = target_page_bytes,
     previous: ?[]u8 = null,
     pending: [max_write_batch]Write = undefined,
     pending_count: usize = 0,
@@ -638,7 +651,7 @@ const SortedBuilder = struct {
         if (height >= self.levels.len) return error.GraphPageTreeTooDeep;
         const level = &self.levels[height];
         const minimum: usize = if (height == 0) 1 else 2;
-        if (level.entries.items.len >= minimum and level.bytes + entry.size() > target_page_bytes)
+        if (level.entries.items.len >= minimum and level.bytes + entry.size() > self.target_bytes)
             try self.flush(height);
         const key = try self.alloc.dupe(u8, entry.key);
         errdefer self.alloc.free(key);
@@ -999,6 +1012,62 @@ const TestStore = struct {
         try self.pages.put(self.alloc, ref.digest, owned);
     }
 };
+
+test "serverless graph bulk packing preserves bounded forward and reverse reads" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        position: u64 = 0,
+        key: [8]u8 = undefined,
+        value: [1024]u8 = @splat(42),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.position == 1000) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var small: TestStore = .{ .alloc = a };
+    defer small.deinit();
+    var large: TestStore = .{ .alloc = a };
+    defer large.deinit();
+    var first: Source = .{};
+    var second: Source = .{};
+    const small_root = try buildSorted(a, small.store(), &first);
+    const large_root = try buildSortedWithOptions(a, large.store(), &second, .{ .target_bytes = bulk_target_page_bytes });
+    try std.testing.expect(large.writes * 4 < small.writes);
+    for ([_][2]u64{ .{ 0, 1000 }, .{ 228, 700 }, .{ 999, 1000 }, .{ 500, 500 } }) |bounds| {
+        var lower: [8]u8 = undefined;
+        var upper: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lower, bounds[0], .big);
+        std.mem.writeInt(u64, &upper, bounds[1], .big);
+        for ([_]bool{ false, true }) |reverse| {
+            var original = if (reverse) try Cursor.initReverse(a, small.store(), small_root, &lower, &upper) else try Cursor.init(a, small.store(), small_root, &lower, &upper);
+            defer original.deinit();
+            var bulk_cursor = if (reverse) try Cursor.initReverse(a, large.store(), large_root, &lower, &upper) else try Cursor.init(a, large.store(), large_root, &lower, &upper);
+            defer bulk_cursor.deinit();
+            var count: u64 = 0;
+            while (try original.next()) |row| {
+                const actual = (try bulk_cursor.next()).?;
+                try std.testing.expectEqualSlices(u8, row.key, actual.key);
+                try std.testing.expectEqualSlices(u8, row.value, actual.value);
+                count += 1;
+            }
+            try std.testing.expectEqual(bounds[1] - bounds[0], count);
+            try std.testing.expect((try bulk_cursor.next()) == null);
+        }
+    }
+    var invalid: Source = .{};
+    const before = large.writes;
+    for ([_]usize{ 0, max_page_bytes + 1 }) |target| {
+        try std.testing.expectError(error.InvalidGraphPageSize, buildSortedWithOptions(a, large.store(), &invalid, .{ .target_bytes = target }));
+    }
+    try std.testing.expectEqual(@as(u64, 0), invalid.position);
+    try std.testing.expectEqual(before, large.writes);
+    var failed: TestStore = .{ .alloc = a, .fail_put = 2 };
+    defer failed.deinit();
+    var fresh: Source = .{};
+    try std.testing.expectError(error.InjectedUploadFailure, buildSortedWithOptions(a, failed.store(), &fresh, .{ .target_bytes = bulk_target_page_bytes }));
+}
 
 test "serverless graph sorted page batches preserve identities and fail before root publication" {
     const a = std.testing.allocator;

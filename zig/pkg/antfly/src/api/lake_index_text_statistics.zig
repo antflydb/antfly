@@ -128,7 +128,7 @@ pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u
     var reads: u64 = 0;
     var writes: u64 = 128 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = io };
-    return tree.buildSorted(a, pages.store(), &source);
+    return tree.buildSortedWithOptions(a, pages.store(), &source, .{ .target_bytes = tree.bulk_target_page_bytes });
 }
 
 /// Private builder: sort memory is bounded and its manager caps temporary disk.
@@ -196,7 +196,7 @@ pub const Builder = struct {
                 }
             };
             var initial: Initial = .{ .deltas = &deltas };
-            return tree.buildSorted(self.a, store, &initial);
+            return tree.buildSortedWithOptions(self.a, store, &initial, .{ .target_bytes = tree.bulk_target_page_bytes });
         }
         var cache: tree.Cache = .{ .alloc = self.a, .underlying = store };
         defer cache.deinit();
