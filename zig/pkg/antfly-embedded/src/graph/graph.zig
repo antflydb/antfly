@@ -20082,7 +20082,9 @@ pub const GraphIndex = struct {
         pub const PreparedColumns = struct {
             session_identity: u64,
             request: score_read.PreparedChunks,
+            results: ?score_read.PreparedResults = null,
             pub fn deinit(self: *@This()) void {
+                if (self.results) |*results| results.deinit();
                 self.request.deinit();
                 self.* = undefined;
             }
@@ -20104,14 +20106,23 @@ pub const GraphIndex = struct {
                 self.prepared_identity = next_metric_session_identity.fetchAdd(1, .monotonic);
                 if (self.prepared_identity == 0 or self.prepared_identity == std.math.maxInt(u64)) @panic("metric session identity exhausted");
             }
-            return .{ .session_identity = self.prepared_identity, .request = try score_read.PreparedChunks.init(alloc, selected, nodes) };
+            var request = try score_read.PreparedChunks.init(alloc, selected, nodes);
+            errdefer request.deinit();
+            const results = score_read.PreparedResults.init(alloc, &request, &self.txn) catch |err| switch (@as(anyerror, err)) {
+                error.Unsupported, error.OutOfMemory, error.ResourceBudgetExceeded => null,
+                else => return err,
+            };
+            return .{ .session_identity = self.prepared_identity, .request = request, .results = results };
         }
 
-        /// No raw inputs, byte comparisons, name lookup, or automatic copies.
+        /// No node-input comparison, name lookup, or automatic key copies.
         /// Shape and session identity keep the handle bound to its pinned txn.
         pub fn readPreparedColumns(self: *@This(), alloc: Allocator, prepared: *const PreparedColumns, columns: []const []?f64) !void {
             if (self.prepared_identity == 0 or prepared.session_identity != self.prepared_identity) return error.InvalidQueryRequest;
-            const read_stats = try score_read.populateChunks(alloc, &self.txn, &prepared.request, columns);
+            const read_stats = if (prepared.results) |*results|
+                try results.populate(alloc, &self.txn, &prepared.request, columns)
+            else
+                try score_read.populateChunks(alloc, &self.txn, &prepared.request, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
         }

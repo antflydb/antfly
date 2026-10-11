@@ -42,6 +42,148 @@ pub fn populateChunks(a: std.mem.Allocator, txn: anytype, request: *const Prepar
     return stats;
 }
 
+/// Optional decoded results owned by one prepared handle and one exact erased
+/// read transaction. The session exclusively uses this owner. Unknown backends
+/// and mutable views cannot opt in; bypass invalidates readiness before reads.
+/// Store/workspace retention caps are independent of this caller-owned memory.
+pub const PreparedResults = struct {
+    handle: *State,
+    const State = struct {
+        allocator: std.mem.Allocator,
+        request_identity: usize,
+        txn_identity: usize,
+        values: []f64,
+        namespace: []u8,
+        ready: bool = false,
+        disabled: bool = false,
+    };
+
+    pub fn init(a: std.mem.Allocator, request: *const PreparedChunks, txn: *const @import("../storage/backend_erased.zig").ReadTxn) !@This() {
+        const namespace = txn.decodedResultsNamespace() orelse return error.Unsupported;
+        var count: usize = 0;
+        if (request.combinedRequest()) |combined| count = combined.readKeys().len else {
+            for (request.chunkPlans()) |chunk| count = try std.math.add(usize, count, chunk.request.readKeys().len);
+        }
+        if (count == 0) return error.Unsupported;
+        const state = try a.create(State);
+        errdefer a.destroy(state);
+        const values = try a.alloc(f64, count);
+        errdefer a.free(values);
+        state.* = .{ .allocator = a, .request_identity = @intFromPtr(request.handle), .txn_identity = @intFromPtr(txn.ptr), .values = values, .namespace = try a.dupe(u8, namespace) };
+        return .{ .handle = state };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        const state = self.handle;
+        const a = state.allocator;
+        a.free(state.values);
+        a.free(state.namespace);
+        a.destroy(state);
+        self.* = undefined;
+    }
+
+    fn disable(self: *const @This()) void {
+        const state = self.handle;
+        state.allocator.free(state.values);
+        state.allocator.free(state.namespace);
+        state.namespace = &.{};
+        state.values = &.{};
+        state.ready = false;
+        state.disabled = true;
+    }
+
+    pub fn populate(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks, columns: []const []?f64) !Stats {
+        try request.validateColumns(columns);
+        const state = self.handle;
+        if (state.txn_identity != @intFromPtr(txn.ptr) or state.request_identity != @intFromPtr(request.handle)) return error.InvalidBatch;
+        if (state.disabled) return populateChunks(a, txn, request, columns);
+        const namespace = txn.decodedResultsNamespace();
+        if (namespace) |bytes| if (!std.mem.eql(u8, bytes, state.namespace)) {
+            // Namespace bytes can be borrowed from a mutable caller buffer.
+            // Keep normal reads available, but never reuse an old lookup view.
+            self.disable();
+            return populateChunks(a, txn, request, columns);
+        };
+        if (namespace == null) {
+            state.ready = false;
+            return populateChunks(a, txn, request, columns) catch |err| {
+                // Bypass/overlay reads also retain the uncached memory floor.
+                self.disable();
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) return populateChunks(a, txn, request, columns);
+                return err;
+            };
+        }
+        errdefer for (columns) |column| @memset(column, null);
+        var stats = Stats{ .keys = state.values.len };
+        if (!state.ready) {
+            stats = self.capture(a, txn, request) catch |err| {
+                // Drop optional residency before the bounded streaming retry.
+                // A failed capture is never visible to subsequent cache hits.
+                self.disable();
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) return populateChunks(a, txn, request, columns);
+                return err;
+            };
+            state.ready = if (txn.decodedResultsNamespace()) |bytes| std.mem.eql(u8, bytes, state.namespace) else false;
+        }
+        self.deliver(request, columns);
+        return stats;
+    }
+
+    fn capture(self: *const @This(), a: std.mem.Allocator, txn: *@import("../storage/backend_erased.zig").ReadTxn, request: *const PreparedChunks) !Stats {
+        const Capture = struct {
+            values: []f64,
+            fn write(ctx: *anyopaque, i: usize, score: ?f64) void {
+                const out: *@This() = @ptrCast(@alignCast(ctx));
+                out.values[i] = score orelse std.math.nan(f64);
+            }
+            fn decoded(ctx: *anyopaque, values: []const f64) void {
+                const out: *@This() = @ptrCast(@alignCast(ctx));
+                @memcpy(out.values, values);
+            }
+            fn sink(out: *@This()) @import("../storage/backend_types.zig").CompleteScoreSink {
+                return .{ .context = out, .write = write, .write_decoded = decoded };
+            }
+        };
+        @memset(self.handle.values, std.math.nan(f64));
+        if (request.combinedRequest()) |combined| {
+            var output = Capture{ .values = self.handle.values };
+            return visitPrepared(a, txn, combined, output.sink());
+        }
+        var offset: usize = 0;
+        var stats = Stats{};
+        for (request.chunkPlans()) |chunk| {
+            const count = chunk.request.readKeys().len;
+            var output = Capture{ .values = self.handle.values[offset..][0..count] };
+            const read = try visitPrepared(a, txn, &chunk.request, output.sink());
+            stats.keys += read.keys;
+            stats.batches += read.batches;
+            offset += count;
+        }
+        return stats;
+    }
+
+    fn deliver(self: *const @This(), request: *const PreparedChunks, columns: []const []?f64) void {
+        if (request.combinedRequest()) |combined| {
+            const plan = combined.plan();
+            for (plan.prefixes, 0..) |prefix, i| if (prefix == null) {
+                @memset(columns[if (plan.column_order_identity) i else plan.column_remap[i]], null);
+            };
+            var output = @import("../storage/prepared_score_plan.zig").PreparedScorePlan.Output{ .plan = plan, .columns = columns };
+            output.completeSink().deliverDecoded(self.handle.values);
+            return;
+        }
+        request.clearAbsentColumns(columns);
+        var offset: usize = 0;
+        for (request.chunkPlans()) |*chunk| {
+            const count = chunk.request.readKeys().len;
+            var output = PreparedChunks.Output{ .owner = request, .chunk = chunk, .columns = columns };
+            output.sink().deliverDecoded(self.handle.values[offset..][0..count]);
+            offset += count;
+        }
+        request.finishColumns(columns);
+    }
+};
+
 /// Explicit callers declare repeated work. Clone a matching exclusively leased
 /// canonical plan, retaining its identity without rebuilding or sorting keys.
 pub fn prepareRequestForReuse(alloc: std.mem.Allocator, txn: anytype, prefixes: []const ?[]const u8, nodes: []const []const u8) !PreparedRequest {

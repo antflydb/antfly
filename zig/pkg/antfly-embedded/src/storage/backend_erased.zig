@@ -471,6 +471,8 @@ pub const ReadTxn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        decoded_results_namespace: ?*const fn (*anyopaque) []const u8 = null,
+        can_reuse_decoded_results: ?*const fn (*anyopaque) bool = null,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -478,6 +480,17 @@ pub const ReadTxn = struct {
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
     };
+
+    /// True only for immutable pinned views that permit cached delivery now.
+    /// Mutable overlays, validation bypass and unsupported backends return false.
+    pub fn canReuseDecodedResults(self: *const ReadTxn) bool {
+        return if (self.vtable.can_reuse_decoded_results) |check| check(self.ptr) else false;
+    }
+
+    pub fn decodedResultsNamespace(self: *const ReadTxn) ?[]const u8 {
+        if (!self.canReuseDecodedResults()) return null;
+        return if (self.vtable.decoded_results_namespace) |get_namespace| get_namespace(self.ptr) else null;
+    }
 
     pub fn abort(self: *ReadTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
@@ -1428,6 +1441,14 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return @ptrCast(@alignCast(ptr));
         }
 
+        fn decodedResultsNamespace(ptr: *anyopaque) []const u8 {
+            return unbox(ptr).handle.decodedResultsNamespace();
+        }
+
+        fn canReuseDecodedResults(ptr: *anyopaque) bool {
+            return unbox(ptr).handle.canReuseDecodedResults();
+        }
+
         fn abort(_: Allocator, ptr: *anyopaque) void {
             unbox(ptr).requestAbort();
         }
@@ -1487,6 +1508,8 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
         .vtable = &.{
+            .decoded_results_namespace = if (@hasDecl(Handle, "decodedResultsNamespace")) vt.decodedResultsNamespace else null,
+            .can_reuse_decoded_results = if (@hasDecl(Handle, "canReuseDecodedResults")) vt.canReuseDecodedResults else null,
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
