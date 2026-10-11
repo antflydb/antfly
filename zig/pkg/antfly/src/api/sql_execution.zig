@@ -1544,20 +1544,63 @@ pub const Adapter = struct {
             if (!first and time.monotonicNs() >= deadline) return error.ReadRequirementNotReady;
             first = false;
             context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
-            var attempt = std.heap.ArenaAllocator.init(polling_alloc);
-            defer attempt.deinit();
-            const scratch = attempt.allocator();
-            var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
-            defer current.deinit(scratch);
-            const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
-            const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
-            context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
-            if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            {
+                var attempt = std.heap.ArenaAllocator.init(polling_alloc);
+                defer attempt.deinit();
+                const scratch = attempt.allocator();
+                var current = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load) catch |err| return receiptPollingError(normalized, deadline, err);
+                defer current.deinit(scratch);
+                const coverage = try @import("../serverless/lake_ingestion.zig").coverage(scratch, current.table);
+                const covered = if (self.lake_visibility == .accepted) (@import("../serverless/lake_ingestion.zig").pending(scratch, binding, options, context, coverage) catch |err| return receiptPollingError(normalized, deadline, err)).lsn else coverage;
+                context.ensureActive() catch |err| return receiptPollingError(normalized, deadline, err);
+                if (covered >= receipt.wal_lsn) return try std.json.parseFromSliceLeaky(@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table, a, try std.json.Stringify.valueAlloc(scratch, current.table, .{}), .{ .allocate = .alloc_always });
+            }
             const now = time.monotonicNs();
             if (now >= deadline) return error.ReadRequirementNotReady;
-            try context.io.?.sleep(.fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms))), .awake);
+            // Retire the polling attempt before lending CPU. Keep the original
+            // receipt budget as an additional fence while reentering the queue.
+            var wait: ReceiptPollWait = .{ .adapter = self, .deadline_ns = deadline };
+            wait.sleep(context.io.?, .fromNanoseconds(@intCast(@min(deadline - now, 50 * std.time.ns_per_ms)))) catch |err|
+                return receiptPollingError(normalized, deadline, err);
         }
     }
+
+    const ReceiptPollWait = struct {
+        adapter: *Adapter,
+        deadline_ns: u64,
+
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.context.ensureActive();
+            if (@import("antfly_platform").time.monotonicNs() >= self.deadline_ns) return error.ReadRequirementNotReady;
+        }
+
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(self);
+            try Adapter.spillWaitBegin(self.adapter);
+        }
+
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const execution = self.adapter.runnable orelse return error.InvalidRunnableTransition;
+            const class = if (execution.entry) |*entry| entry.class else return error.InvalidRunnableTransition;
+            // This restriction expires the receipt wait while queued without
+            // replacing the operation, its deadline, or its retained charge.
+            try execution.enterWithCheck(class, .{ .context = self, .check = check });
+            try self.adapter.context.ensureActive();
+            try self.adapter.validateReadFence(false);
+        }
+
+        fn sleep(self: *@This(), io: std.Io, duration: std.Io.Duration) !void {
+            try check(self);
+            try @import("antfly_local_sources").sql_execution_wait.run(
+                if (self.adapter.runnable != null) .{ .ptr = self, .begin = begin, .end = end } else null,
+                std.Io.sleep,
+                .{ io, duration, std.Io.Clock.awake },
+            );
+        }
+    };
 
     fn receiptPollingError(request: operation.RequestContext, deadline: u64, err: anyerror) anyerror {
         // Caller cancellation and statement expiration retain their SQLSTATE.
@@ -4582,4 +4625,100 @@ test "SQL receipt readiness shares one deadline across preflight and scan checks
     try std.testing.expectEqual(start, budget.deadline(start, 0));
     try std.testing.expect(budget.deadline_ns == null);
     try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
+}
+
+test "SQL read resume fences receipt polling sleep lends CPU and retains the original owner" {
+    const Runnable = http_server.RunnableScheduler;
+    const Case = enum { success, io_canceled, request_canceled, receipt_expired, shutdown, canceled_before, expired_before };
+    const Fixture = struct {
+        scheduler: *Runnable.Scheduler,
+        wait: *Adapter.ReceiptPollWait,
+        canceled: *std.atomic.Value(bool),
+        scenario: Case,
+        calls: usize = 0,
+        parked: bool = false,
+        other_granted: bool = false,
+        control_granted: bool = false,
+        retained_operations: usize = 0,
+        retained_bytes: u64 = 0,
+
+        fn cancellation(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+
+        fn sleep(raw: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const before = self.scheduler.stats();
+            self.parked = before.runnable_slots == 0 and before.resource_blocked == 1;
+            self.retained_operations = before.operations;
+            self.retained_bytes = before.retained_bytes;
+            // Submit without waiting: a regression must fail rather than hang
+            // behind the polling operation's unreleased ordinary CPU slot.
+            var other: Runnable.Entry = .{ .options = .{ .io = std.testing.io }, .class = .query };
+            self.scheduler.submit(&other) catch return error.Canceled;
+            self.other_granted = other.state == .running;
+            self.scheduler.finish(&other);
+            var control: Runnable.Entry = .{ .options = .{ .io = std.testing.io }, .class = .control };
+            self.scheduler.submit(&control) catch return error.Canceled;
+            self.control_granted = control.state == .running;
+            self.scheduler.finish(&control);
+            switch (self.scenario) {
+                .io_canceled => return error.Canceled,
+                .request_canceled => self.canceled.store(true, .release),
+                .receipt_expired => self.wait.deadline_ns = 0,
+                .shutdown => self.scheduler.close(),
+                else => {},
+            }
+        }
+    };
+    for (std.enums.values(Case)) |scenario| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = deadline, .native_now_ns = @import("antfly_platform").time.monotonicNs, .retained_bytes = 17, .cancellation = .{ .ptr = &canceled, .requested = Fixture.cancellation } }, .query);
+        const initial_generation = execution.resume_generation;
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        // A sleep with no captured read pins does not access the server.
+        var adapter: Adapter = .{ .server = undefined, .identity = &identity, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+        var wait: Adapter.ReceiptPollWait = .{ .adapter = &adapter, .deadline_ns = deadline };
+        var fixture: Fixture = .{ .scheduler = &scheduler, .wait = &wait, .canceled = &canceled, .scenario = scenario };
+        var vtable = std.testing.io.vtable.*;
+        vtable.sleep = Fixture.sleep;
+        const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+        if (scenario == .canceled_before) canceled.store(true, .release);
+        if (scenario == .expired_before) wait.deadline_ns = 0;
+        const result = wait.sleep(io, .fromMilliseconds(1));
+        switch (scenario) {
+            .success => try result,
+            .io_canceled, .request_canceled, .canceled_before => try std.testing.expectError(error.Canceled, result),
+            .receipt_expired, .expired_before => try std.testing.expectError(error.ReadRequirementNotReady, result),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+        }
+        const called = scenario != .canceled_before and scenario != .expired_before;
+        try std.testing.expectEqual(@as(usize, if (called) 1 else 0), fixture.calls);
+        if (called) {
+            try std.testing.expect(fixture.parked);
+            try std.testing.expect(fixture.other_granted);
+            try std.testing.expect(fixture.control_granted);
+            try std.testing.expectEqual(@as(usize, 1), fixture.retained_operations);
+            try std.testing.expectEqual(@as(u64, 17), fixture.retained_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(Runnable.Class.query, execution.entry.?.class);
+        if (scenario == .success or scenario == .io_canceled) {
+            try std.testing.expectEqual(Runnable.State.running, execution.entry.?.state);
+            try std.testing.expectEqual(initial_generation + 1, execution.resume_generation);
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("receipt polling sleep case {s}: original owner retired without runnable or metadata charges\n", .{@tagName(scenario)});
+    }
 }
