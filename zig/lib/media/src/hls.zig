@@ -32,7 +32,13 @@ pub const Playlist = struct {
     segments: []Segment,
     target_duration_seconds: u64,
     ended: bool,
+    timing_identity: ?[32]u8 = null,
+    reload_after_seconds: ?f64 = null,
+    /// Generated manifest references; HLS and explicit DASH references borrow input.
+    owned_uris: []const []u8 = &.{},
     pub fn deinit(self: *Playlist) void {
+        for (self.owned_uris) |owned| self.allocator.free(owned);
+        self.allocator.free(self.owned_uris);
         self.allocator.free(self.segments);
         self.* = undefined;
     }

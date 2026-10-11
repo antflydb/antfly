@@ -16,7 +16,7 @@
 //! Authenticated native DASH ingestion for explicit fMP4 SegmentList snapshots.
 const hls_live = @import("hls_live.zig");
 const dash = @import("dash.zig");
-pub const Options = hls_live.Options;
+pub const Options = dash.ReaderOptions;
 pub fn Reader(comptime http: type) type {
     return hls_live.ReaderWithManifest(http, dash);
 }

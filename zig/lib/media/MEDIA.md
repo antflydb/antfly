@@ -391,7 +391,7 @@ boundary. Segment ordinals, ingested bytes and shared admission remain cumulativ
 `max_reconfigurations` bounds repeated initialization changes. Inline initialization
 boxes inside pending media still require the transport to signal the boundary.
 The native HTTP HLS reader below signals these boundaries using map and
-discontinuity changes. The DASH SegmentList adapter reuses the same transport; broader DASH addressing and availability scheduling remain separate work.
+discontinuity changes. DASH list/template snapshots reuse the same transport, including synchronized live availability filtering. Representation selection and broader DASH addressing remain separate work.
 
 The media suite covers a real changed SPS/96×48 initialization, invalid replacement
 rollback, replay after discontinuity, outstanding old leases and allocation failures.
@@ -432,21 +432,37 @@ allocation failures across both epochs. Encrypted, MPEG-TS, master-selection,
 low-latency HLS and broader DASH support remain open.
 
 
-## DASH explicit segment ingestion
+## DASH template and live ingestion
 
-`dash.parse` accepts bounded static XML MPDs with one MP4 video representation
-and an explicit `SegmentList`. It preserves `startNumber`, duration/timescale,
-initialization URI and inclusive byte ranges, converting them to the shared
-fMP4 segment contract. Strings borrow the MPD; owned segment arrays release on
-all allocation failures. XML external entities, DTDs, processing instructions,
-DRM, alternate adaptations/representations and unsupported addressing/timing
-attributes fail explicitly. This is a declared subset of
-[DASH addressing](https://dashif.org/Guidelines-TimingModel/), not a complete MPD
-implementation: `SegmentTemplate`, `SegmentTimeline`, `BaseURL`, dynamic
-availability clocks, MPD Patch and DRM remain open.
+`dash.parse` accepts bounded static XML MPDs with one MP4 video representation,
+using explicit `SegmentList` or representation-level `SegmentTemplate`.
+Templates expand `$RepresentationID$`, `$Bandwidth$`, `$Number$`, `$Time$`,
+`$$` escapes and bounded `%0Nd` decimal widths. `SegmentTimeline` supports
+explicit/implicit starts, nonnegative repeats and `r=-1` bounded by the next
+start, period end or live clock. Duration-based templates use the period duration
+or live clock. Timescales are bounded to 32 bits; XML elapsed durations and UTC
+`Z` timestamps accept millisecond precision. Explicit list references borrow the
+MPD; expanded template references are owned by the playlist. All allocations and
+expanded URI bytes are bounded, including allocator-failure cleanup.
+
+`dash.parseAt` and `dash_live.Options.clock` accept synchronized UTC Unix
+milliseconds. Dynamic templates require `availabilityStartTime`; `Period@start`
+and `presentationTimeOffset` establish sample/presentation clock mapping. Only
+complete segments with zero availability offset are exposed. The time-shift
+window drops expired references arithmetically, avoiding historical enumeration;
+early snapshots can be empty. `minimumUpdatePeriod` is exposed by
+`reloadAfterSeconds`; the caller schedules polling. Changes to availability,
+period-start, timescale or offset identity fail during reload. Overlapping
+segment descriptors remain immutable; missing unconsumed sequences report gaps.
 
 `dash_live.Reader(httpx)` reuses authenticated origin-pinned HTTP, exact ranges,
 shared admission, transactional snapshot reload and retry-safe fMP4 ingestion.
-It returns owned segments and packet leases. A production HTTP fixture verifies
-MPD → initialization → fragment ingestion with authentication on every request.
+It returns owned segments and packet leases. Parser, allocation-failure, clock
+advancement, retry, gap and production authenticated HTTP tests cover these paths.
 It is a library API; grouped model requests still accept owned MP4/MOV bytes.
+
+This is a declared subset of [DASH addressing and timing](https://dashif.org/Guidelines-TimingModel/).
+BaseURL, inherited templates, multiple periods/adaptations/representations,
+nonzero availability offsets, incomplete low-latency segments, UTCTiming fetching,
+MPD Patch, DRM, XML entities/DTDs and unsupported attributes fail explicitly.
+The caller supplies clock synchronization and selects the representation upstream.

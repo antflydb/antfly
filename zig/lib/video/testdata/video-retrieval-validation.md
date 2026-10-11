@@ -228,3 +228,56 @@ Portable logical-picture duration sampling, orthogonal display/SAR geometry and
 static DASH SegmentList ingestion have their own library tests; they do not
 broaden the default model policy or qualify VP-family decoding. Batching,
 VP8 interframes, VP9/AV1 and broader DASH addressing/live scheduling remain open.
+
+## Frame batching and model policy continuation
+
+[Frame batching gates](retrieval-validation/frame-batch-gates.json) bind the final
+production binary and current source identities. Native CPU and Metal batch up to
+two equal-geometry frames, with frame-independent attention/positions/pooling,
+unique-frame ownership and singleton/mixed-geometry flushes. Metal retains device
+inputs/results and bounded decode/preparation overlap. Its request reservation is
+1920 MiB; CPU retains one bounded pending patch frame.
+
+The [actual Metal batched vision test](retrieval-validation/frame-batch-metal-unit.json)
+passes with no skips and no intermediate downloads, comparing positions, RoPE and
+pooling with independent one-frame values. The complete video-model gate passes
+13 tests on actual Metal. Media parser/ingestion tests pass 55 cases; authenticated
+native HTTP tests pass four, including dynamic DASH template ingestion. Python
+qualification tests pass 29. Linux x86-64 musl media/native HTTP and video-model
+gates cross-compile; no new Linux execution or pretrained receipt is claimed.
+
+[Native CPU](retrieval-validation/native-pretrained-frame-batch.json) and
+[Metal](retrieval-validation/metal-pretrained-frame-batch.json) retain all six
+pretrained vectors, token counts, normalized 128-dimensional output, forced
+admission retry and corrupted-selected-frame cleanup/retry. Maximum coordinate
+errors are 4.77e-7 and 2.76e-7 respectively.
+
+[CPU model policies](retrieval-validation/native-model-video-policy.json) and
+[Metal model policies](retrieval-validation/metal-model-video-policy.json) qualify
+a VFR derivative that preserves all compressed frames, total duration and average
+FPS, selecting the pinned `[0,4]` indexes and matching the independent pretrained
+vector. HTTP rejects rotation, non-square pixels and PQ HDR explicitly. These
+receipts do not qualify model display rendering, tone mapping, timestamp-based
+sampling or field-picture indexing.
+
+[Real-clip Metal](retrieval-validation/metal-real-frame-batch.json) preserves all
+ten vectors and four exact rankings/top-k sets; maximum cosine-score error is
+3.46e-7. Scene-0 H.264 has three warm completed HTTP samples with median 0.869
+seconds; sampled owned server/worker RSS peaks at 2,243,592,192 bytes. Concurrent
+and sustained requests and disconnect/retry pass.
+[Long-clip Metal](retrieval-validation/long-metal-frame-batch.json) preserves its
+vector/scores, with maximum score error 3.17e-7, first completed document request
+15.827 seconds (one sample, no warmup), retry 32.186 seconds and sustained request
+14.521 seconds. Peak sampled RSS is 2,152,808,448 bytes.
+
+These are shared-host measurements, including concurrent compiler/qualification
+activity, and do not establish an isolated batching speedup. The long corpus has
+one candidate and trivial rankings. RSS can count shared mappings twice and
+excludes unmapped private GPU memory. Successful disconnect/retry does not expose
+cancellation completion. VP8 interframes and pure Zig VP9/AV1 decoding remain
+unimplemented; template/live DASH is a separately tested bounded library subset.
+
+[Real-clip native CPU](retrieval-validation/native-real-frame-batch.json) also
+preserves all ten vectors and four exact rankings/top-k sets, with sustained
+requests and disconnect/retry. This latest run is macOS ARM64, one timing sample
+per case with no warmup; it does not establish Linux execution or capacity.

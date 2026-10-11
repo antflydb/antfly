@@ -35,19 +35,20 @@ pub fn Reader(comptime http: type) type {
 
 /// Shared authenticated fMP4 transport/epoch/retry state machine.
 pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) type {
+    const ReaderOptions = if (@hasDecl(manifest_parser, "ReaderOptions")) manifest_parser.ReaderOptions else Options;
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
         transport: *network.Adapter(http),
         url: []u8,
-        options: Options,
+        options: ReaderOptions,
         manifest: ?network.Body = null,
         playlist: ?hls.Playlist = null,
         ingest: ?live.Ingest = null,
         next_sequence: ?u64 = null,
         active_initialization: ?hls.Initialization = null,
         active_discontinuity_sequence: ?u64 = null,
-        pub fn init(a: std.mem.Allocator, transport: *network.Adapter(http), url: []const u8, options: Options) !Self {
+        pub fn init(a: std.mem.Allocator, transport: *network.Adapter(http), url: []const u8, options: ReaderOptions) !Self {
             const owned = try network.resolve(a, transport.root_url, url, url, transport.limits.max_uri_bytes);
             return .{ .allocator = a, .transport = transport, .url = owned, .options = options };
         }
@@ -66,10 +67,14 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             try self.transport.control.check();
             var body = try self.transport.fetch(self.url, self.url, null, self.options.playlist.max_bytes);
             errdefer body.deinit();
-            var parsed = try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
+            var parsed = if (@hasDecl(manifest_parser, "parseAt"))
+                try manifest_parser.parseAt(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null)
+            else
+                try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
             errdefer parsed.deinit();
             if (self.playlist) |previous| {
-                if (parsed.target_duration_seconds != previous.target_duration_seconds) return error.SourceVersionChanged;
+                if (!std.meta.eql(parsed.timing_identity, previous.timing_identity)) return error.SourceVersionChanged;
+                if (!@hasDecl(manifest_parser, "parseAt") and parsed.target_duration_seconds != previous.target_duration_seconds) return error.SourceVersionChanged;
                 // Both arrays have consecutive sequence numbers. Compare the
                 // overlap in linear time, checking cancellation during reload.
                 var old_index: usize = 0;
@@ -107,6 +112,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         }
         /// Caller-visible polling delay; no blocking sleeper is hidden in ingest.
         pub fn reloadAfterSeconds(self: *const Self, unchanged: bool) f64 {
+            if (self.playlist) |playlist| if (playlist.reload_after_seconds) |seconds| return seconds;
             const target = if (self.playlist) |playlist| playlist.target_duration_seconds else 1;
             return @as(f64, @floatFromInt(target)) * (if (unchanged) @as(f64, 0.5) else 1.0);
         }
@@ -172,6 +178,8 @@ const FakeHttp = struct {
             }
             if (std.mem.indexOf(u8, url, "/init") != null) return .{ .body = bytes[0..cursor] };
             if (self.fail_media) return error.ConnectionReset;
+            if (std.mem.endsWith(u8, url, "seg-1.m4s")) return .{ .body = bytes[cursor..11206] };
+            if (std.mem.endsWith(u8, url, "seg-2.m4s")) return .{ .body = bytes[11206..20811] };
             return .{ .body = bytes[cursor..] };
         }
     };
@@ -259,4 +267,46 @@ test "live HLS allocation failures release both configuration epochs and retaine
         try std.testing.expectError(error.OutOfMemory, Harness.run(failing.allocator()));
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "live DASH template reload uses refreshed clock retry and gap detection" {
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z' timeShiftBufferDepth='PT4S'><Period><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    const a = std.testing.allocator;
+    const TestClock = struct {
+        time: i64 = 2000,
+        fn now(raw: ?*anyopaque) i64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw.?))).time;
+        }
+    };
+    var clock = TestClock{};
+    var client = FakeHttp.Client{ .manifest = mpd };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now = TestClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var lease = try first.reader.readPacket(0);
+    defer lease.deinit();
+    try std.testing.expect(!reader.ended());
+    try std.testing.expect((try reader.next()) == null);
+    clock.time = 4000;
+    try reader.reload();
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, reader.next());
+    try std.testing.expectEqual(@as(u64, 2), reader.next_sequence.?);
+    client.fail_media = false;
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+    try std.testing.expectEqual(@as(usize, 6), client.calls);
+    const changed_clock = try std.mem.replaceOwned(u8, a, mpd, "1970-01-01", "1970-01-02");
+    defer a.free(changed_clock);
+    client.manifest = changed_clock;
+    try std.testing.expectError(error.SourceVersionChanged, reader.reload());
+    client.manifest = mpd;
+    clock.time = 20000;
+    try std.testing.expectError(error.MediaStreamGap, reader.reload());
+    try std.testing.expectEqual(@as(u64, 3), reader.next_sequence.?);
+    try std.testing.expect(lease.bytes.len > 0);
 }

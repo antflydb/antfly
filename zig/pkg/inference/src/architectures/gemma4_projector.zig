@@ -117,6 +117,7 @@ const AudioConfig = struct {
 };
 
 const Geometry = struct {
+    batches: usize = 1,
     width: usize,
     height: usize,
     grid_x: usize,
@@ -125,7 +126,7 @@ const Geometry = struct {
     pooled_y: usize,
 
     fn tokenCount(self: Geometry) usize {
-        return self.pooled_x * self.pooled_y;
+        return self.batches * self.pooled_x * self.pooled_y;
     }
 };
 
@@ -377,16 +378,24 @@ pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: st
 
 /// Returns an owned projected tensor without a Metal soft-token readback.
 pub fn encodeEmbeddingGemma2VideoTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: @import("../ops/ops.zig").CT, width: u32, height: u32) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2VideoBatchTensorResident(cb, allocator, input, width, height, 1);
+}
+
+/// Frames share projection/FFN dispatches; SDPA has an independent batch axis.
+/// Input rows are frame-major NHWC patches. The returned tensor is frame-major.
+/// A two-frame bound keeps transformer workspace within request admission.
+pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
+    if (frames == 0 or frames > 2) return error.InvalidTensorShape;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
-    const g = Geometry{ .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
-    if (g.tokenCount() > 140) return error.InvalidTensorShape;
+    const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
+    if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
     const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
     defer cb.free(weight);
-    const projected = try cb.linearNoBias(input, weight, g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+    const projected = try cb.linearNoBias(input, weight, frames * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
     defer cb.free(projected);
     if (cb.kind() == .metal) {
         const positions = try store.weightCt("v.position_embd.weight");
@@ -398,7 +407,7 @@ pub fn encodeEmbeddingGemma2VideoTensorResident(cb: *const ComputeBackend, alloc
     defer allocator.free(data);
     const positioned = try addPositionEmbeddings(allocator, &store, cfg, data, g);
     defer allocator.free(positioned);
-    const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
+    const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(frames * g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
     return encodePositionedTensorResident(cb, allocator, &store, cfg, hidden, g);
 }
 
@@ -2832,18 +2841,15 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     if (shape.len != 3 or shape[0] != 2 or shape[1] <= 0 or shape[2] != @as(i64, @intCast(hidden))) return error.InvalidPositionEmbeddingShape;
     const per_axis: usize = @intCast(shape[1]);
     if (geometry.grid_x > per_axis or geometry.grid_y > per_axis) return error.InvalidPositionEmbeddingShape;
-    const rows = geometry.grid_x * geometry.grid_y;
+    const rows = geometry.batches * geometry.grid_x * geometry.grid_y;
     if (!(try cb.tensorShapeMatches(patches, &.{ @intCast(rows), @intCast(hidden) }) orelse false)) return error.InvalidPositionEmbeddingShape;
     const x = try allocator.alloc(i64, rows);
     defer allocator.free(x);
     const y = try allocator.alloc(i64, rows);
     defer allocator.free(y);
-    for (0..geometry.grid_y) |gy| {
-        for (0..geometry.grid_x) |gx| {
-            const i = gy * geometry.grid_x + gx;
-            x[i] = @intCast(gx);
-            y[i] = std.math.cast(i64, per_axis + gy) orelse return error.InvalidPositionEmbeddingShape;
-        }
+    for (0..rows) |i| {
+        x[i] = @intCast(i % geometry.grid_x);
+        y[i] = std.math.cast(i64, per_axis + (i / geometry.grid_x) % geometry.grid_y) orelse return error.InvalidPositionEmbeddingShape;
     }
     const xp = try cb.embeddingLookup(positions, x, rows, hidden);
     defer cb.free(xp);
@@ -2861,7 +2867,7 @@ fn addPositionEmbeddings(
     patch_embeddings: []const f32,
     geometry: Geometry,
 ) ![]f32 {
-    const patch_count = geometry.grid_x * geometry.grid_y;
+    const patch_count = geometry.batches * geometry.grid_x * geometry.grid_y;
     const out = try allocator.alloc(f32, patch_count * cfg.vision_hidden);
     @memcpy(out, patch_embeddings);
     errdefer allocator.free(out);
@@ -2893,16 +2899,15 @@ fn addPositionEmbeddingsInPlace(
         return error.InvalidPositionEmbeddingShape;
     }
 
-    const patch_count = geometry.grid_x * geometry.grid_y;
+    const patch_count = geometry.batches * geometry.grid_x * geometry.grid_y;
     if (patch_embeddings.len != patch_count * cfg.vision_hidden) return error.InvalidPositionEmbeddingShape;
-    for (0..geometry.grid_y) |y| {
-        for (0..geometry.grid_x) |x| {
-            const patch_idx = y * geometry.grid_x + x;
-            const dst = patch_idx * cfg.vision_hidden;
-            for (0..cfg.vision_hidden) |h| {
-                patch_embeddings[dst + h] += positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 0, x, h, hidden_first) +
-                    positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 1, y, h, hidden_first);
-            }
+    for (0..patch_count) |patch_idx| {
+        const x = patch_idx % geometry.grid_x;
+        const y = (patch_idx / geometry.grid_x) % geometry.grid_y;
+        const dst = patch_idx * cfg.vision_hidden;
+        for (0..cfg.vision_hidden) |h| {
+            patch_embeddings[dst + h] += positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 0, x, h, hidden_first) +
+                positionEmbeddingValue(pos.data, cfg.vision_hidden, positions_per_axis, 1, y, h, hidden_first);
         }
     }
 }
@@ -2992,7 +2997,7 @@ fn encoderBlock(
     geometry: Geometry,
     layer: usize,
 ) !CT {
-    const total = geometry.grid_x * geometry.grid_y;
+    const total = geometry.batches * geometry.grid_x * geometry.grid_y;
     var buf: [128]u8 = undefined;
 
     const ln1 = try store.weightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
@@ -3036,11 +3041,11 @@ fn selfAttention(
     layer: usize,
     buf: *[128]u8,
 ) !CT {
-    const total = geometry.grid_x * geometry.grid_y;
+    const total = geometry.batches * geometry.grid_x * geometry.grid_y;
     const head_dim = cfg.vision_hidden / cfg.head_count;
 
     var q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(q);
+    defer cb.free(q);
     {
         const q_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
         defer cb.free(q_norm_w);
@@ -3048,10 +3053,9 @@ fn selfAttention(
         cb.free(q);
         q = normed;
     }
-    defer cb.free(q);
 
     var k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(k);
+    defer cb.free(k);
     {
         const k_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
         defer cb.free(k_norm_w);
@@ -3059,21 +3063,19 @@ fn selfAttention(
         cb.free(k);
         k = normed;
     }
-    defer cb.free(k);
 
     var v = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
-    errdefer cb.free(v);
+    defer cb.free(v);
     {
         const normed = try rmsNormHeadChunksNoScale(cb, allocator, v, total, cfg.vision_hidden, head_dim, cfg.layer_norm_eps);
         cb.free(v);
         v = normed;
     }
-    defer cb.free(v);
 
     const mask = try allocator.alloc(i64, total);
     defer allocator.free(mask);
     @memset(mask, 1);
-    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, 1, total, cfg.head_count, head_dim);
+    const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, geometry.batches, geometry.grid_x * geometry.grid_y, cfg.head_count, head_dim);
     defer cb.free(attn);
 
     return linearNoBiasMaybeClipped(cb, allocator, store, attn, try fmt(buf, "v.blk.{d}.attn_out", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
@@ -3093,7 +3095,7 @@ fn rmsNormHeadChunksAnd2dRope(
     compensate_sdpa_scale: bool,
 ) !CT {
     if (cb.kind() == .metal) {
-        if (head_dim == 0 or head_dim % 4 != 0 or hidden % head_dim != 0 or rows != geometry.grid_x * geometry.grid_y) return error.InvalidTensorShape;
+        if (head_dim == 0 or head_dim % 4 != 0 or hidden % head_dim != 0 or rows != geometry.batches * geometry.grid_x * geometry.grid_y) return error.InvalidTensorShape;
         const chunks = rows * (hidden / head_dim);
         const flat = try cb.reshape2D(allocator, input, rows, hidden, chunks, head_dim);
         defer cb.free(flat);
@@ -3107,7 +3109,7 @@ fn rmsNormHeadChunksAnd2dRope(
         defer allocator.free(positions);
         for (0..rows) |i| {
             positions[i] = @intCast(i % geometry.grid_x);
-            positions[rows + i] = @intCast(i / geometry.grid_x);
+            positions[rows + i] = @intCast((i / geometry.grid_x) % geometry.grid_y);
         }
         const rotated = (try cb.visionRope(interleaved, rows, head_dim, rope_theta, positions)) orelse return error.UnsupportedOperation;
         defer cb.free(rotated);
@@ -3186,7 +3188,7 @@ fn apply2dRope(
 
     for (0..rows) |token| {
         const x: f32 = @floatFromInt(token % geometry.grid_x);
-        const y: f32 = @floatFromInt(token / geometry.grid_x);
+        const y: f32 = @floatFromInt((token / geometry.grid_x) % geometry.grid_y);
         const positions = [2]f32{ x, y };
         for (0..heads) |head| {
             const base = token * hidden + head * head_dim;
@@ -3238,15 +3240,13 @@ fn feedForward(
 fn averagePoolSpatialDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, cfg: Config, geometry: Geometry) !CT {
     const merge = cfg.spatial_merge_size;
     if (merge == 0 or geometry.grid_x != geometry.pooled_x * merge or geometry.grid_y != geometry.pooled_y * merge) return error.InvalidPatchEmbeddingShape;
-    const shape = [_]i64{ @intCast(geometry.pooled_y), @intCast(merge), @intCast(geometry.pooled_x), @intCast(merge), @intCast(cfg.vision_hidden) };
+    const shape = [_]i64{ @intCast(geometry.batches), @intCast(geometry.pooled_y), @intCast(merge), @intCast(geometry.pooled_x), @intCast(merge), @intCast(cfg.vision_hidden) };
     const view = try cb.primReshape(input, &shape);
     defer cb.free(view);
-    // Single-axis reductions stay on device; reducing both axes together
-    // would currently select the generic host implementation.
-    const horizontal = try cb.primReduceMean(view, &.{3}, &shape);
+    const horizontal = try cb.primReduceMean(view, &.{4}, &shape);
     defer cb.free(horizontal);
-    const horizontal_shape = [_]i64{ shape[0], shape[1], shape[2], shape[4] };
-    const vertical = try cb.primReduceMean(horizontal, &.{1}, &horizontal_shape);
+    const horizontal_shape = [_]i64{ shape[0], shape[1], shape[2], shape[3], shape[5] };
+    const vertical = try cb.primReduceMean(horizontal, &.{2}, &horizontal_shape);
     defer cb.free(vertical);
     const flat = try cb.primReshape(vertical, &.{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) });
     defer cb.free(flat);
@@ -3260,25 +3260,25 @@ fn averagePoolSpatial(
     cfg: Config,
     geometry: Geometry,
 ) ![]f32 {
-    if (hidden.len != geometry.grid_x * geometry.grid_y * cfg.vision_hidden) return error.InvalidPatchEmbeddingShape;
+    if (hidden.len != geometry.batches * geometry.grid_x * geometry.grid_y * cfg.vision_hidden) return error.InvalidPatchEmbeddingShape;
     const merge = cfg.spatial_merge_size;
     const pooled = try allocator.alloc(f32, geometry.tokenCount() * cfg.vision_hidden);
-    for (0..geometry.pooled_y) |py| {
-        for (0..geometry.pooled_x) |px| {
-            const dst_token = py * geometry.pooled_x + px;
-            const dst = dst_token * cfg.vision_hidden;
-            @memset(pooled[dst..][0..cfg.vision_hidden], 0.0);
-            for (0..merge) |dy| {
-                for (0..merge) |dx| {
-                    const src_token = (py * merge + dy) * geometry.grid_x + (px * merge + dx);
-                    const src = src_token * cfg.vision_hidden;
-                    for (0..cfg.vision_hidden) |h| pooled[dst + h] += hidden[src + h];
-                }
+    for (0..geometry.tokenCount()) |dst_token| {
+        const batch = dst_token / (geometry.pooled_x * geometry.pooled_y);
+        const py = (dst_token / geometry.pooled_x) % geometry.pooled_y;
+        const px = dst_token % geometry.pooled_x;
+        const dst = dst_token * cfg.vision_hidden;
+        @memset(pooled[dst..][0..cfg.vision_hidden], 0.0);
+        for (0..merge) |dy| {
+            for (0..merge) |dx| {
+                const src_token = batch * geometry.grid_x * geometry.grid_y + (py * merge + dy) * geometry.grid_x + (px * merge + dx);
+                const src = src_token * cfg.vision_hidden;
+                for (0..cfg.vision_hidden) |h| pooled[dst + h] += hidden[src + h];
             }
-            const denom: f32 = @floatFromInt(merge * merge);
-            const scale = @sqrt(@as(f32, @floatFromInt(cfg.vision_hidden)));
-            for (0..cfg.vision_hidden) |h| pooled[dst + h] = (pooled[dst + h] / denom) * scale;
         }
+        const denom: f32 = @floatFromInt(merge * merge);
+        const scale = @sqrt(@as(f32, @floatFromInt(cfg.vision_hidden)));
+        for (0..cfg.vision_hidden) |h| pooled[dst + h] = (pooled[dst + h] / denom) * scale;
     }
     return pooled;
 }
@@ -3925,8 +3925,8 @@ test "gemma4 video device normalization rope and pooling preserve host results w
     defer compute.deinit();
     const cb = compute.computeBackend();
     if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
-    const geometry = Geometry{ .width = 126, .height = 168, .grid_x = 9, .grid_y = 12, .pooled_x = 3, .pooled_y = 4 };
-    const rows = geometry.grid_x * geometry.grid_y;
+    const geometry = Geometry{ .batches = 2, .width = 126, .height = 168, .grid_x = 9, .grid_y = 12, .pooled_x = 3, .pooled_y = 4 };
+    const rows = geometry.batches * geometry.grid_x * geometry.grid_y;
     const hidden = 192;
     const head_dim = 64;
     const values = try a.alloc(f32, rows * hidden);
@@ -3942,7 +3942,12 @@ test "gemma4 video device normalization rope and pooling preserve host results w
         const expected = try a.dupe(f32, values);
         defer a.free(expected);
         activations.rmsNorm(expected, &weights, head_dim, 1e-6);
-        apply2dRope(expected, rows, hidden, head_dim, geometry, 100.0, compensate);
+        for (0..geometry.batches) |batch| {
+            var single = geometry;
+            single.batches = 1;
+            const frame_rows = geometry.grid_x * geometry.grid_y;
+            apply2dRope(expected[batch * frame_rows * hidden ..][0 .. frame_rows * hidden], frame_rows, hidden, head_dim, single, 100.0, compensate);
+        }
         const before = cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes;
         const result = try rmsNormHeadChunksAnd2dRope(&cb, a, input, weight, rows, hidden, head_dim, geometry, 1e-6, 100.0, compensate);
         defer cb.free(result);
@@ -3976,13 +3981,13 @@ test "gemma4 video device normalization rope and pooling preserve host results w
     try std.testing.expectEqual(before_positions, cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes);
     const actual_positioned = try cb.toFloat32(positioned, a);
     defer a.free(actual_positioned);
-    for (0..geometry.grid_y) |y| {
-        for (0..geometry.grid_x) |x| {
-            for (0..hidden) |h| {
-                const i = (y * geometry.grid_x + x) * hidden + h;
-                const expected = values[i] + (positionEmbeddingValue(position_values, hidden, axis_positions, 0, x, h, false) + positionEmbeddingValue(position_values, hidden, axis_positions, 1, y, h, false));
-                try std.testing.expectApproxEqAbs(expected, actual_positioned[i], 2e-6);
-            }
+    for (0..rows) |row| {
+        const x = row % geometry.grid_x;
+        const y = (row / geometry.grid_x) % geometry.grid_y;
+        for (0..hidden) |h| {
+            const i = row * hidden + h;
+            const expected = values[i] + (positionEmbeddingValue(position_values, hidden, axis_positions, 0, x, h, false) + positionEmbeddingValue(position_values, hidden, axis_positions, 1, y, h, false));
+            try std.testing.expectApproxEqAbs(expected, actual_positioned[i], 2e-6);
         }
     }
     const dense_name = "video-test.dense-position-embedding";
@@ -4050,18 +4055,26 @@ test "gemma4 video device normalization rope and pooling preserve host results w
     try std.testing.expectEqual(before_packed, cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes);
     const actual_packed = try cb.toFloat32(packed_result, a);
     defer a.free(actual_packed);
-    for (0..geometry.grid_y) |y| {
-        for (0..geometry.grid_x) |x| {
-            for (0..hidden) |h| {
-                const i = (y * geometry.grid_x + x) * hidden + h;
-                const expected = values[i] + (positionEmbeddingValue(rounded_positions, hidden, axis_positions, 0, x, h, false) + positionEmbeddingValue(rounded_positions, hidden, axis_positions, 1, y, h, false));
-                try std.testing.expectApproxEqAbs(expected, actual_packed[i], 2e-6);
-            }
+    for (0..rows) |row| {
+        const x = row % geometry.grid_x;
+        const y = (row / geometry.grid_x) % geometry.grid_y;
+        for (0..hidden) |h| {
+            const i = row * hidden + h;
+            const expected = values[i] + (positionEmbeddingValue(rounded_positions, hidden, axis_positions, 0, x, h, false) + positionEmbeddingValue(rounded_positions, hidden, axis_positions, 1, y, h, false));
+            try std.testing.expectApproxEqAbs(expected, actual_packed[i], 2e-6);
         }
     }
     const invalid_geometry = Geometry{ .width = 252, .height = 168, .grid_x = 18, .grid_y = 12, .pooled_x = 6, .pooled_y = 4 };
     try std.testing.expectError(error.InvalidPositionEmbeddingShape, addPositionEmbeddingsDevice(&cb, a, input, position_tensor, hidden, invalid_geometry));
-    const expected_pool = try averagePoolSpatial(a, values, cfg, geometry);
+    const expected_pool = try a.alloc(f32, geometry.tokenCount() * hidden);
+    for (0..geometry.batches) |batch| {
+        var single = geometry;
+        single.batches = 1;
+        const frame_rows = geometry.grid_x * geometry.grid_y;
+        const frame_pool = try averagePoolSpatial(a, values[batch * frame_rows * hidden ..][0 .. frame_rows * hidden], cfg, single);
+        defer a.free(frame_pool);
+        @memcpy(expected_pool[batch * single.tokenCount() * hidden ..][0..frame_pool.len], frame_pool);
+    }
     defer a.free(expected_pool);
     const before_pool = cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes;
     const pooled = try averagePoolSpatialDevice(&cb, a, input, cfg, geometry);

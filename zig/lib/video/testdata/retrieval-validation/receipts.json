@@ -114,5 +114,47 @@
   "composition-gates.json": {
     "artifact_sha256": "af8d5a1d95e9790f1d2a94c08fd09fbd53397616361f00a8476ef9f7dca4f05c",
     "original_report_sha256": "af8d5a1d95e9790f1d2a94c08fd09fbd53397616361f00a8476ef9f7dca4f05c"
+  },
+  "metal-pretrained-frame-batch.json": {
+    "artifact_sha256": "071ec52bd93303198b4ff37d78e40aed84cb7cbb81194f2dcc58189aaa283c64",
+    "original_report_sha256": "071ec52bd93303198b4ff37d78e40aed84cb7cbb81194f2dcc58189aaa283c64"
+  },
+  "native-pretrained-frame-batch.json": {
+    "artifact_sha256": "c10619ebda0ebc5bcc41915bec043dbaf80bf5cd3687b03b1bb3894e3cd71327",
+    "original_report_sha256": "c10619ebda0ebc5bcc41915bec043dbaf80bf5cd3687b03b1bb3894e3cd71327"
+  },
+  "metal-model-video-policy.json": {
+    "artifact_sha256": "96c12e2a283ac385bca2277a974b9c226cafd99b1ced172198b5b4141deedb4f",
+    "original_report_sha256": "96c12e2a283ac385bca2277a974b9c226cafd99b1ced172198b5b4141deedb4f"
+  },
+  "native-model-video-policy.json": {
+    "artifact_sha256": "3f6d6d11e2314ebb29ef8b9d679aba4a3eafb53d1f72abfc49434ca3c45eade1",
+    "original_report_sha256": "3f6d6d11e2314ebb29ef8b9d679aba4a3eafb53d1f72abfc49434ca3c45eade1"
+  },
+  "metal-real-frame-batch.json": {
+    "artifact_sha256": "df191629199bdc958317ea5f552509c56114fd14a50cbc0b61643235e34e1f5d",
+    "original_report_sha256": "df191629199bdc958317ea5f552509c56114fd14a50cbc0b61643235e34e1f5d"
+  },
+  "native-real-frame-batch.json": {
+    "artifact_sha256": "f77c6df7000d2b8a7b93d670316a57c0f5ef93e65b8a4af7be793ac688268882",
+    "original_report_sha256": "f77c6df7000d2b8a7b93d670316a57c0f5ef93e65b8a4af7be793ac688268882"
+  },
+  "long-metal-frame-batch.json": {
+    "artifact_sha256": "5e2a98c5b2c981ae12eafd76e7ad3d2de41639688439cf2b3db1e1fbacffc310",
+    "original_report_sha256": "5e2a98c5b2c981ae12eafd76e7ad3d2de41639688439cf2b3db1e1fbacffc310"
+  },
+  "frame-batch-metal-unit.txt": {
+    "artifact_sha256": "776be7386432d97edc692f377840552b268e8d8a743313df08eeac8731c49d19",
+    "original_report_sha256": "776be7386432d97edc692f377840552b268e8d8a743313df08eeac8731c49d19"
+  },
+  "frame-policy-model-unit.txt": {
+    "artifact_sha256": "7017a6f32888af0fcbf56643501f662504634887ed23e43c74a814ac46d1fbb9",
+    "original_report_sha256": "7017a6f32888af0fcbf56643501f662504634887ed23e43c74a814ac46d1fbb9"
+  },
+  "frame-batch-metal-unit.json": {
+    "artifact_sha256": "cbcae15fcd9876a26e22667c7031de5288e86cd49145577159c70a5c54c1ceef"
+  },
+  "frame-batch-gates.json": {
+    "artifact_sha256": "4736c6eb203f0b8273b880ea00dc64ab3d1bd1cb5521dbb3c5355f67f4c98f01"
   }
 }

@@ -75,7 +75,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     // working set before decoding or allocating any projected soft tokens.
     // Metal video also charges three 128 MiB preparation slots: two queued
     // and the producer submission that can block behind them.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 1152) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 1920) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
     defer permit.deinit();
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();

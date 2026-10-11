@@ -929,16 +929,27 @@ enters the joint language backbone; CPU and raster-batch APIs preserve their
 existing host contracts. A real Metal test compares mixed composition with the
 host reference and asserts zero additional host-mirror downloads.
 
-A request-local worker exclusively owns projection/backend operations while the
-producer decodes and submits subsequent preparations. Two preparations can queue
-behind one executing projection; the producer can additionally hold one prepared
-submission while blocked. Admission reserves three additional 128 MiB preparation
-slots before any decode. Duplicates reuse the owner projection; all presentation
-slots are populated after joining the worker. Failure closes the queue, wakes a
-blocked producer, drains GPU leases and joins before backend/allocator teardown.
-This implements decode/preparation/projection overlap, not batched vision
-attention or concurrent backbone execution. Pretrained and sustained-load gates
-must qualify every rebuilt production binary; helper results alone are insufficient.
+The projector batches up to two prepared frames with identical geometry. Patch,
+Q/K/V, FFN and projector linear operations share frame-major rows; attention has
+an independent frame batch axis. Learned positions and 2-D RoPE reset at each
+frame, and pooling preserves frame boundaries. Mixed geometry flushes single
+frames. CPU retains one pending patch frame and flushes a final singleton; duplicate
+samples reuse the owner projection. Metal batches resident inputs and slices the
+result on device, preserving unique-packet ownership and presentation ordering.
+
+A request-local Metal worker exclusively owns projection/backend operations while
+the producer decodes and prepares subsequent frames. Two preparations can queue
+behind two executing frames; one producer-held submission can wait for admission
+to the queue. The model reserves 1920 MiB workspace before decoding: two 768 MiB
+transformer ceilings and three additional 128 MiB preparation slots. Failure
+closes the queue, wakes blocked producers, drains GPU leases and joins before
+backend/allocator teardown. GPU lease destruction fences outstanding preparation
+commands. CPU batching shares transformer dispatches but does not add a decode
+worker. Backbone execution remains request-local and serialized by the session.
+
+Actual-GPU tests compare batched positions, RoPE and pooling against independent
+single-frame results without intermediate downloads. Pretrained, token-count,
+retry and retrieval gates must qualify the rebuilt production binary separately.
 
 `sampling.presentation` accepts logical picture IDs and timestamp durations,
 selects the most recent active picture at each cadence, and exposes explicit
@@ -954,9 +965,17 @@ shear, reflection and arbitrary rotations fail. Preparation already handles thes
 rotations; this geometry API does not qualify HDR tone mapping or broaden the
 model adapter's default unrotated square-pixel SDR policy.
 
-Still open: batched frame-independent vision/projector execution, final device
-normalization, logical field/partition indexing in the model adapter, model-level
-VFR/display/HDR qualification, VP8 interframes, and pure Zig VP9/AV1 decoding.
+Model-level VFR qualification retimes the pinned MJPEG fixture while preserving
+compressed frames, frame count and total duration. The pinned HF average-FPS
+index policy still selects `[0, 4]`, even when frame 4 presents at 0.25 seconds;
+this establishes index-policy parity, not timestamp-policy parity. CPU and Metal
+compare the complete embedding against the independent pretrained pixel oracle.
+The same HTTP campaign verifies explicit rejection of rotation, non-square pixels
+and PQ HDR. No model rotation/SAR rendering or HDR tone mapping is qualified.
+
+Still open: final device normalization, logical field/partition model indexing,
+qualified model rotation/SAR/HDR rendering, VP8 interframes and pure Zig VP9/AV1
+decoding. Decoder transport/header parsing alone is not advertised as decoding.
 
 
 The rebuilt production CPU and Metal routes pass all six pretrained cases,

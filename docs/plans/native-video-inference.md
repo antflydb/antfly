@@ -506,3 +506,36 @@ policies, broader DASH addressing/live timing, VP8 interframes and pure Zig VP9/
 reconstruction. No VP-family interframe decoder is advertised by the new transport
 or sampling APIs. New end-to-end receipts must bind the rebuilt binary and full
 vectors; existing receipts continue to qualify their own earlier binaries.
+
+
+### Frame batching, model policy qualification and live DASH continuation
+
+Implemented two-frame vision/projector batching on native CPU and Metal. Frames
+share linear operations, but SDPA, position coordinates and pooling preserve
+independent frame axes. Mixed geometry and final singletons flush safely;
+repeated sampling reuses owner projections. Metal retains decode/preparation
+worker overlap and device result slicing. Its conservative request workspace
+reservation grows from 1152 to 1920 MiB to account for the second executing frame.
+CPU uses one bounded pending patch frame without a second execution thread.
+
+The model qualification campaign verifies VFR average-FPS index parity against
+unchanged pinned compressed pixels and the existing independent pretrained
+vector, and verifies rejection of rotation, non-square pixels and PQ HDR. It does
+not broaden the model rendering recipe or qualify timestamp sampling/fields.
+Actual-GPU positions/RoPE/pooling tests compare batches with single-frame results
+and require no intermediate downloads; production gates qualify final vectors.
+
+DASH adds representation-level SegmentTemplate, SegmentTimeline, bounded repeat
+expansion, Number/Time/RepresentationID/Bandwidth substitution and numeric widths.
+Dynamic snapshots use a caller-synchronized clock, availability start, period
+start, presentation offset and time-shift window. Only fully available segments
+are exposed; expiration skips history arithmetically. Shared authenticated HTTP
+preserves retry/epoch/gap behavior, checks immutable timing identity and exposes
+minimumUpdatePeriod to the caller. BaseURL, inherited addressing, selection among
+representations/periods, DRM and low-latency availability remain unsupported.
+
+VP8 interframes, VP9 and AV1 reconstruction remain unimplemented. They still need
+pure Zig reference-picture state, entropy/block reconstruction, filtering and
+independent libvpx/dav1d pixel fixtures; no empty decoder API is substituted for
+that work. Device final normalization and broader qualified model display/field
+policies also remain outstanding.
