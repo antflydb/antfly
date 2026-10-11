@@ -815,7 +815,12 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(usize, 2), declarations.len);
     const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer, .input_element = .int64 };
     const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true } }} };
-    const sum_reader = try artifacts.Reader.open(a, store, declarations[0].artifact, recipe, .none);
+    const sum_identity = try recipeIdentity(a, recipe);
+    defer a.free(sum_identity);
+    const sum_declaration = for (declarations) |declaration| {
+        if (std.mem.eql(u8, declaration.binding.index_config_hash, sum_identity)) break declaration;
+    } else return error.InvalidNativeAggregateArtifact;
+    const sum_reader = try artifacts.Reader.open(a, store, sum_declaration.artifact, recipe, .none);
     const cursor = sum_reader.cursor();
     defer cursor.close(cursor.ptr);
     var page = std.heap.ArenaAllocator.init(a);
@@ -828,7 +833,12 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
     const count_recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
-    const count_reader = try artifacts.Reader.open(a, store, declarations[1].artifact, count_recipe, .none);
+    const count_identity = try recipeIdentity(a, count_recipe);
+    defer a.free(count_identity);
+    const count_declaration = for (declarations) |declaration| {
+        if (std.mem.eql(u8, declaration.binding.index_config_hash, count_identity)) break declaration;
+    } else return error.InvalidNativeAggregateArtifact;
+    const count_reader = try artifacts.Reader.open(a, store, count_declaration.artifact, count_recipe, .none);
     const count_cursor = count_reader.cursor();
     defer count_cursor.close(count_cursor.ptr);
     try std.testing.expect(sum_reader.root.state_slot != count_reader.root.state_slot);

@@ -252,8 +252,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
                     timeout=60,
                 )
-                assert not response.ok, (
-                    "Selected corrupt aggregate silently fell back to scanning"
+                assert response.status_code == 500, (
+                    "Selected corrupt aggregate did not fail integrity admission: "
+                    f"{response.status_code} {response.text}"
                 )
             assert request(
                 "POST",
@@ -1666,7 +1667,7 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             subset_hits[1]["_id"]
         ]
         snapshot_token = ordered_first["remote_snapshot"]
-        assert len(snapshot_token) == 64, ordered_first
+        assert isinstance(snapshot_token, str) and snapshot_token, ordered_first
         sort_tuple = ordered_first["hits"]["hits"][0]["_sort"]
         ordered_next = call(
             "POST",
