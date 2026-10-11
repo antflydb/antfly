@@ -23,9 +23,14 @@ const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 pub const prefix = jobs.key ++ ":claim-inventory:";
 pub const registration_prefix = jobs.key ++ ":claim-registration:";
+const authority = @import("../source_authority.zig");
+const Native = @import("receipt_position.zig").Native;
 pub const max_claims = 128;
 pub const max_bytes = 1024 * 1024;
 const key_len = prefix.len + 16 + 32 + 32;
+// AFC1 fixed fields/checksum, both paired keys, and the provenance value.
+// Count the actual bytes GC must carry, not just request string lengths.
+pub const claim_entry_overhead = 76 + key_len + integrity.key_len + inventory_value_len;
 
 fn hash(bytes: []const u8) integrity.Digest {
     return integrity.hash(bytes);
@@ -115,7 +120,73 @@ const Entry = struct {
     address: integrity.Address,
     value: []const u8,
     expected: ?[]const u8,
+    sequence: u64 = 0,
 };
+
+fn bindingDigest(binding: jobs.Binding) !integrity.Digest {
+    var normalized = binding;
+    normalized.phase = .reserved;
+    return hash(&try normalized.encode());
+}
+
+// One immutable cut plus a binding/claim/key/cut digest. The shared generation
+// registration already owns binding identity; duplicating that identity and a
+// claim hash as plaintext in every row adds bytes without additional integrity.
+pub const inventory_value_len = 40;
+
+fn inventoryChecksum(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, cut: []const u8) integrity.Digest {
+    var state = std.crypto.hash.Blake3.init(.{});
+    state.update("antfly private claim provenance v1");
+    state.update(key);
+    state.update(&binding_digest);
+    state.update(&value_digest);
+    state.update(cut);
+    var result: integrity.Digest = undefined;
+    state.final(&result);
+    return result;
+}
+
+fn encodeInventory(key: []const u8, binding_digest: integrity.Digest, value_digest: integrity.Digest, sequence: u64) [inventory_value_len]u8 {
+    var result: [inventory_value_len]u8 = undefined;
+    std.mem.writeInt(u64, result[0..8], sequence, .little);
+    @memcpy(result[8..], &inventoryChecksum(key, binding_digest, value_digest, result[0..8]));
+    return result;
+}
+
+fn decodeInventory(key: []const u8, value: []const u8, provenance: Provenance, value_digest: integrity.Digest) !u64 {
+    _ = try addressFromInventory(key);
+    if (value.len != inventory_value_len or
+        !std.mem.eql(u8, value[8..], &inventoryChecksum(key, provenance.binding_digest, value_digest, value[0..8]))) return error.InvalidPrivateIndexClaimInventory;
+    const sequence = std.mem.readInt(u64, value[0..8], .little);
+    if (sequence <= provenance.reserved or sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
+    return sequence;
+}
+
+const Provenance = struct {
+    binding_digest: integrity.Digest,
+    reserved: u64,
+    maximum: u64,
+
+    fn init(txn: anytype, binding: jobs.Binding) !Provenance {
+        const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
+        const current = try authority.require(txn, .native, namespace);
+        const reserved = (try jobs.nativeEffectPosition(txn, binding, .reserved)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        var maximum = current.sequence;
+        const cancellation = @import("relational_index_cancellation_intent.zig");
+        if (try cancellation.load(txn)) |canceled| {
+            if (canceled.intent.fence.admission_epoch < binding.fence.admission_epoch) {
+                try cancellation.requireOpen(txn, binding);
+            } else {
+                try cancellation.requireCanceled(txn, binding);
+                maximum = @min(maximum, canceled.position.sequence -| 1);
+            }
+        }
+        if (maximum < reserved.sequence) return error.InvalidPrivateIndexClaimInventory;
+        return .{ .binding_digest = try bindingDigest(binding), .reserved = reserved.sequence, .maximum = maximum };
+    }
+};
+
+pub const OrderedOutcome = struct { position: Native, duplicate: bool, claims_added: usize };
 
 /// Own all tuple/claim bytes before serialized apply. A prepared batch does not
 /// retain a store snapshot or borrow request memory. Cancellation is checked
@@ -135,12 +206,13 @@ pub const Prepared = struct {
         var bytes: usize = 0;
         for (claims) |claim| {
             if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
-            bytes = std.math.add(usize, bytes, 256) catch return error.TransactionTooLarge;
+            bytes = std.math.add(usize, bytes, claim_entry_overhead) catch return error.TransactionTooLarge;
             for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
         }
         if (bytes > max_bytes) return error.TransactionTooLarge;
         try jobs.requireReserved(txn, binding);
         const allocation = try requireRegistered(txn, binding);
+        const provenance = try Provenance.init(txn, binding);
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -164,28 +236,64 @@ pub const Prepared = struct {
                 if (!std.mem.eql(u8, raw, value)) return error.UniqueConstraintViolation;
                 break :blk value;
             } else null;
-            try checkInventory(txn, address, expected);
-            try entries.append(owned, .{ .address = address, .value = value, .expected = expected });
+            const sequence = try checkInventory(txn, address, expected, provenance);
+            try entries.append(owned, .{ .address = address, .value = value, .expected = expected, .sequence = sequence });
         }
+        // Stable transport order, independent of request order/coalescing.
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn less(_: void, left: Entry, right: Entry) bool {
+                return std.mem.order(u8, &left.address.claimKey(), &right.address.claimKey()) == .lt;
+            }
+        }.less);
         return .{ .arena = arena, .binding = binding, .entries = entries.items };
     }
 
-    pub fn stage(self: *const Prepared, txn: anytype) !usize {
+    /// Caller commits claim pairs, immutable creation cuts, transport marker
+    /// and outbox together. The batch cut is the maximum creation cut of its
+    /// members: new members receive this effect's cut, existing members never
+    /// change. Retries and regrouping therefore add no metadata and recover an
+    /// exact cut without a per-batch ledger or a global-clock approximation.
+    pub fn stageOrdered(self: *const Prepared, txn: anytype, replay: ?Native) !OrderedOutcome {
         try jobs.requireReserved(txn, self.binding);
-        _ = try requireRegistered(txn, self.binding);
-        for (self.entries) |entry| {
-            const actual = try optional(txn, &entry.address.claimKey());
-            if (!optionalEqual(actual, entry.expected)) return error.VersionConflict;
-            try checkInventory(txn, entry.address, entry.expected);
+        const allocation = try requireRegistered(txn, self.binding);
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.binding.fence.namespace);
+        const current = try authority.require(txn, .native, namespace);
+        const provenance = try Provenance.init(txn, self.binding);
+        if (replay) |position| {
+            try position.validate();
+            if (!position.namespace.eql(self.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
         }
         var changed: usize = 0;
+        var maximum: u64 = 0;
         for (self.entries) |entry| {
-            if (entry.expected != null) continue;
-            try txn.put(&entry.address.claimKey(), entry.value);
-            try txn.put(&inventoryKey(entry.address), &hash(entry.value));
-            changed += 1;
+            if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
+            const actual = try optional(txn, &entry.address.claimKey());
+            if (actual) |value| {
+                if (!std.mem.eql(u8, value, entry.value)) return error.UniqueConstraintViolation;
+                const sequence = try checkInventory(txn, entry.address, entry.value, provenance);
+                if (entry.expected != null and sequence != entry.sequence) return error.VersionConflict;
+                maximum = @max(maximum, sequence);
+            } else {
+                if (entry.expected != null) return error.VersionConflict;
+                _ = try checkInventory(txn, entry.address, null, provenance);
+                changed += 1;
+            }
         }
-        return changed;
+        if (changed == 0) {
+            if (replay) |position| if (position.sequence != maximum) return error.InvalidPrivateIndexClaimReceipt;
+            return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = maximum }, .duplicate = true, .claims_added = 0 };
+        }
+        const sequence = std.math.add(u64, current.sequence, 1) catch return error.OnlineSourceCorrupt;
+        if (replay) |position| if (position.sequence != sequence) return error.OnlineSourceScopeChanged;
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix);
+        for (self.entries) |entry| {
+            if (try optional(txn, &entry.address.claimKey()) != null) continue;
+            const key = inventoryKey(entry.address);
+            try txn.put(&entry.address.claimKey(), entry.value);
+            try txn.put(&key, &encodeInventory(&key, provenance.binding_digest, hash(entry.value), sequence));
+        }
+        _ = try authority.advance(txn, namespace, sequence);
+        return .{ .position = .{ .namespace = self.binding.fence.namespace, .sequence = sequence }, .duplicate = false, .claims_added = changed };
     }
 };
 
@@ -193,11 +301,12 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return if (a) |left| if (b) |right| std.mem.eql(u8, left, right) else false else b == null;
 }
 
-fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u8) !void {
+fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u8, provenance: Provenance) !u64 {
     const actual = try optional(txn, &inventoryKey(address));
     if (expected) |value| {
-        if (actual == null or !std.mem.eql(u8, actual.?, &hash(value))) return error.InvalidPrivateIndexClaimInventory;
+        return decodeInventory(&inventoryKey(address), actual orelse return error.InvalidPrivateIndexClaimInventory, provenance, hash(value));
     } else if (actual != null) return error.InvalidPrivateIndexClaimInventory;
+    return 0;
 }
 
 /// Pin once in the same source/staging transaction as a transfer page. This
@@ -205,11 +314,12 @@ fn checkInventory(txn: anytype, address: integrity.Address, expected: ?[]const u
 /// information for physical validation, never execution/publication authority.
 pub const TransferView = struct {
     generation: ?integrity.Generation = null,
+    provenance: ?Provenance = null,
 
     pub fn init(txn: anytype) !TransferView {
         const binding = (try jobs.load(txn)) orelse return .{};
         if (binding.phase != .reserved) return .{};
-        return .{ .generation = (try requireRegistered(txn, binding)).generation };
+        return .{ .generation = (try requireRegistered(txn, binding)).generation, .provenance = if (binding.authority == .native) try Provenance.init(txn, binding) else null };
     }
 
     pub fn isPrivate(self: TransferView, generation: integrity.Generation) bool {
@@ -222,7 +332,7 @@ pub const TransferView = struct {
         // jobs. Those records must not acquire legitimacy through restoration.
         if (parsed.kind != .claim) return error.InvalidPrivateIndexClaimInventory;
         const actual = (try optional(txn, &inventoryKey(parsed.address))) orelse return error.InvalidPrivateIndexClaimInventory;
-        if (!std.mem.eql(u8, actual, &value_digest)) return error.InvalidPrivateIndexClaimInventory;
+        _ = try decodeInventory(&inventoryKey(parsed.address), actual, self.provenance orelse return error.InvalidPrivateIndexClaimInventory, value_digest);
     }
 };
 
@@ -253,6 +363,7 @@ pub const GcPage = struct {
     pub fn prepare(alloc: Allocator, io: ?std.Io, txn: anytype, binding: jobs.Binding) !?GcPage {
         _ = try jobs.requireCancellationCleanup(txn, binding);
         const allocation = try requireRegistered(txn, binding);
+        const provenance = try Provenance.init(txn, binding);
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -268,15 +379,22 @@ pub const GcPage = struct {
             if (!std.mem.startsWith(u8, entry.key, &start)) break;
             if (io) |runtime| try runtime.checkCancel();
             const address = try addressFromInventory(entry.key);
-            if (entry.value.len != 32) return error.InvalidPrivateIndexClaimInventory;
-            const expected_hash = entry.value[0..32].*;
+            if (entry.value.len != inventory_value_len) return error.InvalidPrivateIndexClaimInventory;
+            // Copy before the claim read can invalidate borrowed cursor bytes.
+            const inventory = entry.value[0..inventory_value_len].*;
             const raw = (try optional(txn, &address.claimKey())) orelse return error.InvalidPrivateIndexClaimInventory;
-            if (raw.len > integrity.max_record_bytes or !std.mem.eql(u8, &expected_hash, &hash(raw))) return error.InvalidPrivateIndexClaimInventory;
+            if (raw.len > integrity.max_record_bytes) return error.InvalidPrivateIndexClaimInventory;
+            const record_bytes = raw.len + key_len + integrity.key_len + inventory_value_len;
+            if (record_bytes > max_bytes) return error.InvalidPrivateIndexClaimInventory;
+            // Stop BEFORE owning another row; checking after append can admit
+            // almost two page budgets when the next claim is large.
+            if (record_bytes > max_bytes - bytes) break;
+            const sequence = try decodeInventory(&inventoryKey(address), &inventory, provenance, hash(raw));
             const value = try owned.dupe(u8, raw);
             const claim = try integrity.Claim.decode(&address.claimKey(), value);
-            if (claim.state != .live) return error.InvalidPrivateIndexClaimInventory;
-            try entries.append(owned, .{ .address = address, .value = value, .expected = value });
-            bytes +|= value.len + key_len;
+            if (claim.state != .live or claim.schema_version != binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
+            try entries.append(owned, .{ .address = address, .value = value, .expected = value, .sequence = sequence });
+            bytes += record_bytes;
             if (entries.items.len >= 256 or bytes >= max_bytes or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break;
         }
         if (entries.items.len == 0) {
@@ -288,10 +406,13 @@ pub const GcPage = struct {
 
     pub fn stage(self: *const GcPage, txn: anytype) !void {
         _ = try jobs.requireCancellationCleanup(txn, self.binding);
-        _ = try requireRegistered(txn, self.binding);
+        const allocation = try requireRegistered(txn, self.binding);
+        const provenance = try Provenance.init(txn, self.binding);
+        try txn.retained.bindPrivateClaims(allocation.generation, prefix);
         for (self.entries) |entry| {
+            if (!std.mem.eql(u8, &entry.address.generation, &allocation.generation)) return error.InvalidPrivateIndexClaimInventory;
             if (!optionalEqual(try optional(txn, &entry.address.claimKey()), entry.expected)) return error.VersionConflict;
-            try checkInventory(txn, entry.address, entry.expected);
+            if (try checkInventory(txn, entry.address, entry.expected, provenance) != entry.sequence) return error.VersionConflict;
             if (try optional(txn, &entry.address.jobKey()) != null) return error.InvalidPrivateIndexClaimInventory;
             var cursor = try txn.openCursor();
             defer cursor.close();

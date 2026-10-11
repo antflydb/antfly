@@ -651,15 +651,36 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     const jobs = @import("relational_index_owner_job.zig");
     const first: integrity.Claim = .{ .tuple = "first", .parent_table = "articles", .parent_key = "a", .schema_version = binding.physical_candidate.schema_version };
     const second: integrity.Claim = .{ .tuple = "second", .parent_table = "articles", .parent_key = "b", .schema_version = binding.physical_candidate.schema_version };
+    const retained = @import("../retained_effects.zig");
+    if (restart.path != null) {
+        // The cold profile retains ordinary public integrity effects. Private
+        // batches and derived GC must not enter this tail or advance it again.
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained.admit(&txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), 42, @splat(7), retained.default_limit);
+        try txn.commit();
+    }
     const foreign_address = try integrity.Address.init(@splat(238), first.tuple);
     const foreign_value = try first.encode(a, foreign_address);
     defer a.free(foreign_value);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(&foreign_address.claimKey(), foreign_value);
+        try std.testing.expectError(error.RetainedEffectsMixedControl, @import("../source_authority.zig").advance(&txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), null));
+    }
     {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(&foreign_address.claimKey(), foreign_value);
         try txn.commit();
     }
+    const retained_start = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk if (try retained.load(&read)) |value| value.latest else @as(?u64, null);
+    };
+    if (restart.path != null) try std.testing.expectEqual(@as(?u64, 1), retained_start);
     var prepared = blk: {
         var read = try store.beginReadTxn();
         defer read.abort();
@@ -669,9 +690,35 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     try std.testing.expectEqual(@as(usize, 2), prepared.entries.len);
     {
         var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        const result = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(!result.duplicate);
+        try std.testing.expectEqual(@as(usize, 2), result.claims_added);
+        try std.testing.expectError(error.RetainedEffectsMixedControl, txn.put(&prepared.entries[0].address.claimKey(), prepared.entries[0].value));
+        try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.commit());
+    }
+    const original_cut = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const selected = try claims.requireRegistered(&read, binding);
+        try std.testing.expectError(error.NotFound, read.get(&claims.inventoryKey(prepared.entries[0].address)));
+        try std.testing.expectError(error.NotFound, read.get(&(try integrity.Address.init(selected.generation, first.tuple)).claimKey()));
+        break :blk (try @import("../source_authority.zig").load(&read)).?.sequence + 1;
+    };
+    {
+        var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expectEqual(@as(usize, 2), try prepared.stage(&txn));
+        const result = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(!result.duplicate);
+        try std.testing.expectEqual(@as(usize, 2), result.claims_added);
+        try std.testing.expectEqual(original_cut, result.position.sequence);
         try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(original_cut, (try @import("../source_authority.zig").load(&read)).?.sequence);
+        try std.testing.expectEqual(retained_start, if (try retained.load(&read)) |value| value.latest else @as(?u64, null));
     }
     const allocation = blk: {
         var read = try store.beginReadTxn();
@@ -685,9 +732,32 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
+        var reordered = try claims.Prepared.init(a, &txn, binding, &.{ second, first, second });
+        defer reordered.deinit();
+        for (prepared.entries, reordered.entries) |left, right| try std.testing.expectEqualSlices(u8, &left.address.claimKey(), &right.address.claimKey());
+        const result = try reordered.stageOrdered(&txn, null);
+        try std.testing.expect(result.duplicate);
+        try std.testing.expectEqual(original_cut, result.position.sequence);
+        try std.testing.expectEqual(original_cut, (try @import("../source_authority.zig").load(&txn)).?.sequence);
+        try std.testing.expect((try reordered.stageOrdered(&txn, result.position)).duplicate);
+        var wrong_cut = result.position;
+        wrong_cut.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, reordered.stageOrdered(&txn, wrong_cut));
+        const raw = try a.dupe(u8, try txn.get(&inventory_key));
+        defer a.free(raw);
+        raw[12] ^= 1;
+        try txn.put(&inventory_key, raw);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, reordered.stageOrdered(&txn, null));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
         var duplicate = try claims.Prepared.init(a, &txn, binding, &.{first});
         defer duplicate.deinit();
-        try std.testing.expectEqual(@as(usize, 0), try duplicate.stage(&txn));
+        const subset = try duplicate.stageOrdered(&txn, null);
+        try std.testing.expect(subset.duplicate);
+        try std.testing.expectEqual(original_cut, subset.position.sequence);
+        try std.testing.expectEqual(@as(usize, 0), subset.claims_added);
         const transfer = @import("relational_integrity.zig");
         const transfer_view = try transfer.TransferView.init(&txn);
         try transfer.validateTransferredCompanionsWithView(&txn, &address.claimKey(), try txn.get(&address.claimKey()), transfer_view);
@@ -715,8 +785,35 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
                 var batch = try claims.Prepared.init(alloc, txn, current, &.{claim});
                 defer batch.deinit();
             }
+            fn ownedControl(alloc: Allocator, txn: *@import("../docstore.zig").DocStore.Txn, current: jobs.Binding, claim: integrity.Claim) !void {
+                const control = @import("relational_index_owner_control.zig");
+                var reserved_binding = current;
+                reserved_binding.phase = .reserved;
+                var prepared_control = try control.PreparedClaims.init(alloc, txn, .{ .binding = reserved_binding, .claims = &.{claim} });
+                defer prepared_control.deinit();
+                try prepared_control.preparePayload();
+                const bytes = try prepared_control.finalizePayload(.{ .namespace = current.fence.namespace, .sequence = 4 });
+                var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: control.Frame }, alloc, bytes, .{});
+                defer wire.deinit();
+                try wire.value.index_owner_control.validate();
+                try std.testing.expectEqualSlices(u8, claim.tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
+                const ExcludedOwner = struct {
+                    lower: [33]u8,
+                    pub fn byteRange(self: *const @This()) @import("types.zig").ByteRange {
+                        return .{ .start = &self.lower, .end = "" };
+                    }
+                };
+                var excluded: ExcludedOwner = undefined;
+                @memcpy(excluded.lower[0..32], &prepared_control.batch.entries[0].address.routing);
+                excluded.lower[32] = 0;
+                try std.testing.expectError(error.KeyOutOfRange, prepared_control.stage(&excluded, txn, null));
+            }
         };
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ &read, binding, first });
+        var binary = first;
+        binary.tuple = "\x00\xff\x80binary-tuple";
+        try Harness.ownedControl(a, &read, binding, binary);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.ownedControl, .{ &read, binding, binary });
     }
     // More than one full GC page, with request buffers overwritten before
     // apply, proves both bounded continuation and prepared-byte ownership.
@@ -736,8 +833,88 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         for (&buffers) |*buffer| @memset(buffer, 'x');
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try std.testing.expectEqual(@as(usize, claims.max_claims), try batch.stage(&txn));
+        try std.testing.expectEqual(@as(usize, claims.max_claims), (try batch.stageOrdered(&txn, null)).claims_added);
         try txn.commit();
+    }
+    // Repartitioning existing work must not create a combinatorial receipt
+    // ledger. Distinct mixed-age subsets resolve by immutable member cuts.
+    for (0..claims.max_claims) |ordinal| {
+        var buffer: [32]u8 = undefined;
+        const tuple = try std.fmt.bufPrint(&buffer, "bulk-{d}-{d}", .{ ordinal % 2, ordinal });
+        const bulk_claim: integrity.Claim = .{ .tuple = tuple, .parent_table = "articles", .parent_key = tuple, .schema_version = binding.physical_candidate.schema_version };
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        var regrouped = try claims.Prepared.init(a, &txn, binding, &.{ bulk_claim, first });
+        defer regrouped.deinit();
+        const expected_cut = original_cut + 1 + ordinal % 2;
+        const result = try regrouped.stageOrdered(&txn, .{ .namespace = binding.fence.namespace, .sequence = expected_cut });
+        try std.testing.expect(result.duplicate);
+        try std.testing.expectEqual(expected_cut, result.position.sequence);
+        try std.testing.expectEqual(@as(usize, 0), result.claims_added);
+        try std.testing.expectEqual(original_cut + 2, (try @import("../source_authority.zig").load(&txn)).?.sequence);
+        try txn.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const selected = inventory_key[0 .. claims.prefix.len + 16];
+        var count: usize = 0;
+        var next = try cursor.seekAtOrAfter(selected);
+        while (next) |entry| : (next = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, selected)) break;
+            try std.testing.expectEqual(@as(usize, claims.inventory_value_len), entry.value.len);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), count);
+    }
+    {
+        const large = try a.alloc(u8, claims.max_bytes);
+        defer a.free(large);
+        @memset(large, 'x');
+        for (0..2) |ordinal| {
+            var buffer: [32]u8 = undefined;
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const large_claim: integrity.Claim = .{ .tuple = try std.fmt.bufPrint(&buffer, "large-{d}", .{ordinal}), .parent_table = "articles", .parent_key = large[0 .. 600 * 1024], .schema_version = binding.physical_candidate.schema_version };
+            var batch = try claims.Prepared.init(a, &txn, binding, &.{large_claim});
+            defer batch.deinit();
+            const extra: integrity.Claim = .{ .tuple = "overlapping-new-member", .parent_table = "articles", .parent_key = "extra", .schema_version = binding.physical_candidate.schema_version };
+            // Both preparations observe the large member as absent. The
+            // second apply must accept its identical concurrent creation,
+            // retain that earlier cut and stamp only its own new member.
+            var overlapping: ?claims.Prepared = if (ordinal == 0) try claims.Prepared.init(a, &txn, binding, &.{ large_claim, second, extra }) else null;
+            defer if (overlapping) |*value| value.deinit();
+            const original = try batch.stageOrdered(&txn, null);
+            try std.testing.expectEqual(@as(usize, 1), original.claims_added);
+            try txn.commit();
+            if (overlapping) |*value| {
+                var next = try store.beginWriteTxn();
+                errdefer next.abort();
+                const result = try value.stageOrdered(&next, null);
+                try std.testing.expect(!result.duplicate);
+                try std.testing.expectEqual(@as(usize, 1), result.claims_added);
+                try std.testing.expectEqual(original.position.sequence + 1, result.position.sequence);
+                try next.commit();
+                var probe = try store.beginReadTxn();
+                defer probe.abort();
+                const earlier = try batch.stageOrdered(&probe, original.position);
+                const later = try value.stageOrdered(&probe, result.position);
+                try std.testing.expect(earlier.duplicate and later.duplicate);
+                try std.testing.expectEqual(original.position, earlier.position);
+                try std.testing.expectEqual(result.position, later.position);
+                try std.testing.expectEqual(result.position.sequence, (try @import("../source_authority.zig").load(&probe)).?.sequence);
+            }
+        }
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var oversized = first;
+        oversized.parent_key = large[0 .. claims.max_bytes - claims.claim_entry_overhead];
+        try std.testing.expectError(error.TransactionTooLarge, claims.Prepared.init(a, &read, binding, &.{oversized}));
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        try std.testing.expectError(error.TransactionTooLarge, @import("relational_index_owner_control.zig").ClaimCommand.validate(.{ .binding = reserved_binding, .claims = &.{oversized} }));
     }
     var third = first;
     third.tuple = "third";
@@ -750,7 +927,23 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
-        try std.testing.expectEqual(@as(usize, 1), try late.stage(&txn));
+        const clock = (try @import("../source_authority.zig").load(&txn)).?.sequence;
+        try std.testing.expectError(error.OnlineSourceScopeChanged, late.stageOrdered(&txn, .{ .namespace = binding.fence.namespace, .sequence = clock + 2 }));
+    }
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(&claims.inventoryKey(late.entries[0].address)));
+        // A late retry of the original batch still recovers its original cut,
+        // not the clock advanced by two later bulk claim effects.
+        const retry = try prepared.stageOrdered(&txn, null);
+        try std.testing.expect(retry.duplicate);
+        try std.testing.expectEqual(original_cut, retry.position.sequence);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(usize, 1), (try late.stageOrdered(&txn, null)).claims_added);
     }
     {
         var txn = try store.beginWriteTxn();
@@ -762,7 +955,8 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
-        try std.testing.expectError(error.PrivateIndexPublicationCanceled, late.stage(&txn));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, late.stageOrdered(&txn, null));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, prepared.stageOrdered(&txn, null));
     }
     try reopenPrivateClaimTestStore(a, restart);
     const cleanup_clock = blk: {
@@ -781,21 +975,93 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         };
         defer page.deinit();
         try std.testing.expect(page.entries.len > 0 and page.entries.len <= 256);
+        var page_bytes: usize = 0;
+        for (page.entries) |entry| page_bytes += entry.value.len + claims.inventoryKey(entry.address).len + entry.address.claimKey().len + claims.inventory_value_len;
+        try std.testing.expect(page_bytes <= claims.max_bytes);
         gc_pages += 1;
-        try std.testing.expect(gc_pages <= 2 + 2 * claims.max_claims);
-        {
+        try std.testing.expect(gc_pages <= 5 + 2 * claims.max_claims);
+        if (page.entries.len != 0) {
             var txn = try store.beginWriteTxn();
             defer txn.abort();
             const selected = page.entries[0].address;
             const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
             const reference_value = try reference.encode(a, selected);
             defer a.free(reference_value);
-            try txn.put(&try reference.key(selected), reference_value);
+            // Deliberately bypass capture to inject an on-disk corruption.
+            // The normal DocStore path rejects unpublished FK companions.
+            try txn.write.?.put(&try reference.key(selected), reference_value);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, page.stage(&txn));
             const transfer = @import("relational_integrity.zig");
             const view = try transfer.TransferView.init(&txn);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, transfer.validateTransferredCompanionsWithView(&txn, &try reference.key(selected), reference_value, view));
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = selected, .kind = .reference }, @splat(0)));
+        }
+        if (page.entries.len != 0) {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const selected = page.entries[0].address;
+            const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
+            const value = try reference.encode(a, selected);
+            defer a.free(value);
+            try page.stage(&txn);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, txn.put(&try reference.key(selected), value));
+            try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.delete(&selected.claimKey()));
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const selected_key = claims.inventoryKey(page.entries[0].address);
+            const damaged = try a.dupe(u8, try txn.get(&selected_key));
+            defer a.free(damaged);
+            damaged[damaged.len - 1] ^= 1;
+            try txn.put(&selected_key, damaged);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, page.stage(&txn));
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.GcPage.prepare(a, std.testing.io, &txn, binding));
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const selected_key = claims.inventoryKey(page.entries[0].address);
+            const future = try a.dupe(u8, try txn.get(&selected_key));
+            defer a.free(future);
+            const canceled = (try @import("relational_index_cancellation_intent.zig").load(&txn)).?;
+            std.mem.writeInt(u64, future[0..8], canceled.position.sequence, .little);
+            // Re-sign the physical checksum to isolate cut-order validation
+            // from the preceding ordinary checksum-corruption regression.
+            var checksum = std.crypto.hash.Blake3.init(.{});
+            checksum.update("antfly private claim provenance v1");
+            checksum.update(&selected_key);
+            var normalized = binding;
+            normalized.phase = .reserved;
+            checksum.update(&integrity.hash(&try normalized.encode()));
+            checksum.update(&integrity.hash(page.entries[0].value));
+            checksum.update(future[0..8]);
+            checksum.final(future[8..40]);
+            try txn.put(&selected_key, future);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.GcPage.prepare(a, std.testing.io, &txn, binding));
+            const view = try claims.TransferView.init(&txn);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = page.entries[0].address, .kind = .claim }, integrity.hash(page.entries[0].value)));
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            // Replacing provenance with another valid historical cut still
+            // invalidates a prepared GC page, independently of its checksum.
+            const selected_key = claims.inventoryKey(page.entries[0].address);
+            const drift = try a.dupe(u8, try txn.get(&selected_key));
+            defer a.free(drift);
+            std.mem.writeInt(u64, drift[0..8], if (page.entries[0].sequence == original_cut) cleanup_clock - 2 else original_cut, .little);
+            var checksum = std.crypto.hash.Blake3.init(.{});
+            checksum.update("antfly private claim provenance v1");
+            checksum.update(&selected_key);
+            var normalized = binding;
+            normalized.phase = .reserved;
+            checksum.update(&integrity.hash(&try normalized.encode()));
+            checksum.update(&integrity.hash(page.entries[0].value));
+            checksum.update(drift[0..8]);
+            checksum.final(drift[8..40]);
+            try txn.write.?.put(&selected_key, drift);
+            try std.testing.expectError(error.VersionConflict, page.stage(&txn));
         }
         collected += page.entries.len;
         // A crash before commit leaves the complete page retryable.
@@ -816,13 +1082,14 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             var read = try store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqual(cleanup_clock, (try @import("../source_authority.zig").load(&read)).?.sequence);
+            try std.testing.expectEqual(retained_start, if (try retained.load(&read)) |value| value.latest else @as(?u64, null));
             try std.testing.expectEqualSlices(u8, foreign_value, try read.get(&foreign_address.claimKey()));
             var reserved_binding = binding;
             reserved_binding.phase = .reserved;
             try std.testing.expectEqualSlices(u8, &try reserved_binding.encode(), &try (try jobs.load(&read)).?.encode());
         }
     }
-    try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), collected);
+    try std.testing.expectEqual(@as(usize, 5 + 2 * claims.max_claims), collected);
     try std.testing.expect(gc_pages >= 2);
     var read = try store.beginReadTxn();
     defer read.abort();

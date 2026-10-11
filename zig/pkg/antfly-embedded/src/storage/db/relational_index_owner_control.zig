@@ -25,11 +25,15 @@ const registry = @import("schema_registry.zig");
 const schema_api = @import("../../schema/mod.zig");
 const source_authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
+const private_claims = @import("relational_index_private_claims.zig");
+const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 pub const envelope_version = 22;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
-pub const max_wire_bytes = max_encoded_inputs + 32 * 1024;
+pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
+pub const max_control_wire_bytes = max_encoded_inputs + 32 * 1024;
+pub const max_wire_bytes = @max(max_control_wire_bytes, max_claim_wire_bytes);
 pub const Manifest = inputs.Prepared;
 
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
@@ -65,6 +69,28 @@ pub const Command = struct {
     }
 };
 
+/// Receiving workers must independently bind the actual hash-owner placement
+/// and live metadata permission. The kernel checks its persisted job, range,
+/// cancellation and exact-cut receipt; this body is not an RPC capability.
+pub const ClaimCommand = struct {
+    binding: jobs.Binding,
+    claims: []const integrity.Claim,
+
+    pub fn validate(self: ClaimCommand) !void {
+        _ = try self.binding.encode();
+        if (self.binding.authority != .native or self.binding.phase != .reserved or
+            self.claims.len == 0 or self.claims.len > private_claims.max_claims) return error.InvalidPrivateIndexClaimInventory;
+        var bytes: usize = 0;
+        for (self.claims) |claim| {
+            if (claim.state != .live or claim.schema_version != self.binding.physical_candidate.schema_version or
+                claim.action != .restrict or claim.target_tuple != null or !std.mem.allEqual(u8, &claim.action_id, 0)) return error.InvalidPrivateIndexClaimInventory;
+            bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.TransactionTooLarge;
+            for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
+        }
+        if (bytes > private_claims.max_bytes) return error.TransactionTooLarge;
+    }
+};
+
 /// Recover only a previously committed publication effect. No physical binding,
 /// candidate digest or replay position is accepted from a receipt caller.
 pub const ReceiptRequest = struct {
@@ -79,10 +105,12 @@ pub const Effect = union(enum) {
     cancel_control: Command,
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
+    claims: ClaimCommand,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
             .control, .cancel_control => |value| value.binding.fence.namespace,
+            .claims => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
         };
@@ -91,6 +119,7 @@ pub const Effect = union(enum) {
     pub fn validate(self: Effect) !void {
         switch (self) {
             .control, .cancel_control => |value| try value.validate(),
+            .claims => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
                 _ = try value.encode();
@@ -101,7 +130,8 @@ pub const Effect = union(enum) {
 
     pub fn wireLimit(self: Effect) usize {
         return switch (self) {
-            .control, .cancel_control => max_wire_bytes,
+            .control, .cancel_control => max_control_wire_bytes,
+            .claims => max_claim_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -154,6 +184,68 @@ pub const CleanupMaintenanceOutcome = struct {
 pub const ClaimCleanupMaintenanceOutcome = struct {
     advanced: bool,
     claims_retired: bool,
+};
+
+pub const ClaimOutcome = struct {
+    binding: jobs.Binding,
+    position: Native,
+    duplicate: bool,
+    claims_added: usize = 0,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+};
+
+pub const PreparedClaims = struct {
+    pub const ApplyOutcome = ClaimOutcome;
+    alloc: Allocator,
+    batch: private_claims.Prepared,
+    command: ClaimCommand,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, txn: anytype, command: ClaimCommand) !PreparedClaims {
+        try command.validate();
+        var batch = try private_claims.Prepared.init(alloc, txn, command.binding, command.claims);
+        errdefer batch.deinit();
+        const owned = try batch.arena.allocator().alloc(integrity.Claim, batch.entries.len);
+        for (owned, batch.entries) |*claim, entry| claim.* = try integrity.Claim.decode(&entry.address.claimKey(), entry.value);
+        return .{ .alloc = alloc, .batch = batch, .command = .{ .binding = command.binding, .claims = owned } };
+    }
+
+    pub fn deinit(self: *PreparedClaims) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.batch.deinit();
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedClaims) !void {
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const PreparedClaims) @FieldType(Native, "namespace") {
+        return self.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedClaims, position: Native) !void {
+        try (Frame{ .effect = .{ .claims = self.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedClaims, position: Native) ClaimOutcome {
+        return .{ .binding = self.command.binding, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *PreparedClaims, core: anytype, txn: anytype, replay: ?Native) !ClaimOutcome {
+        // Actual receiving range, checked under apply exclusion; no caller-set
+        // ownership flag or row owner's routing assumption is accepted.
+        for (self.batch.entries) |entry| if (!core.byteRange().contains(&entry.address.routing)) return error.KeyOutOfRange;
+        const result = try self.batch.stageOrdered(txn, replay);
+        return .{ .binding = self.command.binding, .position = result.position, .duplicate = result.duplicate, .claims_added = result.claims_added };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedClaims) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedClaims, _: anytype, _: *ClaimOutcome) !void {}
+    pub fn preparePayload(self: *PreparedClaims) !void {
+        try prepareNativePayload(self, "claims", self.command, max_claim_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedClaims, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
 };
 
 const Artifacts = struct {
@@ -315,7 +407,7 @@ pub const Prepared = struct {
     /// Serialize the large immutable prefix off-lock. Only the locally assigned
     /// sequence (at most 20 digits) is filled after transactional staging.
     pub fn preparePayload(self: *Prepared) !void {
-        try prepareNativePayload(self, "control", self.command, max_wire_bytes);
+        try prepareNativePayload(self, "control", self.command, max_control_wire_bytes);
     }
 
     pub fn finalizePayload(self: *Prepared, position: Native) ![]const u8 {
@@ -363,7 +455,7 @@ pub const PreparedCancellationControl = struct {
     }
     pub fn populateReceipt(_: *const PreparedCancellationControl, _: anytype, _: *CleanupOutcome) !void {}
     pub fn preparePayload(self: *PreparedCancellationControl) !void {
-        try prepareNativePayload(self, "cancel_control", self.control.command, max_wire_bytes);
+        try prepareNativePayload(self, "cancel_control", self.control.command, max_control_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedCancellationControl, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
@@ -471,6 +563,15 @@ pub const PreparedCleanup = struct {
 };
 
 fn prepareNativePayload(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
+    // This buffer has no I/O sink: Allocating's WriteFailed means allocation
+    // failure. Preserve OOM semantics for callers and exhaustive fault checks.
+    return prepareNativePayloadAllocating(prepared, member, body, maximum) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn prepareNativePayloadAllocating(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
     try prepared.validate();
     if (prepared.payload != null) return;
     var writer: std.Io.Writer.Allocating = .init(prepared.alloc);

@@ -7937,6 +7937,14 @@ pub const DB = struct {
             try replication_effects_mod.validateIndexOwnerPayload(.{ .schema_version = native_index_control.envelope_version, .request = mutation.request, .index_owner_control = frame });
             if (try self.replicationMutationAlreadyApplied(sequence)) return;
             switch (frame.effect) {
+                .claims => |command| {
+                    var prepared = self.prepareNativeIndexOwnerClaims(command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerClaims(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8073,6 +8081,20 @@ pub const DB = struct {
     }
 
     const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
+
+    pub const NativeIndexOwnerClaimCommand = native_index_control.ClaimCommand;
+    pub const NativeIndexOwnerClaimOutcome = native_index_control.ClaimOutcome;
+    pub const PreparedNativeIndexOwnerClaims = native_index_control.PreparedClaims;
+
+    pub fn prepareNativeIndexOwnerClaims(self: *DB, command: NativeIndexOwnerClaimCommand) !PreparedNativeIndexOwnerClaims {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return PreparedNativeIndexOwnerClaims.init(self.alloc, &read, command);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerClaims(self: *DB, prepared: *PreparedNativeIndexOwnerClaims, replay: ?NativeIndexReplay) !NativeIndexOwnerClaimOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
 
     pub const PreparedNativeIndexOwnerCancellationControl = native_index_control.PreparedCancellationControl;
 

@@ -1327,25 +1327,42 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(try outcome.value.receipt.?.digest(), try recovered.value.?.receipt.?.digest());
         request.manifest = .fromSlice(candidate.inputs.bytes);
     }
-    // Prime a real private claim/inventory pair through the kernel primitive.
-    // This is fixture setup, not evidence of a mounted authenticated producer.
+    // Exercise the actual ordered DB path and normalized standby ingress.
+    // This does not authenticate/activate a mounted distributed producer.
     {
-        const claims = local.storage_db_relational_index_owner_job.private_claims;
-        var prepared_claims = blk: {
-            var read = try handle.db.core.store.beginReadTxn();
-            defer read.abort();
-            break :blk try claims.Prepared.init(a, &read, binding, &.{.{
-                .tuple = "compiled-owner-claim",
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const tuple = "compiled\x00\xff\x80-owner-claim";
+        var text = tuple.*;
+        var prepared_claims = try handle.db.prepareNativeIndexOwnerClaims(.{
+            .binding = reserved_binding,
+            .claims = &.{.{
+                .tuple = &text,
                 .parent_table = "items",
                 .parent_key = "claim-owner",
                 .schema_version = binding.physical_candidate.schema_version,
-            }});
-        };
+            }},
+        });
         defer prepared_claims.deinit();
-        var txn = try handle.db.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        try std.testing.expectEqual(@as(usize, 1), try prepared_claims.stage(&txn));
-        try txn.commit();
+        @memset(&text, 'x');
+        try prepared_claims.preparePayload();
+        const claimed = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
+        try std.testing.expect(!claimed.duplicate and !claimed.replication_pending);
+        try std.testing.expectEqual(@as(usize, 1), claimed.claims_added);
+        try std.testing.expectEqual(@as(u64, 4), claimed.position.sequence);
+        const duplicate = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
+        try std.testing.expect(duplicate.duplicate);
+        try std.testing.expectEqual(claimed.position, duplicate.position);
+        const Frame = local.storage_db_relational_index_owner_control.Frame;
+        var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: Frame }, a, try prepared_claims.finalizePayload(claimed.position), .{});
+        defer wire.deinit();
+        try std.testing.expectEqualSlices(u8, tuple, wire.value.index_owner_control.effect.claims.claims[0].tuple);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        try handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = wire.value.index_owner_control, .receipt = .{ .native = claimed.position } }, 1);
+        var corrupt_frame = wire.value.index_owner_control;
+        corrupt_frame.position.sequence += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, handle.db.applyReplicatedBatch(.{ .request = .{}, .index_owner_control = corrupt_frame, .receipt = .{ .native = corrupt_frame.position } }, 2));
+        try std.testing.expectEqual(@as(u64, 1), try handle.db.replicationAppliedSequence());
     }
     var foreign = identity;
     foreign.id[0] ^= 1;
@@ -1373,7 +1390,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer canceled.deinit();
         try std.testing.expectEqual(attempt != 0, canceled.value.duplicate);
         try std.testing.expect(!canceled.value.replication_pending);
-        try std.testing.expectEqual(@as(u64, 4), canceled.value.position.sequence);
+        try std.testing.expectEqual(@as(u64, 5), canceled.value.position.sequence);
         cancel_position = canceled.value.position;
     }
     handle.db.close();
@@ -1403,7 +1420,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer cleanup.deinit();
         try std.testing.expectEqual(attempt != 0, cleanup.value.duplicate);
         try std.testing.expect(!cleanup.value.replication_pending);
-        try std.testing.expectEqual(@as(u64, 5), cleanup.value.position.sequence);
+        try std.testing.expectEqual(@as(u64, 6), cleanup.value.position.sequence);
         try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
     }
     const Denied = struct {
@@ -1439,7 +1456,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
     try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
     try std.testing.expect(response.ptr == null);
     request.manifest = .{};
-    for (0..2) |attempt| {
+    for (0..3) |attempt| {
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
         const claim_response = response;
         defer freeRawBuffer(claim_response.ptr, claim_response.len);
@@ -1453,7 +1470,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer read.abort();
         const authority = local.storage_source_authority;
         const clock = try authority.require(&read, .native, local.storage_db_online_source_contract.namespaceBytes(header.fence.namespace));
-        try std.testing.expectEqual(@as(u64, 5), clock.sequence);
+        try std.testing.expectEqual(@as(u64, 6), clock.sequence);
     }
     request.operation = .cancel_inspect;
     try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
@@ -1464,7 +1481,7 @@ test "storage owner native index raw admission and bounded controls preserve loc
     try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
     try std.testing.expect(status.value.claims_retired);
     try std.testing.expect(status.value.claim_allocation != null);
-    try std.testing.expectEqual(@as(u64, 5), status.value.cleanup.?.sequence);
+    try std.testing.expectEqual(@as(u64, 6), status.value.cleanup.?.sequence);
     try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
 }
 
