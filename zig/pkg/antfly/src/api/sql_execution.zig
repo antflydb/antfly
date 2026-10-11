@@ -41,6 +41,44 @@ test "SQL statement read admission distinguishes availability from corruption an
         try std.testing.expectEqual(err, statementReadAdmissionError(err));
 }
 
+test "SQL statement read admission calls native capture once without write authority" {
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const Fake = struct {
+        failure: anyerror,
+        captures: usize = 0,
+        fn resolve(_: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .policy_publication_status) return a.dupe(u8, "null");
+            try std.testing.expect(call == .resolve_many);
+            return a.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
+        }
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, scans: []const reads.RelationalStatementScan, consistency: @import("../raft/mod.zig").ReadConsistency) !reads.RelationalStatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captures += 1;
+            try std.testing.expectEqual(@as(usize, 1), scans.len);
+            try std.testing.expectEqualStrings("physical", scans[0].table);
+            try std.testing.expectEqual(.read_index, consistency);
+            return self.failure;
+        }
+    };
+    for ([_]struct { failure: anyerror, expected: anyerror }{
+        .{ .failure = error.GroupLeaderUnavailable, .expected = error.SqlStatementReadUnavailable },
+        .{ .failure = error.ReadUnavailable, .expected = error.SqlStatementReadUnavailable },
+        .{ .failure = error.InvalidSqlBackendResponse, .expected = error.InvalidSqlBackendResponse },
+        .{ .failure = error.SqlMutationOutcomeUnknown, .expected = error.SqlMutationOutcomeUnknown },
+    }) |case| {
+        var fake: Fake = .{ .failure = case.failure };
+        var server: http_server.ApiHttpServer = undefined;
+        server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
+        server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.capture } };
+        server.table_writes = null;
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+        const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
+        try std.testing.expectError(case.expected, Adapter.openStatement(&adapter, std.testing.allocator, &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 2 } }}));
+        try std.testing.expectEqual(@as(usize, 1), fake.captures);
+    }
+}
+
 const SettingOverlaySource = enum { durable_session, connection };
 
 fn attachedSettingOverlay(source: SettingOverlaySource, caller: []const setting_catalog.OverlayEntry, durable: []const setting_catalog.OverlayEntry) ![]const setting_catalog.OverlayEntry {
