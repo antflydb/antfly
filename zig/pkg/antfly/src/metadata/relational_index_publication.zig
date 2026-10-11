@@ -58,6 +58,7 @@ pub const Ack = struct {
 };
 
 pub const OwnerOperation = enum { fence, reserve, build, validate, install, release, cancel, cancel_release };
+pub const CancellationControlEffect = enum { fenced, reserved };
 pub const OwnerRequest = struct {
     table_id: u64,
     group_id: u64,
@@ -108,6 +109,22 @@ pub const OwnerDecision = struct {
             .reserve => .reserved,
             else => return error.InvalidGenerationPublication,
         };
+        return self.boundNativeControl(request, observed, effect);
+    }
+
+    pub fn nativeCancellationControl(self: OwnerDecision, observed: local.storage_db_relational_index_owner_job.Binding, effect: CancellationControlEffect) !native_control.Command {
+        return self.boundNativeControl(.{
+            .table_id = self.head.table_id,
+            .group_id = self.owner.owner.group_id,
+            .id = self.head.plan_id,
+            .operation = .cancel,
+        }, observed, switch (effect) {
+            .fenced => .fenced,
+            .reserved => .reserved,
+        });
+    }
+
+    fn boundNativeControl(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, effect: local.storage_db_relational_index_owner_job.NativeEffect) !native_control.Command {
         const identity = try self.nativeExecutionIdentity(request);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
         _ = try observed.encode();
@@ -154,11 +171,19 @@ pub const OwnerDecision = struct {
     /// caller-chosen physical binding. A fresh decision remains a permission
     /// observation, not a lease against later metadata cancellation.
     pub fn nativeAdmission(self: OwnerDecision) !native_control.Admission {
+        return self.nativeAdmissionImpl(false);
+    }
+
+    pub fn nativeCancellationAdmission(self: OwnerDecision) !native_control.Admission {
+        return self.nativeAdmissionImpl(true);
+    }
+
+    fn nativeAdmissionImpl(self: OwnerDecision, comptime canceling: bool) !native_control.Admission {
         const identity = try self.nativeExecutionIdentity(.{
             .table_id = self.head.table_id,
             .group_id = self.owner.owner.group_id,
             .id = self.head.plan_id,
-            .operation = .fence,
+            .operation = if (canceling) .cancel else .fence,
             .projection = .admission,
         });
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;

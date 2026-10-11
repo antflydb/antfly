@@ -4004,6 +4004,18 @@ pub fn storageOwnerNativeIndexControlJson(
         out_response.* = .{ .ptr = response.ptr, .len = response.len };
         return .ok;
     }
+    if (request.operation == .cancel_inspect) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        const state = handle.db.nativeIndexOwnerCancellationState(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+        defer response.deinit();
+        return response.finish(state, out_response);
+    }
     if (request.operation == .cancel_admit or request.operation == .cancel_fence or request.operation == .cancel_reserve) {
         var prepared = if (request.operation == .cancel_admit) blk: {
             if (request.manifest.len == 0 or request.manifest.len > db_mod.DB.PreparedNativeIndexOwnerControl.max_manifest_bytes) return .invalid_argument;

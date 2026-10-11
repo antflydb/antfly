@@ -1223,6 +1223,17 @@ test "storage owner native index raw admission and bounded controls preserve loc
         .table_name = .fromSlice("items"),
         .request_json = .fromSlice(identity_json),
     };
+    {
+        var status_request = inspection;
+        status_request.operation = .cancel_inspect;
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &status_request, &response));
+        const status_response = response;
+        defer freeRawBuffer(status_response.ptr, status_response.len);
+        var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+        defer status.deinit();
+        try std.testing.expectEqual(.native, status.value.source.kind);
+        try std.testing.expect(status.value.intent == null and status.value.binding == null and status.value.cleanup == null);
+    }
     // An absent job cannot attest native mode in a Raft-owned namespace.
     {
         const authority = local.storage_source_authority;
@@ -1410,6 +1421,15 @@ test "storage owner native index raw admission and bounded controls preserve loc
         const clock = try authority.require(&read, .native, local.storage_db_online_source_contract.namespaceBytes(header.fence.namespace));
         try std.testing.expectEqual(@as(u64, 5), clock.sequence);
     }
+    request.operation = .cancel_inspect;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const status_response = response;
+    defer freeRawBuffer(status_response.ptr, status_response.len);
+    var status = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationState, a, status_response.slice(), .{});
+    defer status.deinit();
+    try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+    try std.testing.expectEqual(@as(u64, 5), status.value.cleanup.?.sequence);
+    try std.testing.expectEqual(cancel_position, status.value.intent.?.position);
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

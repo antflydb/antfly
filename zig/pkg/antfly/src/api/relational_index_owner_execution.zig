@@ -87,11 +87,20 @@ pub const CancellationResult = union(enum) {
     /// Only metadata's full canceled receipt can acknowledge this owner.
     acknowledged,
     intent: std.json.Parsed(native.CancellationOutcome),
+    admitted: std.json.Parsed(native.CleanupOutcome),
+    fenced: std.json.Parsed(native.CleanupOutcome),
+    reserved: std.json.Parsed(native.CleanupOutcome),
+    cleanup: std.json.Parsed(native.CleanupOutcome),
+    gc: std.json.Parsed(native.CleanupMaintenanceOutcome),
+    /// Physical artifacts only: global retirement and epoch release are pending.
+    retired,
 
     pub fn deinit(self: *CancellationResult) void {
         switch (self.*) {
-            .acknowledged => {},
+            .acknowledged, .retired => {},
             .intent => |value| value.deinit(),
+            .admitted, .fenced, .reserved, .cleanup => |value| value.deinit(),
+            .gc => |value| value.deinit(),
         }
         self.* = undefined;
     }
@@ -116,6 +125,81 @@ pub fn cancelIntentStep(alloc: std.mem.Allocator, source: anytype, metadata: any
     if (!result.value.intent.eql(intent) or !result.value.position.namespace.eql(intent.fence.namespace))
         return error.PrivateIndexOwnerJobChanged;
     return .{ .intent = result };
+}
+
+/// Resume cancellation with at most one new durable owner effect per call.
+/// This receiver still needs mounted authenticated RPC/signing and final global
+/// retirement before production activation. Physical retirement is NOT an ACK.
+pub fn cancelStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: CancellationRequest, context: operation.RequestContext) !CancellationResult {
+    try context.ensureActive();
+    var lookup: publication.OwnerRequest = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .cancel };
+    try lookup.validate();
+    if (table_name.len == 0) return error.InvalidGenerationPublication;
+    var permission = try decision(alloc, metadata, lookup, context);
+    defer permission.deinit();
+    if (permission.value.disposition == .acknowledged) return .acknowledged;
+    try requireTable(permission.value, table_name);
+    const expected_intent = try permission.value.nativeCancellationIntent();
+    const identity = try permission.value.nativeExecutionIdentity(lookup);
+    var state = try source.nativeIndexOwnerCancellationState(alloc, request.group_id, table_name, identity, context);
+    defer state.deinit();
+    try state.value.validate(identity);
+    if (state.value.intent) |record| {
+        if (!record.intent.eql(expected_intent)) return error.PrivateIndexOwnerJobChanged;
+    } else {
+        var result = try source.cancelNativeIndexOwnerIntent(alloc, request.group_id, table_name, expected_intent, context);
+        errdefer result.deinit();
+        try result.value.position.validate();
+        if (!result.value.intent.eql(expected_intent) or !result.value.position.namespace.eql(identity.namespace)) return error.PrivateIndexOwnerJobChanged;
+        return .{ .intent = result };
+    }
+    const binding = state.value.binding orelse {
+        // Only a genuinely absent job needs schema-sized immutable inputs.
+        // Independently reread cancellation permission with that projection.
+        lookup.projection = .admission;
+        var admission = try decision(alloc, metadata, lookup, context);
+        defer admission.deinit();
+        if (admission.value.disposition == .acknowledged) return .acknowledged;
+        try requireTable(admission.value, table_name);
+        const header = try admission.value.nativeCancellationAdmission();
+        if (!header.eql(expected_intent)) return error.GenerationPublicationChanged;
+        var manifest = try (admission.value.inputs orelse return error.InvalidGenerationPublication).prepareNativeManifest(alloc, admission.value.head);
+        defer manifest.deinit();
+        var result = try source.admitCanceledNativeIndexOwner(alloc, request.group_id, table_name, header, manifest.bytes, context);
+        errdefer result.deinit();
+        try requireCancellationProgress(result.value, null, header);
+        return .{ .admitted = result };
+    };
+    if (state.value.fenced == null or state.value.reserved == null) {
+        const effect: publication.CancellationControlEffect = if (state.value.fenced == null) .fenced else .reserved;
+        const command = try permission.value.nativeCancellationControl(binding, effect);
+        var result = try source.applyCanceledNativeIndexOwnerControl(alloc, request.group_id, table_name, command, context);
+        errdefer result.deinit();
+        try requireCancellationProgress(result.value, command.binding, expected_intent);
+        return if (effect == .fenced) .{ .fenced = result } else .{ .reserved = result };
+    }
+    // Even the final hot path binds metadata's permission to the observed
+    // physical allocation, not merely the caller's table/group/name.
+    _ = try permission.value.nativeCancellationControl(binding, .reserved);
+    if (state.value.cleanup == null) {
+        var result = try source.cleanupNativeIndexOwner(alloc, request.group_id, table_name, identity, context);
+        errdefer result.deinit();
+        try requireCancellationProgress(result.value, binding, expected_intent);
+        return .{ .cleanup = result };
+    }
+    if (state.value.artifacts_retired) return .retired;
+    var result = try source.collectNativeIndexOwnerGarbage(alloc, request.group_id, table_name, identity, context);
+    errdefer result.deinit();
+    if (!result.value.advanced and !result.value.artifacts_retired) return error.InvalidPrivateIndexCancellation;
+    return .{ .gc = result };
+}
+
+fn requireCancellationProgress(result: native.CleanupOutcome, expected: ?jobs.Binding, intent: native.Admission) !void {
+    try result.position.validate();
+    _ = try result.binding.encode();
+    if (result.binding.authority != .native or (expected == null and result.binding.phase != .fencing)) return error.InvalidPrivateIndexOwnerJob;
+    if (!result.position.namespace.eql(intent.fence.namespace) or !native.Admission.fromBinding(result.binding).eql(intent)) return error.PrivateIndexOwnerJobChanged;
+    if (expected) |binding| if (!std.mem.eql(u8, &try binding.encode(), &try result.binding.encode())) return error.PrivateIndexOwnerJobChanged;
 }
 
 fn decision(alloc: std.mem.Allocator, metadata: anytype, request: publication.OwnerRequest, context: operation.RequestContext) !std.json.Parsed(publication.OwnerDecision) {
@@ -200,6 +284,9 @@ const TestDriver = struct {
     admissions: usize = 0,
     controls: usize = 0,
     cancellations: usize = 0,
+    cancel_state: ?jobs.CancellationState = null,
+    cleanups: usize = 0,
+    gc_pages: usize = 0,
     foreign_cancellation: bool = false,
     cancel_admission: bool = false,
     fail_control: bool = false,
@@ -232,6 +319,15 @@ const TestDriver = struct {
     pub fn nativeIndexOwnerState(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.Identity, _: operation.RequestContext) !std.json.Parsed(?jobs.Binding) {
         self.inspections += 1;
         return parsed(?jobs.Binding, alloc, self.binding);
+    }
+
+    pub fn nativeIndexOwnerCancellationState(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, identity: native.Identity, context: operation.RequestContext) !std.json.Parsed(jobs.CancellationState) {
+        try context.ensureActive();
+        self.inspections += 1;
+        if (self.cancel_state == null) self.cancel_state = .{
+            .source = .{ .kind = .native, .namespace = local.storage_db_online_source_contract.namespaceBytes(identity.namespace) },
+        };
+        return parsed(jobs.CancellationState, alloc, self.cancel_state.?);
     }
 
     pub fn nativeIndexOwnerReceiptAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.ReceiptRequest, _: operation.RequestContext) !@FieldType(Result, "recovered") {
@@ -280,8 +376,59 @@ const TestDriver = struct {
             .error_name = if (self.pending) "ReplicationOutboxPending" else null,
         };
         if (self.foreign_cancellation) result.intent.owner_digest[0] ^= 1;
+        if (self.cancel_state) |*state| {
+            state.intent = .{ .intent = result.intent, .position = result.position };
+            state.source.sequence = result.position.sequence;
+        }
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return parsed(native.CancellationOutcome, alloc, result);
+    }
+
+    pub fn admitCanceledNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, group: u64, table: []const u8, header: native.Admission, manifest: []const u8, context: operation.RequestContext) !std.json.Parsed(native.CleanupOutcome) {
+        try context.ensureActive();
+        var admitted = try self.admitNativeIndexOwner(alloc, group, table, header, manifest, context);
+        defer admitted.deinit();
+        const state = &self.cancel_state.?;
+        state.source.sequence += 1;
+        const position: @FieldType(native.CleanupOutcome, "position") = .{ .namespace = header.fence.namespace, .sequence = state.source.sequence };
+        state.binding = admitted.value.binding;
+        state.admitted = position;
+        return parsed(native.CleanupOutcome, alloc, .{ .binding = admitted.value.binding, .position = position, .duplicate = false, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null });
+    }
+
+    pub fn applyCanceledNativeIndexOwnerControl(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.Command, context: operation.RequestContext) !std.json.Parsed(native.CleanupOutcome) {
+        try context.ensureActive();
+        self.controls += 1;
+        if (self.fail_control) return error.ReceiverControlFailed;
+        const state = &self.cancel_state.?;
+        state.source.sequence += 1;
+        const position: @FieldType(native.CleanupOutcome, "position") = .{ .namespace = command.binding.fence.namespace, .sequence = state.source.sequence };
+        switch (command.effect) {
+            .fenced => state.fenced = position,
+            .reserved => {
+                state.reserved = position;
+                state.binding.?.phase = .reserved;
+            },
+            .admitted => return error.InvalidPrivateIndexOwnerJob,
+        }
+        return parsed(native.CleanupOutcome, alloc, .{ .binding = command.binding, .position = position, .duplicate = false });
+    }
+
+    pub fn cleanupNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, identity: native.Identity, context: operation.RequestContext) !std.json.Parsed(native.CleanupOutcome) {
+        try context.ensureActive();
+        self.cleanups += 1;
+        const state = &self.cancel_state.?;
+        state.source.sequence += 1;
+        const position: @FieldType(native.CleanupOutcome, "position") = .{ .namespace = identity.namespace, .sequence = state.source.sequence };
+        state.cleanup = position;
+        return parsed(native.CleanupOutcome, alloc, .{ .binding = state.binding.?, .position = position, .duplicate = false });
+    }
+
+    pub fn collectNativeIndexOwnerGarbage(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, _: native.Identity, context: operation.RequestContext) !std.json.Parsed(native.CleanupMaintenanceOutcome) {
+        try context.ensureActive();
+        self.gc_pages += 1;
+        self.cancel_state.?.artifacts_retired = self.gc_pages == 2;
+        return parsed(native.CleanupMaintenanceOutcome, alloc, .{ .advanced = true, .artifacts_retired = self.cancel_state.?.artifacts_retired });
     }
 
     pub fn applyNativeIndexOwnerControl(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, command: native.Command, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -295,6 +442,67 @@ const TestDriver = struct {
         });
     }
 };
+
+test "relational index publication native cancellation receiver resumes one bounded effect and never acknowledges physical GC" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    @constCast(plan.owners)[0].receipt_authority = .native;
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    var dispatch = try std.json.parseFromSlice(publication.Dispatch, alloc, prepared.dispatch[0], .{});
+    defer dispatch.deinit();
+    var inputs = try std.json.parseFromSlice(publication.Inputs, alloc, prepared.inputs, .{});
+    defer inputs.deinit();
+    const permission: publication.OwnerDecision = .{
+        .metadata_group_id = 13,
+        .metadata_incarnation = @splat('1'),
+        .head = try prepared.head.cancel(prepared.head.revision, .requested),
+        .owner = prepared.owners[0],
+        .disposition = .execute,
+        .dispatch = dispatch.value,
+        .inputs = inputs.value,
+    };
+    const request: CancellationRequest = .{ .table_id = plan.before.table_id, .group_id = plan.owners[0].range.group_id, .id = plan.id };
+    var driver: TestDriver = .{ .value = permission, .pending = true };
+    for ([_]std.meta.Tag(CancellationResult){ .intent, .admitted, .fenced, .reserved, .cleanup, .gc, .gc, .retired }, 0..) |expected, ordinal| {
+        const effects = driver.cancellations + driver.admissions + driver.controls + driver.cleanups + driver.gc_pages;
+        var result = try cancelStep(alloc, &driver, &driver, plan.before.name, request, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(expected, std.meta.activeTag(result));
+        const after = driver.cancellations + driver.admissions + driver.controls + driver.cleanups + driver.gc_pages;
+        try std.testing.expectEqual(@as(usize, if (expected == .retired) 0 else 1), after - effects);
+        if (ordinal == 0) try std.testing.expect(result.intent.value.replication_pending);
+        driver.pending = false;
+    }
+    try std.testing.expectEqual(@as(usize, 8), driver.permission_reads);
+    try std.testing.expectEqual(@as(usize, 1), driver.admission_reads);
+    try std.testing.expectEqual(@as(usize, 2), driver.gc_pages);
+    try std.testing.expectEqual(@as(u64, 7), driver.cancel_state.?.source.sequence);
+    const inspections = driver.inspections;
+    driver.cancel_state.?.source.sequence = 6;
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    try std.testing.expectEqual(inspections + 1, driver.inspections);
+    try std.testing.expectEqual(@as(usize, 2), driver.gc_pages);
+    driver.cancel_state.?.source.sequence = 7;
+    driver.cancel_state.?.intent.?.intent.owner_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, cancelStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+
+    var signal = std.atomic.Value(bool).init(false);
+    const context: operation.RequestContext = .{ .cancellation = operation.CancellationToken.fromAtomic(&signal) };
+    driver = .{ .value = permission, .pending = true, .cancel_after_commit = &signal };
+    var pending_result = try cancelStep(alloc, &driver, &driver, plan.before.name, request, context);
+    defer pending_result.deinit();
+    try std.testing.expect(pending_result == .intent and pending_result.intent.value.replication_pending);
+    try std.testing.expectError(error.Canceled, cancelStep(alloc, &driver, &driver, plan.before.name, request, context));
+    try std.testing.expectEqual(@as(usize, 1), driver.cancellations);
+    signal.store(false, .release);
+    driver.cancel_after_commit = null;
+    driver.value.inputs = null;
+    try std.testing.expectError(error.InvalidGenerationPublication, cancelStep(alloc, &driver, &driver, plan.before.name, request, context));
+    try std.testing.expectEqual(@as(usize, 0), driver.admissions);
+}
 
 test "relational index publication native cancellation receiver uses fixed permission and preserves pending intent" {
     const alloc = std.testing.allocator;

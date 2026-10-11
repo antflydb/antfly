@@ -7960,6 +7960,16 @@ pub const DB = struct {
         return @import("relational_index_owner_job.zig").inspectNative(&txn, expected);
     }
 
+    pub const NativeIndexOwnerCancellationState = @import("relational_index_owner_job.zig").CancellationState;
+
+    pub fn nativeIndexOwnerCancellationState(self: *DB, expected: NativeIndexOwnerIdentity) !NativeIndexOwnerCancellationState {
+        try expected.validate();
+        if (!expected.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return @import("relational_index_owner_job.zig").inspectCancellation(&txn, expected);
+    }
+
     /// Receipt recovery never recompiles a candidate or creates another source
     /// cut. Publication waits precede the immutable read snapshot; its outbox
     /// check closes the flush-versus-new-commit race without an apply lock.

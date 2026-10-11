@@ -128,6 +128,19 @@ pub fn load(txn: anytype) !?Record {
     return record;
 }
 
+/// A retained completed intent is a tombstone, not pending work for a later
+/// owner. Only the exact durable completed-epoch proof can make it inert.
+pub fn pending(txn: anytype) !?Record {
+    const record = (try load(txn)) orelse return null;
+    if (try topology.completed(txn)) |completed| {
+        if (completed.admission_epoch >= record.intent.fence.admission_epoch) {
+            try requireCompleted(txn, record);
+            return null;
+        }
+    }
+    return record;
+}
+
 fn requireCompleted(txn: anytype, record: Record) !void {
     const completed = (try topology.completed(txn)) orelse return error.PrivateIndexCancellationPending;
     if (!completed.namespace.eql(record.intent.fence.namespace) or

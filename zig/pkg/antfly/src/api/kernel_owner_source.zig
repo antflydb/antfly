@@ -93,6 +93,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.admitCanceledNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyCanceledNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.nativeIndexOwnerCancellationState(std.testing.allocator, 7, "rows", identity, context));
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, source.nativeIndexOwnerState(std.testing.allocator, 8, "rows", identity, .{}));
     try std.testing.expectError(error.InvalidPrivateIndexInputs, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "", .{}));
@@ -3631,6 +3632,24 @@ pub const ProvisionedKernelOwnerSource = struct {
         var response = try lease.owner().nativeIndexOwnerStateJson(table_name, encoded);
         defer response.deinit();
         return std.json.parseFromSlice(?index_owner_job.Binding, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    }
+
+    pub fn nativeIndexOwnerCancellationState(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        identity: native_index_control.Identity,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(index_owner_job.CancellationState) {
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCancellationStateJson(table_name, encoded);
+        defer response.deinit();
+        return std.json.parseFromSlice(index_owner_job.CancellationState, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     /// The generation is observed from the same pinned physical owner that
