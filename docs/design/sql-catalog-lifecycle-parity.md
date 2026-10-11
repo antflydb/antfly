@@ -2452,4 +2452,29 @@ durable intent now authorizes the never-visited intermediate state. Generic
 job-less index fences remain rejected. Final Debug qualification passes 43/43
 build steps and all 27 candidate/catalog tests, with no skips, failures or
 leaks. The licensing boundary passes for 2,029 source files and original SQL
-inventory integrity passes unchanged. Optimized qualification is pending.
+inventory integrity passes unchanged. Final ReleaseFast qualification also
+passes 43/43 steps and all 27 tests, with no skips, failures or leaks.
+
+### Cancellation through the shared owner commit path (in qualification)
+
+Cancellation preparation owns only the bounded identity header. Both normal
+native index controls and cancellation now enter the same DB mutation pipeline:
+write gating, snapshot leases, apply-exclusive, transactional native cut and
+transport marker, durable outbox, and completion after lease release. Dedicated
+version-23 replay envelopes reject ordinary mutations, mixed control frames,
+unknown fields and namespace substitutions. Intent results have no publication
+receipt field. The private compiled owner accepts cancellation without a
+manifest; its response storage is reserved before commit. The serving adapter
+uses the actual leased owner and preserves committed pending outcomes after a
+request is canceled.
+
+LSM integration coverage is being qualified for a never-visited primary with a
+failed outbox publication, cold reopen before worker admission, exact payload
+recovery, duplicate intent, gap rejection, atomic standby replay/reopen and late
+normal admission rejection. Compiled-owner coverage also exercises cancellation
+after reservation, duplicate retries and restart. The first integration compile
+caught an extra level of pointer indirection in the shared DB dispatch; that is
+fixed, but these new integration tests are not yet green evidence. Authenticated
+delivery, intent-aware capability barriers, cleanup/release and distributed
+fault qualification remain open. Public production remains disabled; no SQL
+inventory case is credited by this component work.

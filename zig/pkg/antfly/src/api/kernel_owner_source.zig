@@ -88,6 +88,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
     }
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, source.nativeIndexOwnerState(std.testing.allocator, 8, "rows", identity, .{}));
     try std.testing.expectError(error.InvalidPrivateIndexInputs, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "", .{}));
@@ -3674,6 +3675,35 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Transfer the parsed response; this observational caller does not
         // sign it and must not reconstruct a generation from another lookup.
         return (try self.nativeIndexOwnerReceiptAtRoot(alloc, group_id, table_name, request, context)).outcome;
+    }
+
+    /// Persist intent at the leased physical owner; this is not a canceled ACK.
+    pub fn cancelNativeIndexOwnerIntent(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        intent: native_index_control.Admission,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.CancellationOutcome) {
+        try context.ensureActive();
+        try intent.validate();
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = intent.id,
+            .plan_digest = intent.plan_digest,
+            .owner_digest = intent.owner_digest,
+            .ordinal = intent.ordinal,
+            .namespace = intent.fence.namespace,
+            .owner_group_id = intent.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, intent, .{});
+        defer alloc.free(encoded);
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerCancellationJson(table_name, encoded);
+        defer response.deinit();
+        // Cancellation observed after commit must not erase durable progress.
+        return std.json.parseFromSlice(native_index_control.CancellationOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     }
 
     pub fn admitNativeIndexOwner(

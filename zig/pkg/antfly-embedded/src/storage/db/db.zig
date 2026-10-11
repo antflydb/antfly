@@ -7839,6 +7839,21 @@ pub const DB = struct {
     /// Apply an already decoded committed batch. The mutation and its replay
     /// receipt remain in the same primary-store transaction.
     pub fn applyReplicatedBatch(self: *DB, mutation: replicated_mutation.Batch, sequence: u64) !void {
+        if (mutation.index_owner_cancellation) |frame| {
+            try frame.validate();
+            if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
+            try replication_effects_mod.validateIndexCancellationPayload(.{
+                .schema_version = native_index_control.cancellation_envelope_version,
+                .request = mutation.request,
+                .index_owner_cancellation = frame,
+                .index_owner_control = mutation.index_owner_control,
+            });
+            if (try self.replicationMutationAlreadyApplied(sequence)) return;
+            var prepared = try self.prepareNativeIndexOwnerCancellation(frame.intent);
+            defer prepared.deinit();
+            _ = try self.applyPreparedNativeIndexOwnerCancellation(&prepared, .{ .position = frame.position, .lsn = sequence });
+            return;
+        }
         if (mutation.index_owner_control) |frame| {
             try frame.validate();
             if (sequence == 0 or mutation.receipt != .native or !std.meta.eql(mutation.receipt.native, frame.position)) return error.InvalidControlReceiptPosition;
@@ -7877,6 +7892,8 @@ pub const DB = struct {
     pub const NativeIndexOwnerCommand = native_index_control.Command;
     pub const PreparedNativeIndexOwnerControl = native_index_control.Prepared;
     pub const NativeIndexOwnerOutcome = native_index_control.Outcome;
+    pub const PreparedNativeIndexOwnerCancellation = native_index_control.PreparedCancellation;
+    pub const NativeIndexOwnerCancellationOutcome = native_index_control.CancellationOutcome;
     pub const NativeIndexOwnerIdentity = native_index_control.Identity;
     pub const NativeIndexOwnerReceiptRequest = native_index_control.ReceiptRequest;
 
@@ -7949,18 +7966,31 @@ pub const DB = struct {
 
     const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
 
+    pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
+        return PreparedNativeIndexOwnerCancellation.init(self.alloc, intent);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCancellation(self: *DB, prepared: *PreparedNativeIndexOwnerCancellation, replay: ?NativeIndexReplay) !NativeIndexOwnerCancellationOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
     /// Private owner execution. Metadata authorization belongs to the receiving
     /// server, not to a caller-set flag. The replay capability is supplied only
     /// by committed standby ingress, never by ordinary batch decoding.
     pub fn applyPreparedNativeIndexOwnerControl(self: *DB, prepared: *PreparedNativeIndexOwnerControl, replay: ?NativeIndexReplay) !NativeIndexOwnerOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
+    /// One commit/replication machinery for native index controls and intent.
+    /// Preparation owns its off-lock payload; only its bounded effect stages
+    /// under apply-exclusive, together with the transport marker and outbox.
+    fn applyPreparedNativeIndexEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try prepared.command.validate();
-        const jobs = @import("relational_index_owner_job.zig");
-        const binding = prepared.command.binding;
-        if (!binding.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        try prepared.validate();
+        if (!prepared.namespace().eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         if (replay) |value| {
             if (value.lsn == 0) return error.InvalidControlReceiptPosition;
-            try (native_index_control.Frame{ .command = prepared.command, .position = value.position }).validate();
+            try prepared.validateReplay(value.position);
         }
         var replication_mutation = if (replay == null) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
@@ -7973,7 +8003,7 @@ pub const DB = struct {
             if (self.local_execution.replication_async_metadata_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
             if (mirrored) try prepared.preparePayload();
         }
-        var outcome: NativeIndexOwnerOutcome = undefined;
+        var outcome: @TypeOf(prepared.*).ApplyOutcome = undefined;
         {
             var mutation = self.core.snapshot_admission.acquireMutation();
             defer mutation.release();
@@ -7991,37 +8021,18 @@ pub const DB = struct {
                 const current = try apply_receipts.readReplicationAppliedSequenceTxn(&txn);
                 if (current >= value.lsn) {
                     txn.abort();
-                    return .{ .binding = binding, .position = value.position, .duplicate = true };
+                    return prepared.replayDuplicateOutcome(value.position);
                 }
             }
             const forwarded: ?@import("receipt_position.zig").Native = if (replay) |value| value.position else null;
-            const duplicate = (try jobs.nativeEffectPosition(&txn, binding, prepared.command.effect)) != null;
-            switch (prepared.command.effect) {
-                .admitted => {
-                    const artifacts = if (prepared.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
-                    _ = try jobs.stageBeginWithReplay(&txn, binding, &artifacts.candidate.inputs, forwarded);
-                },
-                .fenced => {
-                    var manager = try self.core.initTxnManager();
-                    defer manager.deinit();
-                    _ = try jobs.stageNativeFencedWithReplay(&txn, &manager, binding, forwarded);
-                },
-                .reserved => {
-                    const artifacts = if (prepared.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
-                    var manager = try self.core.initTxnManager();
-                    defer manager.deinit();
-                    _ = try jobs.stageReservationWithReplay(&txn, &manager, binding, &artifacts.candidate, &artifacts.addition, forwarded);
-                },
-            }
-            const position = (try jobs.nativeEffectPosition(&txn, binding, prepared.command.effect)) orelse return error.InvalidPrivateIndexNativeReceipt;
+            outcome = try prepared.stage(self.core, &txn, forwarded);
             if (replay) |value| {
                 var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
                 const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
                 try txn.put(marker.key, marker.value);
             }
-            if (mirrored and !duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(position));
+            if (mirrored and !outcome.duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(outcome.position));
             try txn.commit();
-            outcome = .{ .binding = binding, .position = position, .duplicate = duplicate };
         }
         // Snapshot/commit barriers must not be held across publication or an
         // acknowledgement wait. A committed outbox remains an explicit pending
@@ -8034,13 +8045,13 @@ pub const DB = struct {
             self.scheduleDurableReplicationOutboxRecovery();
             return outcome;
         };
-        if (replay == null and prepared.command.effect != .admitted) {
+        if (replay == null and prepared.hasPublicationReceipt()) {
             var txn = self.core.store.beginReadTxn() catch |err| {
                 outcome.error_name = @errorName(err);
                 return outcome;
             };
             defer txn.abort();
-            outcome.receipt = jobs.nativeReceipt(&txn, binding, prepared.command.effect) catch |err| {
+            prepared.populateReceipt(&txn, &outcome) catch |err| {
                 outcome.error_name = @errorName(err);
                 return outcome;
             };

@@ -290,6 +290,96 @@ test "relational index build pages native owner control preserves committed cuts
     try std.testing.expectEqual(jobs.Phase.reserved, (try jobs.load(&txn)).?.phase);
     // Private reservation must not publish the candidate schema.
     try std.testing.expectEqual(@as(u32, 1), standby.core.schema.?.version);
+
+    // An owner may receive cancellation before its first admission. The
+    // durable intent must survive that jobless restart and replay atomically
+    // with its native cut, source fence, transport marker and outbox.
+    var cancel_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-primary");
+    defer cancel_dir.cleanup();
+    var follower_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-standby");
+    defer follower_dir.cleanup();
+    var cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    defer cancel_primary.close();
+    var follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    defer follower.close();
+    for ([_]*db_mod.DB{ &cancel_primary, &follower }) |db| {
+        try db.setSchemaJson(alloc, before);
+        try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+    }
+    var cancel_barrier: Barrier = .{};
+    var cancel_publisher: Publisher = .{ .barrier = &cancel_barrier, .lsn = 1 };
+    defer if (cancel_publisher.payload) |bytes| alloc.free(bytes);
+    defer cancel_primary.local_execution.replication_async_batch_mirror = null;
+    const cancellation = @import("relational_index_cancellation_intent.zig");
+    const intent = cancellation.Intent.fromBinding(binding);
+    var pending_cancel = try cancel_primary.prepareNativeIndexOwnerCancellation(intent);
+    defer pending_cancel.deinit();
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    const canceled = try cancel_primary.applyPreparedNativeIndexOwnerCancellation(&pending_cancel, null);
+    try std.testing.expect(canceled.replication_pending);
+    try std.testing.expect(!canceled.duplicate);
+    try std.testing.expectEqualStrings("TestPublicationUnavailable", canceled.error_name.?);
+    {
+        var read = try cancel_primary.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.load(&read) == null);
+        try std.testing.expectEqual(canceled.position, (try cancellation.load(&read)).?.position);
+        try jobs.verifyRecovery(alloc, &read, null);
+    }
+    const cancel_payload = try pending_cancel.finalizePayload(canceled.position);
+    try std.testing.expectEqualSlices(u8, cancel_payload, cancel_publisher.payload.?);
+    cancel_primary.local_execution.replication_async_batch_mirror = null;
+    cancel_primary.close();
+    cancel_primary = try db_mod.DB.open(alloc, cancel_dir.path(), options);
+    cancel_publisher.fail = false;
+    cancel_primary.local_execution.replication_async_batch_mirror = cancel_publisher.asMirror();
+    try cancel_primary.flushDurableReplicationOutboxes();
+    try std.testing.expectEqual(@as(usize, 2), cancel_publisher.attempts);
+    try std.testing.expectEqual(@as(usize, 1), cancel_publisher.completed);
+    {
+        var pending = try outbox_store.readPending(alloc, cancel_primary.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expect(pending.isEmpty());
+    }
+    const retried = try cancel_primary.applyPreparedNativeIndexOwnerCancellation(&pending_cancel, null);
+    try std.testing.expect(retried.duplicate);
+    try std.testing.expect(!retried.replication_pending);
+    try std.testing.expectEqual(canceled.position, retried.position);
+    const cancel_record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = cancel_payload };
+    var cancel_decoded = try effects.decodeBatchMutationRequest(alloc, cancel_record);
+    defer cancel_decoded.deinit();
+    var smuggled = cancel_decoded.value;
+    smuggled.request.writes = &.{.{ .key = "smuggled", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexCancellationPayload(smuggled));
+    smuggled = cancel_decoded.value;
+    smuggled.index_owner_control = .{ .command = prepared.command, .position = canceled.position };
+    try std.testing.expectError(error.InvalidBatchRequest, effects.validateIndexCancellationPayload(smuggled));
+    const extra_field = try std.fmt.allocPrint(alloc, "{s},\"unknown_control\":true}}", .{cancel_payload[0 .. cancel_payload.len - 1]});
+    defer alloc.free(extra_field);
+    var unknown_cancel = cancel_record;
+    unknown_cancel.payload = extra_field;
+    try std.testing.expectError(error.InvalidBatchRequest, effects.decodeBatchMutationRequest(alloc, unknown_cancel));
+    var cancel_gap = try replication_ingress.normalizeBatch(cancel_decoded.value);
+    cancel_gap.index_owner_cancellation.?.position.sequence += 1;
+    cancel_gap.receipt = .{ .native = cancel_gap.index_owner_cancellation.?.position };
+    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cancel_gap, 1));
+    try std.testing.expectEqual(@as(u64, 0), try follower.replicationAppliedSequence());
+    try replication_ingress.applyRecord(&follower, cancel_record);
+    try replication_ingress.applyRecord(&follower, cancel_record);
+    follower.close();
+    follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+    try std.testing.expectEqual(@as(u64, 1), try follower.replicationAppliedSequence());
+    {
+        var read = try follower.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.load(&read) == null);
+        try jobs.verifyRecovery(alloc, &read, null);
+        try std.testing.expectEqual(canceled.position, (try cancellation.load(&read)).?.position);
+        try std.testing.expectEqual(canceled.position.sequence, (try authority.load(&read)).?.sequence);
+    }
+    var late_admission = try follower.prepareNativeIndexOwnerAdmission(intent, candidate.inputs.bytes);
+    defer late_admission.deinit();
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, follower.applyPreparedNativeIndexOwnerControl(&late_admission, null));
 }
 
 test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {

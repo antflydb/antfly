@@ -4004,6 +4004,17 @@ pub fn storageOwnerNativeIndexControlJson(
         out_response.* = .{ .ptr = response.ptr, .len = response.len };
         return .ok;
     }
+    if (request.operation == .cancel_intent) {
+        if (request.manifest.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer parsed.deinit();
+        if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var cancellation = handle.db.prepareNativeIndexOwnerCancellation(parsed.value) catch |err|
+            return storageOwnerStatusFromError(err);
+        defer cancellation.deinit();
+        return applyNativeIndexPreparedResponse(handle, &cancellation, out_response);
+    }
     var prepared = switch (request.operation) {
         .admit => blk: {
             if (request.manifest.len == 0 or request.manifest.len > db_mod.DB.PreparedNativeIndexOwnerControl.max_manifest_bytes) return .invalid_argument;
@@ -4028,12 +4039,19 @@ pub fn storageOwnerNativeIndexControlJson(
         else => return .invalid_argument,
     };
     defer prepared.deinit();
+    return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+}
+
+fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     // Reserve response storage before committing. The bounded fixed-identity
     // outcome does not require an allocator call during serialization.
     const buffer = std.heap.c_allocator.alloc(u8, 32 * 1024) catch |err| return storageOwnerStatusFromError(err);
     var owned = true;
     defer if (owned) std.heap.c_allocator.free(buffer);
-    const outcome = handle.db.applyPreparedNativeIndexOwnerControl(&prepared, null) catch |err|
+    const outcome = (if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellation)
+        handle.db.applyPreparedNativeIndexOwnerCancellation(prepared, null)
+    else
+        handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
         return storageOwnerStatusFromError(err);
     var writer: std.Io.Writer = .fixed(buffer);
     std.json.Stringify.value(outcome, .{}, &writer) catch |err| return storageOwnerStatusFromError(err);
