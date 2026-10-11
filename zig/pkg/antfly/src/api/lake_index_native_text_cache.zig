@@ -514,6 +514,11 @@ const Entry = struct {
         entry: *Entry,
         read: @import("lake_index_seekable_text.zig").Read,
         statistics: corpus.statistics.Reader = undefined,
+        fn checkRead(raw: *anyopaque) !void {
+            const read: *const @import("lake_index_seekable_text.zig").Read = @ptrCast(@alignCast(raw));
+            try read.context.ensureActive();
+            try read.cancellation.check();
+        }
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const entry = self.entry;
@@ -527,7 +532,7 @@ const Entry = struct {
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .statistics = .{ .domain = self.domain, .global = null, .segments = &.{}, .read = undefined }, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        const snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
+        const snapshot = self.writer.?.acquireSnapshotWithReadCapability(.{ .ptr = &lease.read, .check = QueryLease.checkRead, .io = context.io }) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
         if (self.statistics_version >= 1) {
             lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries, .directory = self.term_directory, .identities = self.statistics_identities, .ordinals = self.statistics_ordinals, .allocator = self.allocator };
             snapshot.text_statistics = lease.statistics.interface();

@@ -561,6 +561,9 @@ pub const GroupBatch = struct {
     ordinals: []const u64,
 };
 pub const GroupResult = struct {
+    /// In-process partials borrow typed reducers from the page arena. Durable
+    /// and backend interchange continues to use versioned aggregate cells.
+    typed_states: ?[]const Aggregate = null,
     keys: []const Datum,
     aggregates: []const Datum,
     ordinal: u64,
@@ -990,6 +993,21 @@ pub const Grouped = struct {
         self.result_cursor += 1;
         return result;
     }
+    pub fn nextTypedPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.external) |external| {
+            // Decode once at the spill boundary, before any compact join pair.
+            const result = try external.nextPartial(a) orelse return null;
+            const states = try a.alloc(Aggregate, result.aggregates.len);
+            for (states, result.aggregates, self.specs) |*state, cell, spec| state.* = try @import("aggregate_partial.zig").decode(a, cell, spec);
+            return .{ .keys = result.keys, .aggregates = &.{}, .typed_states = states, .ordinal = result.ordinal };
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const index = self.result_cursor;
+        self.result_cursor += 1;
+        const states = try a.alloc(Aggregate, self.specs.len);
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+        return .{ .keys = try self.key_columns.row(a, index), .aggregates = &.{}, .typed_states = states, .ordinal = self.groups.items[index].ordinal };
+    }
     pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
         if (self.external) |external| return external.nextPartial(a);
         if (self.result_cursor == self.groups.items.len) return null;
@@ -1266,6 +1284,26 @@ pub const Grouped = struct {
             state.* = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
             initialized += 1;
         }
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, require_fit);
+    }
+    pub fn importTypedPartialMapped(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64) !void {
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
+    }
+    fn importTypedPartialMappedAdmitted(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
+        if (slots) |mapping| {
+            if (mapping.len == 0 or mapping.len != states.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
+            for (mapping, 0..) |slot, i| {
+                if (slot >= self.specs.len) return error.InvalidSqlSpill;
+                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
+            }
+        } else if (states.len != self.specs.len) return error.InvalidSqlSpill;
+        for (states, 0..) |state, i| {
+            const spec = self.specs[if (slots) |mapping| mapping[i] else i];
+            if (state.kind != spec.kind or state.input_type != spec.input_type or state.input_element != spec.input_element or state.distinct != spec.distinct) return error.InvalidSqlSpill;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
         var input_storage: [256]Datum = undefined;
         const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
@@ -1292,10 +1330,10 @@ pub const Grouped = struct {
                     state.distinct = spec.distinct;
                     initialized_dense += 1;
                 }
-                for (mapping, cells) |slot, value| {
+                for (mapping, states) |slot, value| {
                     // A separate decode gives the dense frame its own payload
                     // ownership and keeps failure cleanup independent.
-                    const replacement = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
+                    const replacement = try @import("aggregate_partial.zig").decode(a, try @import("aggregate_partial.zig").cell(a, value), self.specs[slot]);
                     dense[slot].deinit();
                     dense[slot] = replacement;
                 }

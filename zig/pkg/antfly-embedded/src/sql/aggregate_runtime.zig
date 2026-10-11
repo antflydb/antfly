@@ -286,11 +286,13 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
                 cells[column] = key;
             }
             if (!try bound.input.matchesWithLimits(a, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) continue;
+            const partial_count = if (partial.typed_states) |states| states.len else partial.aggregates.len;
             if (partial.aggregate_slots) |slots| {
-                if (slots.len != partial.aggregates.len) return error.InvalidSqlBackendResponse;
-            } else if (partial.aggregates.len != bound.specs.len) return error.InvalidSqlBackendResponse;
-            const aggregates = try a.dupe(Datum, partial.aggregates);
-            for (aggregates, 0..) |*value, i| {
+                if (slots.len != partial_count) return error.InvalidSqlBackendResponse;
+            } else if (partial_count != bound.specs.len) return error.InvalidSqlBackendResponse;
+            const typed = if (partial.typed_states) |states| try a.dupe(operators.Aggregate, states) else null;
+            const aggregates: []Datum = if (typed != null) &.{} else try a.dupe(Datum, partial.aggregates);
+            for (0..partial_count) |i| {
                 const slot = if (partial.aggregate_slots) |slots| slots[i] else i;
                 if (slot >= bound.filters.len) return error.InvalidSqlBackendResponse;
                 if (bound.filters[slot]) |filter| {
@@ -299,13 +301,17 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
                     if (test_value.sql_null or !test_value.value.bool) {
                         const spec = bound.specs[slot];
                         var empty = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
-                        defer empty.deinit();
+                        defer if (typed == null) empty.deinit();
                         empty.distinct = spec.distinct;
-                        value.* = try @import("aggregate_partial.zig").cell(a, empty);
+                        if (typed) |states| {
+                            states[i] = empty;
+                        } else aggregates[i] = try @import("aggregate_partial.zig").cell(a, empty);
                     }
                 }
             }
-            try grouped.importPartialMapped(partial.keys, aggregates, partial.aggregate_slots, partial.ordinal);
+            if (typed) |states| {
+                try grouped.importTypedPartialMapped(partial.keys, states, partial.aggregate_slots, partial.ordinal);
+            } else try grouped.importPartialMapped(partial.keys, aggregates, partial.aggregate_slots, partial.ordinal);
         }
     }
     return true;

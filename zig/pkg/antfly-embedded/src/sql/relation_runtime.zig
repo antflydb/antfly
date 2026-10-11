@@ -924,6 +924,11 @@ fn Engine(comptime Context: type) type {
             cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
+            // A bounded build-side cost sample is replayed before advancing
+            // its producer again. Native pages stay borrowed and valid.
+            sampled: ?@import("execution_batch.zig").Batch = null,
+            sampled_index: usize = 0,
+            sample_arena: ?std.heap.ArenaAllocator = null,
 
             const SetEntry = struct { values: []const Datum, count: usize, next: ?usize };
 
@@ -983,12 +988,25 @@ fn Engine(comptime Context: type) type {
                 if (self.set_external) |state| state.deinit();
                 self.set_entries.deinit(self.engine.context.alloc);
                 self.set_heads.deinit(self.engine.context.alloc);
+                if (self.sample_arena) |*sample| sample.deinit();
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
                 self.engine.context.alloc.destroy(self);
             }
-            fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+            pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                if (self.sampled) |sample| {
+                    const count = @min(maximum, sample.len() - self.sampled_index);
+                    if (count != 0) {
+                        const source = try a.create(@import("execution_batch.zig").Batch);
+                        source.* = sample;
+                        const selection = try a.alloc(usize, count);
+                        for (selection, 0..) |*index, i| index.* = self.sampled_index + i;
+                        self.sampled_index += count;
+                        return source.select(a, selection);
+                    }
+                    self.sampled = null;
+                }
                 const previous_demand = self.batch_demand;
                 self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
                 defer self.batch_demand = previous_demand;
@@ -1066,6 +1084,14 @@ fn Engine(comptime Context: type) type {
             }
             pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
+                if (self.sampled) |sample| {
+                    if (self.sampled_index < sample.len()) {
+                        const row = try sample.row(alloc, self.sampled_index);
+                        self.sampled_index += 1;
+                        return row;
+                    }
+                    self.sampled = null;
+                }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
                     .materialized_ref => unreachable,
@@ -1759,6 +1785,30 @@ fn Engine(comptime Context: type) type {
                 }
                 return null;
             }
+            pub fn sampleReduction(self: *Iterator, key_columns: []const u32) !bool {
+                std.debug.assert(self.sampled == null and self.sample_arena == null);
+                self.sample_arena = .init(self.engine.context.alloc);
+                const a = self.sample_arena.?.allocator();
+                const batch = try self.nextBatch(a, @min(128, self.engine.context.limits.executionRows()), null);
+                self.sampled = batch;
+                self.sampled_index = 0;
+                if (batch.len() == 0) return false;
+                var distinct: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                defer distinct.deinit(a);
+                // Hashes guide costs only; exact reducers still compare keys.
+                for (0..batch.len()) |row| {
+                    var hash = std.hash.Wyhash.init(0);
+                    for (key_columns) |column| {
+                        const value = try batch.cell(a, row, column);
+                        var bytes: [9]u8 = undefined;
+                        bytes[0] = @intFromBool(value.sql_null);
+                        std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHashDatum(value), .little);
+                        hash.update(&bytes);
+                    }
+                    try distinct.put(a, hash.final(), {});
+                }
+                return distinct.count() * 4 <= batch.len() * 3;
+            }
             pub fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
                 const probe = self.left.?;
                 if (probe.node.operation != .scan or programs.len == 0) return;
@@ -1979,6 +2029,8 @@ fn Engine(comptime Context: type) type {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
                 const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
+                const build_side: u1 = if (self.iterator.flipped_join) 0 else 1;
+                if (!try self.iterator.right.?.sampleReduction(plan.keys[build_side])) return null;
                 const cursor = try @import("join_aggregate.zig").open(a, self.engine, self.iterator, plan);
                 self.opened = true;
                 return cursor;

@@ -962,7 +962,8 @@ fn executeScoredPhraseFilter(
     const avg_dl = snap.textAvgDocLen(phrase_filter.field);
     if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
     var doc_offset: u32 = 0;
-    for (snap.segments) |*segment| {
+    for (snap.segments, 0..) |_, segment_idx| {
+        const segment = try snap.readSegment(segment_idx);
         const segment_offset = doc_offset;
         doc_offset += segment.reader.doc_count;
 
@@ -2420,7 +2421,7 @@ fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapsh
             if (request.diagnostics) |diag| diag.segments_pruned +|= 1;
             continue;
         }
-        const seg = &snap.segments[plan.segment_idx];
+        const seg = try snap.readSegment(plan.segment_idx);
         try collector.beginSegment(plan.doc_offset, seg.reader.doc_count);
         seg.beginAccess();
         defer seg.endAccess();
@@ -2565,7 +2566,8 @@ fn executeSimpleTextBoolWithProducers(
     } else {
         if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
         var doc_offset: u32 = 0;
-        for (snap.segments) |*seg| {
+        for (snap.segments, 0..) |_, segment_idx| {
+            const seg = try snap.readSegment(segment_idx);
             const segment_doc_offset = doc_offset;
             doc_offset += seg.reader.doc_count;
 
@@ -3389,7 +3391,7 @@ const StreamingBoolBuilder = struct {
         return entry.value_ptr.*;
     }
     fn summaryTerm(self: *@This(), field: []const u8, term: []const u8, average: f32) !index_mod.IndexSnapshot.TextTermSummary {
-        const index = (@intFromPtr(self.segment) - @intFromPtr(self.snap.segments.ptr)) / @sizeOf(index_mod.SegmentEntry);
+        const index = self.snap.segmentOrdinal(self.segment);
         if (self.summaries_only and !self.exact_summaries) if (self.snap.text_statistics) |reader| if (reader.planning) |planning| {
             if (try planning(reader.ptr, self.a, index, field, term, average, self.config)) |summary| return summary;
         };
@@ -3750,7 +3752,7 @@ const StreamingBoolPrepared = struct {
         self.budget = .{ .backing = cache.backing, .limit = cache.entry_bytes };
         self.locked = .{ .backing = self.budget.allocator() };
         self.arena = std.heap.ArenaAllocator.init(self.locked.allocator());
-        const segment = &cache.snap.segments[plan.segment_idx];
+        const segment = try cache.snap.readSegment(plan.segment_idx);
         self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
         segment.beginAccess();
         defer segment.endAccess();
@@ -3813,7 +3815,7 @@ const StreamingBoolPreparedCache = struct {
     /// Query-owned scalar singleflight. Syntax, BM25 and constraints are fixed
     /// for this cache; warm bounds still check this facade's current authority.
     fn checkBoundContext(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !void {
-        if (self.snap.text_statistics) |reader| try reader.check(reader.ptr);
+        try self.snap.checkScoringReadContext();
         if (self.snap.segments[plan.segment_idx].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
     }
     fn buildExactBound(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
@@ -3873,7 +3875,7 @@ const StreamingBoolPreparedCache = struct {
         }
     }
     fn get(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !?Lease {
-        const segment = &self.snap.segments[plan.segment_idx];
+        const segment = try self.snap.readSegment(plan.segment_idx);
         if (segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
         try self.mutex.lock(self.io);
         while (true) {
@@ -3943,7 +3945,7 @@ const StreamingBoolPlanning = struct {
             const index = self.next.fetchAdd(1, .monotonic);
             if (index >= self.plans.len) return;
             const plan = &self.plans[index];
-            const segment = &self.cache.snap.segments[plan.segment_idx];
+            const segment = try self.cache.snap.readSegment(plan.segment_idx);
             if (segment.reader.doc_count == 0) continue;
             _ = arena.reset(.free_all);
             var diagnostics: SearchDiagnostics = .{};
@@ -3994,7 +3996,7 @@ fn planStreamingBoolSegmentsCached(a: Allocator, scratch: *std.heap.ArenaAllocat
     for (plans, 0..) |*plan, position| {
         const i = if (candidates) |selected| selected[position].segment_idx else position;
         if (i >= snap.segments.len) return error.InvalidArgument;
-        const segment = &snap.segments[i];
+        const segment = try snap.readSegment(i);
         if (candidates) |selected| offset = selected[position].doc_offset;
         var upper = std.math.inf(f32);
         if (enabled and cache == null and segment.reader.doc_count != 0) {
@@ -4043,7 +4045,7 @@ fn scoreStreamingBoolRange(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, 
     return scoreStreamingBoolRangeCached(snap, bq, request, stats, producers, work, arena, collector, shared, if (shared) |owner| owner.prepared else null);
 }
 fn exactStreamingBoolBound(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
-    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .exact_summaries = true };
+    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = try snap.readSegment(plan.segment_idx), .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .exact_summaries = true };
     defer refinement.deinit();
     return (try refinement.buildRequest(bq)).segmentBound();
 }
@@ -4060,7 +4062,7 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
             return;
         }
     }
-    const segment = &snap.segments[plan.segment_idx];
+    const segment = try snap.readSegment(plan.segment_idx);
     const offset = plan.doc_offset;
     try collector.beginSegment(offset, segment.reader.doc_count);
     segment.beginAccess();
@@ -4298,6 +4300,7 @@ const StreamingBoolParallel = struct {
 
 fn preferParallelText(snap: *const index_mod.IndexSnapshot) bool {
     if (snap.scoringDocCount() < 4096) return false;
+    if (snap.read_context_io != null) return true;
     for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) return true;
     return false;
 }
@@ -4315,7 +4318,7 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     try stats.load();
     var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present() };
     stats.lowered = try lowerer.lower(.{ .bool_query = bq });
-    var io: ?std.Io = null;
+    var io: ?std.Io = snap.read_context_io;
     for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) {
         io = source.ranges.read_io;
         break;
@@ -5594,9 +5597,10 @@ fn collectStatsGrouped(
     stats: *aggregation_mod.StatsAgg,
 ) !void {
     const docs = try candidates.prepare();
-    for (snap.segments, 0..) |*seg, seg_idx| {
+    for (snap.segments, 0..) |_, seg_idx| {
         const local_ids = docs[candidates.offsets.?[seg_idx]..candidates.offsets.?[seg_idx + 1]];
         if (local_ids.len == 0) continue;
+        const seg = try snap.readSegment(seg_idx);
         const reader = (try reads.get(&seg.reader, field)) orelse continue;
 
         // Selective aggregations probe only their candidates. Dense scans use
@@ -5642,7 +5646,7 @@ fn readF64ForDoc(
 ) !?f64 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = &snap.segments[resolved.seg_idx];
+    const seg = try snap.readSegment(resolved.seg_idx);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     return readNumericAsF64(reader, resolved.local_id);
 }
@@ -5675,7 +5679,7 @@ fn readBytesForDoc(
     field: []const u8,
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = &snap.segments[resolved.seg_idx];
+    const seg = try snap.readSegment(resolved.seg_idx);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .bytes_val) return null;
 
@@ -5692,7 +5696,7 @@ fn readTimestampForDoc(
 ) !?i128 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = &snap.segments[resolved.seg_idx];
+    const seg = try snap.readSegment(resolved.seg_idx);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
@@ -5709,7 +5713,7 @@ fn readGeoPointForDoc(
 ) !?geo_mod.GeoPoint {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
-    const seg = &snap.segments[resolved.seg_idx];
+    const seg = try snap.readSegment(resolved.seg_idx);
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
@@ -9040,6 +9044,7 @@ test "streaming boolean single large segment shares bounded ranges and live cuto
     for (serial_segments) |*serial| serial.query_source = null;
     var serial_snapshot = snapshot.*;
     serial_snapshot.segments = serial_segments;
+    serial_snapshot.read_context_io = null;
     for ([_]SearchQuery{
         .{ .term = .{ .field = "title", .term = "alpha" } },
         .{ .match = .{ .field = "title", .text = "alpha beta" } },
@@ -9076,7 +9081,7 @@ test "streaming boolean single large segment shares bounded ranges and live cuto
         defer lease.release();
         var clones = std.heap.ArenaAllocator.init(a);
         defer clones.deinit();
-        var builder: StreamingBoolBuilder = .{ .a = clones.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
+        var builder: StreamingBoolBuilder = .{ .a = clones.allocator(), .snap = snapshot, .segment = try snapshot.readSegment(0), .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
         defer builder.deinit();
         const root = try builder.instantiate(lease.owner.root);
         for (builder.nodes.items) |node| if (node.term) |term| {
@@ -9224,7 +9229,7 @@ test "streaming boolean parallel metadata planning tightens phrase ceilings and 
     sources[0].fail = true;
     try std.testing.expectError(error.TestReadFailed, cache.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) }));
     sources[0].fail = false;
-    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snapshot, .segment = try snapshot.readSegment(0), .offset = 0, .config = .{}, .stats = &stats, .constrained = false };
     defer builder.deinit();
     const root = try builder.instantiate(held.owner.root);
     try std.testing.expect(try root.seek(0) != null);
@@ -9252,7 +9257,7 @@ test "streaming boolean parallel metadata planning tightens phrase ceilings and 
             defer lease.release();
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
-            var clone: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = &snap.segments[0], .offset = 0, .config = .{}, .stats = context, .constrained = false };
+            var clone: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = try snap.readSegment(0), .offset = 0, .config = .{}, .stats = context, .constrained = false };
             defer clone.deinit();
             const node = try clone.instantiate(lease.owner.root);
             try std.testing.expect(try node.seek(32) != null);

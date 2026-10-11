@@ -25,7 +25,7 @@ const materialization = @import("aggregate_materialization.zig");
 const operators = @import("operators.zig");
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
-const partial = @import("aggregate_partial.zig");
+const Batch = @import("execution_batch.zig").Batch;
 
 pub const Plan = struct {
     const OutputKey = struct { side: u1, index: usize };
@@ -50,7 +50,7 @@ pub const Plan = struct {
             if (input.spec.distinct) return null;
             switch (input.spec.kind) {
                 .count, .min, .max, .bool_and, .bool_or => {},
-                .sum => if (input.spec.input_type != .integer) return null,
+                .sum => if (input.spec.input_type != .integer or input.spec.input_element == .numeric) return null,
                 else => return null,
             }
         }
@@ -132,6 +132,9 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
         probe_groups: ?*operators.Grouped = null,
         build_side: u1 = 1,
         build: ?*operators.HashJoin = null,
+        partitions: ?*@import("partition_join.zig").Join = null,
+        current_values: []const Datum = &.{},
+        state_offsets: [2][]usize = .{ &.{}, &.{} },
         current: ?operators.GroupResult = null,
         probe: ?operators.HashJoin.Probe = null,
         ordinal: u64 = 0,
@@ -144,6 +147,7 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             const self = from(raw);
             if (self.probe_groups) |groups| groups.deinit();
             if (self.build) |build| build.deinit();
+            if (self.partitions) |partitions| partitions.close();
             self.probe_arena.deinit();
             self.arena.deinit();
             self.a.destroy(self);
@@ -165,15 +169,22 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 _ = scratch.reset(.free_all);
                 const temporary = scratch.allocator();
                 try self.engine.checkpoint();
-                const row = try child.next(temporary) orelse break;
-                const keys = try temporary.alloc(Datum, self.plan.keys[side].len);
-                for (self.plan.keys[side], keys) |column, *key| key.* = row[column];
-                const inputs = try temporary.alloc(Datum, specs.len);
-                @memset(inputs, Datum.json(.{ .integer = 1 }));
-                for (self.plan.inputs, inputs[1..]) |input, *value| if (input) |source| {
-                    if (source.side == side) value.* = row[source.column];
+                const batch = try child.nextBatch(temporary, @min(context.limits.executionRows(), @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + child.node.columns.len * @sizeOf(Datum) * 16))), null);
+                if (batch.len() == 0) break;
+                const source = try temporary.create(Batch);
+                source.* = batch;
+                const keys = try temporary.alloc(Batch, self.plan.keys[side].len);
+                for (self.plan.keys[side], keys) |column, *key| key.* = try source.project(temporary, column);
+                const ones = try temporary.alloc(u32, batch.len());
+                @memset(ones, 0);
+                const one = try temporary.alloc(Datum, 1);
+                one[0] = Datum.json(.{ .integer = 1 });
+                const inputs = try temporary.alloc(Batch, specs.len);
+                @memset(inputs, .{ .dictionary = .{ .values = one, .indices = ones } });
+                for (self.plan.inputs, inputs[1..]) |input, *value| if (input) |origin| {
+                    if (origin.side == side) value.* = try source.project(temporary, origin.column);
                 };
-                try grouped.add(keys, inputs);
+                try grouped.addEncodedColumns(keys, inputs, batch.len());
             }
             return grouped;
         }
@@ -181,6 +192,16 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             // Match the row executor's cost-based orientation and install its
             // bounded scan filter before pulling any probe rows.
             self.build_side = if (self.iterator.flipped_join) 0 else 1;
+            for (0..2) |side_index| {
+                const side: u1 = @intCast(side_index);
+                self.state_offsets[side] = try self.arena.allocator().alloc(usize, self.plan.inputs.len + 1);
+                var offset = self.plan.keys[side].len;
+                for (self.state_offsets[side], 0..) |*entry, slot| {
+                    entry.* = offset;
+                    const spec = self.stateSpec(side, slot);
+                    offset += if (spec.kind == .count) @as(usize, 1) else if (spec.kind == .sum) 3 else 2;
+                }
+            }
             const join = self.iterator.node.operation.join;
             try self.iterator.prepareScanFilter(if (self.build_side == 0) join.right_keys else join.left_keys);
             const groups = try self.collect(self.build_side);
@@ -192,14 +213,27 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             while (true) {
                 _ = scratch.reset(.free_all);
                 try self.engine.checkpoint();
-                const group = try groups.nextPartialResult(scratch.allocator()) orelse break;
-                // The encoded states and grouping keys are copied into typed
-                // build columns; neither source reducer nor scratch survives.
-                const values = try scratch.allocator().alloc(Datum, group.keys.len + group.aggregates.len);
-                @memcpy(values[0..group.keys.len], group.keys);
-                @memcpy(values[group.keys.len..], group.aggregates);
+                const group = try groups.nextTypedPartialResult(scratch.allocator()) orelse break;
+                const values = try self.pack(scratch.allocator(), group);
                 const keys = group.keys[0..self.plan.join_count];
-                try self.build.?.add(values, keys);
+                if (self.partitions) |owner| {
+                    try owner.add(true, values, keys, @intCast(group.ordinal));
+                } else {
+                    const admitted = try self.build.?.addBatchUntilFull(scratch.allocator(), .{ .rows = &.{values} }, &.{keys});
+                    if (admitted == 0) {
+                        const manager = context.spill orelse return error.SqlProgramLimitExceeded;
+                        const owner = try @import("partition_join.zig").Join.create(self.a, manager, context.limits.retained_bytes / 4, context.limits.scan_rows, 0, false, false);
+                        self.partitions = owner;
+                        var position: usize = 0;
+                        while (try self.build.?.unmatched(&position)) |match| {
+                            const stored = try match.materializeValues(scratch.allocator());
+                            try owner.add(true, stored, stored[0..self.plan.join_count], position - 1);
+                        }
+                        self.build.?.deinit();
+                        self.build = null;
+                        try owner.add(true, values, keys, @intCast(group.ordinal));
+                    }
+                }
                 if (self.iterator.scan_filter) |filter| try filter.add(keys);
             }
             if (self.iterator.scan_filter) |filter| {
@@ -209,7 +243,100 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
             }
             self.probe_groups = try self.collect(1 - self.build_side);
+            if (self.partitions) |owner| {
+                while (true) {
+                    _ = scratch.reset(.free_all);
+                    const group = try self.probe_groups.?.nextTypedPartialResult(scratch.allocator()) orelse break;
+                    try owner.add(false, try self.pack(scratch.allocator(), group), group.keys[0..self.plan.join_count], @intCast(group.ordinal));
+                }
+                self.probe_groups.?.deinit();
+                self.probe_groups = null;
+            }
             self.ready = true;
+        }
+        fn pack(_: *@This(), a_: A, group: operators.GroupResult) ![]const Datum {
+            const states = group.typed_states orelse return error.InvalidSqlBackendResponse;
+            var count = group.keys.len;
+            for (states) |state| count += if (state.kind == .count) @as(usize, 1) else if (state.kind == .sum) 3 else 2;
+            const values = try a_.alloc(Datum, count);
+            @memcpy(values[0..group.keys.len], group.keys);
+            var offset = group.keys.len;
+            for (states) |state| {
+                values[offset] = Datum.json(.{ .integer = @bitCast(state.count) });
+                offset += 1;
+                switch (state.kind) {
+                    .count => {},
+                    .sum => {
+                        const sum: u128 = @bitCast(state.integer_sum);
+                        values[offset] = Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(sum))) });
+                        values[offset + 1] = Datum.json(.{ .integer = @bitCast(@as(u64, @truncate(sum >> 64))) });
+                        offset += 2;
+                    },
+                    .min, .max => {
+                        values[offset] = if (state.selected) |selected| selected.row.values[0] else .{};
+                        offset += 1;
+                    },
+                    .bool_and, .bool_or => {
+                        values[offset] = Datum.json(.{ .bool = state.boolean });
+                        offset += 1;
+                    },
+                    else => return error.InvalidSqlBackendResponse,
+                }
+            }
+            return values;
+        }
+        fn stateSpec(self: *@This(), side: u1, slot: usize) operators.AggregateSpec {
+            return if (slot != 0 and self.plan.inputs[slot - 1] != null and self.plan.inputs[slot - 1].?.side == side) self.plan.recipe.inputs[slot - 1].spec else .{ .kind = .count };
+        }
+        fn countAt(values: []const Datum, offset: usize) !u64 {
+            if (offset >= values.len or values[offset].sql_null or values[offset].value != .integer) return error.InvalidSqlSpill;
+            return @bitCast(values[offset].value.integer);
+        }
+        fn stateAt(self: *@This(), a_: A, side: u1, slot: usize, values: []const Datum) !operators.Aggregate {
+            const spec = self.stateSpec(side, slot);
+            var state = try operators.Aggregate.initTyped(a_, spec.kind, spec.input_type, spec.input_element);
+            var offset = self.state_offsets[side][slot];
+            const count = try countAt(values, offset);
+            offset += 1;
+            switch (spec.kind) {
+                .count => {},
+                .sum => {
+                    const low = try countAt(values, offset);
+                    const high = try countAt(values, offset + 1);
+                    state.integer_sum = @bitCast(@as(u128, low) | (@as(u128, high) << 64));
+                },
+                .min, .max => {
+                    if (offset >= values.len) return error.InvalidSqlSpill;
+                    if (count != 0) try state.update(values[offset]);
+                },
+                .bool_and, .bool_or => {
+                    if (offset >= values.len or values[offset].sql_null or values[offset].value != .bool) return error.InvalidSqlSpill;
+                    state.boolean = values[offset].value.bool;
+                },
+                else => return error.InvalidSqlSpill,
+            }
+            state.count = count;
+            return state;
+        }
+        fn combine(self: *@This(), out: A, built: []const Datum, probed: []const Datum) !operators.GroupResult {
+            const left = if (self.build_side == 0) built else probed;
+            const right = if (self.build_side == 1) built else probed;
+            const left_count = try countAt(left, self.plan.keys[0].len);
+            const right_count = try countAt(right, self.plan.keys[1].len);
+            const keys = try out.alloc(Datum, self.plan.output_keys.len);
+            for (self.plan.output_keys, keys) |key, *value| value.* = try operators.cloneDatum(out, if (key.side == 0) left[key.index] else right[key.index]);
+            const states = try out.alloc(operators.Aggregate, self.plan.inputs.len);
+            for (self.plan.inputs, states, 0..) |input, *state, slot| {
+                state.* = if (input) |source| try self.stateAt(out, source.side, slot + 1, if (source.side == 0) left else right) else try operators.Aggregate.init(out, .count, null);
+                if (input) |source| {
+                    const multiple = if (source.side == 0) right_count else left_count;
+                    state.count = std.math.mul(u64, state.count, multiple) catch return error.SqlNumericOutOfRange;
+                    if (state.kind == .sum) state.integer_sum = std.math.mul(i128, state.integer_sum, multiple) catch return error.SqlNumericOutOfRange;
+                } else state.count = std.math.mul(u64, left_count, right_count) catch return error.SqlNumericOutOfRange;
+            }
+            const result: operators.GroupResult = .{ .keys = keys, .aggregates = &.{}, .typed_states = states, .ordinal = self.ordinal };
+            self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
+            return result;
         }
         fn next(raw: *anyopaque, out: A, maximum: u32) anyerror!?[]const operators.GroupResult {
             const self = from(raw);
@@ -219,43 +346,27 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             var results: std.ArrayList(operators.GroupResult) = .empty;
             while (results.items.len < maximum) {
                 try self.engine.checkpoint();
+                if (self.partitions) |owner| {
+                    const pair = try owner.next() orelse {
+                        self.done = true;
+                        break;
+                    };
+                    try results.append(out, try self.combine(out, pair.right.?, pair.left.?));
+                    continue;
+                }
                 if (self.probe) |*probe| if (try probe.next()) |match| {
                     const built = try match.materializeValues(out);
-                    const current = self.current.?;
-                    const build_keys = built[0..self.plan.keys[self.build_side].len];
-                    const build_states = built[self.plan.keys[self.build_side].len..];
-                    const left_keys = if (self.build_side == 0) build_keys else current.keys;
-                    const right_keys = if (self.build_side == 1) build_keys else current.keys;
-                    const left_states = if (self.build_side == 0) build_states else current.aggregates;
-                    const right_states = if (self.build_side == 1) build_states else current.aggregates;
-                    var left_count = try partial.decode(out, left_states[0], .{ .kind = .count });
-                    defer left_count.deinit();
-                    var right_count = try partial.decode(out, right_states[0], .{ .kind = .count });
-                    defer right_count.deinit();
-                    const keys = try out.alloc(Datum, self.plan.output_keys.len);
-                    for (self.plan.output_keys, keys) |key, *value| value.* = try operators.cloneDatum(out, if (key.side == 0) left_keys[key.index] else right_keys[key.index]);
-                    const values = try out.alloc(Datum, self.plan.inputs.len);
-                    for (self.plan.inputs, self.plan.recipe.inputs, values, 0..) |input, recipe, *value, slot| {
-                        var state = if (input) |source| try partial.decode(out, if (source.side == 0) left_states[slot + 1] else right_states[slot + 1], recipe.spec) else try operators.Aggregate.init(out, .count, null);
-                        defer state.deinit();
-                        if (input) |source| {
-                            const multiple = if (source.side == 0) right_count.count else left_count.count;
-                            state.count = std.math.mul(u64, state.count, multiple) catch return error.SqlNumericOutOfRange;
-                            if (state.kind == .sum) state.integer_sum = std.math.mul(i128, state.integer_sum, multiple) catch return error.SqlNumericOutOfRange;
-                        } else state.count = std.math.mul(u64, left_count.count, right_count.count) catch return error.SqlNumericOutOfRange;
-                        value.* = try partial.cell(out, state);
-                    }
-                    try results.append(out, .{ .keys = keys, .aggregates = values, .ordinal = self.ordinal });
-                    self.ordinal = std.math.add(u64, self.ordinal, 1) catch return error.SqlNumericOutOfRange;
+                    try results.append(out, try self.combine(out, built, self.current_values));
                     continue;
                 };
                 self.probe = null;
                 _ = self.probe_arena.reset(.free_all);
-                self.current = try self.probe_groups.?.nextPartialResult(self.probe_arena.allocator());
+                self.current = try self.probe_groups.?.nextTypedPartialResult(self.probe_arena.allocator());
                 if (self.current == null) {
                     self.done = true;
                     break;
                 }
+                self.current_values = try self.pack(self.probe_arena.allocator(), self.current.?);
                 self.probe = try self.build.?.probe(self.current.?.keys[0..self.plan.join_count]);
             }
             return if (results.items.len == 0) null else try results.toOwnedSlice(out);

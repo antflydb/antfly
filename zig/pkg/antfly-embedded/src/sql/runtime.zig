@@ -2455,6 +2455,7 @@ const TestBackend = struct {
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
+    group_every: ?usize = null,
     metadata_count: ?u64 = null,
     cancelled: bool = false,
     ambiguous: bool = false,
@@ -2543,7 +2544,7 @@ const TestBackend = struct {
         const rows = try alloc.alloc(catalog.Row, count_rows);
         for (rows, from..) |*row, index| {
             var object: std.json.ObjectMap = .empty;
-            try object.put(alloc, "id", .{ .number_string = "9007199254740993" });
+            try object.put(alloc, "id", if (self.group_every) |every| .{ .integer = @intCast(index / every) } else .{ .number_string = "9007199254740993" });
             row.* = .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{index}), .version = 99, .value = .{ .object = object } };
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
@@ -5242,6 +5243,19 @@ test "external lake SQL exact join partial aggregation preserves fanout NULLs fi
         try std.testing.expectEqualStrings(expected_rows, actual_rows);
         try std.testing.expectEqualDeep(expected.output.sql_nulls, actual.output.sql_nulls);
     }
+    // Native signed limbs must preserve an intermediate SUM outside i64,
+    // including negative sign extension, before multiplicity is applied.
+    {
+        var backend: TestBackend = .{};
+        var compiled = try compiler.compile(a, "SELECT COUNT(*), SUM(l.v), SUM(r.v), MIN(l.v) FROM (VALUES (1,-9223372036854775807-1),(1,-1),(1,9223372036854775807)) l(k,v) JOIN (VALUES (1,-3),(1,1)) r(k,v) ON l.k=r.k", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("6", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("-4", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("-6", result.output.rows[0][2].string);
+        try std.testing.expectEqualStrings("-9223372036854775808", result.output.rows[0][3].string);
+    }
     // 24 input rows produce 144 pairs. A 64-row execution budget admits the
     // compact partial path, while expanding the pairs exceeds that budget.
     const repeated = "(VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1))";
@@ -5263,20 +5277,20 @@ test "external lake SQL exact join partial aggregation preserves fanout NULLs fi
 
 test "external lake SQL join partial state spills and unwinds allocation failures" {
     const a = std.testing.allocator;
-    var source: TestBackend = .{ .row_count = 4096 };
+    var source: TestBackend = .{ .row_count = 16384, .group_every = 4 };
     var backend = source.coordinated();
     backend.execution_io = std.testing.io;
     var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
     defer manager.deinit();
     backend.spill_manager = &manager;
-    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l._id=r._id", .{});
+    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l.id=r.id", .{});
     defer compiled.deinit();
-    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+    var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 50000 });
     defer result.deinit();
     try std.testing.expect(manager.written_bytes > 0);
-    try std.testing.expectEqualStrings("4096", result.output.rows[0][0].string);
-    try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][1].string);
-    try std.testing.expectEqualStrings("9007199254740993", result.output.rows[0][2].string);
+    try std.testing.expectEqualStrings("65536", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("4095", result.output.rows[0][2].string);
     const Sweep = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var test_backend: TestBackend = .{};
@@ -5306,4 +5320,16 @@ test "external lake SQL join partials install scan filters before either oriente
         try std.testing.expectEqualStrings("4611686018427388416", result.output.rows[0][1].string);
         try std.testing.expectEqual(@as(usize, 1), source.dynamic_filters);
     }
+}
+
+test "external lake SQL unique join keys replay the bounded cost sample exactly once" {
+    const a = std.testing.allocator;
+    var source: TestBackend = .{ .row_count = 12000 };
+    var compiled = try compiler.compile(a, "SELECT COUNT(*), MIN(l._id), MAX(r._id) FROM things l JOIN things r ON l._id=r._id", .{});
+    defer compiled.deinit();
+    var result = try execute(a, source.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("12000", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("9999", result.output.rows[0][2].string);
 }

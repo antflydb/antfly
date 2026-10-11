@@ -52,6 +52,26 @@ pub const Batch = union(enum) {
             .mapped => |v| v.ordinals.len,
         };
     }
+    /// A single borrowed column retains physical dictionary identities.
+    pub fn project(self: *const Batch, a: A, column: usize) !Batch {
+        if (column >= self.width()) return error.InvalidSqlBackendResponse;
+        if (try self.dictionaryColumn(a, column)) |encoded| return encoded;
+        const View = struct {
+            source: *const Batch,
+            column: usize,
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, _: usize) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cell(alloc, row_index, view.column);
+            }
+            fn identity(raw: *anyopaque, row_index: usize, _: usize) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryIdentity(row_index, view.column);
+            }
+        };
+        const view = try a.create(View);
+        view.* = .{ .source = self, .column = column };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_identity = View.identity, .count = self.len(), .width = 1 } };
+    }
     /// Optional physical representation, with the same cells and row order.
     /// Producers decline when normalization or effects require scalar access.
     pub fn dictionaryColumn(self: Batch, a: A, column: usize) !?Batch {

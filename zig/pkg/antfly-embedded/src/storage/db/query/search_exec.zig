@@ -6829,7 +6829,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
     field: []const u8,
 ) !?SortValue {
     const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
-    const segment = &snapshot.segments[resolved.seg_idx];
+    const segment = try snapshot.readSegment(resolved.seg_idx);
     const reader = (try reads.get(&segment.reader, field)) orelse {
         logNativeDocValueLoadFailure(field, "missing_doc_values_section");
         return error.UnsupportedExactSort;
@@ -7872,7 +7872,7 @@ fn decorateSortedSegmentDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     profile: ?*SortCollectorProfile,
 ) !DecoratedSortHit {
-    const segment = &snapshot.segments[segment_index];
+    const segment = try snapshot.readSegment(segment_index);
     const ordinal = try segment.reader.docOrdinal(local_doc_id);
     const global_doc_id = doc_base + local_doc_id;
     const raw_hit = types.SearchHit{
@@ -7977,7 +7977,7 @@ fn sortedSegmentSeekStartDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     reverse: bool,
 ) !i64 {
-    const segment = &snapshot.segments[iterator.segment_index];
+    const segment = try snapshot.readSegment(iterator.segment_index);
     const doc_count = segment.reader.doc_count;
     if (doc_count == 0) return -1;
     const cursor = activeSortCursor(req);
@@ -8071,7 +8071,7 @@ fn nextSortedSegmentHeadAlloc(
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const iterator = &iterators[iterator_index];
-    const segment = &snapshot.segments[iterator.segment_index];
+    const segment = try snapshot.readSegment(iterator.segment_index);
     while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
         const local_doc_id: u32 = @intCast(iterator.next_doc);
         sortedSegmentIteratorAdvance(iterator, reverse);
@@ -8226,7 +8226,7 @@ fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
 
     var count: usize = 0;
     for (iterators) |*iterator| {
-        const segment = &snapshot.segments[iterator.segment_index];
+        const segment = try snapshot.readSegment(iterator.segment_index);
         while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
             const local_doc_id: u32 = @intCast(iterator.next_doc);
             sortedSegmentIteratorAdvance(iterator, reverse);

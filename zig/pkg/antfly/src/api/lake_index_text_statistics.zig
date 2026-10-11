@@ -550,17 +550,92 @@ pub const Reader = struct {
         result.frequency = 1;
         return result;
     }
+    const seek_lane_bytes = 16 * 1024 * 1024;
+    const SeekBudget = struct {
+        allocator: local.sql_parallel_scheduler.LockedAllocator,
+        mutex: std.atomic.Mutex = .unlocked,
+        remaining: u64 = 64 * 1024 * 1024,
+    };
+    const SeekRead = struct {
+        reader: *Reader,
+        budget: *SeekBudget,
+        fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: [32]u8, token: Cancellation, _: *u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.reader.check();
+            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextStatistics;
+            {
+                @import("antfly_platform").sync.lockYielding(&self.budget.mutex);
+                defer self.budget.mutex.unlock();
+                try stores.chargeReadBudget(&self.budget.remaining, length);
+            }
+            return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.reader.read.cache);
+        }
+    };
+    /// Each lane owns its routing cache and bounded decode arena. Shared
+    /// verified artifact singleflight deduplicates overlapping ancestor reads.
+    /// Results occupy disjoint original-order slots; every task is joined
+    /// before the reader capability or output storage can leave scope.
     fn frequencies(raw: *anyopaque, a: A, field: []const u8, terms: []const []const u8, output: []u32) !void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.check();
         if (terms.len != output.len) return error.InvalidNativeLakeTextStatistics;
+        var budget: SeekBudget = .{ .allocator = .{ .backing = a } };
+        const io = self.read.context.io;
+        const lanes: usize = if (io != null) @min(4, @max(1, terms.len)) else 1;
+        var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+        defer if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
+            task.cancel(runtime) catch {};
+        };
+        for (1..lanes) |lane| {
+            tasks[lane - 1] = local.sql_parallel_scheduler.global().submitIo(io.?, seek_lane_bytes, frequencyLane, .{ self, field, terms, output, &budget, lane, lanes });
+            if (tasks[lane - 1] == null) try self.frequencyLane(field, terms, output, &budget, lane, lanes);
+        }
+        try self.frequencyLane(field, terms, output, &budget, 0, lanes);
+        if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
+            try task.await(runtime);
+            slot.* = null;
+        };
+        try self.check();
+    }
+    fn summaries(raw: *anyopaque, a: A, segment: usize, field: []const u8, terms: []const []const u8, average: f32, config: inverted.BM25Config, output: []local.index.IndexSnapshot.TextTermSummary) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.check();
+        if (segment >= self.segments.len or terms.len != output.len) return error.InvalidNativeLakeTextStatistics;
+        var budget: SeekBudget = .{ .allocator = .{ .backing = a } };
+        const io = self.read.context.io;
+        const lanes: usize = if (io != null) @min(4, @max(1, terms.len)) else 1;
+        var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+        defer if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
+            task.cancel(runtime) catch {};
+        };
+        for (1..lanes) |lane| {
+            tasks[lane - 1] = local.sql_parallel_scheduler.global().submitIo(io.?, seek_lane_bytes, summaryLane, .{ self, segment, field, terms, average, config, output, &budget, lane, lanes });
+            if (tasks[lane - 1] == null) try self.summaryLane(segment, field, terms, average, config, output, &budget, lane, lanes);
+        }
+        try self.summaryLane(segment, field, terms, average, config, output, &budget, 0, lanes);
+        if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
+            try task.await(runtime);
+            slot.* = null;
+        };
+        try self.check();
+    }
+    fn frequencyLane(self: *Reader, field: []const u8, terms: []const []const u8, output: []u32, shared: *SeekBudget, lane: usize, lanes: usize) anyerror!void {
+        try self.check();
+        if (terms.len != output.len) return error.InvalidNativeLakeTextStatistics;
+        var memory: local.sql_memory_budget = .{ .backing = shared.allocator.allocator(), .limit = seek_lane_bytes };
+        var arena = std.heap.ArenaAllocator.init(memory.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
         var store = self.read.store;
-        var reads: u64 = 64 * 1024 * 1024;
+        var read_context: SeekRead = .{ .reader = self, .budget = shared };
         var writes: u64 = 0;
-        var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = self, .read = readPage } };
+        var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &shared.remaining, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &read_context, .read = SeekRead.readPage } };
         var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
         defer cache.deinit();
-        for (terms, output) |term, *count| {
+        var i = lane;
+        while (i < terms.len) : (i += lanes) {
+            const term = terms[i];
+            const count = &output[i];
             const key = try keyAlloc(a, field, term);
             defer a.free(key);
             const value = try self.lookup(a, cache.store(), self.global, key);
@@ -569,17 +644,23 @@ pub const Reader = struct {
         }
         try self.check();
     }
-    fn summaries(raw: *anyopaque, a: A, segment: usize, field: []const u8, terms: []const []const u8, average: f32, config: inverted.BM25Config, output: []local.index.IndexSnapshot.TextTermSummary) !void {
-        const self: *Reader = @ptrCast(@alignCast(raw));
+    fn summaryLane(self: *Reader, segment: usize, field: []const u8, terms: []const []const u8, average: f32, config: inverted.BM25Config, output: []local.index.IndexSnapshot.TextTermSummary, shared: *SeekBudget, lane: usize, lanes: usize) anyerror!void {
         try self.check();
         if (segment >= self.segments.len or terms.len != output.len) return error.InvalidNativeLakeTextStatistics;
+        var memory: local.sql_memory_budget = .{ .backing = shared.allocator.allocator(), .limit = seek_lane_bytes };
+        var arena = std.heap.ArenaAllocator.init(memory.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
         var store = self.read.store;
-        var reads: u64 = 64 * 1024 * 1024;
+        var read_context: SeekRead = .{ .reader = self, .budget = shared };
         var writes: u64 = 0;
-        var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = self, .read = readPage } };
+        var pages: page_store.PageStore = .{ .domain = self.domain, .artifacts = &store, .cancellation = self.read.cancellation, .remaining_read_bytes = &shared.remaining, .remaining_write_bytes = &writes, .read_cache = .{ .ptr = &read_context, .read = SeekRead.readPage } };
         var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
         defer cache.deinit();
-        for (terms, output) |term, *result| {
+        var i = lane;
+        while (i < terms.len) : (i += lanes) {
+            const term = terms[i];
+            const result = &output[i];
             const key = try keyAlloc(a, field, term);
             defer a.free(key);
             var lookup_key = key;
@@ -701,6 +782,19 @@ test "external lake text statistics survive cold reads incremental replacement a
     var reopened: Reader = .{ .read = reader.read, .domain = reader.domain, .global = updated, .segments = &.{ roots[2], roots[1] } };
     try Reader.frequencies(&reopened, a, "body", &.{ "alpha", "beta", "gamma", "common" }, &counts);
     try std.testing.expectEqualSlices(u32, &.{ 0, 2, 2, 4 }, &counts);
+    // Same original-order results with independent cold seeks in four lanes.
+    var parallel = reopened;
+    parallel.read.context.io = std.testing.io;
+    var parallel_counts: [4]u32 = undefined;
+    try Reader.frequencies(&parallel, a, "body", &.{ "alpha", "beta", "gamma", "common" }, &parallel_counts);
+    try std.testing.expectEqualSlices(u32, &counts, &parallel_counts);
+    var serial_summaries: [4]local.index.IndexSnapshot.TextTermSummary = undefined;
+    var parallel_summaries: [4]local.index.IndexSnapshot.TextTermSummary = undefined;
+    try Reader.summaries(&reopened, a, 0, "body", &.{ "gamma", "common", "absent", "gamma" }, 100, .{}, &serial_summaries);
+    try Reader.summaries(&parallel, a, 0, "body", &.{ "gamma", "common", "absent", "gamma" }, 100, .{}, &parallel_summaries);
+    try std.testing.expectEqualDeep(serial_summaries, parallel_summaries);
+    parallel.read.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, Reader.frequencies(&parallel, a, "body", &.{ "alpha", "beta", "gamma", "common" }, &parallel_counts));
     var unchanged = Builder.init(a, &manager);
     defer unchanged.deinit();
     try std.testing.expect((try unchanged.finish(pages.store(), updated)).?.eql(updated.?));

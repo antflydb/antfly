@@ -467,6 +467,46 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             },
         )
         assert filtered_join["rows"] == [["1199"], ["1198"], ["1197"]]
+        # Cost sampling must replay unique keys exactly once; repeated keys
+        # exercise batched typed partial reducers over independent Parquet data.
+        unique_join = (
+            "SELECT COUNT(*), SUM(l.amount), MIN(r.amount) "
+            "FROM lake_large l JOIN lake_large r ON l.amount=r.amount"
+        )
+        assert request("POST", "/sql", {"statement": unique_join})["rows"] == [
+            [str(large_count), str(sum(range(large_count))), "0"]
+        ]
+        compact_join = (
+            "SELECT COUNT(*), SUM(l.amount), MIN(r.amount), MAX(l.amount) "
+            "FROM (SELECT amount % 11 AS k, amount FROM lake_events) l "
+            "JOIN (SELECT amount % 11 AS k, amount FROM lake_events) r ON l.k=r.k"
+        )
+        cardinalities = [len(range(k, count, 11)) for k in range(11)]
+        expected_compact = [
+            [
+                str(sum(n * n for n in cardinalities)),
+                str(
+                    sum(sum(range(k, count, 11)) * cardinalities[k] for k in range(11))
+                ),
+                "0",
+                str(count - 1),
+            ]
+        ]
+        assert (
+            request("POST", "/sql", {"statement": compact_join})["rows"]
+            == expected_compact
+        )
+        assert (
+            request(
+                "POST",
+                "/sql",
+                {
+                    "statement": compact_join
+                    + " AND (l.amount IS NOT DISTINCT FROM l.amount)"
+                },
+            )["rows"]
+            == expected_compact
+        )
         shared_windows = request(
             "POST",
             "/sql",

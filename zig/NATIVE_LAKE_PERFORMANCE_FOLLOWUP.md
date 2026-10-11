@@ -1701,3 +1701,64 @@ Qualification after merging main through `121699433e` (Zig 0.17.0):
   join multiplicity, independent Iceberg commits/deletes, and restart.
 - Canonical license headers, the Apache dependency boundary (2,019 source
   files), Zig formatting, Python lint/format, and diff checks pass.
+
+### Evictable directories, sparse capabilities, and costed typed join partials
+
+Admitted native posting directories now belong to the shared decoded metadata
+cache, keyed by artifact identity, metadata type and authorization scope. The
+corpus owner retains the immutable reference and admitted byte count. Every
+required read pins its parsed directory only for the read, including all parallel
+range workers. Speculative queues pin resident directories until their tasks are
+joined or canceled; speculation never discovers a cold directory. Cold loads
+use the decoded cache's bounded admission and retryable singleflight. Pinned
+pressure can return an uncached lease, while released directories can be evicted
+independently of the corpus. Current cancellation and deadline checks apply to
+cache hits as well as provider reads. Uncached and legacy readers preserve their
+existing source authentication contract.
+
+The remote query path uses an explicit read capability with an independent
+checkpoint and I/O runtime. Its facade pins and borrows the immutable segment
+inventory and field totals, rather than copying and retaining every entry.
+Only selected payload readers acquire stable, query-owned source/decoder entries
+in a synchronized sparse map. Immutable section coverage checks do not bind
+readers. Metadata candidates keep their original segment ordinals and document
+offsets; scoring caches still belong to the exact immutable corpus. Closing a
+query quiesces its bound sources before releasing its capability. The older
+context-only binder retains eager validation for providers without an independent
+capability checkpoint.
+
+A semantic proof alone no longer selects join partial aggregation. A bounded
+sample of at most 128 build rows must show at least 25 percent reduction on the
+complete partial grouping key. The sample is replayed exactly once into either
+executor, with native pages borrowed until consumed. Probe input is not sampled:
+the executor still seals and installs its build filter before advancing the
+probe. This prevents unique-key joins from paying for two unnecessary reducers.
+The initial sample is a cost hint, not an equality or cardinality assertion;
+later distributions can differ without affecting correctness.
+
+Selected partial joins consume native batches and encoded expression columns
+through the existing typed grouping kernels. Compact join payloads use native
+count, signed integer-sum limbs, boolean and extreme-value columns. Compact
+pairs read only their required reducer slots; they do not decode and re-encode
+versioned aggregate strings. Typed partial states merge directly into the final
+group columns. Versioned aggregate cells remain the interchange contract at
+backend and spill boundaries. Build overflow transfers the retained prefix and
+remaining compact groups to the existing sequential Grace partition join, with
+repartitioning and its bounded skew fallback, rather than starting an unpartitioned
+disk-chain join.
+
+Cold statistics batches use up to four independently admitted I/O lanes. Each
+lane owns its routing-page cache and bounded decode workspace, reusing shared
+verified-artifact singleflight for overlapping physical reads. Lanes write
+disjoint slots in original term order and share one synchronized 64 MiB read
+budget. All submitted work is joined or canceled before output or reader
+capabilities leave scope; scheduler saturation uses inline required work.
+
+Regression coverage includes independent directory eviction under a 16 KiB
+corpus heap, reader leases under pinned pressure, expired warm reads, zero
+bindings for an unvisited 32-segment inventory, replay of 12,000 unique join keys,
+NULL and FILTER semantics, signed wide SUM intermediates, forced partial-state
+spilling, and serial/parallel statistics equivalence. The independent Parquet
+E2E also compares unique-key and repeated-key aggregate joins with their expected
+results and ordinary join fallback. Archive-scale latency, provider traffic and
+RSS qualification remains a separate benchmark requirement.

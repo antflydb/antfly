@@ -583,6 +583,7 @@ pub const SegmentEntry = struct {
     // their decoder/navigation state and capability-bound source separately.
     query_base_reader: ?segment_mod.SegmentReader = null,
     query_source: ?SegmentSource = null,
+    query_ordinal: ?usize = null,
 
     pub fn typedMergeWorkingSetBytes(self: *const SegmentEntry) !u64 {
         const cached = self.shared.typed_merge_estimate.load(.acquire);
@@ -639,6 +640,7 @@ pub const SegmentEntry = struct {
         if (self.query_base_reader) |base| result.reader = base;
         result.query_base_reader = null;
         result.query_source = null;
+        result.query_ordinal = null;
         return result;
     }
 
@@ -957,9 +959,53 @@ pub const IndexSnapshot = struct {
     /// The owner contains no query capability; cache misses use this facade.
     scoring_owner: ?*IndexSnapshot = null,
 
+    /// The facade borrows the immutable inventory and pins its generation.
+    /// Only selected payload readers acquire a query-local decoder/source.
+    inventory_owner: ?*IndexSnapshot = null,
+    read_context: ?*anyopaque = null,
+    read_context_check: ?*const fn (*anyopaque) anyerror!void = null,
+    read_context_io: ?std.Io = null,
+    bound_mu: std.atomic.Mutex = .unlocked,
+    bound_segments: std.AutoHashMapUnmanaged(usize, *SegmentEntry) = .empty,
+    quiesced: bool = false,
     /// Installed only on a query facade. Shared scoring caches retain values,
     /// never the caller's credentials, publication lease or read capability.
     text_statistics: ?TextStatistics = null,
+    pub fn readSegment(self: *const IndexSnapshot, ordinal: usize) !*SegmentEntry {
+        if (ordinal >= self.segments.len) return error.InvalidArgument;
+        if (self.read_context_check) |check| try check(self.read_context.?);
+        const context = self.read_context orelse return &self.segments[ordinal];
+        const mutable = @constCast(self);
+        while (!mutable.bound_mu.tryLock()) spinOrYield();
+        defer mutable.bound_mu.unlock();
+        if (mutable.quiesced) return error.Canceled;
+        if (mutable.bound_segments.get(ordinal)) |entry| return entry;
+        const physical = self.segments[ordinal].physical();
+        if (physical.reader.postings_loader == null and !(physical.data == .native and physical.data.native == .ranges and physical.data.native.ranges.bind_read_context != null)) return &self.segments[ordinal];
+        const entry = try self.alloc.create(SegmentEntry);
+        errdefer self.alloc.destroy(entry);
+        entry.* = physical;
+        entry.query_ordinal = ordinal;
+        if (entry.reader.postings_loader) |*loader| loader.context = context;
+        if (entry.data == .native and entry.data.native == .ranges) {
+            const range = entry.data.native.ranges;
+            if (range.bind_read_context) |bind| {
+                var source = try bind(range.ptr, self.alloc, context);
+                errdefer source.close();
+                const reader = try entry.reader.bindSource(self.alloc, source);
+                entry.query_base_reader = entry.reader;
+                entry.query_source = source;
+                entry.reader = reader;
+            }
+        }
+        entry.retain();
+        errdefer entry.releaseRef();
+        try mutable.bound_segments.put(self.alloc, ordinal, entry);
+        return entry;
+    }
+    pub fn segmentOrdinal(self: *const IndexSnapshot, entry: *const SegmentEntry) usize {
+        return entry.query_ordinal orelse (@intFromPtr(entry) - @intFromPtr(self.segments.ptr)) / @sizeOf(SegmentEntry);
+    }
     pub const TextCandidate = struct { segment_idx: usize, doc_offset: u32 };
     pub const TextStatistics = struct {
         ptr: *anyopaque,
@@ -985,7 +1031,8 @@ pub const IndexSnapshot = struct {
         return key;
     }
     pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
-        if (self.text_statistics) |reader| try reader.check(reader.ptr);
+        try self.checkScoringReadContext();
+        if (self.read_context_check) |check| try check(self.read_context.?);
         if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         const key = try textSummaryKey(a, segment, field, term, average, config);
         defer a.free(key);
@@ -997,6 +1044,7 @@ pub const IndexSnapshot = struct {
         if (self.text_statistics) |reader| {
             const value = try reader.summary(reader.ptr, a, segment, field, term, average, config);
             try reader.check(reader.ptr);
+            if (self.read_context_check) |check| try check(self.read_context.?);
             if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
             try self.rememberTextTermSummary(segment, field, term, average, config, value);
             return value;
@@ -1064,7 +1112,12 @@ pub const IndexSnapshot = struct {
     /// A retained snapshot pins immutable data, not the opening query's
     /// authority. Stop capability-bound work before releasing that authority.
     pub fn quiesceReadContext(self: *IndexSnapshot) void {
-        for (self.segments) |segment| if (segment.query_source) |source| source.quiesceReadContext();
+        while (!self.bound_mu.tryLock()) spinOrYield();
+        defer self.bound_mu.unlock();
+        self.quiesced = true;
+        var entries = self.bound_segments.valueIterator();
+        while (entries.next()) |entry| if (entry.*.query_source) |source| source.quiesceReadContext();
+        if (self.inventory_owner == null) for (self.segments) |entry| if (entry.query_source) |source| source.quiesceReadContext();
     }
 
     /// Decrement reference count. Frees the snapshot when the count reaches
@@ -1085,8 +1138,16 @@ pub const IndexSnapshot = struct {
     /// the refcount has reached zero.
     fn freeFinal(self: *IndexSnapshot) void {
         const alloc = self.alloc;
-        for (self.segments) |*seg| seg.releaseRef();
-        alloc.free(self.segments);
+        var entries = self.bound_segments.valueIterator();
+        while (entries.next()) |entry| {
+            entry.*.releaseRef();
+            alloc.destroy(entry.*);
+        }
+        self.bound_segments.deinit(alloc);
+        if (self.inventory_owner == null) {
+            for (self.segments) |*seg| seg.releaseRef();
+            alloc.free(self.segments);
+        }
         {
             const cache_mu = &self.term_doc_freq_cache_mu;
             while (!cache_mu.tryLock()) {
@@ -1108,7 +1169,7 @@ pub const IndexSnapshot = struct {
         var summaries = self.text_summaries.keyIterator();
         while (summaries.next()) |key| alloc.free(key.*);
         self.text_summaries.deinit(alloc);
-        self.global_total_field_len.deinit(alloc);
+        if (self.inventory_owner) |owner| owner.release() else self.global_total_field_len.deinit(alloc);
         if (self.scoring_owner) |owner| owner.release();
         alloc.destroy(self);
     }
@@ -1216,7 +1277,8 @@ pub const IndexSnapshot = struct {
         const plans = try alloc.alloc(TextSegmentPlan, self.segments.len);
         errdefer alloc.free(plans);
         var doc_offset: u32 = 0;
-        for (self.segments, 0..) |*seg, segment_idx| {
+        for (self.segments, 0..) |_, segment_idx| {
+            const seg = try self.readSegment(segment_idx);
             var upper_bound: f32 = std.math.inf(f32);
             if (use_segment_bound_planning) {
                 upper_bound = 0;
@@ -1291,7 +1353,7 @@ pub const IndexSnapshot = struct {
         if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
 
         for (plans) |plan| {
-            const seg = &self.segments[plan.segment_idx];
+            const seg = try self.readSegment(plan.segment_idx);
             // Strict inequality preserves deterministic tie-breaking: a
             // segment whose bound equals the threshold may still contain a
             // lower document ID at the cutoff.
@@ -1398,21 +1460,21 @@ pub const IndexSnapshot = struct {
     /// Get a stored document by global doc ID.
     pub fn storedDoc(self: *const IndexSnapshot, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        self.segments[resolved.seg_idx].noteAccess();
-        return try self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
+        (try self.readSegment(resolved.seg_idx)).noteAccess();
+        return try (try self.readSegment(resolved.seg_idx)).reader.storedDoc(resolved.local_id);
     }
 
     /// Native IDs belong to the supplied read scope, never the segment cache.
     pub fn storedIdScoped(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?[]const u8 {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        self.segments[resolved.seg_idx].noteAccess();
-        return self.segments[resolved.seg_idx].reader.storedIdScoped(alloc, resolved.local_id);
+        (try self.readSegment(resolved.seg_idx)).noteAccess();
+        return (try self.readSegment(resolved.seg_idx)).reader.storedIdScoped(alloc, resolved.local_id);
     }
 
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        self.segments[resolved.seg_idx].noteAccess();
-        return try self.segments[resolved.seg_idx].reader.docOrdinal(resolved.local_id);
+        (try self.readSegment(resolved.seg_idx)).noteAccess();
+        return try (try self.readSegment(resolved.seg_idx)).reader.docOrdinal(resolved.local_id);
     }
 
     /// Get and decompress a stored document by global doc ID into `alloc`.
@@ -1426,15 +1488,15 @@ pub const IndexSnapshot = struct {
     /// The snapshot must remain pinned until the cache is destroyed.
     pub fn storedDocWithBlockCache(self: *const IndexSnapshot, cache: *StoredDocBlockCache, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        const segment = &self.segments[resolved.seg_idx];
+        const segment = try self.readSegment(resolved.seg_idx);
         segment.noteAccess();
         return cache.get(&segment.reader, resolved.local_id);
     }
 
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        self.segments[resolved.seg_idx].noteAccess();
-        const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
+        (try self.readSegment(resolved.seg_idx)).noteAccess();
+        const result = (try (try self.readSegment(resolved.seg_idx)).reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
     }
 
@@ -1442,7 +1504,7 @@ pub const IndexSnapshot = struct {
     /// must outlive the cursor. Native identities expire on every cursor get.
     pub fn storedDocWithCursor(self: *const IndexSnapshot, cursor: *segment_mod.SegmentReader.StoredDocCursor, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
         const resolved = self.resolveDocId(global_id) orelse return null;
-        const segment = &self.segments[resolved.seg_idx];
+        const segment = try self.readSegment(resolved.seg_idx);
         segment.noteAccess();
         return cursor.get(&segment.reader, resolved.local_id);
     }
@@ -1458,7 +1520,8 @@ pub const IndexSnapshot = struct {
         errdefer out.deinit(alloc);
 
         var doc_offset: u32 = 0;
-        for (self.segments) |*seg| {
+        for (self.segments, 0..) |_, segment_idx| {
+            const seg = try self.readSegment(segment_idx);
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
@@ -1494,7 +1557,9 @@ pub const IndexSnapshot = struct {
     pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) !bool {
         for (self.segments) |*seg| {
             if (seg.reader.doc_count == 0) continue;
-            if ((try seg.reader.sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
+            if (seg.reader.native) |native| {
+                if (native.range.findSection(segment_mod.doc_ordinals_field, .doc_ordinals) == null) return false;
+            } else if ((try seg.reader.sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
         }
         return true;
     }
@@ -1526,8 +1591,18 @@ pub const IndexSnapshot = struct {
         return total;
     }
 
-    fn checkScoringReadContext(self: *const IndexSnapshot) !void {
+    pub fn checkScoringReadContext(self: *const IndexSnapshot) !void {
+        const mutable = @constCast(self);
+        while (!mutable.bound_mu.tryLock()) spinOrYield();
+        defer mutable.bound_mu.unlock();
+        if (mutable.quiesced) return error.Canceled;
         if (self.text_statistics) |reader| try reader.check(reader.ptr);
+        if (self.read_context_check) |check| {
+            try check(self.read_context.?);
+            return;
+        }
+        var entries = mutable.bound_segments.valueIterator();
+        while (entries.next()) |entry| if (entry.*.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
             if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         };
@@ -1608,7 +1683,7 @@ pub const IndexSnapshot = struct {
                 @memset(counts, 0);
                 var ordinal = lane;
                 while (ordinal < snapshot_ref.segments.len) : (ordinal += lanes) {
-                    const segment = &snapshot_ref.segments[ordinal];
+                    const segment = try snapshot_ref.readSegment(ordinal);
                     if (segment.query_source) |source| if (source == .ranges) {
                         if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
                     };
@@ -1620,7 +1695,7 @@ pub const IndexSnapshot = struct {
                 }
             }
         };
-        var io: ?std.Io = null;
+        var io: ?std.Io = self.read_context_io;
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
             io = source.ranges.read_io;
             if (io != null) break;
@@ -1708,7 +1783,7 @@ pub const IndexSnapshot = struct {
         if (doc_nums.len != 1) return null;
 
         const resolved = self.resolveDocId(doc_nums[0]) orelse return null;
-        var inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndexScoped(self.alloc, field)) orelse return null;
+        var inv_reader = (try (try self.readSegment(resolved.seg_idx)).reader.invertedIndexScoped(self.alloc, field)) orelse return null;
         defer inv_reader.deinit();
         const lookup = (try inv_reader.lookup(term)) orelse return null;
         var postings = try lookup.iterator(alloc);
@@ -1931,38 +2006,34 @@ pub const IndexWriter = struct {
 
     /// A query owns its authority context; immutable segment bytes and their
     /// loaded posting blocks remain shared across readers and generations.
+    /// Compatibility binder for providers without a separate capability
+    /// check. Explicit capabilities use the sparse path below.
     pub fn acquireSnapshotWithReadContext(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
+        const facade = try self.acquireReadFacade(context);
+        errdefer facade.release();
+        for (0..facade.segments.len) |i| _ = try facade.readSegment(i);
+        return facade;
+    }
+    pub const ReadCapability = struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void, io: ?std.Io = null };
+    pub fn acquireSnapshotWithReadCapability(self: *IndexWriter, capability: ReadCapability) !*IndexSnapshot {
+        try capability.check(capability.ptr);
+        const facade = try self.acquireReadFacade(capability.ptr);
+        facade.read_context_check = capability.check;
+        facade.read_context_io = capability.io;
+        return facade;
+    }
+    fn acquireReadFacade(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
         const old = self.acquireSnapshot();
-        defer old.release();
-        var transferred = false;
-        const segments = try self.alloc.dupe(SegmentEntry, old.segments);
-        errdefer if (!transferred) self.alloc.free(segments);
-        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
-        errdefer if (!transferred) totals.deinit(self.alloc);
+        errdefer old.release();
         const empty = try IndexWriter.init(self.alloc);
-        const snapshot_ref = empty.current;
-        snapshot_ref.segments = segments;
-        snapshot_ref.global_total_field_len = totals;
-        snapshot_ref.epoch = old.epoch;
-        transferred = true;
-        for (segments) |*segment| segment.retain();
-        errdefer snapshot_ref.release();
-        snapshot_ref.scoring_owner = old.scoringCache().retain();
-        for (segments) |*segment| {
-            if (segment.reader.postings_loader) |*loader| loader.context = context;
-            if (segment.data == .native and segment.data.native == .ranges) {
-                const range = segment.data.native.ranges;
-                if (range.bind_read_context) |bind| {
-                    var source = try bind(range.ptr, self.alloc, context);
-                    errdefer source.close();
-                    const reader = try segment.reader.bindSource(self.alloc, source);
-                    segment.query_base_reader = segment.reader;
-                    segment.query_source = source;
-                    segment.reader = reader;
-                }
-            }
-        }
-        return snapshot_ref;
+        const facade = empty.current;
+        facade.segments = old.segments;
+        facade.global_total_field_len = old.global_total_field_len;
+        facade.epoch = old.epoch;
+        facade.inventory_owner = old;
+        facade.read_context = context;
+        facade.scoring_owner = old.scoringCache().retain();
+        return facade;
     }
 
     pub const ImmutableSegment = struct { snapshot: *IndexSnapshot, ordinal: usize, target_id: u64 };
@@ -4006,7 +4077,7 @@ fn boundNativeSnapshotScenario(a: Allocator) !void {
     bound_open = false;
     try std.testing.expect(!state.closed);
     var footer: [4]u8 = undefined;
-    try rebound.segments[0].query_source.?.readInto(bytes.len - 4, &footer);
+    try (try rebound.readSegment(0)).query_source.?.readInto(bytes.len - 4, &footer);
     try std.testing.expectEqualSlices(u8, bytes[bytes.len - 4 ..], &footer);
 }
 
@@ -4276,4 +4347,54 @@ test "external lake overlays reject private masks outside the physical corpus" {
     try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
     try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
+}
+
+test "external lake explicit read capabilities bind only selected immutable segments" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer a.free(bytes);
+    const Source = struct {
+        bytes: []const u8,
+        bindings: usize = 0,
+        allowed: bool = true,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allowed) return error.Forbidden;
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .bind_read_context = bind } };
+        }
+        fn bind(raw: *anyopaque, _: Allocator, context: *anyopaque) !SegmentSource {
+            try check(context);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bindings += 1;
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .check_read_context = check } };
+        }
+    };
+    var source: Source = .{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..32) |i| try writer.addSegmentWithIdData(i + 1, .fromNative(source.source()));
+    const facade = try writer.acquireSnapshotWithReadCapability(.{ .ptr = &source, .check = Source.check });
+    defer facade.release();
+    try std.testing.expect(facade.segments.ptr == writer.snapshot().segments.ptr);
+    try std.testing.expectEqual(@as(usize, 0), facade.bound_segments.count());
+    try std.testing.expectEqual(@as(usize, 0), source.bindings);
+    try std.testing.expectEqual(@as(u32, 32), facade.scoringDocCount());
+    const selected = try facade.readSegment(17);
+    try std.testing.expect(selected == try facade.readSegment(17));
+    try std.testing.expectEqual(@as(usize, 17), facade.segmentOrdinal(selected));
+    try std.testing.expectEqual(@as(usize, 1), source.bindings);
+    try std.testing.expectEqual(@as(usize, 1), facade.bound_segments.count());
+    source.allowed = false;
+    try std.testing.expectError(error.Forbidden, facade.readSegment(17));
+    try std.testing.expectError(error.Forbidden, facade.termDocFreq(a, "body", "common"));
+    source.allowed = true;
+    facade.quiesceReadContext();
+    try std.testing.expectError(error.Canceled, facade.readSegment(18));
 }
