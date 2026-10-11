@@ -652,6 +652,46 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         try std.testing.expectError(error.UniqueConstraintViolation, claims.Prepared.init(a, &txn, binding, &.{conflicting}));
         try txn.delete(&inventory_key);
         try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.Prepared.init(a, &txn, binding, &.{first}));
+        try txn.put(&inventory_key, &@as([32]u8, @splat(0)));
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.Prepared.init(a, &txn, binding, &.{first}));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.delete(&claims.registrationKey(allocation.generation));
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, testOwnerRecoveryAllocations(a, &txn));
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const Harness = struct {
+            fn run(alloc: Allocator, txn: *@import("../docstore.zig").DocStore.Txn, current: jobs.Binding, claim: integrity.Claim) !void {
+                var batch = try claims.Prepared.init(alloc, txn, current, &.{claim});
+                defer batch.deinit();
+            }
+        };
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ &read, binding, first });
+    }
+    // More than one full GC page, with request buffers overwritten before
+    // apply, proves both bounded continuation and prepared-byte ownership.
+    for (0..2) |batch_number| {
+        var buffers: [claims.max_claims][32]u8 = undefined;
+        var bulk: [claims.max_claims]integrity.Claim = undefined;
+        for (&buffers, &bulk, 0..) |*buffer, *claim, ordinal| {
+            const tuple = try std.fmt.bufPrint(buffer, "bulk-{d}-{d}", .{ batch_number, ordinal });
+            claim.* = .{ .tuple = tuple, .parent_table = "articles", .parent_key = tuple, .schema_version = binding.physical_candidate.schema_version };
+        }
+        var batch = blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            break :blk try claims.Prepared.init(a, &read, binding, &bulk);
+        };
+        defer batch.deinit();
+        for (&buffers) |*buffer| @memset(buffer, 'x');
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(usize, claims.max_claims), try batch.stage(&txn));
+        try txn.commit();
     }
     var third = first;
     third.tuple = "third";
@@ -676,9 +716,10 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
-        try std.testing.expectError(error.PrivateIndexCancellationPending, late.stage(&txn));
+        try std.testing.expectError(error.PrivateIndexPublicationCanceled, late.stage(&txn));
     }
     var collected: usize = 0;
+    var gc_pages: usize = 0;
     while (true) {
         var page = blk: {
             var read = try store.beginReadTxn();
@@ -687,6 +728,18 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         };
         defer page.deinit();
         try std.testing.expect(page.entries.len > 0 and page.entries.len <= 256);
+        gc_pages += 1;
+        try std.testing.expect(gc_pages <= 2 + 2 * claims.max_claims);
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const selected = page.entries[0].address;
+            const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
+            const reference_value = try reference.encode(a, selected);
+            defer a.free(reference_value);
+            try txn.put(&try reference.key(selected), reference_value);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, page.stage(&txn));
+        }
         collected += page.entries.len;
         // A crash before commit leaves the complete page retryable.
         {
@@ -699,7 +752,8 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
         try page.stage(&txn);
         try txn.commit();
     }
-    try std.testing.expectEqual(@as(usize, 2), collected);
+    try std.testing.expectEqual(@as(usize, 2 + 2 * claims.max_claims), collected);
+    try std.testing.expect(gc_pages >= 2);
     var read = try store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(&address.claimKey()));

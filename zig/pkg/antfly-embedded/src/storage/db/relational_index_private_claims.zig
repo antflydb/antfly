@@ -156,12 +156,14 @@ pub const Prepared = struct {
                 continue;
             }
             slot.value_ptr.* = entries.items.len;
-            // Clone the borrowed claim before reading its inventory companion.
-            const expected = if (try optional(txn, &address.claimKey())) |raw| try owned.dupe(u8, raw) else null;
-            if (expected) |raw| {
+            // Validate before owning any store bytes. An exact duplicate can
+            // retain the already-owned encoding, avoiding a second allocation
+            // and rejecting oversized corrupt records before cloning them.
+            const expected = if (try optional(txn, &address.claimKey())) |raw| blk: {
                 _ = try integrity.Claim.decode(&address.claimKey(), raw);
                 if (!std.mem.eql(u8, raw, value)) return error.UniqueConstraintViolation;
-            }
+                break :blk value;
+            } else null;
             try checkInventory(txn, address, expected);
             try entries.append(owned, .{ .address = address, .value = value, .expected = expected });
         }
