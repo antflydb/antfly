@@ -1850,3 +1850,75 @@ not counted as a passing gate. Formatting, diff checks, license headers, Apache
 boundary and control-catalog freshness pass. The inventory checker remains
 478 implemented / 136 rejected / 73 superseded / 899 unresolved; these native
 component tests do not qualify the still-open public SQL atomicity gate.
+
+### Bounded immutable worker inputs and live owner permission
+
+Private admission now materializes one shared input manifest per table/job and
+one compact immutable dispatch projection per admitted owner. The existing
+two-byte owner-group ordinal directory is unchanged. Schema/catalog JSON and
+table descriptions appear in the shared input, not in every owner projection;
+the full original plan remains the canonical cohort/checkpoint source. All rows
+commit with admission. Terminal replacement trims the prior dispatch cohort,
+and terminal DROP removes the shared input and owner projections too.
+
+The two new record classes participate in metadata snapshot command masks,
+forward canonical verification and reverse orphan counting. Recovery compares
+their exact canonical bytes with projections rebuilt from the original plan.
+Projection strings are owned before another transactional read can reuse its
+borrowed buffer. Admission rebuilds the typed candidate with the same validator
+as original plan preparation, and checks both the candidate and reservation
+fingerprints against the independently fetched head. A copied plan ID is not
+sufficient evidence of valid worker inputs.
+
+`relational_index_owner_decision` is an identity-only private read: table, owner
+group, job ID, requested operation and permission/admission projection. Trusted
+metadata ingress requires an authenticated service and a body-bound read grant;
+the request cannot set its authorization context. Service execution uses a fresh
+linearizable metadata read. The storage adapter checks the decoder floor,
+current head, directory, owner progress, active-pointer phase, lifecycle lock,
+complete addressed range descriptor, stable namespace/database/table bindings,
+catalog coverage and current indexed schema claim in one snapshot. Permission
+reads do not parse the original owner cohort or schema-sized input manifest.
+Admission projection is only valid for fence/cancel operations; it additionally
+fetches the shared input once.
+
+An already acknowledged operation returns `acknowledged`, with no dispatch or
+input and no authority to execute again. An executable operation returns only
+its current owner projection, plus inputs when admission was requested. Phase
+permission is not a lease: ordered data apply still checks the local job, fence
+and page cursor, and signed metadata ACK apply rechecks its current head/root
+authority. Publication removes the pending-name pointer while retaining the
+lifecycle lock through install/release; both ACK and read dispatch now use that
+same phase-sensitive active-pointer rule.
+
+The storage tests cover projection absence/corruption/orphans in checkpoints
+and incoming snapshots, terminal retention, borrowed-read lifetimes, allocation
+failure cleanup, typed candidate fingerprint substitution, and permission
+versus acknowledged retries on native and Raft owner cohorts. A structural
+size test uses a 64 KiB table description: shared inputs exceed 128 KiB while
+the owner dispatch stays below 4 KiB. This is a representation/read-work bound,
+not a measured distributed throughput or latency result. Qualification is still
+in progress for this checkpoint; the public producer remains disabled.
+
+Final Debug qualification passes 92/92 build steps and 606/606 standard-runner
+tests across the publication, namespace/recovery, catalog store, catalog API
+and complete catalog transport gates. Custom artifact selections also pass
+17 publication/permission tests, the decoder-floor test and the overlapping
+namespace/native selections without skips, failures or leaks. The transport
+gate includes the actual metadata handler's exact-body owner-grant test:
+missing service/read grants and reusing a fence grant for a cancellation body
+are rejected before the callback, while the valid grant sets only the private
+index authority. ReleaseFast qualification is running on this frozen source.
+The earlier narrow mock error-set compile failure and sandbox-denied socket
+binds are not counted as passing runs; storage error propagation and loopback
+tests were retained rather than weakened. Formatting, diff checks, license
+headers, Apache boundary and control-catalog freshness pass.
+
+Native ordered DB/C-ABI/RPC effect commands, standby forwarded positions and
+atomic outbox/replay, global UNIQUE claims, build/validate/install/cancel/release
+continuations, public SQL activation and distributed fault qualification still
+remain required. The original SQL inventory has not been reclassified.
+Public admission must also independently attest each owner's actual native or
+Raft receipt authority, rather than letting a proposed plan choose it. Worker
+activation must preserve ordinary read availability through pinned schema
+views while write/intent fencing and final publication enforce the index cut.

@@ -343,6 +343,39 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
+pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexOwnerDecisionJson(alloc, svc.metadata_group_id, request);
+}
+
+test "system catalog relational index publication read requires authority before a linearizable barrier" {
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        reads: usize = 0,
+        const Store = struct {
+            pub fn relationalIndexOwnerDecisionJson(_: *@This(), _: std.mem.Allocator, _: u64, _: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
+                return error.UnexpectedRead;
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            self.reads += 1;
+        }
+        pub fn projectedStore(_: *@This()) ?*Store {
+            return null;
+        }
+    };
+    var svc: Mock = .{};
+    const request: @import("../metadata/relational_index_publication.zig").OwnerRequest = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence };
+    try std.testing.expectError(error.Forbidden, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{}, request));
+    try std.testing.expectEqual(@as(usize, 0), svc.reads);
+    try std.testing.expectError(error.MissingMetadataStore, relationalIndexOwnerDecisionJson(&svc, std.testing.allocator, .{ .index_publication_authority = true }, request));
+    try std.testing.expectEqual(@as(usize, 1), svc.reads);
+}
+
 pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: fk_publication.Command) ![]u8 {
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
@@ -524,6 +557,7 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .fk_generation_publication_work => |after_child_table_id| fkGenerationPublicationWorkJson(svc, alloc, context, after_child_table_id),
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
+        .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
             if (request.generated_constraint_names.len != 0)

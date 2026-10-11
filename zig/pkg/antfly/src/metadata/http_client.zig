@@ -1156,6 +1156,7 @@ pub const MetadataHttpClient = struct {
         }
         if (response.status != 200) return switch (response.status) {
             400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "InvalidGenerationPublication"))
@@ -1169,11 +1170,13 @@ pub const MetadataHttpClient = struct {
             else if (input == .policy_publication_status and std.mem.eql(u8, response.body, "RowPolicyCatalogChanged"))
                 error.RowPolicyCatalogChanged
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "GenerationPublicationNotFound"))
                 error.GenerationPublicationNotFound
             else if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
+                input == .relational_index_owner_decision or
                 input == .fk_generation_publication_source_decision or input == .fk_initial_create_status or
                 input == .fk_initial_child_decision or input == .fk_initial_parent_decision) and
                 std.mem.eql(u8, response.body, "GenerationPublicationChanged"))

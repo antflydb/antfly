@@ -78,6 +78,7 @@ pub const Call = union(enum) {
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
+    relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
     constraint_name_prepare: domain.ConstraintNamePrepareRequest,
     constraint_name_check: domain.ConstraintNameCheck,
@@ -135,6 +136,7 @@ pub const Call = union(enum) {
             .fk_generation_publication_work,
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
+            .relational_index_owner_decision,
             .fk_initial_create_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_status,
@@ -162,6 +164,16 @@ test "system catalog policy publication status is a service-only read, not a set
     try std.testing.expect((Call{ .setting_snapshot = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .fk_generation_publication_status = undefined }).requiresSettingAuthorityReadGrant());
     try std.testing.expect((Call{ .policy_publication_begin = undefined }).requiresAdministrativeGrant());
+}
+
+test "system catalog relational index owner decision requires a body bound read grant and cannot mutate" {
+    const call: Call = .{ .relational_index_owner_decision = .{ .table_id = 1, .group_id = 2, .id = @splat(3), .operation = .fence } };
+    try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!call.requiresAdministrativeGrant());
+    try std.testing.expect(!call.isMutation());
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Call, std.testing.allocator,
+        \\{"relational_index_owner_decision":{"table_id":1,"group_id":2,"id":[3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3],"operation":"fence","index_publication_authority":true}}
+    , .{}));
 }
 
 test "store-root enrollment status is an admin-bound read, not a mutation" {
