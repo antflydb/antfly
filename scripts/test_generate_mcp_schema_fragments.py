@@ -151,6 +151,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "timeout_ms",
             "order_by",
             "search_after",
+            "lake_read",
         }
         self.assertEqual(
             set(query_schema["properties"]),
@@ -174,6 +175,9 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "search_after": ["hn1/revision/artifact/1/0/fingerprint", "artifact:unit"],
         }
         self.assertEqual([], list(validator.iter_errors(valid)))
+        with_read_requirement = copy.deepcopy(valid)
+        with_read_requirement["lake_read"] = {"visibility": "accepted", "wait_ms": 100}
+        self.assertEqual([], list(validator.iter_errors(with_read_requirement)))
 
         invalid_variants = []
         for field, value in (

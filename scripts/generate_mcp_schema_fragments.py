@@ -74,6 +74,7 @@ QUERY_REQUEST_PROPERTIES = (
     "limit",
     "offset",
     "timeout_ms",
+    "lake_read",
     "order_by",
     "search_after",
     "search_before",

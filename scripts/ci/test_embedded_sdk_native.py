@@ -73,6 +73,14 @@ set -eu
 printf 'native-test-invoked\n'
 """)
             uv.chmod(0o755)
+            pkg_config = tools / "pkg-config"
+            pkg_config.write_text("""#!/bin/sh
+set -eu
+[ "$*" = '--exists libantfly' ]
+[ "${PKG_CONFIG_PATH%%:*}" = "$EXPECTED_NATIVE_LIB/pkgconfig" ]
+[ -s "$EXPECTED_NATIVE_LIB/pkgconfig/libantfly.pc" ]
+""")
+            pkg_config.chmod(0o755)
             env = {
                 **os.environ,
                 "PATH": str(tools) + os.pathsep + os.environ["PATH"],
