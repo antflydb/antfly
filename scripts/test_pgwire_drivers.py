@@ -52,24 +52,31 @@ def exercise_cached_setting_plans(server, password):
     url = f"postgres://admin:{password}@127.0.0.1:{server.pgwire_port}/default"
     query = "SELECT current_setting('app.cached_driver')"
     with (
-        psycopg.connect(url, autocommit=True, prepare_threshold=None) as conn,
+        psycopg.connect(url, autocommit=True, prepare_threshold=5) as conn,
         psycopg.connect(url, autocommit=True, prepare_threshold=None) as migrator,
         psycopg.ClientCursor(conn) as cursor,
     ):
         cursor.execute("PREPARE cached_setting AS " + query)
 
-        def assert_cached(value):
+        def assert_cached(value, expected_name=None):
             cursor.execute("EXECUTE cached_setting")
             assert cursor.fetchone() == (value,)
             assert conn.execute(query, prepare=True).fetchone() == (value,)
+            # Inspect the pinned driver's cache: prepare=True alone cannot
+            # prove reuse, because prepare_threshold=None overrides it.
+            name = conn._prepared._names.get((query.encode(), ()))
+            assert name is not None, "settings query was not cached by psycopg"
+            if expected_name is not None:
+                assert name == expected_name, "settings query was prepared again"
+            return name
 
-        assert_cached("before")
+        prepared_name = assert_cached("before")
         # DDL on another connection keeps the driver's cache intact.
         migrator.execute("CREATE TABLE settings_unrelated (id TEXT PRIMARY KEY)")
-        assert_cached("before")
+        assert_cached("before", prepared_name)
         # A compatible setting definition update also requires a fresh guard.
         define_setting("after")
-        assert_cached("after")
+        assert_cached("after", prepared_name)
     print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
 
 
