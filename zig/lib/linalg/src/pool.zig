@@ -191,6 +191,10 @@ fn dispatchWave(io: std.Io, jobs: []const Job, scoped: bool) std.Io.Cancelable!v
 /// Run the final job on the caller and drain bounded async jobs before return.
 /// Preserve the existing sequential fallback outside Linux or over capacity.
 pub fn dispatchJobs(jobs: []const Job) void {
+    if (comptime @import("builtin").single_threaded) {
+        for (jobs) |job| job.fn_ptr(job.ctx);
+        return;
+    }
     if (jobs.len <= 1 or ensurePool(jobs.len - 1) < jobs.len - 1) {
         var scope = if (scoped_worker_limit != null) WorkerScope.init(1) catch unreachable else null;
         defer if (scope) |*active| active.deinit();

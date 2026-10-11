@@ -166,7 +166,7 @@ fn requireString(obj: std.json.ObjectMap, key: []const u8, expected: []const u8)
     if (v != .string or !std.mem.eql(u8, v.string, expected)) return error.UnsupportedEmbeddingGemma2Geometry;
 }
 
-pub fn validateWeights(allocator: std.mem.Allocator, store: @import("../models/tensor_store.zig").TensorStore, cfg: Config) !void {
+pub fn validateWeights(allocator: std.mem.Allocator, store: anytype, cfg: Config) !void {
     if (store.kind() != .safetensors) return error.UnsupportedEmbeddingGemma2Precision;
     const global = .{
         .{ "language_model.embed_tokens.weight", .{ cfg.vocab_size, cfg.hidden_size } },
@@ -238,7 +238,7 @@ pub fn validateWeights(allocator: std.mem.Allocator, store: @import("../models/t
     }
 }
 
-fn requireWeight(allocator: std.mem.Allocator, store: @import("../models/tensor_store.zig").TensorStore, name: []const u8, shape: []const i64) !void {
+fn requireWeight(allocator: std.mem.Allocator, store: anytype, name: []const u8, shape: []const i64) !void {
     var ref = (try store.describeTensorRange(allocator, name)) orelse return error.InvalidEmbeddingGemma2Weight;
     defer ref.deinit(allocator);
     if (ref.dtype != .bf16 and ref.dtype != .f32) return error.UnsupportedEmbeddingGemma2Precision;
@@ -813,7 +813,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
 }
 
 pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, ids: []const i64, mask: []const i64, batch: usize, seq: usize) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
@@ -830,7 +830,7 @@ pub fn forwardCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: C
 
 /// Already scaled hard-token embeddings with unscaled projected media tokens.
 pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize) !CT {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedEmbeddingGemma2Backend;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
