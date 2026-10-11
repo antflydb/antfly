@@ -634,7 +634,7 @@ test "system catalog relation namespace transaction bulk resolution requires a l
     defer store.deinit();
 
     const description: [256 * 1024]u8 = @splat('x');
-    var table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .description = &description, .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"old_idx\"}]}" };
+    var table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .description = &description, .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"old_idx\"}],\"checks\":[{\"name\":\"new_idx\"}]}" };
     // Hosted name allocation requires a durable Raft cursor for its source
     // cut. Exercise production apply rather than a standalone-only fixture.
     const initialize = try encodeTransitionCommand(a, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
@@ -660,6 +660,8 @@ test "system catalog relation namespace transaction bulk resolution requires a l
         try std.testing.expect(names.relation_names_only);
         try std.testing.expectEqual(relation_names.Kind.table, names.relations[0].?.owner.kind);
         try std.testing.expectEqual(relation_names.Kind.index, names.relations[1].?.owner.kind);
+        // CHECK names are table-qualified memberships, not occupants of the
+        // shared table/index namespace used by generated relation names.
         try std.testing.expect(names.relations[2] == null and names.relations[3] == null);
         try std.testing.expectError(error.CatalogPublicationProofPending, names.validateRelations(.{ .relations = &targets }));
         try std.testing.expectError(error.InvalidCatalogMutation, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .name_allocation = true, .include_query_definitions = true }));
@@ -16059,7 +16061,9 @@ pub const RaftApplyStore = struct {
         var namespaces: [256]?u64 = undefined;
         for (request.relations, 0..) |target, i| namespaces[i] = try resolveSystemCatalogNamespaceTxn(alloc, txn, group_id, target.database, target.namespace);
         var buffers: RelationSourceBuffers = undefined;
-        var source = try relationTableSource(alloc, txn, group_id, &buffers);
+        // Allocation reserves relation names, not table-qualified constraint
+        // memberships. Keep pending creates/restores in the same source cut.
+        var source = try relationTableSource(alloc, txn, group_id, &buffers, .relations);
         defer source.deinit();
         var cursor_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
         var cursor: []const u8 = "";

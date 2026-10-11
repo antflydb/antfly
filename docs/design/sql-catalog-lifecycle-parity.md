@@ -1,6 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: follow-up to merged PR #1048, merged with `origin/main` at `7d6b35000d`.
+Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
+at `77a276cd53`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -2287,8 +2288,10 @@ strings and do not turn cancellation after commit into an uncommitted outcome.
 
 Component assertions cover staging, retry recovery, owned pending responses,
 post-commit cancellation, changed permission, foreign table names, acknowledged
-work, missing admission and allocation-failure cleanup. Execution qualification
-is pending. This layer is not yet wired to an authenticated RPC/root-attestation
+work, missing admission and allocation-failure cleanup. Debug qualification of
+the publication gate passes all 59 build steps and 20 tests (19 publication
+and one decoder-floor), without skips, failures or leaks, after merging main
+at `77a276cd53`. This layer is not yet wired to an authenticated RPC/root-attestation
 producer. Durable cancellation/late-admission tombstones, all later phases and
 the distributed fault/public atomicity gates remain required before activation.
 
@@ -2298,4 +2301,21 @@ private ABI, checks that the public schema is still the predecessor, and fully
 closes/reopens the source before recovering the original reserved receipt. It
 also checks that large admission inputs are requested only once. Metadata phase
 progression is simulated in this fixture; it does not stand in for root-signed
-ACK/enrollment or distributed fault qualification. Execution remains pending.
+ACK/enrollment or distributed fault qualification. Debug qualification passes
+all three focused native-owner tests, including this composed restart fixture,
+without skips, failures or leaks. Optimized qualification remains pending.
+
+### Catalog source coverage after the main merge
+
+The storage-kernel compilation gate exposed a stale allocation-name caller of
+the coverage-aware catalog cursor introduced on main. Name allocation now
+explicitly selects relation coverage: table/index occupancy includes hidden
+create/restore reservations, but excludes table-qualified CHECK/FK memberships.
+The bulk-resolution regression includes a CHECK whose name matches an available
+index name, preserving that namespace distinction. The Debug namespace/restore
+runner passes all 50 selected regressions without skips, failures or leaks.
+Combined with the three native-owner tests above, the Debug gate completes all
+85 build steps. The original inventory checker still reports 478 implemented,
+136 rejected, 73 superseded and 899 unresolved out of 1,586 original cases.
+The Apache/server boundary checker passes for 2,028 source files. None of these
+component gates changes an original SQL disposition.
