@@ -14114,11 +14114,15 @@ pub const ApiHttpServer = struct {
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
 
-        const ReadInput = struct { lake_read: ?struct { wait_ms: u32 = 5000 } = null };
+        const ReadInput = struct { read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null, lake_read: ?struct { wait_ms: u32 = 5000 } = null };
         var read_input = std.json.parseFromSlice(ReadInput, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
         defer read_input.deinit();
+        if (read_input.value.read_requirements) |read| {
+            if (read_input.value.lake_read != null) return error.InvalidQueryRequest;
+            read.validate(.search) catch |err| return if (err == error.UnsupportedReadVisibility) error.UnsupportedQueryRequest else error.InvalidQueryRequest;
+        }
         if (read_input.value.lake_read) |read| if (read.wait_ms > 60000) return error.InvalidQueryRequest;
-        const retry_timeout_ns: u64 = if (read_input.value.lake_read) |read| @as(u64, read.wait_ms) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_timeout_ns: u64 = if (read_input.value.read_requirements) |read| @as(u64, read.wait_ms orelse 5000) * std.time.ns_per_ms else if (read_input.value.lake_read) |read| @as(u64, read.wait_ms) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
@@ -14909,7 +14913,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
-        if (request.lake_read != null) return error.UnsupportedQueryRequest;
+        if (request.lake_read != null or request.read_requirements != null) return error.UnsupportedQueryRequest;
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
         if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
@@ -32064,6 +32068,10 @@ test "api http plain public query preserves outer absolute request deadline" {
 
 test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const artifact_base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(artifact_base);
     const position = "hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066";
     const public_unit_id = "af1:asset:unit:page-1";
     const row_filter = "{\"term\":{\"tenant\":\"acme\"}}";
@@ -32075,6 +32083,7 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
+                    .linearizable_snapshot = linearizableSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                 },
             };
@@ -32100,6 +32109,10 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
+        }
+
+        fn linearizableSnapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            return try adminSnapshot(ptr);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
@@ -32133,6 +32146,9 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             try std.testing.expect(req.hierarchy_children != null);
             try std.testing.expectEqualStrings("doc:a", req.hierarchy_children.?.parent_id);
             try std.testing.expectEqualStrings(row_filter, req.filter_query_json);
+            try std.testing.expect(req.remote_snapshot != null);
+            try std.testing.expect(req.native_query_cut != null);
+            try std.testing.expectEqual(self.calls == 0, req.native_query_cut.?.create);
             try std.testing.expectEqual(@as(usize, 2), req.order_by.len);
             try std.testing.expectEqualStrings("_hierarchy.position", req.order_by[0].field);
             try std.testing.expectEqualStrings("_id", req.order_by[1].field);
@@ -32181,8 +32197,8 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
             self.calls += 1;
             return .{ .json = try std.fmt.allocPrint(
                 inner_alloc,
-                "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
-                .{ public_unit_id, position, public_unit_id, hit.stored_data.? },
+                "{{\"responses\":[{{\"remote_snapshot\":\"{s}\",\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{s}\",\"_sort\":[\"{s}\",\"{s}\"],\"_source\":{s}}}]}} ,\"took\":0,\"status\":200,\"table\":\"docs\"}}]}}",
+                .{ req.remote_snapshot.?, public_unit_id, position, public_unit_id, hit.stored_data.? },
             ) };
         }
     };
@@ -32190,12 +32206,12 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
     const first_body =
         \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1}
     ;
-    const replay_body =
+    const replay_template =
         \\{"hierarchy":{"children":{"parent":{"level":"source","id":"doc:a"},"level":"unit"}},"fields":["unit_id","unit_type","text"],"order_by":[{"field":"_hierarchy.position"}],"limit":1,"search_after":["hn3/0000000000000000000000000000000000000000000000000000000000000000/646f63756d656e745f756e6974735f7631/00000000000000000001/00000000000000000000/ef399c1fbabe67d0050324c3919e367b5e58601110d9a3f563071d97c7905066","af1:asset:unit:page-1"]}
     ;
 
     var reads = FakeReads{};
-    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .native_lake_artifact_base_dir = artifact_base }, FakeSource.iface(), reads.source(), null);
     defer server.deinit();
     var first = try server.executePlainPublicTableQuery(
         alloc,
@@ -32217,6 +32233,12 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
     try std.testing.expectEqualStrings(position, first_hit.get("_sort").?.array.items[0].string);
     try std.testing.expectEqualStrings(public_unit_id, first_hit.get("_sort").?.array.items[1].string);
     try std.testing.expectEqualStrings("page one", first_hit.get("_source").?.object.get("text").?.string);
+
+    var replay_request = try std.json.parseFromSlice(std.json.Value, alloc, replay_template, .{ .allocate = .alloc_always });
+    defer replay_request.deinit();
+    try replay_request.value.object.put(replay_request.arena.allocator(), "remote_snapshot", first_json.value.object.get("responses").?.array.items[0].object.get("remote_snapshot").?);
+    const replay_body = try std.json.Stringify.valueAlloc(alloc, replay_request.value, .{});
+    defer alloc.free(replay_body);
 
     var replay = try server.executePlainPublicTableQuery(
         alloc,

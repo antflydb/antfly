@@ -1585,6 +1585,10 @@ fn pinPublishedSource(binding: *local.serverless_external_source_mod.ExternalTab
             if (binding.format != .iceberg) return error.ExternalLakeSnapshotMismatch;
             binding.snapshot_mode = if (std.mem.startsWith(u8, source.snapshot_id, "empty:")) .current else .{ .snapshot_id = source.snapshot_id };
         },
+        .external_lance => |source| {
+            if (binding.format != .lance) return error.ExternalLakeSnapshotMismatch;
+            binding.snapshot_mode = .{ .snapshot_id = source.snapshot_id };
+        },
         else => return error.ExternalLakeSnapshotMismatch,
     }
     binding.write_policy = .read_only;

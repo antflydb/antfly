@@ -235,7 +235,7 @@ fn testPlanAllocation(alloc: Allocator) !void {
 
 test "column scan plans bind epochs once and release every allocation failure" {
     try testPlanAllocation(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPlanAllocation, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testPlanAllocation, .{});
 }
 
 test "column scan plans bound residency without evicting pinned blocks" {
@@ -311,13 +311,13 @@ fn testCursorAllocation(alloc: Allocator) !void {
 
 test "column scan cursor releases plans on every allocation failure" {
     try testCursorAllocation(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCursorAllocation, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCursorAllocation, .{});
 }
 
 test "column scan cursor historical churn allocation benchmark" {
     var bytes: [2]usize = undefined;
     for (0..2) |mode| {
-        var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
         const alloc = measured.allocator();
         {
             var db = struct { core: TestCore }{ .core = .{ .alloc = alloc } };

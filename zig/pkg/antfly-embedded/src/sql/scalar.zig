@@ -183,7 +183,11 @@ pub const Column = struct {
 /// Canonical SQL identity for both bound expressions and native materialized
 /// inputs. Legacy integer/number declarations use the same default widths.
 pub fn columnType(column: anytype) Type {
-    return .{ .kind = column.type, .nullable = column.nullable, .element_type = column.element_type orelse (if (column.type == .integer) arrays.ElementType.int64 else if (column.type == .number) arrays.ElementType.float64 else null), .numeric_modifier = column.numeric_modifier };
+    return .{ .kind = column.type, .nullable = column.nullable, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+}
+/// Resolve explicit and default scalar widths for expression and recipe identities.
+pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
+    return element orelse (if (kind == .integer) arrays.ElementType.int64 else if (kind == .number) arrays.ElementType.float64 else null);
 }
 pub const BindLimits = struct {
     nodes: usize = 8192,

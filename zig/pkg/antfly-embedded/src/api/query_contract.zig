@@ -2226,6 +2226,15 @@ fn applyCommonSearchRequestOptions(
         }
     }
 
+    if (comptime @hasField(@TypeOf(request), "read_requirements")) if (request.read_requirements) |read| {
+        if (request.lake_read != null) return error.InvalidQueryRequest;
+        const requirements = @import("../sql/read_requirements.zig").Requirements.fromWire(read) catch return error.InvalidQueryRequest;
+        requirements.validate(.search) catch |err| return if (err == error.UnsupportedReadVisibility) error.UnsupportedQueryRequest else error.InvalidQueryRequest;
+        req.lake_read = .{
+            .visibility = if (requirements.visibility == .published) .published else .accepted,
+            .through = if (requirements.after_write) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
+        };
+    };
     if (comptime @hasField(@TypeOf(request), "lake_read")) if (request.lake_read) |read| {
         req.lake_read = .{
             .visibility = if (read.visibility) |visibility| if (std.mem.eql(u8, visibility, "accepted")) .accepted else if (std.mem.eql(u8, visibility, "published")) .published else return error.InvalidQueryRequest else .accepted,
@@ -12063,6 +12072,9 @@ fn applyPublicHierarchyControls(
                     !std.mem.eql(u8, root_key, "timeout_ms") and
                     !std.mem.eql(u8, root_key, "order_by") and
                     !std.mem.eql(u8, root_key, "search_after") and
+                    // The retained cut is required to resume child traversal;
+                    // it is capability metadata, not a relevance/filter knob.
+                    !std.mem.eql(u8, root_key, "remote_snapshot") and
                     !isInternalShardFieldName(root_key))
                 {
                     // Sequential traversal has no relevance/filter execution
@@ -18577,6 +18589,26 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), parsed.req.exclude_doc_ids.len);
             try std.testing.expectEqualStrings("doc:c", parsed.req.exclude_doc_ids[0]);
             try std.testing.expectEqual(@as(?u64, 42), parsed.req.identity_read_generation);
+        }
+
+        test "api query contract normalizes read requirements and rejects mixed aliases" {
+            const alloc = std.testing.allocator;
+            var parsed = try parseQueryRequest(alloc, null, "docs",
+                \\{"read_requirements":{"visibility":"accepted","after_write":{"table_id":7,"object_generation":3,"wal_lsn":12},"wait_ms":0}}
+            );
+            defer parsed.deinit(alloc);
+            const read = parsed.req.lake_read orelse return error.TestExpectedReadRequirements;
+            try std.testing.expectEqual(.accepted, read.visibility);
+            try std.testing.expectEqual(@as(u64, 12), read.through.?.wal_lsn);
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"read_requirements":{},"lake_read":{}}
+            ));
+            try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"read_requirements":{"visibility":"committed"}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+                \\{"read_requirements":{"wait_ms":60001}}
+            ));
         }
 
         test "api query contract maps timeout_ms to execution deadline" {

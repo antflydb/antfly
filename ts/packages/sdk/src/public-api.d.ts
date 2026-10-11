@@ -4741,6 +4741,7 @@ export interface components {
             connection_id?: string;
         };
         SQLPreparedExecutionRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
             parameters?: unknown[];
             /** @default 128 */
             limit?: number;
@@ -4847,9 +4848,10 @@ export interface components {
          *     memory, and encoded results to a 16 MiB allocation budget.
          */
         SQLRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
             /**
-             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
-             * @default committed
+             * @deprecated
+             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
              * @enum {string}
              */
             lake_visibility?: "committed" | "accepted";
@@ -10441,6 +10443,29 @@ export interface components {
                 [key: string]: string;
             } | string[];
         };
+        /** @description Opaque write receipt returned by ingestion. Pass it back unchanged to require a read including that write; it is a minimum freshness frontier, not an exact snapshot. */
+        ReadReceipt: {
+            /** Format: uint64 */
+            table_id: number;
+            /** Format: uint64 */
+            object_generation: number;
+            /** Format: uint64 */
+            wal_lsn: number;
+        };
+        /** @description Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt. */
+        ReadRequirements: {
+            /**
+             * @description Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
+             * @enum {string}
+             */
+            visibility?: "accepted" | "committed" | "published";
+            after_write?: components["schemas"]["ReadReceipt"];
+            /**
+             * Format: uint32
+             * @description Readiness wait budget within the query or statement timeout. Defaults to 5000 ms when requirements are supplied; zero fails immediately if coverage is unavailable.
+             */
+            wait_ms?: number;
+        };
         LakeReadReceipt: {
             /** Format: uint64 */
             table_id: number;
@@ -10463,6 +10488,8 @@ export interface components {
             wait_ms?: number;
         };
         QueryRequest: {
+            read_requirements?: components["schemas"]["ReadRequirements"];
+            /** @deprecated */
             lake_read?: components["schemas"]["LakeReadRequirement"];
             /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
             remote_snapshot?: string;
@@ -21789,7 +21816,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL reads follow committed snapshots. */
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL defaults to committed snapshots and can opt into accepted visibility with read_requirements. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -21797,6 +21824,7 @@ export interface operations {
                 content: {
                     "application/json": {
                         state?: string;
+                        read_receipt?: components["schemas"]["ReadReceipt"];
                         /** Format: uint64 */
                         wal_lsn?: number;
                         /** Format: uint64 */
@@ -26122,7 +26150,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
             };
             400: components["responses"]["BadRequest"];
             /** @description Source already exists */

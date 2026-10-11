@@ -1413,7 +1413,11 @@ jobs:
       # The PR E2E artifact is also the release-packaging smoke artifact. Build
       # the partitioned graph once, test that exact binary, and reuse its
       # distributed PIC archive for both public C API packaging shapes.
-      ANTFLY_CI_ZIG_OPTIMIZE: ${{ inputs.full_validation && 'safe' || 'fast' }}
+      # Functional E2E and installed-ABI packaging smoke coverage need runtime
+      # safety checks, not LLVM optimization of every storage/SQL owner. Keep
+      # this artifact bounded; release, scale, and GPU workflows qualify their
+      # optimized artifacts separately.
+      ANTFLY_CI_ZIG_OPTIMIZE: debug
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
@@ -1477,6 +1481,7 @@ jobs:
   embedded-sdk-native:
     if: >-
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
     name: embedded-sdk-native / ${{ matrix.sdk }}
     needs: [admission, e2e-base-build, e2e-full-build]
@@ -1542,6 +1547,7 @@ jobs:
   pgwire-driver-conformance:
     if: >-
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
     name: pgwire-driver-conformance
     needs: [admission, e2e-base-build, e2e-full-build]
@@ -2047,9 +2053,10 @@ jobs:
     timeout-minutes: 90
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
-      # Keep production optimization while preserving runtime-safety checks and
-      # std.debug.assert invariants exercised by the full E2E suite.
-      ANTFLY_CI_ZIG_OPTIMIZE: safe
+      # Match the PR functional artifact: preserve runtime safety and assertions
+      # without recompiling every storage/SQL owner through LLVM optimization.
+      # Release, scale, and GPU workflows qualify their optimized builds.
+      ANTFLY_CI_ZIG_OPTIMIZE: debug
       # Match release artifact symbol handling without disabling safe
       # checks or std.debug.assert invariants.
       ANTFLY_CI_ZIG_STRIP: "true"
@@ -2213,6 +2220,22 @@ jobs:
 
       - name: Install E2E executable
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-full/antfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}.tar.gz" -C zig
+
+      # Independent ingestion writers use the checkout's embedded SDK and the
+      # C ABI artifact produced by the same build as the server under test.
+      - name: Download ingestion native library
+        if: matrix.suite == 'antfly'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/libantfly-e2e-full
+
+      - name: Install ingestion native library
+        if: matrix.suite == 'antfly'
+        run: |
+          mkdir -p zig/zig-out
+          tar -xzf "${RUNNER_TEMP}/libantfly-e2e-full/libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}.tar.gz" -C zig/zig-out
+          echo "ANTFLY_LIBRARY=${GITHUB_WORKSPACE}/zig/zig-out/lib/libantfly.so" >> "$GITHUB_ENV"
 
       - name: Report inference memory baseline
         if: matrix.suite == 'inference'

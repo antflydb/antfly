@@ -36,6 +36,7 @@ from antfly import (
     SQLRequest,
     SQLResponse,
 )
+from antfly.client_generated.models.sql_numeric_modifier import SQLNumericModifier
 
 
 @pytest.mark.parametrize("kind", list(SQLArrayElementType))
@@ -67,6 +68,7 @@ def test_numeric_scalar_and_array_result_modifiers_round_trip():
             "numeric_modifier": {"precision": 2, "scale": -3},
         }
         column = SQLColumn.from_dict(source)
+        assert isinstance(column.numeric_modifier, SQLNumericModifier)
         assert column.numeric_modifier.precision == 2
         assert column.numeric_modifier.scale == -3
         assert column.to_dict() == source
@@ -80,6 +82,7 @@ def test_numeric_array_schema_preserves_optional_modifier(modifier):
     column = SQLArrayColumnSchema.from_dict(source)
     assert column.to_dict() == source
     if modifier is not None:
+        assert isinstance(column.x_antfly_sql_numeric_modifier, SQLNumericModifier)
         assert column.x_antfly_sql_numeric_modifier.precision == modifier["precision"]
         assert column.x_antfly_sql_numeric_modifier.scale == modifier["scale"]
 
@@ -226,6 +229,7 @@ def test_public_numeric_cast_modifier_round_trip(scale):
         "args": [{"op": "literal", "type": "numeric", "value": "1.245"}],
     }
     expression = RelationalScalarExpression.from_dict(source)
+    assert isinstance(expression.numeric_modifier, SQLNumericModifier)
     assert expression.numeric_modifier.precision == 2
     assert expression.numeric_modifier.scale == scale
     assert expression.to_dict() == source
@@ -416,3 +420,21 @@ async def test_generated_sql_async_bounds_and_no_redirects():
     assert stream.closed
     assert stream.read == (16 << 20) + (64 << 10)
     assert len(calls) == 2
+
+
+def test_read_requirements_share_opaque_receipts_and_preserve_zero_wait():
+    from antfly import ReadRequirements, SQLPreparedExecutionRequest, read_after_write
+
+    read = read_after_write({"table_id": 2, "object_generation": 3, "wal_lsn": 10, "state": "accepted"}, wait_ms=0)
+    expected = {
+        "visibility": "accepted",
+        "after_write": {"table_id": 2, "object_generation": 3, "wal_lsn": 10},
+        "wait_ms": 0,
+    }
+    assert read.to_dict() == expected
+    assert ReadRequirements.from_dict(expected).to_dict() == expected
+    sql = SQLRequest(statement="SELECT 1", read_requirements=read).to_dict()
+    assert sql["read_requirements"] == expected
+    assert "lake_visibility" not in sql
+    prepared = SQLPreparedExecutionRequest(read_requirements=read).to_dict()
+    assert prepared["read_requirements"] == expected

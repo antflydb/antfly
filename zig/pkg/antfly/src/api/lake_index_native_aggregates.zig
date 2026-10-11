@@ -748,6 +748,23 @@ test "external lake native algebraic recipes preserve aliases and SQL NULL ident
     try std.testing.expectEqualStrings("key", recipe.keys[0].path);
     try std.testing.expectEqualStrings("amount", recipe.inputs[0].column.?.path);
     try std.testing.expectEqual(local.sql_ast.ColumnType.integer, recipe.inputs[0].spec.input_type.?);
+    try std.testing.expectEqual(.int64, recipe.inputs[0].spec.input_element.?);
+    // Exact SQL width is part of recipe identity, including explicit widths
+    // whose reducer behavior differs from the default (REAL and NUMERIC).
+    for ([_]local.sql_catalog.Column{
+        .{ .name = "amount", .path = "amount", .type = .integer, .element_type = .int16 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .float32 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric },
+        .{ .name = "amount", .path = "amount", .type = .number },
+    }) |typed_column| {
+        const typed_table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ table.columns[0], typed_column } };
+        const typed = (try recipeFor(a, typed_table, config, mat)).?;
+        var expression: local.sql_ast.Scalar = .{ .column = "amount" };
+        var program = try local.sql_scalar.bind(a, &expression, &.{.{ .name = "amount", .type = typed_column.type, .element_type = typed_column.element_type }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(program.output_type.element_type, typed.inputs[0].spec.input_element);
+        try std.testing.expect(!recipe.eql(typed));
+    }
     const star = (try recipeFor(a, table, config, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"rows\",\"op\":\"count\"}", .{}))).?;
     const column = (try recipeFor(a, table, config, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"values\",\"op\":\"count\",\"measure\":\"value\"}", .{}))).?;
     try std.testing.expect(!star.eql(column));
