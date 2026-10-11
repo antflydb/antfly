@@ -1231,6 +1231,46 @@ Debug and ReleaseFast with zero skips/failures/leaks. FK plan regressions reject
 unrelated table metadata, missing/replaced read layouts, valid but unauthorized
 row-type changes and additional CHECKs. An initial adversarial test incorrectly
 used the invalid JSON-schema type `float`; it was corrected to the valid type
-`number` before qualification. Final mounted qualification is still running;
-no full native-suite or SQL parity claim is made by this checkpoint. The earlier
-native metadata read timeout remains open.
+`number` before qualification. The final mounted CHECK-bearing FK campaign then
+passed all four cases with zero skips/failures/leaks, including DROP/TRUNCATE and
+cold-owner recovery. This qualifies that run, not a full native-suite or SQL
+parity claim; the earlier intermittent metadata read timeout remains open.
+
+### Immutable staged UNIQUE plan preparation
+
+`metadata/relational_index_publication.zig` binds the exact schema-only before
+and after table records, logical table guard, proposed namespace/index name,
+owner catalog predecessor and complete ordered range cohort in an immutable
+format-versioned frame. A counting writer enforces an 8 MiB escaped-frame limit
+before allocating the encoded frame; incoming decoder bounds remain separately
+required. Owner group membership is checked with a temporary hash map, and the
+range cut must cover the whole keyspace without gaps or overlap. Physical
+namespaces, admission epochs and every owner catalog digest must match the plan.
+The ordinary deterministic schema/index derivation independently checks the
+successor index catalog, not just its user-visible schema declaration.
+
+Prepared output owns the immutable frame, candidate and reserved catalogs,
+fixed-size progress head, per-owner progress records and reserved relation-name
+descriptor. It retains no request-owned slices. Temporary validation allocations
+are discarded before returning; nested catalog arenas use the stable caller
+allocator, not a pointer to an arena object moved off the stack. Owner descriptor
+hashes stream directly into a domain-separated hasher without allocating another
+serialized copy for each range. These hashes bind identities, not authentication.
+
+Four focused tests pass in Debug and ReleaseFast with zero skips/failures/leaks.
+They verify owned lifetime after releasing input memory, byte-stable persisted
+round trips, exact head/owner digest bindings, reserved-but-not-active names,
+stale logical guards and owner catalogs, physical namespace substitution,
+incomplete/gapped cuts, duplicate groups and valid disjoint multi-owner cuts.
+The escaping-limit regression uses a failing allocator to prove rejection before
+frame allocation. The control-source catalog is regenerated and its freshness
+check passes. The focused gate is a dependency of the unit aggregate, but the
+full aggregate has not been run for this checkpoint.
+
+This is plan preparation, not durable metadata admission. The transaction
+adapter must independently recheck live namespace/name authority, metadata and
+owner capabilities, current table/range identity and conflicting jobs, then
+atomically stage plan, head, owner records, shared table lock and pending name
+through the verified catalog source/checkpoint machinery. Production owner
+builders, distributed uniqueness claims and public publication also remain
+unfinished. No original SQL inventory credit or latency/throughput claim is made.

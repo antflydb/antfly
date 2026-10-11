@@ -434,6 +434,7 @@ pub const storage_db_relational_index_maintenance_contract = @import("storage/db
 pub const storage_db_relational_index_maintenance_sweep = @import("storage/db/relational_index_maintenance_sweep.zig");
 pub const storage_db_relational_index_plan = @import("storage/db/relational_index_plan.zig");
 pub const storage_db_relational_index_predicate = @import("storage/db/relational_index_predicate.zig");
+pub const storage_db_relational_index_publication_progress = @import("storage/db/relational_index_publication_progress.zig");
 pub const storage_db_relational_index_records = @import("storage/db/relational_index_records.zig");
 pub const storage_db_relational_index_status_contract = @import("storage/db/relational_index_status_contract.zig");
 pub const storage_db_relational_index_system_test = @import("storage/db/relational_index_system_test.zig");
