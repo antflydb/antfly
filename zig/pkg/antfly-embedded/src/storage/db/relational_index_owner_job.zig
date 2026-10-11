@@ -574,6 +574,7 @@ fn requireReservedState(txn: anytype, binding: Binding) !void {
     const schema_bytes = (try optional(txn, schema.schema_key)) orelse return error.RelationalIndexCatalogSchemaMismatch;
     if (!std.mem.eql(u8, &digest(schema_bytes), &binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
     try requireNativeCuts(txn, current);
+    _ = try @import("relational_index_private_claims.zig").requireRegistered(txn, binding);
 }
 
 /// Cold startup/restore validation in the SAME snapshot as the public catalog.
@@ -614,6 +615,7 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
             } else if (active != null) return error.PreparedGenerationChanged;
         },
         .reserved => {
+            _ = try @import("relational_index_private_claims.zig").requireRegistered(txn, job);
             const current = active orelse return error.PreparedGenerationChanged;
             if (!current.head.eql(job.physical_reserved)) return error.PreparedGenerationChanged;
             const blob = (try optional(txn, &physical_catalog.blobKey(job.physical_candidate.blob_digest))) orelse return error.MissingRelationalIndexDefinitions;
@@ -765,6 +767,7 @@ fn stageReservationImpl(txn: anytype, manager: *transactions.TxnManager, binding
         const blob = try txn.get(&physical_catalog.blobKey(binding.physical_candidate.blob_digest));
         if (!std.mem.eql(u8, blob, physical.candidate.blob)) return error.ImmutableRelationalIndexDefinitionConflict;
         if (binding.authority == .native) try requireReplay(try requireNativeCut(txn, binding, .reserved), replay);
+        _ = try @import("relational_index_private_claims.zig").requireRegistered(txn, binding);
         return false;
     }
     try candidate.reservation.stage(txn);
@@ -772,6 +775,7 @@ fn stageReservationImpl(txn: anytype, manager: *transactions.TxnManager, binding
     var next = expected;
     next.phase = .reserved;
     try txn.put(key, &try next.encode());
+    try @import("relational_index_private_claims.zig").stageRegistration(txn, next);
     if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .reserved, replay);
     return true;
 }

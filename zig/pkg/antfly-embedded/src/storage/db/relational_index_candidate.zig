@@ -610,6 +610,102 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool, compti
     try testOwnerRecovery(a, &store, before_view, binding, true);
     try testPrivateBuildPages(a, &store, before_view, binding, &private_addition);
     try testOwnerRecovery(a, &store, before_view, binding, true);
+    try testPrivateClaimInventory(a, &store, &manager, binding);
+}
+
+fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").DocStore, manager: *@import("../transactions.zig").TxnManager, binding: @import("relational_index_owner_job.zig").Binding) !void {
+    const claims = @import("relational_index_private_claims.zig");
+    const integrity = @import("relational_integrity_contract.zig");
+    const jobs = @import("relational_index_owner_job.zig");
+    const first: integrity.Claim = .{ .tuple = "first", .parent_table = "articles", .parent_key = "a", .schema_version = binding.physical_candidate.schema_version };
+    const second: integrity.Claim = .{ .tuple = "second", .parent_table = "articles", .parent_key = "b", .schema_version = binding.physical_candidate.schema_version };
+    var prepared = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk try claims.Prepared.init(a, &read, binding, &.{ first, second, first });
+    };
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), prepared.entries.len);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(usize, 2), try prepared.stage(&txn));
+        try txn.commit();
+    }
+    const allocation = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk try claims.requireRegistered(&read, binding);
+    };
+    const address = try integrity.Address.init(allocation.generation, first.tuple);
+    const inventory_key = claims.inventoryKey(address);
+    try std.testing.expect(@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(&inventory_key));
+    try std.testing.expect(@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(&claims.registrationKey(allocation.generation)));
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        var duplicate = try claims.Prepared.init(a, &txn, binding, &.{first});
+        defer duplicate.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try duplicate.stage(&txn));
+        var conflicting = first;
+        conflicting.parent_key = "different-owner";
+        try std.testing.expectError(error.UniqueConstraintViolation, claims.Prepared.init(a, &txn, binding, &.{conflicting}));
+        try txn.delete(&inventory_key);
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, claims.Prepared.init(a, &txn, binding, &.{first}));
+    }
+    var third = first;
+    third.tuple = "third";
+    var late = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk try claims.Prepared.init(a, &read, binding, &.{third});
+    };
+    defer late.deinit();
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(usize, 1), try late.stage(&txn));
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try jobs.stageCancellationIntentWithReplay(&txn, @import("relational_index_cancellation_intent.zig").Intent.fromBinding(binding), null);
+        _ = try jobs.stageCancellationCleanupWithReplay(&txn, manager, binding, null);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.PrivateIndexCancellationPending, late.stage(&txn));
+    }
+    var collected: usize = 0;
+    while (true) {
+        var page = blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            break :blk (try claims.GcPage.prepare(a, std.testing.io, &read, binding)) orelse break;
+        };
+        defer page.deinit();
+        try std.testing.expect(page.entries.len > 0 and page.entries.len <= 256);
+        collected += page.entries.len;
+        // A crash before commit leaves the complete page retryable.
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try page.stage(&txn);
+        }
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try page.stage(&txn);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), collected);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(&address.claimKey()));
+    try std.testing.expectError(error.NotFound, read.get(&inventory_key));
+    try std.testing.expectError(error.NotFound, read.get(&(try integrity.Address.init(allocation.generation, third.tuple)).claimKey()));
+    _ = try claims.requireRegistered(&read, binding);
 }
 
 fn testOwnerRecovery(a: Allocator, store: *@import("../docstore.zig").DocStore, before: @import("schema_registry.zig").SchemaView, binding: @import("relational_index_owner_job.zig").Binding, reserved: bool) !void {
