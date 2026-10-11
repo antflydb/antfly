@@ -380,6 +380,60 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     return root;
 }
 
+/// Prove the complete retained dependency graph before trusting file fingerprints.
+/// Copy-on-write updates can keep pages without reading them, and covering data
+/// lives outside the tree. Deduplicate cover checks within a bounded attempt.
+pub fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    const Validator = struct {
+        a: A,
+        store: stores.ArtifactStore,
+        domain: [32]u8,
+        context: local.serverless_query_lake_read_context.Context,
+        cancellation: Cancellation,
+        covers: std.AutoHashMapUnmanaged([52]u8, void) = .empty,
+        check_covers: bool = false,
+        remaining_checks: usize = 262144,
+        remaining_reads: u64 = 512 * 1024 * 1024,
+        fn check(v: *@This()) !void {
+            try v.context.ensureActive();
+            try v.cancellation.check();
+            if (v.remaining_checks == 0) return error.LakeSidecarBuildLimitExceeded;
+            v.remaining_checks -= 1;
+        }
+        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+            try v.check();
+            return false;
+        }
+        pub fn visit(_: *@This(), _: tree.Ref) !void {}
+        pub fn visitRecord(v: *@This(), _: tree.Ref, _: []const u8, value: []const u8) !void {
+            if (!v.check_covers) return;
+            try v.context.ensureActive();
+            try v.cancellation.check();
+            const cover = try coverReference(v.a, v.domain, value) orelse return;
+            defer v.a.free(cover.block.artifact_id);
+            const identity = value[18..70].*;
+            if (v.covers.contains(identity)) return;
+            try v.check();
+            var metadata = try v.store.statWithCancellationUsingAllocator(v.a, cover.block.artifact_id, v.cancellation);
+            defer metadata.deinit(v.a);
+            if (metadata.byte_len != cover.block.byte_len or !std.mem.eql(u8, metadata.artifact_id, cover.block.artifact_id) or !std.mem.eql(u8, metadata.checksum, cover.block.checksum)) return error.ArtifactIntegrityMismatch;
+            try v.covers.put(v.a, identity, {});
+        }
+        fn pages(v: *@This(), ref: ?tree.Ref, check_covers: bool) !void {
+            v.check_covers = check_covers;
+            var writes: u64 = 0;
+            var pages_store: page_store.PageStore = .{ .domain = v.domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
+            if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
+        }
+    };
+    var validator: Validator = .{ .a = a, .store = backend, .domain = root.domain, .context = context, .cancellation = cancellation };
+    defer validator.covers.deinit(a);
+    try validator.pages(root.page, true);
+    try validator.pages(root.reverse, false);
+    try validator.pages(root.ties, false);
+    try validator.pages(root.predicates, false);
+}
+
 /// Caller retains the leased root and store capability through cursor close.
 /// A batch is owned by its caller, including all physical identity strings.
 /// Authenticated immutable metadata owned by a decoded-cache lease. Readers

@@ -580,6 +580,94 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         mock.owned = try a.dupe(u8, healthy_catalog);
         mock.table.lake_index_catalog_json = mock.owned.?;
     }
+    // Ordered checkpoints must validate covering blocks and all retained trees,
+    // including those a copy-on-write update would otherwise never read.
+    const original_schema = mock.table.schema_json;
+    for ([_]enum { cover, forward, reverse, ties, predicates }{ .cover, .forward, .reverse, .ties, .predicates }) |mode| {
+        var ordered_arena = std.heap.ArenaAllocator.init(a);
+        defer ordered_arena.deinit();
+        const oa = ordered_arena.allocator();
+        var ordered_schema = try std.json.parseFromSliceLeaky(std.json.Value, oa, original_schema, .{});
+        try ordered_schema.object.put(oa, "relational_indexes", try std.json.parseFromSliceLeaky(std.json.Value, oa, "[{\"name\":\"by_body\",\"keys\":[{\"column\":\"body\"}]}]", .{}));
+        mock.table.schema_json = try std.json.Stringify.valueAlloc(oa, ordered_schema, .{});
+        mock.cancel_checkpoint = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
+        var ordered_partial = try catalog.parse(a, mock.table.lake_index_catalog_json);
+        defer ordered_partial.deinit();
+        try @import("lake_index_directory.zig").hydrateLazy(oa, artifacts, &ordered_partial.value.checkpoint.?, .none, null);
+        const ordered = @import("lake_index_ordered_rows.zig");
+        const ordered_root = try ordered.loadRoot(oa, artifacts, ordered_partial.value.checkpoint.?.declarations[0].artifact, .none, null);
+        var ordered_reader: ordered.Reader = undefined;
+        try ordered_reader.init(a, &artifacts, ordered_root, ordered_root.fingerprint, "", null, .none);
+        defer ordered_reader.deinit();
+        const saved_entries = try ordered_reader.nextEntries(oa, 16);
+        try std.testing.expectEqual(@as(usize, 1), saved_entries.len);
+        const saved_cover = saved_entries[0].cover.?.block;
+        const target = if (mode == .cover) saved_cover.artifact_id else page: {
+            const ref = switch (mode) {
+                .forward => ordered_root.page.?,
+                .reverse => ordered_root.reverse.?,
+                .ties => ordered_root.ties.?,
+                .predicates => ordered_root.predicates.?,
+                .cover => unreachable,
+            };
+            const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(ordered_root.domain, ref);
+            break :page try oa.dupe(u8, &id);
+        };
+        try artifacts.delete(target);
+        const prior_discards = mock.discards;
+        mock.now += options.lease_ms;
+        try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+        try std.testing.expectEqual(prior_discards + 1, mock.discards);
+        var ordered_resumed = try catalog.parse(a, mock.table.lake_index_catalog_json);
+        defer ordered_resumed.deinit();
+        try std.testing.expect(ordered_resumed.value.checkpoint == null);
+        try std.testing.expect(ordered_resumed.value.pending == null and ordered_resumed.value.failure == null);
+        try @import("lake_index_directory.zig").hydrateLazy(oa, artifacts, &ordered_resumed.value.published.?, .none, null);
+        const final_decl = for (ordered_resumed.value.published.?.declarations) |decl| {
+            if (decl.artifact.kind == .ordered_row_index) break decl;
+        } else return error.TestUnexpectedResult;
+        const final_root = try ordered.loadRoot(oa, artifacts, final_decl.artifact, .none, null);
+        try ordered.validateReuse(a, artifacts, final_root, .{}, .none);
+        var final_reader: ordered.Reader = undefined;
+        try final_reader.init(a, &artifacts, final_root, final_root.fingerprint, "", null, .none);
+        defer final_reader.deinit();
+        const final_entries = try final_reader.nextEntries(oa, 16);
+        try std.testing.expectEqual(@as(usize, 2), final_entries.len);
+        for (final_entries) |entry| {
+            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, entry.cover.?.block, .none, null);
+            defer a.free(bytes);
+            const block = try local.sql_spill.decodeColumnarBlockInArena(oa, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            const value = try block.cell(entry.cover.?.row, 0);
+            try std.testing.expect(!value.sql_null);
+            try std.testing.expectEqualStrings("indexed value", value.value.string);
+        }
+        if (mode == .cover) {
+            // Whole-index reuse during a format refresh needs the same proof;
+            // clearing a checkpoint alone cannot retire a damaged publication.
+            var forced = ordered_resumed.value;
+            forced.published.?.reader_protocol = 31;
+            const forced_catalog = try catalog.encode(a, forced);
+            a.free(mock.owned.?);
+            mock.owned = forced_catalog;
+            mock.table.lake_index_catalog_json = forced_catalog;
+            try artifacts.delete(final_entries[0].cover.?.block.artifact_id);
+            try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+            var refreshed_ordered = try catalog.parse(a, mock.table.lake_index_catalog_json);
+            defer refreshed_ordered.deinit();
+            try std.testing.expect(refreshed_ordered.value.checkpoint == null and refreshed_ordered.value.pending == null);
+            try @import("lake_index_directory.zig").hydrateLazy(oa, artifacts, &refreshed_ordered.value.published.?, .none, null);
+            const refreshed_decl = for (refreshed_ordered.value.published.?.declarations) |decl| {
+                if (decl.artifact.kind == .ordered_row_index) break decl;
+            } else return error.TestUnexpectedResult;
+            const refreshed_root = try ordered.loadRoot(oa, artifacts, refreshed_decl.artifact, .none, null);
+            try ordered.validateReuse(a, artifacts, refreshed_root, .{}, .none);
+        }
+        a.free(mock.owned.?);
+        mock.owned = try a.dupe(u8, healthy_catalog);
+        mock.table.lake_index_catalog_json = mock.owned.?;
+        mock.table.schema_json = original_schema;
+    }
 }
 
 test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {

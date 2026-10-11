@@ -76,7 +76,7 @@ const Entry = struct {
     }
 };
 /// The same seed proof is used by shared replay planning and cohort execution.
-fn priorRoot(a: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, cancellation: Cancellation) !?ordered.Root {
+fn priorRoot(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !?ordered.Root {
     for (candidates) |decl| {
         if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
         var previous_binding = decl.binding;
@@ -84,6 +84,7 @@ fn priorRoot(a: A, store: *stores.ArtifactStore, binding: local.serverless_segme
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
         const root = try ordered.loadRoot(a, store.*, decl.artifact, cancellation, null);
         if (!std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.snapshot, decl.binding.snapshot_id) or root.file_fingerprints.len != root.files.len or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain) or !std.mem.eql(u8, &root.fingerprint, &digest)) continue;
+        try ordered.validateReuse(scratch, store.*, root, context, cancellation);
         return root;
     }
     return null;
@@ -148,7 +149,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const reused = for (reusable) |decl| {
                 if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, binding.index_config_hash)) break true;
             } else false;
-            if (!reused) roots[index] = try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
+            if (!reused) roots[index] = try priorRoot(ca, a, store, binding, name, fingerprint(tuple, predicate, cover), candidates, provider.context, cancellation);
             requirements[index] = .{ .reused = reused, .previous = if (roots[index]) |root| .{ .files = root.files, .fingerprints = root.file_fingerprints } else null };
         }
         replay_files = try cohort_files.requiredFiles(ca, current_files, requirements);
@@ -196,12 +197,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, hash)) break decl;
             } else null;
             if (previous) |decl| {
+                const root = try ordered.loadRoot(ca, store.*, decl.artifact, cancellation, null);
+                try ordered.validateReuse(a, store.*, root, provider.context, cancellation);
                 try result.append(out, decl);
                 if (predicate) |*plan| plan.deinit();
                 tuple.deinit();
                 continue;
             }
-            const prior = if (planned_roots) |roots| roots[definition_index] else try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
+            const prior = if (planned_roots) |roots| roots[definition_index] else try priorRoot(ca, a, store, binding, name, fingerprint(tuple, predicate, cover), candidates, provider.context, cancellation);
             const changed = try ca.alloc(bool, source.inventory.files.len);
             const slots = try ca.alloc(u32, source.inventory.files.len);
             var slot_names: std.ArrayList([]const u8) = .empty;
@@ -344,8 +347,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 @memset(retained, true);
                 entry.delta.keep = retained;
                 entry.sort.deinit();
-                entry.sort = spill.Sort.init(a, &manager, &orders, 512 * 1024);
-                entry.sort.run_limit = 4;
+                entry.sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes);
+                entry.sort.run_limit = sort_run_limit;
             }
         }
         for (entries.items) |*entry| {
