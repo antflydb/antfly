@@ -52,7 +52,7 @@ pub const Intent = struct {
         return .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .fence = binding.fence, .candidate_digest = binding.integrity_candidate, .reservation_digest = binding.integrity_reserved };
     }
 
-    fn eql(self: Intent, other: Intent) bool {
+    pub fn eql(self: Intent, other: Intent) bool {
         return std.mem.eql(u8, &self.id, &other.id) and std.mem.eql(u8, &self.plan_digest, &other.plan_digest) and
             std.mem.eql(u8, &self.owner_digest, &other.owner_digest) and self.ordinal == other.ordinal and
             self.fence.eql(other.fence) and std.mem.eql(u8, &self.candidate_digest, &other.candidate_digest) and

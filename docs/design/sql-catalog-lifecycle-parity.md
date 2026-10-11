@@ -2494,8 +2494,13 @@ does not enable the public producer.
 Synthetic receiver tests cover fixed permission without admission/inspection,
 duplicate retry, pending publication, cancellation after commit, foreign result
 identity, wrong group/table and stale metadata phase. They are sequencing tests,
-not physical durability or distributed authority evidence, and qualification is
-pending. Metadata decoder floor 36 and runtime-status V19 are not substitutes
+not physical durability or distributed authority evidence. The first compile
+caught the shared intent equality method's visibility; exposing that exact
+identity comparison fixes the boundary without duplicating its field list.
+Final Debug qualification passes 59/59 build steps and all 21 tests (20
+publication/receiver contracts and one decoder-floor contract), with no skips,
+failures or leaks. Optimized qualification is pending. Metadata decoder floor
+36 and runtime-status V19 are not substitutes
 for intent-aware compiled-owner execution and standby-envelope readiness. Those
 rollout barriers, cleanup/release, actual enrolled-root attestation and the
 public failed-build atomicity gate remain unfinished. Original SQL dispositions
