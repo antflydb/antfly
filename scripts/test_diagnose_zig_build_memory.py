@@ -27,12 +27,14 @@ class DiagnosticTests(unittest.TestCase):
         script = Path(__file__).with_name("diagnose-zig-build-memory.sh")
         with tempfile.TemporaryDirectory(prefix="antfly-command-test-") as tmp:
             root = Path(tmp)
+            response = root / "compiler-args"
+            response.write_text("--name antfly-storage-kernel -Ofast")
             zig = root / "zig"
             zig.write_text(
                 "#!/bin/sh\n"
                 'if [ "$1" = build ]; then\n'
                 '  printf "%s" "$2" > "$ARGUMENT_FILE"\n'
-                '  "$0" build-lib --name antfly-storage-kernel &\n'
+                '  "$0" build-lib "@$RESPONSE_FILE" &\n'
                 '  wait "$!"\n'
                 "else\n"
                 "  sleep 1\n"
@@ -58,7 +60,11 @@ class DiagnosticTests(unittest.TestCase):
                     "build",
                     "two words",
                 ],
-                env=dict(os.environ, ARGUMENT_FILE=str(root / "argument")),
+                env=dict(
+                    os.environ,
+                    ARGUMENT_FILE=str(root / "argument"),
+                    RESPONSE_FILE=str(response),
+                ),
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -68,6 +74,7 @@ class DiagnosticTests(unittest.TestCase):
             summary = (root / "logs/command.summary.txt").read_text()
             self.assertIn("command_mode=1\n", summary)
             self.assertIn("jobs=command-defined\n", summary)
+            self.assertIn("memory_report_status=0\n", summary)
             rows = (root / "logs/command.cpu.tsv").read_text().splitlines()
             self.assertGreater(len(rows), 1)
             for row in rows[1:]:
@@ -77,6 +84,14 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertTrue(fields[3])
             report = summarize((root / "logs/command.rss.tsv").read_text())
             self.assertGreater(report["units"]["storage_kernel"]["peak_rss_bytes"], 0)
+            response.unlink()
+            self.assertEqual(
+                summarize(
+                    (root / "logs/command.rss.tsv").read_text(),
+                    response_dir=root / "logs/command.response-files",
+                ),
+                report,
+            )
 
     def test_live_build_produces_complete_seven_column_samples_and_summary(self):
         script = Path(__file__).with_name("diagnose-zig-build-memory.sh")

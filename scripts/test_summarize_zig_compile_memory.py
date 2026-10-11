@@ -60,6 +60,8 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(summarize(trace, response_dir=retained), report)
             args.write_text("--name antfly-embedded-inference -Ofast")
             self.assertIn("embedded_inference", summarize(trace)["units"])
+            args.write_text("--name antfly-capi-objects -Ofast")
+            self.assertIn("capi_objects", summarize(trace)["units"])
 
     def test_missing_and_recursive_response_files_are_not_silently_unattributed(self):
         with tempfile.TemporaryDirectory() as directory:
