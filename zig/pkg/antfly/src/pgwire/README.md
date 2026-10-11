@@ -13,8 +13,8 @@ unsupported SQL shapes executable.
 SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
 [(expressions...)]`, and `DEALLOCATE [PREPARE] name|ALL` use the same bounded,
 connection-owned registry as wire Parse/Bind. Names survive transaction commit
-and are released on disconnect. Execution preserves the prepared catalog
-identity guard, rechecks current credentials, binds typed values without SQL
+and are released on disconnect. Execution rebinds against the current catalog while preserving the parameter
+and result type contract, rechecks current credentials, binds typed values without SQL
 interpolation, and uses pull streaming for eligible reads. EXECUTE arguments
 are bounded scalar expressions; column references, parameters, and subqueries
 are not an argument-evaluation escape hatch into table reads. These commands
@@ -88,9 +88,15 @@ process's port separately when running multiple nodes on one host.
   Execute suspends/resumes the same snapshot/result
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
-- Prepared native statements retain a catalog revision and every physical table
-  ID/name and schema-version fence through Bind. Execute rejects changed bindings before
-  reading or mutating, including a same-shaped dropped/recreated table.
+- Cached statements recompile before Bind and before an unstarted Execute, using
+  their fixed parameter types and saved namespace/search path. Compatible DDL,
+  including an added unselected column or index, transparently refreshes the
+  catalog guard. Changed result types fail with `0A000` and PostgreSQL's
+  `cached plan must not change result type` message before reading or mutation
+  admission. Rebinding also refreshes the settings epoch; execution validates
+  that fresh epoch to fence concurrent setting catalog changes.
+  Suspended portals keep their original snapshot; execution never replays an
+  admitted mutation. Concurrent DDL after rebinding still meets a schema fence.
 - Extended-query errors drain queued messages until Sync. Backend transaction
   state is reflected by ReadyForQuery, and disconnect abandons session state.
 - Separate CancelRequest connections with cryptographically random secrets;
@@ -107,6 +113,13 @@ acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
 
 ## DDL admission and readiness
+
+Standalone completes initial durable relation catalog publication before opening
+public HTTP or PostgreSQL listeners. This also applies on restart with persisted
+tables. Publication uses bounded control rounds without a fixed total startup
+deadline. SIGINT/SIGTERM cancel the wait; terminal publication failures
+for the current source epoch fail startup.
+HA retains its separate writer/replica authority contract.
 
 `53300` with `retryable:true` for relation catalog publication means no schema
 change was admitted. Wait briefly and retry the complete DDL. Standalone's

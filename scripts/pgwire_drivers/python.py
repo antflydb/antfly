@@ -21,9 +21,11 @@ import os
 import asyncpg
 import psycopg
 
-from ddl import exercise_ddl
+from ddl import exercise_cached_plans, exercise_ddl, exercise_sql_cached_plans
 
 url = os.environ["ANTFLY_PGWIRE_URL"]
+with psycopg.connect(url, autocommit=True, prepare_threshold=None) as conn:
+    exercise_sql_cached_plans(conn)
 with psycopg.connect(url, autocommit=True) as conn:
     assert conn.execute("SELECT 1").fetchone() == (1,)
     assert conn.execute(
@@ -44,6 +46,8 @@ with psycopg.connect(url, autocommit=True) as conn:
         conn.execute(sql, prepare=True)
     with conn.transaction():
         assert conn.execute("SELECT 1").fetchone() == (1,)
+    with psycopg.connect(url, autocommit=True) as migrator:
+        exercise_cached_plans(conn, migrator)
     exercise_ddl(conn)
 print("psycopg: PASS")
 
@@ -54,6 +58,16 @@ async def main():
         assert await conn.fetchval("SELECT 1") == 1
         assert await conn.fetchval("SELECT CAST($1 AS BIGINT)", 42) == 42
         assert conn.get_settings().TimeZone == "UTC"
+        await conn.execute(
+            "CREATE TABLE cached_asyncpg (id TEXT PRIMARY KEY, n BIGINT)"
+        )
+        await conn.execute("INSERT INTO cached_asyncpg (id, n) VALUES ('a', 1)")
+        stmt = await conn.prepare("SELECT n FROM cached_asyncpg WHERE id = $1")
+        assert await stmt.fetchval("a") == 1
+        await conn.execute("ALTER TABLE cached_asyncpg ADD COLUMN note TEXT")
+        assert await stmt.fetchval("a") == 1
+        await conn.execute("CREATE INDEX cached_asyncpg_n ON cached_asyncpg(n)")
+        assert await stmt.fetchval("a") == 1
         async with conn.transaction():
             assert await conn.fetchval("SELECT 1") == 1
     finally:
