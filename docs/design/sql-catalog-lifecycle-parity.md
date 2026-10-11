@@ -816,3 +816,16 @@ skips or leaks. Mounted primary-key qualification and optimized coordinator
 qualification remain pending. This is distributed
 FK-path evidence, not full original SQL-case parity or general activation
 completion.
+
+The corrected mounted PK run reaches successful explicit rewrite and the
+expected NULL/duplicate terminal failures, but then fails in the anonymous
+case's pre-rewrite source SELECT: the fixture still queried the already
+rewritten `pk_good` instead of the current table. Both source SELECTs now bind
+the case's actual name. Additional assertions check both columns of the complete
+successful SQL postimage after publication and after restart, including after
+rejected duplicate writes. Failed rewrites retain exact NULL/duplicate rows
+and notes across restart. Only explicitly retryable `53300`/503 pure reads may
+wait within a bounded interval; no mutation replay or suppression of other
+errors is introduced. The expanded rerun remains pending, including the
+post-publication SQL visibility check; it has not yet established that the
+observed rewritten-owner read unavailability is transient.
