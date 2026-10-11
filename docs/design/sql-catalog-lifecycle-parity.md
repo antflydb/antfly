@@ -2742,7 +2742,7 @@ not a signed owner acknowledgement and cannot substitute for distributed fault
 qualification. The public failed-UNIQUE-build atomicity gate remains open, and
 the original inventory remains 478 / 136 / 73 / 899.
 
-### Bounded private-claim creation provenance (implementation under qualification)
+### Bounded private-claim creation provenance (merged-source qualification pending)
 
 The isolated ordered-claim implementation originally retained one exact-cut
 receipt per canonical batch. Reordering and coalescing were idempotent, but
@@ -2771,8 +2771,10 @@ clock. GC captures each immutable cut and rechecks it before paired deletion.
 Claims and provenance retire in one bounded page protocol. This remains local
 physical evidence, not a signed distributed owner acknowledgement.
 
-Frozen-source qualification is running on isolated commits `e7eb0d5fbc` and
-`94af0fefa9`; these are not yet integrated or claimed passing. The new churn
+Frozen-source qualification at `e7eb0d5fbc` passed 93/93 Debug build steps and
+58 executions. Compact revision `94af0fefa9` passed 62/62 ReleaseFast build
+steps and thirty executions. Both completed runs have zero skips, failures or
+leaks. These are overlapping component selections, not public activation. The new churn
 regression admits 258 distinct claims, commits 128 distinct mixed-age regrouped
 retries, and checks exactly 258 inventory entries and an unchanged source clock.
 The physical accounting is eight extra value bytes per claim versus the earlier
@@ -2786,5 +2788,13 @@ paired keys and provenance bytes, using the same accounting. GC stops before
 the next record would exceed 1 MiB instead of checking only after appending.
 Large-record regressions add two 600-KiB claims, reject oversized command and
 prepared admission, and check the complete paired-byte total of every page.
-This follow-up is committed locally and awaits its own frozen-source gate;
-passing earlier provenance tests cannot qualify this later change.
+Its frozen-source Debug gate is running; passing earlier provenance tests
+cannot qualify this later change. The subsequent regression `8e031be1fe`
+prepares overlapping batches before either commits. It verifies identical
+concurrent creation is accepted, only new members receive the next cut, and
+both batches retain distinct exact retry cuts after the later commit.
+
+The reviewed chain is integrated locally at `ef7154c10f`, with latest main
+`d3bbb9a0c6`. Formatting, diff, control-catalog freshness and the 2,034-file
+Apache boundary pass. Final merged-source qualification is still required
+before pushing this implementation. No new original-case credit is claimed.
