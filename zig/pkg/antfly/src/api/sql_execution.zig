@@ -59,6 +59,13 @@ test "SQL statement read admission calls native capture once without write autho
             try std.testing.expectEqual(.read_index, consistency);
             return self.failure;
         }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, table: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, consistency: @import("../raft/mod.zig").ReadConsistency) !?reads.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captures += 1;
+            try std.testing.expectEqualStrings("physical", table);
+            try std.testing.expectEqual(.read_index, consistency);
+            return self.failure;
+        }
     };
     for ([_]struct { failure: anyerror, expected: anyerror }{
         .{ .failure = error.GroupLeaderUnavailable, .expected = error.SqlStatementReadUnavailable },
@@ -69,12 +76,15 @@ test "SQL statement read admission calls native capture once without write autho
         var fake: Fake = .{ .failure = case.failure };
         var server: http_server.ApiHttpServer = undefined;
         server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
-        server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.capture } };
+        server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.capture, .open_relational_read = Fake.open } };
         server.table_writes = null;
         var identity: ?http_server.AuthenticatedIdentity = null;
         var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
         const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
         try std.testing.expectError(case.expected, Adapter.openStatement(&adapter, std.testing.allocator, &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 2 } }}));
+        try std.testing.expectEqual(@as(usize, 1), fake.captures);
+        fake.captures = 0;
+        try std.testing.expectError(case.expected, Adapter.openNativeScan(&adapter, std.testing.allocator, table, .{ .fields = &.{}, .limit = 2 }));
         try std.testing.expectEqual(@as(usize, 1), fake.captures);
     }
 }
@@ -1349,7 +1359,7 @@ pub const Adapter = struct {
         const scan_request = try self.prepareScan(scratch.allocator(), table, request);
         // The provider owns all request data it retains; only page values use
         // short-lived arenas. Closing the cursor releases its snapshot first.
-        const view = (try source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return null;
+        const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return statementReadAdmissionError(read_err)) orelse return null;
         errdefer view.deinit();
         // Tie the acquired physical snapshot to the SQL binding, not merely
         // the provider's independently resolved routing fence. Replacement or
@@ -1575,7 +1585,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         const scan_request = try self.prepareScan(alloc, table, request);
         const source = self.server.table_reads orelse return error.TableNotFound;
-        var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
+        var response = (source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return statementReadAdmissionError(read_err)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         var rows: std.ArrayList(catalog.Row) = .empty;
         const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
@@ -1612,14 +1622,14 @@ pub const Adapter = struct {
         if (writes.len == 0) return input;
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
         const upper = try pointUpperBound(alloc, writes[0].key);
-        const view = (try source.openRelationalRead(alloc, table.physical_name, writes[0].key, upper, .{
+        const view = (source.openRelationalRead(alloc, table.physical_name, writes[0].key, upper, .{
             .limit = 1,
             .inclusive_from = true,
             .exclusive_to = true,
             .relational_query = .{ .fields = &.{}, .schema_version = table.schema_version },
             .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
             .cancellation = self.context.cancellation,
-        }, .read_index)) orelse return error.UnsupportedSqlExecution;
+        }, .read_index) catch |read_err| return statementReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
         defer view.deinit();
         const normalized = try view.normalize(alloc, writes);
         const result = try images.merge(alloc, input, normalized);
@@ -1683,7 +1693,7 @@ pub const Adapter = struct {
                 const policy_proof = try self.rowPolicyProof(alloc, table);
                 const first_key = writes.items[0].key;
                 const upper = try pointUpperBound(alloc, first_key);
-                const view = (try source.openRelationalRead(alloc, table.physical_name, first_key, upper, .{
+                const view = (source.openRelationalRead(alloc, table.physical_name, first_key, upper, .{
                     .limit = 1,
                     .inclusive_from = true,
                     .exclusive_to = true,
@@ -1692,7 +1702,7 @@ pub const Adapter = struct {
                     .row_policy_database = scope.database,
                     .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
                     .cancellation = self.context.cancellation,
-                }, .read_index)) orelse return error.UnsupportedSqlExecution;
+                }, .read_index) catch |read_err| return statementReadAdmissionError(read_err)) orelse return error.UnsupportedSqlExecution;
                 defer view.deinit();
                 try self.verify(alloc, table);
                 break :blk try view.normalize(alloc, writes.items);
