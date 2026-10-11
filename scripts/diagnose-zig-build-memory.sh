@@ -177,6 +177,9 @@ summary="${out_dir}/${label}.summary.txt"
 build_log="${out_dir}/${label}.build.log"
 sample_file="${out_dir}/${label}.sample.txt"
 max_command_file="${out_dir}/${label}.max-command.txt"
+memory_report="${out_dir}/${label}.memory.json"
+response_dir="${out_dir}/${label}.response-files"
+rm -f "${memory_report}"
 
 rss_kb_for_pid() {
     ps -o rss= -p "$1" 2>/dev/null | awk '{print $1}'
@@ -287,6 +290,12 @@ end_epoch="$(date +%s)"
 elapsed_total="$((end_epoch - start_epoch))"
 max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
 
+# Large compilations use @response files. Retain them before another packaging
+# invocation replaces its cache, and resolve unit attribution while readable.
+memory_report_status=0
+python3 "${repo_root}/scripts/summarize_zig_compile_memory.py" "${timeline}" \
+    --output "${memory_report}" --capture-response-dir "${response_dir}" || memory_report_status=$?
+
 {
     echo "label=${label}"
     echo "status=${build_status}"
@@ -311,6 +320,10 @@ max_rss_mb="$(rss_mb_from_kb "${max_rss_kb}")"
     echo "sample_taken=${sample_taken}"
     echo "sample_pid=${sample_pid}"
     echo "timeline=${timeline}"
+    echo "cpu_timeline=${cpu_timeline}"
+    echo "memory_report_status=${memory_report_status}"
+    echo "memory_report=${memory_report}"
+    echo "response_dir=${response_dir}"
     echo "build_log=${build_log}"
     if [ "${sample_taken}" = "1" ]; then
         echo "sample_file=${sample_file}"
