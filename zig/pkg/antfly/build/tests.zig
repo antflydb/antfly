@@ -6104,6 +6104,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     relational_index_page_step.dependOn(&native_index_candidate_run.step);
     b.step("relational-index-candidate-test", "Verify native private UNIQUE candidate compilation without server dependencies")
         .dependOn(&native_index_candidate_run.step);
+    const private_claim_transfer_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{ "relational integrity transfer validates borrowed action jobs", "relational integrity topology handoff transfers routed companions" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const private_claim_transfer_step = b.step("antfly-private-claim-transfer-test", "Verify private claim ownership, borrowed companions and routed handoff");
+    private_claim_transfer_step.dependOn(&native_index_candidate_run.step);
+    private_claim_transfer_step.dependOn(&addFilteredTestRunArtifact(b, private_claim_transfer_tests).step);
     db_test_step.dependOn(&native_index_candidate_run.step);
     unit_test_step.dependOn(&native_index_candidate_run.step);
     const native_index_catalog_tests = b.addTest(.{

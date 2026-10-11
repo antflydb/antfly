@@ -663,6 +663,37 @@ pub fn actionPageWithBudget(alloc: Allocator, io: ?std.Io, txn: anytype, address
     return .{ .arena = arena, .claim = claim, .job = job, .next_cursor = next_cursor, .references = reference_items, .complete = complete };
 }
 
+test "relational integrity transfer validates borrowed action jobs before companion reads" {
+    const alloc = std.testing.allocator;
+    const address = try Address.init(@splat(1), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "parent", .parent_key = "p", .schema_version = 1, .state = .draining, .action = .parent_delete, .action_id = @splat(2) };
+    const claim_bytes = try claim.encode(alloc, address);
+    defer alloc.free(claim_bytes);
+    var job: Job = .{ .action_id = @splat(2), .parent_version = 1, .parent_schema_version = 1 };
+    const job_bytes = try job.encode(alloc, address);
+    defer alloc.free(job_bytes);
+    const Borrowed = struct {
+        address: Address,
+        claim: []const u8,
+        job: []const u8,
+        scratch: [2048]u8 = undefined,
+
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            const raw = if (std.mem.eql(u8, key, &self.address.claimKey())) self.claim else if (std.mem.eql(u8, key, &self.address.jobKey())) self.job else return error.NotFound;
+            @memcpy(self.scratch[0..raw.len], raw);
+            return self.scratch[0..raw.len];
+        }
+    };
+    var txn: Borrowed = .{ .address = address, .claim = claim_bytes, .job = job_bytes };
+    try validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey()));
+    try validateTransferredCompanionsWithView(&txn, &address.jobKey(), try txn.get(&address.jobKey()), .{});
+    job.action_id = @splat(3);
+    const foreign = try job.encode(alloc, address);
+    defer alloc.free(foreign);
+    txn.job = foreign;
+    try std.testing.expectError(error.ForeignKeyActionMismatch, validateTransferredCompanions(&txn, &address.jobKey(), try txn.get(&address.jobKey())));
+}
+
 test "relational integrity keys are generation bound explicitly routed and checksummed" {
     const alloc = std.testing.allocator;
     const address = try Address.init(@splat(1), "typed composite tuple");

@@ -744,6 +744,10 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             defer a.free(reference_value);
             try txn.put(&try reference.key(selected), reference_value);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, page.stage(&txn));
+            const transfer = @import("relational_integrity.zig");
+            const view = try transfer.TransferView.init(&txn);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, transfer.validateTransferredCompanionsWithView(&txn, &try reference.key(selected), reference_value, view));
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = selected, .kind = .reference }, @splat(0)));
         }
         collected += page.entries.len;
         // A crash before commit leaves the complete page retryable.
