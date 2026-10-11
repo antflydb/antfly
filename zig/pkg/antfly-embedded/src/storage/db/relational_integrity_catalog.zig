@@ -100,6 +100,30 @@ fn generation(incarnation: integrity.Generation, allocation: u64) integrity.Gene
 const header_len = 100;
 const entry_header_len = 64;
 
+pub const PrivateIndexAllocation = struct { allocation: u64, generation: integrity.Generation };
+
+/// Extract the one allocation burned by an exact private index reservation.
+/// This verifies bounded catalog metadata without allocating or decoding its
+/// definitions. It is not publication or
+/// retirement authority. Caller must independently require the durable owner
+/// job, reserved catalogs and source fence in the committing snapshot.
+pub fn privateIndexAllocationFromReservation(bytes: []const u8, expected: integrity.Digest, table_id: u64) !PrivateIndexAllocation {
+    if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or
+        !std.mem.eql(u8, bytes[0..4], "AIC2") or !std.mem.eql(u8, &digest(bytes), &expected)) return error.IntegrityCatalogChanged;
+    const incarnation = try incarnationFromTableId(table_id);
+    if (!std.mem.eql(u8, bytes[4..20], &incarnation) or
+        !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32])) or
+        std.mem.readInt(u32, bytes[64..68], .little) > max_definitions) return error.InvalidIntegrityCatalog;
+    const next = std.mem.readInt(u64, bytes[56..64], .little);
+    if (next <= 1) return error.InvalidIntegrityCatalog;
+    return .{ .allocation = next - 1, .generation = generation(incarnation, next - 1) };
+}
+
+pub fn privateIndexGeneration(table_id: u64, allocation: u64) !integrity.Generation {
+    if (allocation == 0) return error.InvalidIntegrityCatalog;
+    return generation(try incarnationFromTableId(table_id), allocation);
+}
+
 pub fn decode(alloc: Allocator, bytes: []const u8) !Catalog {
     if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or !std.mem.eql(u8, bytes[0..4], "AIC2") or
         !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32]))) return error.InvalidIntegrityCatalog;

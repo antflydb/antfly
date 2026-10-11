@@ -500,11 +500,12 @@ test "relational index build pages native owner control preserves committed cuts
     try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
     const queued = try follower.nativeIndexOwnerCancellationState(receipt_identity);
     try std.testing.expectEqual(@as(u64, 5), queued.cleanup.?.sequence);
+    try std.testing.expect(queued.claim_allocation != null);
     try std.testing.expect(!queued.artifacts_retired);
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expectEqual(admitted_cleanup.position, (try cancellation.Record.decode(try read.get(jobs.cancellation_cleanup_key))).position);
+        try std.testing.expectEqual(admitted_cleanup.position, (try jobs.CancellationCleanupRecord.decode(try read.get(jobs.cancellation_cleanup_key))).position);
         try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.requireCancellationArtifactsRetired(&read, binding));
         try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
     }

@@ -421,6 +421,7 @@ const TestDriver = struct {
         state.source.sequence += 1;
         const position: @FieldType(native.CleanupOutcome, "position") = .{ .namespace = identity.namespace, .sequence = state.source.sequence };
         state.cleanup = position;
+        state.claim_allocation = 1;
         return parsed(native.CleanupOutcome, alloc, .{ .binding = state.binding.?, .position = position, .duplicate = false });
     }
 

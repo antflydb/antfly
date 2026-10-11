@@ -327,6 +327,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(cleanup.position, status.value.cleanup.?);
         try std.testing.expectEqual(cleanup.position.sequence, status.value.source.sequence);
         try std.testing.expect(status.value.artifacts_retired and status.value.binding != null);
+        try std.testing.expect(status.value.claim_allocation != null);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
