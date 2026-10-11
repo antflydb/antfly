@@ -656,6 +656,12 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     defer a.free(foreign_value);
     {
         var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(&foreign_address.claimKey(), foreign_value);
+        try std.testing.expectError(error.RetainedEffectsMixedControl, @import("../source_authority.zig").advance(&txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), null));
+    }
+    {
+        var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(&foreign_address.claimKey(), foreign_value);
         try txn.commit();
@@ -875,12 +881,24 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
             const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
             const reference_value = try reference.encode(a, selected);
             defer a.free(reference_value);
-            try txn.put(&try reference.key(selected), reference_value);
+            // Deliberately bypass capture to inject an on-disk corruption.
+            // The normal DocStore path rejects unpublished FK companions.
+            try txn.write.?.put(&try reference.key(selected), reference_value);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, page.stage(&txn));
             const transfer = @import("relational_integrity.zig");
             const view = try transfer.TransferView.init(&txn);
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, transfer.validateTransferredCompanionsWithView(&txn, &try reference.key(selected), reference_value, view));
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, view.validateCompanion(&txn, .{ .address = selected, .kind = .reference }, @splat(0)));
+        }
+        if (page.entries.len != 0) {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const selected = page.entries[0].address;
+            const reference: integrity.Reference = .{ .child_table = "child", .child_key = "c", .constraint_name = "unexpected_fk", .constraint_generation = @splat(99) };
+            const value = try reference.encode(a, selected);
+            defer a.free(value);
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, txn.put(&try reference.key(selected), value));
+            try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.delete(&selected.claimKey()));
         }
         if (page.receipts.len != 0) {
             var txn = try store.beginWriteTxn();

@@ -22,6 +22,7 @@
 const std = @import("std");
 const internal_keys = @import("internal_keys.zig");
 const integrity = @import("db/relational_integrity_contract.zig");
+const private_index_job = @import("db/relational_index_owner_job.zig");
 const retained_frame = @import("retained_frame.zig");
 const Allocator = std.mem.Allocator;
 pub const state_key = "\x00\x00__retained_rows__:state";
@@ -714,6 +715,8 @@ pub const Capture = struct {
     key_bytes: usize = 0,
     checked: bool = false,
     pin_checked: bool = false,
+    private_claims_checked: bool = false,
+    private_claim_generation: ?integrity.Generation = null,
     has_state: bool = false,
     enabled: bool = false,
     direct_vectors: bool = false,
@@ -734,6 +737,21 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, alloc: Allocator, txn: anytype, key: []const u8, primary: bool, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
+        // A transaction-local classification, never a caller's skip flag.
+        // Invalidate on every identity/catalog/fence change; inventory and
+        // receipt writes do not repeat schema-sized verification per claim.
+        if (std.mem.eql(u8, key, private_index_job.key) or
+            std.mem.eql(u8, key, @import("db/relational_integrity_catalog.zig").key) or
+            std.mem.eql(u8, key, @import("db/relational_index_catalog.zig").head_key) or
+            std.mem.eql(u8, key, @import("db/relational_integrity_topology_contract.zig").fence_key) or
+            std.mem.eql(u8, key, @import("db/schema.zig").schema_key) or
+            std.mem.eql(u8, key, @import("source_authority.zig").key) or
+            std.mem.eql(u8, key, &internal_keys.identity_namespace_key) or
+            std.mem.startsWith(u8, key, @import("db/relational_index_private_claims.zig").registration_prefix))
+        {
+            self.private_claims_checked = false;
+            self.private_claim_generation = null;
+        }
         if (std.mem.eql(u8, key, &internal_keys.ordered_document_applied_entry_key)) {
             try @import("source_authority.zig").requireRaftMarkerAllowed(txn);
             self.raft_marker = true;
@@ -766,6 +784,22 @@ pub const Capture = struct {
             if (cache == null or cache.?.load(.acquire) != 1) {
                 if (try namespace(txn)) |current| try @import("source_pin_state.zig").requireNoPrepared(txn, current);
             }
+        }
+        if (integrity.isKey(key)) {
+            const parsed = try integrity.parseKey(key);
+            if (!self.private_claims_checked) {
+                self.private_claim_generation = try private_index_job.retainedPrivateClaimGeneration(txn);
+                self.private_claims_checked = true;
+            }
+            if (self.private_claim_generation) |generation| if (std.mem.eql(u8, &generation, &parsed.address.generation)) {
+                // Unpublished UNIQUE claims are derived state, like private
+                // physical index keys. Their explicit ordered batch/outbox
+                // owns the source cut; ordinary row tails must not capture or
+                // double-advance it. FK companions cannot exist in this scope.
+                if (self.staged or self.poisoned) return error.RetainedEffectsTransactionFailed;
+                if (parsed.kind != .claim) return error.InvalidPrivateIndexClaimInventory;
+                return;
+            };
         }
         const vector = @import("db/online_vector_artifacts.zig").isKey(key);
         const graph = @import("db/online_graph_artifacts.zig").isKey(key);
