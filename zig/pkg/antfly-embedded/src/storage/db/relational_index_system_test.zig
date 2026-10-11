@@ -144,6 +144,8 @@ test "relational index build pages native owner control preserves committed cuts
         .namespace = binding.fence.namespace,
         .owner_group_id = binding.fence.owner_group_id,
     };
+    try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationAdmission(db_mod.DB.NativeIndexOwnerAdmission.fromBinding(binding), candidate.inputs.bytes));
+    try std.testing.expectError(error.PrivateIndexCancellationRequired, primary.prepareNativeIndexOwnerCancellationControl(.{ .effect = .fenced, .binding = binding }));
     for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
         var control = if (effect == .admitted)
             try primary.prepareNativeIndexOwnerControl(prepared.command)
@@ -398,23 +400,51 @@ test "relational index build pages native owner control preserves committed cuts
     defer late_admission.deinit();
     try std.testing.expectError(error.PrivateIndexPublicationCanceled, follower.applyPreparedNativeIndexOwnerControl(&late_admission, null));
 
-    // Fixture setup uses the independently tested cancellation-specific drain
-    // and burn primitives. Cleanup admission itself must use the real DB
-    // outbox/standby pipeline, not direct writes or a synthetic positive cut.
-    const artifacts = if (prepared.artifacts) |*value| value else unreachable;
-    for ([_]*db_mod.DB{ &cancel_primary, &follower }) |db| {
-        var manager = try db.core.initTxnManager();
-        defer manager.deinit();
-        var burn_txn = try db.core.store.beginWriteTxn();
-        errdefer burn_txn.abort();
-        _ = try jobs.stageCanceledBeginWithReplay(&burn_txn, binding, &artifacts.candidate.inputs, null);
-        _ = try jobs.stageCanceledFencedWithReplay(&burn_txn, &manager, binding, null);
-        _ = try jobs.stageCanceledReservationWithReplay(&burn_txn, &manager, binding, &artifacts.candidate, &artifacts.addition, null);
-        try burn_txn.commit();
+    // Drain and burn now use the real DB commit/outbox/replay pipeline too.
+    // Each committed mirror failure retains its exact payload and cut; ordinary
+    // controls remain canceled and none of these outcomes has a receipt field.
+    for ([_]jobs.NativeEffect{ .admitted, .fenced, .reserved }, 0..) |effect, ordinal| {
+        alloc.free(cancel_publisher.payload.?);
+        cancel_publisher.payload = null;
+        cancel_publisher.lsn = 2 + ordinal;
+        cancel_publisher.fail = true;
+        var canceled_control = if (effect == .admitted)
+            try cancel_primary.prepareNativeIndexOwnerCancellationAdmission(intent, candidate.inputs.bytes)
+        else
+            try cancel_primary.prepareNativeIndexOwnerCancellationControl(.{ .effect = effect, .binding = binding });
+        defer canceled_control.deinit();
+        const progress_outcome = try cancel_primary.applyPreparedNativeIndexOwnerCancellationControl(&canceled_control, null);
+        try std.testing.expect(progress_outcome.replication_pending);
+        try std.testing.expect(!progress_outcome.duplicate);
+        try std.testing.expectEqual(@as(u64, 2 + ordinal), progress_outcome.position.sequence);
+        const progress_payload = try canceled_control.finalizePayload(progress_outcome.position);
+        try std.testing.expectEqualSlices(u8, progress_payload, cancel_publisher.payload.?);
+        cancel_publisher.fail = false;
+        try cancel_primary.flushDurableReplicationOutboxes();
+        const duplicate_progress = try cancel_primary.applyPreparedNativeIndexOwnerCancellationControl(&canceled_control, null);
+        try std.testing.expect(duplicate_progress.duplicate);
+        try std.testing.expectEqual(progress_outcome.position, duplicate_progress.position);
+        var progress_record = cancel_record;
+        progress_record.lsn = 2 + ordinal;
+        progress_record.previous_lsn = 1 + ordinal;
+        progress_record.payload = progress_payload;
+        var decoded_progress = try effects.decodeBatchMutationRequest(alloc, progress_record);
+        defer decoded_progress.deinit();
+        try std.testing.expect(decoded_progress.value.index_owner_control.?.effect == .cancel_control);
+        var progress_gap = try replication_ingress.normalizeBatch(decoded_progress.value);
+        progress_gap.index_owner_control.?.position.sequence += 1;
+        progress_gap.receipt = .{ .native = progress_gap.index_owner_control.?.position };
+        try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(progress_gap, progress_record.lsn));
+        try std.testing.expectEqual(progress_record.previous_lsn, try follower.replicationAppliedSequence());
+        try replication_ingress.applyRecord(&follower, progress_record);
+        try replication_ingress.applyRecord(&follower, progress_record);
+        follower.close();
+        follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
+        try std.testing.expectEqual(progress_record.lsn, try follower.replicationAppliedSequence());
     }
     alloc.free(cancel_publisher.payload.?);
     cancel_publisher.payload = null;
-    cancel_publisher.lsn = 2;
+    cancel_publisher.lsn = 5;
     cancel_publisher.fail = true;
     var cleanup = try cancel_primary.prepareNativeIndexOwnerCleanup(receipt_identity);
     defer cleanup.deinit();
@@ -434,8 +464,8 @@ test "relational index build pages native owner control preserves committed cuts
     try std.testing.expect(duplicate_cleanup.duplicate);
     try std.testing.expectEqual(admitted_cleanup.position, duplicate_cleanup.position);
     var cleanup_record = cancel_record;
-    cleanup_record.lsn = 2;
-    cleanup_record.previous_lsn = 1;
+    cleanup_record.lsn = 5;
+    cleanup_record.previous_lsn = 4;
     cleanup_record.payload = cleanup_payload;
     var decoded_cleanup = try effects.decodeBatchMutationRequest(alloc, cleanup_record);
     defer decoded_cleanup.deinit();
@@ -443,13 +473,13 @@ test "relational index build pages native owner control preserves committed cuts
     var cleanup_gap = try replication_ingress.normalizeBatch(decoded_cleanup.value);
     cleanup_gap.index_owner_control.?.position.sequence += 1;
     cleanup_gap.receipt = .{ .native = cleanup_gap.index_owner_control.?.position };
-    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cleanup_gap, 2));
-    try std.testing.expectEqual(@as(u64, 1), try follower.replicationAppliedSequence());
+    try std.testing.expectError(error.OnlineSourceScopeChanged, follower.applyReplicatedBatch(cleanup_gap, 5));
+    try std.testing.expectEqual(@as(u64, 4), try follower.replicationAppliedSequence());
     try replication_ingress.applyRecord(&follower, cleanup_record);
     try replication_ingress.applyRecord(&follower, cleanup_record);
     follower.close();
     follower = try db_mod.DB.open(alloc, follower_dir.path(), options);
-    try std.testing.expectEqual(@as(u64, 2), try follower.replicationAppliedSequence());
+    try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();
@@ -497,7 +527,7 @@ test "relational index build pages native owner control preserves committed cuts
     try std.testing.expect(!duplicate_page.advanced);
     try std.testing.expect(duplicate_page.artifacts_retired);
     try std.testing.expectError(error.WriteAdmissionRejected, follower.collectRelationalIndexGarbageStep());
-    try std.testing.expectEqual(@as(u64, 2), try follower.replicationAppliedSequence());
+    try std.testing.expectEqual(@as(u64, 5), try follower.replicationAppliedSequence());
     {
         var read = try follower.core.store.beginReadTxn();
         defer read.abort();

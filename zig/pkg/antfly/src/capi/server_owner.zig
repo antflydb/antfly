@@ -4004,6 +4004,29 @@ pub fn storageOwnerNativeIndexControlJson(
         out_response.* = .{ .ptr = response.ptr, .len = response.len };
         return .ok;
     }
+    if (request.operation == .cancel_admit or request.operation == .cancel_fence or request.operation == .cancel_reserve) {
+        var prepared = if (request.operation == .cancel_admit) blk: {
+            if (request.manifest.len == 0 or request.manifest.len > db_mod.DB.PreparedNativeIndexOwnerControl.max_manifest_bytes) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerAdmission, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerCancellationAdmission(parsed.value, request.manifest.slice()) catch |err|
+                return storageOwnerStatusFromError(err);
+        } else blk: {
+            if (request.manifest.len != 0) return .invalid_argument;
+            var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCommand, handle.alloc, request.request_json.slice(), .{}) catch |err|
+                return storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const effect: @FieldType(db_mod.DB.NativeIndexOwnerCommand, "effect") = if (request.operation == .cancel_fence) .fenced else .reserved;
+            if (parsed.value.effect != effect or parsed.value.inputs_b64 != null or
+                parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+            break :blk handle.db.prepareNativeIndexOwnerCancellationControl(parsed.value) catch |err|
+                return storageOwnerStatusFromError(err);
+        };
+        defer prepared.deinit();
+        return applyNativeIndexPreparedResponse(handle, &prepared, out_response);
+    }
     if (request.operation == .cancel_gc_page) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerIdentity, handle.alloc, request.request_json.slice(), .{}) catch |err|
@@ -4095,7 +4118,9 @@ const NativeIndexResponse = struct {
 fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
     defer response.deinit();
-    const outcome = (if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCleanup)
+    const outcome = (if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellationControl)
+        handle.db.applyPreparedNativeIndexOwnerCancellationControl(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCleanup)
         handle.db.applyPreparedNativeIndexOwnerCleanup(prepared, null)
     else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellation)
         handle.db.applyPreparedNativeIndexOwnerCancellation(prepared, null)

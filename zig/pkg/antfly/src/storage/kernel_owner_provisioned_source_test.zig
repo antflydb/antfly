@@ -264,6 +264,53 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expect(authority.sequence >= reserved_receipt.position.native.sequence);
         try std.testing.expectEqual(root_generation, observed.metadata.lsm_root_generation);
         try std.testing.expectEqual(@as(usize, 1), metadata.admission_reads);
+        // Exercise cancellation through the actual leased compiled owner, not
+        // a synthetic source callback. Metadata/RPC authentication is a
+        // separate gate; these operations prove the private storage boundary.
+        const native = local.storage_db_relational_index_owner_control;
+        var canceled_binding = recovered.outcome().?.binding;
+        // Control commands carry the admitted preimage, even when inspection
+        // recovered the durable reserved postimage. Never relax that guard.
+        canceled_binding.phase = .fencing;
+        const intent = native.Admission.fromBinding(canceled_binding);
+        var canceled = try owners.cancelNativeIndexOwnerIntent(alloc, group, plan.before.name, intent, .{});
+        defer canceled.deinit();
+        try std.testing.expect(canceled.value.position.sequence > reserved_receipt.position.native.sequence);
+        var manifest = try metadata.value.inputs.?.prepareNativeManifest(alloc, metadata.value.head);
+        defer manifest.deinit();
+        var canceled_admission = try owners.admitCanceledNativeIndexOwner(alloc, group, plan.before.name, intent, manifest.bytes, .{});
+        defer canceled_admission.deinit();
+        try std.testing.expect(canceled_admission.value.duplicate);
+        inline for (.{ .fenced, .reserved }) |effect| {
+            var canceled_control = try owners.applyCanceledNativeIndexOwnerControl(alloc, group, plan.before.name, .{ .effect = effect, .binding = canceled_binding }, .{});
+            defer canceled_control.deinit();
+            try std.testing.expect(canceled_control.value.duplicate);
+            if (effect == .reserved) try std.testing.expectEqual(reserved_receipt.position.native.sequence, canceled_control.value.position.sequence);
+        }
+        var cleanup = try owners.cleanupNativeIndexOwner(alloc, group, plan.before.name, .{
+            .id = intent.id,
+            .plan_digest = intent.plan_digest,
+            .owner_digest = intent.owner_digest,
+            .ordinal = intent.ordinal,
+            .namespace = intent.fence.namespace,
+            .owner_group_id = group,
+        }, .{});
+        defer cleanup.deinit();
+        try std.testing.expect(cleanup.value.position.sequence > canceled.value.position.sequence);
+        const owner_identity: native.Identity = .{
+            .id = intent.id,
+            .plan_digest = intent.plan_digest,
+            .owner_digest = intent.owner_digest,
+            .ordinal = intent.ordinal,
+            .namespace = intent.fence.namespace,
+            .owner_group_id = group,
+        };
+        for (0..3) |attempt| {
+            var gc = try owners.collectNativeIndexOwnerGarbage(alloc, group, plan.before.name, owner_identity, .{});
+            defer gc.deinit();
+            try std.testing.expectEqual(attempt < 2, gc.value.advanced);
+            try std.testing.expectEqual(attempt > 0, gc.value.artifacts_retired);
+        }
         // A subsequent routing/root switch must not relabel the already
         // recovered receipt as belonging to the replacement physical root.
         root_generation += 1;

@@ -76,12 +76,13 @@ pub const ReceiptRequest = struct {
 /// no legacy parallel-field envelopes: mixed effects are not representable.
 pub const Effect = union(enum) {
     control: Command,
+    cancel_control: Command,
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
-            .control => |value| value.binding.fence.namespace,
+            .control, .cancel_control => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
         };
@@ -89,7 +90,7 @@ pub const Effect = union(enum) {
 
     pub fn validate(self: Effect) !void {
         switch (self) {
-            .control => |value| try value.validate(),
+            .control, .cancel_control => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
                 _ = try value.encode();
@@ -99,7 +100,10 @@ pub const Effect = union(enum) {
     }
 
     pub fn wireLimit(self: Effect) usize {
-        return if (self == .control) max_wire_bytes else max_cancellation_wire_bytes;
+        return switch (self) {
+            .control, .cancel_control => max_wire_bytes,
+            else => max_cancellation_wire_bytes,
+        };
     }
 };
 
@@ -213,23 +217,36 @@ pub const Prepared = struct {
 
     /// Called only under the shared DB mutation/apply/outbox pipeline.
     pub fn stage(self: *Prepared, core: anytype, txn: anytype, replay: ?Native) !Outcome {
+        return self.stageImpl(core, txn, replay, false);
+    }
+
+    fn stageImpl(self: *Prepared, core: anytype, txn: anytype, replay: ?Native, comptime canceling: bool) !Outcome {
         const binding = self.command.binding;
         const duplicate = (try jobs.nativeEffectPosition(txn, binding, self.command.effect)) != null;
         switch (self.command.effect) {
             .admitted => {
                 const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
-                _ = try jobs.stageBeginWithReplay(txn, binding, &artifacts.candidate.inputs, replay);
+                if (canceling)
+                    _ = try jobs.stageCanceledBeginWithReplay(txn, binding, &artifacts.candidate.inputs, replay)
+                else
+                    _ = try jobs.stageBeginWithReplay(txn, binding, &artifacts.candidate.inputs, replay);
             },
             .fenced => {
                 var manager = try core.initTxnManager();
                 defer manager.deinit();
-                _ = try jobs.stageNativeFencedWithReplay(txn, &manager, binding, replay);
+                if (canceling)
+                    _ = try jobs.stageCanceledFencedWithReplay(txn, &manager, binding, replay)
+                else
+                    _ = try jobs.stageNativeFencedWithReplay(txn, &manager, binding, replay);
             },
             .reserved => {
                 const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
                 var manager = try core.initTxnManager();
                 defer manager.deinit();
-                _ = try jobs.stageReservationWithReplay(txn, &manager, binding, &artifacts.candidate, &artifacts.addition, replay);
+                if (canceling)
+                    _ = try jobs.stageCanceledReservationWithReplay(txn, &manager, binding, &artifacts.candidate, &artifacts.addition, replay)
+                else
+                    _ = try jobs.stageReservationWithReplay(txn, &manager, binding, &artifacts.candidate, &artifacts.addition, replay);
             },
         }
         return .{ .binding = binding, .position = (try jobs.nativeEffectPosition(txn, binding, self.command.effect)) orelse return error.InvalidPrivateIndexNativeReceipt, .duplicate = duplicate };
@@ -297,6 +314,53 @@ pub const Prepared = struct {
     }
 
     pub fn finalizePayload(self: *Prepared, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// Drain and burn controls have a distinct wire effect and a receipt-free
+/// result. Reusing ordinary command preparation does not grant cancellation:
+/// each actual staged primitive requires the exact persisted intent.
+pub const PreparedCancellationControl = struct {
+    pub const ApplyOutcome = CleanupOutcome;
+    alloc: Allocator,
+    control: Prepared,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, txn: anytype, prepared: Prepared) !PreparedCancellationControl {
+        try @import("relational_index_cancellation_intent.zig").requireCanceled(txn, prepared.command.binding);
+        return .{ .alloc = alloc, .control = prepared };
+    }
+    pub fn deinit(self: *PreparedCancellationControl) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.control.deinit();
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedCancellationControl) !void {
+        try self.control.validate();
+    }
+    pub fn namespace(self: *const PreparedCancellationControl) @FieldType(Native, "namespace") {
+        return self.control.namespace();
+    }
+    pub fn validateReplay(self: *const PreparedCancellationControl, position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_control = self.control.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedCancellationControl, position: Native) CleanupOutcome {
+        return .{ .binding = self.control.command.binding, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *PreparedCancellationControl, core: anytype, txn: anytype, replay: ?Native) !CleanupOutcome {
+        const result = try self.control.stageImpl(core, txn, replay, true);
+        return .{ .binding = result.binding, .position = result.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedCancellationControl) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedCancellationControl, _: anytype, _: *CleanupOutcome) !void {}
+    pub fn preparePayload(self: *PreparedCancellationControl) !void {
+        try prepareNativePayload(self, "cancel_control", self.control.command, max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedCancellationControl, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
     }
 };

@@ -7903,6 +7903,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexOwnerControl(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .cancel_control => |command| {
+                    var prepared = self.prepareNativeIndexOwnerCancellationControl(command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellationControl(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .cancel_intent => |intent| {
                     var prepared = try self.prepareNativeIndexOwnerCancellation(intent);
                     defer prepared.deinit();
@@ -8012,6 +8020,38 @@ pub const DB = struct {
     }
 
     const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
+
+    pub const PreparedNativeIndexOwnerCancellationControl = native_index_control.PreparedCancellationControl;
+
+    pub fn prepareNativeIndexOwnerCancellationAdmission(self: *DB, header: NativeIndexOwnerAdmission, manifest: []const u8) !PreparedNativeIndexOwnerCancellationControl {
+        try header.validate();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const cancellation = @import("relational_index_cancellation_intent.zig");
+        const intent = (try cancellation.load(&txn)) orelse return error.PrivateIndexCancellationRequired;
+        if (!intent.intent.eql(header)) return error.PrivateIndexOwnerJobChanged;
+        var prepared = try native_index_control.Prepared.admission(self.alloc, view, &txn, header, manifest);
+        errdefer prepared.deinit();
+        return native_index_control.PreparedCancellationControl.init(self.alloc, &txn, prepared);
+    }
+
+    pub fn prepareNativeIndexOwnerCancellationControl(self: *DB, command: NativeIndexOwnerCommand) !PreparedNativeIndexOwnerCancellationControl {
+        try command.validate();
+        var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        try @import("relational_index_cancellation_intent.zig").requireCanceled(&txn, command.binding);
+        var prepared = try native_index_control.Prepared.control(self.alloc, view, &txn, command);
+        errdefer prepared.deinit();
+        return native_index_control.PreparedCancellationControl.init(self.alloc, &txn, prepared);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerCancellationControl(self: *DB, prepared: *PreparedNativeIndexOwnerCancellationControl, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
 
     pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
         return PreparedNativeIndexOwnerCancellation.init(self.alloc, intent);
