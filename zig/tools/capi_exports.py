@@ -142,6 +142,8 @@ def link_macho(args: argparse.Namespace) -> None:
     # archive that otherwise has no undefined reference from the C API object.
     for name in args.exports.read_text().splitlines():
         command.extend(["-u", name])
+    if link_map := getattr(args, "map", None):
+        command.extend(["-map", str(link_map)])
     subprocess.run(command, check=True)
 
 
@@ -174,11 +176,14 @@ def consumer_test(
     # Put the dependency first: a leaked __dso_handle must not bind a later
     # consumer object's direct relocation to libantfly's copy.
     linking = [cc, "-Xlinker", "-rpath", "-Xlinker", str(library.parent)]
-    inputs = lambda obj: (
-        [str(library), str(obj)]
-        if object_format == "macho"
-        else [str(obj), str(library)]
-    )
+
+    def inputs(obj: Path) -> list[str]:
+        return (
+            [str(library), str(obj)]
+            if object_format == "macho"
+            else [str(obj), str(library)]
+        )
+
     subprocess.run([*linking, *inputs(object_file), "-o", str(executable)], check=True)
     subprocess.run(
         [
@@ -224,6 +229,7 @@ def main() -> None:
     link.add_argument("--exports", type=Path, required=True)
     link.add_argument("--archive", type=Path, required=True)
     link.add_argument("--output", type=Path, required=True)
+    link.add_argument("--map", type=Path)
     link.add_argument("link_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:

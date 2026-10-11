@@ -5112,6 +5112,54 @@ by this experiment**. Local graph gates, packaging/tooling tests and
 consumer tests validate the relevant changes; a new cold profile would
 be needed for a performance comparison against that revision.
 
+## 2026-10-11: native Darwin retained-code attribution
+
+Relinked the retained archives from the preceding experiment with the
+same SDK, ARM64 architecture, deployment target 15.0, frameworks, public
+export roots and dead stripping, adding only a linker map. The relink
+reproduced the original **69,178,784-byte** library size. This avoids
+mistaking distances between the stripped library's sparse surviving
+symbols for individual function sizes.
+
+The map's `__text` atoms attribute 34,481,724 bytes to the public C API
+object, 19,356,368 to native inference, 1,529,068 to native enrichment,
+and 735,116 to Metal's Objective-C object. These are machine-code bytes,
+not complete archive or product sizes. Storage-prefixed functions total
+18,130,708 text bytes; specialized stable sorts total 4,124,664. Two
+`batchInternalPrepared` specializations alone occupy 1,925,824 and
+1,825,464 bytes. The source instantiates this generic mutation code for
+both resident DB and recovery execution receivers; combining them would
+require preserving their state ownership and recovery-specific behavior.
+Inference includes the native kernels and model pipelines required by
+the public product. Shared dependency names also recur across owners,
+but identical names do not establish identical code or interchangeable
+state.
+
+The apparent 2,621,440-byte Metal allocation-record array belongs to
+zero-fill `__bss`; it does not account for those bytes on disk. Likewise,
+the 262,144-byte per-owner signal stacks are thread-local zero-fill, not
+an artifact-size saving available by deleting initialized data. This is
+why subsequent attribution must distinguish text, file-backed data and
+zero-fill sections.
+
+**Result: retain linker maps; no speculative runtime rewrite or budget
+increase.** Native Mach-O links now emit `libantfly.map` beside the cached
+library as a tracked build output, retained by the diagnostic workflow's
+work-directory upload. It is not installed in release archives. A native
+regression verifies that the map is emitted while exact exports and
+executable/shared-library consumer linkage remain valid. The 60 MiB
+cross-build guard is unchanged; neither attribution nor the preceding
+native build establishes that the pinned-SDK CI library passes it.
+
+The latest completed main CI run (`38163110166`, main `84a0080999`)
+also exposed a stale control-source catalog and a Debug ELF C API link
+that selected the self-hosted backend with LLD. The catalog was
+regenerated from physical-source reachability, and the ELF C API helper
+now explicitly selects LLVM alongside its required LLD export linker.
+A minimal Linux-musl Debug build through that production helper passes
+and verifies its exact dynamic export boundary. This checks the backend
+failure directly; it is not a substitute for the full Linux E2E suite.
+
 ## Definition of done
 
 This compilation architecture work is complete when:
