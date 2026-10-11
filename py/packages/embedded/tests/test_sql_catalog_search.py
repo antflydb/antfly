@@ -18,6 +18,7 @@
 import json
 from contextlib import closing
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -319,7 +320,7 @@ def test_sql_search_highlights_match_public_json_and_do_not_use_stored_metadata(
                 "document_schemas": {"doc": {"schema": {"type": "object", "properties": {"body": {"type": "string"}}}}},
             },
         )
-        request = {"full_text_search": {"match": "alpha", "field": "body"}}
+        request: dict[str, Any] = {"full_text_search": {"match": "alpha", "field": "body"}}
         with db.open_table("notes") as table:
             table.batch_json({"inserts": {"n1": {"body": "alpha memory", "_highlights": {"spoof": []}}}})
             table.run_until_idle()
@@ -355,7 +356,7 @@ def test_sql_semantic_search_uses_the_named_tables_configured_embedder(require_n
             self.end_headers()
             self.wfile.write(response)
 
-        def log_message(self, *args):
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Embedder)

@@ -779,6 +779,8 @@ pub const Stream = struct {
             statement_backend.settings_view = view;
         }
         const binding = try describe.bind(arena, statement_backend, compiled, &.{});
+        if (statement_backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, self.budget.allocator(), binding);
+        statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
         if (self.parameter_invocation) |invocation| try invocation.prepareJson(self.budget.allocator(), parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes });

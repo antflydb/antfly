@@ -346,6 +346,24 @@ pub const ListRestoreJobsParams = struct {
     scope: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateQuerySourceResponse = union(enum) {
+    status_201: types.SavedQuerySource,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.SavedQuerySource, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -2431,7 +2449,7 @@ pub const Client = struct {
 
     /// Create saved query source
     /// POST /db/v1/sources/{sourceName}
-    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(types.SavedQuerySource) {
+    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(CreateQuerySourceResponse) {
         const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
         defer self.allocator.free(encoded_source_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
@@ -2439,7 +2457,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateQuerySourceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop saved query source

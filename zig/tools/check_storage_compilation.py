@@ -344,8 +344,11 @@ def main() -> None:
             (
                 "read coordination",
                 "api/table_reads.zig",
-                {"antfly-runtime-distributed"},
-                (ARCHIVES - {"antfly-runtime-distributed"})
+                # A retained multi-range cut leases its DB generations inside
+                # the physical owner and reuses the canonical read merger.
+                # Both owners must therefore invalidate this shared source.
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-runtime-distributed", "antfly-storage-kernel"})
                 | {"storage-owner-tests", "storage-owner-enrichment-tests"},
             ),
             (

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // Browser bundle inspection is independent of the inference implementation.
+
 import { resolveAdapter } from './model-adapters.js';
 import { configurationReason } from './model-configuration.js';
 const decoder = new TextDecoder('utf-8', { fatal: true });

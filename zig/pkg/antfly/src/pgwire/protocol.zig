@@ -113,14 +113,15 @@ pub const Session = struct {
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
-    lake_visibility: commands.LakeVisibility = .committed,
+    lake_visibility: commands.ReadRequirements = .{},
+    read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.LakeVisibility, lake_committed: commands.LakeVisibility } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.LakeVisibility, committed_lake: commands.LakeVisibility, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.ReadRequirements, lake_committed: commands.ReadRequirements } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.ReadRequirements, committed_lake: commands.ReadRequirements, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -347,7 +348,9 @@ pub const Session = struct {
             .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
-            .lake_visibility = self.lake_visibility,
+            .lake_visibility = if (self.lake_visibility.visibility == .accepted) .accepted else .committed,
+            .read_requirements = self.lake_visibility,
+            .read_receipt_budget = &self.read_receipt_budget,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -368,6 +371,8 @@ pub const Session = struct {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
                 .lake_visibility => |value| if (value == .show) &.{.{ .name = "antfly.lake_visibility", .type = .string }} else &.{},
+                .read_visibility => |value| if (value == .show) &.{.{ .name = "antfly.read_visibility", .type = .string }} else &.{},
+                .read_requirements => |value| if (value == .show) &.{.{ .name = "antfly.read_requirements", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
                 .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
@@ -434,7 +439,9 @@ pub const Session = struct {
             return switch (setting) {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
-                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value),
+                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.lake_visibility"),
+                .read_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.read_visibility"),
+                .read_requirements => |value| self.executeReadRequirementsSetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
                 .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
@@ -591,13 +598,37 @@ pub const Session = struct {
         return result;
     }
 
-    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting) !backend.Result {
+    fn executeReadRequirementsSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ReadRequirementsSetting) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
         if (setting == .show) {
-            result.columns = &.{.{ .name = "antfly.lake_visibility", .type = .string }};
+            result.columns = &.{.{ .name = "antfly.read_requirements", .type = .string }};
             const row = try alloc.alloc(std.json.Value, 1);
-            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility)) };
+            row[0] = .{ .string = try std.json.Stringify.valueAlloc(alloc, self.lake_visibility, .{ .emit_null_optional_fields = false }) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.ReadRequirementsSetting{ .set = .{ .local = false, .value = .{} } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        try update.value.validate(.sql);
+        self.lake_visibility = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed = update.value;
+        };
+        return result;
+    }
+
+    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting, name: []const u8) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = name, .type = .string };
+            result.columns = columns;
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility.visibility orelse .committed)) };
             const rows = try alloc.alloc([]const std.json.Value, 1);
             rows[0] = row;
             result.rows = rows;
@@ -605,9 +636,9 @@ pub const Session = struct {
         }
         const update = if (setting == .reset) (commands.LakeVisibilitySetting{ .set = .{ .local = false, .value = .committed } }).set else setting.set;
         if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
-        self.lake_visibility = update.value;
+        self.lake_visibility.visibility = if (update.value == .accepted) .accepted else .committed;
         if (!update.local) if (self.timeout_transaction) |*settings| {
-            settings.lake_committed = update.value;
+            settings.lake_committed.visibility = self.lake_visibility.visibility;
         };
         return result;
     }
@@ -721,7 +752,7 @@ pub const Session = struct {
         self.statement_timeout = null;
         self.namespace_setting = null;
         self.application_name = .{};
-        self.lake_visibility = .committed;
+        self.lake_visibility = .{};
         if (self.catalog_settings) |*state| state.resetAll();
         // RESET ALL is a session-level change even inside a transaction.
         // Savepoint snapshots can still roll it back locally; a committed
@@ -730,7 +761,7 @@ pub const Session = struct {
             settings.committed = null;
             settings.namespace_committed = null;
             settings.application_committed = .{};
-            settings.lake_committed = .committed;
+            settings.lake_committed = .{};
         }
         return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
     }
@@ -757,6 +788,7 @@ pub const Session = struct {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
             'Q' => {
+                self.read_receipt_budget = .{};
                 const statement = try cursor.string();
                 try cursor.finish();
                 self.removePortal("");
@@ -943,6 +975,7 @@ pub const Session = struct {
                     portal.stream = null;
                 };
                 if (!portal.stream_opened) {
+                    self.read_receipt_budget = .{};
                     portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
@@ -1772,6 +1805,10 @@ fn sqlstate(err: anyerror) []const u8 {
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
+        error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
+        error.UnsupportedReadVisibility => "0A000",
+        error.ReadRequirementNotReady => "53300",
+        error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",

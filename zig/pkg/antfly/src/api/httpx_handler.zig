@@ -5930,7 +5930,8 @@ pub const AntflyApiHandler = struct {
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
         const Input = struct {
-            lake_visibility: enum { committed, accepted } = .committed,
+            read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null,
+            lake_visibility: ?enum { committed, accepted } = null,
             statement: ?[]const u8 = null,
             parameters: ?[]const std.json.Value = null,
             database: ?[]const u8 = null,
@@ -5946,6 +5947,10 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (request.read_requirements != null and request.lake_visibility != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read_requirements and lake_visibility are mutually exclusive" });
+        const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
+        read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
+        if (mode == .prepare and (request.read_requirements != null or request.lake_visibility != null)) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read requirements belong to execution, not preparation" });
         const statement = request.statement orelse "";
         if (mode == .prepare and statement.len > @import("sql_prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
         if (mode == .statement or mode == .prepare) {
@@ -5991,10 +5996,7 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .lake_visibility = switch (request.lake_visibility) {
-                .committed => .committed,
-                .accepted => .accepted,
-            }, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .read_requirements = read_requirements, .lake_visibility = if (read_requirements.visibility == .accepted or request.lake_visibility == .accepted) .accepted else .committed, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -12784,6 +12786,10 @@ test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
     try std.testing.expectEqual(@as(?usize, null), transport.router.bodySizeLimit(.POST, "/db/v1/query"));
     const cases = [_]struct { body: []const u8, status: u16, state: []const u8 }{
         .{ .body = "{}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{},\"lake_visibility\":\"accepted\"}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"visibility\":\"published\"}}", .status = 501, .state = "0A000" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"wait_ms\":60001}}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"read_requirements\":{\"visibility\":\"accepted\",\"wait_ms\":0}}", .status = 503, .state = "53300" },
         .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"limit\":0}", .status = 400, .state = "22023" },
         .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"session_id\":\"opaque\"}", .status = 400, .state = "22023" },
         .{ .body = "{\"statement\":\"BEGIN\"}", .status = 501, .state = "0A000" },
@@ -14084,7 +14090,10 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
                 var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, ddl, .{});
                 defer compiled.deinit();
                 const change = compiled.statement.catalog_ddl;
-                try std.testing.expectEqualStrings(name, change.name.table);
+                try std.testing.expectEqual(.index, change.kind);
+                try std.testing.expectEqual(.create, change.action);
+                try std.testing.expectEqualStrings(name, change.index_table.?.table);
+                try std.testing.expectEqualStrings(change.name.table, change.schema_change.?.create_index.name);
                 try std.testing.expect(change.schema_change.?.create_index.unique);
                 if (indexed_selectors) selector_index_name = try a.dupe(u8, change.schema_change.?.create_index.name);
                 try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, change));
@@ -14233,6 +14242,34 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    // Receipts must be checked even when a native cursor, constant result or
+    // streaming plan would otherwise bypass the lake reader.
+    for ([_][]const u8{ "SELECT id FROM usage_records WHERE _id = 'a'", "SELECT SUM(amount) FROM usage_records", "SELECT u.id FROM usage_records u JOIN usage_records v ON u.id = v.id", "SELECT 1" }) |statement| {
+        var compiled_receipt = try @import("antfly_local_sources").sql_compiler.compile(alloc, statement, .{});
+        defer compiled_receipt.deinit();
+        var receipt_identity: ?@import("http_server.zig").AuthenticatedIdentity = null;
+        var receipt_adapter: @import("sql_execution.zig").Adapter = .{ .server = &server, .identity = &receipt_identity, .context = .{}, .read_requirements = .{ .visibility = .accepted, .after_write = .{ .table_id = 999, .object_generation = 9, .wal_lsn = 999999 }, .wait_ms = 0 } };
+        try std.testing.expectError(error.ReadReceiptGenerationMismatch, receipt_adapter.execute(alloc, &compiled_receipt, &.{}, .{}, null));
+        try std.testing.expectError(error.ReadReceiptGenerationMismatch, @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, receipt_adapter.backend(), &compiled_receipt, &.{}, .{}));
+        var receipt_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer receipt_request.deinit();
+        const receipt_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement, .read_requirements = receipt_adapter.read_requirements }, .{});
+        defer alloc.free(receipt_body);
+        receipt_request.body = receipt_body;
+        var receipt_ctx = httpx.Context.init(alloc, std.testing.io, &receipt_request);
+        defer receipt_ctx.deinit();
+        var receipt_response = try handler.executeSQL(&receipt_ctx);
+        defer receipt_response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), receipt_response.status.code);
+        var receipt_diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, receipt_response.body.?, .{});
+        defer receipt_diagnostic.deinit();
+        try std.testing.expectEqualStrings("22023", receipt_diagnostic.value.code);
+        if (compiled_receipt.statement.select.table != null) {
+            receipt_adapter.read_requirements.after_write.?.table_id = 7;
+            try std.testing.expectError(error.UnsupportedReadVisibility, receipt_adapter.execute(alloc, &compiled_receipt, &.{}, .{}, null));
+        }
+    }
+
     const reference_cases = [_][]const u8{
         "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
         "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",

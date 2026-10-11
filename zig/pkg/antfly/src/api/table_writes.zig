@@ -59068,187 +59068,191 @@ fn implementationTests() type {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            const FakeEmbeddingProvider = struct {
-                request_count: std.atomic.Value(u32) = .init(0),
+            // Reconfiguration installs producers without overriding the owner
+            // policy: startup owners drain inline; serving owners use workers.
+            for ([_]ManagedDbOpenMode{ .startup_catch_up, .default_async }) |open_mode| {
+                const FakeEmbeddingProvider = struct {
+                    request_count: std.atomic.Value(u32) = .init(0),
 
-                fn dense(
-                    ptr: *anyopaque,
-                    allocator: std.mem.Allocator,
-                    model: []const u8,
-                    texts: []const []const u8,
-                ) anyerror![][]f32 {
-                    const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expectEqualStrings("test-embed", model);
-                    try std.testing.expect(texts.len > 0);
-                    try std.testing.expect(std.mem.indexOf(u8, texts[0], "alpha body") != null);
-                    _ = self.request_count.fetchAdd(1, .monotonic);
+                    fn dense(
+                        ptr: *anyopaque,
+                        allocator: std.mem.Allocator,
+                        model: []const u8,
+                        texts: []const []const u8,
+                    ) anyerror![][]f32 {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try std.testing.expectEqualStrings("test-embed", model);
+                        try std.testing.expect(texts.len > 0);
+                        try std.testing.expect(std.mem.indexOf(u8, texts[0], "alpha body") != null);
+                        _ = self.request_count.fetchAdd(1, .monotonic);
 
-                    const vectors = try allocator.alloc([]f32, texts.len);
-                    errdefer allocator.free(vectors);
-                    for (vectors, 0..) |*vector, i| {
-                        vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
-                            for (vectors[0..i]) |owned| allocator.free(owned);
-                            return err;
+                        const vectors = try allocator.alloc([]f32, texts.len);
+                        errdefer allocator.free(vectors);
+                        for (vectors, 0..) |*vector, i| {
+                            vector.* = allocator.dupe(f32, &.{ 1, 0, 0 }) catch |err| {
+                                for (vectors[0..i]) |owned| allocator.free(owned);
+                                return err;
+                            };
+                        }
+                        return vectors;
+                    }
+
+                    fn sparse(
+                        _: *anyopaque,
+                        allocator: std.mem.Allocator,
+                        _: []const u8,
+                        _: []const []const u8,
+                    ) anyerror![]db_embedder.SparseEmbedding {
+                        return try allocator.alloc(db_embedder.SparseEmbedding, 0);
+                    }
+
+                    fn interface(self: *@This()) managed_embedder.AntflyProvider {
+                        return .{
+                            .ptr = self,
+                            .embed_dense_texts = dense,
+                            .embed_sparse_texts = sparse,
                         };
                     }
-                    return vectors;
+                };
+
+                const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race/{t}", .{ tmp.sub_path, open_mode });
+                defer alloc.free(replica_root_dir);
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+                defer alloc.free(path);
+
+                // Model the create-table race: startup observed the catalog before the
+                // managed index was published and opened the generation with only the
+                // default index. The create request below is the newer authority.
+                const Catalog = struct {
+                    var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+
+                    fn iface() table_catalog.CatalogSource {
+                        return .{
+                            .ptr = undefined,
+                            .vtable = &.{
+                                .admin_snapshot = adminSnapshot,
+                                .free_admin_snapshot = freeAdminSnapshot,
+                                .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                                .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                                .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                            },
+                        };
+                    }
+
+                    fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                        const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
+                        errdefer std.testing.allocator.free(tables);
+                        tables[0] = .{
+                            .table_id = 7,
+                            .name = "docs",
+                            .schema_json = tables_api.default_schema_json,
+                            .indexes_json = indexes_json_buf,
+                            .placement_role = "data",
+                        };
+                        const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
+                        errdefer std.testing.allocator.free(ranges);
+                        ranges[0] = .{
+                            .group_id = 7001,
+                            .range_id = 7101,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                        };
+                        return .{
+                            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                            .tables = tables,
+                            .ranges = ranges,
+                            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        };
+                    }
+
+                    fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+                        std.testing.allocator.free(snapshot.tables);
+                        std.testing.allocator.free(snapshot.ranges);
+                    }
+                };
+
+                const managed_indexes_json =
+                    \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"enrichments":[{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128},{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"test-embed\"}"}],"title_body":{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","dimension":3,"embedder":{"provider":"antfly","model":"test-embed"}},"artifact_vectors":{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{"artifact":"body_dense_v1"}]}}
+                ;
+                Catalog.indexes_json_buf = tables_api.default_indexes_json;
+                var provider = FakeEmbeddingProvider{};
+
+                var write_cache = ProvisionedTableWriteCache.init(alloc);
+                defer write_cache.deinit();
+                var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+                defer source.deinit();
+                source.write_cache = &write_cache;
+                _ = source.withAntflyProvider(provider.interface());
+
+                {
+                    var stale_owner = try write_cache.getOrOpenLockedMode(
+                        path,
+                        Catalog.iface(),
+                        7001,
+                        source.visibleRootGeneration(7001),
+                        "docs",
+                        open_mode,
+                    );
+                    defer stale_owner.deinit(alloc);
+                    try std.testing.expect(stale_owner.db.enrichment_runtime == null);
+                    // Reproduce the production failure precisely: metadata publication
+                    // advanced independently while the resident runtime stayed stale.
+                    // A fingerprint match alone must never let create skip installation.
+                    ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
+                    try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
+                        stale_owner.entry.?,
+                        managed_indexes_json,
+                    ));
                 }
 
-                fn sparse(
-                    _: *anyopaque,
-                    allocator: std.mem.Allocator,
-                    _: []const u8,
-                    _: []const []const u8,
-                ) anyerror![]db_embedder.SparseEmbedding {
-                    return try allocator.alloc(db_embedder.SparseEmbedding, 0);
-                }
+                // Admission has committed the new catalog value, but the startup cache
+                // still owns a writer constructed from the earlier snapshot.
+                Catalog.indexes_json_buf = managed_indexes_json;
+                var req = tables_api.CreateTableRequest{
+                    .indexes_json = try alloc.dupe(u8, managed_indexes_json),
+                };
+                defer req.deinit(alloc);
+                _ = try source.source().createTable(alloc, "docs", req);
 
-                fn interface(self: *@This()) managed_embedder.AntflyProvider {
-                    return .{
-                        .ptr = self,
-                        .embed_dense_texts = dense,
-                        .embed_sparse_texts = sparse,
-                    };
-                }
-            };
+                try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+                const entry = write_cache.entries.items[0];
+                try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
+                const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
+                try std.testing.expectEqual(open_mode != .startup_catch_up, runtime.stats().worker_started);
 
-            const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-managed-runtime-race", .{tmp.sub_path});
-            defer alloc.free(replica_root_dir);
-            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
-            defer alloc.free(path);
+                _ = try source.source().batch(alloc, "docs", .{
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
+                    .sync_level = .full_index,
+                });
+                try std.testing.expect(provider.request_count.load(.monotonic) > 0);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
+                try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
 
-            // Model the create-table race: startup observed the catalog before the
-            // managed index was published and opened the generation with only the
-            // default index. The create request below is the newer authority.
-            const Catalog = struct {
-                var indexes_json_buf: []const u8 = tables_api.default_indexes_json;
+                const query_vec = [_]f32{ 1, 0, 0 };
+                var result = try entry.db.search(alloc, .{
+                    .index_name = "title_body",
+                    .dense = .{ .vector = query_vec[0..], .k = 1 },
+                    .limit = 1,
+                });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
-                fn iface() table_catalog.CatalogSource {
-                    return .{
-                        .ptr = undefined,
-                        .vtable = &.{
-                            .admin_snapshot = adminSnapshot,
-                            .free_admin_snapshot = freeAdminSnapshot,
-                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
-                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
-                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
-                        },
-                    };
-                }
-
-                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-                    const tables = try std.testing.allocator.alloc(metadata_table_manager.TableRecord, 1);
-                    errdefer std.testing.allocator.free(tables);
-                    tables[0] = .{
-                        .table_id = 7,
-                        .name = "docs",
-                        .schema_json = tables_api.default_schema_json,
-                        .indexes_json = indexes_json_buf,
-                        .placement_role = "data",
-                    };
-                    const ranges = try std.testing.allocator.alloc(metadata_table_manager.RangeRecord, 1);
-                    errdefer std.testing.allocator.free(ranges);
-                    ranges[0] = .{
-                        .group_id = 7001,
-                        .range_id = 7101,
-                        .table_id = 7,
-                        .start_key = "",
-                        .end_key = null,
-                    };
-                    return .{
-                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                        .tables = tables,
-                        .ranges = ranges,
-                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-                    };
-                }
-
-                fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
-                    std.testing.allocator.free(snapshot.tables);
-                    std.testing.allocator.free(snapshot.ranges);
-                }
-            };
-
-            const managed_indexes_json =
-                \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"enrichments":[{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":128},{"name":"body_dense_v1","kind":"embedding","field":"body","source_artifact_name":"body_chunks_v1","expected_dims":3,"producer_json":"{\"provider\":\"antfly\",\"model\":\"test-embed\"}"}],"title_body":{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","dimension":3,"embedder":{"provider":"antfly","model":"test-embed"}},"artifact_vectors":{"name":"artifact_vectors","type":"embeddings","dimension":3,"sources":[{"artifact":"body_dense_v1"}]}}
-            ;
-            Catalog.indexes_json_buf = tables_api.default_indexes_json;
-            var provider = FakeEmbeddingProvider{};
-
-            var write_cache = ProvisionedTableWriteCache.init(alloc);
-            defer write_cache.deinit();
-            var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
-            defer source.deinit();
-            source.write_cache = &write_cache;
-            _ = source.withAntflyProvider(provider.interface());
-
-            {
-                var stale_owner = try write_cache.getOrOpenLockedMode(
-                    path,
-                    Catalog.iface(),
-                    7001,
-                    source.visibleRootGeneration(7001),
-                    "docs",
-                    .startup_catch_up,
-                );
-                defer stale_owner.deinit(alloc);
-                try std.testing.expect(stale_owner.db.enrichment_runtime == null);
-                // Reproduce the production failure precisely: metadata publication
-                // advanced independently while the resident runtime stayed stale.
-                // A fingerprint match alone must never let create skip installation.
-                ProvisionedTableWriteCache.publishEntryManagedConfig(stale_owner.entry.?, managed_indexes_json);
-                try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(
-                    stale_owner.entry.?,
-                    managed_indexes_json,
-                ));
+                var artifact_result = try entry.db.search(alloc, .{
+                    .index_name = "artifact_vectors",
+                    .dense = .{ .vector = query_vec[0..], .k = 1 },
+                    .limit = 1,
+                });
+                defer artifact_result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), artifact_result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
             }
-
-            // Admission has committed the new catalog value, but the startup cache
-            // still owns a writer constructed from the earlier snapshot.
-            Catalog.indexes_json_buf = managed_indexes_json;
-            var req = tables_api.CreateTableRequest{
-                .indexes_json = try alloc.dupe(u8, managed_indexes_json),
-            };
-            defer req.deinit(alloc);
-            _ = try source.source().createTable(alloc, "docs", req);
-
-            try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
-            const entry = write_cache.entries.items[0];
-            try std.testing.expect(ProvisionedTableWriteCache.entryManagedConfigMatches(entry, managed_indexes_json));
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body") != null);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors") != null);
-            const runtime = entry.db.enrichment_runtime orelse return error.MissingDbEnrichmentRuntime;
-            try std.testing.expect(runtime.stats().worker_started);
-
-            _ = try source.source().batch(alloc, "docs", .{
-                .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
-                .sync_level = .full_index,
-            });
-            try std.testing.expect(provider.request_count.load(.monotonic) > 0);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("title_body").?.index.metadata.active_count > 0);
-            try std.testing.expect(entry.db.core.index_manager.denseIndex("artifact_vectors").?.index.metadata.active_count > 0);
-
-            const query_vec = [_]f32{ 1, 0, 0 };
-            var result = try entry.db.search(alloc, .{
-                .index_name = "title_body",
-                .dense = .{ .vector = query_vec[0..], .k = 1 },
-                .limit = 1,
-            });
-            defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-            try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-
-            var artifact_result = try entry.db.search(alloc, .{
-                .index_name = "artifact_vectors",
-                .dense = .{ .vector = query_vec[0..], .k = 1 },
-                .limit = 1,
-            });
-            defer artifact_result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), artifact_result.hits.len);
-            try std.testing.expectEqualStrings("doc:a", artifact_result.hits[0].id);
         }
 
         test "provisioned table write source restore table does not hold local db mutex during restore work" {
