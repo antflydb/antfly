@@ -66,9 +66,11 @@ const Entry = struct {
     slots: []const u32,
     delta: ordered.Delta,
     built_hashes: [][32]u8,
+    retained: []bool,
     published: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
     root_arena: std.heap.ArenaAllocator,
-    fn deinit(self: *Entry) void {
+    fn deinit(self: *Entry, a: A) void {
+        a.free(self.retained);
         self.sort.deinit();
         self.root_arena.deinit();
         if (self.predicate) |*predicate| predicate.deinit();
@@ -175,7 +177,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
         defer {
-            for (entries.items) |*entry| entry.deinit();
+            for (entries.items) |*entry| entry.deinit(a);
             entries.deinit(a);
         }
         var columns: std.StringHashMapUnmanaged(void) = .empty;
@@ -244,7 +246,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (prior) |root| for (root.file_fingerprints, 0..) |digest, slot| {
                 if (keep[slot]) built_hashes[slot] = digest;
             };
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .built_hashes = built_hashes, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            const retained = try a.alloc(bool, slot_names.items.len);
+            errdefer a.free(retained);
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
             entries.items[entries.items.len - 1].sort.run_limit = sort_run_limit;
         }
         if (entries.items.len == 0) continue;
@@ -327,7 +331,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (!entry.changed[file_index]) continue;
                 const slot = entry.slots[file_index];
                 entry.built_hashes[slot] = entry.delta.fingerprints[slot];
-                const keep = try ca.dupe(bool, entry.delta.keep);
+                const keep = try a.dupe(bool, entry.delta.keep);
+                defer a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
                 const delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
                 const ref = ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) catch |err| {
@@ -343,9 +348,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 // Retaining every prefix here would grow metadata quadratically.
                 _ = entry.root_arena.reset(.free_all);
                 entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
-                const retained = try ca.alloc(bool, entry.delta.files.len);
-                @memset(retained, true);
-                entry.delta.keep = retained;
+                @memset(entry.retained, true);
+                entry.delta.keep = entry.retained;
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes);
                 entry.sort.run_limit = sort_run_limit;

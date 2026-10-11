@@ -442,13 +442,10 @@ fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local
         store: stores.ArtifactStore,
         context: local.serverless_query_lake_read_context.Context,
         cancellation: Cancellation,
-        remaining_checks: usize = 262144,
-        remaining_reads: u64 = 512 * 1024 * 1024,
+        remaining_reads: u64 = tree.max_page_bytes,
         fn check(v: *@This()) !void {
             try v.context.ensureActive();
             try v.cancellation.check();
-            if (v.remaining_checks == 0) return error.LakeSidecarBuildLimitExceeded;
-            v.remaining_checks -= 1;
         }
         fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
             try v.check();
@@ -458,6 +455,7 @@ fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local
         }
         pub fn skip(v: *@This(), _: tree.Ref) !bool {
             try v.check();
+            v.remaining_reads = tree.max_page_bytes;
             return false;
         }
         pub fn visit(_: *@This(), _: tree.Ref) !void {}
@@ -479,7 +477,7 @@ fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local
             continue;
         }
         try validator.check();
-        try stores.chargeReadBudget(&validator.remaining_reads, segment.byte_len);
+        // loadDirectory independently bounds each decoded directory to 4 MiB.
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = backend, .cache = null, .context = context, .cancellation = cancellation }, segment);
