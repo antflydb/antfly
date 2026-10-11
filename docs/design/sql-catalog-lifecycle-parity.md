@@ -1525,3 +1525,38 @@ because allocator remapping changed allocation counts. It now uses the existing
 platform stable allocation-failure helper, as the adjacent publication campaign
 already does. Successful normal-allocator coverage, OOM propagation and leak
 assertions remain intact; no test was skipped or weakened.
+
+### Restartable unpublished physical plans
+
+`PrivateAddition.stageReservation` now retains the immutable candidate definition
+blob in the same transaction as the physical generation burn. It does not select
+the candidate head. Its caller must still stage the authenticated owner binding
+and outbox in that transaction and abort on any error. Conflicting bytes at the
+content-addressed candidate key are rejected rather than overwritten.
+
+`PrivateAddition.reopen` reconstructs an owned plan using a single read snapshot
+and expected heads/name supplied by the future durable owner binding. It checks
+the exact active reserved head, the next schema epoch, absence of the private
+generation from active bindings, canonical candidate bytes, unchanged existing
+bindings, and independent recompilation to the same candidate head. This is a
+cold restart operation, not a per-row or per-page parse. No job authentication or
+publication authority is inferred from matching physical bytes.
+
+Memory/LSM transaction coverage verifies that abort removes both the burn and
+private blob, bootstrap keeps public definitions empty, reload owns its data
+after the read transaction closes, and a higher reservation rejects old reloads.
+An additional actual LSM close/reopen test discards the prepared object, rebuilds
+from durable definitions, exercises every allocation failure, rejects missing or
+corrupt private blobs, and checks idempotent reservation and component-only
+installation. Candidate-blob cancellation/GC must join the future authenticated
+owner cancellation transaction; retaining the blob does not yet enable a native
+build worker, public SQL producer, or distributed UNIQUE enforcement.
+
+All six focused gates pass in Debug and ReleaseFast after this change: eight
+native candidate/private-addition tests, fourteen native catalog tests, five
+metadata candidate tests, six FK tests, ten publication tests plus the decoder
+floor test, and fifty namespace/recovery tests. Each mode completed 92 build
+steps with zero skips, failures or leaks. Formatting, diff and control-source
+catalog freshness checks pass. Repeated cases across gates are not separate SQL
+coverage credits; the original inventory and open public atomicity case remain
+unchanged.
