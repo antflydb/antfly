@@ -45,8 +45,10 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
-    /// Public Lite connections own a cached generation rather than a lifetime writer.
+    /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
+    /// Active connection context while its private SQL state is attached.
+    lite_connection_context: ?*@import("lite_connection.zig").Connection = null,
     lease_snapshot: bool = false,
     selected_table_name: ?[]u8 = null,
     selected_table_id: u64 = 0,
