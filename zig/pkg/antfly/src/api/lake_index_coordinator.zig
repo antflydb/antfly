@@ -400,12 +400,14 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     const stores = @import("../serverless/artifacts/store.zig");
     var checkpoint_store = store.artifactStore();
     checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(checkpoint_directory.artifact_id);
-    for ([_]enum { missing, corrupt, ambiguous, root, manifest, statistics, ambiguous_root, source }{ .missing, .corrupt, .ambiguous, .root, .manifest, .statistics, .ambiguous_root, .source }) |mode| {
+    const checkpoint_segment = try @import("lake_index_seekable_text.zig").loadDirectory(partial.arena.allocator(), .{ .store = resumed_artifacts, .cache = null, .context = .{}, .cancellation = .none }, partial_root.file_groups[0].segments[0]);
+    for ([_]enum { missing, corrupt, ambiguous, root, manifest, statistics, segment_directory, pack, ambiguous_root, source }{ .missing, .corrupt, .ambiguous, .root, .manifest, .statistics, .segment_directory, .pack, .ambiguous_root, .source }) |mode| {
         var restored = partial.value;
-        const child = mode == .root or mode == .manifest or mode == .statistics or mode == .ambiguous_root;
         const target: @import("lake_index_aggregate_artifact.zig").ChunkRef = switch (mode) {
             .root, .ambiguous_root => .{ .artifact_id = first_text.artifact.artifact_id, .checksum = first_text.artifact.checksum, .byte_len = first_text.artifact.byte_len },
             .manifest => partial_root.manifests[0],
+            .segment_directory => partial_root.file_groups[0].segments[0],
+            .pack => checkpoint_segment.blocks[0].retainedArtifact(),
             .statistics => stats: {
                 const ref = partial_root.term_statistics.?;
                 const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(partial_root.domain, ref);
@@ -445,14 +447,6 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             defer restored_source.deinit(a);
             mock.now += options.retry_ms;
         }
-        if (child and mode != .ambiguous_root) {
-            try std.testing.expectError(error.FileNotFound, reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options));
-            var failed_child = try catalog.parse(a, mock.table.lake_index_catalog_json);
-            defer failed_child.deinit();
-            try std.testing.expect(failed_child.value.checkpoint == null and failed_child.value.failure != null);
-            try std.testing.expectEqual(@as(u64, 2), failed_child.value.published.?.generation);
-            mock.now += options.retry_ms;
-        }
         try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
         try std.testing.expectEqual(prior_discards + @as(usize, if (mode == .source) 0 else 1), mock.discards);
         var rebuilt = try catalog.parse(a, mock.table.lake_index_catalog_json);
@@ -461,6 +455,13 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         try @import("lake_index_directory.zig").hydrateLazy(rebuilt.arena.allocator(), resumed_artifacts, &rebuilt.value.published.?, .none, null);
         const rebuilt_root = try @import("lake_index_native_text.zig").loadRoot(rebuilt.arena.allocator(), resumed_artifacts, rebuilt.value.published.?.declarations[0].artifact, .none, null);
         try std.testing.expectEqual(@as(usize, 2), rebuilt_root.file_groups.len);
+        var rebuilt_writer = try @import("lake_index_native_text.zig").loadWriter(a, resumed_artifacts, rebuilt_root, .none, null, null);
+        defer rebuilt_writer.deinit();
+        const rebuilt_snapshot = rebuilt_writer.acquireSnapshot();
+        defer rebuilt_snapshot.release();
+        const rebuilt_hits = try rebuilt_snapshot.search(a, "body", &.{"index"}, 10);
+        defer a.free(rebuilt_hits.hits);
+        try std.testing.expectEqual(@as(u32, 2), rebuilt_hits.total_count);
         checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(target.artifact_id);
         var repaired = try checkpoint_store.putWithCancellation(target_bytes, .none);
         defer repaired.deinit(a);
@@ -520,6 +521,50 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer refreshed.deinit();
     try std.testing.expectEqual(@as(u64, 7), refreshed.value.published.?.generation);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, refreshed.value.published.?, .none));
+    // A format refresh must recover even if only a published root or one of
+    // its retained packs disappeared. No checkpoint invalidation alone can
+    // remove these candidates; serving authority remains until replacement.
+    const healthy_catalog = try a.dupe(u8, mock.table.lake_index_catalog_json);
+    defer a.free(healthy_catalog);
+    try @import("lake_index_directory.zig").hydrateLazy(refreshed.arena.allocator(), artifacts, &refreshed.value.published.?, .none, null);
+    const healthy_ref = refreshed.value.published.?.declarations[0].artifact;
+    const healthy_root = try @import("lake_index_native_text.zig").loadRoot(refreshed.arena.allocator(), artifacts, healthy_ref, .none, null);
+    const healthy_segment = try @import("lake_index_seekable_text.zig").loadDirectory(refreshed.arena.allocator(), .{ .store = artifacts, .cache = null, .context = .{}, .cancellation = .none }, healthy_root.file_groups[0].segments[0]);
+    for ([_]@import("lake_index_aggregate_artifact.zig").ChunkRef{
+        .{ .artifact_id = healthy_ref.artifact_id, .checksum = healthy_ref.checksum, .byte_len = healthy_ref.byte_len },
+        healthy_segment.blocks[0].retainedArtifact(),
+    }) |target| {
+        const saved_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, target, .none, null);
+        defer a.free(saved_bytes);
+        try artifacts.delete(target.artifact_id);
+        var forced = refreshed.value;
+        forced.published.?.reader_protocol = 31;
+        const forced_catalog = try catalog.encode(a, forced);
+        a.free(mock.owned.?);
+        mock.owned = forced_catalog;
+        mock.table.lake_index_catalog_json = forced_catalog;
+        try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+        var repaired_publication = try catalog.parse(a, mock.table.lake_index_catalog_json);
+        defer repaired_publication.deinit();
+        try std.testing.expectEqual(@as(u64, 8), repaired_publication.value.published.?.generation);
+        try std.testing.expect(repaired_publication.value.pending == null and repaired_publication.value.failure == null);
+        try @import("lake_index_directory.zig").hydrateLazy(repaired_publication.arena.allocator(), artifacts, &repaired_publication.value.published.?, .none, null);
+        const repaired_root = try @import("lake_index_native_text.zig").loadRoot(repaired_publication.arena.allocator(), artifacts, repaired_publication.value.published.?.declarations[0].artifact, .none, null);
+        var repaired_writer = try @import("lake_index_native_text.zig").loadWriter(a, artifacts, repaired_root, .none, null, null);
+        defer repaired_writer.deinit();
+        const repaired_snapshot = repaired_writer.acquireSnapshot();
+        defer repaired_snapshot.release();
+        const repaired_hits = try repaired_snapshot.search(a, "body", &.{"index"}, 10);
+        defer a.free(repaired_hits.hits);
+        try std.testing.expectEqual(@as(u32, 2), repaired_hits.total_count);
+        // Restore the fixture to independently exercise each damaged child.
+        checkpoint_store.upload_scope = try stores.uploadScopeFromArtifactId(target.artifact_id);
+        var restored_artifact = try checkpoint_store.putWithCancellation(saved_bytes, .none);
+        defer restored_artifact.deinit(a);
+        a.free(mock.owned.?);
+        mock.owned = try a.dupe(u8, healthy_catalog);
+        mock.table.lake_index_catalog_json = mock.owned.?;
+    }
 }
 
 test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {

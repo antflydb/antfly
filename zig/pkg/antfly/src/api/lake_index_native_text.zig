@@ -300,6 +300,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.statistics_version == 1 and std.mem.eql(u8, &root.recipe, &recipe)) {
+                try validateReuse(a, store.*, root, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -311,6 +312,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.statistics_version != 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
+            try validateReuse(a, store.*, root, provider.context, cancellation);
             break root;
         } else null;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
@@ -428,6 +430,69 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try declarations.append(out, try publishRoot(a, out, store, want.name, root, cancellation));
     }
     return declarations.toOwnedSlice(out);
+}
+// Reusing manifests must prove their retained leaves still exist. HEAD checks
+// bound memory and avoid downloading the archive; normal serving continues to
+// authenticate posting ranges. Metadata trees are read and authenticated in
+// bounded pages, including descendants not touched by incremental updates.
+fn validateReuse(a: A, backend: stores.ArtifactStore, root: Root, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const Validator = struct {
+        a: A,
+        store: stores.ArtifactStore,
+        context: local.serverless_query_lake_read_context.Context,
+        cancellation: Cancellation,
+        remaining_checks: usize = 262144,
+        remaining_reads: u64 = 512 * 1024 * 1024,
+        fn check(v: *@This()) !void {
+            try v.context.ensureActive();
+            try v.cancellation.check();
+            if (v.remaining_checks == 0) return error.LakeSidecarBuildLimitExceeded;
+            v.remaining_checks -= 1;
+        }
+        fn leaf(v: *@This(), ref: artifacts.ChunkRef) !void {
+            try v.check();
+            var metadata = try v.store.statWithCancellationUsingAllocator(v.a, ref.artifact_id, v.cancellation);
+            defer metadata.deinit(v.a);
+            if (metadata.byte_len != ref.byte_len or !std.mem.eql(u8, metadata.artifact_id, ref.artifact_id) or !std.mem.eql(u8, metadata.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
+        }
+        pub fn skip(v: *@This(), _: tree.Ref) !bool {
+            try v.check();
+            return false;
+        }
+        pub fn visit(_: *@This(), _: tree.Ref) !void {}
+        fn pages(v: *@This(), domain: [32]u8, ref: ?tree.Ref) !void {
+            var writes: u64 = 0;
+            var pages_store: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = domain, .artifacts = &v.store, .cancellation = v.cancellation, .remaining_read_bytes = &v.remaining_reads, .remaining_write_bytes = &writes };
+            if (ref) |page| try tree.walkPostOrder(v.a, pages_store.store(), page, v, false);
+        }
+    };
+    var validator: Validator = .{ .a = a, .store = backend, .context = context, .cancellation = cancellation };
+    try validator.pages(root.domain, root.term_statistics);
+    for (root.file_groups) |group| {
+        for (group.summaries) |summary| try validator.pages(root.domain, summary);
+        for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
+    }
+    for (root.segments) |segment| {
+        if (!root.seekable) {
+            try validator.leaf(segment);
+            continue;
+        }
+        try validator.check();
+        try stores.chargeReadBudget(&validator.remaining_reads, segment.byte_len);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const directory = try @import("lake_index_seekable_text.zig").loadDirectory(scratch.allocator(), .{ .store = backend, .cache = null, .context = context, .cancellation = cancellation }, segment);
+        for ([_][]const @import("lake_index_seekable_text.zig").Piece{ directory.metadata, directory.blocks }) |pieces| {
+            var prior: ?artifacts.ChunkRef = null;
+            for (pieces) |piece| {
+                const retained = piece.retainedArtifact();
+                if (prior) |old| if (std.mem.eql(u8, old.artifact_id, retained.artifact_id)) continue;
+                try validator.leaf(retained);
+                prior = retained;
+            }
+        }
+    }
 }
 fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {
     var refs: std.ArrayList(artifacts.ChunkRef) = .empty;

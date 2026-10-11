@@ -132,10 +132,41 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     return buildWithLeaseAndEmbedding(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, null, null);
 }
 pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo) ![]u8 {
+    return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, true) catch |err| {
+        switch (err) {
+            error.LakeIndexArtifactUnavailable, error.ArtifactIntegrityMismatch => {},
+            else => return err,
+        }
+        try context.ensureActive();
+        try cancellation.check();
+        // Rebuild once without any derived reuse. Keep the serving publication
+        // in authority until its replacement commits, and never replay an
+        // ambiguous checkpoint CAS. Source failures do not enter this path.
+        if (lease) |owner| {
+            const latest = try owner.snapshot(owner.ptr, a);
+            defer a.free(latest.lake_index_catalog_json);
+            var saved = try catalog.parse(a, latest.lake_index_catalog_json);
+            defer saved.deinit();
+            if (saved.value.checkpoint != null) {
+                const discard = owner.discard_checkpoint orelse return err;
+                try discard(owner.ptr);
+            }
+            const fresh = try owner.snapshot(owner.ptr, a);
+            defer a.free(fresh.lake_index_catalog_json);
+            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
+        }
+        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
+    };
+}
+fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
     try context.ensureActive();
     try cancellation.check();
     var current = try catalog.parse(a, table.lake_index_catalog_json);
     defer current.deinit();
+    if (!reuse) {
+        current.value.published = null;
+        current.value.checkpoint = null;
+    }
     const attempt = current.value.pending orelse return error.LakeIndexPublicationFenceChanged;
     const started = try clock.now_ms(clock.ptr);
     if (started < attempt.started_at_ms or started >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
