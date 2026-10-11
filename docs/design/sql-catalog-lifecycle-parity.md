@@ -866,11 +866,21 @@ broader coordinator gate passes all 29 tests in both build modes. The PostgreSQL
 the original inventory remains 478 implemented, 136 rejected, 73 superseded
 and 899 unresolved, with no additional original-case completion claimed.
 
-Main's standalone pgwire DDL publication/ownership fix (PR #1070) is being
-integrated before publication of this follow-up. Its separate result and scratch
-allocators must be preserved through DDL dispatch, schema alteration and FK
+Main's standalone pgwire DDL publication/ownership fix (PR #1070) is merged
+before publication of this follow-up. Its separate result and scratch
+allocators are preserved through DDL dispatch, schema alteration and FK
 plan validation. Generated names remain compiler provenance until native
 owner-bound preparation and atomic admission; the older SQL-side name chooser
-is superseded, not run as a second independent naming authority. The combined
-SQL/catalog/standalone regression gates must pass on the resolved merge before
-it is pushed.
+is superseded, not run as a second independent naming authority.
+
+Qualification of the resolved merge passes: 708 native SQL contracts (three
+benchmark-only skips, zero failures/leaks), 25 catalog DDL tests and their
+selection audit, two read-admission tests, two standalone pgwire DDL tests,
+the mounted six-case PK restart campaign and the two-test three-voter FK
+failover campaign. Mounted campaigns have no skips or leaks. The SQL build
+wrapper exits successfully after both selected passes. Its first rerun exposed
+missing guidance on duplicate-index/constraint diagnostics; both now carry
+actionable hints without changing SQLSTATE or non-retryable semantics.
+The PostgreSQL 18 oracle passes all 14 tests again on the merged worktree.
+The original parity inventory is unchanged; this is qualified scoped work,
+not completion of the remaining SQL architecture.
