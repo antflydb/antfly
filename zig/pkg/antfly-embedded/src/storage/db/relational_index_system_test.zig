@@ -405,12 +405,12 @@ test "relational index build pages native owner control preserves committed cuts
     for ([_]*db_mod.DB{ &cancel_primary, &follower }) |db| {
         var manager = try db.core.initTxnManager();
         defer manager.deinit();
-        var write = try db.core.store.beginWriteTxn();
-        errdefer write.abort();
-        _ = try jobs.stageCanceledBeginWithReplay(&write, binding, &artifacts.candidate.inputs, null);
-        _ = try jobs.stageCanceledFencedWithReplay(&write, &manager, binding, null);
-        _ = try jobs.stageCanceledReservationWithReplay(&write, &manager, binding, &artifacts.candidate, &artifacts.addition, null);
-        try write.commit();
+        var burn_txn = try db.core.store.beginWriteTxn();
+        errdefer burn_txn.abort();
+        _ = try jobs.stageCanceledBeginWithReplay(&burn_txn, binding, &artifacts.candidate.inputs, null);
+        _ = try jobs.stageCanceledFencedWithReplay(&burn_txn, &manager, binding, null);
+        _ = try jobs.stageCanceledReservationWithReplay(&burn_txn, &manager, binding, &artifacts.candidate, &artifacts.addition, null);
+        try burn_txn.commit();
     }
     alloc.free(cancel_publisher.payload.?);
     cancel_publisher.payload = null;
