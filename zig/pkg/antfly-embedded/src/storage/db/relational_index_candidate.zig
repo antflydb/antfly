@@ -689,6 +689,20 @@ fn testPrivateClaimInventory(a: Allocator, store: *@import("../docstore.zig").Do
     defer prepared.deinit();
     try std.testing.expectEqual(@as(usize, 2), prepared.entries.len);
     {
+        const native = @import("relational_index_owner_control.zig");
+        var oversized = std.Io.Writer.Allocating.init(a);
+        defer oversized.deinit();
+        try oversized.writer.writeAll("{\"claims\":[");
+        for (0..claims.max_claims) |ordinal| {
+            if (ordinal != 0) try oversized.writer.writeAll(",");
+            try std.json.Stringify.value(first, .{}, &oversized.writer);
+        }
+        // A malformed 129th item must never be parsed; otherwise this reports
+        // UnexpectedToken instead of the bounded-container LengthMismatch.
+        try oversized.writer.writeAll(",null]}");
+        try std.testing.expectError(error.LengthMismatch, std.json.parseFromSlice(native.ClaimCommand, a, oversized.written(), .{}));
+    }
+    {
         var txn = try store.beginWriteTxn();
         defer txn.abort();
         const result = try prepared.stageOrdered(&txn, null);

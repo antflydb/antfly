@@ -3979,6 +3979,20 @@ pub fn storageOwnerNativeIndexControlJson(
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (request.operation == .claims) {
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (request.manifest.len != 0 or request.request_json.len == 0 or request.request_json.ptr == null or
+            request.request_json.len > native.max_claim_wire_bytes) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimCommand, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .invalid_argument,
+        };
+        defer parsed.deinit();
+        if (parsed.value.binding.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var prepared_claims = handle.db.prepareNativeIndexOwnerClaims(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+        defer prepared_claims.deinit();
+        return applyNativeIndexPreparedResponse(handle, &prepared_claims, out_response);
+    }
     // Headers/bindings contain only fixed-size identities. Large schema inputs
     // remain raw borrowed bytes rather than another JSON/base64 representation.
     if (request.request_json.len == 0 or request.request_json.len > 32 * 1024) return .invalid_argument;
@@ -4141,6 +4155,8 @@ fn applyNativeIndexPreparedResponse(handle: anytype, prepared: anytype, out_resp
         handle.db.applyPreparedNativeIndexOwnerCleanup(prepared, null)
     else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerCancellation)
         handle.db.applyPreparedNativeIndexOwnerCancellation(prepared, null)
+    else if (comptime @TypeOf(prepared.*) == db_mod.DB.PreparedNativeIndexOwnerClaims)
+        handle.db.applyPreparedNativeIndexOwnerClaims(prepared, null)
     else
         handle.db.applyPreparedNativeIndexOwnerControl(prepared, null)) catch |err|
         return storageOwnerStatusFromError(err);

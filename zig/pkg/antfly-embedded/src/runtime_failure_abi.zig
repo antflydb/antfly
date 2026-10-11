@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 63;
+pub const abi_version: u32 = 64;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -737,6 +737,23 @@ pub const Status = enum(u32) {
     catalog_publication_proof_pending = 777,
     seed_replica_policy_mismatch = 778,
     catalog_occupancy_not_ready = 779,
+    immutable_relational_index_definition_conflict = 780,
+    invalid_index_publication_candidate = 781,
+    invalid_private_index_cancellation = 782,
+    invalid_private_index_claim_inventory = 783,
+    invalid_private_index_claim_receipt = 784,
+    invalid_private_index_inputs = 785,
+    invalid_private_index_native_receipt = 786,
+    invalid_private_index_owner_job = 787,
+    invalid_relational_index_progress = 788,
+    missing_relational_index_definitions = 789,
+    private_index_cancellation_pending = 790,
+    private_index_cancellation_required = 791,
+    private_index_job_required = 792,
+    private_index_owner_job_changed = 793,
+    private_index_publication_canceled = 794,
+    private_index_publication_required = 795,
+    relational_index_catalog_schema_mismatch = 796,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

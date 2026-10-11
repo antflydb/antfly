@@ -88,6 +88,7 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.admitNativeIndexOwner(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.applyNativeIndexOwnerControl(std.testing.allocator, 7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.applyNativeIndexOwnerClaims(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cancelNativeIndexOwnerIntent(std.testing.allocator, 7, "rows", undefined, context));
         try std.testing.expectError(expected, source.cleanupNativeIndexOwner(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.collectNativeIndexOwnerGarbage(std.testing.allocator, 7, "rows", identity, context));
@@ -3615,6 +3616,42 @@ pub const ProvisionedKernelOwnerSource = struct {
             return error.IdentityNamespaceMismatch;
         try context.ensureActive();
         return lease;
+    }
+
+    /// Claim bytes and expected binding are not a remote capability. The
+    /// authenticated receiver independently obtains current metadata permission
+    /// before calling this leased physical adapter. Kernel apply rechecks the
+    /// durable job, actual receiving range and cancellation in its transaction.
+    pub fn applyNativeIndexOwnerClaims(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        command: native_index_control.ClaimCommand,
+        context: request_operation.RequestContext,
+    ) !std.json.Parsed(native_index_control.ClaimOutcome) {
+        try context.ensureActive();
+        try command.validate();
+        const binding = command.binding;
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, .{
+            .id = binding.id,
+            .plan_digest = binding.plan_digest,
+            .owner_digest = binding.owner_digest,
+            .ordinal = binding.ordinal,
+            .namespace = binding.fence.namespace,
+            .owner_group_id = binding.fence.owner_group_id,
+        }, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > native_index_control.max_claim_wire_bytes) return error.TransactionTooLarge;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerClaimsJson(table_name, encoded);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(native_index_control.ClaimOutcome, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer parsed.deinit();
+        try parsed.value.validateFor(command);
+        return parsed;
     }
 
     pub fn nativeIndexOwnerState(

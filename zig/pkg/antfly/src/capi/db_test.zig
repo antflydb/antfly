@@ -1346,13 +1346,92 @@ test "storage owner native index raw admission and bounded controls preserve loc
         defer prepared_claims.deinit();
         @memset(&text, 'x');
         try prepared_claims.preparePayload();
-        const claimed = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared_claims.command, .{});
+        defer a.free(encoded);
+        var claim_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{
+            .operation = .claims,
+            .table_name = .fromSlice("items"),
+            .request_json = .fromSlice(encoded),
+        };
+        var claim_response: kernel_owner_abi.OwnedBytes = .{};
+        claim_request.manifest = .fromSlice("not-permitted");
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.manifest = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const claimed_buffer = claim_response;
+        defer freeRawBuffer(claimed_buffer.ptr, claimed_buffer.len);
+        var parsed_claimed = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, claimed_buffer.slice(), .{});
+        defer parsed_claimed.deinit();
+        const claimed = parsed_claimed.value;
+        try claimed.validateFor(prepared_claims.command);
+        var invalid_receipt = claimed;
+        invalid_receipt.position.namespace.range_id += 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.duplicate = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
+        invalid_receipt.replication_pending = true;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
         try std.testing.expect(!claimed.duplicate and !claimed.replication_pending);
         try std.testing.expectEqual(@as(usize, 1), claimed.claims_added);
         try std.testing.expectEqual(@as(u64, 4), claimed.position.sequence);
         const duplicate = try handle.db.applyPreparedNativeIndexOwnerClaims(&prepared_claims, null);
         try std.testing.expect(duplicate.duplicate);
         try std.testing.expectEqual(claimed.position, duplicate.position);
+        {
+            var stale = prepared_claims.command;
+            stale.binding.id[0] ^= 1;
+            const rejected = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.private_index_owner_job_changed, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+            stale.binding = prepared_claims.command.binding;
+            stale.binding.fence.owner_group_id += 1;
+            const wrong_owner = try std.json.Stringify.valueAlloc(a, stale, .{});
+            defer a.free(wrong_owner);
+            claim_request.request_json = .fromSlice(wrong_owner);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            var different = prepared_claims.command.claims[0];
+            different.parent_key = "conflicting-owner";
+            const rejected = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{ .binding = reserved_binding, .claims = &.{different} }, .{});
+            defer a.free(rejected);
+            claim_request.request_json = .fromSlice(rejected);
+            try std.testing.expectEqual(kernel_owner_abi.Status.unique_constraint_violation, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        {
+            const forged = try std.json.Stringify.valueAlloc(a, .{ .binding = reserved_binding, .claims = prepared_claims.command.claims, .position = claimed.position }, .{});
+            defer a.free(forged);
+            claim_request.request_json = .fromSlice(forged);
+            try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+            try std.testing.expect(claim_response.ptr == null);
+        }
+        // Claim bodies have their own bounded lane, not the fixed 32-KiB
+        // control-header limit. Oversized lengths fail before pointer access.
+        claim_request.request_json = .{ .len = local.storage_db_relational_index_owner_control.max_claim_wire_bytes + 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        claim_request.request_json = .{ .len = 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        try std.testing.expect(claim_response.ptr == null);
+        const padded = try a.alloc(u8, 32 * 1024 + encoded.len);
+        defer a.free(padded);
+        @memset(padded[0 .. 32 * 1024], ' ');
+        @memcpy(padded[32 * 1024 ..], encoded);
+        claim_request.request_json = .fromSlice(padded);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &claim_request, &claim_response));
+        const retried_buffer = claim_response;
+        defer freeRawBuffer(retried_buffer.ptr, retried_buffer.len);
+        var retried = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerClaimOutcome, a, retried_buffer.slice(), .{});
+        defer retried.deinit();
+        try std.testing.expect(retried.value.duplicate);
+        try std.testing.expectEqual(claimed.position, retried.value.position);
         const Frame = local.storage_db_relational_index_owner_control.Frame;
         var wire = try std.json.parseFromSlice(struct { schema_version: u32, request: struct {}, index_owner_control: Frame }, a, try prepared_claims.finalizePayload(claimed.position), .{});
         defer wire.deinit();
@@ -1410,6 +1489,18 @@ test "storage owner native index raw admission and bounded controls preserve loc
     var late = try handle.db.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
     defer late.deinit();
     try std.testing.expectError(error.PrivateIndexPublicationCanceled, handle.db.applyPreparedNativeIndexOwnerControl(&late, null));
+    {
+        var reserved_binding = binding;
+        reserved_binding.phase = .reserved;
+        const encoded = try std.json.Stringify.valueAlloc(a, db_mod.DB.NativeIndexOwnerClaimCommand{
+            .binding = reserved_binding,
+            .claims = &.{.{ .tuple = "late-claim", .parent_table = "items", .parent_key = "late-owner", .schema_version = binding.physical_candidate.schema_version }},
+        }, .{});
+        defer a.free(encoded);
+        var rejected: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_publication_canceled, server_api.storageOwnerNativeIndexControlJson(id, &.{ .operation = .claims, .table_name = .fromSlice("items"), .request_json = .fromSlice(encoded) }, &rejected));
+        try std.testing.expect(rejected.ptr == null);
+    }
     request.operation = .cancel_cleanup;
     request.request_json = .fromSlice(identity_json);
     for (0..2) |attempt| {

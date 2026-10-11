@@ -76,6 +76,39 @@ pub const ClaimCommand = struct {
     binding: jobs.Binding,
     claims: []const integrity.Claim,
 
+    /// Shared by the compiled owner and normalized replay decoder. Reject a
+    /// 129th record before parsing/allocating it; a wire-size ceiling alone
+    /// otherwise admits thousands of tiny structs before semantic validation.
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ClaimCommand {
+        const wire = try std.json.innerParse(struct { binding: jobs.Binding, claims: BoundedClaims }, alloc, source, options);
+        return .{ .binding = wire.binding, .claims = wire.claims.items };
+    }
+
+    const BoundedClaims = struct {
+        items: []const integrity.Claim,
+
+        pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !BoundedClaims {
+            if (try source.next() != .array_begin) return error.UnexpectedToken;
+            var items: std.ArrayList(integrity.Claim) = .empty;
+            var bytes: usize = 0;
+            var limited = options;
+            limited.max_value_len = @min(options.max_value_len.?, private_claims.max_bytes);
+            while (try source.peekNextTokenType() != .array_end) {
+                if (items.items.len >= private_claims.max_claims) return error.LengthMismatch;
+                const claim = try std.json.innerParse(integrity.Claim, alloc, source, limited);
+                if (claim.state != .live or claim.action != .restrict or claim.target_tuple != null or
+                    !std.mem.allEqual(u8, &claim.action_id, 0)) return error.UnexpectedToken;
+                bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.Overflow;
+                for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.Overflow;
+                if (bytes > private_claims.max_bytes) return error.LengthMismatch;
+                try items.append(alloc, claim);
+            }
+            _ = try source.next();
+            if (items.items.len == 0) return error.LengthMismatch;
+            return .{ .items = try items.toOwnedSlice(alloc) };
+        }
+    };
+
     pub fn validate(self: ClaimCommand) !void {
         _ = try self.binding.encode();
         if (self.binding.authority != .native or self.binding.phase != .reserved or
@@ -193,6 +226,20 @@ pub const ClaimOutcome = struct {
     claims_added: usize = 0,
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
+
+    /// Physical delivery acknowledgement only, never a publication signature.
+    /// Check a decoded provider result before a receiver can use its cut.
+    pub fn validateFor(self: ClaimOutcome, command: ClaimCommand) !void {
+        try command.validate();
+        const actual = self.binding.encode() catch return error.InvalidPrivateIndexClaimReceipt;
+        const expected = try command.binding.encode();
+        self.position.validate() catch return error.InvalidPrivateIndexClaimReceipt;
+        if (!std.mem.eql(u8, &actual, &expected) or
+            !self.position.namespace.eql(command.binding.fence.namespace) or
+            self.claims_added > command.claims.len or
+            self.duplicate != (self.claims_added == 0) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexClaimReceipt;
+    }
 };
 
 pub const PreparedClaims = struct {

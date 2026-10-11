@@ -542,6 +542,18 @@ pub const Owner = struct {
         return response;
     }
 
+    /// Private kernel delivery only; metadata permission and the actual leased
+    /// hash-owner placement must be established by the server receiver.
+    pub fn nativeIndexOwnerClaimsJson(self: *Owner, table_name: []const u8, command_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .claims,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(command_json),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
