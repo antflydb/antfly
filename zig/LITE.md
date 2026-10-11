@@ -15,6 +15,10 @@ antfly lite <command>
 The embedded library and the storage engine use the product name Antfly Lite.
 The server topology remains Antfly Standalone.
 
+SQLite relational data can be migrated with the separate `antfly-migrate`
+executable. Its [design and plan contract](../docs/design/sqlite-aflite-migration.md)
+describe explicit schema mappings, value verification, and staged publication.
+
 ## Goals
 
 - Provide an embedded Antfly database with no server process and a full

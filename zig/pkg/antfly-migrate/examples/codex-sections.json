@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "sources": [{"name": "state", "path": "state.sqlite"}],
+  "destination": "sections.aflite",
+  "schema": {
+    "statements": ["CREATE TABLE codex_thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL, appearance TEXT)"]
+  },
+  "tables": [{
+    "source": "state",
+    "query": "SELECT id, name, appearance FROM thread_sections ORDER BY id",
+    "target": "codex_thread_sections",
+    "key": ["id"],
+    "columns": [
+      {"name": "id", "from": "id", "type": "text", "nullable": false},
+      {"name": "name", "from": "name", "type": "text", "nullable": false},
+      {"name": "appearance", "from": "appearance", "type": "text"}
+    ]
+  }],
+  "batch_rows": 100,
+  "batch_bytes": 1048576
+}
