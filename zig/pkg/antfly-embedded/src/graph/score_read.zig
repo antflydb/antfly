@@ -62,12 +62,22 @@ pub fn populate(
                             // Prepared ownership must not raise the minimum
                             // memory needed by the streaming read path.
                             plan.deinit();
+                            // A failed read may leave scratch capacity in this
+                            // scope. Close it before admitting the streaming retry.
+                            active.close();
+                            scope = null;
+                            scope = try txn.openReadScope(caller_alloc);
                             for (columns) |column| @memset(column, null);
                             break :prepared_read;
                         },
                         else => return err,
                     };
                     return .{ .keys = plan.read_keys.len, .batches = if (plan.read_keys.len == 0) 0 else 1 };
+                } else {
+                    // Plan construction itself can fail after partial work.
+                    active.close();
+                    scope = null;
+                    scope = try txn.openReadScope(caller_alloc);
                 }
             };
         }

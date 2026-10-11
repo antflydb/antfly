@@ -1154,7 +1154,10 @@ pub const ArtifactLease = struct {
     }
 };
 
+var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
+
 pub const Store = struct {
+    score_cache_owner: u64 = 0,
     allocator: Allocator,
     workspace_reclaimer: ?u64 = null,
     metadata_pool: @import("metadata_pool.zig").MetadataPool = .{},
@@ -1237,6 +1240,7 @@ pub const Store = struct {
         else
             try native.NativeFile.openWithOptions(allocator, path, native_opts);
         var result: Store = .{
+            .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
             .allocator = allocator,
             .file = file,
             .read_only = opts.read_only,
@@ -1290,6 +1294,7 @@ pub const Store = struct {
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
         return .{
+            .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
             .allocator = allocator,
             .file = file,
             .read_only = false,
@@ -2911,6 +2916,7 @@ pub const Txn = struct {
         scratch: read_scratch,
         batch_scratch: read_scratch,
         native_batch: native.DocumentBatchReadState = .{},
+        discard_workspace: bool = false,
 
         pub fn metadataAllocator(self: *const @This(), fallback: Allocator) Allocator {
             // Opaque caller allocators keep their own accounting/failure policy.
@@ -2937,7 +2943,12 @@ pub const Txn = struct {
             return if (self.workspace) |w| &w.batch else &self.batch_scratch;
         }
         fn nativeState(self: *@This()) *native.DocumentBatchReadState {
-            return if (self.workspace) |w| &w.native_state else &self.native_batch;
+            const state = if (self.workspace) |w| &w.native_state else &self.native_batch;
+            if (self.parent.store) |store| state.binding = .{
+                .owner = store.score_cache_owner,
+                .generation = if (self.parent.read_generation) |g| g.owner_generation else store.assessment_generation,
+            };
+            return state;
         }
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
@@ -2959,6 +2970,13 @@ pub const Txn = struct {
         }
 
         pub fn visitManySortedScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
+            return self.visitScores(keys, sink) catch |err| {
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded) self.discard_workspace = true;
+                return err;
+            };
+        }
+
+        fn visitScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
             var unique = true;
             for (keys, 0..) |key, i| {
                 if (i == 0) continue;
@@ -2972,43 +2990,73 @@ pub const Txn = struct {
                 defer self.batchScratch().reset();
                 return (try self.parent.readFile()).visitScoresAtCheckpointWithState(self.batchScratch().allocator(), self.parent.checkpoint, keys, sink, self.nativeState());
             }
-            const scores = try self.scratch.allocator().alloc(?f64, keys.len);
-            try self.getManySortedScores(keys, scores);
-            for (scores, 0..) |score, i| if (score) |value| sink.write(sink.context, i, value);
+            defer self.batchScratch().reset();
+            const temporary = self.batchScratch().allocator();
+            const physical_keys = try temporary.alloc([]const u8, keys.len);
+            const positions = try temporary.alloc(usize, keys.len);
+            var namespace_bytes: usize = 0;
+            if (self.parent.prefix.len != 0) for (keys, 0..) |key, index| {
+                if (index != 0 and std.mem.eql(u8, keys[index - 1], key)) continue;
+                namespace_bytes = std.math.add(usize, namespace_bytes, self.parent.prefix.len) catch return error.InvalidBatch;
+                namespace_bytes = std.math.add(usize, namespace_bytes, key.len) catch return error.InvalidBatch;
+            };
+            const encoded = try temporary.alloc(u8, namespace_bytes);
+            var encoded_offset: usize = 0;
+            var count: usize = 0;
+            var i: usize = 0;
+            while (i < keys.len) {
+                var end = i + 1;
+                while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {}
+                const full = if (self.parent.prefix.len == 0) keys[i] else blk: {
+                    const begin = encoded_offset;
+                    @memcpy(encoded[encoded_offset..][0..self.parent.prefix.len], self.parent.prefix);
+                    encoded_offset += self.parent.prefix.len;
+                    @memcpy(encoded[encoded_offset..][0..keys[i].len], keys[i]);
+                    encoded_offset += keys[i].len;
+                    break :blk encoded[begin..encoded_offset];
+                };
+                if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |raw| {
+                        const score = try native.decodeScore(raw);
+                        for (i..end) |index| sink.write(sink.context, index, score);
+                    }
+                } else {
+                    physical_keys[count] = full;
+                    positions[count] = i;
+                    count += 1;
+                }
+                i = end;
+            }
+            if (count == 0) return;
+            const Output = struct {
+                keys: []const []const u8,
+                positions: []const usize,
+                sink: backend_types.ScoreSink,
+                fn write(ctx: *anyopaque, index: usize, score: f64) void {
+                    const out: *@This() = @ptrCast(@alignCast(ctx));
+                    const start = out.positions[index];
+                    var end = start + 1;
+                    while (end < out.keys.len and std.mem.eql(u8, out.keys[start], out.keys[end])) : (end += 1) {}
+                    for (start..end) |logical| out.sink.write(out.sink.context, logical, score);
+                }
+            };
+            var output = Output{ .keys = keys, .positions = positions[0..count], .sink = sink };
+            return (try self.parent.readFile()).visitScoresAtCheckpointWithState(temporary, self.parent.checkpoint, physical_keys[0..count], .{ .context = &output, .write = Output.write }, self.nativeState());
         }
 
         pub fn getManySortedScores(self: *@This(), keys: []const []const u8, scores: []?f64) !void {
             if (keys.len != scores.len) return error.InvalidBatch;
             @memset(scores, null);
             errdefer @memset(scores, null);
-            var unique = true;
-            for (keys, 0..) |key, i| {
-                if (i == 0) continue;
-                switch (std.mem.order(u8, keys[i - 1], key)) {
-                    .gt => return error.InvalidBatch,
-                    .eq => unique = false,
-                    .lt => {},
+            const Output = struct {
+                scores: []?f64,
+                fn write(ctx: *anyopaque, index: usize, score: f64) void {
+                    const out: *@This() = @ptrCast(@alignCast(ctx));
+                    out.scores[index] = score;
                 }
-            }
-            defer self.batchScratch().reset();
-            const temporary = self.batchScratch().allocator();
-            if (unique and self.parent.prefix.len == 0 and self.parent.pending_count == 0) {
-                return (try self.parent.readFile()).getScoresAtCheckpointWithState(temporary, self.parent.checkpoint, keys, scores, self.nativeState());
-            }
-            const slots = try temporary.alloc([8]u8, keys.len);
-            const buffers = try temporary.alloc([]u8, keys.len);
-            const values = try temporary.alloc(?[]const u8, keys.len);
-            for (slots, buffers) |*slot, *buffer| buffer.* = slot;
-            // Keep fallback metadata separate: readBatch resets its own arena.
-            var fallback = try self.parent.openReadScope(self.scratch.arena.child_allocator);
-            defer fallback.close();
-            fallback.getManySortedInto(keys, buffers, values) catch |err| switch (err) {
-                error.BufferTooSmall => return error.InvalidGraphMetricScore,
-                else => return err,
             };
-            for (values, scores) |value, *score| if (value) |raw| {
-                score.* = try native.decodeScore(raw);
-            };
+            var output = Output{ .scores = scores };
+            return self.visitManySortedScores(keys, .{ .context = &output, .write = Output.write });
         }
 
         fn readBatch(self: *@This(), keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8) !void {
@@ -3081,7 +3129,10 @@ pub const Txn = struct {
             self.scratch.deinit();
             self.batch_scratch.deinit();
             self.native_batch.deinit();
-            if (self.workspace) |w| self.parent.store.?.returnWorkspace(w);
+            if (self.workspace) |w| {
+                if (self.discard_workspace) w.discardRetainedStorage();
+                self.parent.store.?.returnWorkspace(w);
+            }
             self.* = undefined;
         }
     };
@@ -6297,7 +6348,7 @@ test "lite fused scores validate overlays duplicates prefixes and malformed valu
     defer store.close();
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
-    try store.file.putDocumentBatch(&.{ .{ .key = "p\x00a", .value = &raw }, .{ .key = "p\x00b", .value = "bad" } });
+    try store.file.putDocumentBatch(&.{ .{ .key = "p\x00a", .value = &raw }, .{ .key = "p\x00b", .value = "bad" }, .{ .key = "p\x00d", .value = &raw } });
     var txn = try Txn.openWriteWithPrefix(&store, "p\x00");
     defer txn.abort();
     try txn.put("c", &raw);
@@ -6307,12 +6358,30 @@ test "lite fused scores validate overlays duplicates prefixes and malformed valu
     var scores: [3]?f64 = undefined;
     try scope.getManySortedScores(&.{ "a", "c", "c" }, &scores);
     try std.testing.expectEqualSlices(?f64, &.{ null, 2, 2 }, &scores);
+    const Output = struct {
+        scores: []?f64,
+        fn write(ctx: *anyopaque, index: usize, score: f64) void {
+            const out: *@This() = @ptrCast(@alignCast(ctx));
+            out.scores[index] = score;
+        }
+    };
+    var output = Output{ .scores = &scores };
+    const sink = backend_types.ScoreSink{ .context = &output, .write = Output.write };
+    @memset(&scores, null);
+    try scope.visitManySortedScores(&.{ "a", "c", "c" }, sink);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 2, 2 }, &scores);
+    @memset(&scores, null);
+    try scope.visitManySortedScores(&.{ "c", "d", "d" }, sink);
+    try std.testing.expectEqualSlices(?f64, &.{ 2, 2, 2 }, &scores);
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.visitManySortedScores(&.{ "b", "c", "c" }, sink));
+    try std.testing.expectError(error.InvalidBatch, scope.visitManySortedScores(&.{ "c", "b", "a" }, sink));
     try std.testing.expectError(error.InvalidGraphMetricScore, scope.getManySortedScores(&.{ "b", "c", "c" }, &scores));
     for (scores) |score| try std.testing.expect(score == null);
     try std.testing.expectError(error.InvalidBatch, scope.getManySortedScores(&.{ "c", "b", "a" }, &scores));
     std.mem.writeInt(u64, &raw, @bitCast(std.math.nan(f64)), .little);
     try txn.put("c", &raw);
     try std.testing.expectError(error.InvalidGraphMetricScore, scope.getManySortedScores(&.{ "a", "c", "c" }, &scores));
+    try std.testing.expectError(error.InvalidGraphMetricScore, scope.visitManySortedScores(&.{ "a", "c", "c" }, sink));
 }
 
 test "lite fused graph visitors preserve reordered rows duplicate columns and erased scopes" {
@@ -6823,4 +6892,257 @@ test "lite metadata nested backing pressure skips busy owners and retries after 
     const bytes = try alloc.alloc(u8, 2048);
     alloc.free(bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "lite prepared logical cache credit is not physical reclaim progress" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backing = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_block_table_cache, a, 1);
+    defer backing.deinit();
+    var pool = @import("metadata_pool.zig").MetadataPool{};
+    defer pool.deinit();
+    const alloc = pool.allocator(backing.threadSafeAllocator(), &manager);
+    const node = try alloc.alloc(u8, 16);
+    const active = try alloc.alloc(u8, 16);
+    defer alloc.free(active);
+    alloc.free(node);
+    _ = backing.releaseUnusedCreditThreadSafe();
+    var second_budget = resource_manager_mod.BudgetedAllocator.init(&manager, .lite_docstore_snapshot_cache, a, 1);
+    defer second_budget.deinit();
+    const Other = struct {
+        budget: *resource_manager_mod.BudgetedAllocator,
+        bytes: ?[]u8,
+        fn reclaim(ctx: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const bytes = self.bytes orelse return 0;
+            self.budget.allocator().free(bytes);
+            self.bytes = null;
+            return bytes.len;
+        }
+    };
+    var other = Other{ .budget = &second_budget, .bytes = try second_budget.allocator().alloc(u8, 32 * 1024) };
+    defer if (other.bytes) |bytes| second_budget.allocator().free(bytes);
+    _ = second_budget.releaseUnusedCreditThreadSafe();
+    const First = struct {
+        fn reclaim(ctx: *anyopaque, bytes: u64) u64 {
+            const p: *@import("metadata_pool.zig").MetadataPool = @ptrCast(@alignCast(ctx));
+            const freed = p.reclaim(bytes);
+            if (freed != 0) if (resource_manager_mod.BudgetedAllocator.fromAllocator(p.backing.?)) |owner| {
+                _ = owner.releaseUnusedCreditThreadSafe();
+            };
+            return freed;
+        }
+    };
+    const first_id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &pool, First.reclaim);
+    defer manager.unregisterReclaimer(first_id);
+    const second_id = try manager.registerReclaimer(.lite_docstore_snapshot_cache, &other, Other.reclaim);
+    defer manager.unregisterReclaimer(second_id);
+    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+    const before = manager.snapshot().memory.used_bytes;
+    var request = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .dense_search_working_set, a, 1);
+    defer request.deinit();
+    const result = request.threadSafeAllocator().alloc(u8, 8192);
+    if (result) |bytes| request.threadSafeAllocator().free(bytes) else |_| {}
+    const after = manager.snapshot().memory.used_bytes;
+    std.debug.print("FRESH_RECLAIM request_ok={any} physical_freed={d} remaining_idle={any} requests={d}\n", .{ if (result) |_| true else |_| false, before - after, other.bytes != null, manager.reclaim_requests.load(.monotonic) });
+    _ = try result;
+    try std.testing.expect(other.bytes == null);
+    try std.testing.expect(before - after >= 8192);
+    _ = Other.reclaim(&other, 8192);
+    const bytes = try request.threadSafeAllocator().alloc(u8, 8192);
+    request.threadSafeAllocator().free(bytes);
+}
+
+test "lite prepared namespaced prepared fallback memory floor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var keys: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&keys, &nodes, &docs, 0..) |*key, *node, *doc, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &raw };
+    }
+    const PlainScope = struct {
+        inner: Txn.ReadScope,
+        pub fn close(self: *@This()) void {
+            self.inner.close();
+        }
+        pub fn reset(self: *@This()) void {
+            self.inner.reset();
+        }
+        pub fn getManySorted(self: *@This(), k: []const []const u8, values: []?[]const u8) !void {
+            return self.inner.getManySorted(k, values);
+        }
+        pub fn workingAllocator(self: *@This()) Allocator {
+            return self.inner.workingAllocator();
+        }
+        pub fn visitManySortedScores(self: *@This(), k: []const []const u8, sink: backend_types.ScoreSink) !void {
+            return self.inner.visitManySortedScores(k, sink);
+        }
+    };
+    const PlainTxn = struct {
+        inner: *Txn,
+        pub fn getManySorted(self: *@This(), k: []const []const u8, values: []?[]const u8) !void {
+            return self.inner.getManySorted(k, values);
+        }
+        pub fn openReadScope(self: *@This(), allocator: Allocator) !PlainScope {
+            return .{ .inner = try self.inner.openReadScope(allocator) };
+        }
+    };
+    var regressions: usize = 0;
+    for (24..81) |step| {
+        const limit = step * 2048;
+        var successes: [2]bool = undefined;
+        for (0..2) |mode| {
+            const name = try std.fmt.allocPrint(a, "ns-{d}-{d}.aflite", .{ limit, mode });
+            defer a.free(name);
+            const path = try testPath(a, tmp, name);
+            defer a.free(path);
+            var limits = resource_manager_mod.Options.defaultBudgets();
+            limits[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = limit };
+            var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+            defer manager.deinit(a);
+            var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+            defer store.close();
+            try store.file.putDocumentBatch(&docs);
+            var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+            defer query.deinit();
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var columns: [512]?f64 = undefined;
+            var plain = PlainTxn{ .inner = &txn };
+            const result = if (mode == 0) @import("../../graph/score_read.zig").populate(query.allocator(), &plain, &.{""}, &nodes, &.{&columns}) else @import("../../graph/score_read.zig").populate(query.allocator(), &txn, &.{""}, &nodes, &.{&columns});
+            successes[mode] = if (result) |_| true else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => false,
+                else => return err,
+            };
+            if (successes[mode]) for (columns) |score| try std.testing.expectEqual(@as(?f64, 3), score);
+        }
+        if (successes[0] and !successes[1]) {
+            regressions += 1;
+            std.debug.print("FRESH_NS_FLOOR limit={d} baseline_ok=true prepared_ok=false\n", .{limit});
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), regressions);
+}
+
+test "lite prepared namespaced graph measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prepared-measure.aflite");
+    defer a.free(path);
+    var file_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = file_budget.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var score: [8]u8 = undefined;
+    std.mem.writeInt(u64, &score, @bitCast(@as(f64, 3)), .little);
+    for (&docs, &key_storage, &nodes, 0..) |*doc, *key, *node, i| {
+        @memcpy(key[0..3], "ns\x00");
+        node.* = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+        key[11] = 0;
+        key[12] = 0;
+        doc.* = .{ .key = key, .value = &score };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [512]?f64 = undefined;
+    const reader = @import("../../graph/score_read.zig");
+    var reversed = nodes;
+    std.mem.reverse([]const u8, &reversed);
+    var shuffled = nodes;
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().shuffle([]const u8, &shuffled);
+    inline for (.{0}) |varying| {
+        inline for (.{ false, true }) |erased| {
+            for (0..5) |_| {
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, &nodes, &.{&columns});
+            }
+            const before = file_budget.alloc_calls;
+            const cpu_before = std.posix.getrusage(0);
+            for (0..5000) |i| {
+                const requested_nodes = if (varying == 0 or i % 2 == 1) &nodes else if (varying == 1) &reversed else &shuffled;
+                const raw = try Txn.openReadWithPrefix(&store, "ns\x00");
+                var txn = if (erased) try backend_erased.readTxnFrom(alloc, raw) else raw;
+                defer txn.abort();
+                _ = try reader.populate(alloc, &txn, &.{""}, requested_nodes, &.{&columns});
+                for (columns) |value| try std.testing.expectEqual(@as(?f64, 3), value);
+            }
+            const cpu_after = std.posix.getrusage(0);
+            const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+            std.debug.print("LITE_NAMESPACED_MEASURE erased={any} varying={any} queries=5000 keys=512 cpu_us={d} file_allocations={d} scope_bytes={d}\n", .{ erased, varying, cpu_us, file_budget.alloc_calls - before, @sizeOf(Txn.ReadScope) });
+            try std.testing.expectEqual(@as(usize, 0), file_budget.alloc_calls - before);
+        }
+    }
+}
+
+test "lite prepared resolved scores fence namespaces vacuum and reopened owners" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "resolved-generations.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    var store_open = true;
+    defer if (store_open) store.close();
+    const reader = @import("../../graph/score_read.zig");
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 2)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "p\x00a\x00\x00", .value = &raw }});
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 9)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "q\x00a\x00\x00", .value = &raw }});
+    var scores: [2]?f64 = undefined;
+    var old = try Txn.openReadWithPrefix(&store, "p\x00");
+    var old_open = true;
+    defer if (old_open) old.abort();
+    _ = try reader.populate(a, &old, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, null }, &scores);
+    {
+        var other = try Txn.openReadWithPrefix(&store, "q\x00");
+        defer other.abort();
+        _ = try reader.populate(a, &other, &.{""}, &.{ "a", "missing" }, &.{&scores});
+        try std.testing.expectEqualSlices(?f64, &.{ 9, null }, &scores);
+    }
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "p\x00");
+        errdefer write.abort();
+        try write.put("a\x00\x00", &raw);
+        try write.put("missing\x00\x00", &raw);
+        try write.commit();
+    }
+    _ = try store.vacuum();
+    {
+        var fresh = try Txn.openReadWithPrefix(&store, "p\x00");
+        defer fresh.abort();
+        _ = try reader.populate(a, &fresh, &.{""}, &.{ "a", "missing" }, &.{&scores});
+        try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &scores);
+    }
+    _ = try reader.populate(a, &old, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 2, null }, &scores);
+    old.abort();
+    old_open = false;
+    const owner = store.score_cache_owner;
+    store.close();
+    store_open = false;
+    store = try Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store_open = true;
+    try std.testing.expect(store.score_cache_owner != owner);
+    var reopened = try Txn.openReadWithPrefix(&store, "p\x00");
+    defer reopened.abort();
+    _ = try reader.populate(a, &reopened, &.{""}, &.{ "a", "missing" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 9, 9 }, &scores);
 }

@@ -28,9 +28,11 @@ pub const Workspace = struct {
     query_reservation: ?resources.BudgetedAllocator.BorrowedScratch = null,
     live: usize = 0,
     busy: bool = false,
+    allocation_failed: bool = false,
     batch: Scratch,
     graph: Scratch,
     native_state: native.DocumentBatchReadState,
+    resolved_scores: native.ResolvedScoreBatch = .{},
     score_plan: @import("../prepared_score_plan.zig").PreparedScorePlan = .{},
 
     pub fn create(backing: Allocator, manager: ?*resources.ResourceManager) !*Workspace {
@@ -45,8 +47,9 @@ pub const Workspace = struct {
             }
         }
         const a = self.allocator();
-        self.batch = Scratch.init(a, 256 * 1024);
-        self.graph = Scratch.init(a, 256 * 1024);
+        self.batch = Scratch.init(self.arenaAllocator(), 256 * 1024);
+        self.graph = Scratch.init(self.arenaAllocator(), 256 * 1024);
+        self.native_state.resolved = &self.resolved_scores;
         self.native_state.allocator = a;
         self.native_state.path.allocator = a;
         return self;
@@ -70,9 +73,24 @@ pub const Workspace = struct {
         };
     }
 
+    /// Failed speculative reads must not raise the streaming memory floor.
+    /// Call only after the scope has finished using its working allocations.
+    pub fn discardRetainedStorage(self: *Workspace) void {
+        self.score_plan.deinit();
+        self.native_state.deinit();
+        self.batch.deinit();
+        self.graph.deinit();
+        self.allocation_failed = false;
+        const a = self.allocator();
+        self.batch = Scratch.init(self.arenaAllocator(), 256 * 1024);
+        self.graph = Scratch.init(self.arenaAllocator(), 256 * 1024);
+        self.native_state = .{ .allocator = a, .path = .{ .allocator = a }, .resolved = &self.resolved_scores };
+    }
+
     pub fn end(self: *Workspace) void {
-        // No file, checkpoint, or cache lease survives a query. Index frames
-        // retain only independently owned storage and its allocator.
+        if (self.allocation_failed) self.discardRetainedStorage();
+        // No file or cache lease survives a query. Snapshot identity is numeric;
+        // index frames retain independently owned storage and its allocator.
         self.native_state.detach();
         self.batch.reset();
         self.graph.reset();
@@ -100,13 +118,23 @@ pub const Workspace = struct {
     fn heap(self: *Workspace) Allocator {
         return if (self.budget) |*b| b.allocator() else self.backing;
     }
+    // Arena growth must not depend on whether a failed speculative allocation
+    // left a remappable heap block behind. Stable chunks give a clean retry the
+    // same memory floor as a cold read. Native owned buffers still resize.
+    fn arenaAllocator(self: *Workspace) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
     pub fn allocator(self: *Workspace) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Workspace = @ptrCast(@alignCast(ctx));
-        self.admit(std.math.add(usize, self.live, len) catch return null) catch return null;
+        self.admit(std.math.add(usize, self.live, len) catch return null) catch {
+            self.allocation_failed = true;
+            return null;
+        };
         const p = self.heap().rawAlloc(len, alignment, ra) orelse {
+            self.allocation_failed = true;
             self.restoreAdmission();
             return null;
         };

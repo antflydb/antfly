@@ -1119,11 +1119,72 @@ pub fn decodeScore(raw: []const u8) !f64 {
     return score;
 }
 
-/// Scope-owned working storage. No page views survive a call; bounded buffers
+/// Independently owned offsets for one exact request at one pinned snapshot.
+/// No reader, descriptor, cache pin, or caller key is retained. Opportunistic
+/// construction is bounded; failure leaves the streaming resolver available.
+pub const ResolvedScoreBatch = struct {
+    const Binding = struct { owner: u64, generation: u64 };
+    storage: ?[]u8 = null,
+    binding: ?Binding = null,
+    checkpoint: CheckpointSlot = .{},
+    keys: []const []const u8 = &.{},
+    references: []u64 = &.{},
+    order: ?[]usize = null,
+
+    pub fn deinit(self: *@This(), a: Allocator) void {
+        if (self.storage) |bytes| a.free(bytes);
+        self.* = .{};
+    }
+
+    fn matches(self: *const @This(), binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8) bool {
+        if (self.binding == null or !std.meta.eql(self.binding.?, binding) or
+            !std.meta.eql(self.checkpoint, checkpoint) or self.keys.len != keys.len) return false;
+        for (self.keys, keys) |owned, key| if (!std.mem.eql(u8, owned, key)) return false;
+        return true;
+    }
+
+    fn remember(self: *@This(), a: Allocator, binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8, references: []const u64, order: ?[]const usize) !bool {
+        if (self.matches(binding, checkpoint, keys)) return true;
+        self.binding = null;
+        if (keys.len > 4096) {
+            self.deinit(a);
+            return false;
+        }
+        var required = std.math.mul(usize, keys.len, @sizeOf([]const u8) + @sizeOf(u64) + @sizeOf(usize)) catch return false;
+        required = std.math.add(usize, required, 32) catch return false;
+        for (keys) |key| required = std.math.add(usize, required, key.len) catch return false;
+        if (required > 128 * 1024) {
+            self.deinit(a);
+            return false;
+        }
+        const capacity = std.math.ceilPowerOfTwo(usize, required) catch return false;
+        if (self.storage == null or self.storage.?.len < capacity) {
+            self.deinit(a);
+            self.storage = a.alloc(u8, capacity) catch return false;
+        }
+        var arena = std.heap.FixedBufferAllocator.init(self.storage.?);
+        const alloc = arena.allocator();
+        const owned = try alloc.alloc([]const u8, keys.len);
+        self.references = try alloc.alloc(u64, keys.len);
+        const positions = try alloc.alloc(usize, keys.len);
+        for (owned, keys) |*copy, key| copy.* = try alloc.dupe(u8, key);
+        self.keys = owned;
+        @memcpy(self.references, references);
+        self.order = if (order != null) positions else null;
+        if (order) |indices| @memcpy(positions, indices);
+        self.checkpoint = checkpoint;
+        self.binding = binding;
+        return true;
+    }
+};
+
+/// Scope-local working storage. No page views survive a call; bounded buffers
 /// and stable index frames are retained for the next batch. Never share a state
 /// between concurrent reads. Detach before releasing the owning transaction
 /// or file; allocators for retained storage must outlive the state.
 pub const DocumentBatchReadState = struct {
+    binding: ?ResolvedScoreBatch.Binding = null,
+    resolved: ?*ResolvedScoreBatch = null,
     allocator: ?Allocator = null,
     file: ?*NativeFile = null,
     path_allocator: ?Allocator = null,
@@ -1133,6 +1194,7 @@ pub const DocumentBatchReadState = struct {
 
     pub fn deinit(self: *@This()) void {
         if (self.allocator) |a| {
+            if (self.resolved) |resolved| resolved.deinit(a);
             if (self.path_allocator) |pa| self.path.deinit(pa);
             self.reader.deinit(a);
             self.window.deinit(a);
@@ -1146,7 +1208,11 @@ pub const DocumentBatchReadState = struct {
         const allocator_changed = if (self.path_allocator) |old| old.ptr != path_allocator.ptr or old.vtable != path_allocator.vtable else false;
         if ((self.file != null and self.file != file) or allocator_changed) {
             const allocator = self.allocator;
+            const binding = self.binding;
+            const resolved = self.resolved;
             self.deinit();
+            self.resolved = resolved;
+            self.binding = binding;
             self.allocator = allocator;
             self.path.allocator = path_override;
         }
@@ -1158,6 +1224,7 @@ pub const DocumentBatchReadState = struct {
     pub fn detach(self: *@This()) void {
         self.reset();
         self.file = null;
+        self.binding = null;
         self.window.file = null;
     }
 
@@ -1186,7 +1253,11 @@ pub const DocumentBatchReadState = struct {
         if (self.window.bytes) |bytes| retained += bytes.len;
         if (self.reader.raw) |raw| retained += raw.len;
         retained += self.reader.offsets.capacity * @sizeOf(u16);
+        if (self.resolved) |resolved| if (resolved.storage) |bytes| {
+            retained += bytes.len;
+        };
         if (retained > 256 * 1024) {
+            if (self.resolved) |resolved| resolved.deinit(a);
             const path_allocator = self.path.allocator;
             self.path.deinit(self.path_allocator.?);
             self.path = .{ .allocator = path_allocator };
@@ -6036,27 +6107,42 @@ pub const NativeFile = struct {
             @memset(values, null);
         }
         if (keys.len == 0 or checkpoint.document_index_root_page == 0) return;
-        const references = try temporary.alloc(u64, keys.len);
-        defer temporary.free(references);
-        @memset(references, 0);
-        try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, &state.path, 0);
+        const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+        if (!use_cache) if (state.resolved) |resolved| {
+            resolved.binding = null;
+        };
+        const cached = scores != null and state.binding != null and state.resolved != null and use_cache and
+            state.resolved.?.matches(state.binding.?, checkpoint, keys);
+        // A miss must have the same memory floor as an uncached batch. Build
+        // optional retained offsets only after all record reads succeed.
+        if (!cached) if (state.resolved) |resolved| {
+            resolved.deinit(state.allocator.?);
+        };
+        const references = if (cached) state.resolved.?.references else try temporary.alloc(u64, keys.len);
+        defer if (!cached) temporary.free(references);
+        if (!cached) {
+            @memset(references, 0);
+            try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, &state.path, 0);
+        }
         var ordered = true;
-        for (references[1..], references[0 .. references.len - 1]) |next, prior| {
+        if (!cached) for (references[1..], references[0 .. references.len - 1]) |next, prior| {
             if (recordReferenceLessThan(next, prior)) {
                 ordered = false;
                 break;
             }
-        }
-        const order: ?[]usize = if (ordered) null else try temporary.alloc(usize, keys.len);
-        defer if (order) |positions| temporary.free(positions);
-        if (order) |positions| {
+        };
+        const order: ?[]usize = if (cached) state.resolved.?.order else if (ordered) null else try temporary.alloc(usize, keys.len);
+        defer if (!cached) {
+            if (order) |positions| temporary.free(positions);
+        };
+        if (!cached) if (order) |positions| {
             for (positions, 0..) |*position, i| position.* = i;
             std.mem.sort(usize, positions, references, struct {
                 fn less(refs: []const u64, lhs: usize, rhs: usize) bool {
                     return recordReferenceLessThan(refs[lhs], refs[rhs]);
                 }
             }.less);
-        }
+        };
         const reader = &state.reader;
         const window = &state.window;
         for (0..references.len) |position| {
@@ -6088,6 +6174,9 @@ pub const NativeFile = struct {
                 try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
             else
                 try allocator.dupe(u8, entry.value);
+        }
+        if (!cached and scores != null and state.binding != null and state.resolved != null and use_cache) {
+            _ = state.resolved.?.remember(state.allocator.?, state.binding.?, checkpoint, keys, references, order) catch false;
         }
     }
 
@@ -17441,10 +17530,19 @@ test "lite fused native scores reorder physical pages and reject malformed paylo
     try file.putDocumentBatch(&.{ .{ .key = "a", .value = &first }, .{ .key = "b", .value = &second } });
     // Move a after b physically; key order and physical order now differ.
     try file.putDocument("a", &first);
-    var state = DocumentBatchReadState{};
+    var resolved = ResolvedScoreBatch{};
+    var state = DocumentBatchReadState{ .resolved = &resolved, .binding = .{ .owner = 1, .generation = 1 } };
     defer state.deinit();
     var scores: [4]?f64 = undefined;
     try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "0", "a", "b", "z" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 3, 5, null }, &scores);
+    try std.testing.expect(resolved.order != null);
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "0", "a", "b", "z" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ null, 3, 5, null }, &scores);
+    _ = file.page_cache_bypass.fetchAdd(1, .monotonic);
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "0", "a", "b", "z" }, &scores, &state);
+    _ = file.page_cache_bypass.fetchSub(1, .monotonic);
+    try std.testing.expect(resolved.binding == null);
     try std.testing.expectEqualSlices(?f64, &.{ null, 3, 5, null }, &scores);
     try file.putDocument("b", "invalid length");
     try std.testing.expectError(error.InvalidGraphMetricScore, file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "0", "a", "b", "z" }, &scores, &state));

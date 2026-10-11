@@ -1386,38 +1386,41 @@ pub const ResourceManager = struct {
         if (slot.retiring and slot.in_flight == 0) slot.* = .{};
     }
 
+    // Callback return values can include logical slice credit. Only ledger
+    // deficits establish whether both host and requester admission now fit.
+    fn allocationReclaimDebt(self: *ResourceManager, requester: Slice, additional_bytes: u64) struct { total: u64, slice: u64 } {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const memory_hard = self.memory.budget.hard_limit_bytes;
+        const memory_target = if (memory_hard == 0)
+            0
+        else
+            (self.memory.used_bytes +| additional_bytes) -| memory_hard;
+        const requester_state = &self.slices[sliceIndex(requester)];
+        const slice_hard = requester_state.budget.hard_limit_bytes;
+        // These slices mix active allocations with reclaimable retained
+        // state. Satisfy their slice pressure before aggregate pressure:
+        // evicting an unrelated cache cannot raise this slice's ceiling.
+        const requester_slice_reclaimable = requester == .dense_search_working_set or
+            requester == .hbc_node_metadata_cache or
+            requester == .relational_preparation_working_set or
+            requester == .document_extraction_working_set or
+            requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache;
+        const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
+            0
+        else
+            (requester_state.used_bytes +| additional_bytes) -| slice_hard;
+        return .{ .total = @max(memory_target, slice_target), .slice = slice_target };
+    }
+
     /// Reclaim enough aggregate cache memory to make one allocation retry
-    /// meaningful. Cache callbacks run outside the accounting mutex and may
-    /// therefore publish their byte decreases through normal accounting APIs.
+    /// meaningful. Callbacks publish their decreases through accounting APIs;
+    /// logical slice relief never substitutes for required host memory relief.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
         if (additional_bytes == 0) return 0;
-        const targets = blk: {
-            lockAtomic(&self.mutex);
-            defer self.mutex.unlock();
-            const memory_hard = self.memory.budget.hard_limit_bytes;
-            const memory_target = if (memory_hard == 0)
-                0
-            else
-                (self.memory.used_bytes +| additional_bytes) -| memory_hard;
-            const requester_state = &self.slices[sliceIndex(requester)];
-            const slice_hard = requester_state.budget.hard_limit_bytes;
-            // These slices mix active allocations with reclaimable retained
-            // state. Satisfy their slice pressure before aggregate pressure:
-            // evicting an unrelated cache cannot raise this slice's ceiling.
-            const requester_slice_reclaimable = requester == .dense_search_working_set or
-                requester == .hbc_node_metadata_cache or
-                requester == .relational_preparation_working_set or
-                requester == .document_extraction_working_set or
-                requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache;
-            const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
-                0
-            else
-                (requester_state.used_bytes +| additional_bytes) -| slice_hard;
-            const target = @max(memory_target, slice_target);
-            if (target == 0) return 0;
-            break :blk .{ .total = target, .slice = slice_target };
-        };
-        const target_bytes = targets.total;
+        const targets = self.allocationReclaimDebt(requester, additional_bytes);
+        if (targets.total == 0) return 0;
+        var debt = targets;
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
@@ -1446,7 +1449,7 @@ pub const ResourceManager = struct {
                 // The first pass is the only one that can resolve local
                 // pressure. Do not discard useful unrelated cache contents
                 // when live owners prevented that pass from making progress.
-                if (reclaimed < targets.slice) break;
+                if (debt.slice != 0) break;
                 if (candidate_slice == requester) continue;
             }
             if (candidate_slice == requester and
@@ -1492,7 +1495,7 @@ pub const ResourceManager = struct {
                         .weight = slot.weight,
                     };
                     slot.in_flight += 1;
-                    const remaining_target = target_bytes -| reclaimed;
+                    const remaining_target = debt.total;
                     if (pass == 0 and remaining_weight > invocation.weight) divided_target = true;
                     const fair_target = if (pass != 0 or remaining_weight <= invocation.weight)
                         remaining_target
@@ -1503,11 +1506,12 @@ pub const ResourceManager = struct {
 
                     reclaimed +|= invocation.reclaim(invocation.context, fair_target);
                     self.releaseReclaimerInvocation(invocation);
-                    if (reclaimed >= target_bytes) break;
+                    debt = self.allocationReclaimDebt(requester, additional_bytes);
+                    if (debt.total == 0) break;
                 }
-                if (reclaimed >= target_bytes or reclaimed == before_pass or !divided_target) break;
+                if (debt.total == 0 or reclaimed == before_pass or !divided_target) break;
             }
-            if (reclaimed >= target_bytes) break;
+            if (debt.total == 0) break;
         }
         _ = self.reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
         return reclaimed;
@@ -5755,6 +5759,7 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     };
     const RetiringContext = struct {
         manager: *ResourceManager,
+        accounted: u64 = 0,
         retire_identity: u64 = 0,
         calls: u64 = 0,
 
@@ -5762,7 +5767,9 @@ test "resource manager invokes reclaimers without holding registry mutex" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             self.manager.unregisterReclaimer(self.retire_identity);
-            return target;
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
         }
     };
 
@@ -5774,8 +5781,7 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     defer manager.unregisterReclaimer(retiring_id);
     retiring.retire_identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &passive, PassiveContext.reclaim);
 
-    var accounted: u64 = 0;
-    manager.observeUsage(.hbc_node_metadata_cache, &accounted, 100);
+    manager.observeUsage(.hbc_node_metadata_cache, &retiring.accounted, 100);
     // The second bounded pass can revisit the surviving owner, but never
     // invokes the registry slot retired by its first callback.
     try std.testing.expectEqual(@as(u64, 10), manager.reclaimForAllocation(.dense_apply_working_set, 10));
