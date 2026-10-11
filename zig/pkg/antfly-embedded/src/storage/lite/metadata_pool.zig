@@ -102,13 +102,24 @@ pub const MetadataPool = struct {
         self.mutex.unlock();
         if (!retain) self.heap().destroy(node);
     }
+    pub const Reclaimed = struct {
+        physical: u64 = 0,
+        logical: u64 = 0,
+        pub fn total(self: @This()) u64 {
+            return self.physical +| self.logical;
+        }
+    };
     pub fn reclaim(self: *@This(), target: u64) u64 {
+        return self.reclaimDetailed(target).total();
+    }
+    /// Logical spare credit is admission relief, not freed node storage.
+    pub fn reclaimDetailed(self: *@This(), target: u64) Reclaimed {
         // A nested backing allocator may request reclamation while our own
         // allocator is busy. Never reenter it through a blocking free.
         const budget = if (self.budget) |*owner| owner else null;
-        if (budget) |owner| if (!owner.allocator_mutex.tryLock()) return 0;
+        if (budget) |owner| if (!owner.allocator_mutex.tryLock()) return .{};
         defer if (budget) |owner| owner.allocator_mutex.unlock();
-        const a = if (budget) |owner| owner.allocator() else if (self.backing) |backing| backing else return 0;
+        const a = if (budget) |owner| owner.allocator() else if (self.backing) |backing| backing else return .{};
         var freed: u64 = 0;
         while (freed < target) {
             if (!self.mutex.tryLock()) break;
@@ -122,8 +133,8 @@ pub const MetadataPool = struct {
             a.destroy(owned);
             freed += @sizeOf(Node);
         }
-        if (budget) |owner| freed +|= owner.releaseUnusedCredit();
-        return freed;
+        const logical = if (budget) |owner| owner.releaseUnusedCredit() else 0;
+        return .{ .physical = freed, .logical = logical };
     }
     pub fn deinit(self: *@This()) void {
         std.debug.assert(self.active == 0);

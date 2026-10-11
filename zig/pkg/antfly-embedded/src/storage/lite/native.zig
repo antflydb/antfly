@@ -938,6 +938,9 @@ pub const RecordPageReader = struct {
     /// Only callers with sorted, known references supply a multi-page run.
     /// The window is allocated lazily and admits pages only when requested.
     fn readWithWindow(self: *RecordPageReader, comptime windowed: bool, window: ?*RecordReadWindow, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, reference: u64, expected: PageKind, ahead: usize) ![]const u8 {
+        return self.readWithWindowAllocators(windowed, window, file, allocator, allocator, checkpoint, reference, expected, ahead);
+    }
+    fn readWithWindowAllocators(self: *RecordPageReader, comptime windowed: bool, window: ?*RecordReadWindow, file: *NativeFile, allocator: Allocator, optional_allocator: Allocator, checkpoint: CheckpointSlot, reference: u64, expected: PageKind, ahead: usize) ![]const u8 {
         const page = physicalPage(reference);
         if (page == 0 or page >= checkpoint.page_count) return error.InvalidPageId;
         const bundled = reference & packed_record_flag != 0;
@@ -972,7 +975,7 @@ pub const RecordPageReader = struct {
                 self.payload = lease.bytes[page_header_size..][0..validation.payload_len];
             } else {
                 if (windowed) {
-                    const raw = try window.?.read(file, allocator, checkpoint, page, ahead);
+                    const raw = try window.?.readAllocators(file, allocator, optional_allocator, checkpoint, page, ahead);
                     if (builtin.is_test) _ = file.test_page_reads.fetchAdd(1, .monotonic);
                     self.payload = try decodePagePayload(raw, kind);
                     if (file.page_cache_enabled.load(.monotonic) and file.page_cache_bypass.load(.monotonic) == 0 and file.admitPageToCache(raw)) file.page_cache.put(file.allocator, page, raw);
@@ -1078,6 +1081,9 @@ const RecordReadWindow = struct {
     }
 
     fn read(self: *RecordReadWindow, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, page: u64, ahead: usize) ![]const u8 {
+        return self.readAllocators(file, allocator, allocator, checkpoint, page, ahead);
+    }
+    fn readAllocators(self: *RecordReadWindow, file: *NativeFile, allocator: Allocator, optional_allocator: Allocator, checkpoint: CheckpointSlot, page: u64, ahead: usize) ![]const u8 {
         const bypass = file.page_cache_bypass.load(.monotonic) != 0;
         const size: usize = file.header.page_size;
         if (!bypass and self.contains(file, page)) return self.bytes.?[@as(usize, @intCast(page - self.first)) * size ..][0..size];
@@ -1086,7 +1092,8 @@ const RecordReadWindow = struct {
         // Single-page requests need only page-sized scratch until a run appears.
         const needed = count * size;
         if (self.bytes == null or (!self.growth_failed and self.bytes.?.len < needed)) {
-            if (allocator.alloc(u8, needed)) |bytes| {
+            const growth_allocator = if (count > 1) optional_allocator else allocator;
+            if (growth_allocator.alloc(u8, needed)) |bytes| {
                 if (self.bytes) |old| allocator.free(old);
                 self.bytes = bytes;
             } else |_| {
@@ -1130,10 +1137,15 @@ pub const ResolvedScoreBatch = struct {
     keys: []const []const u8 = &.{},
     references: []u64 = &.{},
     order: ?[]usize = null,
+    borrowed: bool = false,
+    recovered_optional_failure: bool = false,
+    promotion_allocator: ?Allocator = null,
 
     pub fn deinit(self: *@This(), a: Allocator) void {
-        if (self.storage) |bytes| a.free(bytes);
-        self.* = .{};
+        const promotion = self.promotion_allocator;
+        const recovered = self.recovered_optional_failure;
+        if (self.storage) |bytes| (promotion orelse a).free(bytes);
+        self.* = .{ .promotion_allocator = promotion, .recovered_optional_failure = recovered };
     }
 
     fn matches(self: *const @This(), binding: Binding, checkpoint: CheckpointSlot, keys: []const []const u8) bool {
@@ -1160,7 +1172,7 @@ pub const ResolvedScoreBatch = struct {
         const capacity = std.math.ceilPowerOfTwo(usize, required) catch return false;
         if (self.storage == null or self.storage.?.len < capacity) {
             self.deinit(a);
-            self.storage = a.alloc(u8, capacity) catch return false;
+            self.storage = (self.promotion_allocator orelse a).alloc(u8, capacity) catch return false;
         }
         var arena = std.heap.FixedBufferAllocator.init(self.storage.?);
         const alloc = arena.allocator();
@@ -6096,6 +6108,7 @@ pub const NativeFile = struct {
     fn readBatchAtCheckpoint(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, scores: ?ScoreSink, state: *DocumentBatchReadState) !void {
         state.prepare(self);
         defer state.reset();
+        if (state.resolved) |resolved| resolved.recovered_optional_failure = false;
         if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
         if (scores == null and keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
@@ -6111,49 +6124,67 @@ pub const NativeFile = struct {
         if (!use_cache) if (state.resolved) |resolved| {
             resolved.binding = null;
         };
-        const cached = scores != null and state.binding != null and state.resolved != null and use_cache and
+        var cached = scores != null and state.binding != null and state.resolved != null and use_cache and
             state.resolved.?.matches(state.binding.?, checkpoint, keys);
         // A miss must have the same memory floor as an uncached batch. Build
         // optional retained offsets only after all record reads succeed.
-        if (!cached) if (state.resolved) |resolved| {
+        if (!cached and scores != null) if (state.resolved) |resolved| {
             resolved.deinit(state.allocator.?);
         };
-        const references = if (cached) state.resolved.?.references else try temporary.alloc(u64, keys.len);
-        defer if (!cached) temporary.free(references);
-        if (!cached) {
-            @memset(references, 0);
-            try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, &state.path, 0);
-        }
-        var ordered = true;
-        if (!cached) for (references[1..], references[0 .. references.len - 1]) |next, prior| {
-            if (recordReferenceLessThan(next, prior)) {
-                ordered = false;
-                break;
-            }
+        // Mandatory growth may evict optional offsets only when not borrowed.
+        if (state.resolved) |resolved| resolved.borrowed = cached;
+        defer if (state.resolved) |resolved| {
+            resolved.borrowed = false;
         };
-        const order: ?[]usize = if (cached) state.resolved.?.order else if (ordered) null else try temporary.alloc(usize, keys.len);
+        var references = if (cached) state.resolved.?.references else try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+        defer if (!cached) temporary.free(references);
+        var order = if (cached) state.resolved.?.order else try batchReferenceOrder(temporary, references);
         defer if (!cached) {
             if (order) |positions| temporary.free(positions);
         };
-        if (!cached) if (order) |positions| {
-            for (positions, 0..) |*position, i| position.* = i;
-            std.mem.sort(usize, positions, references, struct {
-                fn less(refs: []const u64, lhs: usize, rhs: usize) bool {
-                    return recordReferenceLessThan(refs[lhs], refs[rhs]);
-                }
-            }.less);
-        };
+        var recovered = false;
         const reader = &state.reader;
         const window = &state.window;
-        for (0..references.len) |position| {
+        const optional_allocator = blk: {
+            const candidate = if (state.resolved) |resolved| resolved.promotion_allocator orelse state.allocator.? else state.allocator.?;
+            const owner = state.allocator.?;
+            // The window is freed by its normal owner, including file changes.
+            break :blk if (candidate.ptr == owner.ptr and candidate.vtable.free == owner.vtable.free) candidate else owner;
+        };
+        var position: usize = 0;
+        while (position < keys.len) {
             const i = if (order) |positions| positions[position] else position;
             const reference = references[i];
-            if (reference == 0) continue;
+            if (reference == 0) {
+                position += 1;
+                continue;
+            }
             const ahead = if (reader.page_id == physicalPage(reference) or window.contains(self, physicalPage(reference))) 1 else recordRunAhead(references, order, position);
-            const bytes = try reader.readWithWindow(true, window, self, state.allocator.?, checkpoint, reference, .document, ahead);
+            const bytes = reader.readWithWindowAllocators(true, window, self, state.allocator.?, optional_allocator, checkpoint, reference, .document, ahead) catch |err| {
+                if (!cached or (@as(anyerror, err) != error.OutOfMemory and @as(anyerror, err) != error.ResourceBudgetExceeded)) return err;
+                // No borrowed offsets survive their eviction. Resolve again at
+                // this same pinned checkpoint and resume the failed position;
+                // already delivered scores are never replayed to the sink.
+                const resolved = state.resolved.?;
+                resolved.borrowed = false;
+                resolved.deinit(state.allocator.?);
+                cached = false;
+                references = &.{};
+                order = null;
+                state.reset();
+                references = try self.resolveBatchReferences(temporary, checkpoint, keys, &state.path);
+                order = try batchReferenceOrder(temporary, references);
+                const resumed = if (order) |positions| positions[position] else position;
+                if (resumed != i or references[resumed] != reference) return error.InvalidDocumentIndex;
+                recovered = true;
+                continue;
+            };
             const entry = try decodeDocumentEntry(bytes);
             if (!std.mem.eql(u8, entry.key, keys[i])) return error.InvalidDocumentIndex;
-            if (entry.is_delete) continue;
+            if (entry.is_delete) {
+                position += 1;
+                continue;
+            }
             if (scores) |out| {
                 const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
                 if (length != 8) return error.InvalidGraphMetricScore;
@@ -6174,10 +6205,34 @@ pub const NativeFile = struct {
                 try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
             else
                 try allocator.dupe(u8, entry.value);
+            position += 1;
         }
         if (!cached and scores != null and state.binding != null and state.resolved != null and use_cache) {
             _ = state.resolved.?.remember(state.allocator.?, state.binding.?, checkpoint, keys, references, order) catch false;
         }
+        if (recovered) state.resolved.?.recovered_optional_failure = true;
+    }
+
+    fn resolveBatchReferences(self: *NativeFile, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, path: *BatchIndexReadPath) ![]u64 {
+        const references = try temporary.alloc(u64, keys.len);
+        errdefer temporary.free(references);
+        @memset(references, 0);
+        try self.readDocumentBatchWithPath(checkpoint, checkpoint.document_index_root_page, keys, references, path, 0);
+        return references;
+    }
+
+    fn batchReferenceOrder(temporary: Allocator, references: []const u64) !?[]usize {
+        for (references[1..], references[0 .. references.len - 1]) |next, prior| {
+            if (recordReferenceLessThan(next, prior)) break;
+        } else return null;
+        const positions = try temporary.alloc(usize, references.len);
+        for (positions, 0..) |*position, i| position.* = i;
+        std.mem.sort(usize, positions, references, struct {
+            fn less(refs: []const u64, lhs: usize, rhs: usize) bool {
+                return if (refs[lhs] == refs[rhs]) lhs < rhs else recordReferenceLessThan(refs[lhs], refs[rhs]);
+            }
+        }.less);
+        return positions;
     }
 
     fn readDocumentBatchNode(self: *NativeFile, checkpoint: CheckpointSlot, page: u64, keys: []const []const u8, references: []u64) !void {

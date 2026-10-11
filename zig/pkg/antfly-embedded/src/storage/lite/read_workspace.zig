@@ -51,6 +51,7 @@ pub const Workspace = struct {
         self.graph = Scratch.init(self.arenaAllocator(), 256 * 1024);
         self.native_state.resolved = &self.resolved_scores;
         self.native_state.allocator = a;
+        self.resolved_scores.promotion_allocator = self.optionalAllocator();
         self.native_state.path.allocator = a;
         return self;
     }
@@ -68,8 +69,15 @@ pub const Workspace = struct {
     pub fn begin(self: *Workspace, query_budget: ?*resources.BudgetedAllocator) !void {
         self.query_budget = query_budget;
         self.admit(self.live) catch |err| {
-            self.query_budget = null;
-            return err;
+            if (self.evictOptionalScores()) {
+                self.admit(self.live) catch |retry_err| {
+                    self.query_budget = null;
+                    return retry_err;
+                };
+            } else {
+                self.query_budget = null;
+                return err;
+            }
         };
     }
 
@@ -92,11 +100,22 @@ pub const Workspace = struct {
         // No file or cache lease survives a query. Snapshot identity is numeric;
         // index frames retain independently owned storage and its allocator.
         self.native_state.detach();
-        self.batch.reset();
-        self.graph.reset();
+        self.resetScratch(&self.batch);
+        self.resetScratch(&self.graph);
         if (self.query_reservation) |*r| r.release();
         self.query_reservation = null;
         self.query_budget = null;
+    }
+
+    pub fn resetBatch(self: *Workspace) void {
+        self.resetScratch(&self.batch);
+    }
+    fn resetScratch(self: *Workspace, scratch: *Scratch) void {
+        // Arena consolidation is optional preheating after the required read.
+        const child = scratch.arena.child_allocator;
+        scratch.arena.child_allocator = self.optionalAllocator();
+        defer scratch.arena.child_allocator = child;
+        scratch.reset();
     }
 
     fn admit(self: *Workspace, bytes: usize) !void {
@@ -127,19 +146,40 @@ pub const Workspace = struct {
     pub fn allocator(self: *Workspace) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
+    /// Optional cache ownership must not poison otherwise successful scratch.
+    pub fn optionalAllocator(self: *Workspace) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = optionalAlloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn evictOptionalScores(self: *Workspace) bool {
+        if (self.resolved_scores.borrowed or self.resolved_scores.storage == null) return false;
+        self.resolved_scores.deinit(self.optionalAllocator());
+        return true;
+    }
+    fn optionalAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        return allocImpl(ctx, len, alignment, ra, false);
+    }
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        return allocImpl(ctx, len, alignment, ra, true);
+    }
+    fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize, required: bool) ?[*]u8 {
         const self: *Workspace = @ptrCast(@alignCast(ctx));
-        self.admit(std.math.add(usize, self.live, len) catch return null) catch {
-            self.allocation_failed = true;
-            return null;
-        };
-        const p = self.heap().rawAlloc(len, alignment, ra) orelse {
-            self.allocation_failed = true;
-            self.restoreAdmission();
-            return null;
-        };
-        self.live += len;
-        return p;
+        for (0..2) |attempt| {
+            const next = std.math.add(usize, self.live, len) catch return null;
+            self.admit(next) catch {
+                if (required and attempt == 0 and self.evictOptionalScores()) continue;
+                if (required) self.allocation_failed = true;
+                return null;
+            };
+            const p = self.heap().rawAlloc(len, alignment, ra) orelse {
+                self.restoreAdmission();
+                if (required and attempt == 0 and self.evictOptionalScores()) continue;
+                if (required) self.allocation_failed = true;
+                return null;
+            };
+            self.live += len;
+            return p;
+        }
+        unreachable;
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Workspace = @ptrCast(@alignCast(ctx));
@@ -172,3 +212,29 @@ pub const Workspace = struct {
         self.restoreAdmission();
     }
 };
+
+test "lite workspace optional cache evicts for required growth but protects borrowed references" {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    const w = try Workspace.create(a, &manager);
+    defer w.destroy();
+    var query = resources.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    try w.begin(&query);
+    defer w.end();
+    const scratch = try w.allocator().alloc(u8, 4096);
+    defer w.allocator().free(scratch);
+    w.resolved_scores.storage = try w.optionalAllocator().alloc(u8, 32 * 1024);
+    manager.slices[@backingInt(resources.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
+    w.resolved_scores.borrowed = true;
+    try std.testing.expectError(error.OutOfMemory, w.allocator().alloc(u8, 8192));
+    try std.testing.expect(w.resolved_scores.storage != null);
+    w.allocation_failed = false;
+    w.resolved_scores.borrowed = false;
+    const required = try w.allocator().alloc(u8, 8192);
+    defer w.allocator().free(required);
+    try std.testing.expect(w.resolved_scores.storage == null);
+    try std.testing.expect(!w.allocation_failed);
+    try std.testing.expectEqual(@as(usize, 4096 + 8192), w.live);
+}
