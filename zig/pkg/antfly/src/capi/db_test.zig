@@ -1323,6 +1323,58 @@ test "storage owner native index raw admission and bounded controls preserve loc
     foreign.namespace.range_id += 1;
     try std.testing.expectError(error.IdentityNamespaceMismatch, handle.db.nativeIndexOwnerState(foreign));
     try std.testing.expectEqual(@as(u32, 1), handle.db.core.schema.?.version);
+
+    request.operation = .cancel_intent;
+    request.request_json = .fromSlice(json);
+    // Cancellation has a fixed identity header, never replacement inputs.
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    request.manifest = .{};
+    handle.storage_owner_group_id = 99;
+    try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    handle.storage_owner_group_id = 11;
+    var cancel_position: @FieldType(db_mod.DB.NativeIndexOwnerCancellationOutcome, "position") = undefined;
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cancel_response = response;
+        defer freeRawBuffer(cancel_response.ptr, cancel_response.len);
+        // Strict decoding also proves no publication receipt was returned.
+        var canceled = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, cancel_response.slice(), .{});
+        defer canceled.deinit();
+        try std.testing.expectEqual(attempt != 0, canceled.value.duplicate);
+        try std.testing.expect(!canceled.value.replication_pending);
+        try std.testing.expectEqual(@as(u64, 4), canceled.value.position.sequence);
+        cancel_position = canceled.value.position;
+    }
+    handle.db.close();
+    handle.db = try db_mod.DB.open(a, directory.path(), .{
+        .start_optional_runtimes = false,
+        .primary_backend = .{ .lsm = .{} },
+        .online_source_authority = .native,
+        .identity_namespace = header.fence.namespace,
+    });
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+    const recovered_cancel_response = response;
+    defer freeRawBuffer(recovered_cancel_response.ptr, recovered_cancel_response.len);
+    var recovered_cancel = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCancellationOutcome, a, recovered_cancel_response.slice(), .{});
+    defer recovered_cancel.deinit();
+    try std.testing.expect(recovered_cancel.value.duplicate);
+    try std.testing.expectEqual(cancel_position, recovered_cancel.value.position);
+    var late = try handle.db.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+    defer late.deinit();
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, handle.db.applyPreparedNativeIndexOwnerControl(&late, null));
+    request.operation = .cancel_cleanup;
+    request.request_json = .fromSlice(identity_json);
+    for (0..2) |attempt| {
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &request, &response));
+        const cleanup_response = response;
+        defer freeRawBuffer(cleanup_response.ptr, cleanup_response.len);
+        var cleanup = try std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerCleanupOutcome, a, cleanup_response.slice(), .{});
+        defer cleanup.deinit();
+        try std.testing.expectEqual(attempt != 0, cleanup.value.duplicate);
+        try std.testing.expect(!cleanup.value.replication_pending);
+        try std.testing.expectEqual(@as(u64, 5), cleanup.value.position.sequence);
+        try std.testing.expectEqual(binding.index, cleanup.value.binding.index);
+    }
 }
 
 test "storage owner open rejects prior ABI before reading expanded request fields" {

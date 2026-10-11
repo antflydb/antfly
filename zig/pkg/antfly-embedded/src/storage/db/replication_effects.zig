@@ -835,6 +835,7 @@ pub fn decodeBatchMutationRequest(
         };
         defer strict.deinit();
         try validateIndexOwnerPayload(parsed.value);
+        if (record.payload.len > parsed.value.index_owner_control.?.effect.wireLimit()) return error.InvalidBatchRequest;
         return parsed;
     }
     try unwrapGraphApplyEnvelope(&parsed.value);

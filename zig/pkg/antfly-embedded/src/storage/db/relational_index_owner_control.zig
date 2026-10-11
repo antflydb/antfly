@@ -27,19 +27,12 @@ const source_authority = @import("../source_authority.zig");
 const Native = @import("receipt_position.zig").Native;
 const Allocator = std.mem.Allocator;
 pub const envelope_version = 22;
+pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_wire_bytes = max_encoded_inputs + 32 * 1024;
 pub const Manifest = inputs.Prepared;
 
-pub const Admission = struct {
-    id: [16]u8,
-    plan_digest: [32]u8,
-    owner_digest: [32]u8,
-    ordinal: u16,
-    fence: @import("relational_integrity_topology.zig").Fence,
-    candidate_digest: [32]u8,
-    reservation_digest: [32]u8,
-};
+pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
 
 /// Metadata's immutable owner identity, without physical allocation choices or
 /// schema-sized inputs. Status is information, never publication permission.
@@ -79,15 +72,64 @@ pub const ReceiptRequest = struct {
     effect: enum { fenced, reserved },
 };
 
+/// Exactly one owner effect per transaction. This unpublished PR format has
+/// no legacy parallel-field envelopes: mixed effects are not representable.
+pub const Effect = union(enum) {
+    control: Command,
+    cancel_intent: Admission,
+    cancel_cleanup: jobs.Binding,
+
+    pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
+        return switch (self) {
+            .control => |value| value.binding.fence.namespace,
+            .cancel_intent => |value| value.fence.namespace,
+            .cancel_cleanup => |value| value.fence.namespace,
+        };
+    }
+
+    pub fn validate(self: Effect) !void {
+        switch (self) {
+            .control => |value| try value.validate(),
+            .cancel_intent => |value| try value.validate(),
+            .cancel_cleanup => |value| {
+                _ = try value.encode();
+                if (value.authority != .native or value.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+            },
+        }
+    }
+
+    pub fn wireLimit(self: Effect) usize {
+        return if (self == .control) max_wire_bytes else max_cancellation_wire_bytes;
+    }
+};
+
 pub const Frame = struct {
-    command: Command,
+    effect: Effect,
     position: Native,
 
     pub fn validate(self: Frame) !void {
-        try self.command.validate();
+        try self.effect.validate();
         try self.position.validate();
-        if (!self.position.namespace.eql(self.command.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+        if (!self.position.namespace.eql(self.effect.namespace())) return error.IdentityNamespaceMismatch;
     }
+};
+
+/// Durable intent progress only: this type deliberately has no publication
+/// receipt. A pending mirror must not become a canceled owner acknowledgement.
+pub const CancellationOutcome = struct {
+    intent: Admission,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+};
+
+pub const CleanupOutcome = struct {
+    binding: jobs.Binding,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
 };
 
 pub const Outcome = struct {
@@ -138,6 +180,7 @@ const Artifacts = struct {
 };
 
 pub const Prepared = struct {
+    pub const ApplyOutcome = Outcome;
     pub const max_manifest_bytes = inputs.max_bytes;
 
     alloc: Allocator,
@@ -145,6 +188,54 @@ pub const Prepared = struct {
     artifacts: ?Artifacts = null,
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
+
+    pub fn validate(self: *const Prepared) !void {
+        try self.command.validate();
+    }
+
+    pub fn namespace(self: *const Prepared) @FieldType(Native, "namespace") {
+        return self.command.binding.fence.namespace;
+    }
+
+    pub fn validateReplay(self: *const Prepared, position: Native) !void {
+        try (Frame{ .effect = .{ .control = self.command }, .position = position }).validate();
+    }
+
+    pub fn replayDuplicateOutcome(self: *const Prepared, position: Native) Outcome {
+        return .{ .binding = self.command.binding, .position = position, .duplicate = true };
+    }
+
+    /// Called only under the shared DB mutation/apply/outbox pipeline.
+    pub fn stage(self: *Prepared, core: anytype, txn: anytype, replay: ?Native) !Outcome {
+        const binding = self.command.binding;
+        const duplicate = (try jobs.nativeEffectPosition(txn, binding, self.command.effect)) != null;
+        switch (self.command.effect) {
+            .admitted => {
+                const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+                _ = try jobs.stageBeginWithReplay(txn, binding, &artifacts.candidate.inputs, replay);
+            },
+            .fenced => {
+                var manager = try core.initTxnManager();
+                defer manager.deinit();
+                _ = try jobs.stageNativeFencedWithReplay(txn, &manager, binding, replay);
+            },
+            .reserved => {
+                const artifacts = if (self.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+                var manager = try core.initTxnManager();
+                defer manager.deinit();
+                _ = try jobs.stageReservationWithReplay(txn, &manager, binding, &artifacts.candidate, &artifacts.addition, replay);
+            },
+        }
+        return .{ .binding = binding, .position = (try jobs.nativeEffectPosition(txn, binding, self.command.effect)) orelse return error.InvalidPrivateIndexNativeReceipt, .duplicate = duplicate };
+    }
+
+    pub fn hasPublicationReceipt(self: *const Prepared) bool {
+        return self.command.effect != .admitted;
+    }
+
+    pub fn populateReceipt(self: *const Prepared, txn: anytype, outcome: *Outcome) !void {
+        outcome.receipt = try jobs.nativeReceipt(txn, self.command.binding, self.command.effect);
+    }
 
     pub fn deinit(self: *Prepared) void {
         if (self.payload) |bytes| self.alloc.free(bytes);
@@ -196,28 +287,138 @@ pub const Prepared = struct {
     /// Serialize the large immutable prefix off-lock. Only the locally assigned
     /// sequence (at most 20 digits) is filled after transactional staging.
     pub fn preparePayload(self: *Prepared) !void {
-        try self.command.validate();
-        if (self.payload != null) return;
-        var writer: std.Io.Writer.Allocating = .init(self.alloc);
-        defer writer.deinit();
-        try writer.writer.writeAll("{\"schema_version\":22,\"request\":{},\"index_owner_control\":{\"command\":");
-        try std.json.Stringify.value(self.command, .{}, &writer.writer);
-        try writer.writer.writeAll(",\"position\":{\"namespace\":");
-        try std.json.Stringify.value(self.command.binding.fence.namespace, .{}, &writer.writer);
-        try writer.writer.writeAll(",\"sequence\":");
-        self.prefix_len = writer.written().len;
-        if (self.prefix_len + 23 > max_wire_bytes) return error.InvalidPrivateIndexInputs;
-        try writer.writer.splatByteAll(' ', 23);
-        self.payload = try writer.toOwnedSlice();
+        try prepareNativePayload(self, "control", self.command, max_wire_bytes);
     }
 
     pub fn finalizePayload(self: *Prepared, position: Native) ![]const u8 {
-        try position.validate();
-        if (!position.namespace.eql(self.command.binding.fence.namespace)) return error.IdentityNamespaceMismatch;
-        const bytes = self.payload orelse return error.InvalidPrivateIndexOwnerJob;
-        const digits = try std.fmt.bufPrint(bytes[self.prefix_len .. self.prefix_len + 20], "{d}", .{position.sequence});
-        const end = self.prefix_len + digits.len;
-        @memcpy(bytes[end .. end + 3], "}}}");
-        return bytes[0 .. end + 3];
+        return finalizeNativePayload(self, position);
     }
 };
+
+/// Cancellation intent preparation neither loads a schema nor compiles a
+/// candidate. Physical authority and the actual existing job are checked in
+/// the committing snapshot by stageCancellationIntentWithReplay.
+pub const PreparedCancellation = struct {
+    pub const ApplyOutcome = CancellationOutcome;
+    alloc: Allocator,
+    intent: Admission,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, intent: Admission) !PreparedCancellation {
+        try intent.validate();
+        return .{ .alloc = alloc, .intent = intent };
+    }
+
+    pub fn deinit(self: *PreparedCancellation) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+
+    pub fn validate(self: *const PreparedCancellation) !void {
+        try self.intent.validate();
+    }
+    pub fn namespace(self: *const PreparedCancellation) @FieldType(Native, "namespace") {
+        return self.intent.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedCancellation, position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_intent = self.intent }, .position = position }).validate();
+    }
+
+    pub fn replayDuplicateOutcome(self: *const PreparedCancellation, position: Native) CancellationOutcome {
+        return .{ .intent = self.intent, .position = position, .duplicate = true };
+    }
+
+    pub fn stage(self: *PreparedCancellation, _: anytype, txn: anytype, replay: ?Native) !CancellationOutcome {
+        const staged = try jobs.stageCancellationIntentWithReplay(txn, self.intent, replay);
+        return .{ .intent = staged.record.intent, .position = staged.record.position, .duplicate = staged.duplicate };
+    }
+
+    pub fn hasPublicationReceipt(_: *const PreparedCancellation) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedCancellation, _: anytype, _: *CancellationOutcome) !void {}
+
+    pub fn preparePayload(self: *PreparedCancellation) !void {
+        try prepareNativePayload(self, "cancel_intent", self.intent, max_cancellation_wire_bytes);
+    }
+
+    pub fn finalizePayload(self: *PreparedCancellation, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// Prepared from the actual inspected durable job, never an API-selected
+/// physical allocation. Stage rechecks intent, drain and both burned catalogs.
+pub const PreparedCleanup = struct {
+    pub const ApplyOutcome = CleanupOutcome;
+    alloc: Allocator,
+    binding: jobs.Binding,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, binding: jobs.Binding) !PreparedCleanup {
+        try (Effect{ .cancel_cleanup = binding }).validate();
+        return .{ .alloc = alloc, .binding = binding };
+    }
+    pub fn deinit(self: *PreparedCleanup) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedCleanup) !void {
+        try (Effect{ .cancel_cleanup = self.binding }).validate();
+    }
+    pub fn namespace(self: *const PreparedCleanup) @FieldType(Native, "namespace") {
+        return self.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedCleanup, position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_cleanup = self.binding }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedCleanup, position: Native) CleanupOutcome {
+        return .{ .binding = self.binding, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *PreparedCleanup, core: anytype, txn: anytype, replay: ?Native) !CleanupOutcome {
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        const result = try jobs.stageCancellationCleanupWithReplay(txn, &manager, self.binding, replay);
+        return .{ .binding = self.binding, .position = result.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedCleanup) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedCleanup, _: anytype, _: *CleanupOutcome) !void {}
+    pub fn preparePayload(self: *PreparedCleanup) !void {
+        try prepareNativePayload(self, "cancel_cleanup", self.binding, max_cancellation_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedCleanup, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+fn prepareNativePayload(prepared: anytype, comptime member: []const u8, body: anytype, maximum: usize) !void {
+    try prepared.validate();
+    if (prepared.payload != null) return;
+    var writer: std.Io.Writer.Allocating = .init(prepared.alloc);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"schema_version\":");
+    try std.json.Stringify.value(envelope_version, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"request\":{},\"index_owner_control\":{\"effect\":{\"" ++ member ++ "\":");
+    try std.json.Stringify.value(body, .{}, &writer.writer);
+    try writer.writer.writeAll("},\"position\":{\"namespace\":");
+    try std.json.Stringify.value(prepared.namespace(), .{}, &writer.writer);
+    try writer.writer.writeAll(",\"sequence\":");
+    prepared.prefix_len = writer.written().len;
+    if (prepared.prefix_len + 23 > maximum) return error.InvalidPrivateIndexInputs;
+    try writer.writer.splatByteAll(' ', 23);
+    prepared.payload = try writer.toOwnedSlice();
+}
+
+fn finalizeNativePayload(prepared: anytype, position: Native) ![]const u8 {
+    try position.validate();
+    if (!position.namespace.eql(prepared.namespace())) return error.IdentityNamespaceMismatch;
+    const bytes = prepared.payload orelse return error.InvalidPrivateIndexOwnerJob;
+    const digits = try std.fmt.bufPrint(bytes[prepared.prefix_len .. prepared.prefix_len + 20], "{d}", .{position.sequence});
+    const end = prepared.prefix_len + digits.len;
+    @memcpy(bytes[end .. end + 3], "}}}");
+    return bytes[0 .. end + 3];
+}

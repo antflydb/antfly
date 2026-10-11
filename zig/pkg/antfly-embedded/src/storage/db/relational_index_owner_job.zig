@@ -29,9 +29,16 @@ const source_authority = @import("../source_authority.zig");
 const positions = @import("receipt_position.zig");
 const publication = @import("relational_index_publication_progress.zig");
 const inputs_mod = @import("relational_index_inputs.zig");
+const cancellation = @import("relational_index_cancellation_intent.zig");
 const Digest = [32]u8;
 pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
 pub const Phase = enum(u8) { fencing, reserved };
+pub const cancellation_cleanup_key = key ++ ":cancel-gc";
+
+/// One reusable cleanup-admission slot, not a publication acknowledgement.
+/// Public retirement admission leaves a single reserved slot for the active
+/// private job, so cancellation cannot deadlock behind a full churn queue.
+pub const CancellationCleanup = struct { position: positions.Native, duplicate: bool };
 
 fn digest(bytes: []const u8) Digest {
     var result: Digest = undefined;
@@ -347,7 +354,7 @@ fn requireNativeJob(txn: anytype, binding: Binding) !Binding {
     if (!std.mem.eql(u8, &try nativeContext(current), &try nativeContext(binding))) return error.PrivateIndexOwnerJobChanged;
     try requireActive(txn, binding.fence);
     if (current.phase == .reserved) {
-        try requireReserved(txn, binding);
+        try requireReservedState(txn, binding);
     } else {
         try requireNativeCuts(txn, current);
         const integrity = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
@@ -372,7 +379,17 @@ pub fn stageNativeFenced(txn: anytype, manager: *transactions.TxnManager, bindin
 /// in a coordinator's effect request. A retry must match the original cut even
 /// when the native clock has subsequently advanced.
 pub fn stageNativeFencedWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !publication.Receipt {
+    return stageNativeFencedImpl(txn, manager, binding, replay, false);
+}
+
+/// This proves only the drained fence, never complete cancellation/cleanup.
+pub fn stageCanceledFencedWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !publication.Receipt {
+    return stageNativeFencedImpl(txn, manager, binding, replay, true);
+}
+
+fn stageNativeFencedImpl(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native, comptime canceling: bool) !publication.Receipt {
     try validateReplay(binding, replay);
+    if (canceling) try cancellation.requireCanceled(txn, binding) else try cancellation.requireOpen(txn, binding);
     const current = try requireNativeJob(txn, binding);
     // Integrity must fail before staging a new cut, not only when the caller
     // subsequently reconstructs its receipt after commit.
@@ -394,7 +411,14 @@ pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
 }
 
 pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
-    const binding = (try load(txn)) orelse return error.PrivateIndexJobRequired;
+    const binding = (try load(txn)) orelse {
+        // The never-visited cancellation phase has a source fence but no
+        // schema-sized worker binding yet. Only its exact durable native
+        // intent can authorize that intermediate state.
+        if (try cancellation.load(txn) == null) return error.PrivateIndexJobRequired;
+        try cancellation.requirePendingFence(txn, fence);
+        return;
+    };
     if (!binding.fence.eql(fence)) return error.PrivateIndexOwnerJobChanged;
     try requireNamespace(txn, binding);
 }
@@ -403,6 +427,11 @@ pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
 /// identities, not the public write snapshot. The owned candidate plan was
 /// independently compiled/reloaded before page preparation.
 pub fn requireReserved(txn: anytype, binding: Binding) !void {
+    try cancellation.requireOpen(txn, binding);
+    try requireReservedState(txn, binding);
+}
+
+fn requireReservedState(txn: anytype, binding: Binding) !void {
     var expected = binding;
     expected.phase = .reserved;
     const current = (try load(txn)) orelse return error.PrivateIndexJobRequired;
@@ -424,9 +453,14 @@ pub fn requireReserved(txn: anytype, binding: Binding) !void {
 /// Work is bounded by catalog size, never the number of primary rows.
 pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const physical_catalog.Loaded) !void {
     const binding = try load(txn);
+    try cancellation.verifyRecovery(txn, binding);
+    _ = try loadCancellationCleanup(txn, binding);
     const fence = if (try optional(txn, topology.fence_key)) |bytes| try topology.Fence.decode(bytes) else null;
     if (binding == null) {
-        if (fence) |value| if (value.role == .index_build) return error.PrivateIndexJobRequired;
+        if (fence) |value| if (value.role == .index_build) {
+            if (try cancellation.load(txn) == null) return error.PrivateIndexJobRequired;
+            try cancellation.requirePendingFence(txn, value);
+        };
         if (try optional(txn, inputs_mod.key) != null) return error.InvalidPrivateIndexInputs;
         return;
     }
@@ -516,12 +550,23 @@ pub fn stageBegin(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prep
 /// transaction. Errors require aborting that transaction, including when the
 /// forwarded clock is not the exact successor of the local durable clock.
 pub fn stageBeginWithReplay(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prepared, replay: ?positions.Native) !bool {
+    return stageBeginImpl(txn, binding, inputs, replay, false);
+}
+
+/// A never-visited cancellation still needs an exact admitted fence and burns.
+/// Its durable intent must precede this operation and closes normal retries.
+pub fn stageCanceledBeginWithReplay(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prepared, replay: ?positions.Native) !bool {
+    return stageBeginImpl(txn, binding, inputs, replay, true);
+}
+
+fn stageBeginImpl(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prepared, replay: ?positions.Native, comptime canceling: bool) !bool {
     try validateReplay(binding, replay);
     if (binding.phase != .fencing) return error.InvalidPrivateIndexOwnerJob;
     const encoded = try binding.encode();
     _ = try inputs_mod.decode(inputs.bytes);
     if (!std.mem.eql(u8, &inputs_mod.digest(inputs.bytes), &binding.inputs_digest)) return error.InvalidPrivateIndexInputs;
     try requireNamespace(txn, binding);
+    if (canceling) try cancellation.requireCanceled(txn, binding) else try cancellation.requireOpen(txn, binding);
     if (try load(txn)) |existing| {
         var original = existing;
         original.phase = .fencing;
@@ -560,7 +605,18 @@ pub fn stageReservation(txn: anytype, manager: *transactions.TxnManager, binding
 /// Both allocation burns and the forwarded native cut share the caller's
 /// transaction/outbox. Duplicate replay never allocates a new generation.
 pub fn stageReservationWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition, replay: ?positions.Native) !bool {
+    return stageReservationImpl(txn, manager, binding, candidate, physical, replay, false);
+}
+
+/// Burns both allocation spaces under the exact persisted cancellation intent.
+/// These burns are not proof that artifacts/claims have been cleaned up.
+pub fn stageCanceledReservationWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition, replay: ?positions.Native) !bool {
+    return stageReservationImpl(txn, manager, binding, candidate, physical, replay, true);
+}
+
+fn stageReservationImpl(txn: anytype, manager: *transactions.TxnManager, binding: Binding, candidate: *const candidate_mod.Candidate, physical: *const physical_catalog.PrivateAddition, replay: ?positions.Native, comptime canceling: bool) !bool {
     try validateReplay(binding, replay);
+    if (canceling) try cancellation.requireCanceled(txn, binding) else try cancellation.requireOpen(txn, binding);
     const expected = try prepare(binding.id, binding.plan_digest, binding.owner_digest, binding.ordinal, binding.fence, binding.authority, candidate, physical);
     var original = binding;
     original.phase = .fencing;
@@ -590,4 +646,80 @@ pub fn stageReservationWithReplay(txn: anytype, manager: *transactions.TxnManage
     try txn.put(key, &try next.encode());
     if (binding.authority == .native) _ = try stageNativeCut(txn, binding, .reserved, replay);
     return true;
+}
+
+/// Caller commits this intent/clock with its authenticated durable outbox. The
+/// returned cut is intent evidence, NOT a canceled publication receipt.
+pub fn stageCancellationIntentWithReplay(txn: anytype, intent: cancellation.Intent, replay: ?positions.Native) !cancellation.Stage {
+    try intent.validate();
+    const binding = try load(txn);
+    if (binding) |current| _ = try requireNativeJob(txn, current);
+    return cancellation.stage(txn, intent, binding, replay);
+}
+
+fn loadCancellationCleanup(txn: anytype, binding: ?Binding) !?cancellation.Record {
+    // Decode before any subsequent store read invalidates borrowed bytes.
+    const record = try cancellation.Record.decode((try optional(txn, cancellation_cleanup_key)) orelse return null);
+    const authority = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.intent.fence.namespace));
+    if (record.position.sequence > authority.sequence) return error.InvalidPrivateIndexCancellation;
+    if (binding) |current| if (record.intent.eql(cancellation.Intent.fromBinding(current))) {
+        if (current.phase != .reserved) return error.InvalidPrivateIndexCancellation;
+        try cancellation.requireCanceled(txn, current);
+        const intent = (try cancellation.load(txn)).?;
+        const reserved = try requireNativeCut(txn, current, .reserved);
+        if (record.position.sequence <= intent.position.sequence or record.position.sequence <= reserved.position.sequence)
+            return error.InvalidPrivateIndexCancellation;
+        return record;
+    };
+    // An old slot is inert only after its exact epoch has been consumed.
+    const completed = (try topology.completed(txn)) orelse return error.InvalidPrivateIndexCancellation;
+    if (completed.admission_epoch < record.intent.fence.admission_epoch or
+        (completed.admission_epoch == record.intent.fence.admission_epoch and !completed.eql(record.intent.fence)))
+        return error.InvalidPrivateIndexCancellation;
+    if (binding) |current| if (current.fence.admission_epoch <= record.intent.fence.admission_epoch)
+        return error.PrivateIndexOwnerJobChanged;
+    return null;
+}
+
+/// Queue only this canceled, drained and burned generation in the shared GC
+/// state machine. The caller must commit its outbox atomically and abort on
+/// every error. Neither queue admission nor its cut is a canceled owner ACK.
+pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !CancellationCleanup {
+    try validateReplay(binding, replay);
+    try cancellation.requireCanceled(txn, binding);
+    try requireReservedState(txn, binding);
+    try topology.requireDrained(txn, manager, binding.fence);
+    const gc = @import("relational_index_gc.zig");
+    const queue_key = gc.key(binding.index);
+    if (try loadCancellationCleanup(txn, try load(txn))) |record| {
+        try requireReplay(.{ .position = record.position, .evidence = @splat(0) }, replay);
+        if (try optional(txn, &queue_key)) |bytes| _ = try gc.decode(binding.index, bytes);
+        return .{ .position = record.position, .duplicate = true };
+    }
+    if (try optional(txn, &queue_key) != null) return error.InvalidPrivateIndexCancellation;
+    const position: positions.Native = .{ .namespace = binding.fence.namespace, .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |value| value.sequence else null) };
+    const record: cancellation.Record = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position };
+    try txn.put(cancellation_cleanup_key, &try record.encode());
+    try txn.put(&queue_key, &gc.initial(binding.index));
+    return .{ .position = position, .duplicate = false };
+}
+
+/// Bounded physical-artifact verification only. Global claims, final binding
+/// retirement and epoch release still need independent completion; callers
+/// must not turn this check into a signed canceled publication receipt.
+pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void {
+    try cancellation.requireCanceled(txn, binding);
+    try requireReservedState(txn, binding);
+    _ = (try loadCancellationCleanup(txn, try load(txn))) orelse return error.PrivateIndexCancellationRequired;
+    const gc = @import("relational_index_gc.zig");
+    if (try optional(txn, &gc.key(binding.index)) != null or
+        try optional(txn, &@import("relational_index_jobs.zig").progressKey(binding.index)) != null or
+        try optional(txn, &@import("relational_index_maintenance_contract.zig").controlKey(binding.index)) != null)
+        return error.PrivateIndexCancellationPending;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    for ([_][records.forward_prefix_len]u8{ try records.forwardPrefix(binding.index), try records.ownershipPrefix(binding.index) }) |prefix| {
+        if (try cursor.seekAtOrAfter(&prefix)) |entry| if (std.mem.startsWith(u8, entry.key, &prefix))
+            return error.PrivateIndexCancellationPending;
+    }
 }

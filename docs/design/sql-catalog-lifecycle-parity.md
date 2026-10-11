@@ -2352,9 +2352,226 @@ cloning/deduplication and service readiness. A combined Debug repeat passes
 LSM restart. Review then extended monotone readiness retention to historical
 profiles: a late weaker probe cannot erase a stronger proof for the same
 membership, while replacement membership discards the old proof. All three
-standalone protocol tests pass for that final change. The final combined repeat,
-C-ABI contention/cleanup and optimized runs remain in qualification.
+standalone protocol tests pass for that final change. The final Debug result is
+recorded below; optimized authority qualification remains pending.
 Authenticated producer/signing integration, cancellation
 tombstones, later publication phases and distributed fault/public atomicity
 gates are still unfinished. No original SQL case receives credit from this
 component work.
+
+The final Debug repeat completes 105/105 build steps and 44 tests, including
+the six private C-ABI native-index/runtime-status contention and cleanup cases,
+with no skips, failures or leaks. Separately, the pre-authority main-merged
+baseline completes 103/103 optimized build steps and 73 tests (three native
+owner, fifty namespace/restore and twenty publication/decoder tests). The
+authority change itself still requires optimized qualification; the baseline
+does not establish that result.
+
+The data-server integration Debug gate also completes 91/91 build steps and
+both selected `runRound` regressions without skips, failures or leaks. This
+compiles the reporting integration rather than relying only on metadata codec
+and storage adapter component roots.
+
+### Physical-root-bound native receipt recovery (in qualification)
+
+Receipt recovery now returns the generation of the exact owner lease that
+recovered the durable native cut. The receiver retains that generation with its
+owned recovered outcome. It cannot safely recover a cut, release the owner and
+then attach a generation obtained from a separate current-root lookup: a root
+replacement between those operations would relabel evidence from the old root.
+This adds no scan, additional physical RPC or schema-sized allocation. Pending
+replication outcomes remain pending and do not gain a publishable receipt.
+
+The composed LSM fixture now provisions a non-default descriptor generation,
+fully closes/reopens it, recovers the original reserved cut and observes the
+same generation from the compiled owner's runtime status. A subsequent routing
+generation change must not change the generation already attached to the
+recovered result. Empty-job, foreign-namespace and pre-acquisition cancellation
+checks cover the new adapter. The combined Debug gate passes 94/94 build steps
+and all 23 tests (three physical-owner, nineteen publication and one decoder
+floor), with no skips, failures or leaks. Optimized qualification is pending;
+these are physical receipt/lease tests, not enrollment or distributed placement
+evidence. Inventory integrity and the 2,028-source licensing boundary pass;
+the original SQL dispositions remain unchanged.
+
+Signing still needs actual durable replica placement, the enrolled store root,
+the current reporter incarnation and metadata's matching root-generation
+checks. Native standalone ownership must not borrow a synthetic replica ID or
+Raft position, nor perform a full replica-catalog scan for each receipt. That
+integration, authenticated delivery, cancellation, later lifecycle phases and
+the public failed-build atomicity gate remain required before activation.
+
+The shared Antfly replica catalog in `raft/storage/catalog.zig` already exposes
+revisioned `readReplica` point reads backed by the resident record map. Native
+provisioning and attestation should share that borrowed catalog instance and
+its durable placement admission, just as the Raft host does. Reopening
+`FileReplicaCatalog` from its path per receipt would reload the whole file and
+defeat the point-read boundary. The engine-level generic Raft catalog is not
+the relevant serving-owner interface. Missing native placement remains unknown
+authority, never permission to invent a replica ID from a group or node number.
+
+### Durable cancellation intent before owner visitation (in qualification)
+
+The native transaction primitives now retain one 368-byte canonical intent per
+owner, binding the full plan/owner identity, exact source fence, candidate and
+reservation fingerprints, and a real native sequence. Intent, source clock and
+source fence are staged together, including for a never-visited owner. That
+closes ordinary participant admission and schema mutation immediately, without
+first fetching or compiling schema-sized worker inputs. Existing predecessor
+participants may still resolve and must drain before any fenced proof or burn.
+
+Normal admission, fence, reservation and private pages check the intent in their
+committing snapshot, closing the delayed-dispatch race after metadata canceled
+the plan. Cancellation-specific admission/drain/reservation paths require the
+exact persisted intent; there is no incoming bypass flag. A new plan cannot
+replace the slot until the old epoch is durably consumed. Intent retries retain
+their original cut and do not advance the native clock again. Recovery validates
+an intent even when no worker job or manifest was ever created, as well as its
+namespace, clock, source fence and public predecessor catalog.
+
+This is intent and fence/drain/burn machinery, NOT a canceled publication ACK.
+Artifact/claim cleanup, release, authenticated command execution, the dedicated
+replication envelope and coordinated intent-aware owner capability barrier are
+still required. The caller must commit its durable outbox with these primitives
+and abort on every error; direct transaction tests are not production standby
+delivery evidence. An older owner cannot safely receive intent-bearing state
+until that decoder/executor rollout barrier is implemented. Public production
+remains disabled and no original SQL case is credited.
+
+Memory and LSM cases cover never-visited, admitted
+and reserved owners, rollback, clock-gap rejection, exact replay, foreign
+identity, delayed normal operations, generic cancellation refusal, predecessor
+draining, both catalog burns and cold verification. Framing tests include every
+truncation, checksum corruption, canonical padding, Raft/native separation and
+namespace substitution. Review adds a real private page prepared before intent
+whose apply is rejected before candidate/progress writes, and reserves the
+intent key against extra-metadata writes and deletes. The first compilation
+exposed a shadowed local name. The first runtime run exposed the old assumption
+that every index fence already had a worker binding; only an exact, pending
+durable intent now authorizes the never-visited intermediate state. Generic
+job-less index fences remain rejected. Final Debug qualification passes 43/43
+build steps and all 27 candidate/catalog tests, with no skips, failures or
+leaks. The licensing boundary passes for 2,029 source files and original SQL
+inventory integrity passes unchanged. Final ReleaseFast qualification also
+passes 43/43 steps and all 27 tests, with no skips, failures or leaks.
+
+### Cancellation through the shared owner commit path (in qualification)
+
+Cancellation preparation owns only the bounded identity header. Both normal
+native index controls and cancellation now enter the same DB mutation pipeline:
+write gating, snapshot leases, apply-exclusive, transactional native cut and
+transport marker, durable outbox, and completion after lease release. Dedicated
+version-23 replay envelopes reject ordinary mutations, mixed control frames,
+unknown fields and namespace substitutions. Intent results have no publication
+receipt field. The private compiled owner accepts cancellation without a
+manifest; its response storage is reserved before commit. The serving adapter
+uses the actual leased owner and preserves committed pending outcomes after a
+request is canceled.
+
+LSM integration coverage is being qualified for a never-visited primary with a
+failed outbox publication, cold reopen before worker admission, exact payload
+recovery, duplicate intent, gap rejection, atomic standby replay/reopen and late
+normal admission rejection. Compiled-owner coverage also exercises cancellation
+after reservation, duplicate retries and restart. The first integration compile
+caught an extra level of pointer indirection in the shared DB dispatch; that is
+fixed, but these new integration tests are not yet green evidence. Authenticated
+delivery, intent-aware capability barriers, cleanup/release and distributed
+fault qualification remain open. Public production remains disabled; no SQL
+inventory case is credited by this component work.
+
+### Fixed-header cancellation receiver (qualification pending)
+
+The native receiver can now request cancellation permission independently from
+metadata and persist one owner-local intent. The permission projection binds
+table, group, plan, owner, exact source fence and admitted fingerprints without
+fetching or compiling a schema manifest, including on a never-visited owner.
+The receiver validates the returned intent identity and native namespace; an
+intent result, even when mirrored, is distinct from metadata's full canceled
+receipt. A committed pending result is retained if request cancellation follows
+the storage boundary. This helper is not mounted as an authenticated RPC and
+does not enable the public producer.
+
+Synthetic receiver tests cover fixed permission without admission/inspection,
+duplicate retry, pending publication, cancellation after commit, foreign result
+identity, wrong group/table and stale metadata phase. They are sequencing tests,
+not physical durability or distributed authority evidence. The first compile
+caught the shared intent equality method's visibility; exposing that exact
+identity comparison fixes the boundary without duplicating its field list.
+Final Debug qualification passes 59/59 build steps and all 21 tests (20
+publication/receiver contracts and one decoder-floor contract), with no skips,
+failures or leaks. Final ReleaseFast qualification also passes 59/59 steps and
+all 21 tests, with no skips, failures or leaks. Metadata decoder floor
+36 and runtime-status V19 are not substitutes
+for intent-aware compiled-owner execution and standby-envelope readiness. Those
+rollout barriers, cleanup/release, actual enrolled-root attestation and the
+public failed-build atomicity gate remain unfinished. Original SQL dispositions
+remain unchanged.
+
+### Shared cancellation artifact retirement (in qualification)
+
+After exact persisted cancellation intent, transaction drain and both allocation
+burns, a private generation can enter the existing forward/ownership GC state
+machine. A single fixed-size cleanup-admission slot binds the full immutable
+intent and a real native cut newer than both cancellation and reservation.
+Admission, queue insertion and cut advance share the caller's transaction and
+must share its durable outbox. Duplicate admission retains the original cut and
+never resets the GC cursor or requeues a completed generation. Recovery checks
+the slot even after physical deletion, rejects forged cuts/identity, and permits
+an old slot only after its epoch was durably consumed.
+
+Ordinary churn is bounded by the existing retirement limit; the sole active
+private job owns one additional cancellation-only slot. This avoids deadlock
+when that public queue is full without adding a second cleanup engine or an
+unbounded admission scan. The existing GC keeps its 256-record, byte and time
+budgets. Final physical verification uses fixed point reads and two generation
+prefix seeks, not a primary-table scan. Extra-metadata mutation cannot forge or
+delete the cleanup-admission slot.
+
+Memory and LSM tests for never-visited, admitted and reserved cancellation now
+seed 300 forward/ownership/reverse companions, require multiple bounded pages,
+verify all reverse deletions and retain an unrelated generation. They cover
+full public-queue headroom, rollback, replay gaps, exact duplicate admission,
+cold structural recovery, corrupt cleanup cuts/identity and preservation of
+the source fence. Debug and ReleaseFast qualification each pass 43/43 build
+steps and all 27 candidate/catalog tests, with no skips, failures or leaks.
+The initial fixture materialized the complete 8,192-entry unrelated public
+queue in each owner scenario; it was replaced by a point-only transaction
+adapter that rejects any admission cursor scan, alongside the existing public
+capacity test. A sampled remaining Debug run was in exhaustive allocation-fault
+recovery and allocator stack-trace collection, not a stuck GC loop.
+
+This is physical artifact retirement, NOT full canceled publication proof.
+Generation-local GC pages still need authenticated durable owner/standby
+delivery; global UNIQUE claims, private manifest/blob and binding retirement,
+final completion cuts, epoch release and coordinated intent-aware capability
+barriers remain unfinished. No canceled ACK is emitted and the public producer
+remains disabled. No original SQL case is reclassified by this component work.
+
+### Unified owner effects and durable cleanup admission (in qualification)
+
+The private owner protocol is newly introduced in this PR and absent from main.
+It now carries exactly one tagged effect in the version-22 envelope: ordinary
+control, cancellation intent, or cancellation cleanup admission. Separate
+top-level cancellation fields/version-23 prototypes are removed rather than
+retained as legacy formats. The strict frame rejects mixed tagged effects and
+unknown fields; each effect validates its actual native namespace and has its
+own byte limit. This is one owner-effect transaction contract, not additional
+mutation routes.
+
+Cleanup preparation uses the actual inspected durable job. The private compiled
+owner receives immutable identity only, not caller-chosen physical allocation
+or a replacement manifest. Queue admission goes through the existing shared DB
+commit pipeline and commits its native cut, marker and durable outbox together;
+standby replay stages that same queue effect and transport LSN atomically.
+Its result has no publication receipt and survives committed mirror failure.
+Both C-ABI and leased-owner adapters expose only this internal progress step.
+
+The updated integration gate is running. It adds real primary outbox failure,
+cold reopen, exact pending-payload recovery, duplicate cleanup admission,
+standby clock-gap rejection, replay and standby reopen, plus compiled-owner
+cleanup retries. Fixture setup drains/burns the jobs using the independently
+tested cancellation primitives; it is not proof of authenticated distributed
+drain/burn delivery. GC page delivery, cleanup completion cuts, global claims,
+manifest/blob and binding retirement, epoch release and coordinated rollout
+barriers remain open. Public production stays disabled and no SQL case is
+credited by this protocol consolidation.
