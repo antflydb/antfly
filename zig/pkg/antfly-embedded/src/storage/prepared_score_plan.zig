@@ -48,6 +48,12 @@ pub const PreparedScorePlan = struct {
     duplicate_next: []u16 = &.{},
     row_lookup_valid: bool = false,
     row_order_identity: bool = true,
+    column_remap: []u16 = &.{},
+    column_identity: []u16 = &.{},
+    column_consumed: []u16 = &.{},
+    column_sorted: []const usize = &.{},
+    column_count: usize = 0,
+    column_order_identity: bool = true,
 
     pub fn deinit(self: *@This()) void {
         if (self.storage) |storage| self.backing.?.free(storage);
@@ -197,6 +203,21 @@ pub const PreparedScorePlan = struct {
             self.duplicate_next[row] = self.row_heads[slot];
             self.row_heads[slot] = @intCast(row + 1);
         }
+        self.column_remap = try a.alloc(u16, prefixes.len);
+        self.column_identity = try a.alloc(u16, prefixes.len);
+        self.column_consumed = try a.alloc(u16, prefixes.len);
+        var null_column = column_count;
+        for (owned_prefixes, 0..) |prefix, column| {
+            self.column_remap[column] = @intCast(column);
+            self.column_identity[column] = @intCast(column);
+            if (prefix == null) {
+                columns[null_column] = column;
+                null_column += 1;
+            }
+        }
+        self.column_sorted = columns;
+        self.column_count = column_count;
+        self.column_order_identity = true;
         self.nodes = owned_nodes;
         self.prefixes = owned_prefixes;
         self.targets = targets;
@@ -209,7 +230,7 @@ pub const PreparedScorePlan = struct {
     // Include copied identities, target fanout, key spans, and alignment.
     // Caller inputs must not borrow this plan's storage across preparation.
     fn requiredBytes(prefixes: []const ?[]const u8, nodes: []const []const u8) ?usize {
-        if (nodes.len >= std.math.maxInt(u16)) return null;
+        if (nodes.len >= std.math.maxInt(u16) or prefixes.len >= std.math.maxInt(u16)) return null;
         const slots = std.math.ceilPowerOfTwo(usize, @max(@as(usize, 1), nodes.len * 2)) catch return null;
         var estimate: usize = 1024 + nodes.len * 3 * @sizeOf(u16) + slots * 2 * @sizeOf(u16);
         var count: usize = 0;
@@ -218,7 +239,7 @@ pub const PreparedScorePlan = struct {
             if (estimate > max_bytes) return null;
         }
         for (prefixes) |prefix| {
-            estimate = std.math.add(usize, estimate, @sizeOf(?[]const u8) + @sizeOf(usize)) catch return null;
+            estimate = std.math.add(usize, estimate, @sizeOf(?[]const u8) + @sizeOf(usize) + 3 * @sizeOf(u16)) catch return null;
             if (prefix) |p| {
                 estimate = std.math.add(usize, estimate, p.len) catch return null;
                 for (nodes) |node| {
@@ -236,7 +257,8 @@ pub const PreparedScorePlan = struct {
 
     fn prefixesMatch(self: *const @This(), prefixes: []const ?[]const u8) bool {
         if (!self.valid or prefixes.len != self.prefixes.len) return false;
-        for (prefixes, self.prefixes) |prefix, old| {
+        for (prefixes, 0..) |prefix, column| {
+            const old = self.prefixes[if (self.column_order_identity) column else self.column_identity[column]];
             if (prefix) |p| {
                 if (old == null or !std.mem.eql(u8, p, old.?)) return false;
             } else if (old != null) return false;
@@ -245,7 +267,11 @@ pub const PreparedScorePlan = struct {
     }
 
     fn matches(self: *const @This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
-        if (!self.prefixesMatch(prefixes) or nodes.len != self.nodes.len) return false;
+        return self.prefixesMatch(prefixes) and self.nodesMatch(nodes);
+    }
+
+    fn nodesMatch(self: *const @This(), nodes: []const []const u8) bool {
+        if (!self.valid or nodes.len != self.nodes.len) return false;
         if (self.row_order_identity) {
             for (nodes, self.nodes) |node, old| if (!std.mem.eql(u8, node, old)) return false;
         } else {
@@ -257,7 +283,10 @@ pub const PreparedScorePlan = struct {
     /// Match a multiset in linear expected time without re-encoding or sorting.
     /// Hashes select a probe slot only; exact bytes and duplicate counts decide.
     fn reusePermutation(self: *@This(), prefixes: []const ?[]const u8, nodes: []const []const u8) bool {
-        if (!self.row_lookup_valid or !self.prefixesMatch(prefixes) or nodes.len != self.nodes.len) return false;
+        if (!self.valid or prefixes.len != self.prefixes.len or nodes.len != self.nodes.len) return false;
+        if (!self.prefixesMatch(prefixes) and !self.reuseColumns(prefixes)) return false;
+        if (self.nodesMatch(nodes)) return true;
+        if (!self.row_lookup_valid) return false;
         @memcpy(self.row_cursors, self.row_heads);
         const mask = self.row_heads.len - 1;
         var identity_mapping = true;
@@ -281,27 +310,69 @@ pub const PreparedScorePlan = struct {
         return true;
     }
 
+    // Canonical non-null columns are sorted once. Binary lookup plus a
+    // duplicate cursor verifies the full multiset with bounded O(n log n) work.
+    fn reuseColumns(self: *@This(), prefixes: []const ?[]const u8) bool {
+        @memset(self.column_consumed, 0);
+        var identity_mapping = true;
+        for (prefixes, 0..) |prefix, column| {
+            var low: usize = 0;
+            if (prefix) |wanted| {
+                var high = self.column_count;
+                while (low < high) {
+                    const mid = low + (high - low) / 2;
+                    if (std.mem.order(u8, self.prefixes[self.column_sorted[mid]].?, wanted) == .lt) low = mid + 1 else high = mid;
+                }
+                if (low == self.column_count) return false;
+            } else low = self.column_count;
+            if (low == self.column_sorted.len) return false;
+            const first = self.column_sorted[low];
+            const position = low + self.column_consumed[first];
+            if (position >= self.column_sorted.len) return false;
+            const identity = self.column_sorted[position];
+            const old = self.prefixes[identity];
+            if (prefix) |wanted| {
+                if (old == null or !std.mem.eql(u8, old.?, wanted)) return false;
+            } else if (old != null) return false;
+            self.column_consumed[first] += 1;
+            self.column_remap[identity] = @intCast(column);
+            self.column_identity[column] = @intCast(identity);
+            identity_mapping = identity_mapping and identity == column;
+        }
+        self.column_order_identity = identity_mapping;
+        return true;
+    }
+
     pub const Output = struct {
         plan: *const PreparedScorePlan,
         columns: []const []?f64,
         pub fn sink(self: *@This()) ScoreSink {
-            return .{ .context = self, .write = if (self.plan.row_order_identity) writeCanonical else writeRemapped };
+            return .{ .context = self, .write = if (self.plan.column_order_identity)
+                (if (self.plan.row_order_identity) writeCanonical else writeRemapped)
+            else
+                (if (self.plan.row_order_identity) writeColumns else writeBoth) };
         }
         fn writeCanonical(ctx: *anyopaque, index: usize, score: f64) void {
-            writeRows(ctx, index, score, false);
+            writeRows(ctx, index, score, false, false);
         }
         fn writeRemapped(ctx: *anyopaque, index: usize, score: f64) void {
-            writeRows(ctx, index, score, true);
+            writeRows(ctx, index, score, true, false);
         }
-        fn writeRows(ctx: *anyopaque, index: usize, score: f64, comptime remapped: bool) void {
+        fn writeColumns(ctx: *anyopaque, index: usize, score: f64) void {
+            writeRows(ctx, index, score, false, true);
+        }
+        fn writeBoth(ctx: *anyopaque, index: usize, score: f64) void {
+            writeRows(ctx, index, score, true, true);
+        }
+        fn writeRows(ctx: *anyopaque, index: usize, score: f64, comptime remapped: bool, comptime columns_remapped: bool) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             if (self.plan.read_keys.len == self.plan.targets.len) {
                 const target = self.plan.targets[index];
-                self.columns[target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = score;
+                self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = score;
                 return;
             }
             const start = if (index == 0) 0 else self.plan.ends[index - 1];
-            for (self.plan.targets[start..self.plan.ends[index]]) |target| self.columns[target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = score;
+            for (self.plan.targets[start..self.plan.ends[index]]) |target| self.columns[if (columns_remapped) self.plan.column_remap[target.column] else target.column][if (remapped) self.plan.row_remap[target.row] else target.row] = score;
         }
     };
 };
@@ -374,4 +445,34 @@ test "prepared score plan bounds hash collision work and retains sorting fallbac
     try std.testing.expect(try plan.prepare(std.testing.allocator, &.{"p/"}, &nodes));
     try std.testing.expect(!plan.row_lookup_valid);
     try std.testing.expectEqual(@as(usize, 33), plan.read_keys.len);
+}
+
+test "prepared score plan column permutations preserve duplicate null and row fanout" {
+    var plan = PreparedScorePlan{};
+    defer plan.deinit();
+    const a = std.testing.allocator;
+    try std.testing.expect(try plan.prepare(a, &.{ "p/", null, "q/", "p/" }, &.{ "a", "b", "a" }));
+    const storage = plan.storage.?.ptr;
+    const physical = plan.read_keys.ptr;
+    const requests = [_][4]?[]const u8{
+        .{ "q/", "p/", "p/", null },
+        .{ null, "p/", "q/", "p/" },
+        .{ "p/", null, "q/", "p/" },
+    };
+    for (requests) |prefixes| {
+        const nodes = [_][]const u8{ "b", "a", "a" };
+        try std.testing.expect(try plan.prepare(a, &prefixes, &nodes));
+        try std.testing.expectEqual(storage, plan.storage.?.ptr);
+        try std.testing.expectEqual(physical, plan.read_keys.ptr);
+        var scores: [4][3]?f64 = @splat(@splat(null));
+        var output = PreparedScorePlan.Output{ .plan = &plan, .columns = &.{ &scores[0], &scores[1], &scores[2], &scores[3] } };
+        const sink = output.sink();
+        for (plan.read_keys, 0..) |key, i| sink.write(sink.context, i, @floatFromInt(key[0] + key[key.len - 3]));
+        for (prefixes, scores) |prefix, column| for (nodes, column) |node, value| {
+            try std.testing.expectEqual(if (prefix) |p| @as(?f64, @floatFromInt(p[0] + node[0])) else null, value);
+        };
+    }
+    // A changed multiset must rebuild, even after a partial mapping attempt.
+    try std.testing.expect(try plan.prepare(a, &.{ "q/", "p/", "q/", null }, &.{ "b", "a", "a" }));
+    try std.testing.expectEqualStrings("q/", plan.prefixes[0].?);
 }

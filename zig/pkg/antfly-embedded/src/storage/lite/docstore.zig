@@ -2917,7 +2917,7 @@ pub const Txn = struct {
     pub const ReadScope = struct {
         parent: *Txn,
         workspace: ?*ReadWorkspace = null,
-        scratch: read_scratch,
+        scratch: @import("result_scratch.zig").Scratch,
         batch_scratch: read_scratch,
         native_batch: native.DocumentBatchReadState = .{},
         discard_workspace: bool = false,
@@ -2963,7 +2963,16 @@ pub const Txn = struct {
         }
 
         pub fn getInto(self: *@This(), key: []const u8, out: []u8) ![]const u8 {
-            return self.parent.getInto(key, out);
+            if (self.parent.prefix.len == 0) return self.parent.getInto(key, out);
+            defer self.resetBatchScratch();
+            const full = try std.mem.concat(self.batchScratch().allocator(), u8, &.{ self.parent.prefix, key });
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const value = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                if (value.len > out.len) return error.BufferTooSmall;
+                @memcpy(out[0..value.len], value);
+                return out[0..value.len];
+            }
+            return (try self.parent.readFile()).readDocumentInto(self.parent.checkpoint, full, out);
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
@@ -3154,7 +3163,7 @@ pub const Txn = struct {
     /// owned copies, so subsequent pending mutations cannot invalidate them.
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
         const workspace = if (self.store) |store| try store.checkoutWorkspace(allocator) else null;
-        return .{ .parent = self, .workspace = workspace, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024), .native_batch = .{ .allocator = allocator } };
+        return .{ .parent = self, .workspace = workspace, .scratch = @import("result_scratch.zig").Scratch.init(if (workspace) |w| w.resultAllocator(allocator) else allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024), .native_batch = .{ .allocator = allocator } };
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -7496,4 +7505,278 @@ test "lite prepared cached scores retry after page cache eviction" {
     const before = counter.alloc_calls;
     try scope.getManySortedScores(&keys, &scores);
     try std.testing.expectEqual(before, counter.alloc_calls);
+}
+
+test "lite prepared point versus batch scope measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "point-review.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][11]u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    for (&docs, &key_storage, 0..) |*doc, *key, i| {
+        @memcpy(key[0..3], "ns\x00");
+        _ = try std.fmt.bufPrint(key[3..], "{d:0>8}", .{i});
+        doc.* = .{ .key = key, .value = "document" };
+    }
+    try store.file.putDocumentBatch(&docs);
+    inline for (.{ false, true }) |batch| {
+        for (0..5) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            var buffer: [8]u8 = undefined;
+            if (batch) {
+                var values: [1]?[]const u8 = undefined;
+                try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buffer}, &values);
+                try std.testing.expectEqualStrings("document", values[0].?);
+            } else try std.testing.expectEqualStrings("document", try scope.getInto(key_storage[0][3..], &buffer));
+        }
+        const before = counter.alloc_calls;
+        const cpu_before = std.posix.getrusage(0);
+        for (0..5000) |_| {
+            var txn = try Txn.openReadWithPrefix(&store, "ns\x00");
+            defer txn.abort();
+            var scope = try txn.openReadScope(alloc);
+            defer scope.close();
+            var buffer: [8]u8 = undefined;
+            if (batch) {
+                var values: [1]?[]const u8 = undefined;
+                try scope.getManySortedInto(&.{key_storage[0][3..]}, &.{&buffer}, &values);
+                try std.testing.expectEqualStrings("document", values[0].?);
+            } else try std.testing.expectEqualStrings("document", try scope.getInto(key_storage[0][3..], &buffer));
+        }
+        const cpu_after = std.posix.getrusage(0);
+        const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+        try std.testing.expectEqual(@as(usize, 0), counter.alloc_calls - before);
+        std.debug.print("POINT_REVIEW batch={any} cpu_us={d} allocations={d}\n", .{ batch, cpu_us, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared returned documents cache pressure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "mixed-pressure.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    const limits = resource_manager_mod.Options.defaultBudgets();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = limits });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    var repeated: [1024][]const u8 = undefined;
+    for (keys, 0..) |key, i| {
+        repeated[2 * i] = key;
+        repeated[2 * i + 1] = key;
+    }
+    var storage: [1024][8]u8 = undefined;
+    var buffers: [1024][]u8 = undefined;
+    for (&buffers, &storage) |*out, *buf| out.* = buf;
+    var values: [1024]?[]const u8 = undefined;
+    var evictions: usize = 0;
+
+    for (40..161) |step| {
+        if (step % 8 != 0) continue;
+        var successes: [2]bool = undefined;
+        for (0..2) |mode| {
+            _ = Store.reclaimIdleWorkspaces(&store, std.math.maxInt(u64));
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = 0;
+            var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+            defer query.deinit();
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            var scope = try txn.openReadScope(query.allocator());
+            defer scope.close();
+            var scores: [512]?f64 = undefined;
+            try scope.getManySortedScores(&keys, &scores);
+            const w = scope.workspace.?;
+            try std.testing.expect(w.resolved_scores.storage != null);
+            if (mode == 0) w.resolved_scores.deinit(w.allocator());
+            manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = step * 1024;
+            const result = scope.getManySorted(&repeated, &values);
+            successes[mode] = if (result) |_| true else |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => false,
+                else => return err,
+            };
+            if (successes[mode]) {
+                for (values) |value| try std.testing.expectEqualSlices(u8, &raw, value.?);
+                try std.testing.expect(!w.allocation_failed);
+                if (mode == 1 and w.resolved_scores.storage == null) evictions += 1;
+            }
+        }
+        if (successes[0]) try std.testing.expect(successes[1]);
+    }
+    try std.testing.expect(evictions > 0);
+}
+
+test "lite prepared prefix permutation measurement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "prefix-review.aflite");
+    defer a.free(path);
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const alloc = counter.allocator();
+    var store = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [1024][13]u8 = undefined;
+    var nodes: [512][]const u8 = undefined;
+    var docs: [1024]native.DocumentMutation = undefined;
+    var score: [2][8]u8 = undefined;
+    const prefixes = [_]?[]const u8{ "m1/", "m2/" };
+    for (&score, 0..) |*raw, column| std.mem.writeInt(u64, raw, @bitCast(@as(f64, @floatFromInt(column + 3))), .little);
+    for (prefixes, 0..) |prefix, column| {
+        for (0..512) |i| {
+            const key = &key_storage[column * 512 + i];
+            @memcpy(key[0..3], prefix.?);
+            const node = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
+            key[11] = 0;
+            key[12] = 0;
+            if (column == 0) nodes[i] = node;
+            docs[column * 512 + i] = .{ .key = key, .value = &score[column] };
+        }
+    }
+    try store.file.putDocumentBatch(&docs);
+    var columns: [2][512]?f64 = undefined;
+    inline for (.{ false, true }) |varying| {
+        for (0..5) |_| {
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            _ = try @import("../../graph/score_read.zig").populate(alloc, &txn, &prefixes, &nodes, &.{ &columns[0], &columns[1] });
+        }
+        const before = counter.alloc_calls;
+        const cpu_before = std.posix.getrusage(0);
+        for (0..5000) |iteration| {
+            const swap = varying and iteration % 2 == 1;
+            const requested = if (swap) [_]?[]const u8{ prefixes[1], prefixes[0] } else prefixes;
+            var txn = try Txn.openRead(&store);
+            defer txn.abort();
+            _ = try @import("../../graph/score_read.zig").populate(alloc, &txn, &requested, &nodes, &.{ &columns[0], &columns[1] });
+            for (columns, 0..) |values, column| for (values) |value| try std.testing.expectEqual(@as(?f64, @floatFromInt(3 + (if (swap) 1 - column else column))), value);
+        }
+        const cpu_after = std.posix.getrusage(0);
+        const cpu_us = (cpu_after.utime.sec - cpu_before.utime.sec + cpu_after.stime.sec - cpu_before.stime.sec) * 1000000 + cpu_after.utime.usec - cpu_before.utime.usec + cpu_after.stime.usec - cpu_before.stime.usec;
+        try std.testing.expectEqual(@as(usize, 0), counter.alloc_calls - before);
+        std.debug.print("PREFIX_REVIEW varying={any} cpu_us={d} allocations={d}\n", .{ varying, cpu_us, counter.alloc_calls - before });
+    }
+}
+
+test "lite prepared result eviction preserves earlier values and accounting" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "result-lifetime.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const big = try a.alloc(u8, 32 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try store.file.putDocument("large", big);
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    var scope_open = true;
+    defer if (scope_open) scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const earlier = try scope.get(keys[0]);
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    _ = query.releaseUnusedCredit();
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = query.live_bytes + 24 * 1024;
+    const returned = try scope.get("large");
+    try std.testing.expectEqualSlices(u8, big, returned);
+    try std.testing.expectEqualSlices(u8, &raw, earlier);
+    try std.testing.expect(w.resolved_scores.storage == null);
+    scope.close();
+    scope_open = false;
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
+}
+
+test "lite prepared unavailable resize preserves optional cache" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "result-lifetime.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var key_storage: [512][10]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var docs: [512]native.DocumentMutation = undefined;
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 3)), .little);
+    for (&key_storage, &keys, &docs, 0..) |*buf, *key, *doc, i| {
+        _ = try std.fmt.bufPrint(buf[0..8], "{d:0>8}", .{i});
+        buf[8] = 0;
+        buf[9] = 0;
+        key.* = buf;
+        doc.* = .{ .key = buf, .value = &raw };
+    }
+    try store.file.putDocumentBatch(&docs);
+    const big = try a.alloc(u8, 32 * 1024);
+    defer a.free(big);
+    @memset(big, 'x');
+    try store.file.putDocument("large", big);
+    const query_backing = Allocator{ .ptr = a.ptr, .vtable = &.{ .alloc = a.vtable.alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = a.vtable.free } };
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, query_backing, 1);
+    defer query.deinit();
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var scope = try txn.openReadScope(query.allocator());
+    var scope_open = true;
+    defer if (scope_open) scope.close();
+    var scores: [512]?f64 = undefined;
+    try scope.getManySortedScores(&keys, &scores);
+    const earlier = try scope.get(keys[0]);
+    const w = scope.workspace.?;
+    try std.testing.expect(w.resolved_scores.storage != null);
+    const returned = try scope.get("large");
+    try std.testing.expectEqualSlices(u8, big, returned);
+    try std.testing.expectEqualSlices(u8, &raw, earlier);
+    try std.testing.expect(w.resolved_scores.storage != null);
+    scope.close();
+    scope_open = false;
+    try std.testing.expectEqual(@as(u64, 0), query.live_bytes);
 }

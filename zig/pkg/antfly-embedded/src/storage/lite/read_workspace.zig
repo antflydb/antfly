@@ -26,6 +26,7 @@ pub const Workspace = struct {
     budget: ?resources.BudgetedAllocator = null,
     query_budget: ?*resources.BudgetedAllocator = null,
     query_reservation: ?resources.BudgetedAllocator.BorrowedScratch = null,
+    result_backing: ?Allocator = null,
     live: usize = 0,
     busy: bool = false,
     allocation_failed: bool = false,
@@ -105,6 +106,7 @@ pub const Workspace = struct {
         if (self.query_reservation) |*r| r.release();
         self.query_reservation = null;
         self.query_budget = null;
+        self.result_backing = null;
     }
 
     pub fn resetBatch(self: *Workspace) void {
@@ -149,6 +151,23 @@ pub const Workspace = struct {
     /// Optional cache ownership must not poison otherwise successful scratch.
     pub fn optionalAllocator(self: *Workspace) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = optionalAlloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    /// Results remain query-owned; this adapter only evicts unused residency
+    /// before retrying growth. Its context is stable for the exclusive lease.
+    pub fn resultAllocator(self: *Workspace, backing: Allocator) Allocator {
+        self.result_backing = backing;
+        return .{ .ptr = self, .vtable = &.{ .alloc = resultAlloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = resultFree } };
+    }
+    fn resultAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Workspace = @ptrCast(@alignCast(ctx));
+        const backing = self.result_backing.?;
+        if (backing.rawAlloc(len, alignment, ra)) |p| return p;
+        if (!self.evictOptionalScores()) return null;
+        return backing.rawAlloc(len, alignment, ra);
+    }
+    fn resultFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *Workspace = @ptrCast(@alignCast(ctx));
+        self.result_backing.?.rawFree(memory, alignment, ra);
     }
     fn evictOptionalScores(self: *Workspace) bool {
         if (self.resolved_scores.borrowed or self.resolved_scores.storage == null) return false;
