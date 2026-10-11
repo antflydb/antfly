@@ -114,6 +114,7 @@ pub const Session = struct {
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
     lake_visibility: commands.ReadRequirements = .{},
+    read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
@@ -349,6 +350,7 @@ pub const Session = struct {
             .session_id = self.session_id,
             .lake_visibility = if (self.lake_visibility.visibility == .accepted) .accepted else .committed,
             .read_requirements = self.lake_visibility,
+            .read_receipt_budget = &self.read_receipt_budget,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -786,6 +788,7 @@ pub const Session = struct {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
             'Q' => {
+                self.read_receipt_budget = .{};
                 const statement = try cursor.string();
                 try cursor.finish();
                 self.removePortal("");
@@ -972,6 +975,7 @@ pub const Session = struct {
                     portal.stream = null;
                 };
                 if (!portal.stream_opened) {
+                    self.read_receipt_budget = .{};
                     portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {

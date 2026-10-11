@@ -108,21 +108,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
     if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
 }
 
-const ReceiptWaitBudget = struct {
-    deadline_ns: ?u64 = null,
-
-    fn deadline(self: *ReceiptWaitBudget, now: u64, wait_ms: u32) u64 {
-        // Zero still permits one check under the caller's I/O deadline.
-        if (wait_ms == 0) return now;
-        if (self.deadline_ns == null) self.deadline_ns = now +| @as(u64, wait_ms) * std.time.ns_per_ms;
-        return self.deadline_ns.?;
-    }
-};
+const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
     receipt_wait_budget: ReceiptWaitBudget = .{},
+    shared_receipt_wait_budget: ?*ReceiptWaitBudget = null,
     /// A transport may consume borrowed result columns within the same policy,
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
@@ -1166,7 +1158,8 @@ pub const Adapter = struct {
         const normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wait_ms = self.read_requirements.wait_ms orelse 5000;
-        const wait_deadline = self.receipt_wait_budget.deadline(time.monotonicNs(), wait_ms);
+        const budget = self.shared_receipt_wait_budget orelse &self.receipt_wait_budget;
+        const wait_deadline = budget.deadline(time.monotonicNs(), wait_ms);
         const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
         // Zero permits one readiness check under the statement's I/O budget.
         // Positive budgets also bound catalog and WAL I/O, not just sleeps.

@@ -30,7 +30,7 @@ Each option is optional. Omitting `visibility` preserves the surface's default.
 bounds readiness polling, defaults to 5000, and accepts 0 through 60000. Zero
 checks readiness once under the statement I/O budget without retrying. Positive
 budgets also cap catalog and WAL polling I/O. SQL binding preflight and scan
-readiness checks share that budget. Statement deadlines and cancellation still
+readiness checks share that budget, including PostgreSQL streaming fallback. Statement deadlines and cancellation still
 apply. Unsupported visibility modes fail explicitly.
 
 HTTP SQL accepts the same object on `/sql` requests and prepared executions.

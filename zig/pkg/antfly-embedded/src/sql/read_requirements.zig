@@ -56,3 +56,14 @@ test "read requirements distinguish visibility, receipt generations and pinned c
     try std.testing.expectError(error.ReadSnapshotTooOld, read.requireCoverage(2, 3, 9, true));
     try std.testing.expectError(error.ReadReceiptGenerationMismatch, read.requireCoverage(2, 4, 10, false));
 }
+
+pub const WaitBudget = struct {
+    deadline_ns: ?u64 = null,
+
+    pub fn deadline(self: *WaitBudget, now: u64, wait_ms: u32) u64 {
+        // Zero still permits one check under the caller's I/O deadline.
+        if (wait_ms == 0) return now;
+        if (self.deadline_ns == null) self.deadline_ns = now +| @as(u64, wait_ms) * std.time.ns_per_ms;
+        return self.deadline_ns.?;
+    }
+};

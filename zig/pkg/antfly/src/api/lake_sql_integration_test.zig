@@ -304,6 +304,23 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
     try std.testing.expectEqualStrings("1", checked.output.rows[0][0].string);
     try std.testing.expect(observer.observed != null);
     try std.testing.expect(!observer.changed);
+    // Pgwire shares admission state across a streaming attempt and its new
+    // materialized adapter. AI aggregates deliberately take this fallback.
+    var fallback_query = try local.sql_compiler.compile(a, "SELECT ai_probability(CAST(SUM(amount) AS TEXT), 'Refund?', 'local') FROM events LIMIT 0", .{});
+    defer fallback_query.deinit();
+    var mock_decisions: local.sql_decision_eval.testing.Provider = .{};
+    var shared_budget: local.sql_read_requirements.WaitBudget = .{};
+    var stream_attempt: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .decision_provider = mock_decisions.provider(), .shared_receipt_wait_budget = &shared_budget, .read_requirements = .{ .visibility = .committed, .after_write = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 1 }, .wait_ms = 5000 } };
+    try std.testing.expect((try local.sql_read_stream.Stream.open(a, stream_attempt.backend(), &fallback_query, &.{}, .{})) == null);
+    try std.testing.expect(shared_budget.deadline_ns != null);
+    // Expire the established deadline deterministically before the handoff.
+    shared_budget.deadline_ns = 0;
+    var fallback_attempt: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .decision_provider = mock_decisions.provider(), .shared_receipt_wait_budget = &shared_budget, .read_requirements = stream_attempt.read_requirements };
+    try std.testing.expectError(error.ReadRequirementNotReady, fallback_attempt.execute(a, &fallback_query, &.{}, .{}, null));
+    shared_budget = .{};
+    var next_statement = try fallback_attempt.execute(a, &fallback_query, &.{}, .{}, null);
+    defer next_statement.deinit();
+    try std.testing.expectEqual(@as(usize, 0), next_statement.output.rows.len);
     // An already covered receipt must not succeed after its positive polling
     // budget expires while the provider performs readiness checkpoints.
     const SlowCheckpoint = struct {
