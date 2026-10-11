@@ -35,9 +35,11 @@ pub const PageStore = struct {
     remaining_read_bytes: *u64,
     remaining_write_bytes: *u64,
     read_cache: ?ReadCache = null,
+    /// Only build owners with a concurrency-safe artifact allocator opt in.
+    io: ?std.Io = null,
 
     pub fn store(self: *PageStore) tree.Store {
-        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .check = check };
+        return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
     }
 
     pub fn namespaceDomain(namespace: []const u8) [32]u8 {
@@ -128,11 +130,50 @@ pub const PageStore = struct {
         if (!std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
         if (bytes.len > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes.len;
+        try self.upload(ref, bytes);
+    }
+
+    fn upload(self: *PageStore, ref: tree.Ref, bytes: []const u8) !void {
         var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, bytes, self.cancellation);
         defer metadata.deinit(self.artifacts.allocator);
         const id = try identity(self.domain, ref);
         if (metadata.byte_len != ref.bytes or !std.mem.eql(u8, metadata.artifact_id, &id) or
             !std.mem.eql(u8, metadata.checksum, id[7..71])) return error.ArtifactIntegrityMismatch;
+    }
+
+    fn putMany(ptr: *anyopaque, writes: []const tree.Write) !void {
+        const self: *PageStore = @ptrCast(@alignCast(ptr));
+        if (writes.len > tree.max_write_batch) return error.GraphPageWriteBudgetExceeded;
+        var bytes: u64 = 0;
+        for (writes) |write| {
+            try write.ref.validate();
+            if (!std.mem.eql(u8, &write.ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
+            if (write.ref.bytes != write.bytes.len) return error.ArtifactIntegrityMismatch;
+            bytes = try std.math.add(u64, bytes, write.bytes.len);
+        }
+        // Charge before spawning. Workers never race on admission counters.
+        if (bytes > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
+        self.remaining_write_bytes.* -= bytes;
+        try self.cancellation.check();
+        var failures: [tree.max_write_batch]?anyerror = @splat(null);
+        var group: std.Io.Group = .init;
+        const io = self.io.?;
+        const Worker = struct {
+            fn run(owner: *PageStore, write: tree.Write, failure: *?anyerror) void {
+                owner.upload(write.ref, write.bytes) catch |err| {
+                    failure.* = err;
+                };
+            }
+        };
+        for (writes, 0..) |write, index| group.async(io, Worker.run, .{ self, write, &failures[index] });
+        // Even cancellation must drain all children before borrowed pages and
+        // the publication owner are released.
+        group.await(io) catch |err| {
+            group.cancel(io);
+            return err;
+        };
+        for (failures[0..writes.len]) |failure| if (failure) |err| return err;
+        try self.cancellation.check();
     }
 };
 
@@ -204,6 +245,9 @@ const TestArtifacts = struct {
     memory: tree.testing.MemoryStore,
     deleted: usize = 0,
     fail_delete_after: ?usize = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    fail_upload: bool = false,
+    completed_uploads: std.atomic.Value(usize) = .init(0),
 
     fn capability(self: *@This()) artifacts.ArtifactStore {
         return .{ .allocator = self.memory.alloc, .ptr = self, .vtable = &.{
@@ -239,7 +283,10 @@ const TestArtifacts = struct {
     }
 
     fn putScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifacts.UploadScope, bytes: []const u8, cancellation: CancellationToken) !artifacts.ArtifactMetadata {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        defer _ = self.completed_uploads.fetchAdd(1, .acq_rel);
         try cancellation.check();
+        if (self.fail_upload) return error.InjectedUploadFailure;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         const id = try scope.artifactId(&std.fmt.bytesToHex(&digest, .lower));
@@ -248,6 +295,8 @@ const TestArtifacts = struct {
 
     fn save(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, bytes: []const u8) !artifacts.ArtifactMetadata {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const store = self.memory.store();
         try store.put(store.ptr, .{ .digest = address(id), .bytes = @intCast(bytes.len), .height = 0, .records = 1 }, bytes);
         return metadata(alloc, id, bytes.len);
@@ -525,4 +574,48 @@ test "serverless paged public adjacency reader preserves query-local identities 
 
 test "serverless paged public adjacency reader cleans every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
+}
+
+test "serverless graph page store bounded uploads drain failures and respect admission" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = alloc } };
+    defer fixture.memory.deinit();
+    var capability = fixture.capability();
+    var read_bytes: u64 = 0;
+    var write_bytes: u64 = 511;
+    var pages: PageStore = .{
+        .domain = PageStore.namespaceDomain("bounded-upload-test"),
+        .attempt = @splat(1),
+        .artifacts = &capability,
+        .remaining_read_bytes = &read_bytes,
+        .remaining_write_bytes = &write_bytes,
+        .io = io_impl.io(),
+    };
+    const bytes: [64]u8 = @splat(7);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    const writes: [tree.max_write_batch]tree.Write = @splat(.{
+        .ref = .{ .digest = digest, .attempt = @splat(1), .bytes = bytes.len, .height = 0, .records = 1 },
+        .bytes = &bytes,
+    });
+    const store = pages.store();
+    try std.testing.expectError(error.GraphPageWriteBudgetExceeded, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 0), fixture.completed_uploads.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 511), write_bytes);
+    write_bytes = 512;
+    try store.put_many.?(store.ptr, &writes);
+    try std.testing.expectEqual(@as(u64, 0), write_bytes);
+    try std.testing.expectEqual(@as(usize, 8), fixture.completed_uploads.load(.acquire));
+    fixture.fail_upload = true;
+    write_bytes = 512;
+    try std.testing.expectError(error.InjectedUploadFailure, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 16), fixture.completed_uploads.load(.acquire));
+    // A borrowed cancellation is checked before scheduling any uploads.
+    var signal: std.atomic.Value(bool) = .init(true);
+    pages.cancellation = CancellationToken.fromAtomic(&signal);
+    write_bytes = 512;
+    try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 16), fixture.completed_uploads.load(.acquire));
 }

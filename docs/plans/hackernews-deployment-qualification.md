@@ -344,9 +344,11 @@ compute while retaining $10 per run for noncompute, all earlier/local holds and
 the original history. Recorded exposure is $90.927106. The reconciled follow-up
 plan permits two new $20 reservations, for at most $130.927106 held or recorded,
 under the unchanged $150 ceiling. No pending storage/networking hold was refunded.
-The broad cursor query is recorded separately as `the`; a physical count of the
-unchanged one-file source found only 854 bodies mentioning `database`, so the
-primary relevance query cannot qualify the intended cursor depth by itself.
+The cursor workload now uses `AI`, with 4,110 actual analyzed matches in the
+unchanged one-file partition. The previous `the` selection was invalid because
+the standard analyzer removes it; physical substring counts cannot establish
+indexed cursor coverage. The primary query has 856 matches and cannot qualify
+the 4,097-hit depth gate by itself.
 
 The follow-up profile enables `qualify_composed_sources`. It inserts two native
 current rows under a numeric `hn_id` key and verifies union, replacement overlay,
@@ -354,3 +356,43 @@ saved-source lookup and retained source cursors after mutations and daemon
 restart, against the unchanged historical Parquet source. This is a qualification
 assertion, not measured evidence until the actual public-API run passes. It does
 not establish a running Firebase feed, replacement-pod recovery or serving SLO.
+
+
+## First regional publication result and corrections
+
+[`publication-baseline-20261011.json`](../../examples/hackernews/publication-baseline-20261011.json)
+records the first completed regional one-file publication. The unchanged
+142,577-row file and all declared text/metadata indexes published, and SQL count
+passed. The qualification verdict failed: cold highlighted search took
+16,102 ms against the 10,000 ms gate; warm primary p95 was 323 ms. Publication
+plus queries before failure took 1,107.78 seconds; the failed harness did not
+retain an isolated publication duration, so that duration remains unknown.
+The owned pod was deleted. Full-archive qualification and deployment have not
+passed.
+
+Cold search received 55,652,318 network bytes with the stored-source projection
+disabled. The next profile explicitly enables `store_source` on the archive text
+index, permitting highlights to read indexed text while other selected columns
+still use the authoritative source. This increases sidecar storage and must be
+measured; it is not yet a qualified latency improvement. The serving candidate
+uses the same policy.
+
+The composed history/current check failed with `unsupported_exact_sort` on a
+numeric native-table key filter. Exact native filter lowering now translates
+unambiguous JSON pointers and declared numeric/boolean equality. Positional
+array paths, literal dotted components and integer equality outside f64's exact
+range remain unresolved rather than producing approximate sorted results.
+Native indexed range predicates also translate safe pointer paths.
+
+Sorted page publication now admits batches of at most eight immutable uploads.
+All children finish before roots can be returned or owners released, including
+failure and cancellation. Memory admission is synchronized across workers;
+format, page identities, attempt scope and publication fences stay intact. This
+reduces serial request latency but does not reduce object counts or prove full
+archive throughput. Repeated remote reads during statistics reduction and full
+archive object-request costs remain measurement targets.
+
+The harness keeps the last nonempty deep page for restart replay, rejects
+initial duplicate IDs, preserves completed filter/publication measurements on
+failure, and continues baseline restart checks after a composed-source failure.
+Required composed coverage still fails the overall gate when unavailable.

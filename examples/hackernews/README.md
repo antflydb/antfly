@@ -754,11 +754,10 @@ Use `archive-qualification-followup.json` with the same reconciled ledger and
 `--extend-run-limit` for two additional attempts within the original $150 ceiling.
 Its plan includes prior reconciled exposure; it must not be admitted against a
 fresh ledger. Original attempts and extension records remain auditable.
-The deep cursor workload explicitly uses `the`: the one-file source only has
-roughly 854 bodies containing `database`, insufficient for the 4,097-hit gate.
-Relevance and shallow pagination still use the primary query. Deep pages and their
-restart continuation use the broad query's own retained snapshot. Reports record
-the cursor term and comparisons reject differing cursor workloads.
+The deep cursor workload uses `AI`, which the standard analyzer retains and
+which matches 4,110 rows in the qualification partition. This exceeds the
+4,097-hit gate; stopwords such as `the` cannot establish that coverage. Restart
+checks replay the last nonempty deep page.
 
 The follow-up also requires real public-API checks across historical and current
 tables: union visibility, suppression of a historical match by a nonmatching

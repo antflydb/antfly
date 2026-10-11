@@ -219,6 +219,7 @@ def main():
     parser.add_argument("--workload-terms", nargs="+", default=[])
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument("--qualify-composed-sources", action="store_true")
+    parser.add_argument("--store-source", action="store_true")
     parser.add_argument(
         "--cursor-term", help="Separate broad query for deep cursor coverage"
     )
@@ -447,7 +448,13 @@ def main():
                             "credentials": {"ref": "hn-gcs-source"},
                         },
                     },
-                    "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+                    "indexes": {
+                        "body_text": {
+                            "type": "full_text",
+                            "field": "body",
+                            "store_source": args.store_source,
+                        }
+                    },
                 },
             )
             registration_seconds = round(time.monotonic() - registration_started, 2)
@@ -609,7 +616,11 @@ def main():
                 dict(cursor_query, limit=128), "cursor_initial"
             )
             deep_snapshot = deep_page["remote_snapshot"]
-            seen = {h["_id"] for h in deep_page["hits"]["hits"]}
+            initial_ids = [h["_id"] for h in deep_page["hits"]["hits"]]
+            assert len(set(initial_ids)) == len(initial_ids), (
+                "Cursor repeated initial hits"
+            )
+            seen = set(initial_ids)
             cursor_depth = {
                 "hits": len(seen),
                 "samples_ms": [],
@@ -621,13 +632,17 @@ def main():
         for _ in range(args.cursor_pages):
             if not deep_page["hits"]["hits"]:
                 break
-            deep_request = dict(
+            candidate_request = dict(
                 cursor_query,
                 limit=128,
                 search_after=deep_page["hits"]["hits"][-1]["_sort"],
                 remote_snapshot=deep_snapshot,
             )
-            deep_page, elapsed = timed_query(deep_request, "cursor_depth")
+            deep_page, elapsed = timed_query(candidate_request, "cursor_depth")
+            cursor_depth["samples_ms"].append(elapsed)
+            if not deep_page["hits"]["hits"]:
+                break
+            deep_request = candidate_request
             deep_signature = [
                 (h["_id"], h["_score"]) for h in deep_page["hits"]["hits"]
             ]
@@ -637,7 +652,6 @@ def main():
             )
             seen.update(ids)
             cursor_depth["hits"] += len(ids)
-            cursor_depth["samples_ms"].append(elapsed)
         selected = hits[0]["_source"]["hn_id"]
         filtered_query = dict(
             query, filter_query={"term": {"path": "/hn_id", "value": selected}}
@@ -747,11 +761,17 @@ def main():
         assert not empty["hits"]["hits"], "Out-of-sample date range returned hits"
         composed_cursor = None
         composed_verified = []
+        composed_error = None
         if args.qualify_composed_sources:
             phase = "composed_sources"
-            composed_cursor, composed_expected = qualify_composed_sources(
-                call, query, hits[0]["_source"]
-            )
+            try:
+                composed_cursor, composed_expected = qualify_composed_sources(
+                    call, query, hits[0]["_source"]
+                )
+            except (RuntimeError, AssertionError) as exc:
+                # Preserve baseline restart measurements while the required
+                # composed-source gate still fails. Never save provider bodies.
+                composed_error = type(exc).__name__
         stop()
         start()
         if composed_cursor is not None:
@@ -812,7 +832,10 @@ def main():
             "metadata_filters": filter_results,
             "workloads": workload_results,
             "cursor_depth": cursor_depth,
-            "composed_sources": {"verified": composed_verified},
+            "composed_sources": {
+                "verified": composed_verified,
+                "error": composed_error,
+            },
             "io_profiles": io_profiles,
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
             "cache_files": len(cache_files),
@@ -884,6 +907,9 @@ def main():
             ("cursor_depth", "cursor_depth"),
             ("restart_ms", "after_restart_ms"),
             ("io_profiles", "io_profiles"),
+            ("ready_seconds", "ready_seconds"),
+            ("filter_results", "metadata_filters"),
+            ("count", "sql_count"),
         ):
             if name in scope:
                 measurements[target] = scope[name]

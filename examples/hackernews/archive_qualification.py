@@ -356,6 +356,8 @@ def main():
     ):
         command.extend(["--" + flag, str(config[key])])
     command.extend(["--cursor-pages", str(config["cursor_pages"])])
+    if config.get("store_source"):
+        command.append("--store-source")
     if config.get("qualify_composed_sources"):
         command.append("--qualify-composed-sources")
     if config.get("cursor_term"):

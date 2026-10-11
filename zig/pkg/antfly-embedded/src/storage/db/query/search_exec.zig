@@ -9335,11 +9335,7 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("bool")) |bool_query| return try patternBoolFilterToSearchQuery(alloc, bool_query, text_analysis, runtime_schema);
 
     if (value.object.get("term")) |term| {
-        const field_value = try singleFieldString(term, "term");
-        return .{ .term = .{
-            .field = try exactTermFilterFieldAlloc(alloc, field_value.field, text_analysis, runtime_schema),
-            .term = field_value.value,
-        } };
+        return try scalarTermFilterToSearchQuery(alloc, term, text_analysis, runtime_schema);
     }
     if (value.object.get("terms")) |terms| {
         const field_terms = try singleFieldTerms(alloc, terms);
@@ -9426,7 +9422,7 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
-    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(range_query, runtime_schema);
+    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(alloc, range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
     if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
@@ -9783,6 +9779,62 @@ const FieldFuzzy = struct {
     auto_fuzzy: bool = false,
 };
 
+/// Native indexes use dotted source paths. Only translate pointers whose
+/// components have the same meaning; literal dots and array positions need
+/// stored evaluation rather than an approximate index predicate.
+fn nativeFilterFieldAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, field, "/")) {
+        if (field.len == 0) return error.InvalidArgument;
+        return field;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var parts = std.mem.splitScalar(u8, field[1..], '/');
+    while (parts.next()) |part| {
+        const decoded = try graph_exec.decodePatternJsonPointerSegmentAlloc(alloc, part);
+        defer if (std.mem.indexOfScalar(u8, part, '~') != null) alloc.free(decoded);
+        if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, '.') != null) return error.InvalidArgument;
+        if (std.fmt.parseInt(u64, decoded, 10)) |_| return error.InvalidArgument else |_| {}
+        if (out.items.len != 0) try out.append(alloc, '.');
+        try out.appendSlice(alloc, decoded);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn scalarTermFilterToSearchQuery(
+    alloc: Allocator,
+    term: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    if (term != .object) return error.InvalidArgument;
+    if (term.object.get("field") != null and term.object.get("path") != null) return error.InvalidArgument;
+    if (term.object.get("term") != null and term.object.get("value") != null) return error.InvalidArgument;
+    const raw_field, const value = blk: {
+        if (term.object.get("field") orelse term.object.get("path")) |field| {
+            break :blk .{ jsonString(field) orelse return error.InvalidArgument, term.object.get("term") orelse term.object.get("value") orelse return error.InvalidArgument };
+        }
+        if (term.object.count() != 1) return error.InvalidArgument;
+        var it = term.object.iterator();
+        const entry = it.next().?;
+        break :blk .{ entry.key_ptr.*, entry.value_ptr.* };
+    };
+    const field = try nativeFilterFieldAlloc(alloc, raw_field);
+    if (value == .string) return .{ .term = .{
+        .field = try exactTermFilterFieldAlloc(alloc, field, text_analysis, runtime_schema),
+        .term = value.string,
+    } };
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(runtime_schema orelse return error.InvalidArgument, field) orelse return error.InvalidArgument;
+    if (mapping.field_type == .numeric and (value == .integer or value == .float or value == .number_string)) {
+        const number = try jsonOptionalF64Strict(value);
+        // f64 indexes cannot distinguish neighboring large integer keys.
+        if (!std.math.isFinite(number.?) or @abs(number.?) >= 9007199254740992.0) return error.InvalidArgument;
+        return .{ .numeric_range = .{ .field = field, .min = number, .max = number, .inclusive_min = true, .inclusive_max = true } };
+    }
+    if (mapping.field_type == .boolean and value == .bool) return .{ .bool_field = .{ .field = field, .value = value.bool } };
+    return error.InvalidArgument;
+}
+
 fn singleFieldString(value: std.json.Value, value_key: []const u8) !FieldString {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
@@ -9973,6 +10025,42 @@ test "pattern date range filter lowers public date and timestamp bounds" {
     try std.testing.expect(ns_query == .date_range);
     try std.testing.expectEqual(@as(u64, 1767398400000000000), ns_query.date_range.start_ns.?);
     try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
+}
+
+test "pattern native pointer scalar filters preserve exact numeric and escaped path semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema: runtime_schema_mod.TableSchema = .{ .declared_fields = &.{
+        .{ .field = "hn_id", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "created_at", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "published", .mapping = .{ .field_type = .boolean } },
+    } };
+    const term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":142577}}
+    , .{});
+    const query = try patternFilterValueToSearchQuery(alloc, term.value, .{}, schema);
+    try std.testing.expectEqualStrings("hn_id", query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 142577), query.numeric_range.min);
+    try std.testing.expectEqual(query.numeric_range.min, query.numeric_range.max);
+    try std.testing.expect(query.numeric_range.inclusive_min and query.numeric_range.inclusive_max);
+    const range = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"path":"/created_at","gte":1700000000}}
+    , .{});
+    const range_query = try patternFilterValueToSearchQuery(alloc, range.value, .{}, schema);
+    try std.testing.expectEqualStrings("created_at", range_query.numeric_range.field);
+    const boolean = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/published","value":true}}
+    , .{});
+    try std.testing.expect((try patternFilterValueToSearchQuery(alloc, boolean.value, .{}, schema)).bool_field.value);
+    const unsafe = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term":{"path":"/hn_id","value":9007199254740993}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unsafe.value, .{}, schema));
+    try std.testing.expectEqualStrings("a/b~c.child", try nativeFilterFieldAlloc(alloc, "/a~1b~0c/child"));
+    for ([_][]const u8{ "", "/", "/a.b", "/items/0", "/a~2b" }) |path| {
+        try std.testing.expectError(error.InvalidArgument, nativeFilterFieldAlloc(alloc, path));
+    }
 }
 
 test "pattern typed structured filters accept explicit path alias" {
@@ -10413,20 +10501,21 @@ const JsonRangeBound = struct {
 };
 
 fn parseStandardRangeQuery(
+    alloc: Allocator,
     value: std.json.Value,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !search_mod.SearchQuery {
     if (value != .object) return error.InvalidArgument;
     if (value.object.get("field") orelse value.object.get("path")) |field_value| {
         const field = jsonString(field_value) orelse return error.InvalidArgument;
-        return try parseStandardRangeObject(field, value.object, runtime_schema);
+        return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, field), value.object, runtime_schema);
     }
 
     if (value.object.count() != 1) return error.InvalidArgument;
     var it = value.object.iterator();
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .object) return error.InvalidArgument;
-    return try parseStandardRangeObject(entry.key_ptr.*, entry.value_ptr.object, runtime_schema);
+    return try parseStandardRangeObject(try nativeFilterFieldAlloc(alloc, entry.key_ptr.*), entry.value_ptr.object, runtime_schema);
 }
 
 fn parseStandardRangeObject(

@@ -52,6 +52,10 @@ pub const Summary = struct {
 };
 
 pub fn publishSegment(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !?Ref {
+    return publishSegmentWithIo(a, store, bytes, cancellation, null);
+}
+
+pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation, io: ?std.Io) !?Ref {
     var segment = try local.segment.SegmentReader.init(a, bytes);
     defer segment.deinit();
     const names = try a.alloc([]const u8, segment.fields.len);
@@ -123,7 +127,7 @@ pub fn publishSegment(a: A, store: *stores.ArtifactStore, bytes: []const u8, can
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     var reads: u64 = 0;
     var writes: u64 = 128 * 1024 * 1024;
-    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = io };
     return tree.buildSorted(a, pages.store(), &source);
 }
 

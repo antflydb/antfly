@@ -347,6 +347,9 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_paths;
+    _ = @import("antfly_local_sources").storage_lite_read_workspace;
+    _ = @import("antfly_local_sources").storage_lite_result_scratch;
+    _ = @import("antfly_local_sources").storage_prepared_score_plan;
     _ = @import("antfly_local_sources").storage_lite_reclamation;
     _ = @import("antfly_local_sources").storage_lite_restore_staging;
     _ = @import("antfly_local_sources").storage_lite_secret_store;

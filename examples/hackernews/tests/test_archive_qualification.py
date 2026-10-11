@@ -95,10 +95,10 @@ class ArchiveQualificationTest(unittest.TestCase):
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
 
     def test_deep_cursor_workload_cannot_silently_change(self):
-        self.config["cursor_term"] = "the"
+        self.config["cursor_term"] = "AI"
         self.assertFalse(archive.assess(self.regional, self.config)["passed"])
         for report in self.regional["runs"]["indexed"]:
-            report["cursor_depth"]["term"] = "the"
+            report["cursor_depth"]["term"] = "AI"
         self.assertTrue(archive.assess(self.regional, self.config)["passed"])
 
     def test_composed_coverage_is_required_when_enabled(self):

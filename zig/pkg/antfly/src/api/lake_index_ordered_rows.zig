@@ -100,7 +100,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
-    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes };
+    var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .io = sort.manager.io };
     var predicates = predicate_blocks.Builder.init(a, sort.manager);
     defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);

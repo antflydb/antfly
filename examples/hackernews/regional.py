@@ -153,6 +153,7 @@ def main():
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument("--cursor-term")
     parser.add_argument("--qualify-composed-sources", action="store_true")
+    parser.add_argument("--store-source", action="store_true")
     args = parser.parse_args()
     if len(set(args.modes)) != len(args.modes):
         parser.error("modes must not contain duplicates")
@@ -329,6 +330,8 @@ def main():
                 str(args.cursor_retention_ms),
             ]
             command.extend(["--cursor-pages", str(args.cursor_pages)])
+            if args.store_source:
+                command.append("--store-source")
             if args.qualify_composed_sources:
                 command.append("--qualify-composed-sources")
             if args.cursor_term:

@@ -395,14 +395,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal);
+            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source, file_ordinal, provider.context.io);
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
@@ -506,7 +506,7 @@ fn updateStatistics(a: A, store: *stores.ArtifactStore, provider: *@import("lake
     var reads: u64 = 512 * 1024 * 1024;
     var writes: u64 = 512 * 1024 * 1024;
     const scope = store.upload_scope.?;
-    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = provider.context.io };
     if (old) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, -1);
     if (next) |group| for (group.summaries) |ref| try builder.add(pages.store(), ref, 1);
     return builder.finish(pages.store(), previous);
@@ -534,7 +534,7 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
     defer a.free(encoded);
     return std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always });
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool, file_ordinal: usize, io: ?std.Io) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
@@ -549,7 +549,7 @@ fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectio
         var upload = store.*;
         upload.allocator = out;
         const ref = @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation) catch |err| return buildFailure(err, "segment_packs", file_ordinal, segments.items.len);
-        const summary = statistics.publishSegment(a, store, bytes, cancellation) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
+        const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, io) catch |err| return buildFailure(err, "segment_statistics", file_ordinal, segments.items.len);
         try summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }

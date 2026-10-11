@@ -233,7 +233,9 @@ def candidate(bucket, image):
                 "credentials": {"ref": "hn-history"},
             },
         },
-        "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        "indexes": {
+            "body_text": {"type": "full_text", "field": "body", "store_source": True}
+        },
     }
     source = {
         "source": {
