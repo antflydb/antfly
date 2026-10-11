@@ -21,6 +21,7 @@ Run: uv run --extra lake --project e2e/antfly pytest e2e/antfly/test_lake_sql.py
 import hashlib
 import json
 import os
+import shutil
 import struct
 import time
 from pathlib import Path
@@ -196,7 +197,11 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         # Prove actual artifact consumption: a checksum failure after selection
         # aborts an eligible query; a predicate lacking an equivalence proof
         # still scans Parquet. Restore the object before the restart checks.
-        aggregate_root = None
+        # Pause publication/GC while locating and damaging immutable objects.
+        # A prior contribution can carry the same SUM recipe in a different
+        # fused cohort, so cover every matching root rather than the first one.
+        server.pause()
+        checksums = set()
         for artifact_path in artifact_root.rglob("*"):
             if not artifact_path.is_file():
                 continue
@@ -211,15 +216,16 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     and inputs[0]["spec"]["kind"] == "sum"
                     and inputs[0]["column"]["path"] == "amount"
                 ):
-                    aggregate_root = candidate
-                    break
-        assert aggregate_root is not None, "Native exact aggregate root missing"
-        checksum = aggregate_root["blocks"][0]["artifact"]["checksum"]
-        candidates = list((artifact_root / "objects").rglob(checksum))
+                    checksums.update(
+                        block["artifact"]["checksum"] for block in candidate["blocks"]
+                    )
+        assert checksums, "Native exact aggregate blocks missing"
+        candidates = [
+            path
+            for checksum in sorted(checksums)
+            for path in (artifact_root / "objects").rglob(checksum)
+        ]
         assert candidates, "Native aggregate block missing"
-        # Overlapping publication attempts can retain identical blocks under
-        # distinct scopes. Damage every copy so selection cannot choose an
-        # intact generation, and restore all copies even if an assertion fails.
         originals = []
         try:
             for artifact_path in candidates:
@@ -229,6 +235,13 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 damaged = bytearray(original)
                 damaged[marker] ^= 1
                 artifact_path.write_bytes(damaged)
+            # COUNT can warm a fused block containing SUM, and verified immutable
+            # bytes may also survive on disk. Make source-integrity admission
+            # explicitly cold instead of treating a valid cache hit as fallback.
+            for cache_root in list(server.root.rglob("lake-ranges")):
+                if cache_root.is_dir():
+                    shutil.rmtree(cache_root)
+            server.resume()
             for statement in (
                 "SELECT SUM(amount) FROM lake_events",
                 "SELECT SUM(amount), COUNT(*) FROM lake_events",
@@ -249,7 +262,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             )["rows"] == [[str(amount_sum)]]
         finally:
             for artifact_path, original in originals:
-                artifact_path.write_bytes(original)
+                # Do not resurrect obsolete generations collected after resume.
+                if artifact_path.exists():
+                    artifact_path.write_bytes(original)
         assert request(
             "POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events"}
         )["rows"] == [[str(amount_sum)]]
@@ -1819,14 +1834,29 @@ def test_native_remote_signed_timestamp_index(tmp_path, covering):
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
     failed = True
 
-    def call(method, path, body=None, lines=False):
-        response = requests.request(
-            method,
-            server.api_url + path,
-            json=body,
-            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-            timeout=60,
-        )
+    def call(method, path, body=None, lines=False, retry_ddl=False):
+        deadline = time.monotonic() + 30
+        while True:
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            if response.ok or not retry_ddl or response.status_code != 503:
+                break
+            error = response.json()
+            # Main's relation-catalog fence explicitly guarantees this DDL
+            # admitted no schema change and can be replayed in its entirety.
+            if (
+                error.get("code") != "53300"
+                or error.get("retryable") is not True
+                or error.get("transaction_status") != "idle"
+            ):
+                break
+            assert time.monotonic() < deadline, response.text + server.debug_logs()
+            time.sleep(0.1)
         assert response.ok, response.text + server.debug_logs()
         return (
             [json.loads(line) for line in response.text.splitlines() if line]
@@ -1862,6 +1892,7 @@ def test_native_remote_signed_timestamp_index(tmp_path, covering):
                 "statement": "CREATE INDEX ts_idx ON lake_epoch (ts)"
                 + (" INCLUDE (label)" if covering else "")
             },
+            retry_ddl=True,
         )
         deadline = time.monotonic() + 60
         while True:

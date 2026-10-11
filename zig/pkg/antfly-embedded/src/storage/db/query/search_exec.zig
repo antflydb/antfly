@@ -7809,7 +7809,8 @@ fn buildSortedSegmentDocMembershipAlloc(
 
     var doc_base: u32 = 0;
     var candidate_count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, i| {
+    for (snapshot.segments, 0..) |_, i| {
+        const segment = try snapshot.readSegment(i);
         defer doc_base += segment.reader.doc_count;
         bitmaps[i] = try filter.executeWithOffset(alloc, segment, doc_base);
         candidate_count += bitmaps[i].cardinality();
@@ -8160,8 +8161,9 @@ fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
     defer constraint_membership.deinit(alloc);
 
     var count: usize = 0;
-    for (snapshot.segments, 0..) |*segment, segment_index| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        const segment = try snapshot.readSegment(segment_index);
         for (0..segment.reader.doc_count) |local_doc_id_usize| {
             const local_doc_id: u32 = @intCast(local_doc_id_usize);
             scanned_count +|= 1;
@@ -12480,7 +12482,8 @@ fn textDocNumsForDocIdsAlloc(
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        const seg = try snapshot.readSegment(segment_index);
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12742,7 +12745,8 @@ fn collectFilteredExplicitTextStats(
     var selected_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer freeDocIdArrayList(alloc, &selected_doc_keys);
     var doc_offset: u32 = 0;
-    for (snapshot.segments) |*seg| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        const seg = try snapshot.readSegment(segment_index);
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
@@ -12793,7 +12797,8 @@ fn collectFilteredExplicitTextStats(
         // Index-only adapters have no primary document store. Retain an exact
         // fallback by summing native term frequencies for allowed documents.
         doc_offset = 0;
-        for (snapshot.segments) |*seg| {
+        for (snapshot.segments, 0..) |_, segment_index| {
+            const seg = try snapshot.readSegment(segment_index);
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
             {
@@ -16279,8 +16284,12 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
     validation: ?index_mod.CoverageValidation,
 ) !TypedDocValuesCoverage {
     var expected_value_type: ?typed_dv.ValueType = null;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        const segment = snapshot.readSegment(segment_index) catch |err| switch (err) {
+            error.Canceled => return error.Cancelled,
+            else => return err,
+        };
         const cached = (segment.typedDocValuesCoverageWithValidation(field, validation) catch |err| switch (err) {
             // Search requests use the historical double-l spelling at this
             // layer; keep that public contract while the shared token remains
@@ -16316,8 +16325,9 @@ fn snapshotGeoPointDocValuesCoverage(
     snapshot: *const index_mod.IndexSnapshot,
     field: []const u8,
 ) !TypedDocValuesCoverageStatus {
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        const segment = try snapshot.readSegment(segment_index);
         const cached = (try segment.typedDocValuesCoverage(field)) orelse return .missing_doc_values_section;
         const value_type = cached.value_type orelse return cached.status;
         if (value_type != .geo_point) return .doc_values_kind_mismatch;
@@ -16615,8 +16625,9 @@ fn snapshotSegmentsHaveIndexSortAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        const segment = try snapshot.readSegment(segment_index);
         covered_live_segments = true;
         if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
     }
@@ -16697,8 +16708,9 @@ fn snapshotSegmentsHaveIndexSortBoundsAlloc(
 ) !bool {
     if (schema.index_sort.len == 0) return false;
     var covered_live_segments = false;
-    for (snapshot.segments) |*segment| {
-        if (segment.liveDocCount() == 0) continue;
+    for (snapshot.segments, 0..) |*physical, segment_index| {
+        if (physical.liveDocCount() == 0) continue;
+        const segment = try snapshot.readSegment(segment_index);
         covered_live_segments = true;
         const bounds = segment.reader.indexSortBoundsAlloc(alloc) catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -16859,7 +16871,8 @@ fn buildAllOrdinalTextDocIdMapAlloc(
 
     var doc_offset: u32 = 0;
     var saw_live_doc = false;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        const segment = try snapshot.readSegment(segment_index);
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();
@@ -16894,7 +16907,8 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
-    for (snapshot.segments) |*segment| {
+    for (snapshot.segments, 0..) |_, segment_index| {
+        const segment = try snapshot.readSegment(segment_index);
         {
             segment.shared.lockDeletionShared();
             defer segment.shared.unlockDeletionShared();

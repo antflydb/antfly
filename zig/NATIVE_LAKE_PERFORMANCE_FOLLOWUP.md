@@ -1762,3 +1762,24 @@ spilling, and serial/parallel statistics equivalence. The independent Parquet
 E2E also compares unique-key and repeated-key aggregate joins with their expected
 results and ordinary join fallback. Archive-scale latency, provider traffic and
 RSS qualification remains a separate benchmark requirement.
+
+Broad E2E qualification also covers the generic native consumers that sit
+outside text scoring. Sort coverage, physical sort bounds, membership filters,
+identity/ordinal conversion and filtered statistics acquire the selected
+query-bound segment before reading payloads. Counts, offsets and immutable
+section inventories still use the borrowed physical metadata.
+
+Native aggregate publication and scalar binding now share canonical column type
+identities, including default integer/double widths and explicit numeric widths.
+This prevents a published SUM or COUNT(column) recipe from missing its eligible
+SQL consumer because one side omitted the input identity. Existing untyped
+recipes remain conservative scan fallbacks until republished; incompatible
+states are not relabeled or merged. The recipe regression compares native
+publication against bound SQL across eight scalar identity shapes.
+
+The independent artifact-integrity E2E stops publication/GC before inspecting
+all matching aggregate cohorts and makes both RAM and persistent caches cold
+before testing damaged source objects. Valid cached immutable bytes are not
+mistaken for scan fallback, and restoration does not resurrect collected old
+artifacts. Timestamp DDL retries only the explicit idle, retryable 53300 response
+introduced by main's relation-catalog publication fence.
