@@ -811,7 +811,8 @@ The first corrected mounted generated-FK Debug run passes both tests with no
 skips or leaks. It exercises SQL anonymous-name preparation, atomic initial
 support publication and the real three-voter hidden-child leadership transfer,
 checking the persisted generated name and plan binding before and after
-publication. A second current-source rerun, mounted primary-key qualification
-and optimized coordinator qualification remain pending. This is distributed
+publication. The second current-source rerun also passes both tests with no
+skips or leaks. Mounted primary-key qualification and optimized coordinator
+qualification remain pending. This is distributed
 FK-path evidence, not full original SQL-case parity or general activation
 completion.
