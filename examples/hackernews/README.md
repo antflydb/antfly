@@ -595,3 +595,137 @@ than five minutes before the retained restart-pagination check. Reports include
 the configured retention window.
 The first durable generation's transfer latency and automatic background warming
 must be qualified separately from ordinary unordered search latency.
+
+## Full-archive deployment qualification
+
+The merged engine is qualified separately from the public HN deployment. See
+[deployment gates](../../docs/plans/hackernews-deployment-qualification.md) for
+performance targets, source freshness and durable deployment requirements.
+
+Capture only authenticated Parquet footers, including immutable object versions:
+
+```sh
+python examples/hackernews/archive_inventory.py \
+  --prefix hn-poc/20261009-full-portability-2b1f7524d047/archive \
+  --output /private/tmp/hn-archive-inventory.json
+```
+
+Build merged main for Linux using `-Dtarget=x86_64-linux-musl -Doptimize=fast
+-Dmetal=false -Dstrip=true`. Print the bounded plan before executing:
+
+```sh
+python examples/hackernews/archive_qualification.py \
+  --inventory /private/tmp/hn-archive-inventory.json \
+  --binary /path/to/linux/antfly --revision FULL_SOURCE_REVISION \
+  --ledger /private/tmp/hn-archive-budget.json \
+  --output /private/tmp/hn-archive-attempt-01
+```
+
+Add `--execute` to verify the live inventory and start the temporary regional
+pod. Use the same ledger for retries; failed/interrupted runs consume their
+reservation. Results include the raw logs and a failing verdict when construction
+or latency gates fail. Never interpret an index-build failure as successful
+archive qualification. The configuration targets the pinned 47,717,307-row
+export; an expired or changed source requires a newly reviewed inventory/config.
+The temporary bucket is unsuitable for the public service's durable storage.
+
+### October 10 full-archive results
+
+[archive-results-20261010.json](archive-results-20261010.json) records the pinned
+47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
+took 49.6 seconds, then publication failed with `ParquetRowGroupTooLarge` before
+SQL counts or search timings could be measured. The temporary pod and its 36
+small derived objects were deleted; the source export was preserved.
+
+The follow-up decoder separates column-vector ownership from physical row
+references. Streaming cursors create references once per bounded output batch
+instead of retaining a complete reference array for each column page. Existing
+materialization limits remain in force. A 12-column, 145,186-row regression
+covers cached/uncached reads and correct references across 4,096-row batches;
+one column's measured allocation peak was 4,065,504 bytes within its combined
+5,592,404-byte payload/structure allowance. The 132 focused Parquet and 31 lake
+SQL tests passed.
+
+The fixed optimized rerun passed the original decoder failure but stopped during
+construction with `SqlProgramLimitExceeded` after 195.3 seconds, with 174 MiB
+peak RSS. Registration took 41.9 seconds. Static inspection points to the
+archive-wide replay capture inheriting SQL’s 1 GiB spill limit; the runtime
+error does not identify the exact limit site. The second pod and 78 derived
+objects were deleted. No search latency was measured in either attempt.
+
+The follow-up now bounds replay and metadata sorts by file, updates text
+statistics by file, and saves complete file contributions in a separate
+non-serving catalog checkpoint. Retries use a fresh lease and retain completed
+work; both vacuum paths protect checkpoint roots. The local replay optimization
+falls back to streaming for an oversized file. Per-file index admission remains
+enforced. Optimized archive construction and query benchmarks are being rerun.
+
+The original two attempts consumed $65 in conservative allowances including
+prior work. The follow-up now permits four additional attempts, up to $145 of
+allowances within the unchanged $150 ceiling. One is a separately labelled
+142,577-row raw-file search diagnostic; full-archive gates remain unchanged.
+`--extend-run-limit` records each extension in the existing ledger; it cannot
+reset failed reservations or change spend limits.
+
+The bounded archive attempt ran 841.6 seconds before another
+`SqlProgramLimitExceeded`, at 267.5 MiB peak RSS. A shared spill-capacity
+regression exposed the predicate builder retaining too many runs alongside
+fused sorts; that builder now retains four runs. Its synchronized admission
+diagnostics identify spill file and byte peaks on the next attempt. The
+142,577-row diagnostic stopped at its first `Timeout` after 640.2 seconds,
+before searches. The harness now records transient timeout observations and
+waits for queued checkpoint recovery under the original build deadline.
+Permanent admission errors still fail immediately. Neither result establishes
+archive latency.
+
+The fifth full-archive attempt used the predicate-capacity fix, but stopped at
+`Unauthorized` after 670.2 seconds (218.9 MiB peak RSS), before searches.
+Cached credential expiration is plausible; original expiry evidence is unavailable.
+The regional harness now forces one fresh token per pod, checks its lifetime
+against the remaining pod deadline, and reuses it across cycles. Only expiry
+metadata is persisted. All five pods and 22,946 failed derived objects are
+removed; $125 remains reserved in the shared ledger. The final reserved attempt
+is a separately labelled one-file search diagnostic, not archive qualification.
+
+The final raw-file diagnostic stopped at the original 45-minute build deadline,
+after 38 engine `Timeout` events, with 350 MiB peak process RSS. It reached
+generation 39 and reused all five metadata child-tree sets across retries; the
+text index stayed incomplete. SQL count and search timings were never reached.
+The six owned pods, 50,069 failed derived objects and temporary source copy are
+removed; the original full export is preserved. All six allowances total $145
+in reservations, not measured billing.
+
+Native-client probes in the same pod verified full GCS uploads and media reads
+up to 8 MiB, narrowing the failure investigation. Their traffic overlaps build
+network counters and does not qualify search latency. New publication/checkpoint
+and text-stage diagnostics preserve errors without logging source text or
+credentials. Those diagnostics were not in the measured binary. The timeout was subsequently reproduced and fixed as described below;
+reconcile actual cloud charges before further regional attempts. The 160 lake regressions,
+22 harness tests and keep-alive TLS upload regression pass.
+
+
+A focused production builder subsequently reproduced `Timeout` in
+`segment_statistics` while uploading a GCS page. The TLS writer discarded a
+plaintext tail when record framing filled the ciphertext buffer. Flush now
+consumes only encrypted bytes and repeats until empty, without increasing engine
+HTTP timeouts. An exact-buffer regression fails before the fix and passes after
+it with TLS 1.2 and TLS 1.3; all seven focused HTTPS tests pass.
+
+The fixed native optimized diagnostic reached 1,995 GCS artifacts (139,903,056
+bytes) without an engine timeout before its local 300-second bound. Those
+artifacts were generation-deleted after stopping the reader. This body-only,
+testing-allocator production-builder diagnostic uses unchanged raw Parquet and
+real GCS artifacts, but excludes the serving API and public search measurements.
+The shared ledger now reserves the complete $150 ceiling: $145 for earlier work
+and six pod attempts, plus $5 for local GCS diagnostics. Local diagnostic
+reservations count against the same harness budget. Billing exports are still
+too stale to release allowances. Full-archive and search latency remain
+unqualified.
+
+The subsequent 600-second completion check also hit its local bound before
+publication: 2,265 artifacts, 157,341,017 bytes, no engine timeout logged. A
+one-second stack sample placed remaining work in document-frequency statistics
+reading pages through GCS. Complete GCS publication remains unverified; this
+sample does not attribute all elapsed time or qualify regional performance.
+All 2,265 artifacts were generation-deleted after the builder stopped; the
+original archive source was preserved.

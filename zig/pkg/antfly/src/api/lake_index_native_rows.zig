@@ -65,14 +65,20 @@ const Entry = struct {
     changed: []const bool,
     slots: []const u32,
     delta: ordered.Delta,
-    fn deinit(self: *Entry) void {
+    built_hashes: [][32]u8,
+    retained: []bool,
+    published: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+    root_arena: std.heap.ArenaAllocator,
+    fn deinit(self: *Entry, a: A) void {
+        a.free(self.retained);
         self.sort.deinit();
+        self.root_arena.deinit();
         if (self.predicate) |*predicate| predicate.deinit();
         self.tuple.deinit();
     }
 };
 /// The same seed proof is used by shared replay planning and cohort execution.
-fn priorRoot(a: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, cancellation: Cancellation) !?ordered.Root {
+fn priorRoot(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !?ordered.Root {
     for (candidates) |decl| {
         if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
         var previous_binding = decl.binding;
@@ -80,6 +86,7 @@ fn priorRoot(a: A, store: *stores.ArtifactStore, binding: local.serverless_segme
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
         const root = try ordered.loadRoot(a, store.*, decl.artifact, cancellation, null);
         if (!std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.snapshot, decl.binding.snapshot_id) or root.file_fingerprints.len != root.files.len or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain) or !std.mem.eql(u8, &root.fingerprint, &digest)) continue;
+        try ordered.validateReuse(scratch, store.*, root, context, cancellation);
         return root;
     }
     return null;
@@ -144,7 +151,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const reused = for (reusable) |decl| {
                 if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, binding.index_config_hash)) break true;
             } else false;
-            if (!reused) roots[index] = try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
+            if (!reused) roots[index] = try priorRoot(ca, a, store, binding, name, fingerprint(tuple, predicate, cover), candidates, provider.context, cancellation);
             requirements[index] = .{ .reused = reused, .previous = if (roots[index]) |root| .{ .files = root.files, .fingerprints = root.file_fingerprints } else null };
         }
         replay_files = try cohort_files.requiredFiles(ca, current_files, requirements);
@@ -170,7 +177,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
         defer {
-            for (entries.items) |*entry| entry.deinit();
+            for (entries.items) |*entry| entry.deinit(a);
             entries.deinit(a);
         }
         var columns: std.StringHashMapUnmanaged(void) = .empty;
@@ -192,12 +199,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, hash)) break decl;
             } else null;
             if (previous) |decl| {
+                const root = try ordered.loadRoot(ca, store.*, decl.artifact, cancellation, null);
+                try ordered.validateReuse(a, store.*, root, provider.context, cancellation);
                 try result.append(out, decl);
                 if (predicate) |*plan| plan.deinit();
                 tuple.deinit();
                 continue;
             }
-            const prior = if (planned_roots) |roots| roots[definition_index] else try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
+            const prior = if (planned_roots) |roots| roots[definition_index] else try priorRoot(ca, a, store, binding, name, fingerprint(tuple, predicate, cover), candidates, provider.context, cancellation);
             const changed = try ca.alloc(bool, source.inventory.files.len);
             const slots = try ca.alloc(u32, source.inventory.files.len);
             var slot_names: std.ArrayList([]const u8) = .empty;
@@ -232,7 +241,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (slot_names.items, slot_hashes.items) |file, *digest| if (!files.contains(file)) {
                 digest.* = @splat(0);
             };
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            const built_hashes = try ca.alloc([32]u8, slot_names.items.len);
+            @memset(built_hashes, @splat(0));
+            if (prior) |root| for (root.file_fingerprints, 0..) |digest, slot| {
+                if (keep[slot]) built_hashes[slot] = digest;
+            };
+            const retained = try a.alloc(bool, slot_names.items.len);
+            errdefer a.free(retained);
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
             entries.items[entries.items.len - 1].sort.run_limit = sort_run_limit;
         }
         if (entries.items.len == 0) continue;
@@ -247,67 +263,102 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         for (entries.items) |entry| for (needed, entry.changed) |*need, changed| {
             need.* = need.* or changed;
         };
-        input.only_files = needed;
-        const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
-        defer rows.deinit(a);
-        var key: std.ArrayList(u8) = .empty;
-        defer key.deinit(a);
-        var condition_key: std.ArrayList(u8) = .empty;
-        defer condition_key.deinit(a);
-        var row_scratch = std.heap.ArenaAllocator.init(a);
-        defer row_scratch.deinit();
         var ordinal: u64 = 0;
-        while (try rows.next(a)) |batch| {
-            try cancellation.check();
-            for (entries.items) |*entry| {
-                var bound = try entry.tuple.bindBatch(a, batch);
-                defer bound.deinit();
-                var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
-                defer {
-                    for (condition_batches.items) |*condition| condition.deinit();
-                    condition_batches.deinit(a);
-                }
-                if (entry.predicate) |plan| for (plan.conditions) |condition| {
-                    var selected = try condition.tuple.bindBatch(a, batch);
-                    errdefer selected.deinit();
-                    try condition_batches.append(a, selected);
-                };
-                for (batch.row_refs, 0..) |ref, row| {
-                    if (row % 128 == 0) {
-                        try cancellation.check();
-                        try provider.context.ensureActive();
+        // Sort and publish one source file at a time. Neither the fused
+        // metadata sorts nor replay retain archive-sized local runs.
+        for (needed, 0..) |need, file_index| {
+            if (!need) continue;
+            input.only_files = null;
+            input.only_file = file_index;
+            const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
+            defer rows.deinit(a);
+            var key: std.ArrayList(u8) = .empty;
+            defer key.deinit(a);
+            var condition_key: std.ArrayList(u8) = .empty;
+            defer condition_key.deinit(a);
+            var row_scratch = std.heap.ArenaAllocator.init(a);
+            defer row_scratch.deinit();
+            while (try rows.next(a)) |batch| {
+                try cancellation.check();
+                for (entries.items) |*entry| {
+                    var bound = try entry.tuple.bindBatch(a, batch);
+                    defer bound.deinit();
+                    var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
+                    defer {
+                        for (condition_batches.items) |*condition| condition.deinit();
+                        condition_batches.deinit(a);
                     }
-                    var live = true;
-                    if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
-                        condition_key.clearRetainingCapacity();
-                        const is_null = try selected.append(a, &condition_key, row);
-                        if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
-                            live = false;
-                            break;
-                        }
+                    if (entry.predicate) |plan| for (plan.conditions) |condition| {
+                        var selected = try condition.tuple.bindBatch(a, batch);
+                        errdefer selected.deinit();
+                        try condition_batches.append(a, selected);
                     };
-                    if (!live) continue;
-                    if (ref != .external) return error.InvalidNativeLakeRowIndex;
-                    const file = files.get(ref.external.file_id) orelse return error.InvalidNativeLakeRowIndex;
-                    if (!entry.changed[file]) continue;
-                    key.clearRetainingCapacity();
-                    _ = try bound.append(a, &key, row);
-                    try key.appendSlice(a, &ordered.coordinate(entry.slots[file], ref.external));
-                    _ = row_scratch.reset(.retain_capacity);
-                    const values = try a.alloc(local.sql_scalar.Datum, entry.cover.len);
-                    defer a.free(values);
-                    const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
-                    for (values, entry.cover) |*value, column| {
-                        const cell = try page.cell(row_scratch.allocator(), 0, column);
-                        value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
+                    for (batch.row_refs, 0..) |ref, row| {
+                        if (row % 128 == 0) {
+                            try cancellation.check();
+                            try provider.context.ensureActive();
+                        }
+                        var live = true;
+                        if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
+                            condition_key.clearRetainingCapacity();
+                            const is_null = try selected.append(a, &condition_key, row);
+                            if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
+                                live = false;
+                                break;
+                            }
+                        };
+                        if (!live) continue;
+                        if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                        const file = files.get(ref.external.file_id) orelse return error.InvalidNativeLakeRowIndex;
+                        if (!entry.changed[file]) continue;
+                        key.clearRetainingCapacity();
+                        _ = try bound.append(a, &key, row);
+                        try key.appendSlice(a, &ordered.coordinate(entry.slots[file], ref.external));
+                        _ = row_scratch.reset(.retain_capacity);
+                        const values = try a.alloc(local.sql_scalar.Datum, entry.cover.len);
+                        defer a.free(values);
+                        const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
+                        for (values, entry.cover) |*value, column| {
+                            const cell = try page.cell(row_scratch.allocator(), 0, column);
+                            value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
+                        }
+                        try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal });
+                        ordinal = std.math.add(u64, ordinal, 1) catch return error.LakeSidecarBuildLimitExceeded;
                     }
-                    try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal });
-                    ordinal = std.math.add(u64, ordinal, 1) catch return error.LakeSidecarBuildLimitExceeded;
                 }
+            }
+            for (entries.items) |*entry| {
+                if (!entry.changed[file_index]) continue;
+                const slot = entry.slots[file_index];
+                entry.built_hashes[slot] = entry.delta.fingerprints[slot];
+                const keep = try a.dupe(bool, entry.delta.keep);
+                defer a.free(keep);
+                if (slot < keep.len) keep[slot] = false;
+                const delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
+                const ref = ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) catch |err| {
+                    if (err == error.SqlProgramLimitExceeded) {
+                        const admission = manager.admissionStats();
+                        std.log.warn("native ordered lake admission exhausted file_index={d} total_files={d} peak_spill_files={d} peak_spill_bytes={d} spill_byte_limit={d}", .{ file_index, needed.len, admission.peak_files, admission.peak_bytes, admission.max_bytes });
+                    }
+                    return err;
+                };
+                entry.published = ref;
+                try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
+                // Only the latest root directory is needed for the next file.
+                // Retaining every prefix here would grow metadata quadratically.
+                _ = entry.root_arena.reset(.free_all);
+                entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+                @memset(entry.retained, true);
+                entry.delta.keep = entry.retained;
+                entry.sort.deinit();
+                entry.sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes);
+                entry.sort.run_limit = sort_run_limit;
             }
         }
         for (entries.items) |*entry| {
-            const root = try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
+            // With no changed file, an empty incremental merge still retires
+            // deleted source slots. Otherwise the last per-file root is final.
+            const root = entry.published orelse try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
             var owned_binding = entry.binding;
             owned_binding.source_id = try out.dupe(u8, entry.binding.source_id);
             owned_binding.snapshot_id = try out.dupe(u8, entry.binding.snapshot_id);
@@ -316,7 +367,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const paths = try out.alloc([]const u8, entry.binding.column_bindings.len);
             for (paths, entry.binding.column_bindings) |*path, old| path.* = try out.dupe(u8, old);
             owned_binding.column_bindings = paths;
-            try result.append(out, .{ .name = root.name, .artifact = root, .binding = owned_binding });
+            const encoded = try std.json.Stringify.valueAlloc(a, Declared{ .name = root.name, .artifact = root, .binding = owned_binding }, .{});
+            defer a.free(encoded);
+            try result.append(out, try std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always }));
         }
     }
     return result.toOwnedSlice(out);

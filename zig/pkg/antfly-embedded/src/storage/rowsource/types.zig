@@ -211,6 +211,26 @@ pub const ColumnVector = struct {
     }
 };
 
+/// Validate decoded vectors independently of row-reference ownership.
+pub fn validateColumns(columns: []const ColumnVector, row_count: usize) !void {
+    for (columns) |column| {
+        if (column.values == .dictionary_bytes) {
+            const dictionary = column.values.dictionary_bytes;
+            for (dictionary.indices, 0..) |id, index| if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
+        }
+        switch (column.values) {
+            inline .dictionary_i64, .dictionary_f64 => |dictionary| for (dictionary.indices, 0..) |id, index| {
+                if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
+            },
+            else => {},
+        }
+        if (column.rowCount() != row_count) return error.RowSourceColumnLengthMismatch;
+        if (column.nulls.bytes.len != 0 and column.nulls.bytes.len != row_count) {
+            return error.RowSourceNullBitmapLengthMismatch;
+        }
+    }
+}
+
 pub const ColumnBatch = struct {
     snapshot: SnapshotRef,
     row_refs: []const RowRef,
@@ -221,22 +241,7 @@ pub const ColumnBatch = struct {
     }
 
     pub fn validate(self: ColumnBatch) !void {
-        for (self.columns) |column| {
-            if (column.values == .dictionary_bytes) {
-                const dictionary = column.values.dictionary_bytes;
-                for (dictionary.indices, 0..) |id, index| if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
-            }
-            switch (column.values) {
-                inline .dictionary_i64, .dictionary_f64 => |dictionary| for (dictionary.indices, 0..) |id, index| {
-                    if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
-                },
-                else => {},
-            }
-            if (column.rowCount() != self.row_refs.len) return error.RowSourceColumnLengthMismatch;
-            if (column.nulls.bytes.len != 0 and column.nulls.bytes.len != self.row_refs.len) {
-                return error.RowSourceNullBitmapLengthMismatch;
-            }
-        }
+        try validateColumns(self.columns, self.row_refs.len);
     }
 
     pub fn findColumn(self: ColumnBatch, name: []const u8) ?ColumnVector {
