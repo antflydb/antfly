@@ -569,7 +569,7 @@ pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Req
 /// Runs a plan built by `plan` for the same request. The caller owns the
 /// managed backend, model lock and admission for the complete execution.
 pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda) return error.UnsupportedExtractionBackend;
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda and cb.kind() != .wasm) return error.UnsupportedExtractionBackend;
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
     if (options.decide_request != null and request.items.len != 1) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
