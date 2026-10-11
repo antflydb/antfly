@@ -334,6 +334,14 @@ def main():
         return
     if not args.binary.is_file():
         parser.error("Binary must exist before reserving cloud work")
+    binary_digest = hashlib.sha256()
+    with args.binary.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1048576), b""):
+            binary_digest.update(chunk)
+    harness_digests = {
+        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        for name in ("archive_qualification.py", "regional.py", "poc.py")
+    }
     # Check live object versions before spending a run reservation. The regional
     # engine separately fences source/publication versions during serving.
     from archive_inventory import verify_inventory
@@ -347,6 +355,9 @@ def main():
                 "config": config,
                 "estimate": estimate,
                 "run_prefix": run_id,
+                "binary_revision": args.revision,
+                "binary_sha256": binary_digest.hexdigest(),
+                "harness_sha256": harness_digests,
                 "inventory_sha256": hashlib.sha256(
                     args.inventory.read_bytes()
                 ).hexdigest(),
