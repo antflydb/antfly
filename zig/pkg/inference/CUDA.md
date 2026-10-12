@@ -177,7 +177,13 @@ with cubins for the current validation targets and a `compute_75` PTX fallback:
 - `sm_90` cubin for H100.
 - `sm_100`, `sm_110`, and `sm_120` cubins for Blackwell-generation targets.
 
-Keep the `compute_75` PTX path even when fatbins are used by default.
+Decision: release builds ship the multi-arch fatbin, not portable PTX alone.
+`-Dcuda-artifacts=fatbin` is the `build.zig` default; the Linux GNU release
+archives (`scripts/packaging/build_zig_release_archive.sh`) build with
+`-Dcuda=true` and no artifact override, and the CI/E2E build script defaults
+`ANTFLY_CI_ZIG_CUDA_ARTIFACTS` to `fatbin`. Portable PTX alone is an explicit opt-in
+(`-Dcuda-artifacts=portable`); CUDA 13.2 PTX does not load on the tested R580
+drivers. Keep the `compute_75` PTX path even when fatbins are used by default.
 Architecture-specific cubins must never be the only checked-in artifact.
 
 ## Kernel Artifact Policy
@@ -1121,8 +1127,6 @@ CUDA meets its minimal-usefulness bar:
   CUDA artifacts in manifests.
 - Which GGUF model defines first acceptance: small deterministic fixture, a
   common 7B Q4_K model, or both?
-- Should release builds ship only portable PTX at first, or PTX plus L4/T4
-  cubins once CI can generate them?
 - How aggressive should per-op fallback be before the cost of CPU/GPU
   transfers makes whole-layer fallback preferable?
 - Should CUDA direct sessions load before or after Metal in `auto` when
