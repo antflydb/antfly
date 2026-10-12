@@ -104,7 +104,7 @@ model generation. Neither layer merges task semantics or resets deadlines.
 | Dense text, including Qwen3 embedding profiles | Text broker; task/instruction-aware keys; observed adaptive execution |
 | Sparse text | Typed sparse-vector broker; fixed-shape/serial graphs bypass native fill delay |
 | CLIP/ClipClap images | Encoded-image or borrowed-raster groups |
-| CLAP/ClipClap audio | Indexed decoding and bounded PCM/feature windows |
+| CLAP/ClipClap audio | Indexed decoding, bounded waves of up to eight clips, and one future CPU feature wave overlapping the resident native encoder |
 | GLiNER NER, relations, structured extraction, classification | Shared encoder boundary; classification retains independent score decoding; ONNX remains compatibility execution |
 | Native generators, including multimodal architectures | Existing token-step coordinator, now reachable from isolated direct and non-streaming HTTP requests |
 | Fixed chunker | Immediate bounded transform; no model fill delay |
@@ -950,3 +950,15 @@ speculative GPU permit and drains workers on every exit. Diagnostic flags and
 A/B benchmark commands are in the report. `encoded-embedding` additionally
 measures an independent decode for every row; the existing `embedding` scope
 uses a shared borrowed raster after one decode.
+
+### Gemma4 and CLAP audio preparation and batching
+
+See [audio throughput](../../../docs/design/inference/audio-throughput.md) for
+real-model paired measurements and limits. Gemma4 audio-only accelerated cohorts
+retain projected rows through prompt packing and physically batch the embedding
+encoder in length-qualified groups of at most four (25% padding, 1,024-token
+sequence cap); conformer execution remains per clip. CLAP retains native batches
+of up to eight and singleton fusion/fallback behavior. Both prepare one bounded
+future CPU wave, join producers on every exit and preserve indexed codec errors.
+Gemma4 audio-only server groups can use the generation-qualified broker; mixed
+and titled groups retain compatibility. No CUDA performance gain is claimed.

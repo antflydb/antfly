@@ -1121,6 +1121,17 @@ pub fn build(b: *std.Build) void {
     run_gemma4_image_bench.addPassthruArgs();
     b.step("bench-gemma4-image", "Benchmark Gemma4 vision and image embeddings").dependOn(&run_gemma4_image_bench.step);
 
+    const audio_embedding_bench = b.addExecutable(.{
+        .name = "antfly-audio-embedding-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/audio_embedding.zig"), .target = target, .optimize = optimize }),
+    });
+    audio_embedding_bench.root_module.addImport("build_options", build_options_mod);
+    audio_embedding_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(audio_embedding_bench.root_module);
+    audio_embedding_bench.root_module.link_libc = true;
+    const install_audio_embedding_bench = b.addInstallArtifact(audio_embedding_bench, .{});
+    b.step("build-audio-embedding-bench", "Build the synchronized real-model audio embedding benchmark").dependOn(&install_audio_embedding_bench.step);
+
     // Standalone PDF benchmark shares image/hash identity with inference.
     // Font data belongs only to this tool, not the production inference graph.
     const pdf_fonts_files = b.addWriteFiles();

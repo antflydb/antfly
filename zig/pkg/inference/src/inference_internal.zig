@@ -48,6 +48,7 @@ pub const server = struct {
 pub const pipelines = struct {
     pub const image = @import("pipelines/image.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
+    pub const audio = @import("pipelines/audio.zig");
     pub const embedding = @import("pipelines/embedding.zig");
     pub const gliner = @import("pipelines/gliner.zig");
     pub const extraction_schema = @import("pipelines/extraction_schema.zig");

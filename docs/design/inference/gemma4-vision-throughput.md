@@ -175,3 +175,7 @@ beside this document records hashes and summarized measurements. PDF rendering
 and codec decode remain on CPU; this change overlaps image preparation, not the
 PDF renderer itself. These vision results do not establish a PDF throughput gain
 until a full PDF render-plus-embedding workload is measured.
+
+The same PR now includes [audio throughput](audio-throughput.md): resident
+Gemma4 audio prompt packing and length-qualified embedding encoder batches, plus
+bounded CLAP preparation overlap. The vision Flash kernel remains vision-only.

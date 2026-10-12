@@ -6583,6 +6583,33 @@ pub const Node = struct {
     }
 
     fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
+        if (model.manifest.embedding_style == .embedding_gemma2 and parsed.audio.items.len == parsed.total_count and parsed.total_count > 0 and instruction == null) {
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const parts = try allocator.alloc(grouped.Part, parsed.total_count);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, parsed.total_count);
+            defer allocator.free(groups);
+            for (parsed.audio.items, parts, groups, 0..) |input, *part, *group, index| {
+                // Ambiguous codecs retain the MIME-aware pipeline executor.
+                if (@import("../pipelines/audio.zig").detectFormat(input.bytes) == null) return null;
+                part.* = .{ .audio = input.bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, parsed.total_count);
+            @memset(vectors, &.{});
+            errdefer freeDirectDenseVectors(allocator, vectors);
+            for (batch.items, parsed.audio.items) |*item, input| switch (item.result) {
+                .value => |*value| {
+                    vectors[input.index] = value.vector;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
         if (model.manifest.embedding_style == .embedding_gemma2 and (parsed.images.items.len != 0 or parsed.audio.items.len != 0)) return null;
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
@@ -7047,7 +7074,7 @@ pub const Node = struct {
                 group.* = .{ .content = parts[index..][0..1] };
             }
             const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
-            const batch = (try self.tryEmbedGemma4ImageGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
             defer batch.deinit();
             const vectors = try allocator.alloc([]f32, n);
             var initialized: usize = 0;
@@ -20072,8 +20099,9 @@ pub const Node = struct {
         return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, admission.byte_cap);
     }
 
-    fn tryEmbedGemma4ImageGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
-        if (platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER")) return null;
+    fn tryEmbedGemma4MediaGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
+        const audio_only = groups.len > 0 and groups[0].content.len == 1 and groups[0].content[0] == .audio;
+        if (platform.env.getenvBool(if (audio_only) "ANTFLY_GEMMA4_DISABLE_AUDIO_BROKER" else "ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER")) return null;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(out, control.io, &owned_io);
@@ -20107,7 +20135,7 @@ pub const Node = struct {
             for (vectors[0..count]) |vector| out.free(vector);
             out.free(vectors);
         }
-        if (try self.tryEmbedGemma4ImageGroups(out, loaded, groups, options, control, contract)) |batch| {
+        if (try self.tryEmbedGemma4MediaGroups(out, loaded, groups, options, control, contract)) |batch| {
             defer batch.deinit();
             for (batch.items, vectors) |*item, *vector| {
                 switch (item.result) {
@@ -20180,7 +20208,7 @@ pub const Node = struct {
         for (groups, compact) |maybe, *value| {
             if (maybe) |group| value.* = group else complete = false;
         }
-        var coalesced = if (complete) try self.tryEmbedGemma4ImageGroups(a, loaded, compact, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, control, contract) else null;
+        var coalesced = if (complete) try self.tryEmbedGemma4MediaGroups(a, loaded, compact, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, control, contract) else null;
         if (coalesced) |*batch| {
             defer batch.deinit();
             for (batch.items, 0..) |*item, index| switch (item.result) {
