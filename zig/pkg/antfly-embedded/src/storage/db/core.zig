@@ -1648,9 +1648,7 @@ pub const DBCore = struct {
                     if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
                         if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
                     } else {
-                        var encoded_namespace: [24]u8 = undefined;
-                        doc_identity.encodeNamespace(&encoded_namespace, participants.namespace);
-                        try txn.put(&internal_keys.identity_namespace_key, &encoded_namespace);
+                        try doc_identity.writeNamespaceTxn(txn, participants.namespace);
                     }
                     try catalog.stage(txn);
                     try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
@@ -2759,7 +2757,7 @@ fn buildRecoveryIntentBatch(
         identity_visibility_deletes.deinit(alloc);
     }
     const identity_live_before = (try doc_identity.fastStatsFromStore(identity_ctx.store)).live_ordinals;
-    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
         alloc,
         identity_ctx.store,
         context_snapshot.namespace,

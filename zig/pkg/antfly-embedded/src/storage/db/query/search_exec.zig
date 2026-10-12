@@ -562,6 +562,9 @@ pub const MatchAllCandidateStreamStats = struct {
 };
 
 pub const MatchAllExecutor = struct {
+    /// The caller proved this is a primary-row population with no residual
+    /// predicates or transforms requiring exhaustive candidate collection.
+    bounded_unordered_page: bool = false,
     ctx: ?*anyopaque,
     collect_candidates: *const fn (
         ctx: ?*anyopaque,
@@ -636,6 +639,7 @@ pub const MatchAllExecutor = struct {
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
     /// Snapshot-pinned row providers stream public identities directly.
+    scan_ids_ctx: ?*anyopaque = null,
     scan_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) anyerror!void = null,
     scan_store_range: *const fn (
         ctx: ?*anyopaque,
@@ -2967,7 +2971,7 @@ fn logExactSortBudgetRejection(
     );
 }
 
-fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+pub fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
     if (req.cancellation) |cancellation| {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
@@ -7624,7 +7628,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
     };
 }
 
-const MatchAllIdSeekContext = struct {
+const MatchAllPageContext = struct {
     alloc: Allocator,
     req: types.SearchRequest,
     skip_count: usize,
@@ -7638,12 +7642,13 @@ const MatchAllIdSeekContext = struct {
     }
 };
 
-fn consumeMatchAllIdSeekCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
-    const seek_ctx: *MatchAllIdSeekContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+fn consumeMatchAllPageCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const seek_ctx: *MatchAllPageContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     const alloc = seek_ctx.alloc;
 
     var owned_candidate = candidate;
-    errdefer owned_candidate.deinit(alloc);
+    // The stream retains ownership on callback failure. On success this
+    // consumer either releases the candidate or transfers it into its page.
 
     seek_ctx.accepted_count += 1;
     if (seek_ctx.accepted_count <= seek_ctx.skip_count) {
@@ -7655,10 +7660,13 @@ fn consumeMatchAllIdSeekCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate
         return;
     }
 
-    const sort_values = try alloc.alloc(std.json.Value, 1);
-    errdefer alloc.free(sort_values);
-    sort_values[0] = .{ .string = try alloc.dupe(u8, owned_candidate.id) };
-    errdefer types.deinitJsonValue(alloc, &sort_values[0]);
+    const sort_values: []std.json.Value = if (seek_ctx.req.order_by.len > 0)
+        try alloc.alloc(std.json.Value, 1)
+    else
+        &.{};
+    errdefer if (sort_values.len > 0) alloc.free(sort_values);
+    if (sort_values.len > 0) sort_values[0] = .{ .string = try alloc.dupe(u8, owned_candidate.id) };
+    errdefer if (sort_values.len > 0) types.deinitJsonValue(alloc, &sort_values[0]);
 
     try seek_ctx.hits.append(alloc, .{
         .id = owned_candidate.id,
@@ -7747,7 +7755,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
     observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     if (collect_sort_profile) profile.window_capacity = stop_after;
-    var seek_ctx = MatchAllIdSeekContext{
+    var seek_ctx = MatchAllPageContext{
         .alloc = alloc,
         .req = effective_req,
         .skip_count = skip_count,
@@ -7762,7 +7770,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
         .primary_key_reverse = reverse,
         .stop_after_accepted = stop_after,
         .scan_batch_size = @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
-    }, &seek_ctx, consumeMatchAllIdSeekCandidate);
+    }, &seek_ctx, consumeMatchAllPageCandidate);
 
     const hits = try seek_ctx.hits.toOwnedSlice(alloc);
     if (reverse and hits.len > 1) std.mem.reverse(types.SearchHit, hits);
@@ -17631,6 +17639,53 @@ pub fn searchMatchAll(
         native_constraints.exclusion_query_json_resolved,
     );
 
+    if (executor.bounded_unordered_page and exec_req.order_by.len == 0 and
+        !requestHasSortPageOptions(exec_req) and !unresolved_stored_filters and
+        executor.collect_candidates_stream != null)
+    {
+        const start_ns = if (postprocess_req.profile) platform_time.monotonicNs() else 0;
+        // This is the final page of a proven single primary population.
+        // Fusion windows do not widen its public pagination or zero-limit count.
+        const paging = ComponentPaging{ .offset = postprocess_req.offset, .limit = postprocess_req.limit };
+        const count_only = postprocess_req.count_only or paging.limit == 0;
+        var page = MatchAllPageContext{
+            .alloc = alloc,
+            .req = postprocess_req,
+            .skip_count = paging.offset,
+            .limit = if (count_only) 0 else paging.limit,
+        };
+        defer page.deinitHits();
+        const stop_after: usize = @as(usize, paging.offset) +| @as(usize, paging.limit);
+        const stats = try executor.collect_candidates_stream.?(executor.ctx, alloc, postprocess_req, .{
+            .constraints = &native_constraints,
+            .stop_after_accepted = if (count_only) null else stop_after,
+            .scan_batch_size = if (count_only) default_match_all_primary_key_scan_batch_size else @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
+        }, &page, consumeMatchAllPageCandidate);
+        try checkSearchRequestDeadline(postprocess_req);
+        const selected_count = page.hits.items.len;
+        var out = types.SearchResult{
+            .alloc = alloc,
+            .hits = try page.hits.toOwnedSlice(alloc),
+            .total_hits = boundedU32(stats.accepted_count),
+            .total_hits_relation = if (stats.stopped_early or stats.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (postprocess_req.profile) sortResultProfile(postprocess_req, .{ .kind = .score_top_k }, false, .{
+                .candidate_source = "primary_key",
+                .candidate_count = stats.accepted_count,
+                .selected_count = selected_count,
+                .window_capacity = if (count_only) 0 else stop_after,
+                .window_len = selected_count,
+                .total_ns = platform_time.monotonicNs() - start_ns,
+            }) else null,
+            .graph_results = &.{},
+        };
+        errdefer out.deinit();
+        if (postprocess_req.include_stored) {
+            _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+            try dropMissingStoredSearchHits(alloc, &out, "match_all");
+        }
+        return out;
+    }
+
     if (exec_req.order_by.len > 0 and
         (planned_sort.kind == .sorted_segment_seek or planned_sort.kind == .native_doc_values_top_n) and
         (native_constraints.filter_doc_ids.len > 0 or native_constraints.exclude_doc_ids.len > 0))
@@ -18160,7 +18215,7 @@ fn collectMatchAllCandidateStateWithOptions(
                 return .@"continue";
             }
         };
-        try scan(collector.ctx, alloc, options, &state, Visitor.visit);
+        try scan(collector.scan_ids_ctx orelse collector.ctx, alloc, options, &state, Visitor.visit);
     } else if (collector.scan_store_range_with_context) |scan| {
         var current_lower = try alloc.dupe(u8, lower);
         defer alloc.free(current_lower);
@@ -18371,10 +18426,15 @@ const MatchAllCandidateCollectState = struct {
 
         errdefer candidate.deinit(self.alloc);
         if (self.consumer) |consumer| {
-            const seen_key = try self.alloc.dupe(u8, candidate.id);
-            errdefer self.alloc.free(seen_key);
-            try self.seen.put(self.alloc, seen_key, {});
-            try self.seen_key_storage.append(self.alloc, seen_key);
+            {
+                const seen_key = try self.alloc.dupe(u8, candidate.id);
+                errdefer self.alloc.free(seen_key);
+                try self.seen.put(self.alloc, seen_key, {});
+                try self.seen_key_storage.append(self.alloc, seen_key);
+            }
+            // Storage owns the dedup key before the consumer can fail. Its
+            // outer cleanup frees it; the candidate remains owned here until
+            // the consumer succeeds.
 
             try consumer(self.consumer_ctx, candidate);
             candidate.id = @constCast(&[_]u8{});
@@ -20779,6 +20839,45 @@ fn testStreamMatchAllCandidatesCallback(
     }
     _ = req;
     return .{ .accepted_count = accepted, .stopped_early = false };
+}
+
+// Exercise production candidate ownership and deduplication with a small
+// deterministic identity source; the ordinary mock stream skips that layer.
+fn testStreamPrimaryMatchAllCandidatesCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: MatchAllCandidateConsumer,
+) anyerror!MatchAllCandidateStreamStats {
+    const Harness = struct {
+        fn scan(raw: ?*anyopaque, _: Allocator, _: MatchAllCandidateCollectOptions, target: ?*anyopaque, visitor: *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) !void {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids) |id| if (try visitor(target, id) == .stop) return;
+        }
+        fn range(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) ![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+        fn expired(_: ?*anyopaque, _: Allocator, _: []const u8) !bool {
+            return false;
+        }
+        fn ordinal(raw: ?*anyopaque, _: Allocator, id: []const u8, _: ?u64) !?doc_set.DocOrdinal {
+            const source: *const TestMatchAllCtx = @ptrCast(@alignCast(raw.?));
+            for (source.ids, 0..) |key, i| if (std.mem.eql(u8, id, key)) return if (i < source.ordinals.len) source.ordinals[i] else null;
+            return null;
+        }
+    };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, req, .{
+        .ctx = ctx,
+        .scan_ids = Harness.scan,
+        .scan_store_range = Harness.range,
+        .is_expired_key = Harness.expired,
+        .lookup_doc_ordinal = Harness.ordinal,
+    }, options, consumer_ctx, consumer);
+    const source: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx.?));
+    if (source.stream_accepted_count) |count| count.* += stats.accepted_count;
+    return stats;
 }
 
 fn testMatchAllLoadProjectedCallback(
@@ -29650,6 +29749,48 @@ test "match_all native stream sort zero limit counts without decoration" {
     try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
 }
 
+test "bounded primary match_all stops after the page and owns allocation failures (#1095)" {
+    const Exercise = struct {
+        fn run(alloc: Allocator) !void {
+            for ([_]bool{ false, true }) |count_only| {
+                var accepted: usize = 0;
+                var collected: usize = 0;
+                const ctx = TestMatchAllCtx{
+                    .ids = &.{ "doc:a", "doc:b", "doc:c" },
+                    .ordinals = &.{ 1, 2, 3 },
+                    .stream_accepted_count = &accepted,
+                    .collect_count = &collected,
+                };
+                var executor = testMatchAllExecutor(&ctx);
+                executor.bounded_unordered_page = true;
+                executor.collect_candidates_stream = testStreamPrimaryMatchAllCandidatesCallback;
+                var result = try searchMatchAll(alloc, .{
+                    .limit = 1,
+                    .offset = 1,
+                    .include_stored = false,
+                    .count_only = count_only,
+                    .profile = true,
+                }, executor);
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 0), collected);
+                try std.testing.expectEqual(@as(usize, if (count_only) 3 else 2), accepted);
+                try std.testing.expectEqual(@as(u32, if (count_only) 3 else 2), result.total_hits);
+                try std.testing.expectEqual(if (count_only) types.TotalHitsRelation.exact else .gte, result.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, if (count_only) 0 else 1), result.hits.len);
+                const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqualStrings("primary_key", profile.candidate_source);
+                try std.testing.expectEqual(@as(u64, if (count_only) 0 else 1), profile.selected_count);
+                if (!count_only) {
+                    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+                    try std.testing.expectEqual(@as(usize, 0), result.hits[0].sort_values.len);
+                }
+            }
+        }
+    };
+    try Exercise.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+}
+
 test "match_all supports id-only sort without native doc values" {
     const alloc = std.testing.allocator;
     var collect_count: usize = 0;
@@ -32512,6 +32653,16 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "primary match_all stream retains ownership on consumer error (#1095)" {
+    var source = TestMatchAllCtx{ .ids = &.{"doc:a"}, .ordinals = &.{1} };
+    const Consumer = struct {
+        fn fail(_: ?*anyopaque, _: MatchAllCandidate) !void {
+            return error.ConsumerFailure;
+        }
+    };
+    try std.testing.expectError(error.ConsumerFailure, testStreamPrimaryMatchAllCandidatesCallback(&source, std.testing.allocator, .{}, .{}, null, Consumer.fail));
 }
 
 test "external lake ranked delivery shares exact snapshot authority until its final owner closes" {

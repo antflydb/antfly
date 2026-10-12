@@ -597,6 +597,7 @@ pub const ProbeTxn = struct {
         get_many_sorted_is_atomic: bool = false,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_leased: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
@@ -609,6 +610,17 @@ pub const ProbeTxn = struct {
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// Exact presence in the probe's committed view, without retaining a value
+    /// on backends that implement native presence reads.
+    pub fn contains(self: *ProbeTxn, key: []const u8) !bool {
+        if (self.vtable.contains) |check| return try check(self.ptr, key);
+        _ = self.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     /// May pin an immutable generation until abort. Prefer get for long-lived
@@ -1589,6 +1601,10 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn contains(ptr: *anyopaque, key: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.contains(key);
+        }
+
         pub fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             if (@hasDecl(Handle, "getLeased")) return try unbox(ptr).handle.getLeased(key);
             return try unbox(ptr).handle.get(key);
@@ -1627,6 +1643,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
             .get = vt.get,
+            .contains = if (@hasDecl(Handle, "contains")) vt.contains else null,
             .get_leased = vt.getLeased,
             .get_many_sorted = vt.getManySorted,
             .get_many_sorted_with_block_cache_admission = vt.getManySortedWithBlockCacheAdmission,

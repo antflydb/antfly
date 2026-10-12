@@ -1757,6 +1757,20 @@ pub const IndexManager = struct {
         // back on success so steady state is unaffected.
         merge_segment_cap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
 
+        /// Default projections retain a native identity for every primary row,
+        /// including rows with no text. Field and artifact projections have
+        /// their own membership and cannot substitute the primary population.
+        pub fn coversPrimaryDocuments(self: *const TextIndex) bool {
+            return self.chunk_name == null and self.source_artifact_names.len == 0 and self.selected_field == null;
+        }
+
+        fn retainsEmptyPrimaryDocument(self: *const TextIndex, key: []const u8) bool {
+            // Primary inputs may carry public IDs or encoded row keys.
+            // Generated members use encoded artifact keys.
+            return self.coversPrimaryDocuments() and (internal_keys.isStoredDocumentRowKey(key) or
+                (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null));
+        }
+
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
         }
@@ -18360,7 +18374,7 @@ pub const IndexManager = struct {
         defer builder.deinit();
         for (source_docs, 0..) |doc, source_idx| {
             const before = builder.text_docs.items.len;
-            try builder.appendSourceDocWithSelectedField(doc, textIndexSelectedFieldForKey(entry, doc.key));
+            try builder.appendSourceDocForIndex(doc, textIndexSelectedFieldForKey(entry, doc.key), entry.retainsEmptyPrimaryDocument(doc.key));
             if (projected_source_indices) |indices| {
                 const appended = builder.text_docs.items.len - before;
                 if (appended > 1) return error.InvalidTextProjection;
@@ -24750,9 +24764,10 @@ pub const IndexManager = struct {
                 while (source_end < source_docs_with_ordinals.len) {
                     const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
                     const previous_projection_docs = builder.text_docs.items.len;
-                    try builder.appendSourceDocWithSelectedField(
+                    try builder.appendSourceDocForIndex(
                         source_docs_with_ordinals[source_end],
                         textIndexSelectedFieldForKey(entry, source_docs_with_ordinals[source_end].key),
+                        entry.retainsEmptyPrimaryDocument(source_docs_with_ordinals[source_end].key),
                     );
                     if (metrics_enabled) projection_ns +|= platform_time.monotonicNs() - projection_start_ns;
                     source_end += 1;
@@ -37487,6 +37502,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
         &identity_writes,
         &.{"doc:target"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -37675,6 +37691,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
         &identity_writes,
         &.{"doc:legacy"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -39622,6 +39639,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
         &identity_writes,
         doc_ids[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -42580,6 +42598,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
         &identity_writes,
         doc_ids[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
@@ -42707,6 +42726,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
         &identity_writes,
         &.{"doc:primary"},
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
 
