@@ -22,8 +22,9 @@ Current macOS CPU and Metal preserve eight pretrained vectors and three exact
 query rankings/top-k sets. CPU completes all five concurrent load requests;
 Metal records one completion and four retryable admission denials under host
 pressure. Metal rejects three zeroed-first-packet cases and preserves clean-retry
-vectors. Broader corruption recovery remains active. Current Linux pretrained
-qualification remains in progress. The receipt explicitly records
+vectors. Broader corruption recovery remains active. Current Linux ARM64 pretrained qualification also passes all eight vectors,
+three exact rankings/top-k sets, disconnect retry and five concurrent requests.
+This receipt binds the header-only checkpoint preceding indexed replay work. The receipt explicitly records
 which gates pass and which are pending. This does not close broader codec,
 SIMD/scheduling, display or streaming requirements.
 

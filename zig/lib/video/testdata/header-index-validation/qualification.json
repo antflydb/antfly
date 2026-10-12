@@ -1,5 +1,5 @@
 {
-  "status": "in_progress",
+  "status": "pass",
   "purpose": "header-only logical WebM index qualification; full non-CUDA goal remains active",
   "qualified": {
     "macos_video": {
@@ -51,11 +51,10 @@
       "scope": "zeroed first coded packet; broader corruption recovery remains active"
     },
     "vp9_fuzz_followup": "100K campaign with verified Smith-serialized seeds; exact counters in vp9-fuzz.log",
-    "av1_fuzz_followup": "Three matching AV1 reconstruction, Annex B and metadata targets pass with verified Smith-serialized seeds; aggregate counters in av1-fuzz.log"
+    "av1_fuzz_followup": "Three matching AV1 reconstruction, Annex B and metadata targets pass with verified Smith-serialized seeds; aggregate counters in av1-fuzz.log",
+    "linux_arm64_pretrained": "8 vectors, 3 exact rankings/top-k sets, disconnect retry and all 5 concurrent load requests pass"
   },
-  "pending": [
-    "current Linux pretrained model qualification"
-  ],
+  "pending": [],
   "measurement_limits": [
     "Index timings are completed logical indexing only; sampling and comparison excluded.",
     "Shared host was busy; owned builds/model runs overlapped. Timings are diagnostic, not capacity or speedup claims.",
@@ -66,7 +65,8 @@
     "/private/tmp/native-video-header-index-benchmark/bin/webm-benchmark": "98eb5f25762bf3afa7e0d7c25bb035faaf212c67dd2d1c6c656f5475500f1876",
     "/private/tmp/native-video-header-linux/bin/webm-benchmark": "77b5aeeee32771d945c14664aafdf44fc3e0f17577b95487e32f6a8d6972e4b6",
     "/private/tmp/native-video-header-linux/bin/video-tests": "379ec5d49630ca4ca807fdaf6654cd2fe505f3cf4a528ea2c8af2609450afd5e",
-    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/pkg/inference/zig-out/bin/antfly-inference-bench-server": "35355aedc5cfddf92e7f825fdfa881602f11508e119ff6b3b083f43423f81bd3"
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/zig/pkg/inference/zig-out/bin/antfly-inference-bench-server": "35355aedc5cfddf92e7f825fdfa881602f11508e119ff6b3b083f43423f81bd3",
+    "/private/tmp/native-video-header-linux-inference/bin/antfly-inference-bench-server": "54f6283503ab247182e51e4c5e751e6d7acc0f061845a1d146968e842c92b3d0"
   },
   "implementation_files_sha256_at_receipt": {
     "zig/lib/video/src/codecs/av1_headers.zig": "4fda158cc6aa842e4bb7da04256df4b0365b62f37674e8fa6ea34a54cf7a5401",
@@ -75,7 +75,7 @@
     "zig/lib/video/src/webm_benchmark.zig": "29e2a574517d2d3c9ef18194dfd4809015003ecee3db77216d5c3f93aaa395c6"
   },
   "artifacts_sha256": {
-    "README.md": "578720c6e784c201e1d40e5438bf57ed5db3fe25e68a03c73b2d8c6e6dc82b1c",
+    "README.md": "87a40a9a8774e801422d1025366823c6973a8901828a1db5729941d82461375a",
     "fuzz-seed-tests.log": "6f9f10b14bfe7312b4ba51aa6d720e778ffeca6248f9a6c38ed38d1cd81b8c62",
     "linux-arm64/sintel-av1-1080p.jsonl": "a83d3435ec3230690df1e0bfdfc52fdd781e3f619d36f07f989f7a145d09eba2",
     "linux-arm64/sintel-av1-480p.jsonl": "6db7a578f2e149630fcff753736e483d70e0639a56254cd0dcca4c762c5388d2",
@@ -98,7 +98,8 @@
     "model-tests.log": "9ba5f99c2741b65946645e1d9e70b9375ab70f5ddce2fa18dc1ee12237e4647d",
     "native-webm.json": "212f9e28fb4f76a8aaf52fbed1fd51e3d9fbdb68bb931d7ed513ca86a21455a8",
     "vp9-fuzz.log": "63319ce09789fc4847699f195599e7237250f03b20535902c1e5541a8cb2ddba",
-    "av1-fuzz.log": "e59af6b7dcbc3bba8f4f7e58f64abd4b0e3e6260ef3b63fa35892b0fe6630bac"
+    "av1-fuzz.log": "e59af6b7dcbc3bba8f4f7e58f64abd4b0e3e6260ef3b63fa35892b0fe6630bac",
+    "linux-native-webm.json": "5a7d15205aea9afdc66873b69948c563d5e32424f8b548bdc23026a86955ec2e"
   },
   "toolchain": {
     "zig": "0.17.0",
@@ -114,5 +115,6 @@
     "zig build install-video-tests install-webm-benchmark -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe -Dvideo-use-llvm=true",
     "zig build fuzz-video -Dvideo-fuzz-filter=\"fuzz seed\"",
     "zig build fuzz-video -Dvideo-fuzz-filter=\"video fuzz AV1 metadata\" -Doptimize=ReleaseSafe --fuzz=100K"
-  ]
+  ],
+  "source_commit": "db6fc97710b66f84af65eb80932afaef70c1e95d"
 }
