@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-01
+Last updated: 2026-10-11
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -326,6 +326,15 @@ ABI without a server binary. Opening a Lite handle with the local-runtime
 configured flag reports `inference_mode: "local_embedded"` and
 `local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
 section). There is no inference-free `libantfly` product.
+
+ELF builds select LLVM for the C API and its embedded inference and enrichment
+archives. The final export boundary requires LLD, which cannot link Zig's
+self-hosted Debug output. The provider archives must use the same backend:
+borrowed `std.Io` executors exchange internal Zig callback pointers, whose
+calling convention differs between LLVM and the self-hosted backend. Mixing
+them crashes the first provider background job even though the public C ABI
+links successfully. Keep the native `capi-smoke` runtime check alongside the
+export and executable/shared-consumer linkage checks.
 
 ## Why compiled boundaries are required
 
