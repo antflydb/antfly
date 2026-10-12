@@ -4303,9 +4303,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 defer a.free(bytes);
                 try std.testing.expect(bytes.len <= index_publication.max_ack_bytes);
                 try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, bytes));
-                const enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{});
+                const enrollment_request = try store_root_enrollment.Request.sign(identity, seed);
+                const enrollment = try std.json.Stringify.valueAlloc(a, enrollment_request, .{});
                 defer a.free(enrollment);
-                try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
+                if (@hasDecl(Driver, "enroll"))
+                    try Driver.enroll(&store, enrollment_request)
+                else
+                    try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
                 try store.validateRelationalIndexOwnerAck(group, bytes);
                 {
                     const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
@@ -12389,13 +12393,17 @@ pub const RaftApplyStore = struct {
     }
 
     fn standbyRelationActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, required: u16) !topology_protocol.Activation {
+        return self.requireTopologyActivationTxn(txn, group, @max(required, topology_protocol.relation_publication_version));
+    }
+
+    fn requireTopologyActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, required: u16) !topology_protocol.Activation {
         var buf: [160]u8 = undefined;
         const raw = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
         if (raw.len > 1024) return error.InvalidCatalogRecord;
         var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
         defer parsed.deinit();
         const activation = parsed.value;
-        if (activation.version < @max(required, topology_protocol.relation_publication_version)) return error.TableTopologyProtocolUpgradeRequired;
+        if (activation.version < required) return error.TableTopologyProtocolUpgradeRequired;
         if (activation.version > topology_protocol.current_version or activation.member_count == 0 or
             std.mem.allEqual(u8, &activation.membership_fingerprint, 0)) return error.InvalidCatalogRecord;
         const identity_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
@@ -14623,6 +14631,14 @@ pub const RaftApplyStore = struct {
             }
         }
         return .{ .items = try entries.toOwnedSlice(alloc), .next_key = next_key };
+    }
+
+    /// Standalone admission uses the same durable capability and incarnation
+    /// proof as other metadata lifecycle operations, never a local version flag.
+    pub fn validateStoreRootEnrollmentProtocol(self: *RaftApplyStore, group_id: u64) !void {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireTopologyActivationTxn(&txn, group_id, topology_protocol.store_root_enrollment_version);
     }
 
     pub fn storeRootControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, control: fk_initial_retirement_wire.Control) ![]u8 {

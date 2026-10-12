@@ -3117,7 +3117,7 @@ standalone commit/post-publication lock split still need activation work and
 qualification. Optimized standalone qualification is pending. Public producer
 activation and original-case dispositions remain unchanged.
 
-### Enrolled standalone ACK qualification
+### Enrolled standalone ACK qualification (`b27008d385`)
 
 The storage ACK authority fixture is now shared with the standalone catalog
 adapter test, rather than duplicating its enrollment setup or replacing durable
@@ -3142,3 +3142,37 @@ These checks do not qualify the pending native dispatcher test or distributed
 activation. The initial sandboxed boundary audit was stopped only after a
 process sample proved Python was blocked in macOS timezone initialization;
 the replacement read-only audit completed successfully outside that sandbox.
+
+### Standalone explicit root enrollment
+
+Standalone enrollment and enrollment-status calls now dispatch through the
+existing store-root control protocol instead of returning UnsupportedOperation.
+Both require administrator authority before catalog access. Enrollment joins
+the shared standby mutation barrier and validates the possession signature,
+persisted decoder activation and matching metadata incarnation, and the current
+store's advertised root identity. The preflight aborts its write transaction;
+durable apply independently repeats identity checks. A committed revision alone
+is not success: the exact enrolled identity must be observed after apply.
+Normal enrollment advances the projection epoch in constant work without
+decoding the full catalog; unexpected revisions retain normal reconciliation.
+Neither ordinary registration nor an internal service credential enrolls a root.
+
+The existing topology-activation verifier is shared without changing standby's
+stronger relation-publication floor. Enrollment requires its own declared floor,
+not a local process capability or an invented membership fingerprint. The new
+adapter fixture dispatches both enrollment and ACK against real durable store
+authority, and adds foreign-cluster, unauthorized, corrupt-signature, missing
+activation and standby-before-lock/body rejection checks. The expanded Debug
+gate passed all 102 build steps and 30 component executions: three standalone,
+26 publication and one decoder-floor test, with zero skips, failures or leaks.
+This includes successful enrollment and ACK dispatch for both position domains.
+Optimized qualification is still pending. Automatic signing, complete worker
+activation, shared commit/publication lock separation and distributed faults
+remain open. Public production and original SQL dispositions are unchanged.
+
+Standalone currently synthesizes local store/placement information for public
+catalog listings; that listing is not durable root/reporter or receipt authority.
+This new dispatch does not promote those synthetic entries into enrollment or
+invent Raft replicas. Production native root/reporter observation and placement
+admission still need integration before automatic native publication. An absent
+durable store registration remains a rejection, not an implicit local grant.

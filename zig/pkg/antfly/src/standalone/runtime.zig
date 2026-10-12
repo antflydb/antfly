@@ -2539,6 +2539,7 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
+        if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
         if (call == .lake_index_lifecycle_work) {
             try context.ensureActive();
@@ -2554,7 +2555,7 @@ const LocalStandaloneMetadata = struct {
         }
         const shared_catalog_mutation = call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack;
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -2616,11 +2617,38 @@ const LocalStandaloneMetadata = struct {
                 if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
+            .store_root_enrollment_status => |identity| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try identity.validate();
+                try store.validateStoreRootEnrollmentProtocol(group_ids.main_metadata_group_id);
+                return store.storeRootControlJson(alloc, group_ids.main_metadata_group_id, .{ .enrollment_status = identity });
+            },
+            .store_root_enroll => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try request.validate();
+                try store.validateStoreRootEnrollmentProtocol(group_ids.main_metadata_group_id);
+                const checked = try store.storeRootControlJson(alloc, group_ids.main_metadata_group_id, .{ .preflight_enrollment = request });
+                alloc.free(checked);
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > 8192) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                const prior_revision = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_store_root_enrollment = bytes }) catch
+                    return error.MetadataMutationOutcomeUnknown;
+                const observed_revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (prior_revision != 0 and prior_revision != std.math.maxInt(u64) and observed_revision == prior_revision + 1) {
+                    self.epoch = observed_revision;
+                    self.durable_revision = observed_revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                // Apply may safely discard a stale enrollment proposal. Only
+                // its exact durable identity proves a successful outcome.
+                return store.storeRootControlJson(alloc, group_ids.main_metadata_group_id, .{ .enrollment_status = request.identity }) catch
+                    return error.MetadataMutationOutcomeUnknown;
+            },
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
-            .store_root_enroll,
-            .store_root_enrollment_status,
             => return error.UnsupportedOperation,
             .fk_generation_publication_status,
             .fk_generation_publication_work,
@@ -13048,10 +13076,13 @@ test "standalone native index owner catalog calls preserve authority and capabil
     const publication = @import("../metadata/relational_index_publication.zig");
     const Call = @import("../system_catalog/server_call.zig").Call;
     const ack = try publication.testing.fencedAck();
+    const enrollment = try @import("../metadata/store_root_enrollment.zig").Request.sign(ack.signed.proof.identity, @splat(9));
     const calls = [_]Call{
         .{ .relational_index_owner_decision = .{ .table_id = ack.table_id, .group_id = ack.signed.receipt.owner.group_id, .id = ack.signed.receipt.owner.plan_id, .operation = .fence } },
         .{ .relational_index_owner_ack = ack },
         .{ .relational_index_owner_ack_status = ack },
+        .{ .store_root_enroll = enrollment },
+        .{ .store_root_enrollment_status = enrollment.identity },
     };
     var unavailable: LocalStandaloneMetadata = undefined;
     for (calls) |call| {
@@ -13069,7 +13100,7 @@ test "standalone native index owner catalog calls preserve authority and capabil
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
     const revision = metadata.durable_revision;
-    const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
+    const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true, .setting_admin = true };
     for (calls) |call| {
         // A valid signature and an internal caller do not activate a protocol
         // or enroll an owner. These are real durable-store preflight failures.
@@ -13081,41 +13112,90 @@ test "standalone native index owner catalog calls preserve authority and capabil
     corrupt.signed.proof.signature[0] ^= 1;
     try std.testing.expectError(error.InvalidIndexOwnerReceipt, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .relational_index_owner_ack = corrupt }));
     try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+    var corrupt_enrollment = enrollment;
+    corrupt_enrollment.signature[0] ^= 1;
+    try std.testing.expectError(error.InvalidStoreRootEnrollment, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .store_root_enroll = corrupt_enrollment }));
+    try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+}
+
+fn withOwnerCatalogForTest(store: *antfly.metadata.RaftApplyStore, request: anytype, comptime check: anytype) !void {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    defer a.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    // Borrow actual durable authority, without fabricating enrollment or
+    // placement. Restore the owned store before destroying the adapter.
+    const original_store = metadata.lifecycle_store;
+    metadata.lifecycle_store = store;
+    defer metadata.lifecycle_store = original_store;
+    const revision = try store.standaloneRevision();
+    metadata.durable_revision = revision;
+    metadata.epoch = revision;
+    try check(&metadata, request, revision);
 }
 
 test "standalone native index owner catalog calls commit enrolled receipts and resolve lost replies" {
     try @import("../metadata/storage/raft_apply_store.zig").OwnerAckTestFixture.run(struct {
+        pub fn enroll(store: *antfly.metadata.RaftApplyStore, request: @import("../metadata/store_root_enrollment.zig").Request) !void {
+            try withOwnerCatalogForTest(store, request, enrollThroughCatalog);
+        }
+
+        fn enrollThroughCatalog(metadata: *LocalStandaloneMetadata, request: @import("../metadata/store_root_enrollment.zig").Request, revision: u64) !void {
+            const a = std.testing.allocator;
+            const enrollment = @import("../metadata/store_root_enrollment.zig");
+            const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true };
+            try std.testing.expectError(error.Forbidden, LocalStandaloneMetadata.systemCatalog(metadata, a, .{}, .{ .store_root_enroll = request }));
+            try std.testing.expectError(error.Forbidden, LocalStandaloneMetadata.systemCatalog(metadata, a, .{}, .{ .store_root_enrollment_status = request.identity }));
+            try std.testing.expectError(error.StoreRootEnrollmentChanged, LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .store_root_enrollment_status = request.identity }));
+            var foreign = request.identity;
+            foreign.metadata_incarnation = @splat('f');
+            const foreign_request = try enrollment.Request.sign(foreign, @splat(9));
+            try std.testing.expectError(error.StoreRootEnrollmentChanged, LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .store_root_enroll = foreign_request }));
+            try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+            {
+                const reply = try LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .store_root_enroll = request });
+                defer a.free(reply);
+                var parsed = try std.json.parseFromSlice(enrollment.Identity, a, reply, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualDeep(request.identity, parsed.value);
+            }
+            {
+                const reply = try LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .store_root_enrollment_status = request.identity });
+                defer a.free(reply);
+                var parsed = try std.json.parseFromSlice(enrollment.Identity, a, reply, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualDeep(request.identity, parsed.value);
+            }
+            try std.testing.expectEqual(revision + 1, metadata.durable_revision);
+            try std.testing.expectEqual(revision + 1, metadata.epoch);
+            try std.testing.expectEqual(revision + 1, try metadata.lifecycle_store.?.standaloneRevision());
+        }
+
         pub fn apply(store: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack, _: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+            try withOwnerCatalogForTest(store, ack, ackThroughCatalog);
+        }
+
+        fn ackThroughCatalog(metadata: *LocalStandaloneMetadata, ack: @import("../metadata/relational_index_publication.zig").Ack, revision: u64) !void {
             const a = std.testing.allocator;
             const publication = @import("../metadata/relational_index_publication.zig");
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
-            defer a.free(root);
-            const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
-            defer a.free(path);
-            var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
-            defer runtime.deinit();
-            var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
-            defer metadata.deinit();
-            // Borrow the fixture's fully enrolled durable authority. The
-            // adapter owns no enrollment flag and never fabricates placement.
-            const original_store = metadata.lifecycle_store;
-            metadata.lifecycle_store = store;
-            defer metadata.lifecycle_store = original_store;
-            const revision = try store.standaloneRevision();
-            metadata.durable_revision = revision;
-            metadata.epoch = revision;
+            const store = metadata.lifecycle_store.?;
             const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
             {
-                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack_status = ack });
+                const reply = try LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .relational_index_owner_ack_status = ack });
                 defer a.free(reply);
                 var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
                 defer parsed.deinit();
                 try std.testing.expect(!try parsed.value.isAcknowledged(ack));
             }
             {
-                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack = ack });
+                const reply = try LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .relational_index_owner_ack = ack });
                 defer a.free(reply);
                 var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
                 defer parsed.deinit();
@@ -13126,9 +13206,9 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
             try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
             // Resolve a lost reply with the ORIGINAL expected revision. An
             // attempted write replay must not advance the durable catalog.
-            try std.testing.expectError(error.GenerationPublicationChanged, LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack = ack }));
+            try std.testing.expectError(error.GenerationPublicationChanged, LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .relational_index_owner_ack = ack }));
             {
-                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack_status = ack });
+                const reply = try LocalStandaloneMetadata.systemCatalog(metadata, a, context, .{ .relational_index_owner_ack_status = ack });
                 defer a.free(reply);
                 var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
                 defer parsed.deinit();
@@ -13337,6 +13417,7 @@ test "standalone standby catalog create rejects before contended locks" {
         // A receipt is also a durable catalog mutation, not a status read.
         // Reject the standby before inspecting its body or either held lock.
         try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .index_publication_authority = true }, .{ .relational_index_owner_ack = undefined }));
+        try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .setting_admin = true }, .{ .store_root_enroll = undefined }));
     }
 }
 
