@@ -965,6 +965,16 @@ and titled groups retain compatibility. No CUDA performance gain is claimed.
 
 ### Gemma4 generative OCR optimization
 
+The follow-up adds `ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1` within the experimental
+OCR lane: QKV, FFN, PLE and vocabulary projections span the active rows, with
+per-page RoPE/attention and frame-local F32/F16 KV suffix writes. The four-row
+corpus run submitted one frame per multi-row step and matched all transcripts,
+but remained slower than serialized generation, so this switch defaults off.
+`ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME=1` also qualifies canonical one-token
+hidden/choice recovery past the local-attention window. K=2, including bonus
+acceptance, matched the complete OCR corpus but did not pass the speed gate.
+See the design doc below for source pins, flags and measured limits.
+
 [The OCR optimization investigation](../../../docs/design/inference/gemma4-ocr-optimization.md)
 compares the identical GGUF model/projector with llama.cpp, profiles optimized
 Metal decode hits and transfer/wait counters, and keeps generative projected

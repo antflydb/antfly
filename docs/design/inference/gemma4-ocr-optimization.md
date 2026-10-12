@@ -2,6 +2,79 @@
 
 [Compact results](gemma4-ocr-optimization.json).
 
+## Implemented matrix batching and MTP follow-up
+
+[Eight-page qualification](gemma4-ocr-matrix-qualification.json) records the
+follow-up implementation. Earlier sections below describe the preceding
+implementations and measurements.
+
+The new prepared Metal decoder applies QKV projections, attention output,
+feed-forward projections, PLE projections and the vocabulary head to a cohort
+of rows. Each page retains its own position, RoPE and paged KV identity.
+Embedding/PLE initialization is batched too. The Q4 feed-forward wrapper now
+has a bounded two-to-eight-row route to the existing batched device encoder,
+instead of silently looping over singleton calls.
+
+A new frame-local KV suffix seed reserves capacity before acquiring its
+encoder, handles F32/F16 storage and encodes directly on the same runtime as
+the cohort. This avoids the generic paged-attention writer's intermediate
+frame flushes. The final argmax returns the cohort's token IDs together.
+All 1,314 measured multi-row decode steps in the eight-page four-row run
+submitted exactly one frame. Singleton tails continue through the ordinary
+optimized decoder. Cancellation/error cleanup retains the existing frame and
+request ownership rules; unsupported KV formats/runtimes fail closed.
+
+MTP's preprojection now joins its assistant/postprojection/selection frame.
+`ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME=1` permits the existing fully owned
+one-token decoder to return both the greedy choice and normalized hidden
+state beyond the local-attention window. It retains the prior hidden-only
+fallback when that route is unavailable; leaving the switch off preserves
+the earlier long-context guard. This recovery path restored exact transcripts
+with K=2 on the complete eight-page corpus, including bonus acceptance.
+
+Dispatch tracing identified a BF16 prepared vocabulary head on this checkpoint;
+the earlier Q6_K switch did not control that head. The shared BF16 linear
+kernel now keeps two-to-four-row accumulators in registers and reduces with
+SIMD shuffles using the existing binary addition tree. Larger row counts
+retain the prior path. Tests cover small rows, tails, offsets and BF16 range.
+
+| Configuration | Seconds, one eight-page pass | Completion tokens | Exact control text |
+| --- | ---: | ---: | --- |
+| Resident ordinary greedy | 54.012 | 4,057 | Yes |
+| True matrix batching, four rows | 76.750 | 4,057 | Yes |
+| MTP K=2, full-context recovery/draft frame | 88.222 | 4,057 | Yes |
+| Same MTP K=2, bonus acceptance | 81.657 | 4,057 | Yes |
+
+These are single complete passes with one page warmed outside measurement.
+The final serving build and other CPU compilation overlapped the campaign;
+these observations establish transcript agreement on the corpus and argue
+against promotion, not a precise speedup estimate. The timed executable is
+pinned to `65dbefeb706e1eb1c21aa57d3d5819ae067d3a90`; the final serving revision
+removes only its disabled synchronized diagnostic. A diagnostic experiment
+inserted intermediate waits and exposed an encoder-lifecycle assertion; that
+mode was removed and its interrupted request is excluded from qualification.
+
+Four-page pilots also showed that two-row matrix batching and forced MTP K=4
+could shorten/change the diagram-page transcript. They failed the parity gate.
+Four-row batching and K=2 passed all eight transcript checks, but their elapsed
+times still failed the performance gate. Serving defaults therefore retain the
+previous batch path and Metal MTP qualification policy.
+
+To exercise the new page path, set `ANTFLY_GEMMA4_METAL_OCR_BATCH=1`,
+`ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS=4` and
+`ANTFLY_GEMMA4_METAL_OCR_MULTIROW=1`. The last switch also selects batched Q4
+feed-forward processing; `ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN=1` exposes that
+route independently for backend qualification. The corpus MTP cases used
+`ANTFLY_GEMMA4_MTP_MULTIMODAL=1`, disabled adaptive K, explicitly forced K=2,
+enabled full-context recovery and
+`TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME=1`. Bonus acceptance
+remains a separate switch. Complete flags and source/binary pins are in JSON.
+
+`ANTFLY_GEMMA4_OCR_PROFILE=1` now logs `metal_ocr_matrix_frame` with row count,
+actual submission count and wait/GPU duration, without extra synchronization.
+The remaining throughput work is kernel efficiency: sharing weight reads alone
+did not overcome this implementation's additional matrix/operator cost.
+
 ## Why the expected speedups have not appeared
 
 The current result qualifies these implementations, not the potential of GPU
