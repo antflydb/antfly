@@ -1763,7 +1763,8 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, table_catalog.key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
-        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
+        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key);
 }
 
 /// True only for durable keys that a validated portable import may create.
@@ -3436,6 +3437,7 @@ const PortableArchiveValidation = struct {
     saw_index_catalog: bool = false,
     saw_enrichment_catalog: bool = false,
     saw_resolver_catalog: bool = false,
+    saw_resolver_merges: bool = false,
 
     const DecodedEpoch = struct {
         version: u32,
@@ -4610,6 +4612,13 @@ fn validateMetadataEntries(
             for (configs) |*config| config.deinit(alloc);
             alloc.free(configs);
             archive.saw_resolver_catalog = true;
+        } else if (std.mem.eql(u8, entry.key, resolver_catalog.merge_catalog_key)) {
+            if (archive.saw_resolver_merges) return error.InvalidMetadataBatch;
+            resolver_catalog.validateSerializedMergeState(alloc, entry.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataBatch,
+            };
+            archive.saw_resolver_merges = true;
         }
     }
 }
@@ -6418,6 +6427,7 @@ test "import preflights durable catalogs before mutating destination" {
         .{ .key = "\x00\x00__metadata__:indexes", .value = "not-an-index-catalog" },
         .{ .key = "\x00\x00__metadata__:enrichments", .value = "not-json" },
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
+        .{ .key = resolver_catalog.merge_catalog_key, .value = "not-json" },
     };
     for (cases) |case| {
         var tmp_src = std.testing.tmpDir(.{});

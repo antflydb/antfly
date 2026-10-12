@@ -846,7 +846,10 @@ Explicit aliases do not require canonical documents or embedding IO.
 
 Query extraction and resolution never publish a synthetic document, resolution
 artifact, promotion, graph edge, or replay record. They also work on read-only
-handles. They use resolver-level aliases and ignore document-specific curation
+handles. Read-only text queries lazily cache a foreground extractor producer on
+the handle, reusing its inference provider and loaded models across calls.
+Producer invocations are serialized and the cache is released on close.
+They use resolver-level aliases and ignore document-specific curation
 since the query has no stored document identity. Queries currently require an
 asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
 resolver is rejected rather than inventing chunk context. The text form requires
@@ -861,9 +864,18 @@ inline `aliases`. The resolver catalog records their version and generation;
 merge state, generation, and backfill cursors commit in one transaction. Normal
 inline config upserts preserve merge state even when callers omit all aliases.
 Callers can keep reapplying declarative index configs on open without reading
-curated merges first. Durable merges take precedence over an inline redirect of
+curated merges first. Replaying an identical native index config on an existing
+index is idempotent, including after close/reopen; a different physical config
+is rejected. Durable merges take precedence over an inline redirect of
 the same source. Removing a resolver deliberately removes its associated merge
-state; merely replacing its configuration does not. Splits copy both catalogs.
+state; merely replacing its configuration does not. Splits and portable backups copy both catalogs. Memory/file restore and live
+import validate and preserve durable merge state. Once merges exist, changes to
+`table` or `key_template` are rejected with a namespace diagnostic; callers must
+explicitly reset or migrate the identities before changing their namespace.
+The effective resolution revision advances on either a config change or merge,
+even when the incoming config generation equals the preceding merge revision.
+For example, config generation 2 → merge → config generation 3 yields effective
+revisions 2 → 3 → 4. Identical config replay leaves the revision unchanged.
 Missing, corrupt, cyclic, or unsupported required merge metadata fails opening
 rather than silently resolving keys differently. Both mention and relation
 edges are reconciled on the root drain, including removal of old endpoints.
@@ -882,9 +894,11 @@ Files written by interim PR builds are not a supported downgrade format.
 The normal native regression now ingests an extraction, promotes its first
 entity, computes its embedding through the enrichment runtime, drains the root,
 and matches a different mention through ANN. It uses a deterministic embedding
-provider so the ordering contract runs in ordinary CI. The opt-in Qwen test
-exercises the same promotion/drain/second-mention path with real embeddings and
-also checks ad-hoc ANN query resolution. Neither test writes a candidate entity
+provider for both canonical entities and mentions so the ordering contract runs
+in ordinary CI. The required public Python Qwen test downloads the SHA-pinned
+Q8 bundle from the runtime registry, exercises the same promotion/drain/second-
+mention path with real embeddings and checks ad-hoc ANN query resolution.
+The opt-in Go Qwen test also exercises this contract. Neither test writes a candidate entity
 or its vector by hand.
 
 The required pinned CPU extraction CI test sets

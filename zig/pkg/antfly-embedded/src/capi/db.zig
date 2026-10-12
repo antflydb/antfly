@@ -6931,20 +6931,19 @@ pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_nam
     for (configs) |*cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
-        // Read-only databases deliberately have no enrichment worker. Scope a
-        // producer to this query instead of reconfiguring a writable runtime.
-        const QueryProducer = @import("../asset_producer_runtime.zig").Runtime;
-        var query_producer: ?*QueryProducer = null;
-        defer if (query_producer) |producer| {
-            producer.deinit();
-            handle.alloc.destroy(producer);
-        };
-        if (text != null and handle.database().enrichment_runtime == null) {
+        // Read-only databases have no enrichment worker. Retain a lazy producer
+        // on the handle so repeated queries reuse transport/capability state and
+        // the handle's inference provider/model cache. Serialize its foreground
+        // invocations independently of persistent database writes.
+        const cached_producer = text != null and handle.database().enrichment_runtime == null;
+        if (cached_producer) handle.query_producer_mutex.lockUncancelable(handleLockIo());
+        defer if (cached_producer) handle.query_producer_mutex.unlock(handleLockIo());
+        if (cached_producer and handle.query_producer == null) {
             const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
-            query_producer = QueryProducer.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+            handle.query_producer = @import("../asset_producer_runtime.zig").Runtime.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
         }
         const extracted = if (text) |value|
-            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (query_producer) |producer| producer.producer() else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
+            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (cached_producer) handle.query_producer.?.producer() else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
         else
             std.json.Stringify.valueAlloc(handle.alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
         defer handle.alloc.free(extracted);
@@ -7068,7 +7067,29 @@ pub export fn antfly_db_add_index_json(
     else
         parsed.value.config_json;
     defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
-    handle.database().*.addIndex(.{
+    // Native clients replay inline configs on every open. Admit an identical
+    // existing index idempotently, while retaining duplicate-config conflicts.
+    var existing_index = false;
+    if (handle.lite_profile == .native) {
+        const installed = handle.database().listIndexes(handle.alloc) catch |err| {
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        };
+        defer db_mod.types.freeIndexConfigs(handle.alloc, installed);
+        for (installed) |cfg| {
+            if (!std.mem.eql(u8, cfg.name, parsed.value.name)) continue;
+            const same = cfg.kind == kind and (@import("../storage/db/enrichment/config_validation.zig").producerJsonValuesEqual(handle.alloc, cfg.config_json, stored_config_json) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            });
+            if (!same) {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapErrorContext(error.InvalidArgument, "index already exists with a different configuration");
+            }
+            existing_index = true;
+        }
+    }
+    if (!existing_index) handle.database().*.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
         .config_json = stored_config_json,
@@ -7084,10 +7105,12 @@ pub export fn antfly_db_add_index_json(
     // all-or-nothing.
     if (handle.lite_profile == .native and kind == .graph) {
         registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
-            _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
+            if (!existing_index) _ = handle.database().*.deleteIndex(parsed.value.name) catch |delete_err| {
                 std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
             };
             if (rollback) |*undo| undo.restore();
+            if (err == error.ResolverMergeNamespaceChange)
+                return capi.mapErrorContext(err, "changing a resolver table or key_template requires explicitly resetting or migrating its durable merges");
             return capi.mapError(err);
         };
     }

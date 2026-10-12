@@ -368,6 +368,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.InvalidEnumTag,
         error.InvalidResolverAlias,
         error.InvalidResolverAliasCycle,
+        error.ResolverMergeNamespaceChange,
         error.EmptyEntityKey,
         error.InvalidArgument,
         error.SqlArraySubscriptError,

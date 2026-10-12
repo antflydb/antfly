@@ -54,3 +54,13 @@ exact-span counts on CPU (`native`) and Metal, including the multi-window case:
 | descriptions | 38 | 3 | 1 | 0.927 | 0.974 | 0.950 |
 
 These are regression results on a curated corpus, not held-out benchmark scores.
+
+The same required CPU CI step runs `scripts/ci/run_lite_embedding_test.py` through
+the public embedded Python API. It creates the embeddings index and inline
+resolver, promotes an entity from an extraction, generates canonical and mention
+embeddings, drains the root, then checks ANN matching during ingestion and query
+resolution. No candidate document or vector is seeded by hand.
+`qwen_embedding_bundle.json` pins the Qwen3-Embedding-0.6B Q8 GGUF and tokenizer
+files by revision, size and SHA-256, plus the canonical manifest digest. The
+receipt is checked against `qwen3_embedding_catalog.zig`; preparation verifies
+every file, and missing inference support fails rather than skipping the test.

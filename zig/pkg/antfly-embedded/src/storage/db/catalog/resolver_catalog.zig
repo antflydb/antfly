@@ -92,6 +92,8 @@ pub const ResolverConfig = struct {
     aliases: []const resolver_lib.KeyAlias = &.{},
     /// API-created redirects are durable identity state, never inline config.
     merges: []const resolver_lib.KeyAlias = &.{},
+    /// Combined resolution revision after the first merge. Advanced on either
+    /// config changes or merges; the field name retains catalog compatibility.
     merge_generation: u64 = 0,
     merge_state_version: u32 = 0,
     /// Materialize canonical entity documents; false resolves graph keys only.
@@ -379,6 +381,17 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]ResolverConfig 
 
 pub const merge_catalog_key = "\x00\x00__metadata__:resolver_merges_v1";
 const MergeState = struct { name: []const u8, aliases: []const resolver_lib.KeyAlias };
+
+/// Validate a portable metadata record before publishing imported state.
+pub fn validateSerializedMergeState(alloc: Allocator, data: []const u8) !void {
+    var parsed = try std.json.parseFromSlice([]const MergeState, alloc, data, .{});
+    defer parsed.deinit();
+    for (parsed.value, 0..) |state, index| {
+        if (state.name.len == 0 or state.aliases.len == 0) return error.InvalidResolverMergeState;
+        for (parsed.value[0..index]) |previous| if (std.mem.eql(u8, previous.name, state.name)) return error.InvalidResolverMergeState;
+        try resolver_lib.validateAliases(state.aliases);
+    }
+}
 
 pub fn serializeMergeState(alloc: Allocator, configs: []const ResolverConfig) ![]u8 {
     var states: std.ArrayList(MergeState) = .empty;

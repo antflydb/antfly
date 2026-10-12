@@ -64,11 +64,53 @@ def prepare(destination: Path, source: Path | None = None) -> None:
     )
 
 
+def prepare_embedding(destination: Path, source: Path | None = None) -> None:
+    """Install the registry's pinned Q8 bundle for the public embedder gate."""
+    root = Path(__file__).resolve().parents[2]
+    receipt = json.loads(
+        (root / "scripts/testdata/eval_extract/qwen_embedding_bundle.json").read_text()
+    )
+    for name, pin in receipt["model_files"].items():
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".partial")
+        try:
+            if source and (source / name).is_file():
+                shutil.copyfile(source / name, temporary)
+            else:
+                model_id = pin.get("model_id", receipt["model_id"])
+                revision = pin.get("revision", receipt["revision"])
+                url = f"https://huggingface.co/{model_id}/resolve/{revision}/{name}"
+                with (
+                    urllib.request.urlopen(url, timeout=120) as response,
+                    temporary.open("wb") as output,
+                ):
+                    shutil.copyfileobj(response, output)
+            with temporary.open("rb") as data:
+                digest = hashlib.file_digest(data, "sha256").hexdigest()
+            if temporary.stat().st_size != pin["size_bytes"] or digest != pin["sha256"]:
+                raise ValueError(f"pinned embedding model file mismatch: {name}")
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    manifest = receipt["model_manifest"].encode()
+    if hashlib.sha256(manifest).hexdigest() != receipt["model_manifest_sha256"]:
+        raise ValueError("pinned embedding manifest mismatch")
+    (destination / "model_manifest.json").write_bytes(manifest)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", type=Path)
     parser.add_argument(
         "--source", type=Path, help="Verify/copy an already downloaded pinned bundle"
     )
+    parser.add_argument(
+        "--embedding-destination",
+        type=Path,
+        help="Also install the pinned Qwen Q8 bundle",
+    )
     args = parser.parse_args()
     prepare(args.destination, args.source)
+    if args.embedding_destination:
+        prepare_embedding(args.embedding_destination)

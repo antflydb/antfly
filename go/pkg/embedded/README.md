@@ -270,7 +270,7 @@ schema, search, index, and enrichment methods. Close table handles before
 dropping them. Closing the database invalidates its table handles.
 
 Portable `.afb` archives back up the entire database: its table catalog,
-schemas, documents, indexes, enrichments, and constraint records. Call backup
+schemas, documents, indexes, enrichments, durable resolver merges, and constraint records. Call backup
 on the database handle. Restore publishes all tables together into either
 Lite or directory storage; import requires an empty database with no open
 table handles, SQL sessions, or cursors. Table handles cannot export or import
@@ -285,4 +285,5 @@ The real local synonym/ANN regression is opt-in with
 model root (containing `Qwen/Qwen3-Embedding-0.6B-GGUF`), rather than searching the
 user's home directory. The Zig CI gate separately downloads the pinned GLiNER base
 bundle and runs real extraction, promotion, and a public `direction: "both"`
-PageRank query; Unicode resolver tests run in the ordinary `lib-test` gate.
+PageRank query. It also downloads the pinned Qwen bundle for a required public
+Python embedding/promotion/drain/ANN test; Unicode resolver tests run in the ordinary `lib-test` gate.

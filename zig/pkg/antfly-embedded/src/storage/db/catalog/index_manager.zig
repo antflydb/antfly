@@ -12289,7 +12289,17 @@ pub const IndexManager = struct {
                 cfg.merge_state_version = entry.merge_state_version;
             }
             try cfg.validate();
+            if (entry.merges.len > 0 and
+                (!std.mem.eql(u8, entry.table, cfg.table) or !std.mem.eql(u8, entry.key_template, cfg.key_template)))
+                return error.ResolverMergeNamespaceChange;
             if (entry.eql(cfg)) return .updated_no_backfill;
+            // Once curated identities exist, merge_generation is the combined
+            // revision clock. A config bump can equal a previous merge revision;
+            // every change must still invalidate older resolution artifacts.
+            if (entry.merges.len > 0) {
+                const revision = try std.math.add(u64, entry.effectiveGeneration(), 1);
+                cfg.merge_generation = @max(revision, @max(cfg.config_generation, cfg.merge_generation));
+            }
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
