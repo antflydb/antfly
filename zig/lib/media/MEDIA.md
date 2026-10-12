@@ -590,8 +590,9 @@ after the reader is destroyed. Submitted Metal owners fence work before releasin
 capacity; releasing completed source storage retains the output charge.
 
 The same parent controller gates concurrent model requests before decoding.
-HTTP video preflight now has its own shared host reservation; cross-request
-decode/preparation ahead of the model gate remains work. Library callers continue
+HTTP video preflight has its own shared host reservation. The first-video
+producer described below decodes/prepares before the model gate, permitting
+preparation to overlap another request's execution. Library callers continue
 to supply a shared Pool explicitly; the bridge does not silently introduce a
 process-global singleton.
 

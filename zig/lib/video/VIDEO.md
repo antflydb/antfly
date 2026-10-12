@@ -1269,14 +1269,14 @@ a command slot before uploading coefficients or submitting driver work.
 `deinit` fences the command before releasing capacity.
 
 Five preparations may coexist: two queued, two consumer jobs and one producer.
-The conservative video workspace reservation now includes 1536 MiB for model
-execution, five 256 MiB preparation bounds, 16 MiB coefficient storage and
-512 MiB native decoder surfaces (3344 MiB total). The request-local device ledger
-has the corresponding 1808 MiB preprocessing share and five command slots.
-The parent shared controller gates concurrent requests before decode. This
-closes the missing reservation hooks, but does not yet move decode/preparation
-ahead of the shared model execution gate or overlap work across requests ahead of the model gate. HTTP preflight now
-has a separate shared host reservation. Cross-request overlap remains work. The current server passes the six original pretrained video/mixed cases on CPU
+The original bridge used a 3344 MiB blanket video workspace bound. The
+geometry-derived planning continuation below replaces it with 1536 MiB model
+execution plus selected preparation/native-surface bounds and 16 MiB coefficient
+storage. Its request-local ledger permits up to five command owners.
+The parent shared controller gates concurrent requests before decode; HTTP
+preflight has a separate shared host reservation. The first-video producer
+continuation below prepares before the model gate/provider lease. Measured
+scheduling and reservation tuning remain work. The current server passes the six original pretrained video/mixed cases on CPU
 and Metal, including admission/decode retry and reduced dimensions. Eight WebM
 vectors (five clips and three queries) preserve all reference rankings/top-k;
 concurrent/sustained and disconnect/retry checks pass. These are correctness and

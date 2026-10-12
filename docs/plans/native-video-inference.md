@@ -758,9 +758,9 @@ The focused model gate passes 17 tests; the full macOS video suite passes
 CPU/Metal pretrained video/mixed cases, 128 dimensions, forced admission retry
 and damaged-selected-frame cleanup/retry. Its eight WebM vectors preserve all
 three reference rankings and top-k sets on both backends; concurrent/sustained
-and disconnect/retry checks pass. Cross-request stage overlap, preflight admission
-and measured/tuned reservations remain work; the full non-CUDA scope remains
-active. These changes must not be described as completed whole-pipeline
+and disconnect/retry checks pass. The continuations below implement shared
+preflight and preparation before the model gate. Measured/tuned reservations
+and the full non-CUDA scope remain active. These changes must not be described as completed whole-pipeline
 scheduling until those remaining paths are implemented and qualified.
 
 Actual Linux ARM64 executes the updated portable video suite: 134 passes and
@@ -794,8 +794,9 @@ The substantive shared-capacity/denial/retry test and its 33 import gates pass.
 The production CPU/Metal server passes six original cases, reduced dimensions
 and admission/decode retries; eight WebM vectors preserve all reference
 rankings/top-k and concurrent/sustained/disconnect retry checks. Evidence is
-in `tools/embeddinggemma2/testdata/preflight-admission/qualification.json`. Cross-request stage overlap and the broader
-non-CUDA qualification/performance/streaming work remain active.
+in `tools/embeddinggemma2/testdata/preflight-admission/qualification.json`.
+Preparation before the model gate is implemented in the following continuation;
+broader non-CUDA qualification/performance/streaming work remains active.
 
 
 ### Preparation ahead of model execution (2026-10-11)
