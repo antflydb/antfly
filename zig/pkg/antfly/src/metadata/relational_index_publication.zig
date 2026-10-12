@@ -125,6 +125,27 @@ pub const OwnerRequest = struct {
             return error.InvalidGenerationPublication;
     }
 };
+/// Fixed-size authority observed in the permission transaction. This is not
+/// enrollment or a lease: metadata independently revalidates every ACK.
+pub const NativeSigningView = struct {
+    identity: @import("store_root_enrollment.zig").Identity,
+    reporter_incarnation: u64,
+    binding_digest: [32]u8,
+
+    pub fn validate(self: NativeSigningView, metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation) !void {
+        self.identity.validate() catch return error.InvalidCatalogRecord;
+        if (self.reporter_incarnation == 0 or !std.mem.eql(u8, &metadata_incarnation, &self.identity.metadata_incarnation))
+            return error.InvalidCatalogRecord;
+        const binding: @import("standalone_native_owner.zig").Binding = .{
+            .metadata_incarnation = self.identity.metadata_incarnation,
+            .node_id = self.identity.node_id,
+            .store_id = self.identity.store_id,
+            .root_incarnation = self.identity.root_incarnation,
+        };
+        if (!std.mem.eql(u8, &try binding.digest(), &self.binding_digest)) return error.InvalidCatalogRecord;
+    }
+};
+
 pub const OwnerDecision = struct {
     metadata_group_id: u64,
     metadata_incarnation: local.metadata_incarnation.MetadataClusterIncarnation,
@@ -133,6 +154,7 @@ pub const OwnerDecision = struct {
     disposition: enum { execute, acknowledged },
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
+    native_signing: ?NativeSigningView = null,
 
     pub fn requireRequest(self: OwnerDecision, request: OwnerRequest) !void {
         try request.validate();
@@ -140,6 +162,10 @@ pub const OwnerDecision = struct {
         if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
             !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
         if (try ownerPermission(self.head, self.owner, request.operation) != self.disposition) return error.InvalidCatalogRecord;
+        if (self.native_signing) |view| {
+            if (self.disposition != .execute or self.owner.owner.authority != .native) return error.InvalidCatalogRecord;
+            try view.validate(self.metadata_incarnation);
+        }
     }
 
     /// Bind a fresh permission response to the receiver's independently parsed

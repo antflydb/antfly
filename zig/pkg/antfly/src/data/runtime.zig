@@ -11623,7 +11623,39 @@ pub const DataServer = struct {
         // This native receiver cannot borrow a data-Raft leader's authority.
         if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
         const owners = try self.ensureKernelOwnerSource();
-        return antfly.public_api.relational_index_owner_execution.step(alloc, owners, &self.status_source, table_name, request, context);
+        var result = try antfly.public_api.relational_index_owner_execution.step(alloc, owners, &self.status_source, table_name, request, context);
+        // The effect may already be committed. A missing/replaced signing key
+        // must not turn that progress into an apparent failed mutation.
+        if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
+        return result;
+    }
+
+    fn signNativeIndexOwnerResult(self: *DataServer, alloc: std.mem.Allocator, result: *antfly.public_api.relational_index_owner_execution.Result) void {
+        const registration = self.store_registration orelse {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const runtime = self.ensureBackendRuntime() catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const io = runtime.apiIo() orelse {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        // Only load the existing physical-root key. Creating a replacement
+        // after applying an effect could attest it under a different root.
+        const root = @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.write_source.replica_root_dir) catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        const reporter = self.reporterIncarnation() catch {
+            result.signingFailed(.identity_unavailable);
+            return;
+        };
+        result.signNative(root, registration.node_id, registration.store_id, reporter) catch |err| {
+            result.signingFailed(if (err == error.IndexOwnerReceiptChanged or err == error.InvalidGenerationPublication) .authority_changed else .signing_failed);
+        };
     }
 
     fn installRowPolicyControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.row_policy_install.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.row_policy_install.Response {

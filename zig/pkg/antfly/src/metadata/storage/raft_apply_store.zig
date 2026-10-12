@@ -4311,6 +4311,8 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     defer decision.deinit();
                     try std.testing.expectEqual(.execute, decision.value.disposition);
                     try std.testing.expect(decision.value.dispatch != null and decision.value.inputs != null);
+                    // Registration alone cannot authorize signing.
+                    try std.testing.expect(decision.value.native_signing == null);
                     var candidate = try decision.value.inputs.?.prepareCandidate(a, decision.value.head);
                     defer candidate.deinit();
                     try std.testing.expectEqualSlices(u8, prepared.candidate.next.value, candidate.next.value);
@@ -4347,6 +4349,19 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try std.testing.expectEqual(before_enrollment.revision + 1, after_enrollment.revision);
                 try std.testing.expectEqual(before_enrollment.projection_revision, after_enrollment.projection_revision);
                 try store.validateRelationalIndexOwnerAck(group, bytes);
+                {
+                    const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
+                    defer a.free(reply);
+                    var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
+                    defer decision.deinit();
+                    try decision.value.requireRequest(owner_request);
+                    if (authority == .native) {
+                        const view = decision.value.native_signing orelse return error.TestExpectedNativeSigningView;
+                        try std.testing.expectEqualDeep(identity, view.identity);
+                        try std.testing.expectEqual(@as(u64, 4), view.reporter_incarnation);
+                        try std.testing.expectEqualSlices(u8, &try native_binding.digest(), &view.binding_digest);
+                    } else try std.testing.expect(decision.value.native_signing == null);
+                }
                 if (authority == .native) {
                     var foreign_binding_ack = ack;
                     foreign_binding_ack.signed.proof.authority.native[0] ^= 1;
@@ -4413,6 +4428,14 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     changed.runtime_statuses = &changed_runtime;
                     changed.group_statuses = &changed_groups;
                     _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed);
+                    if (authority == .native) switch (fault) {
+                        .root_identity, .native_binding_missing, .native_binding_changed => try std.testing.expect(try store.nativeIndexSigningViewTxn(&txn, group, incarnation) == null),
+                        .reporter => {
+                            const observed = (try store.nativeIndexSigningViewTxn(&txn, group, incarnation)).?;
+                            try std.testing.expectEqual(changed.reporter_incarnation, observed.reporter_incarnation);
+                        },
+                        else => {},
+                    };
                     const placement_bytes = try encodePlacementIntent(a, changed_placement);
                     defer a.free(placement_bytes);
                     try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
@@ -4479,6 +4502,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                     defer decision.deinit();
                     try std.testing.expectEqual(.acknowledged, decision.value.disposition);
                     try std.testing.expect(decision.value.dispatch == null and decision.value.inputs == null);
+                    try std.testing.expect(decision.value.native_signing == null);
                     var next = owner_request;
                     next.operation = .reserve;
                     next.projection = .permission;
@@ -15751,6 +15775,30 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
+    /// Read only fixed-size native ownership, current reporter and explicit
+    /// enrollment. No synthetic listing or caller-provided identity qualifies.
+    fn nativeIndexSigningViewTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, incarnation: metadata_incarnation.MetadataClusterIncarnation) !?index_publication.NativeSigningView {
+        var buf: [256]u8 = undefined;
+        const raw = (try stagingGet(txn, try standalone_native_owner.key(&buf, group_id))) orelse return null;
+        const binding = standalone_native_owner.decode(raw) catch return error.InvalidCatalogRecord;
+        if (!std.mem.eql(u8, &binding.metadata_incarnation, &incarnation)) return error.InvalidCatalogRecord;
+        const current = (try self.loadStoreHeaderTxn(txn, group_id, binding.store_id)) orelse return null;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (!current.live or current.reporter_incarnation == 0 or current.node_id != binding.node_id or
+            current.replica_root_incarnation != binding.root_incarnation or std.mem.allEqual(u8, &current.replica_root_public_key, 0)) return null;
+        const view: index_publication.NativeSigningView = .{
+            .identity = .{ .metadata_incarnation = incarnation, .node_id = binding.node_id, .store_id = binding.store_id, .root_incarnation = binding.root_incarnation, .public_key = current.replica_root_public_key },
+            .reporter_incarnation = current.reporter_incarnation,
+            .binding_digest = try binding.digest(),
+        };
+        try view.validate(incarnation);
+        self.requireStoreRootEnrollmentTxn(txn, group_id, view.identity) catch |err| switch (err) {
+            error.StoreRootEnrollmentChanged => return null,
+            else => return err,
+        };
+        return view;
+    }
+
     pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.OwnerRequest) ![]u8 {
         try request.validate();
         var txn = try self.store.beginReadTxn();
@@ -15792,6 +15840,7 @@ pub const RaftApplyStore = struct {
         if (claim.kind != .table or claim.phase != .active or claim.table_id != request.table_id or
             claim.schema_version != schema_version or !std.mem.eql(u8, &claim.schema_digest, &schema_digest)) return error.GenerationPublicationChanged;
         decision.dispatch = d;
+        if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
         var inputs: ?std.json.Parsed(index_publication.Inputs) = null;
         defer if (inputs) |*value| value.deinit();
         if (request.projection == .admission) {

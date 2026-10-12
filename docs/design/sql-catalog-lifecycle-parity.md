@@ -3284,3 +3284,50 @@ or verifier. Production native registration/report publishing, root signing from
 the exact applying/recovering lease, complete worker activation, adoption and
 distributed fault qualification remain open. Public production is disabled
 and original-case dispositions are unchanged.
+
+### Pinned native signing view and receiver receipts
+
+The native owner permission transaction now optionally projects a fixed-size
+signing view from the persisted native binding, current live store/reporter and
+explicit administrator root enrollment. It does not use synthetic placement
+listings or caller truth flags. Unregistered, unready and unenrolled identities
+leave progress unsigned; malformed persisted authority fails closed. Raft and
+acknowledged decisions carry no native signing view. No schema-sized input or
+table scan is added to this hot path.
+
+Fresh and recovered control results own a copy of that permission cut, its
+expected head revision and the exact applying/recovering lease root generation.
+The standalone data receiver can load an existing physical-root signing key
+and attach an index ACK after checking configured node/store/reporter identity.
+It never creates a replacement key after applying an effect. Missing identity,
+changed authority and signing errors retain the owned committed outcome with
+a bounded typed signing failure; they are not apparent mutation rollbacks.
+Admission and replication-pending outcomes cannot produce ACKs. HTTP response
+validation binds an optional signed ACK to the actual outcome receipt, applying
+root and native binding digest. This consistency check does not replace the
+independent transactional metadata publication verifier.
+
+The first corrected Debug publication gate passed 59/59 build steps, including
+28 publication/component tests and one decoder-floor test, with no skips,
+failures or leaks. An initial invocation used the unrelated Homebrew Zig 0.16
+on PATH and failed before branch compilation; all qualification uses the
+repository Zig 0.17 compiler. The first 0.17 compilation exposed a misplaced
+signing-context declaration; it was corrected before the passing gate. After
+additional native projection fault checks, the final HTTP/authority Debug gate
+passed 76/76 build steps and 67 component executions (28 publication, four
+service authority, 19 HTTP ACK/catalog identity, 12 mounted client and four
+durable report/authority tests), without skips, failures or leaks. The compiled
+data-receiver Debug gate passed 91/91 steps and its one selected receiver test,
+also without skips, failures or leaks. The selections overlap and are not 68
+distinct original SQL contracts. License-boundary (2,035 source files), original
+inventory integrity, Zig 0.17 formatting and diff checks passed. These component
+tests do not prove
+complete public worker activation, durable producer registration/reporting,
+full distributed lifecycle/recovery, or original-case SQL coverage. Public
+native production remains disabled; the original inventory is unchanged.
+
+The optimized projection-watermark gate for frozen checkpoint `d274cfbe4d`
+also completed successfully: 102/102 build steps and 33 component executions
+(five standalone, 27 publication and one floor test), without skips, failures
+or leaks. That historical checkpoint predates the explicit native proof and
+this receiver signing implementation, so it does not certify either change.
