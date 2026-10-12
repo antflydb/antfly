@@ -5295,7 +5295,9 @@ pub const ApiHttpServer = struct {
     fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
         const reader = self.table_reads orelse return;
         const writer = self.table_writes orelse return;
-        var snapshot = (try self.source.cachedAdminSnapshot()) orelse return;
+        // Validation must make progress on a cold owner without depending
+        // on an unrelated diagnostic request to populate a cache.
+        var snapshot = (try self.controlAdminSnapshot()) orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         if (snapshot.ranges.len == 0) return;
         const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
@@ -5716,7 +5718,7 @@ pub const ApiHttpServer = struct {
         try publication.validateShape();
         if (publication.phase == .active or
             (publication.phase == .disabled and publication.disabled_acknowledged_owners.len == publication.required_owners.len)) return error.InvalidRowPolicyPublication;
-        var snapshot = (try self.source.cachedAdminSnapshot()) orelse return error.CatalogRoutingUnavailable;
+        var snapshot = (try self.controlAdminSnapshot()) orelse return error.CatalogRoutingUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table_name = for (snapshot.tables) |table| {
             if (table.table_id == publication.table_id) break table.name;
@@ -57580,9 +57582,10 @@ test "api http server serves status using control metadata without diagnostic tr
     var available = try server.loadClusterStatus(std.testing.allocator);
     defer available.deinit(std.testing.allocator);
     try std.testing.expectEqual(cluster.ArtifactSourcesCapabilityState.upgrade_pending, available.index_capabilities.artifact_sources_state);
+    try server.advanceRelationalActivationOnce();
     fake.deny = true;
     var denied = try server.loadClusterStatus(std.testing.allocator);
     defer denied.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), fake.control_reads);
+    try std.testing.expectEqual(@as(usize, 3), fake.control_reads);
     try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
 }
