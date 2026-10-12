@@ -1301,3 +1301,23 @@ Current macOS CPU/Metal pretrained reports and source hashes are in
 [preflight qualification](../../../tools/embeddinggemma2/testdata/preflight-admission/README.md).
 Cross-request stage overlap, current Linux pretrained execution, measured tuning
 and the other non-CUDA goal requirements remain active.
+
+
+### Preparation before the model gate (2026-10-11)
+
+Grouped inference starts a bounded producer for its first video after shared
+execution admission and before the model gate/backend lease. A two-slot queue
+hands owned CPU patches or Metal preparations to the model consumer. Later
+video parts stay sequential. Producer work never touches model weights or
+backend operations; cleanup closes, joins, drains and fences before returning
+resource capacity. Calls without a runtime retain the synchronous path.
+
+Cold Metal preparation borrows the process device through once initialization.
+The producer retains its preparer until queued imports are consumed/drained;
+CoreVideo imports independently retain the originating cache. Direct CPU and
+actual-Metal checks cover blocked queues, cancellation, allocation failure and
+imports that outlive their cache/preparer. Model execution still serializes;
+measured scheduling/performance tuning and the broader non-CUDA scope remain
+active. Current Metal and actual Linux ARM64 binaries preserve six original
+cases, eight WebM vectors and ten timestamp/window vectors with exact rankings.
+See the [source-bound execution receipt](../../../tools/embeddinggemma2/testdata/pipeline-overlap/README.md).

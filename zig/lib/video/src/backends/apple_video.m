@@ -133,7 +133,7 @@ const uint8_t *av_surface_plane(void *p, size_t plane, size_t *stride, size_t *w
     return CVPixelBufferGetBaseAddressOfPlane(p, plane);
 }
 typedef struct { CVMetalTextureCacheRef cache; } AVMetal;
-typedef struct { CVPixelBufferRef pixel; CVMetalTextureRef planes[2]; } AVImport;
+typedef struct { CVMetalTextureCacheRef cache; CVPixelBufferRef pixel; CVMetalTextureRef planes[2]; } AVImport;
 int32_t av_metal_create(void *device, void **out) {
     *out = NULL;
     if (!device) return paramErr;
@@ -156,6 +156,9 @@ int32_t av_metal_import(void *cache, void *pixel, void **out) {
         format != kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) return paramErr;
     const bool high = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
     AVImport *p = calloc(1, sizeof(*p)); if (!p) return memFullErr;
+    // CoreVideo texture wrappers may call back into their originating cache on
+    // release. Preserve it when imports outlive their creating cache/preparer.
+    p->cache = (CVMetalTextureCacheRef)CFRetain(((AVMetal *)cache)->cache);
     p->pixel = CVPixelBufferRetain(pixel);
     for (size_t i = 0; i < 2; ++i) {
         CVReturn status = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
@@ -174,5 +177,6 @@ void av_metal_import_release(void *handle) {
     AVImport *p = handle;
     for (size_t i = 0; i < 2; ++i) if (p->planes[i]) CFRelease(p->planes[i]);
     if (p->pixel) CVPixelBufferRelease(p->pixel);
+    if (p->cache) CFRelease(p->cache);
     free(p);
 }

@@ -118,12 +118,30 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     // a maximum, while projected tokens stay in the model workspace.
     var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = if (session.backend() == .metal) device_bytes else 0, .commands = if (session.backend() == .metal) command_slots else 0 } };
     defer std.debug.assert(std.meta.eql(video_budget.snapshot(), media_admission.Resources{}));
+    var preparation_guard = if (has_video) try effective.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
+    defer preparation_guard.deinit();
+    var prefetched: ?*@import("embedding_gemma2_video.zig").Prefetch = null;
+    defer if (prefetched) |producer| producer.deinit();
+    if (has_video) {
+        const context = try factory.videoPreparationContext(session);
+        if (effective.io orelse context.io) |io| {
+            for (group.content) |part| switch (part) {
+                inline .video, .sampled_video => |payload| {
+                    const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
+                    const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.start(a, io, context.device, bytes, effective, sampling, &video_budget);
+                    break;
+                },
+                else => {},
+            };
+        }
+    }
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
-    const prepared = try prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget);
+    const prepared = try prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, &video_budget, prefetched);
     defer prepared.deinit(a);
     const count = prepared.ids.len;
     const mask = prepared.mask;
@@ -171,9 +189,9 @@ const PreparedGroup = struct {
 };
 
 fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control) !PreparedGroup {
-    return prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, null);
+    return prepareGroupWithBudget(a, cb, tokenizer, group, options, effective, null, null);
 }
-fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control, video_budget: ?*media_admission.Pool) !PreparedGroup {
+fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").ComputeBackend, tokenizer: Tokenizer, group: Group, options: Options, effective: Control, video_budget: ?*media_admission.Pool, prefetched: ?*@import("embedding_gemma2_video.zig").Prefetch) !PreparedGroup {
     const image_scope = @import("antfly_image").work_control.Scope.enter(effective.imageWorkControl());
     defer image_scope.deinit();
     const prefix = try encoder.taskPrefix(options.task_type);
@@ -199,6 +217,7 @@ fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.z
         media.deinit(a);
     }
     var media_tokens: usize = 0;
+    var used_prefetch = false;
     for (group.content, 0..) |part, index| {
         try effective.check();
         if (index > 0) try rendered.append(a, '\n');
@@ -207,7 +226,10 @@ fn prepareGroupWithBudget(a: std.mem.Allocator, cb: *const @import("../ops/ops.z
             inline .video, .sampled_video => |payload| {
                 const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                 const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                const encoded = try @import("embedding_gemma2_video.zig").encodeWithBudget(a, cb, bytes, effective, sampling, video_budget);
+                const encoded = if (!used_prefetch and prefetched != null) blk: {
+                    used_prefetch = true;
+                    break :blk try prefetched.?.encode(cb);
+                } else try @import("embedding_gemma2_video.zig").encodeWithBudget(a, cb, bytes, effective, sampling, video_budget);
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {

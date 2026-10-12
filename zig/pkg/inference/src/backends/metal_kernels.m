@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
 #include <stdint.h>
@@ -16466,7 +16467,8 @@ static id<MTLLibrary> termite_metal_make_library(id<MTLDevice> device, BOOL prec
 
 static id<MTLDevice> termite_metal_shared_device(void) {
     static id<MTLDevice> shared_device = nil;
-    if (shared_device == nil) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         shared_device = MTLCreateSystemDefaultDevice();
         if (shared_device == nil) {
             NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
@@ -16474,8 +16476,15 @@ static id<MTLDevice> termite_metal_shared_device(void) {
                 shared_device = devices[0];
             }
         }
-    }
+    });
     return shared_device;
+}
+
+// Borrow the process device without creating or leasing a model provider.
+// Video preparers retain it and own independent queues. Cold video requests
+// must be able to prepare before the first model backend has been constructed.
+void *termite_metal_video_preparation_device(void) {
+    return (__bridge void *)termite_metal_shared_device();
 }
 
 static id<MTLCommandBuffer> termite_metal_new_command_buffer(id<MTLCommandQueue> queue, const char *label_cstr) {

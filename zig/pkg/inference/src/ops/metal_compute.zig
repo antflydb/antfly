@@ -41158,3 +41158,42 @@ test "embeddinggemma2 Metal video buffer survives producer destruction and enter
         try std.testing.expectApproxEqAbs(expected[patch * 768 + 1], actual[patch * 2 + 1], 1e-6);
     }
 }
+
+test "embeddinggemma2 Metal video producer prepares while compute lease is held and drains on abandonment" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.MetalUnavailable;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const pipeline = @import("../pipelines/embedding_gemma2_video.zig");
+    const admission = @import("antfly_media").admission;
+    inline for (.{ "mjpeg.mov", "vp9.webm", "h264-frameonly.mp4", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        var pool = admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        const plan = try pipeline.inspectPlan(a, bytes, .{ .io = std.testing.io }, .reference, &pool, true);
+        pool.limits.device_bytes = try plan.deviceBytes();
+        pool.limits.commands = plan.commands;
+        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 512 * 1024 * 1024 };
+        const producer = try pipeline.Prefetch.start(bounded.allocator(), std.testing.io, try MetalCompute.videoDevice(&cb), bytes, .{}, .reference, &pool);
+        var live = true;
+        defer if (live) producer.deinit();
+        const deadline = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+        while (producer.published.load(.acquire) < 2) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 2), producer.published.load(.acquire));
+        // The existing backend still owns its provider lease. Preparation has
+        // completed independently and abandonment fences/drains all owners.
+        producer.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), bounded.live);
+        try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+    }
+}

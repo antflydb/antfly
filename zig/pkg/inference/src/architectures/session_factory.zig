@@ -8189,6 +8189,18 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
     return if (self.arch_config == .embedding_gemma2) self.arch_config.embedding_gemma2 else null;
 }
 
+/// Preparation owns its own queue and never borrows mutable provider execution
+/// state. The loaded session handle must remain alive through producer cleanup;
+/// callers guard native driver work before querying/retaining this device.
+pub fn videoPreparationContext(session: Session) !struct { io: ?std.Io, device: ?*anyopaque } {
+    if (session.vtable != &arch_vtable) return error.NotArchSession;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal) return .{ .io = self.io, .device = null };
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.MetalRuntimeUnavailable;
+    return .{ .io = self.io, .device = device };
+}
+
 /// Incremental native Whisper decoder bound to one session for the duration
 /// of one transcription. Holds the compute backend (and on shared GPU
 /// backends its execution lease) and the session's execution gate, so it

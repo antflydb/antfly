@@ -11,3 +11,10 @@ at timescale 16384. `tools/embeddinggemma2/video_policy_qualification.py` create
 it from the pinned pretrained fixture; its Python contract test verifies this
 embedded copy byte-for-byte. The native model test verifies every compressed
 packet matches the CFR source. It is a synthetic Apache-2.0 derivative.
+
+`h264-frameonly.mp4` copies the Apache-2.0 generated pretrained video fixture
+`tools/embeddinggemma2/testdata/video/video-h264.mp4` (SHA-256
+`35c72f117cbf9f56064f69ca4b82217acb51b8b7c34953829917d11e4f359676`).
+Its pinned processor/decode provenance is recorded by that directory's
+`video-oracle.json`. It exercises independent VideoToolbox/Metal production
+before model execution and queue abandonment with actual CoreVideo imports.

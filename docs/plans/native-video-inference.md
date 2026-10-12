@@ -622,8 +622,9 @@ current receipts are in `zig/lib/video/testdata/webm-validation`. Full completio
 - Broader WebM display/Colour qualification and decoded/projected frame reuse
   across model window groups. Logical AVC indexing and explicit model timestamp
   windows are implemented; their current qualification is recorded below.
-- Cross-request scheduling and coordinated preprocessing/model resource budgets;
-  final Metal pooling/normalization is implemented and qualified below.
+- Measured cross-request scheduling/reservation tuning and cross-group frame
+  reuse. Coordinated preprocessing/model budgets and bounded preparation before
+  the model gate are implemented below, as is final Metal normalization.
 - Broader live/HLS coverage. DASH inherited templates/BaseURL, representation
   selection, automatic multi-period playback and stable live period cursors
   are implemented and qualified in the continuations below.
@@ -795,3 +796,40 @@ and admission/decode retries; eight WebM vectors preserve all reference
 rankings/top-k and concurrent/sustained/disconnect retry checks. Evidence is
 in `tools/embeddinggemma2/testdata/preflight-admission/qualification.json`. Cross-request stage overlap and the broader
 non-CUDA qualification/performance/streaming work remain active.
+
+
+### Preparation ahead of model execution (2026-10-11)
+
+The first video part in a grouped request now starts a request-owned producer
+before acquiring the model gate or Metal provider execution lease. Shared
+execution admission and geometry-derived budgets precede producer startup.
+The producer owns decode/preparation and a two-slot queue; only the consumer
+projects frames and operates the model backend. CPU uses owned patch jobs;
+Metal uses prepared buffers and device imports. Later video parts execute
+sequentially, preserving the maximum-transient-budget contract. Library calls
+without a runtime keep their existing synchronous path.
+
+Process protection spans producer startup through joined/fenced cleanup. Queue
+closure wakes a blocked producer; abandonment, allocation failure and cancelled
+consumer entry reclaim metadata, patches and GPU reservations. A completed
+producer retains its preparer until queued imports have been consumed or drained.
+CoreVideo imports also retain their originating cache independently of its
+wrapper. Cold Metal preparation obtains the same process device through atomic
+once initialization without creating or leasing a model provider.
+
+The focused model gate passes 24 tests, including preparation before model access,
+preparation while a compute provider lease is held, full-queue abandonment,
+allocation-failure cleanup and cancelled consumer entry. A separate actual-Metal
+regression verifies imports/preparations survive their creating cache/preparer.
+The full macOS video gate passes 157 tests with two platform skips. Current
+production Metal and actually executed Linux ARM64 native binaries each pass
+six original cases/retries, eight WebM vectors and ten timestamp/window vectors.
+All reference rankings/top-k match; concurrent sustained and disconnect/retry
+checks pass. Source/binary/report hashes are recorded in
+`tools/embeddinggemma2/testdata/pipeline-overlap/qualification.json`. These are
+correctness/lifetime checks under shared-host load, not speedup measurements.
+
+Measured overlap tuning, cross-group frame reuse, broader codec/display/live
+qualification and the other non-CUDA requirements remain active. Backbone
+execution still serializes by model; this continuation overlaps preparation
+with another request's execution rather than concurrently mutating model state.

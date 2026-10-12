@@ -18455,6 +18455,7 @@ pub extern fn termite_metal_decode_runtime_reserve_graph_plan_slot(
     bytes: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_commit_graph_plan(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_video_preparation_device() ?*anyopaque;
 pub extern fn termite_metal_decode_runtime_device(runtime: ?*RawMetalDecodeRuntime) ?*anyopaque;
 pub extern fn termite_metal_buffer_retain_external(runtime: ?*RawMetalDecodeRuntime, handle: *anyopaque, length: usize) ?*anyopaque;
 pub extern fn termite_metal_buffer_alloc(runtime: ?*RawMetalDecodeRuntime, length: usize, storage_mode: c_int) ?*anyopaque;

@@ -385,3 +385,36 @@ const NoResize = struct {
         self.backing.rawFree(bytes, alignment, ra);
     }
 };
+
+test "video Metal imports and preparations outlive their creating cache and preparer" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.SkipZigTest;
+    defer av_test_device_destroy(device);
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var frames = try video.apple.decodeSelected(a, &reader, &.{0}, .{ .require_hardware = false });
+    defer frames.deinit();
+    var cache = try video.apple.MetalCache.init(device);
+    var imported = blk: {
+        defer cache.deinit();
+        break :blk try cache.import(&frames.frames[0].surface);
+    };
+    defer imported.deinit();
+    _ = try imported.texture(0);
+    _ = try imported.texture(1);
+    const options = video.preparation.Options{ .width = 48, .height = 48, .matrix = .bt709 };
+    const expected = try video.preparation.reference(a, &frames.frames[0].surface, options, .{});
+    defer a.free(expected);
+    var preparer = try video.preparation.Metal.init(device);
+    var prepared = blk: {
+        defer preparer.deinit();
+        break :blk try preparer.submit(a, &frames.frames[0].surface, options, .{});
+    };
+    defer prepared.deinit();
+    try prepared.wait(std.testing.io, .{});
+    const actual = try prepared.readback(a);
+    defer a.free(actual);
+    for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2.01 / 255.0);
+    try prepared.releaseSource();
+}
