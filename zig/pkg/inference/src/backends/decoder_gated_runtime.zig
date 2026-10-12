@@ -6184,6 +6184,23 @@ pub fn pipelinedCancelPending(cb: *const ops.ComputeBackend) void {
     _ = decoderRuntimePipelinedControl(cb, .cancel_pending) catch {};
 }
 
+/// Canonical backend-owned singleton, without the unused normalized-hidden
+/// snapshot. Declines rather than changing to the generic decoder route.
+pub fn forwardGreedyTokenPreparedOnly(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?i64 {
+    if (!supportsPreparedDecodeConfig(gpt_config) or decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode) return null;
+    var result = (try tryBackendOwnedGreedyTokenResult(cb, allocator, gpt_config, configured_layer_count, token_id, seq_len, decode_context, false)) orelse return null;
+    defer result.deinit(cb);
+    return result.token_id;
+}
+
 pub fn forwardGreedyTokenAndFinalHidden(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,

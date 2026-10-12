@@ -935,7 +935,10 @@ typedef struct termite_metal_planned_encoder_range {
     termite_metal_planned_range_type type;
 } termite_metal_planned_encoder_range;
 
+#include "metal_mtp_head.h"
+
 typedef struct termite_metal_decode_runtime {
+    TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
     // the request drains; reused buffers are already covered by retained leases.
@@ -28810,6 +28813,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_span_key_row_bytes = 0;
     runtime->attention_span_v_row_stride = 0;
     runtime->attention_span_position_offset = 0;
+    runtime->mtp_head_workspace = nil;
     free(runtime);
     }
 }
@@ -67211,3 +67215,5 @@ int termite_metal_decode_runtime_seed_paged_suffix_on_frame(
     const int end_rc = termite_metal_decode_runtime_end_planned_compute_scope(runtime);
     return rc != 0 ? rc : end_rc;
 }
+
+#include "metal_mtp_head_impl.h"

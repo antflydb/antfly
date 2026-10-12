@@ -48455,3 +48455,27 @@ test "metal native Q4 short rows match F64 with offset inputs and output tails" 
         }
     }
 }
+
+pub extern fn termite_metal_decode_runtime_mtp_cluster_head(
+    runtime: ?*anyopaque,
+    lm_slot: usize,
+    centroid_slot: usize,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    ordering_handle: ?*anyopaque,
+    ordering_offset: usize,
+    hidden: usize,
+    vocab: usize,
+    clusters: usize,
+    topk: usize,
+    token: *u32,
+) c_int;
+
+extern fn termite_metal_decode_runtime_mtp_cluster_head_test(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+test "Metal Gemma4 clustered head selects F32 BF16 F16 Q8 candidates with offsets and changing inputs" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_mtp_cluster_head_test(runtime));
+}

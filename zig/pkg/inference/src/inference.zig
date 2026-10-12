@@ -120,6 +120,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = server;
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
     _ = @import("hard_cancellation_watchdog.zig");

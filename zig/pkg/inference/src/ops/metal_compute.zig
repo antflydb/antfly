@@ -710,6 +710,21 @@ fn decoderRuntimeLayerRopeTheta(layer: *const ops.DecoderRuntimeLayerSpec) f32 {
     return layer.rope_theta;
 }
 
+const Gemma4DecodeScratchEnvelope = struct { kv_heads: usize, head_dim: usize, intermediate_size: usize };
+
+fn gemma4DecodeScratchEnvelope(layers: []const ops.DecoderRuntimeLayerSpec, ple_size: usize) ?Gemma4DecodeScratchEnvelope {
+    if (layers.len == 0) return null;
+    var result = Gemma4DecodeScratchEnvelope{ .kv_heads = layers[0].kv_heads, .head_dim = 0, .intermediate_size = ple_size };
+    for (layers) |layer| {
+        // Uniform KV-head geometry makes these maxima exactly the same
+        // capacity envelope as reserving every layer individually.
+        if (layer.kv_heads == 0 or layer.kv_heads != result.kv_heads or layer.head_dim == 0 or layer.intermediate_size == 0) return null;
+        result.head_dim = @max(result.head_dim, layer.head_dim);
+        result.intermediate_size = @max(result.intermediate_size, layer.intermediate_size);
+    }
+    return result;
+}
+
 pub const MetalCompute = if (build_options.enable_metal) struct {
     const mlx_quant = struct {
         pub const Provider = void;
@@ -1133,6 +1148,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     layer_output_scale_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     unit_rms_weight_device_cache: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
     adjusted_norm_weight_device_cache: std.AutoHashMapUnmanaged(AdjustedNormWeightKey, MetalTensor) = .empty,
+    mtp_ordering_device_cache: ?MetalTensor = null,
+    mtp_ordering_weight_name: ?[]u8 = null,
     attention_mask_device_cache: ?MetalTensor = null,
     attention_mask_values_cache: []i64 = &.{},
     attention_mask_batch: usize = 0,
@@ -4500,6 +4517,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.clearPendingPrefillKvDeviceSeeds();
         self.resetBackendKvCache();
         self.cyclic_page_table_cache.deinit(self.allocator);
+        if (self.mtp_ordering_device_cache) |*tensor| tensor.deinit();
+        if (self.mtp_ordering_weight_name) |name| self.allocator.free(name);
         if (self.attention_mask_device_cache) |*tensor| tensor.deinit();
         if (self.attention_mask_values_cache.len != 0) self.allocator.free(self.attention_mask_values_cache);
         if (self.deberta_relative_index_device_cache) |*tensor| tensor.deinit();
@@ -27779,7 +27798,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return false;
         }
         const active_decode_frame_enabled = active_decode_frame_requested;
-        if (active_decode_frame_enabled) {
+        const scratch_envelope = if (getenvBool("TERMITE_METAL_ENABLE_GEMMA4_DECODE_SCRATCH_ENVELOPE") and
+            request.contract == .gemma4_gated_ple_shared_kv and request.items.len == 1)
+            gemma4DecodeScratchEnvelope(request.layers, request.ple_hidden_size)
+        else
+            null;
+        if (active_decode_frame_enabled and scratch_envelope != null) {
+            const envelope = scratch_envelope.?;
+            if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(self.provider_impl, 1, request.num_attention_heads, envelope.kv_heads, envelope.head_dim, request.hidden_size, envelope.intermediate_size, 0)) {
+                self.timing_stats.active_decode_frame_scratch_failures += 1;
+                return false;
+            }
+        } else if (active_decode_frame_enabled) {
             for (request.layers) |layer| {
                 if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return false;
                 if (!metal_runtime.decoderRuntimeReservePrefillLayerScratch(
@@ -30602,6 +30632,81 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             null;
     }
 
+    fn ensureMtpHeadLinearSlot(self: *MetalCompute, weight: CT, bias: CT, in_dim: usize, out_dim: usize) !?usize {
+        const buf = toBuf(weight);
+        if (buf.quantized_storage == null and buf.runtime_quantized_storage == null)
+            return self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim);
+        if (buf.mutable_state) return null;
+        const key = quantizedStorageLinearSlotKey(weight, in_dim, out_dim);
+        if (self.dynamic_linear_slots.get(key)) |slot| return slot;
+        const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        if (!(try decoderRuntimePrepareLinearOp(self, &.{ .slot = slot, .weight = weight, .bias = bias, .in_dim = in_dim, .out_dim = out_dim, .retain_dense_fallback = false }))) return null;
+        try self.dynamic_linear_slots.put(self.allocator, key, slot);
+        return slot;
+    }
+
+    fn mtpOrderingDeviceTensor(self: *MetalCompute, ordering: CT, vocab: usize) !MetalTensor {
+        const buf = toBuf(ordering);
+        if (buf.mutable_state) return error.UnsupportedTensorType;
+        const name = buf.weight_handle_name orelse return self.ownedDeviceMetalTensorFromCt(ordering);
+        if (self.mtp_ordering_weight_name) |cached_name| {
+            if (std.mem.eql(u8, cached_name, name)) {
+                if (self.mtp_ordering_device_cache) |*cached| {
+                    if (cached.elemCount() == vocab) return cached.retainedCopy();
+                }
+            }
+        }
+        var uploaded = try self.ownedDeviceMetalTensorFromCt(ordering);
+        errdefer uploaded.deinit();
+        if (uploaded.elemCount() != vocab or uploaded.dtype != .f32 or !uploaded.isDevice()) return error.InvalidTensorShape;
+        const copied_name = try self.allocator.dupe(u8, name);
+        if (self.mtp_ordering_device_cache) |*cached| cached.deinit();
+        if (self.mtp_ordering_weight_name) |old| self.allocator.free(old);
+        self.mtp_ordering_device_cache = uploaded;
+        self.mtp_ordering_weight_name = copied_name;
+        return self.mtp_ordering_device_cache.?.retainedCopy();
+    }
+
+    fn gemma4MtpMaskedSelectFromHiddenOp(ctx: *anyopaque, request: *const ops.Gemma4MtpMaskedSelectFromHiddenRequest) anyerror!?u32 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_CLUSTER_HEAD") or
+            request.use_inverse_ordering or request.hidden_size == 0 or request.vocab_size == 0 or
+            request.num_centroids == 0 or request.top_k == 0 or request.top_k > request.num_centroids or
+            request.vocab_size % request.num_centroids != 0) return null;
+        if (!self.provider_impl.hasDecoderRuntime()) return null;
+        const lm_bias = try self.cachedZeroBiasBuf(request.vocab_size);
+        defer freeOp(ctx, lm_bias);
+        const centroid_bias = try self.cachedZeroBiasBuf(request.num_centroids);
+        defer freeOp(ctx, centroid_bias);
+        const lm_slot = (try self.ensureMtpHeadLinearSlot(request.lm_head_weight, lm_bias, request.hidden_size, request.vocab_size)) orelse return null;
+        const centroid_slot = (try self.ensureMtpHeadLinearSlot(request.centroid_weight, centroid_bias, request.hidden_size, request.num_centroids)) orelse return null;
+        var input = try self.ownedDeviceMetalTensorFromCt(request.assistant_hidden);
+        defer input.deinit();
+        var ordering = try self.mtpOrderingDeviceTensor(request.token_ordering, request.vocab_size);
+        defer ordering.deinit();
+        if (input.dtype != .f32 or ordering.dtype != .f32 or !input.isDevice() or !ordering.isDevice()) return null;
+        if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
+            if (metal_runtime.termite_metal_decode_runtime_flush_active_frame(self.provider_impl.raw_decode_runtime) != 0) return error.MetalFrameSyncFailed;
+        }
+        var token: u32 = 0;
+        const rc = metal_runtime.termite_metal_decode_runtime_mtp_cluster_head(
+            self.provider_impl.raw_decode_runtime,
+            lm_slot,
+            centroid_slot,
+            input.deviceHandle(),
+            input.deviceByteOffset(),
+            ordering.deviceHandle(),
+            ordering.deviceByteOffset(),
+            request.hidden_size,
+            request.vocab_size,
+            request.num_centroids,
+            request.top_k,
+            &token,
+        );
+        if (rc != 0) return null;
+        return token;
+    }
+
     fn linearNoBiasArgmaxLastRowOp(
         ctx: *anyopaque,
         input: CT,
@@ -31795,6 +31900,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;
         vt.argmaxLastRow = argmaxLastRowOp;
+        vt.gemma4MtpMaskedSelectFromHidden = gemma4MtpMaskedSelectFromHiddenOp;
         vt.linearNoBiasArgmaxLastRow = linearNoBiasArgmaxLastRowOp;
         vt.argmaxRows = argmaxRowsOp;
         vt.argmaxRowsSuppress = argmaxRowsSuppressOp;
@@ -41555,4 +41661,24 @@ test "metal GLiNER centered residual norm preserves sum and low variance" {
         defer a.free(actual_sum);
         for (actual_sum, values, residual) |got, left, right| try std.testing.expectEqual(left + right, got);
     }
+}
+
+test "Gemma4 decode scratch envelope preserves capacity maxima and rejects mixed KV heads" {
+    var layers = [_]ops.DecoderRuntimeLayerSpec{ std.mem.zeroes(ops.DecoderRuntimeLayerSpec), std.mem.zeroes(ops.DecoderRuntimeLayerSpec) };
+    layers[0].kv_heads = 2;
+    layers[0].head_dim = 256;
+    layers[0].intermediate_size = 6144;
+    layers[1].kv_heads = 2;
+    layers[1].head_dim = 512;
+    layers[1].intermediate_size = 4096;
+    const envelope = gemma4DecodeScratchEnvelope(&layers, 8960).?;
+    try std.testing.expectEqual(@as(usize, 2), envelope.kv_heads);
+    try std.testing.expectEqual(@as(usize, 512), envelope.head_dim);
+    try std.testing.expectEqual(@as(usize, 8960), envelope.intermediate_size);
+    layers[1].kv_heads = 1;
+    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&layers, 8960));
+    layers[1].kv_heads = 2;
+    layers[1].head_dim = 0;
+    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&layers, 8960));
+    try std.testing.expectEqual(@as(?Gemma4DecodeScratchEnvelope, null), gemma4DecodeScratchEnvelope(&.{}, 8960));
 }

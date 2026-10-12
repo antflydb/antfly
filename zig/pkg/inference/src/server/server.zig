@@ -1367,8 +1367,20 @@ pub const GenerationBatchingConfig = struct {
         return policy;
     }
 
+    fn gemma4MetalOcrContinuousPolicyForRows(self: @This(), requested_rows: usize, requested_window: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.gemma4MetalOcrPolicyForRows(requested_rows);
+        // Admit a bounded resident window larger than a single GPU cohort.
+        // Finished tasks retire their leases immediately, so pending decoders
+        // fill the next step without waiting for the longest page in a wave.
+        policy.max_active_requests_for_batching = @min(@max(requested_window, policy.max_step_items), 16);
+        return policy;
+    }
+
     fn gemma4MetalOcrPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
-        return self.gemma4MetalOcrPolicyForRows(platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2);
+        const rows = platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2;
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false))
+            return self.gemma4MetalOcrContinuousPolicyForRows(rows, platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_WINDOW") orelse 8);
+        return self.gemma4MetalOcrPolicyForRows(rows);
     }
 };
 
@@ -14776,7 +14788,11 @@ pub const Node = struct {
             var admitted_group_len = generateBatchWindowPrefixLen(
                 media_shapes,
                 group_indices.items,
-                provisional_contract.batch.max_items,
+                if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false) and
+                    (selection.native_choice == .metal or selection.native_choice == .auto) and prepared_model.manifest.gguf_projector_path != null)
+                    @min(provisional_contract.batch.max_items, self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?)
+                else
+                    provisional_contract.batch.max_items,
                 provisional_contract.batch.max_encoded_media_bytes,
             );
             var group_encoded_bytes: usize = 0;
@@ -36417,4 +36433,53 @@ test "generation batch corrupt images are permanent while allocation failures re
     try std.testing.expect(!bad_image.retryable);
     const allocation = batchGenerationError(error.OutOfMemory);
     try std.testing.expect(allocation.retryable);
+}
+
+test "Metal OCR continuous window keeps GPU cohorts bounded" {
+    const config = GenerationBatchingConfig{};
+    const policy = config.gemma4MetalOcrContinuousPolicyForRows(4, 8);
+    try std.testing.expectEqual(@as(usize, 4), policy.max_step_items);
+    try std.testing.expectEqual(@as(usize, 8), policy.max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 16), config.gemma4MetalOcrContinuousPolicyForRows(4, 999).max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrContinuousPolicyForRows(4, 0).max_active_requests_for_batching.?);
+}
+
+test "Metal OCR continuous coordinator refills four row cohorts from eight unequal pages" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy((GenerationBatchingConfig{}).gemma4MetalOcrContinuousPolicyForRows(4, 8));
+    var leases: [9]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| if (lease.request_id != 0) {
+        coordinator.release(lease);
+    };
+    var work: [9]u8 = undefined;
+    for (leases[0..8], 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row * 17);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row * 17, 11 + row * 17, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+    coordinator.release(leases[0]);
+    leases[0].request_id = 0;
+    leases[8] = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    initialized += 1;
+    coordinator.beginDecode(&leases[8], 1000);
+    try coordinator.enqueueDecodeWork(leases[8], @ptrCast(&work[8]), 1001, 1001, 0, .{});
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[4], @ptrCast(&work[4]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    for (claimed.items) |item| try std.testing.expect(item.work_ptr != @as(*anyopaque, @ptrCast(&work[0])));
+    coordinator.completeStep(&leases[4], claimed.items);
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[8], @ptrCast(&work[8]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+    coordinator.completeStep(&leases[8], claimed.items);
 }

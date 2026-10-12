@@ -10366,6 +10366,18 @@ pub const NativeGenerationPipeline = struct {
         _ = try decode_runtime.appendGeneratedToken();
         errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
         const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_RECOVERY_CHOICE_ONLY", false) and
+            gemma4MtpActiveMaterializeEnabled() and hidden_source == .final and self.cb.kind() == .metal and
+            (gemma4MtpActiveMaterializeSupported(self.cb.kind(), self.gpt_config, total_seq_len) or getenvBool("ANTFLY_GEMMA4_MTP_LONG_CONTEXT_FRAME")))
+        {
+            if (try decoder_gated_runtime.forwardGreedyTokenPreparedOnly(&self.cb, self.allocator, self.gpt_config, self.gpt_config.num_hidden_layers, token_ids[total_seq_len - 1], total_seq_len, &decode_context)) |choice| {
+                if (choice < 0 or choice >= self.gpt_config.vocab_size) return error.InvalidModelOutput;
+                const token: u32 = @intCast(choice);
+                if (isSuppressedToken(token, self.gpt_config.suppressTokenIds())) return error.InvalidModelOutput;
+                return token;
+            }
+        }
+
         if (try self.materializeAcceptedTokenKvActiveHiddenForMtp(
             token_ids,
             total_seq_len,
