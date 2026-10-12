@@ -13083,6 +13083,62 @@ test "standalone native index owner catalog calls preserve authority and capabil
     try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
 }
 
+test "standalone native index owner catalog calls commit enrolled receipts and resolve lost replies" {
+    try @import("../metadata/storage/raft_apply_store.zig").OwnerAckTestFixture.run(struct {
+        pub fn apply(store: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack, _: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
+            const a = std.testing.allocator;
+            const publication = @import("../metadata/relational_index_publication.zig");
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+            defer a.free(root);
+            const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+            defer a.free(path);
+            var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+            defer runtime.deinit();
+            var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+            defer metadata.deinit();
+            // Borrow the fixture's fully enrolled durable authority. The
+            // adapter owns no enrollment flag and never fabricates placement.
+            const original_store = metadata.lifecycle_store;
+            metadata.lifecycle_store = store;
+            defer metadata.lifecycle_store = original_store;
+            const revision = try store.standaloneRevision();
+            metadata.durable_revision = revision;
+            metadata.epoch = revision;
+            const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
+            {
+                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack_status = ack });
+                defer a.free(reply);
+                var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
+                defer parsed.deinit();
+                try std.testing.expect(!try parsed.value.isAcknowledged(ack));
+            }
+            {
+                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack = ack });
+                defer a.free(reply);
+                var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
+                defer parsed.deinit();
+                try std.testing.expect(try parsed.value.isAcknowledged(ack));
+            }
+            try std.testing.expectEqual(revision + 1, metadata.durable_revision);
+            try std.testing.expectEqual(revision + 1, metadata.epoch);
+            try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
+            // Resolve a lost reply with the ORIGINAL expected revision. An
+            // attempted write replay must not advance the durable catalog.
+            try std.testing.expectError(error.GenerationPublicationChanged, LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack = ack }));
+            {
+                const reply = try LocalStandaloneMetadata.systemCatalog(&metadata, a, context, .{ .relational_index_owner_ack_status = ack });
+                defer a.free(reply);
+                var parsed = try std.json.parseFromSlice(publication.AckStatus, a, reply, .{});
+                defer parsed.deinit();
+                try std.testing.expect(try parsed.value.isAcknowledged(ack));
+            }
+            try std.testing.expectEqual(revision + 1, try store.standaloneRevision());
+        }
+    });
+}
+
 test "standalone shared mutation refreshes a committed catalog before retry" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

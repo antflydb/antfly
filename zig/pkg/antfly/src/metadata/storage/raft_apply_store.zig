@@ -4206,243 +4206,256 @@ test "relational index publication range enumeration stops before excess allocat
 }
 
 test "relational index publication authenticated owner ACKs persist both positions and reject stale authority without namespace churn" {
-    const a = std.testing.allocator;
-    const group = group_ids.main_metadata_group_id;
-    const incarnation = "11111111111111111111111111111111".*;
-    const seed: [32]u8 = @splat(9);
-    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
-    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
-    const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key };
-    inline for (.{ index_progress.Authority.raft, index_progress.Authority.native }) |authority| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-ack", .{tmp.sub_path});
-        defer a.free(path);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        var plan = try index_publication.testing.plan(arena.allocator());
-        var owners = [_]index_publication.Owner{plan.owners[0]};
-        owners[0].receipt_authority = authority;
-        plan.owners = &owners;
-        var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
-        var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 6 }};
-        runtimes[0].source_authority = .{
-            .kind = if (authority == .native) .native else .raft,
-            .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = plan.before.table_id, .shard_id = 301, .range_id = 301 }),
-            .sequence = if (authority == .native) 10 else 0,
-        };
-        const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
-        const placement: raft_reconciler.PlacementIntent = .{ .record = .{ .group_id = owners[0].range.group_id, .replica_id = 5, .local_node_id = 2 }, .store_id = 3, .peer_node_ids = &.{2} };
-        var ack: index_publication.Ack = undefined;
-        {
-            var store = try RaftApplyStore.init(a, .{ .root_dir = path });
-            defer store.deinit();
-            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
-            try store.applyStandaloneCommand(group, .{ .upsert_table = plan.before });
-            try store.applyStandaloneCommand(group, .{ .upsert_range = owners[0].range });
-            try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
-            try store.applyStandaloneCommand(group, .{ .register_store = current });
-            try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
-            const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_admission_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
-            defer a.free(activation);
-            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
-            try adoptRelationWriterForTest(&store, a, group);
-            _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
-            {
-                var read = try store.store.beginReadTxn();
-                defer read.abort();
-                var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
-                plan.table_guard = .{ .target = .{ .name = plan.before.name }, .logical_table = plan.before.name, .owner = (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?, .incarnation = live.root.epoch.incarnation };
-            }
-            const begin = try std.json.Stringify.valueAlloc(a, index_publication.Begin{ .plan = plan }, .{});
-            defer a.free(begin);
-            try store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = begin });
-            var prepared = try plan.prepare(a);
-            defer prepared.deinit();
-            const owner_request: index_publication.OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = owners[0].range.group_id, .id = plan.id, .operation = .fence, .projection = .admission };
-            {
-                const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
-                defer a.free(reply);
-                var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
-                defer decision.deinit();
-                try std.testing.expectEqual(.execute, decision.value.disposition);
-                try std.testing.expect(decision.value.dispatch != null and decision.value.inputs != null);
-                var candidate = try decision.value.inputs.?.prepareCandidate(a, decision.value.head);
-                defer candidate.deinit();
-                try std.testing.expectEqualSlices(u8, prepared.candidate.next.value, candidate.next.value);
-                var invalid = owner_request;
-                invalid.id[0] ^= 1;
-                try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexOwnerDecisionJson(a, group, invalid));
-                invalid = owner_request;
-                invalid.projection = .permission;
-                invalid.operation = .reserve;
-                try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexOwnerDecisionJson(a, group, invalid));
-            }
-            const receipt: index_progress.Receipt = .{
-                .owner = prepared.owners[0].owner,
-                .action = .fenced,
-                .position = if (authority == .native) .{ .native = .{ .namespace = owners[0].namespace, .sequence = 5 } } else .{ .raft = .{ .term = 2, .index = 5 } },
-                .candidate_digest = prepared.head.candidate_digest,
-                .reservation_digest = prepared.head.reservation_digest,
-                .evidence_digest = @splat(8),
+    try OwnerAckTestFixture.run(struct {
+        pub fn apply(store: *RaftApplyStore, _: index_publication.Ack, command: TransitionCommand) !void {
+            try store.applyStandaloneCommand(group_ids.main_metadata_group_id, command);
+        }
+    });
+}
+
+/// Shared real-store authority fixture. Server adapters supply only the ACK
+/// dispatch; enrollment, observed cuts, fault rejection and reopen verification
+/// remain identical to the storage contract. No production authority bypass.
+pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
+    pub fn run(comptime Driver: type) !void {
+        const a = std.testing.allocator;
+        const group = group_ids.main_metadata_group_id;
+        const incarnation = "11111111111111111111111111111111".*;
+        const seed: [32]u8 = @splat(9);
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+        const identity: store_root_enrollment.Identity = .{ .metadata_incarnation = incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key };
+        inline for (.{ index_progress.Authority.raft, index_progress.Authority.native }) |authority| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/index-ack", .{tmp.sub_path});
+            defer a.free(path);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var plan = try index_publication.testing.plan(arena.allocator());
+            var owners = [_]index_publication.Owner{plan.owners[0]};
+            owners[0].receipt_authority = authority;
+            plan.owners = &owners;
+            var groups = [_]metadata.GroupStatusReport{.{ .group_id = owners[0].range.group_id, .raft_applied_index = 10, .raft_term = 2 }};
+            var runtimes = [_]metadata.RuntimeGroupStatusReport{.{ .group_id = owners[0].range.group_id, .table_id = plan.before.table_id, .store_id = 3, .node_id = 2, .lsm_root_generation = 6 }};
+            runtimes[0].source_authority = .{
+                .kind = if (authority == .native) .native else .raft,
+                .namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(.{ .table_id = plan.before.table_id, .shard_id = 301, .range_id = 301 }),
+                .sequence = if (authority == .native) 10 else 0,
             };
-            ack = .{ .table_id = plan.before.table_id, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (index_publication.RootProof{ .identity = identity, .reporter_incarnation = 4, .replica_id = 5, .root_generation = 6, .signature = undefined }).sign(root, try receipt.digest()) } };
-            const bytes = try std.json.Stringify.valueAlloc(a, ack, .{});
-            defer a.free(bytes);
-            try std.testing.expect(bytes.len <= index_publication.max_ack_bytes);
-            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, bytes));
-            const enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{});
-            defer a.free(enrollment);
-            try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
-            try store.validateRelationalIndexOwnerAck(group, bytes);
+            const current: metadata.StoreRecord = .{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = root.public_key, .live = true, .role = "data", .group_statuses = &groups, .runtime_statuses = &runtimes };
+            const placement: raft_reconciler.PlacementIntent = .{ .record = .{ .group_id = owners[0].range.group_id, .replica_id = 5, .local_node_id = 2 }, .store_id = 3, .peer_node_ids = &.{2} };
+            var ack: index_publication.Ack = undefined;
             {
-                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
-                defer a.free(reply);
-                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
-                defer status.deinit();
-                try std.testing.expect(!try status.value.isAcknowledged(ack));
+                var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+                defer store.deinit();
+                try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+                try store.applyStandaloneCommand(group, .{ .upsert_table = plan.before });
+                try store.applyStandaloneCommand(group, .{ .upsert_range = owners[0].range });
+                try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 2, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+                try store.applyStandaloneCommand(group, .{ .register_store = current });
+                try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{ .expected_metadata_version = null, .expected_version_fence = 0, .expected_target_drain_requested = false, .replacement = placement } });
+                const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_publication_admission_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+                defer a.free(activation);
+                try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+                try adoptRelationWriterForTest(&store, a, group);
+                _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+                {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+                    plan.table_guard = .{ .target = .{ .name = plan.before.name }, .logical_table = plan.before.name, .owner = (try live.getClaim(.{ .namespace_id = plan.namespace_id, .name = plan.before.name })).?, .incarnation = live.root.epoch.incarnation };
+                }
+                const begin = try std.json.Stringify.valueAlloc(a, index_publication.Begin{ .plan = plan }, .{});
+                defer a.free(begin);
+                try store.applyStandaloneCommand(group, .{ .begin_relational_index_publication = begin });
+                var prepared = try plan.prepare(a);
+                defer prepared.deinit();
+                const owner_request: index_publication.OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = owners[0].range.group_id, .id = plan.id, .operation = .fence, .projection = .admission };
+                {
+                    const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
+                    defer a.free(reply);
+                    var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
+                    defer decision.deinit();
+                    try std.testing.expectEqual(.execute, decision.value.disposition);
+                    try std.testing.expect(decision.value.dispatch != null and decision.value.inputs != null);
+                    var candidate = try decision.value.inputs.?.prepareCandidate(a, decision.value.head);
+                    defer candidate.deinit();
+                    try std.testing.expectEqualSlices(u8, prepared.candidate.next.value, candidate.next.value);
+                    var invalid = owner_request;
+                    invalid.id[0] ^= 1;
+                    try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexOwnerDecisionJson(a, group, invalid));
+                    invalid = owner_request;
+                    invalid.projection = .permission;
+                    invalid.operation = .reserve;
+                    try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexOwnerDecisionJson(a, group, invalid));
+                }
+                const receipt: index_progress.Receipt = .{
+                    .owner = prepared.owners[0].owner,
+                    .action = .fenced,
+                    .position = if (authority == .native) .{ .native = .{ .namespace = owners[0].namespace, .sequence = 5 } } else .{ .raft = .{ .term = 2, .index = 5 } },
+                    .candidate_digest = prepared.head.candidate_digest,
+                    .reservation_digest = prepared.head.reservation_digest,
+                    .evidence_digest = @splat(8),
+                };
+                ack = .{ .table_id = plan.before.table_id, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (index_publication.RootProof{ .identity = identity, .reporter_incarnation = 4, .replica_id = 5, .root_generation = 6, .signature = undefined }).sign(root, try receipt.digest()) } };
+                const bytes = try std.json.Stringify.valueAlloc(a, ack, .{});
+                defer a.free(bytes);
+                try std.testing.expect(bytes.len <= index_publication.max_ack_bytes);
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+                const enrollment = try std.json.Stringify.valueAlloc(a, try store_root_enrollment.Request.sign(identity, seed), .{});
+                defer a.free(enrollment);
+                try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
+                try store.validateRelationalIndexOwnerAck(group, bytes);
+                {
+                    const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                    defer a.free(reply);
+                    var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                    defer status.deinit();
+                    try std.testing.expect(!try status.value.isAcknowledged(ack));
+                }
+                const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle };
+                inline for (std.meta.tags(Fault)) |fault| {
+                    // Each fault has its own aborted storage cut. No simulated
+                    // verification boolean can substitute for real durable reads.
+                    var txn = try store.store.beginWriteTxn();
+                    defer txn.abort();
+                    var buf: [192]u8 = undefined;
+                    var changed = current;
+                    var changed_runtime = runtimes;
+                    var changed_groups = groups;
+                    var changed_placement = placement;
+                    switch (fault) {
+                        .reporter => changed.reporter_incarnation += 1,
+                        .root_identity => changed.replica_root_incarnation += 1,
+                        .root_generation => changed_runtime[0].lsm_root_generation += 1,
+                        .placement_replica => changed_placement.record.replica_id += 1,
+                        .placement_store => changed_placement.store_id += 1,
+                        .placement_state => changed_placement.serving_state = .planned,
+                        .observed_position => changed_groups[0].raft_applied_index = 0,
+                        .source_mode => {
+                            changed_runtime[0].source_authority.?.kind = if (authority == .native) .raft else .native;
+                            changed_runtime[0].source_authority.?.sequence = 0;
+                        },
+                        .source_namespace => changed_runtime[0].source_authority.?.namespace[0] ^= 1,
+                        .source_cut => if (authority == .native) {
+                            changed_runtime[0].source_authority.?.sequence = 4;
+                        },
+                        .source_unknown => changed_runtime[0].source_authority = null,
+                        .range_namespace => {
+                            var changed_range = owners[0].range;
+                            changed_range.doc_identity_shard_id += 1;
+                            const range_bytes = try encodeRangeRecord(a, changed_range);
+                            defer a.free(range_bytes);
+                            try txn.put(try rangeKeyForGroup(&buf, group, changed_range.group_id), range_bytes);
+                        },
+                        .active_job => try txn.put(try index_publication.activeKey(&buf, group, ack.table_id), &@as([16]u8, @splat(9))),
+                        .lifecycle => try txn.delete(try @import("../table_lifecycle_lock.zig").key(&buf, group, ack.table_id)),
+                    }
+                    changed.runtime_statuses = &changed_runtime;
+                    changed.group_statuses = &changed_groups;
+                    _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed);
+                    const placement_bytes = try encodePlacementIntent(a, changed_placement);
+                    defer a.free(placement_bytes);
+                    try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
+                    if (fault == .active_job or fault == .lifecycle) {
+                        try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
+                    } else if (fault == .observed_position and authority == .native) {
+                        // Native sequence 5 remains valid even when Raft index is
+                        // zero: comparing these domains would invent authority.
+                        _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                    } else if ((fault == .source_cut or fault == .source_unknown) and authority == .raft) {
+                        // Legacy Raft observations retain their actual watermark;
+                        // absence never substitutes for a native observation.
+                        _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                    } else {
+                        try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
+                    }
+                    try std.testing.expectEqualSlices(u8, &try prepared.head.encode(), try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
+                    try std.testing.expectEqualSlices(u8, &try prepared.owners[0].encode(), try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+                }
+                const source = blk: {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
+                };
+                const encoded = try encodeTransitionCommand(a, .{ .ack_relational_index_publication = bytes });
+                defer a.free(encoded);
+                var decoded = (try decodeTransitionCommand(a, encoded)).?;
+                defer decoded.deinit(a);
+                try std.testing.expectEqualSlices(u8, bytes, decoded.ack_relational_index_publication);
+                try Driver.apply(&store, ack, decoded);
+                // Original revision lost: committed replay is a no-op, not a log
+                // poison. Preflight still reports the conflict to its caller.
+                try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+                {
+                    // A lost reply is resolved with the original revision and
+                    // exact receipt, without replaying or selecting a later phase.
+                    const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                    defer a.free(reply);
+                    var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                    defer status.deinit();
+                    try std.testing.expect(try status.value.isAcknowledged(ack));
+                    try std.testing.expectEqual(@as(u64, 2), status.value.head.revision);
+                }
+                try store.applyStandaloneCommand(group, decoded);
+                ack.expected_revision = 2;
+                const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
+                defer a.free(replay);
+                try store.validateRelationalIndexOwnerAck(group, replay);
+                try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = replay });
+                {
+                    // An acknowledged operation never grants execution or resends
+                    // schema-sized input, even when the caller asks for admission.
+                    const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
+                    defer a.free(reply);
+                    var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
+                    defer decision.deinit();
+                    try std.testing.expectEqual(.acknowledged, decision.value.disposition);
+                    try std.testing.expect(decision.value.dispatch == null and decision.value.inputs == null);
+                    var next = owner_request;
+                    next.operation = .reserve;
+                    next.projection = .permission;
+                    const permission = try store.relationalIndexOwnerDecisionJson(a, group, next);
+                    defer a.free(permission);
+                    var parsed_permission = try std.json.parseFromSlice(index_publication.OwnerDecision, a, permission, .{});
+                    defer parsed_permission.deinit();
+                    try std.testing.expectEqual(.execute, parsed_permission.value.disposition);
+                    try std.testing.expect(parsed_permission.value.inputs == null and parsed_permission.value.dispatch != null);
+                }
+                {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expect(source.eql(try RaftApplyStore.relationSourceEpochTxn(&read, group)));
+                    const head = try index_publication.verifyJob(a, &read, group, ack.table_id);
+                    try std.testing.expectEqual(@as(u64, 2), head.revision);
+                    try std.testing.expectEqual(index_progress.Phase.reserving, head.phase);
+                }
+                try verifyRelationRecoveryForTest(&store, a, group);
             }
-            const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle };
-            inline for (std.meta.tags(Fault)) |fault| {
-                // Each fault has its own aborted storage cut. No simulated
-                // verification boolean can substitute for real durable reads.
-                var txn = try store.store.beginWriteTxn();
+            {
+                var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+                defer store.deinit();
+                try verifyRelationRecoveryForTest(&store, a, group);
+                const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
+                defer a.free(replay);
+                try store.validateRelationalIndexOwnerAck(group, replay);
+                {
+                    const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                    defer a.free(reply);
+                    var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                    defer status.deinit();
+                    try std.testing.expect(try status.value.isAcknowledged(ack));
+                }
+                var txn = try store.store.beginReadTxn();
                 defer txn.abort();
                 var buf: [192]u8 = undefined;
-                var changed = current;
-                var changed_runtime = runtimes;
-                var changed_groups = groups;
-                var changed_placement = placement;
-                switch (fault) {
-                    .reporter => changed.reporter_incarnation += 1,
-                    .root_identity => changed.replica_root_incarnation += 1,
-                    .root_generation => changed_runtime[0].lsm_root_generation += 1,
-                    .placement_replica => changed_placement.record.replica_id += 1,
-                    .placement_store => changed_placement.store_id += 1,
-                    .placement_state => changed_placement.serving_state = .planned,
-                    .observed_position => changed_groups[0].raft_applied_index = 0,
-                    .source_mode => {
-                        changed_runtime[0].source_authority.?.kind = if (authority == .native) .raft else .native;
-                        changed_runtime[0].source_authority.?.sequence = 0;
-                    },
-                    .source_namespace => changed_runtime[0].source_authority.?.namespace[0] ^= 1,
-                    .source_cut => if (authority == .native) {
-                        changed_runtime[0].source_authority.?.sequence = 4;
-                    },
-                    .source_unknown => changed_runtime[0].source_authority = null,
-                    .range_namespace => {
-                        var changed_range = owners[0].range;
-                        changed_range.doc_identity_shard_id += 1;
-                        const range_bytes = try encodeRangeRecord(a, changed_range);
-                        defer a.free(range_bytes);
-                        try txn.put(try rangeKeyForGroup(&buf, group, changed_range.group_id), range_bytes);
-                    },
-                    .active_job => try txn.put(try index_publication.activeKey(&buf, group, ack.table_id), &@as([16]u8, @splat(9))),
-                    .lifecycle => try txn.delete(try @import("../table_lifecycle_lock.zig").key(&buf, group, ack.table_id)),
-                }
-                changed.runtime_statuses = &changed_runtime;
-                changed.group_statuses = &changed_groups;
-                _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed);
-                const placement_bytes = try encodePlacementIntent(a, changed_placement);
-                defer a.free(placement_bytes);
-                try txn.put(try placementKeyForGroup(&buf, group, owners[0].range.group_id, 2), placement_bytes);
-                if (fault == .active_job or fault == .lifecycle) {
-                    try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
-                } else if (fault == .observed_position and authority == .native) {
-                    // Native sequence 5 remains valid even when Raft index is
-                    // zero: comparing these domains would invent authority.
-                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
-                } else if ((fault == .source_cut or fault == .source_unknown) and authority == .raft) {
-                    // Legacy Raft observations retain their actual watermark;
-                    // absence never substitutes for a native observation.
-                    _ = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
-                } else {
-                    try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes));
-                }
-                try std.testing.expectEqualSlices(u8, &try prepared.head.encode(), try txn.get(try index_publication.headKey(&buf, group, ack.table_id)));
-                try std.testing.expectEqualSlices(u8, &try prepared.owners[0].encode(), try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+                const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
+                try std.testing.expectEqualDeep(ack.signed.receipt.position, owner.position.?);
             }
-            const source = blk: {
-                var read = try store.store.beginReadTxn();
-                defer read.abort();
-                break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
-            };
-            const encoded = try encodeTransitionCommand(a, .{ .ack_relational_index_publication = bytes });
-            defer a.free(encoded);
-            var decoded = (try decodeTransitionCommand(a, encoded)).?;
-            defer decoded.deinit(a);
-            try std.testing.expectEqualSlices(u8, bytes, decoded.ack_relational_index_publication);
-            try store.applyStandaloneCommand(group, decoded);
-            // Original revision lost: committed replay is a no-op, not a log
-            // poison. Preflight still reports the conflict to its caller.
-            try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexOwnerAck(group, bytes));
-            {
-                // A lost reply is resolved with the original revision and
-                // exact receipt, without replaying or selecting a later phase.
-                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
-                defer a.free(reply);
-                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
-                defer status.deinit();
-                try std.testing.expect(try status.value.isAcknowledged(ack));
-                try std.testing.expectEqual(@as(u64, 2), status.value.head.revision);
-            }
-            try store.applyStandaloneCommand(group, decoded);
-            ack.expected_revision = 2;
-            const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
-            defer a.free(replay);
-            try store.validateRelationalIndexOwnerAck(group, replay);
-            try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = replay });
-            {
-                // An acknowledged operation never grants execution or resends
-                // schema-sized input, even when the caller asks for admission.
-                const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
-                defer a.free(reply);
-                var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
-                defer decision.deinit();
-                try std.testing.expectEqual(.acknowledged, decision.value.disposition);
-                try std.testing.expect(decision.value.dispatch == null and decision.value.inputs == null);
-                var next = owner_request;
-                next.operation = .reserve;
-                next.projection = .permission;
-                const permission = try store.relationalIndexOwnerDecisionJson(a, group, next);
-                defer a.free(permission);
-                var parsed_permission = try std.json.parseFromSlice(index_publication.OwnerDecision, a, permission, .{});
-                defer parsed_permission.deinit();
-                try std.testing.expectEqual(.execute, parsed_permission.value.disposition);
-                try std.testing.expect(parsed_permission.value.inputs == null and parsed_permission.value.dispatch != null);
-            }
-            {
-                var read = try store.store.beginReadTxn();
-                defer read.abort();
-                try std.testing.expect(source.eql(try RaftApplyStore.relationSourceEpochTxn(&read, group)));
-                const head = try index_publication.verifyJob(a, &read, group, ack.table_id);
-                try std.testing.expectEqual(@as(u64, 2), head.revision);
-                try std.testing.expectEqual(index_progress.Phase.reserving, head.phase);
-            }
-            try verifyRelationRecoveryForTest(&store, a, group);
-        }
-        {
-            var store = try RaftApplyStore.init(a, .{ .root_dir = path });
-            defer store.deinit();
-            try verifyRelationRecoveryForTest(&store, a, group);
-            const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
-            defer a.free(replay);
-            try store.validateRelationalIndexOwnerAck(group, replay);
-            {
-                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
-                defer a.free(reply);
-                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
-                defer status.deinit();
-                try std.testing.expect(try status.value.isAcknowledged(ack));
-            }
-            var txn = try store.store.beginReadTxn();
-            defer txn.abort();
-            var buf: [192]u8 = undefined;
-            const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group, ack.table_id, 0)));
-            try std.testing.expectEqualDeep(ack.signed.receipt.position, owner.position.?);
         }
     }
-}
+} else struct {};
 
 test "relational index publication admission reserves names atomically and survives recovery with fault verification" {
     const a = std.testing.allocator;

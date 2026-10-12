@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `d3bbb9a0c6` (including #1078).
+at `b9feda47fb` (including #1079), with merge checkpoint `9a8b2b0ffa`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
@@ -3116,3 +3116,29 @@ native ACKs through this dispatcher, HA post-commit faults and the shared
 standalone commit/post-publication lock split still need activation work and
 qualification. Optimized standalone qualification is pending. Public producer
 activation and original-case dispositions remain unchanged.
+
+### Enrolled standalone ACK qualification
+
+The storage ACK authority fixture is now shared with the standalone catalog
+adapter test, rather than duplicating its enrollment setup or replacing durable
+authority with test booleans. The adapter supplies only dispatch of the first
+ACK; both native and Raft position domains retain the existing real-store
+reporter/root/placement/source-cut faults and reopen verification. The adapter
+asserts an initially unacknowledged receipt, the exact committed postimage,
+one durable and projected revision increment, rejection of a write replay, and
+read-only resolution using the original expected revision. This is a simulated
+lost response after successful local dispatch, not a network or HA fault.
+
+The Debug standalone gate passed all 82 build steps and both selected tests,
+with zero skips, failures or leaks. This includes the existing rejection test
+and the new successful enrolled dispatch for both authority domains. Shared commit/publication lock
+separation, automatic signing, enrollment activation, complete native worker
+execution and distributed fault campaigns remain required. No public producer
+activation or original-case disposition changes are claimed.
+
+The merged branch passes the 16-test isolated PostgreSQL catalog lifecycle
+oracle, original inventory integrity and the 2,035-source Apache boundary audit.
+These checks do not qualify the pending native dispatcher test or distributed
+activation. The initial sandboxed boundary audit was stopped only after a
+process sample proved Python was blocked in macOS timezone initialization;
+the replacement read-only audit completed successfully outside that sandbox.
