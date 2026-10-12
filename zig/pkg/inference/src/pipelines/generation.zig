@@ -5135,6 +5135,24 @@ pub const NativeGenerationPipeline = struct {
                 speculative_stats.accepted_tokens, speculative_stats.correction_tokens, speculative_stats.bonus_tokens,
             });
         }
+        if (speculative_stats.mtp_profile.enabled) {
+            const profile = speculative_stats.mtp_profile;
+            // Report existing phase counters without inserting GPU fences.
+            // These are wall times, not independent GPU kernel durations.
+            std.log.info("mtp_phase_profile: sync={any} draft_ns={d} verify_ns={d} materialize_ns={d} activation_ns={d} fallback_ns={d} draft_steps={d} verify_calls={d} verify_rows={d} materializations={d} corrections={d} bonus={d} deferred={d} runtime_hits={d} runtime_fallbacks={d}", .{
+                profile.sync_enabled,              profile.draft_token_ns,              profile.target_verify_ns,
+                profile.materialization_ns,        profile.activation_copy_ns,          profile.fallback_ns,
+                profile.draft_steps,               profile.target_verify_calls,         profile.target_verify_rows,
+                profile.materializations,          profile.correction_materializations, profile.bonus_materializations,
+                profile.deferred_materializations, profile.dedicated_runtime_hits,      profile.dedicated_runtime_fallbacks,
+            });
+            std.log.info("mtp_draft_profile: embedding_ns={d} concat_ns={d} preprojection_ns={d} assistant_ns={d} postprojection_ns={d} head_ns={d} selection_ns={d} argmax_ns={d} resident_steps={d} host_steps={d} cross_copies={d}", .{
+                profile.draft_target_embedding_ns, profile.draft_concat_ns,                     profile.draft_preprojection_ns,
+                profile.draft_assistant_ns,        profile.draft_postprojection_ns,             profile.draft_lm_head_ns,
+                profile.draft_selection_ns,        profile.draft_argmax_ns,                     profile.resident_draft_steps,
+                profile.host_draft_steps,          profile.draft_target_embedding_cross_copies,
+            });
+        }
         return .{
             .text = text,
             .reasoning_text = reasoning_text,
