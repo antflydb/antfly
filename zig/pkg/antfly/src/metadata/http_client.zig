@@ -1123,6 +1123,32 @@ pub const MetadataHttpClient = struct {
         return parsed.value;
     }
 
+    pub fn relationalIndexOwnerAck(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32) !@import("relational_index_publication.zig").AckStatus {
+        const publication = @import("relational_index_publication.zig");
+        if (remaining_ms == 0) return error.Timeout;
+        try request.validate();
+        const bytes = try self.forwardSystemCatalog(base_uri, .{ .relational_index_owner_ack = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > publication.max_ack_status_bytes) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(publication.AckStatus, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
+
+    pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
+        const publication = @import("relational_index_publication.zig");
+        try request.validate();
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_owner_ack_status = request }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (!std.mem.eql(u8, &observed.metadata_incarnation, &request.signed.proof.identity.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        if (observed.body.len == 0 or observed.body.len > publication.max_ack_status_bytes) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(publication.AckStatus, self.alloc, observed.body, .{});
+        defer parsed.deinit();
+        _ = try parsed.value.isAcknowledged(request);
+        return parsed.value;
+    }
+
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
@@ -1154,6 +1180,7 @@ pub const MetadataHttpClient = struct {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (response.status != 200) return switch (response.status) {
             400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
                 input == .relational_index_owner_decision or
@@ -1210,7 +1237,7 @@ pub const MetadataHttpClient = struct {
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
         const authority = @import("../system_catalog/setting_authority.zig");
-        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (setting_admin or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (setting_admin) .admin else .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
@@ -1231,6 +1258,7 @@ pub const MetadataHttpClient = struct {
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
         if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
         if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        if (input.isRelationalIndexOwnerCall()) if (@import("relational_index_publication.zig").ownerAckHttpFailure(response.status, response.body)) |err| return err;
         if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         return switch (response.status) {
             400 => if (input == .store_root_enroll and std.mem.eql(u8, response.body, "InvalidStoreRootEnrollment"))
@@ -4530,6 +4558,75 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
         .public_key = @splat(1),
     };
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
+}
+
+test "relational index publication ACK client binds read grants and never retries an ambiguous mutation" {
+    const alloc = std.testing.allocator;
+    const publication = @import("relational_index_publication.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        body: []const u8,
+        status: u16 = 200,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
+        calls: usize = 0,
+        wrong_cluster: bool = false,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try authority.verify("index-ack-secret", "index-ack", .read, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
+            defer call.deinit();
+            const mutation = call.value.isMutation();
+            try std.testing.expect(call.value.isRelationalIndexOwnerCall());
+            var response: http_common.HttpResponse = .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+            errdefer response.deinit(a);
+            const headers = try a.alloc(http_common.Header, if (mutation) 1 else 2);
+            var count: usize = 0;
+            errdefer {
+                for (headers[0..count]) |*header| header.deinit(a);
+                a.free(headers);
+            }
+            const names = [_][]const u8{ if (mutation) routes.Routes.raft_mutation_outcome_header else "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" };
+            const values = [_][]const u8{ if (mutation) self.outcome else "13", if (self.wrong_cluster) "22222222222222222222222222222222" else "11111111111111111111111111111111" };
+            for (headers, 0..) |*header, i| {
+                const name = try a.dupe(u8, names[i]);
+                errdefer a.free(name);
+                header.* = .{ .name = name, .value = try a.dupe(u8, values[i]) };
+                count += 1;
+            }
+            response.headers = headers;
+            return response;
+        }
+    };
+    const request = try publication.testing.fencedAck();
+    const pending = publication.testing.pendingAckStatus(request);
+    const update = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.acknowledge(pending.head, pending.owner, 1, request.signed.receipt);
+    const complete = try std.json.Stringify.valueAlloc(alloc, publication.AckStatus{ .head = update.head, .owner = update.owner }, .{});
+    defer alloc.free(complete);
+    const absent = try std.json.Stringify.valueAlloc(alloc, pending, .{});
+    defer alloc.free(absent);
+    var executor: Executor = .{ .body = complete };
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("index-ack-secret", "index-ack");
+    _ = client.withInternalServiceAuth("index-ack-service-secret-0123456789", "index-ack");
+    try std.testing.expect(try (try client.relationalIndexOwnerAck("http://metadata.invalid", request, 25)).isAcknowledged(request));
+    executor.body = absent;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    executor.status = 409;
+    executor.body = "IndexOwnerReceiptChanged";
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, client.relationalIndexOwnerAck("http://metadata.invalid", request, 25));
+    try std.testing.expectError(error.Timeout, client.relationalIndexOwnerAck("http://metadata.invalid", request, 0));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.status = 200;
+    executor.body = absent;
+    try std.testing.expect(!try (try client.relationalIndexOwnerAckStatus("http://metadata.invalid", request, 25, null)).isAcknowledged(request));
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexOwnerAckStatus("http://metadata.invalid", request, 25, null));
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
 }
 
 test "system catalog relation replacement preserves private grants and definitive ownership rejection" {

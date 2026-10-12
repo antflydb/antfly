@@ -750,6 +750,8 @@ pub const Detail = enum(c_int) {
     invalid_private_index_native_receipt,
     invalid_relational_index_progress,
     missing_relational_index_definitions,
+    index_owner_receipt_changed,
+    invalid_index_owner_receipt,
 };
 
 test "native index claim failures preserve typed callback boundary identities" {
@@ -772,6 +774,8 @@ test "native index claim failures preserve typed callback boundary identities" {
         .{ error.InvalidPrivateIndexNativeReceipt, Code.corrupt },
         .{ error.InvalidRelationalIndexProgress, Code.corrupt },
         .{ error.MissingRelationalIndexDefinitions, Code.corrupt },
+        .{ error.IndexOwnerReceiptChanged, Code.conflict },
+        .{ error.InvalidIndexOwnerReceipt, Code.invalid_argument },
     };
     inline for (cases) |entry| {
         const result = statusFromError(entry[0]);
@@ -1056,6 +1060,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidPrivateIndexNativeReceipt => status(.corrupt, .invalid_private_index_native_receipt),
         error.InvalidRelationalIndexProgress => status(.corrupt, .invalid_relational_index_progress),
         error.MissingRelationalIndexDefinitions => status(.corrupt, .missing_relational_index_definitions),
+        error.IndexOwnerReceiptChanged => status(.conflict, .index_owner_receipt_changed),
+        error.InvalidIndexOwnerReceipt => status(.invalid_argument, .invalid_index_owner_receipt),
         error.PreparedGenerationChanged => status(.conflict, .prepared_generation_changed),
         error.PreparedReadSetChanged => status(.conflict, .prepared_read_set_changed),
         error.ForeignKeyActionMismatch => status(.conflict, .foreign_key_action_mismatch),
@@ -1776,6 +1782,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_private_index_native_receipt => "InvalidPrivateIndexNativeReceipt",
         .invalid_relational_index_progress => "InvalidRelationalIndexProgress",
         .missing_relational_index_definitions => "MissingRelationalIndexDefinitions",
+        .index_owner_receipt_changed => "IndexOwnerReceiptChanged",
+        .invalid_index_owner_receipt => "InvalidIndexOwnerReceipt",
         .prepared_generation_changed => "PreparedGenerationChanged",
         .prepared_read_set_changed => "PreparedReadSetChanged",
         .foreign_key_action_mismatch => "ForeignKeyActionMismatch",

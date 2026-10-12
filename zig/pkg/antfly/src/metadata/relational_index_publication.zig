@@ -49,12 +49,61 @@ pub const SignedReceipt = struct {
 pub const max_bytes = 8 * 1024 * 1024;
 pub const max_command_bytes = max_bytes + 16 * 1024;
 pub const max_ack_bytes = 4096;
+pub const max_ack_status_bytes = 8192;
+
+/// Only use for reads or definitely-not-proposed mutations. The transport
+/// outcome header takes precedence over any apparently retryable error body.
+pub fn ownerAckHttpFailure(status: u16, body: []const u8) ?anyerror {
+    const failures: []const anyerror = switch (status) {
+        400 => &.{ error.InvalidIndexOwnerReceipt, error.InvalidGenerationPublication },
+        409 => &.{ error.IndexOwnerReceiptChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound },
+        500 => &.{error.InvalidCatalogRecord},
+        else => return null,
+    };
+    for (failures) |err| if (std.mem.eql(u8, body, @errorName(err))) return err;
+    return null;
+}
 /// A planless, bounded owner acknowledgement. The admitted head and ordinal
 /// directory, not request fields, determine the records that may change.
 pub const Ack = struct {
     table_id: u64,
     expected_revision: u64,
     signed: SignedReceipt,
+
+    pub fn validate(self: Ack) !void {
+        if (self.table_id == 0 or self.signed.receipt.owner.namespace.table_id != self.table_id or
+            self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
+        try (progress.OwnerState{ .owner = self.signed.receipt.owner }).validate();
+        try self.signed.verifySignature();
+    }
+};
+
+/// Fixed-size exact receipt observation. Later owners may advance the head;
+/// neither a matching revision nor a phase alone proves this receipt committed.
+pub const AckStatus = struct {
+    head: progress.Head,
+    owner: progress.OwnerState,
+
+    pub fn isAcknowledged(self: AckStatus, request: Ack) !bool {
+        try request.validate();
+        try self.head.validate();
+        try self.owner.validate();
+        for (self.head.counts, 0..) |count, i| {
+            const present = self.owner.flags & (@as(u8, 1) << @as(u3, @intCast(i))) != 0;
+            if ((count == 0 and present) or (count == self.head.owner_count and !present)) return error.InvalidCatalogRecord;
+        }
+        const receipt = request.signed.receipt;
+        if (self.head.table_id != request.table_id or self.head.revision < request.expected_revision or
+            !std.mem.eql(u8, &self.head.plan_id, &receipt.owner.plan_id) or
+            !std.mem.eql(u8, &self.head.plan_digest, &receipt.owner.plan_digest) or
+            !std.mem.eql(u8, &self.head.candidate_digest, &receipt.candidate_digest) or
+            !std.mem.eql(u8, &self.head.reservation_digest, &receipt.reservation_digest) or
+            receipt.owner.ordinal >= self.head.owner_count or !std.meta.eql(self.owner.owner, receipt.owner)) return error.GenerationPublicationChanged;
+        const stored = self.owner.receipts[@backingInt(receipt.action)];
+        if (std.mem.allEqual(u8, &stored, 0)) return false;
+        if (!std.mem.eql(u8, &stored, &try receipt.digest())) return error.GenerationPublicationChanged;
+        return true;
+    }
 };
 
 pub const OwnerOperation = enum { fence, reserve, build, validate, install, release, cancel, cancel_release };
@@ -1024,7 +1073,60 @@ fn testPlan(a: Allocator) !Plan {
 
 pub const testing = if (@import("builtin").is_test) struct {
     pub const plan = testPlan;
+
+    pub fn fencedAck() !Ack {
+        const seed: [32]u8 = @splat(9);
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+        const namespace: local.storage_db_doc_identity.Namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 401 };
+        const receipt: progress.Receipt = .{
+            .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = 0, .group_id = 301, .namespace = namespace, .authority = .native, .fence_digest = @splat(3) },
+            .action = .fenced,
+            .position = .{ .native = .{ .namespace = namespace, .sequence = 5 } },
+            .candidate_digest = @splat(4),
+            .reservation_digest = @splat(5),
+            .evidence_digest = @splat(6),
+        };
+        return .{ .table_id = 101, .expected_revision = 1, .signed = .{ .receipt = receipt, .proof = try (RootProof{
+            .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
+            .reporter_incarnation = 4,
+            .replica_id = 5,
+            .root_generation = 6,
+            .signature = undefined,
+        }).sign(root, try receipt.digest()) } };
+    }
+
+    pub fn pendingAckStatus(request: Ack) AckStatus {
+        const receipt = request.signed.receipt;
+        return .{
+            .head = .{ .plan_id = receipt.owner.plan_id, .plan_digest = receipt.owner.plan_digest, .candidate_digest = receipt.candidate_digest, .reservation_digest = receipt.reservation_digest, .table_id = request.table_id, .owner_count = 1 },
+            .owner = .{ .owner = receipt.owner },
+        };
+    }
 } else struct {};
+
+test "relational index publication ACK status binds exact committed digest not revisions or phases" {
+    const request = try testing.fencedAck();
+    const pending = testing.pendingAckStatus(request);
+    try std.testing.expect(!try pending.isAcknowledged(request));
+    const update = try progress.acknowledge(pending.head, pending.owner, request.expected_revision, request.signed.receipt);
+    const complete: AckStatus = .{ .head = update.head, .owner = update.owner };
+    try std.testing.expect(try complete.isAcknowledged(request));
+    var bad = complete;
+    bad.owner.receipts[0][0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, bad.isAcknowledged(request));
+    bad = complete;
+    bad.head.plan_id[0] ^= 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, bad.isAcknowledged(request));
+    var future = request;
+    future.expected_revision = complete.head.revision + 1;
+    try std.testing.expectError(error.GenerationPublicationChanged, complete.isAcknowledged(future));
+    future.expected_revision = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, future.validate());
+    try std.testing.expectEqual(error.IndexOwnerReceiptChanged, ownerAckHttpFailure(409, "IndexOwnerReceiptChanged").?);
+    try std.testing.expect(ownerAckHttpFailure(503, "IndexOwnerReceiptChanged") == null);
+    try std.testing.expect(ownerAckHttpFailure(409, "unrecognized") == null);
+}
 
 test "relational index publication signatures bind owner authority position and root generation" {
     const seed: [32]u8 = @splat(9);

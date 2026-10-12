@@ -312,6 +312,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     index_publication_step.dependOn(&addFilteredTestRunArtifact(b, index_publication_barrier_tests).step);
+    const index_owner_ack_http_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational index publication ACK", "system catalog read identity" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const index_owner_ack_step = b.step("antfly-relational-index-ack-test", "Verify authenticated index owner receipt submission and exact ambiguous-outcome observation");
+    index_owner_ack_step.dependOn(&index_publication_run.step);
+    index_owner_ack_step.dependOn(&addFilteredTestRunArtifact(b, index_owner_ack_http_tests).step);
     const owner_authority_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "runtime status", "store observer durable projection includes", "relational index publication authenticated owner ACKs" },

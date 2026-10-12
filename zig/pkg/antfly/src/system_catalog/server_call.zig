@@ -79,6 +79,8 @@ pub const Call = union(enum) {
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
     relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
+    relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
     constraint_name_prepare: domain.ConstraintNamePrepareRequest,
     constraint_name_check: domain.ConstraintNameCheck,
@@ -137,6 +139,8 @@ pub const Call = union(enum) {
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
             .relational_index_owner_decision,
+            .relational_index_owner_ack,
+            .relational_index_owner_ack_status,
             .fk_initial_create_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_status,
@@ -149,10 +153,40 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        return self == .mutate or self == .fk_initial_retirement_ack or
+        return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or
             (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self.requiresAdministrativeGrant());
     }
+
+    pub fn isRelationalIndexOwnerCall(self: @This()) bool {
+        return self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status;
+    }
 };
+
+test "relational index publication ACK calls require body bound authority and distinguish mutations from status" {
+    const abi = @import("antfly_runtime_abi");
+    const VTable = struct { submit: *const fn (*const anyerror) anyerror!u64 };
+    const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    const Callbacks = struct {
+        fn submit(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+        fn foreign(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return Boundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.IndexOwnerReceiptChanged, error.InvalidIndexOwnerReceipt, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expectError(err, Boundary.call("submit", &Callbacks.foreign, &Callbacks.submit, .{&err}));
+    }
+    const ack: Call = .{ .relational_index_owner_ack = undefined };
+    const status: Call = .{ .relational_index_owner_ack_status = undefined };
+    for ([_]Call{ ack, status }) |call| {
+        try std.testing.expect(call.requiresSettingAuthorityReadGrant());
+        try std.testing.expect(!call.requiresAdministrativeGrant());
+        try std.testing.expect(call.isRelationalIndexOwnerCall());
+    }
+    try std.testing.expect(ack.isMutation());
+    try std.testing.expect(!status.isMutation());
+}
 
 test "system catalog policy publication status is a service-only read, not a setting grant" {
     const status: Call = .{ .policy_publication_status = 7 };

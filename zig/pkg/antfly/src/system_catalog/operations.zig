@@ -343,6 +343,44 @@ pub fn fkGenerationPublicationSourceDecisionJson(svc: anytype, alloc: std.mem.Al
     return store.fkGenerationPublicationSourceDecisionJson(alloc, svc.metadata_group_id, request);
 }
 
+pub fn relationalIndexOwnerAckStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexOwnerAckStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").Ack) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.index_publication_admission_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    const publication = @import("../metadata/relational_index_publication.zig");
+    if (bytes.len > publication.max_ack_bytes) return error.CatalogCommandTooLarge;
+    try store.validateRelationalIndexOwnerAck(svc.metadata_group_id, bytes);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .ack_relational_index_publication = bytes });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = store.relationalIndexOwnerAckStatusJson(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    var parsed = std.json.parseFromSlice(publication.AckStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
 pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try request.validate();
@@ -350,6 +388,85 @@ pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, 
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return store.relationalIndexOwnerDecisionJson(alloc, svc.metadata_group_id, request);
+}
+
+test "relational index publication ACK submission fences capabilities releases mutation gates and preserves ambiguous outcomes" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        waits: usize = 0,
+        wait_failure: bool = false,
+        store: Store,
+        const Store = struct {
+            observed: publication.AckStatus,
+            reject: bool = false,
+            pub fn validateRelationalIndexOwnerAck(self: *@This(), _: u64, _: []const u8) !void {
+                if (self.reject) return error.IndexOwnerReceiptChanged;
+            }
+            pub fn relationalIndexOwnerAckStatusJson(self: *@This(), alloc: std.mem.Allocator, _: u64, _: publication.Ack) ![]u8 {
+                return std.json.Stringify.valueAlloc(alloc, self.observed, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            try std.testing.expectEqual(protocol.index_publication_admission_version, version);
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .ack_relational_index_publication);
+            self.proposals += 1;
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            self.waits += 1;
+            if (self.wait_failure) return error.Timeout;
+        }
+    };
+    const request = try publication.testing.fencedAck();
+    const pending = publication.testing.pendingAckStatus(request);
+    const update = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.acknowledge(pending.head, pending.owner, 1, request.signed.receipt);
+    var svc: Mock = .{ .store = .{ .observed = .{ .head = update.head, .owner = update.owner } } };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.Forbidden, relationalIndexOwnerAckStatusJson(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.DeadlineExceeded, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, .{ .index_publication_authority = true, .deadline_ns = 0 }, undefined));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request);
+    std.testing.allocator.free(bytes);
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = true;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = false;
+    svc.wait_failure = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    svc.wait_failure = false;
+    svc.store.observed = pending;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 3), svc.proposals);
+    try std.testing.expectEqual(@as(usize, 3), svc.waits);
 }
 
 test "system catalog relational index publication read requires authority before a linearizable barrier" {
@@ -558,6 +675,8 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .fk_generation_publication_decision => |request| fkGenerationPublicationDecisionJson(svc, alloc, context, request),
         .fk_generation_publication_source_decision => |request| fkGenerationPublicationSourceDecisionJson(svc, alloc, context, request),
         .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),
+        .relational_index_owner_ack => |request| acknowledgeRelationalIndexOwner(svc, alloc, context, request),
+        .relational_index_owner_ack_status => |request| relationalIndexOwnerAckStatusJson(svc, alloc, context, request),
         .fk_initial_create_prepare => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
             if (request.generated_constraint_names.len != 0)

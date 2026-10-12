@@ -4295,6 +4295,13 @@ test "relational index publication authenticated owner ACKs persist both positio
             defer a.free(enrollment);
             try store.applyStandaloneCommand(group, .{ .apply_store_root_enrollment = enrollment });
             try store.validateRelationalIndexOwnerAck(group, bytes);
+            {
+                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                defer a.free(reply);
+                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                defer status.deinit();
+                try std.testing.expect(!try status.value.isAcknowledged(ack));
+            }
             const Fault = enum { reporter, root_identity, root_generation, placement_replica, placement_store, placement_state, observed_position, source_mode, source_namespace, source_cut, source_unknown, range_namespace, active_job, lifecycle };
             inline for (std.meta.tags(Fault)) |fault| {
                 // Each fault has its own aborted storage cut. No simulated
@@ -4369,6 +4376,16 @@ test "relational index publication authenticated owner ACKs persist both positio
             // Original revision lost: committed replay is a no-op, not a log
             // poison. Preflight still reports the conflict to its caller.
             try std.testing.expectError(error.GenerationPublicationChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+            {
+                // A lost reply is resolved with the original revision and
+                // exact receipt, without replaying or selecting a later phase.
+                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                defer a.free(reply);
+                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                defer status.deinit();
+                try std.testing.expect(try status.value.isAcknowledged(ack));
+                try std.testing.expectEqual(@as(u64, 2), status.value.head.revision);
+            }
             try store.applyStandaloneCommand(group, decoded);
             ack.expected_revision = 2;
             const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
@@ -4411,6 +4428,13 @@ test "relational index publication authenticated owner ACKs persist both positio
             const replay = try std.json.Stringify.valueAlloc(a, ack, .{});
             defer a.free(replay);
             try store.validateRelationalIndexOwnerAck(group, replay);
+            {
+                const reply = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+                defer a.free(reply);
+                var status = try std.json.parseFromSlice(index_publication.AckStatus, a, reply, .{});
+                defer status.deinit();
+                try std.testing.expect(try status.value.isAcknowledged(ack));
+            }
             var txn = try store.store.beginReadTxn();
             defer txn.abort();
             var buf: [192]u8 = undefined;
@@ -15469,7 +15493,7 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(index_publication.Ack, self.alloc, bytes, .{});
         defer parsed.deinit();
         const ack = parsed.value;
-        try ack.signed.verifySignature();
+        try ack.validate();
         if (ack.table_id == 0 or ack.signed.receipt.owner.namespace.table_id != ack.table_id) return error.InvalidIndexOwnerReceipt;
         const lifecycle = @import("../table_lifecycle_lock.zig");
         const lock = (try lifecycle.read(txn, group_id, ack.table_id)) orelse return error.GenerationPublicationChanged;
@@ -15562,6 +15586,29 @@ pub const RaftApplyStore = struct {
 
     /// Bounded hot dispatch: point directory/head/owner/projection/catalog/range
     /// reads only. Immutable schema-sized inputs are fetched at admission only.
+    pub fn relationalIndexOwnerAckStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.Ack) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const activation = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_admission_version);
+        if (activation.version < topology_protocol.index_publication_admission_version) return error.TableTopologyProtocolUpgradeRequired;
+        var buf: [192]u8 = undefined;
+        const head = index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group_id, request.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationNotFound,
+            else => return err,
+        }) catch return error.InvalidCatalogRecord;
+        try index_publication.requireActivePointer(&txn, group_id, head);
+        const ordinal = index_publication.ownerOrdinal(&txn, group_id, request.table_id, request.signed.receipt.owner.group_id) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationChanged,
+            else => return err,
+        };
+        if (ordinal != request.signed.receipt.owner.ordinal) return error.GenerationPublicationChanged;
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, request.table_id, ordinal)));
+        const status: index_publication.AckStatus = .{ .head = head, .owner = owner };
+        _ = try status.isAcknowledged(request);
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
+    }
+
     pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.OwnerRequest) ![]u8 {
         try request.validate();
         var txn = try self.store.beginReadTxn();
