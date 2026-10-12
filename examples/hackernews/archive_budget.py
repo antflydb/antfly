@@ -363,6 +363,133 @@ def replan_future_reservation(ledger_path, evidence_path):
         }
 
 
+def admit_transport_resume(
+    ledger_path, origin, config, binary_sha256, inventory_sha256, output
+):
+    """One replacement pod shares an unsettled attempt's two-hour deposit."""
+    plan = json.loads((origin / "plan.json").read_text())
+    cleanup_path = origin / "regional" / "cleanup.json"
+    cleanup = json.loads(cleanup_path.read_text())
+    worker = json.loads((origin / "regional" / "worker.json").read_text())
+    verdict = json.loads((origin / "verdict.json").read_text())
+    logs = list((origin / "regional").glob("*-*.log"))
+    transport_failure = any(
+        "error: error reading from error stream:" in p.read_text()
+        and "connection reset by peer" in p.read_text()
+        for p in logs
+    )
+    if (
+        plan["config"] != config
+        or plan["binary_sha256"] != binary_sha256
+        or plan["inventory_sha256"] != inventory_sha256
+        or verdict.get("passed") is not False
+        or verdict.get("engine_failures") != []
+        or not transport_failure
+        or cleanup.get("created") is not True
+        or cleanup.get("deleted") is not True
+        or cleanup.get("pod") != worker["metadata"]["name"]
+        or not worker["metadata"].get("uid")
+        or worker.get("kind") != "Pod"
+        or worker["metadata"].get("labels", {}).get("app") != "hackernews-benchmark"
+        or not worker["metadata"]["name"].startswith("hackernews-benchmark-")
+        or worker["spec"].get("activeDeadlineSeconds") != config["lifetime_seconds"]
+        or not 0 <= worker["spec"].get("terminationGracePeriodSeconds", 30) <= 60
+        or worker["spec"]["restartPolicy"] != "Never"
+        or worker["spec"].get("initContainers")
+        or worker["spec"].get("ephemeralContainers")
+        or any("persistentVolumeClaim" in v for v in worker["spec"].get("volumes", []))
+        or len(worker["spec"]["containers"]) != 1
+    ):
+        raise ValueError("Resume must preserve a closed transport-failed attempt")
+    created = datetime.fromisoformat(
+        worker["metadata"]["creationTimestamp"].replace("Z", "+00:00")
+    )
+    absent = datetime.fromtimestamp(cleanup_path.stat().st_mtime, timezone.utc)
+    elapsed = (absent - created).total_seconds()
+    # Add fifteen minutes for bounded scheduling, control calls, report copies
+    # and termination on top of the replacement's hard lifetime.
+    maximum_seconds = elapsed + config["lifetime_seconds"] + 900
+    if (
+        not 0 <= elapsed
+        or maximum_seconds > 7200
+        or absent > datetime.now(timezone.utc)
+    ):
+        raise ValueError("Replacement exceeds the attempt's aggregate two-hour bound")
+    requested = worker["spec"]["containers"][0]["resources"]["requests"]
+    r = config["resources"]
+    if (
+        money(requested["cpu"]) != money(r["cpu"])
+        or requested["memory"] != f"{r['memory_gib']}Gi"
+        or requested["ephemeral-storage"] != f"{r['disk_gib']}Gi"
+    ):
+        raise ValueError("Admitted resources differ from the reserved attempt")
+    with ledger_path.open("r+") as file:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        ledger = json.load(file)
+        validate_future_reservation(ledger, config)
+        run_id = plan["run_prefix"]
+        run = next((run for run in ledger["runs"] if run["id"] == run_id), None)
+        if (
+            run is None
+            or ledger["project"] != config["project"]
+            or ledger["budget"] != config["budget"]
+            or any(
+                row["run_id"] == run_id
+                for key in ("reconciliations", "closed_compute_bounds")
+                for audit in ledger.get(key, [])
+                for row in audit["runs"]
+            )
+            or any(
+                audit["run_id"] == run_id
+                for audit in ledger.get("transport_resumes", [])
+            )
+        ):
+            raise ValueError(
+                "Only one replacement of an unsettled owned attempt is allowed"
+            )
+        b = ledger["budget"]
+        floor = 2 * (
+            money(r["cpu"]) * money(b["cpu_hour_usd"])
+            + money(r["memory_gib"]) * money(b["memory_gib_hour_usd"])
+            + money(r["disk_gib"]) * money(b["disk_gib_hour_usd"])
+        ) + money(b["other_run_allowance_usd"])
+        if money(run["reserved_usd"]) < floor or money(exposure(ledger)) > money(
+            b["ceiling_usd"]
+        ):
+            raise ValueError(
+                "Existing deposit does not cover the aggregate replacement"
+            )
+        before = exposure(ledger)
+        ledger.setdefault("transport_resumes", []).append(
+            {
+                "run_id": run_id,
+                "output": str(output.resolve()),
+                "at_unix": time.time(),
+                "previous_pod_uid": worker["metadata"]["uid"],
+                "maximum_aggregate_pod_seconds": maximum_seconds,
+                "reserved_usd": run["reserved_usd"],
+                "provenance_sha256": {
+                    name: hashlib.sha256((origin / path).read_bytes()).hexdigest()
+                    for name, path in (
+                        ("plan", "plan.json"),
+                        ("worker", "regional/worker.json"),
+                        ("cleanup", "regional/cleanup.json"),
+                        ("verdict", "verdict.json"),
+                    )
+                },
+            }
+        )
+        if exposure(ledger) != before:
+            raise ValueError("Resume cannot change reserved exposure")
+        file.seek(0)
+        json.dump(ledger, file, indent=2)
+        file.write("\n")
+        file.truncate()
+        file.flush()
+        os.fsync(file.fileno())
+        return run_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ledger", type=Path, required=True)

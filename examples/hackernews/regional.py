@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import uuid
 
 SDK_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9"
@@ -114,6 +115,76 @@ def fresh_bearer_for_lifetime(invoke, project, required_seconds, *, now=None):
     }
 
 
+def remote_job(
+    run,
+    kubectl,
+    pod_name,
+    command,
+    token,
+    directory,
+    deadline,
+    *,
+    now=time.monotonic,
+    sleep=time.sleep,
+):
+    """Short control-plane calls cannot terminate the owned benchmark process."""
+    expected = hashlib.sha256(json.dumps(command).encode()).hexdigest()
+    launched = False
+    failures = 0
+    while now() < deadline:
+        try:
+            if not launched:
+                run(
+                    kubectl
+                    + [
+                        "exec",
+                        "-i",
+                        pod_name,
+                        "--",
+                        "python3",
+                        "/workspace/regional_worker.py",
+                        "launch",
+                        directory,
+                        *command,
+                    ],
+                    input=token + "\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                launched = True
+            code = "import json,sys; from pathlib import Path; p=Path(sys.argv[1])/'exit.json'; print(p.read_text() if p.exists() else 'null')"
+            result = run(
+                kubectl + ["exec", pod_name, "--", "python3", "-c", code, directory],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            status = json.loads(result.stdout)
+            failures = 0
+            if status is not None:
+                if status.get("command_sha256") != expected:
+                    raise ValueError("Worker completion authority differs")
+                return status["exit_code"]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            failures += 1
+            if failures >= 5:
+                raise RuntimeError("Benchmark control plane unavailable") from None
+            # Retrying launch is safe: the supervisor's lock prevents duplicate
+            # execution even if the first launch's reply was lost.
+        sleep(min(2, max(0, deadline - now())))
+    raise RuntimeError("Benchmark worker exceeded its owned pod deadline")
+
+
+def copy_result(run, command):
+    for attempt in range(3):
+        try:
+            return run(command, capture_output=True, timeout=45)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            if attempt == 2:
+                raise
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -182,6 +253,7 @@ def main():
     env = dict(os.environ, KUBECONFIG=str(Path(credentials.name) / "kubeconfig"))
 
     def run(argv, **kwargs):
+        kwargs.setdefault("timeout", 60)
         return subprocess.run(argv, env=env, check=True, **kwargs)
 
     run(
@@ -220,7 +292,10 @@ def main():
     pod = {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": pod_name, "labels": {"app": "hackernews-benchmark"}},
+        "metadata": {
+            "name": pod_name,
+            "labels": {"app": "hackernews-benchmark", "qualification-owner": pod_name},
+        },
         "spec": {
             "restartPolicy": "Never",
             "activeDeadlineSeconds": args.lifetime,
@@ -255,12 +330,16 @@ def main():
         },
     }
     created = False
+    create_attempted = False
+    worker = None
     try:
+        create_attempted = True
         run(kubectl + ["create", "-f", "-"], input=json.dumps(pod), text=True)
         created = True
         run(
             kubectl
-            + ["wait", "--for=condition=Ready", "pod/" + pod_name, "--timeout=300s"]
+            + ["wait", "--for=condition=Ready", "pod/" + pod_name, "--timeout=300s"],
+            timeout=330,
         )
         worker = json.loads(
             run(
@@ -279,6 +358,15 @@ def main():
                 str(Path(__file__).with_name("poc.py")),
                 pod_name + ":/workspace/poc.py",
             ]
+        )
+        copy_result(
+            run,
+            kubectl
+            + [
+                "cp",
+                str(Path(__file__).with_name("regional_worker.py")),
+                pod_name + ":/workspace/regional_worker.py",
+            ],
         )
         run(kubectl + ["exec", pod_name, "--", "chmod", "+x", "/workspace/antfly"])
         worker_start = datetime.fromisoformat(
@@ -345,45 +433,70 @@ def main():
             reports[mode] = []
             for cycle in range(args.cycles):
                 label = mode + "-" + str(cycle + 1)
-                with (args.output / (label + ".log")).open("w") as log:
-                    completed = subprocess.run(
-                        command,
-                        env=env,
-                        input=token + "\n",
-                        text=True,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
+                directory = "/workspace/jobs/" + uuid.uuid4().hex
+                worker_command = command[command.index("--") + 1 :]
+                (args.output / (label + "-job.json")).write_text(
+                    json.dumps(
+                        {
+                            "directory": directory,
+                            "command_sha256": hashlib.sha256(
+                                json.dumps(worker_command).encode()
+                            ).hexdigest(),
+                        },
+                        indent=2,
                     )
-                if completed.returncode:
-                    subprocess.run(
-                        kubectl
-                        + [
-                            "cp",
-                            pod_name + ":/workspace/" + mode + "/failure.json",
-                            str(args.output / (label + "-failure.json")),
-                        ],
-                        env=env,
-                        check=False,
-                        capture_output=True,
-                    )
-                    run(
+                    + "\n"
+                )
+                deadline = time.monotonic() + max(
+                    0,
+                    args.lifetime
+                    - (datetime.now(timezone.utc) - worker_start).total_seconds(),
+                )
+                exit_code = remote_job(
+                    run, kubectl, pod_name, worker_command, token, directory, deadline
+                )
+                copy_result(
+                    run,
+                    kubectl
+                    + [
+                        "cp",
+                        pod_name + ":" + directory + "/output.log",
+                        str(args.output / (label + ".log")),
+                    ],
+                )
+                if exit_code:
+                    try:
+                        copy_result(
+                            run,
+                            kubectl
+                            + [
+                                "cp",
+                                pod_name + ":/workspace/" + mode + "/failure.json",
+                                str(args.output / (label + "-failure.json")),
+                            ],
+                        )
+                    except subprocess.CalledProcessError:
+                        pass
+                    copy_result(
+                        run,
                         kubectl
                         + [
                             "cp",
                             pod_name + ":/workspace/" + mode + "/server.log",
                             str(args.output / (label + "-server.log")),
-                        ]
+                        ],
                     )
                     raise RuntimeError(
                         f"{label} failed; see {args.output / (label + '.log')}"
                     )
-                run(
+                copy_result(
+                    run,
                     kubectl
                     + [
                         "cp",
                         pod_name + ":/workspace/" + mode + "/report.json",
                         str(args.output / (label + ".json")),
-                    ]
+                    ],
                 )
                 result = json.loads((args.output / (label + ".json")).read_text())
                 reports[mode].append(result)
@@ -422,21 +535,48 @@ def main():
         }
         (args.output / "regional.json").write_text(json.dumps(report, indent=2) + "\n")
     finally:
-        cleanup = {"pod": pod_name, "created": created, "deleted": not created}
+        cleanup = {"pod": pod_name, "created": created, "deleted": not create_attempted}
         try:
-            if created:
-                run(
+            if create_attempted:
+                current = run(
                     kubectl
-                    + [
-                        "delete",
-                        "pod",
-                        pod_name,
-                        "--wait=true",
-                        "--timeout=60s",
-                        "--ignore-not-found",
-                    ]
+                    + ["get", "pod", pod_name, "-o", "json", "--ignore-not-found"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
-                cleanup["deleted"] = True
+                if not current.stdout.strip():
+                    cleanup["deleted"] = True
+                else:
+                    observed = json.loads(current.stdout)
+                    if (
+                        worker is not None
+                        and observed["metadata"]["uid"] != worker["metadata"]["uid"]
+                    ):
+                        cleanup["deleted"] = True  # The owned incarnation is gone.
+                    elif (
+                        observed["metadata"]
+                        .get("labels", {})
+                        .get("qualification-owner")
+                        != pod_name
+                    ):
+                        raise RuntimeError("Benchmark cleanup ownership differs")
+                    else:
+                        cleanup["created"] = True
+                        cleanup["pod_uid"] = observed["metadata"]["uid"]
+                        run(
+                            kubectl
+                            + [
+                                "delete",
+                                "pod",
+                                pod_name,
+                                "--wait=true",
+                                "--timeout=60s",
+                                "--ignore-not-found",
+                            ],
+                            timeout=75,
+                        )
+                        cleanup["deleted"] = True
         finally:
             (args.output / "cleanup.json").write_text(
                 json.dumps(cleanup, indent=2) + "\n"

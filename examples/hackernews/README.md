@@ -829,3 +829,27 @@ plus the unchanged noncompute allowance, and fit the existing spend ceiling.
 The review is hash-audited, changes only future deposits, preserves original run
 reservations and costs, and constrains both planning and direct reservation.
 It does not establish actual billed spend.
+
+Regional benchmark jobs run under a detached, singleflight supervisor. Launches
+and status checks use short control-plane calls; a lost launch reply cannot start
+a duplicate job, and stdout disconnection cannot terminate the benchmark. The
+worker records terminal status and output on its owned ephemeral filesystem.
+Credential material is sent only through bounded stdin pipes and is absent from
+job descriptors, logs and completion records. Results are copied after confirmed
+completion, with bounded retries; the pod still has a hard lifetime and cleanup
+checks its ownership and incarnation.
+
+`archive_qualification.py --resume-from <failed-run>` admits at most one
+replacement of an unsettled attempt that failed specifically at the Kubernetes
+exec transport. It requires confirmed deletion, the same configuration, inventory
+and engine binary, and no recorded engine failure. Original run/deposit records
+stay intact; an append-only resume admission bounds the aggregate lifetime of
+both pods to two hours, including scheduling, copy and termination allowance.
+It cannot add another reservation, refund exposure, bypass a settled attempt or
+repeat a consumed replacement. The failed original evidence remains available.
+
+The ordinal/lookahead binary completed local public recovery checks for both
+storage profiles. Its first regional cold search measured 7.0 seconds and early
+continuation pages roughly 0.8–1.3 seconds, but the control-plane stream reset
+while returning results. These partial observations are not a passing verdict.
+A complete supervised two-cycle run is required before readiness.

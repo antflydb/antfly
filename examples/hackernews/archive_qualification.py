@@ -33,7 +33,12 @@ import sys
 import time
 import uuid
 
-from archive_budget import exposure, money, validate_future_reservation
+from archive_budget import (
+    admit_transport_resume,
+    exposure,
+    money,
+    validate_future_reservation,
+)
 
 REQUIRED_CHECKS = {
     "remote_bm25",
@@ -316,6 +321,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="Replace a closed transport-failed worker within its existing aggregate reservation",
+    )
+    parser.add_argument(
         "--extend-run-limit",
         action="store_true",
         help="Record an explicitly reviewed retry extension without changing spend limits or prior reservations",
@@ -325,7 +335,11 @@ def main():
     inventory = json.loads(args.inventory.read_text())
     ledger = json.loads(args.ledger.read_text()) if args.ledger.exists() else None
     estimate = plan(config, inventory, ledger)
-    run_id = "hn-poc/archive-qualification/" + uuid.uuid4().hex
+    run_id = (
+        json.loads((args.resume_from / "plan.json").read_text())["run_prefix"]
+        if args.resume_from is not None
+        else "hn-poc/archive-qualification/" + uuid.uuid4().hex
+    )
     r = config["resources"]
     command = [
         sys.executable,
@@ -393,6 +407,7 @@ def main():
             "archive_inventory.py",
             "regional.py",
             "poc.py",
+            "regional_worker.py",
         )
     }
     # Check live object versions before spending a run reservation. The regional
@@ -401,11 +416,27 @@ def main():
 
     verify_inventory(inventory)
     args.output.mkdir(parents=True, exist_ok=False)
-    reserve(args.ledger, config, run_id, extend_run_limit=args.extend_run_limit)
+    if args.resume_from is not None:
+        previous = json.loads((args.resume_from / "plan.json").read_text())
+        if previous["binary_revision"] != args.revision:
+            parser.error("Transport resume must use the same engine revision")
+        admit_transport_resume(
+            args.ledger,
+            args.resume_from,
+            config,
+            binary_digest.hexdigest(),
+            hashlib.sha256(args.inventory.read_bytes()).hexdigest(),
+            args.output,
+        )
+    else:
+        reserve(args.ledger, config, run_id, extend_run_limit=args.extend_run_limit)
     (args.output / "plan.json").write_text(
         json.dumps(
             {
                 "config": config,
+                "resume_from": str(args.resume_from)
+                if args.resume_from is not None
+                else None,
                 "estimate": estimate,
                 "run_prefix": run_id,
                 "binary_revision": args.revision,

@@ -22,12 +22,87 @@ from types import SimpleNamespace
 import importlib.util
 from pathlib import Path
 import unittest
+import hashlib
+import subprocess
 
 spec = importlib.util.spec_from_file_location(
     "hn_regional", Path(__file__).parents[1] / "regional.py"
 )
 regional = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(regional)
+
+
+class DetachedControlTests(unittest.TestCase):
+    def test_lost_launch_reply_and_poll_reset_do_not_change_the_job(self):
+        command = ["python3", "/workspace/poc.py", "--bearer-stdin"]
+        digest = hashlib.sha256(json.dumps(command).encode()).hexdigest()
+        clock = [0]
+        launched = [0]
+        polls = [0]
+
+        def run(argv, **kwargs):
+            if "launch" in argv:
+                launched[0] += 1
+                if launched[0] == 1:
+                    raise subprocess.CalledProcessError(1, argv)
+                return subprocess.CompletedProcess(argv, 0, "{}")
+            polls[0] += 1
+            if polls[0] == 1:
+                raise subprocess.CalledProcessError(1, argv)
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"exit_code": 0, "command_sha256": digest})
+            )
+
+        def sleep(delay):
+            clock[0] += delay
+
+        self.assertEqual(
+            regional.remote_job(
+                run,
+                ["kubectl"],
+                "owned",
+                command,
+                "credential",
+                "/workspace/job",
+                20,
+                now=lambda: clock[0],
+                sleep=sleep,
+            ),
+            0,
+        )
+        self.assertEqual(launched[0], 2)
+        self.assertEqual(polls[0], 2)
+
+    def test_wrong_completion_authority_and_expired_deadline_fail(self):
+        def run(argv, **kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"exit_code": 0, "command_sha256": "wrong"})
+            )
+
+        with self.assertRaisesRegex(ValueError, "authority"):
+            regional.remote_job(
+                run,
+                [],
+                "owned",
+                [],
+                "credential",
+                "/job",
+                2,
+                now=lambda: 0,
+                sleep=lambda _: None,
+            )
+        with self.assertRaisesRegex(RuntimeError, "deadline"):
+            regional.remote_job(
+                run,
+                [],
+                "owned",
+                [],
+                "credential",
+                "/job",
+                0,
+                now=lambda: 0,
+                sleep=lambda _: None,
+            )
 
 
 class ComparativeResultsTest(unittest.TestCase):

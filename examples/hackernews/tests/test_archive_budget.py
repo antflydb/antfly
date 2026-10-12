@@ -19,6 +19,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -99,6 +100,99 @@ class BudgetReconciliationTest(unittest.TestCase):
     def apply_bound(self, evidence):
         self.evidence_path.write_text(json.dumps(evidence))
         return budget.bound_closed_pods(self.ledger, self.evidence_path)
+
+    def test_transport_resume_keeps_deposit_and_requires_closed_matching_work(self):
+        origin = Path(self.directory.name) / "origin"
+        (origin / "regional").mkdir(parents=True)
+        run_id = self.original["runs"][0]["id"]
+        plan = {
+            "config": self.config,
+            "run_prefix": run_id,
+            "binary_sha256": "binary",
+            "inventory_sha256": "inventory",
+        }
+        (origin / "plan.json").write_text(json.dumps(plan))
+        worker = {
+            "kind": "Pod",
+            "metadata": {
+                "name": "hackernews-benchmark-owned",
+                "uid": "owned-uid",
+                "labels": {"app": "hackernews-benchmark"},
+                "creationTimestamp": (
+                    datetime.now(timezone.utc) - timedelta(minutes=10)
+                ).isoformat(),
+            },
+            "spec": {
+                "activeDeadlineSeconds": self.config["lifetime_seconds"],
+                "restartPolicy": "Never",
+                "containers": [
+                    {
+                        "resources": {
+                            "requests": {
+                                "cpu": str(self.config["resources"]["cpu"]),
+                                "memory": str(self.config["resources"]["memory_gib"])
+                                + "Gi",
+                                "ephemeral-storage": str(
+                                    self.config["resources"]["disk_gib"]
+                                )
+                                + "Gi",
+                            }
+                        }
+                    }
+                ],
+            },
+        }
+        (origin / "regional/worker.json").write_text(json.dumps(worker))
+        (origin / "regional/cleanup.json").write_text(
+            json.dumps(
+                {"pod": worker["metadata"]["name"], "created": True, "deleted": True}
+            )
+        )
+        (origin / "verdict.json").write_text(
+            json.dumps({"passed": False, "engine_failures": []})
+        )
+        (origin / "regional/indexed-1.log").write_text(
+            "error: error reading from error stream: connection reset by peer"
+        )
+        before = self.ledger.read_bytes()
+        with self.assertRaises(ValueError):
+            budget.admit_transport_resume(
+                self.ledger,
+                origin,
+                self.config,
+                "wrong",
+                "inventory",
+                origin / "replacement",
+            )
+        self.assertEqual(self.ledger.read_bytes(), before)
+        self.assertEqual(
+            budget.admit_transport_resume(
+                self.ledger,
+                origin,
+                self.config,
+                "binary",
+                "inventory",
+                origin / "replacement",
+            ),
+            run_id,
+        )
+        updated = json.loads(self.ledger.read_text())
+        self.assertEqual(updated["runs"], self.original["runs"])
+        self.assertEqual(updated["budget"], self.original["budget"])
+        self.assertEqual(budget.exposure(updated), budget.exposure(self.original))
+        self.assertLessEqual(
+            updated["transport_resumes"][0]["maximum_aggregate_pod_seconds"], 7200
+        )
+        with self.assertRaises(ValueError):
+            budget.admit_transport_resume(
+                self.ledger,
+                origin,
+                self.config,
+                "binary",
+                "inventory",
+                origin / "another",
+            )
+        self.assertEqual(json.loads(self.ledger.read_text()), updated)
 
     def test_future_deposit_keeps_history_ceiling_and_noncompute_hold(self):
         evidence = {
