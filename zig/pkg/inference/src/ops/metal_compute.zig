@@ -26595,6 +26595,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try cb.checkExecutionControl();
             const q_dim = request.num_attention_heads * layer.head_dim;
             const kv_dim = layer.kv_heads * layer.head_dim;
+            // Attribute queued matrix work with the existing timestamp sampler.
+            // Scopes preserve the single frame and track intra-encoder hazards.
+            var projection_scope = self.beginActivePlannedComputeScopeIfPossible(.quant_linear, .attention_project);
+            defer self.endActivePlannedComputeScope(projection_scope);
             var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
                 .slot = layer.attn_pre_norm_slot,
                 .input = hidden,
@@ -26627,6 +26631,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .out_dim = kv_dim,
                 })) orelse return error.NativeBatchedDecodeUnavailable;
             }
+            self.endActivePlannedComputeScope(projection_scope);
+            projection_scope = false;
             const attn_shape = [_]i32{ @intCast(rows), @intCast(q_dim) };
             const attn_ct = (try allocUninitF32ShapeOp(ctx, &attn_shape)) orelse return error.NativeBatchedDecodeUnavailable;
             defer freeOp(ctx, attn_ct);
@@ -26738,13 +26744,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .output_scale_value = layer.output_scale_value,
             };
             const attn_mt = try self.borrowedMetalTensorFromCt(attn_ct);
-            const block = (try self.finishGatedDecoderBlockFromAttentionOutputMt(&block_request, layer_index, attn_mt, hidden, null)) orelse return error.NativeBatchedDecodeUnavailable;
+            const block = blk: {
+                const scope = self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
+                defer self.endActivePlannedComputeScope(scope);
+                break :blk (try self.finishGatedDecoderBlockFromAttentionOutputMt(&block_request, layer_index, attn_mt, hidden, null)) orelse return error.NativeBatchedDecodeUnavailable;
+            };
             // finishGatedLayerTailMt consumes the block on both success/error.
-            const next_hidden = (try self.finishGatedLayerTailMt(&block_request, layer_index, block, ple_layer_mt)) orelse return error.NativeBatchedDecodeUnavailable;
+            const next_hidden = blk: {
+                const scope = self.beginActivePlannedComputeScopeIfPossible(.ple, .ple);
+                defer self.endActivePlannedComputeScope(scope);
+                break :blk (try self.finishGatedLayerTailMt(&block_request, layer_index, block, ple_layer_mt)) orelse return error.NativeBatchedDecodeUnavailable;
+            };
             hidden.deinit();
             hidden = next_hidden;
             self.timing_stats.active_decode_layers += rows;
         }
+        const tail_scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(tail_scope);
         const hidden_ct = try retainedCtFromMetalTensor(self, &hidden);
         defer freeOp(ctx, hidden_ct);
         const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{

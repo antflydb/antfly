@@ -26190,7 +26190,14 @@ static bool termite_metal_rms_norm_rows_reduce_preferred(
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"))) {
         return rows >= 9u && rows <= 64u && hidden_size >= 1024u;
     }
-    return small_rows_enabled == 1 && rows >= 2u && rows <= 8u && hidden_size >= 1024u;
+    // Matrix OCR and MTP verification must not normalize a full hidden row
+    // serially on a single GPU thread. Keep this coupled to the opt-in matrix
+    // path and preserve the existing global rollback switch.
+    const bool gemma4_matrix = rows >= 2u && rows <= 4u &&
+        termite_metal_env_flag_enabled(getenv("ANTFLY_GEMMA4_METAL_OCR_MULTIROW")) &&
+        !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_SMALL_ROWS_NORM_REDUCE"));
+    return (small_rows_enabled == 1 || gemma4_matrix) &&
+        rows >= 2u && rows <= 8u && hidden_size >= 1024u;
 }
 
 static bool termite_metal_a4b_simd4_rms_norm_rows_preferred(
