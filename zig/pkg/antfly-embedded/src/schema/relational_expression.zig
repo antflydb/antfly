@@ -417,7 +417,14 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5 };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt };
+
+fn numericFunction(op: Op) ?@import("../sql/numeric_functions.zig").Function {
+    return switch (op) {
+        inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @field(@import("../sql/numeric_functions.zig").Function, @tagName(tag)),
+        else => null,
+    };
+}
 
 /// Shared structural grammar for public prechecks and typed compilation.
 /// These rules grant no column/type authority; the pinned compiler owns that.
@@ -428,7 +435,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
         .column => std.mem.eql(u8, name, "column"),
         .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
         .array => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
-        .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
+        .add, .subtract, .multiply, .divide, .modulo, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         else => std.mem.eql(u8, name, "args") or ((isComparison(op) or op == .in_list or op == .not_in_list) and std.mem.eql(u8, name, "collation")),
     };
 }
@@ -437,7 +444,8 @@ pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
         .array => count <= 32,
-        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5 => count == 1,
+        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast, .md5, .abs, .ceil, .floor, .sign, .sqrt => count == 1,
+        .round, .trunc => count == 1 or count == 2,
         .replace => count == 3,
         .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
         .in_list, .not_in_list => count >= 2 and count <= max_nodes,
@@ -774,6 +782,41 @@ pub const Plan = struct {
             budget.* -= result.allocated_bytes;
             return .{ .string = result.bytes };
         }
+        if (numericFunction(node.op)) |function| {
+            // Selected arguments are evaluated before strict NULL propagation.
+            var args: [2]Value = undefined;
+            var has_null = false;
+            for (node.children, 0..) |child, i| {
+                args[i] = try self.evaluateNode(execution, source, child);
+                has_null = has_null or args[i] == .null;
+            }
+            if (has_null) return .null;
+            if (args[0] == .integer) {
+                const input = args[0].integer;
+                return numericCast(.{ .integer = if (input < 0) std.math.negate(input) catch return error.RelationalExpressionOverflow else input }, node.sql_type orelse .int64);
+            }
+            if (args[0] == .number) {
+                const result = @import("../sql/numeric_functions.zig").floating(&execution.numeric, function, args[0].number) catch |err| return executionFailure(err);
+                return numericCast(.{ .number = result }, node.sql_type orelse .float64);
+            }
+            if (function == .abs) return numericOperation(execution, node, args[0..1], self.nodes[node.children[0]]);
+            if (function == .sign) {
+                const view = try binary.layout.View.openWithBudget(args[0].numeric, .{}, &execution.numeric);
+                const sign: exact.Value = if (view.kind == .nan) .{ .kind = .nan } else if (view.kind == .finite and view.count == 0) .{} else .{ .digits = &.{1}, .negative = view.negative or view.kind == .negative_infinity };
+                var scratch: NumericScratch = undefined;
+                scratch.init(execution);
+                defer scratch.deinit();
+                return scratch.encode(sign) catch |err| return scratch.failure(err);
+            }
+            var scratch: NumericScratch = undefined;
+            scratch.init(execution);
+            defer scratch.deinit();
+            const input = numericOperand(&execution.numeric, args[0], false) catch |err| return scratch.failure(err);
+            const scale: i32 = if (node.children.len == 2) std.math.cast(i32, args[1].integer) orelse return error.RelationalExpressionOverflow else 0;
+            const result = @import("../sql/numeric_functions.zig").numeric(&execution.numeric, function, input, scale) catch |err| return scratch.failure(err);
+            // The scratch owner pins borrowed limbs through canonical encoding.
+            return scratch.encode(result.value) catch |err| return scratch.failure(err);
+        }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
             operands[i] = try self.evaluateNode(execution, source, child);
@@ -847,6 +890,110 @@ pub const Plan = struct {
         }
     }
 };
+
+test "relational index system SQL durable numeric ABS borrows positive payloads without allocation" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "9007199254740993.2500", "NaN", "Infinity", "0.00" }) |input| {
+        const text = try std.fmt.allocPrint(a, "{{\"op\":\"abs\",\"args\":[{{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"{s}\"}}]}}", .{input});
+        defer a.free(text);
+        var definition = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer definition.deinit();
+        var plan = try Plan.init(a, .{}, definition.value, .numeric);
+        defer plan.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const result = try plan.evaluate(none.allocator(), &.{});
+        try std.testing.expectEqual(@intFromPtr(plan.nodes[0].literal.numeric.ptr), @intFromPtr(result.numeric.ptr));
+        try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    }
+}
+
+test "relational index system SQL durable numeric functions validate mixed types and selected errors" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"op":"ceil","sql_type":"float32","args":[{"op":"literal","type":"number","sql_type":"float64","value":1}]}
+        ,
+        \\{"op":"abs","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":1}]}
+        ,
+        "{\"op\":\"ceil\",\"args\":[{\"op\":\"literal\",\"type\":\"integer\",\"value\":1}]}",
+        "{\"op\":\"sqrt\",\"args\":[{\"op\":\"literal\",\"type\":\"number\",\"sql_type\":\"float32\",\"value\":1}]}",
+        "{\"op\":\"round\",\"args\":[{\"op\":\"literal\",\"type\":\"number\",\"value\":1},{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int32\",\"value\":2}]}",
+        "{\"op\":\"trunc\",\"args\":[{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"1\"},{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int64\",\"value\":2}]}",
+    }) |text| {
+        var definition = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer definition.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, .{}, definition.value, .numeric));
+    }
+    var definition = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"round","args":[{"op":"literal","type":"numeric"},{"op":"divide","sql_type":"int32","args":[{"op":"literal","type":"integer","sql_type":"int32","value":1},{"op":"literal","type":"integer","sql_type":"int32","value":0}]}]}
+    , .{});
+    defer definition.deinit();
+    var plan = try Plan.init(a, .{}, definition.value, .numeric);
+    defer plan.deinit();
+    try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(a, &.{}));
+}
+
+test "relational index system SQL durable numeric functions unwind faults and retain shared cancellation" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn definition(alloc: Allocator, function: []const u8) !std.json.Parsed(std.json.Value) {
+            const scale: []const u8 = if (std.mem.eql(u8, function, "round") or std.mem.eql(u8, function, "trunc")) ",{\"op\":\"literal\",\"type\":\"integer\",\"sql_type\":\"int32\",\"value\":2}" else "";
+            const text = try std.fmt.allocPrint(alloc, "{{\"op\":\"{s}\",\"sql_type\":\"numeric\",\"args\":[{{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"123456789.125\"}}{s}]}}", .{ function, scale });
+            defer alloc.free(text);
+            return std.json.parseFromSlice(std.json.Value, alloc, text, .{ .allocate = .alloc_always });
+        }
+        fn prepare(alloc: Allocator, expression: std.json.Value) !void {
+            var plan = try Plan.init(alloc, .{}, expression, .numeric);
+            defer plan.deinit();
+        }
+        fn evaluate(alloc: Allocator, plan: *const Plan) !void {
+            const result = try plan.evaluate(alloc, &.{});
+            if (result.numeric.ptr != plan.nodes[0].literal.numeric.ptr) alloc.free(result.numeric);
+        }
+    };
+    const Control = struct {
+        polls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == self.fail_at) return error.QueryCanceled;
+        }
+    };
+    inline for (comptime std.meta.fieldNames(@import("../sql/numeric_functions.zig").Function)) |function| {
+        var parsed = try Harness.definition(a, function);
+        defer parsed.deinit();
+        // Force arena growth through allocations: backing allocator resize
+        // success may depend on its address/bin history, changing the number
+        // of fault cuts. This also exercises every replacement-allocation cut.
+        var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.prepare, .{parsed.value});
+        var plan = try Plan.init(a, .{}, parsed.value, .numeric);
+        defer plan.deinit();
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.evaluate, .{&plan});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var bytes: usize = max_allocated_bytes;
+        var execution = Execution.init(arena.allocator(), &bytes);
+        var observed: Control = .{};
+        execution.numeric.checkpoint = Control.check;
+        execution.numeric.ptr = &observed;
+        _ = try plan.evaluateWithExecution(&execution, &.{});
+        for (1..observed.polls + 1) |cut| {
+            bytes = max_allocated_bytes;
+            execution = Execution.init(arena.allocator(), &bytes);
+            var control: Control = .{ .fail_at = cut };
+            execution.numeric.checkpoint = Control.check;
+            execution.numeric.ptr = &control;
+            try std.testing.expectError(error.QueryCanceled, plan.evaluateWithExecution(&execution, &.{}));
+            try std.testing.expectError(error.QueryCanceled, execution.charge(0));
+        }
+        bytes = max_allocated_bytes;
+        execution = Execution.init(arena.allocator(), &bytes);
+        execution.numeric.remaining = 0;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+    }
+}
 
 test "relational index system SQL durable text literal patterns compile once and retain invocation limits" {
     const a = std.testing.allocator;
@@ -952,10 +1099,11 @@ fn numericOperation(execution: *Execution, node: Node, operands: []const Value, 
     const input = operands[0];
     if (node.op == .cast and input == .numeric) if (node.numeric_modifier) |modifier|
         return normalizeNumericBinding(execution, input.numeric, modifier, false);
-    if (input == .numeric and (node.op == .negate or (node.op == .cast and node.sql_type == .numeric))) {
+    if (input == .numeric and (node.op == .negate or node.op == .abs or (node.op == .cast and node.sql_type == .numeric))) {
         const View = @import("../common/sql_numeric_layout.zig").View;
         const view = try View.openWithBudget(input.numeric, .{}, &execution.numeric);
         if (node.op == .cast or view.kind == .nan or (view.kind == .finite and view.count == 0)) return input;
+        if (node.op == .abs and !view.negative and view.kind != .negative_infinity) return input;
         try execution.numeric.charge(input.numeric.len);
         const bytes = try allocateOutput(execution.alloc, input.numeric.len, execution.bytes);
         @memcpy(bytes, input.numeric);
@@ -1768,7 +1916,9 @@ test "relational declarations blob views decode boundaries and validate complete
 
 fn finite(value: f64) !Value {
     if (!std.math.isFinite(value)) return error.RelationalExpressionOverflow;
-    return .{ .number = if (value == 0) 0 else value };
+    // SQL scalar results retain signed zero. Ordered keys may normalize its
+    // equality identity, but that must not erase expression result semantics.
+    return .{ .number = value };
 }
 
 fn valueHasKind(value: Value, kind: Kind) bool {
@@ -1957,6 +2107,12 @@ const Compiler = struct {
                             if (candidate.kind != .boolean) return error.InvalidRelationalExpressionType;
                         } else if (!sameOperandType(candidate, operand)) return error.InvalidRelationalExpressionType;
                     }
+                } else if (numericFunction(op) != null) {
+                    if (operand.kind != .integer and operand.kind != .number and operand.kind != .numeric) return error.InvalidRelationalExpressionType;
+                    if (operand.kind == .integer and op != .abs) return error.InvalidRelationalExpressionType;
+                    if (operand.kind == .number and op != .abs and numericIdentity(operand) != .float64) return error.InvalidRelationalExpressionType;
+                    if (children.len == 2 and (operand.kind != .numeric or self.nodes.items[children[1]].kind != .integer or numericIdentity(self.nodes.items[children[1]]) != .int32)) return error.InvalidRelationalExpressionType;
+                    node.sql_type = numericIdentity(operand);
                 } else for (children[1..]) |child| if (!sameOperandType(self.nodes.items[child], operand)) return error.InvalidRelationalExpressionType;
                 if (isComparison(op) or op == .in_list or op == .not_in_list) {
                     if (input.object.get("collation")) |collation| {
@@ -1975,7 +2131,7 @@ const Compiler = struct {
                         if ((operand.kind == .sql_array) != (node.kind == .sql_array)) return error.InvalidRelationalExpressionType;
                         if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
                     },
-                    .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
+                    .add, .subtract, .multiply, .divide, .negate, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     // PostgreSQL has no float4/float8 remainder operator.
                     .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii, .replace, .md5 => if (node.kind != .string) return error.InvalidRelationalExpressionType,
@@ -2001,6 +2157,10 @@ const Compiler = struct {
         if (input.object.get("sql_type")) |identity| {
             if (identity != .string) return error.InvalidRelationalExpressionType;
             const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
+            // Function identity follows its resolved operand. Assignment or
+            // width conversion is an explicit surrounding cast, not an
+            // undeclared float4 overload or narrowed integer ABS operation.
+            if (numericFunction(op) != null and typed != numericIdentity(self.nodes.items[node.children[0]])) return error.InvalidRelationalExpressionType;
             if (node.kind != .sql_array and (node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
             if (node.kind == .sql_array and op == .cast and self.nodes.items[node.children[0]].sql_type != typed) return error.InvalidRelationalExpressionType;
             node.sql_type = typed;

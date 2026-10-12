@@ -1982,6 +1982,7 @@ fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
         if (std.mem.eql(u8, native, "RelationalCheckViolation")) return error.RelationalCheckViolation;
         if (std.mem.eql(u8, native, "RelationalExpressionOverflow")) return error.RelationalExpressionOverflow;
         if (std.mem.eql(u8, native, "RelationalExpressionDivisionByZero")) return error.RelationalExpressionDivisionByZero;
+        if (std.mem.eql(u8, native, "SqlInvalidPowerArgument")) return error.SqlInvalidPowerArgument;
         if (std.mem.eql(u8, native, "SqlFeatureNotSupported")) return error.SqlFeatureNotSupported;
     }
     if (status == 400) return error.SqlTypeMismatch;
@@ -2005,6 +2006,8 @@ test "SQL diagnostics preserve SQLSTATE and Unicode character positions" {
     try std.testing.expectEqualStrings("42601", sqlState(error.InvalidSqlSyntax));
     try std.testing.expectEqualStrings("0A000", sqlState(error.SqlFeatureNotSupported));
     try std.testing.expectEqual(error.SqlFeatureNotSupported, definiteMutationFailure(400, "SqlFeatureNotSupported").?);
+    try std.testing.expectEqual(error.SqlInvalidPowerArgument, definiteMutationFailure(400, "SqlInvalidPowerArgument").?);
+    try std.testing.expectEqualStrings("2201F", sqlState(error.SqlInvalidPowerArgument));
     try std.testing.expectEqual(@as(u16, 501), httpStatus(error.UnsupportedSqlShape));
     try std.testing.expectEqual(@as(u16, 409), httpStatus(error.SqlMutationOutcomeUnknown));
     try std.testing.expectEqual(@as(?i64, 4), characterPosition("éé x", 5));

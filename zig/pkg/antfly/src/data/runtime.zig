@@ -1324,6 +1324,7 @@ const RaftTableApplyStateMachine = struct {
         integrity_handoff_destination_reset_required,
         RelationalExpressionOverflow,
         RelationalExpressionDivisionByZero,
+        SqlInvalidPowerArgument,
         RelationalExpressionBudgetExceeded,
         InvalidRelationalExpressionInput,
         InvalidRelationalGeneratedValue,

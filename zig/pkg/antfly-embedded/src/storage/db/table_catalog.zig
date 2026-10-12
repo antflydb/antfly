@@ -150,6 +150,7 @@ pub const Catalog = struct {
             if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 27 and schema.requires_text_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };
@@ -195,6 +196,19 @@ test "relational index system SQL durable text catalog fences expression readers
     try catalog.validateForSchema(table);
     table.requires_text_expressions = true;
     catalog.schema_format_version = 27;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system SQL durable numeric functions fence catalog readers" {
+    var table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_functions = true };
+    var catalog: Catalog = .{ .schema_format_version = 27, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    table.requires_numeric_functions = false;
+    try catalog.validateForSchema(table);
+    table.requires_numeric_functions = true;
+    catalog.schema_format_version = 28;
     try catalog.validateForSchema(table);
     const restored = try Catalog.decode(&catalog.encode());
     try restored.validateForSchema(table);

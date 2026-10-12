@@ -292,6 +292,10 @@ test "relational declarations public array casts preserve typed NULL and NUMERIC
 test "relational declarations public expression grammar shares typed array numeric CASE and IN shapes" {
     const a = std.testing.allocator;
     for ([_][]const u8{
+        \\{"op":"round","sql_type":"numeric","args":[{"op":"literal","type":"numeric","value":"9007199254740993.255"},{"op":"literal","type":"integer","sql_type":"int32","value":2}]}
+        ,
+        \\{"op":"sqrt","sql_type":"numeric","args":[{"op":"literal","type":"numeric","value":"2"}]}
+        ,
         \\{"op":"array","sql_type":"int32","args":[]}
         ,
         \\{"op":"array","sql_type":"numeric","args":[{"op":"literal","type":"numeric","sql_type":"numeric","value":"12.345"},{"op":"literal","type":"numeric","sql_type":"numeric","value":null}]}
@@ -310,7 +314,7 @@ test "relational declarations public expression grammar shares typed array numer
         defer parsed.deinit();
         try std.testing.expect(valid(parsed.value));
         const op = parsed.value.object.get("op").?.string;
-        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast")) .numeric else if (std.mem.eql(u8, op, "literal") or std.mem.eql(u8, op, "array")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
+        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast") or std.mem.eql(u8, op, "round") or std.mem.eql(u8, op, "sqrt")) .numeric else if (std.mem.eql(u8, op, "literal") or std.mem.eql(u8, op, "array")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
         var plan = try expressions.Plan.init(a, .{}, parsed.value, expected);
         defer plan.deinit();
         var arena = std.heap.ArenaAllocator.init(a);

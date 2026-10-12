@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .sql_invalid_power_argument, .err = error.SqlInvalidPowerArgument },
     .{ .status = .immutable_relational_index_definition_conflict, .err = error.ImmutableRelationalIndexDefinitionConflict },
     .{ .status = .invalid_index_publication_candidate, .err = error.InvalidIndexPublicationCandidate },
     .{ .status = .invalid_private_index_cancellation, .err = error.InvalidPrivateIndexCancellation },
@@ -1035,6 +1036,8 @@ test "seed replica policy mismatch survives compiled runtime boundaries" {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    try std.testing.expectEqual(abi.Status.sql_invalid_power_argument, statusFromError(error.SqlInvalidPowerArgument));
+    try std.testing.expectError(error.SqlInvalidPowerArgument, statusToError(.sql_invalid_power_argument));
     // Typed occupancy is a publication precondition, not an undeclared
     // provider defect or proof of an uncertain admitted mutation.
     const occupancy = failureFromError(error.CatalogOccupancyNotReady, .storage_owner, abi.abi_version, 23);

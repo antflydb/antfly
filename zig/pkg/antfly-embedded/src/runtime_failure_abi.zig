@@ -754,6 +754,7 @@ pub const Status = enum(u32) {
     private_index_publication_canceled = 794,
     private_index_publication_required = 795,
     relational_index_catalog_schema_mismatch = 796,
+    sql_invalid_power_argument = 797,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

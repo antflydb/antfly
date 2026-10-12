@@ -5,6 +5,18 @@ from antfly.client_generated.models.relational_expression_type import Relational
 from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
 
 
+def test_generated_numeric_functions_round_trip_typed_scale_and_exact_literal():
+    for function in ("abs", "ceil", "floor", "round", "trunc", "sign", "sqrt"):
+        args = [{"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.5"}]
+        if function in ("round", "trunc"):
+            args.append({"op": "literal", "type": "integer", "sql_type": "int32", "value": -2})
+        source = {"column": "n", "expression": {"op": function, "sql_type": "numeric", "args": args}}
+        model = RelationalColumnExpression.from_dict(source)
+        assert model.expression.op.value == function
+        assert model.expression.sql_type is SQLBuiltinType.NUMERIC
+        assert model.to_dict() == source
+
+
 def test_generated_text_expression_operations_round_trip_recursively():
     source = {
         "column": "digest",

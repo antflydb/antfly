@@ -2342,6 +2342,70 @@ test "relational index system partial membership discharges uncovered predicates
     std.debug.print("partial-index uncovered membership predicate rows=128 primary_probes=0 residual_fallback_probes=128\n", .{});
 }
 
+test "relational index system SQL durable numeric functions survive LSM reopen and portable restore" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("durable-numeric-index");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("durable-numeric-restored");
+    defer target.cleanup();
+    var archive: std.ArrayList(u8) = .empty;
+    defer archive.deinit(alloc);
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        var create = try @import("../../sql/compiler.zig").compile(alloc, "CREATE TABLE t (id integer, n numeric, g numeric GENERATED ALWAYS AS (round(n,2)) STORED, d numeric DEFAULT trunc(9.876::numeric,2), CHECK (sqrt(n) >= 0))", .{});
+        defer create.deinit();
+        const schema_bytes = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(alloc, create.statement.create_table);
+        defer alloc.free(schema_bytes);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var public = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), schema_bytes, .{ .parse_numbers = false });
+        var index = try @import("../../sql/compiler.zig").compile(alloc, "CREATE INDEX tenant_id ON t ((round(n,2))) INCLUDE (id,n,g,d)", .{});
+        defer index.deinit();
+        _ = try @import("../../sql/schema_ddl.zig").apply(arena.allocator(), &public, index.statement.catalog_ddl);
+        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), public, .{});
+        try seed.setSchemaJson(alloc, encoded);
+        try std.testing.expect(seed.core.schema.?.requires_numeric_functions);
+        try seed.batch(.{ .writes = &.{
+            .{ .key = "r1", .value = "{\"id\":1,\"n\":9007199254740993.255}" },
+            .{ .key = "r2", .value = "{\"id\":2,\"n\":1.255}" },
+        } });
+        _ = try ready(&seed);
+        try @import("../portable_backup.zig").exportPortable(alloc, seed.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_numeric_functions);
+        _ = try ready(db);
+        const generation = (try db.relationalIndexBuildStatus("tenant_id")).generation;
+        var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "n", "g", "d" } });
+        defer reader.deinit();
+        var page = try reader.nextTypedPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        for (page.rows) |row| {
+            const object = row.typed.?.object;
+            const value = object.get("g").?;
+            const expected: []const u8 = if (object.get("id").?.integer == 1) "9007199254740993.26" else "1.26";
+            try std.testing.expectEqualStrings(expected, if (value == .number_string) value.number_string else value.string);
+            const default = object.get("d").?;
+            try std.testing.expectEqualStrings("9.87", if (default == .number_string) default.number_string else default.string);
+        }
+        try std.testing.expectError(error.SqlInvalidPowerArgument, db.batch(.{ .writes = &.{
+            .{ .key = "not-committed", .value = "{\"id\":3,\"n\":2}" },
+            .{ .key = "invalid", .value = "{\"id\":4,\"n\":-1}" },
+        } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "r2", .value = "{\"id\":2,\"n\":2.345}" }} });
+        try std.testing.expectEqual(generation, (try db.relationalIndexBuildStatus("tenant_id")).generation);
+    }
+}
+
 test "relational index system durable text indexes and CHECKs survive LSM reopen and portable restore" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("durable-text-index");
     defer directory.cleanup();

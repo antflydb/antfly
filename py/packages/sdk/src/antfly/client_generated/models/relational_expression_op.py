@@ -2,16 +2,19 @@ from enum import StrEnum
 
 
 class RelationalExpressionOp(StrEnum):
+    ABS = "abs"
     ADD = "add"
     AND = "and"
     ARRAY = "array"
     CASE_WHEN = "case_when"
     CAST = "cast"
+    CEIL = "ceil"
     COALESCE = "coalesce"
     COLUMN = "column"
     CONCAT = "concat"
     DIVIDE = "divide"
     EQ = "eq"
+    FLOOR = "floor"
     GT = "gt"
     GTE = "gte"
     IN_LIST = "in_list"
@@ -32,7 +35,11 @@ class RelationalExpressionOp(StrEnum):
     NOT_IN_LIST = "not_in_list"
     OR = "or"
     REPLACE = "replace"
+    ROUND = "round"
+    SIGN = "sign"
+    SQRT = "sqrt"
     SUBTRACT = "subtract"
+    TRUNC = "trunc"
     UPPER_ASCII = "upper_ascii"
 
     def __str__(self) -> str:

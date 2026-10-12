@@ -281,17 +281,20 @@ fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, 
                     .mod => "modulo",
                     .replace => "replace",
                     .md5 => "md5",
+                    inline .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt => |tag| @tagName(tag),
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
                 if (part.function == .mod and kind != .integer and instruction.type.element_type != .numeric) return error.UnsupportedSqlShape;
-                for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce or part.function == .mod)
+                for (args, part.args, 0..) |*arg, index, position| arg.* = if ((part.function == .round or part.function == .trunc) and position == 1)
+                    try promoteNumeric(alloc, values[index], program.instructions[index].type, .{ .kind = .integer, .element_type = .int32 })
+                else if (part.function == .coalesce or part.function == .mod or part.function == .abs or part.function == .ceil or part.function == .floor or part.function == .round or part.function == .trunc or part.function == .sign or part.function == .sqrt)
                     try promoteNumeric(alloc, values[index], program.instructions[index].type, instruction.type)
                 else
                     values[index];
                 if (part.function == .coalesce and args.len == 1) break :blk args[0];
                 var result = try json(alloc, .{ .op = op, .args = args });
-                if (part.function == .mod) if (instruction.type.element_type) |identity| try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+                if (part.function == .mod or part.function == .abs or part.function == .ceil or part.function == .floor or part.function == .round or part.function == .trunc or part.function == .sign or part.function == .sqrt) if (instruction.type.element_type) |identity| try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
                 break :blk result;
             },
             .cast => |part| blk: {
@@ -1066,6 +1069,55 @@ test "SQL schema partial index constant bounds match PostgreSQL domains and erro
             else => unreachable,
         }
     }
+}
+
+test "SQL durable numeric functions lower and execute independent PostgreSQL contracts" {
+    const a = std.testing.allocator;
+    const native = @import("../schema/relational_expression.zig");
+    const storage = @import("../storage/schema.zig");
+    const exact = @import("numeric_value.zig");
+    const Entry = struct { domain: enum { numeric, float64 }, input: ?[]const u8, sql: []const u8, expected: ?[]const u8, sqlstate: ?[]const u8 };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_numeric_functions_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var exercised: usize = 0;
+    for (fixture.value.entries) |entry| {
+        // Durable float cells currently admit finite values only. NUMERIC has
+        // its own exact special-value representation; do not alias the two.
+        const floating: ?f64 = if (entry.domain == .float64 and entry.input != null) try @import("builtin_cast.zig").floatValue(f64, .{ .string = entry.input.? }) else null;
+        if (floating) |value| if (!std.math.isFinite(value)) continue;
+        exercised += 1;
+        errdefer std.debug.print("durable numeric oracle: {s}\n", .{entry.sql});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const schema = try json(owned, .{ .storage_mode = "relational", .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .n = .{ .type = "number", .@"x-antfly-sql-type" = if (entry.domain == .numeric) "numeric" else "float64" } } } } } });
+        const sql = try std.mem.replaceOwned(u8, owned, entry.sql, "$1", "n");
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        const lowered = try lower(owned, schema, compiled.expression, null);
+        const columns = [_]storage.RelationalColumn{.{ .name = "n", .path = "n", .column_type = if (entry.domain == .numeric) .numeric else .number, .sql_element_type = if (entry.domain == .numeric) .numeric else .float64, .allows_null = true }};
+        var plan = try native.Plan.init(a, .{ .relational_columns = &columns }, lowered, if (entry.domain == .numeric) .numeric else .number);
+        defer plan.deinit();
+        var bytes: usize = native.max_allocated_bytes;
+        var execution = native.Execution.init(owned, &bytes);
+        const input: native.Value = if (entry.input == null) .null else if (entry.domain == .numeric) try native.numericJson(&execution, .{ .string = entry.input.? }) else .{ .number = floating.? };
+        const result = plan.evaluateWithExecution(&execution, &.{input}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(entry.expected == null, result == .null);
+        if (result == .null) continue;
+        if (entry.domain == .numeric) {
+            var output = try @import("numeric_binary.zig").decodeCanonical(&execution.numeric, result.numeric);
+            defer output.deinit();
+            try std.testing.expectEqualStrings(entry.expected.?, try exact.format(&execution.numeric, output.value));
+        } else {
+            var hex: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(entry.expected.?, try std.fmt.bufPrint(&hex, "{x:0>16}", .{@as(u64, @bitCast(result.number))}));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 189), exercised);
 }
 
 test "SQL schema partial bounds never fold columns or erase comparison promotions" {

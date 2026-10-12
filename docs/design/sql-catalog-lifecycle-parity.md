@@ -4032,3 +4032,54 @@ and the 2,051-file Apache boundary passed. No public contract changed, so client
 generation was not required. Cache GC remains preview-only while unrelated
 worktrees have active builds. This is neither remote CI qualification nor
 durable numeric-function activation or complete original-case parity.
+
+### Durable typed numeric-function activation
+
+The durable VM and SQL declaration lowering now consume the shared ABS, CEIL,
+FLOOR, ROUND, TRUNC, SIGN and SQRT boundary. Lowering preserves the resolved
+result domain and promotes operands before persistence; ROUND/TRUNC keep their
+separate int32 scale operand rather than coercing it to NUMERIC. Native typed
+compilation rejects unpromoted integer/real overloads and mixed-domain public
+programs. Selected arguments evaluate before strict NULL propagation.
+
+ASCH/catalog capability 28 fences these functions independently of physical
+column types and older arithmetic capabilities. Derivation covers generated
+columns, defaults, CHECKs, relational index keys and UNIQUE keys, including an
+isolated UNIQUE owner without its companion physical index. Runtime cloning,
+serialization/preflight validation and catalog restore retain the bit; text
+projection identity explicitly excludes it. Public operations and client enums
+come from OpenAPI regeneration, with SDK transport/admission regressions.
+
+Durable ABS borrows canonical positive, zero and special payloads without
+allocating, and flips negative canonical signs without decoding coefficients.
+SIGN inspects canonical metadata and encodes its tiny result without building
+an input limb vector. Other functions use bounded unpublished numeric scratch,
+one invocation work/cancellation identity and canonical result encoding. Scalar
+floating results retain signed zero; ordered-key equality normalization must
+not erase expression semantics. Negative SQRT retains SQLSTATE 2201F through
+the semantic ABI, C classification, replicated apply and HTTP mutation boundary;
+it is not an unregistered provider failure or a retryable restore condition.
+
+The durable PostgreSQL matrix exercises all 147 exact NUMERIC contracts plus
+42 finite/NULL float contracts, for 189 total. Existing durable floating cells
+do not admit nonfinite payloads; query-only special-float coverage is not claimed
+as durable coverage. New native tests cover zero-allocation payload borrowing,
+malformed overloads/scales, selected argument errors, all allocation failures
+and observed cancellation cuts. LSM qualification spans exact generated values,
+defaults, CHECK domain failures, index-only reads, atomic failed batches, updates,
+restart and portable restore. Typed JSON extraction and original-case public/
+distributed index authority evidence remain separate open work; no original
+inventory disposition changes are justified by this activation alone.
+
+Durable activation qualification uses Debug for correctness: 764 SQL-owner and
+226 linked tests passed (three existing skips, 21/21 build steps), 218 native
+lifecycle tests plus one linked test passed (50/50 steps), and four mounted
+HTTP/public-contract checks passed (80/80 steps), all without failures or leaks.
+Nine live PostgreSQL oracle tests passed. Go SDK checks, eight Python expression
+tests, TypeScript type checking and 484 TypeScript tests passed (one skip).
+OpenAPI generation, formatting, source-catalog freshness, inventory integrity
+and the 2,051-file Apache boundary passed. Initial allocation-sweep instability
+was corrected by disabling backing-allocator resize, retaining every allocation
+cut; unmatched focused-test selectors were corrected before qualification.
+Fresh origin/main was already incorporated. This is local qualification, not
+remote CI or complete original-case parity; 898 originals remain unresolved.

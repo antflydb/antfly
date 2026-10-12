@@ -20,6 +20,13 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   upper_ascii: [1, 1],
   replace: [3, 3],
   md5: [1, 1],
+  abs: [1, 1],
+  ceil: [1, 1],
+  floor: [1, 1],
+  round: [1, 2],
+  trunc: [1, 2],
+  sign: [1, 1],
+  sqrt: [1, 1],
   eq: [2, 2],
   ne: [2, 2],
   gt: [2, 2],
@@ -35,7 +42,21 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   not: [1, 1],
 };
 const operations = new Set(Object.keys(arities));
-const numericOperations = new Set(["add", "subtract", "multiply", "divide", "modulo", "negate"]);
+const numericOperations = new Set([
+  "add",
+  "subtract",
+  "multiply",
+  "divide",
+  "modulo",
+  "negate",
+  "abs",
+  "ceil",
+  "floor",
+  "round",
+  "trunc",
+  "sign",
+  "sqrt",
+]);
 const integerIdentities = new Set(["int16", "int32", "int64"]);
 const floatIdentities = new Set(["float32", "float64"]);
 const comparisons = new Set([

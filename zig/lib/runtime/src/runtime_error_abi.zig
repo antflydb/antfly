@@ -752,6 +752,7 @@ pub const Detail = enum(c_int) {
     missing_relational_index_definitions,
     index_owner_receipt_changed,
     invalid_index_owner_receipt,
+    sql_invalid_power_argument,
 };
 
 test "native index claim failures preserve typed callback boundary identities" {
@@ -907,6 +908,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlInvalidPowerArgument => status(.invalid_argument, .sql_invalid_power_argument),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
         error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
@@ -1631,6 +1633,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_invalid_power_argument => "SqlInvalidPowerArgument",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
         .sql_index_already_exists => "SqlIndexAlreadyExists",

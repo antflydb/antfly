@@ -117,6 +117,29 @@ func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
 	}
 }
 
+func TestRelationalNumericFunctionOperations(t *testing.T) {
+	for _, op := range []oapi.RelationalExpressionOp{oapi.RelationalExpressionOpAbs, oapi.RelationalExpressionOpCeil, oapi.RelationalExpressionOpFloor, oapi.RelationalExpressionOpRound, oapi.RelationalExpressionOpTrunc, oapi.RelationalExpressionOpSign, oapi.RelationalExpressionOpSqrt} {
+		if !op.Valid() {
+			t.Fatalf("generated numeric operation rejected: %s", op)
+		}
+		source := RelationalScalarExpression{Op: op, SqlType: oapi.SQLBuiltinTypeNumeric, Args: []RelationalScalarExpression{{Op: oapi.RelationalExpressionOpLiteral, Type: oapi.RelationalExpressionTypeNumeric, SqlType: oapi.SQLBuiltinTypeNumeric, Value: "9007199254740993.5"}}}
+		if op == oapi.RelationalExpressionOpRound || op == oapi.RelationalExpressionOpTrunc {
+			source.Args = append(source.Args, RelationalScalarExpression{Op: oapi.RelationalExpressionOpLiteral, Type: oapi.RelationalExpressionTypeInteger, SqlType: oapi.SQLBuiltinTypeInt32, Value: -2})
+		}
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var restored RelationalScalarExpression
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if restored.Op != op || restored.SqlType != oapi.SQLBuiltinTypeNumeric || restored.Args[0].Value != source.Args[0].Value || len(restored.Args) != len(source.Args) {
+			t.Fatalf("numeric identity or exact literal lost: %s", encoded)
+		}
+	}
+}
+
 func TestRelationalTextExpressionOperations(t *testing.T) {
 	var expression RelationalScalarExpression
 	if err := json.Unmarshal([]byte("{\"op\":\"md5\",\"args\":[{\"op\":\"replace\",\"args\":[{\"op\":\"column\",\"column\":\"s\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"X\"}]}]}"), &expression); err != nil {

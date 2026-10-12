@@ -479,7 +479,7 @@ components:
 
     RelationalExpressionOp:
       type: string
-      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5]
+      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt]
 
     RelationalExpressionType:
       type: string
@@ -507,6 +507,15 @@ components:
         including when nested inside scalar/boolean expressions. Literal search
         patterns are prepared with immutable plans; matching, copies and dynamic
         pattern preparation share invocation work/cancellation admission.
+        Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require
+        reader capability version 28, even when nested in boolean programs.
+        They take one NUMERIC or float64 argument; abs also preserves integer
+        widths and float32. round and trunc optionally accept an int32 scale
+        as a second argument only for NUMERIC. Operands must already have their
+        resolved SQL types; SQL lowering inserts required promotions. NUMERIC
+        round uses ties away from zero; float64 round uses ties to even. All
+        selected arguments evaluate before strict NULL propagation. NUMERIC
+        execution never converts through float and shares invocation admission.
         Allocations and byte-comparison operand work share a 4 MiB evaluation budget per
         row and expression set. An integer literal may use a decimal string
         for exact int64 transport; blob uses base64 and datetime uses the
