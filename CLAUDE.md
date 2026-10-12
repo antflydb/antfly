@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Worktrees and Build Caches
+
+Work in a git worktree under `.worktrees/<name>` created from `origin/main`. Keep build caches inside that worktree, never in a temporary `--cache-dir`, and run `make gc` after long build sessions. Details are in @AGENTS.md.
+
 ## Project Overview
 
 Antfly is a distributed key-value store and vector search engine with a Zig server runtime. It provides hybrid search capabilities combining full-text search (BM25) with vector similarity search, supporting multimodal data (images, audio, video) and various embedding models.
@@ -51,6 +55,7 @@ See `docs/architecture.mdx` for full details.
 ```bash
 make build              # All binaries + frontend + codegen
 make generate           # After OpenAPI/proto changes (SDKs, docs, protobufs)
+make gc                 # Garbage-collect build caches across all worktrees
 ```
 
 ## Testing

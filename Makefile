@@ -48,6 +48,8 @@ help:
 	@echo "  install-git-hooks  Configure Git to use the repository hooks in .githooks/"
 	@echo "  update-deps        Update Go dependencies"
 	@echo "  download-omni-deps Download ONNX Runtime and PJRT archives"
+	@echo "  gc                 Garbage-collect build caches (Zig/Rust/Go/uv/Node) across all worktrees"
+	@echo "                     Options: DRY_RUN=1 GC_MAX_AGE_DAYS=3 GC_MAX_GB=20 GC_ACTIVE_MINUTES=30"
 	@echo ""
 	@echo "TLA+ Verification Commands:"
 	@echo "  tla-tools          Download TLA+ tools (tla2tools.jar, CommunityModules)"
@@ -176,6 +178,10 @@ fmt-check:
 
 repository-check:
 	scripts/ci/check.sh all
+
+.PHONY: gc
+gc: ## Garbage-collect build caches across the checkout, all worktrees, and user caches.
+	scripts/cache_gc.sh
 
 lint:
 	@for mod in $(GO_MODULES); do \
