@@ -3798,19 +3798,37 @@ pub const HttpHandler = struct {
                 return error.InvalidQueryRequest;
             projection_metric_value_names[i] = metric_value_names[dependency_index];
         }
+        const owned_projection_names = try self.alloc.alloc([]u8, projection_name_count);
+        var owned_name_count: usize = 0;
+        var projection_names_owned = true;
+        errdefer if (projection_names_owned) {
+            for (owned_projection_names[0..owned_name_count]) |name| self.alloc.free(name);
+            self.alloc.free(owned_projection_names);
+        };
+        for (projection_metric_value_names, owned_projection_names) |name, *owned| {
+            owned.* = try self.alloc.dupe(u8, name);
+            owned_name_count += 1;
+        }
         const previous_metric_values_slab = result.metric_values_slab;
-        const replacement_metric_values_slab = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumns(
+        const replacement_columns = try graph_query_mod.GraphQueryEngine.materializeSelectedMetricColumnsCompact(
             self.alloc,
-            projection_metric_value_names,
+            self.alloc,
+            self.alloc,
+            owned_projection_names,
             projection_columns,
             active_rows,
             &result.nodes,
         );
-        result.metric_values_slab = replacement_metric_values_slab;
+        projection_names_owned = false;
+        result.metric_values_slab = &.{};
         if (previous_metric_values_slab.len > 0) self.alloc.free(previous_metric_values_slab);
+        if (result.metric_columns) |owner| owner.deinit(self.alloc);
+        result.metric_columns = replacement_columns;
         for (result.metric_value_names) |name| self.alloc.free(name);
         if (result.metric_value_names.len > 0) self.alloc.free(result.metric_value_names);
-        result.metric_value_names = metric_value_names;
+        result.metric_value_names = &.{};
+        for (metric_value_names) |name| self.alloc.free(name);
+        self.alloc.free(metric_value_names);
         metric_names_owned = false;
         for (result.metric_status) |*status| status.deinit(self.alloc);
         if (result.metric_status.len > 0) self.alloc.free(result.metric_status);

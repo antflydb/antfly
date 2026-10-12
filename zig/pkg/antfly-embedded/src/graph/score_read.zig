@@ -610,7 +610,25 @@ fn populateColumnsUsingScope(
                         var offset: usize = 0;
                         while (offset < nodes.len) {
                             const end = @min(nodes.len, offset + max_keys_per_read);
-                            stats.batches += try active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]);
+                            stats.batches += active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]) catch |err| switch (err) {
+                                error.OutOfMemory, error.ResourceBudgetExceeded => retry: {
+                                    // Inputs and outputs belong to the caller. Retire
+                                    // the failed lease, then retry once at the same
+                                    // transaction checkpoint without cached scratch.
+                                    active.close();
+                                    scope = null;
+                                    scope = try txn.openReadScope(caller_alloc);
+                                    if (comptime @hasDecl(Scope, "beginScoreBatch")) {
+                                        if (@typeInfo(@TypeOf(active.beginScoreBatch())) == .error_union) {
+                                            active.beginScoreBatch() catch |batch_err| {
+                                                if (batch_err != error.Unsupported) return batch_err;
+                                            };
+                                        } else active.beginScoreBatch();
+                                    }
+                                    break :retry try active.readSortedScoreColumn(name, nodes[offset..end], column[offset..end]);
+                                },
+                                else => return err,
+                            };
                             stats.keys += end - offset;
                             offset = end;
                         }
@@ -1142,4 +1160,62 @@ test "graph metric physical compact chunk fallback overwrites partial pressure d
         for (columns[1]) |value| try std.testing.expect(value == null);
         try std.testing.expectEqualSlices(?f64, &columns[0], &columns[2]);
     }
+}
+
+test "graph metric typed spans retire failed lease and retry once without clearing completed columns" {
+    const backend = @import("../storage/backend_erased.zig");
+    const Txn = struct {
+        calls: usize = 0,
+        opened: usize = 0,
+        closed: usize = 0,
+        always_fail: bool = false,
+        const Parent = @This();
+        const Scope = struct {
+            parent: *Parent,
+            pub fn beginScoreBatch(_: *@This()) void {}
+            pub fn resetScoreBatch(_: *@This()) void {}
+            pub fn close(self: *@This()) void {
+                self.parent.closed += 1;
+            }
+            pub fn readSortedScoreColumn(self: *@This(), prefix: []const u8, nodes: []const []const u8, values: []f64) !usize {
+                self.parent.calls += 1;
+                if (self.parent.always_fail or self.parent.calls == 2) {
+                    @memset(values, 99);
+                    return error.OutOfMemory;
+                }
+                try std.testing.expectEqual(nodes.len, values.len);
+                @memset(values, if (std.mem.eql(u8, prefix, "first")) 1 else 2);
+                return 1;
+            }
+            pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                return error.Unsupported;
+            }
+            pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+                return error.Unsupported;
+            }
+        };
+        pub fn openReadScope(self: *@This(), a: std.mem.Allocator) !backend.ReadScope {
+            const scope = try backend.readScopeFrom(a, Scope{ .parent = self });
+            self.opened += 1;
+            return scope;
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.Unsupported;
+        }
+    };
+    var txn = Txn{};
+    var first: [3]f64 = undefined;
+    var second: [3]f64 = undefined;
+    const stats = try populateFloatColumns(std.testing.allocator, &txn, &.{ "first", "second" }, &.{ "a", "b", "c" }, &.{ &first, &second });
+    try std.testing.expectEqual(@as(usize, 6), stats.keys);
+    try std.testing.expectEqualSlices(f64, &.{ 1, 1, 1 }, &first);
+    try std.testing.expectEqualSlices(f64, &.{ 2, 2, 2 }, &second);
+    try std.testing.expectEqual(@as(usize, 2), txn.opened);
+    try std.testing.expectEqual(txn.opened, txn.closed);
+    txn = .{ .always_fail = true };
+    try std.testing.expectError(error.OutOfMemory, populateFloatColumns(std.testing.allocator, &txn, &.{ "first", "second" }, &.{ "a", "b", "c" }, &.{ &first, &second }));
+    try std.testing.expectEqual(@as(usize, 2), txn.calls);
+    try std.testing.expectEqual(txn.opened, txn.closed);
+    for (first) |value| try std.testing.expect(std.math.isNan(value));
+    for (second) |value| try std.testing.expect(std.math.isNan(value));
 }

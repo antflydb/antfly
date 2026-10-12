@@ -3142,8 +3142,9 @@ pub const Txn = struct {
             // chunks. Separate key/byte owners can leave earlier chunks live
             // for every span of a large ordinary read.
             const metadata = try std.math.mul(usize, nodes.len, @sizeOf([]const u8));
-            const storage = try encoder.alignedAlloc(u8, .fromByteUnits(@alignOf([]const u8)), try std.math.add(usize, metadata, bytes));
-            defer encoder.free(storage);
+            const storage_size = try std.math.add(usize, metadata, bytes);
+            const storage = if (self.workspace) |w| try w.scoreKeyStorage(storage_size) else try encoder.alignedAlloc(u8, .fromByteUnits(@alignOf([]const u8)), storage_size);
+            defer if (self.workspace == null) encoder.free(storage);
             const keys = @as([*][]const u8, @ptrCast(@alignCast(storage.ptr)))[0..nodes.len];
             var encoded = std.ArrayListUnmanaged(u8).empty;
             encoded.items = storage[metadata..][0..0];
@@ -10452,11 +10453,13 @@ test "lite prepared sparse compaction measurement" {
     const rows = 50000;
     const nodes = try a.alloc(q.GraphResultNode, rows);
     defer a.free(nodes);
-    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0 };
+    const key_storage = try a.alloc([8]u8, rows);
+    defer a.free(key_storage);
+    for (nodes, key_storage, 0..) |*node, *key, row| node.* = .{ .key = try std.fmt.bufPrint(key, "{d:0>8}", .{row}), .depth = 0, .distance = 0 };
     const Reader = struct {
         pub fn readDecodedColumns(_: *@This(), _: std.mem.Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
             for (columns) |column| {
-                for (keys, column, 0..) |_, *value, i| value.* = @floatFromInt(i);
+                for (keys, column) |key, *value| value.* = @floatFromInt(try std.fmt.parseInt(usize, key, 10));
             }
         }
     };
@@ -10521,7 +10524,9 @@ test "lite prepared sparse compaction falls back within original working budget"
     const n = 16000;
     const nodes = try a.alloc(q.GraphResultNode, n);
     defer a.free(nodes);
-    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0 };
+    const key_storage = try a.alloc([8]u8, n);
+    defer a.free(key_storage);
+    for (nodes, key_storage, 0..) |*node, *key, row| node.* = .{ .key = try std.fmt.bufPrint(key, "{d:0>8}", .{row}), .depth = 0, .distance = 0 };
     const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p" };
     var metrics: [16]q.GraphMetricRead = undefined;
     for (&metrics, names) |*metric, name| metric.* = .{ .name = name };
@@ -10532,7 +10537,7 @@ test "lite prepared sparse compaction falls back within original working budget"
     const Reader = struct {
         pub fn readDecodedColumns(_: *@This(), _: std.mem.Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
             for (columns) |column| {
-                for (keys, column, 0..) |_, *value, i| value.* = @floatFromInt(i);
+                for (keys, column) |key, *value| value.* = @floatFromInt(try std.fmt.parseInt(usize, key, 10));
             }
         }
     };
@@ -10613,7 +10618,9 @@ test "lite prepared compaction reserves all group fallbacks before copying" {
     const n = 4097;
     const nodes = try a.alloc(q.GraphResultNode, n);
     defer a.free(nodes);
-    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0 };
+    const key_storage = try a.alloc([8]u8, n);
+    defer a.free(key_storage);
+    for (nodes, key_storage, 0..) |*node, *key, row| node.* = .{ .key = try std.fmt.bufPrint(key, "{d:0>8}", .{row}), .depth = 0, .distance = 0 };
     const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" };
     var metrics: [12]q.GraphMetricRead = undefined;
     for (&metrics, names) |*metric, name| metric.* = .{ .name = name };
@@ -10622,7 +10629,7 @@ test "lite prepared compaction reserves all group fallbacks before copying" {
     const Reader = struct {
         pub fn readDecodedColumns(_: *@This(), _: std.mem.Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
             for (columns) |column| {
-                for (keys, column, 0..) |_, *value, i| value.* = @floatFromInt(i);
+                for (keys, column) |key, *value| value.* = @floatFromInt(try std.fmt.parseInt(usize, key, 10));
             }
         }
     };
@@ -10905,4 +10912,55 @@ test "lite typed score spans preserve binary keys namespaces missing deletions a
     _ = try pending.readSortedScoreColumn("p/", &keys, &values);
     try std.testing.expectEqual(@as(f64, 1), values[1]);
     try std.testing.expect(std.math.isNan(values[4]));
+}
+
+test "lite typed score spans admit exact encoder after warmed graph scratch" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "warm-span.aflite");
+    defer a.free(path);
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = resource_manager_mod.Options.defaultBudgets() });
+    defer manager.deinit(a);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .resource_manager = &manager, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, @bitCast(@as(f64, 1)), .little);
+    try store.file.putDocumentBatch(&.{.{ .key = "00000000\x00\x00", .value = &raw }});
+    const storage = try a.alloc([10]u8, 4096);
+    defer a.free(storage);
+    const keys = try a.alloc([]const u8, 4096);
+    defer a.free(keys);
+    const nodes = try a.alloc([]const u8, 4096);
+    defer a.free(nodes);
+    for (storage, keys, nodes, 0..) |*bytes, *key, *node, i| {
+        _ = try std.fmt.bufPrint(bytes[0..8], "{d:0>8}", .{i});
+        bytes[8] = 0;
+        bytes[9] = 0;
+        key.* = bytes;
+        node.* = bytes[0..8];
+    }
+    var txn = try Txn.openRead(&store);
+    defer txn.abort();
+    var warm_query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer warm_query.deinit();
+    var warm = try txn.openReadScope(warm_query.allocator());
+    var ignored: [4096]?f64 = undefined;
+    try warm.getManySortedScores(keys, &ignored);
+    const w = warm.workspace.?;
+    w.resolved_scores.deinit(w.optionalAllocator());
+    _ = try w.graph.allocator().alloc(u8, 20 * 1024);
+    _ = try w.graph.allocator().alloc(u8, 20 * 1024);
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = w.live + 1024;
+    warm.close();
+    const limit = 400 * 1024;
+    manager.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].budget.hard_limit_bytes = limit;
+    var query = resource_manager_mod.BudgetedAllocator.init(&manager, .dense_search_working_set, a, 1);
+    defer query.deinit();
+    var scope = try txn.openReadScope(query.allocator());
+    defer scope.close();
+    var values: [4096]f64 = undefined;
+    _ = try scope.readSortedScoreColumn("", nodes, &values);
+    try std.testing.expectEqual(@as(f64, 1), values[0]);
+    for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
 }

@@ -3223,7 +3223,7 @@ const CanonicalGraphStep = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.nodes[0..self.node_count]) |*node| {
             for (node.metrics) |*metric| metric.deinit(alloc);
-            if (node.metrics.len > 0) alloc.free(node.metrics);
+            if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
         }
         alloc.free(self.nodes);
         alloc.free(self.path_edges);
@@ -10987,7 +10987,7 @@ fn materializeResultNode(
             null,
         );
         errdefer result.deinit(alloc);
-        result.metrics = try cloneGraphMetricValues(alloc, node.metrics);
+        result.metrics = try node.cloneMetrics(alloc);
         return result;
     }
 
@@ -11010,7 +11010,7 @@ fn materializeResultNode(
         break :blk null;
     };
 
-    const metrics = try cloneGraphMetricValues(alloc, node.metrics);
+    const metrics = try node.cloneMetrics(alloc);
     errdefer {
         for (metrics) |*metric| metric.deinit(alloc);
         if (metrics.len > 0) alloc.free(metrics);
@@ -11041,7 +11041,8 @@ fn reserveMaterializedResultNode(
         return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
     if (node_table) |table| total = std.math.add(usize, total, table.len) catch
         return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
-    for (node.metrics) |metric| {
+    for (0..node.metricCount()) |column| {
+        const metric = node.metricAt(column);
         total = std.math.add(usize, total, @sizeOf(graph_query_mod.GraphMetricValue) + metric.name.len) catch
             return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
     }
@@ -12259,7 +12260,8 @@ fn compareOptionalGraphMetricScore(
 }
 
 fn graphNodeMetricScore(node: graph_query_mod.GraphResultNode, name: []const u8) ?f64 {
-    for (node.metrics) |metric| {
+    for (0..node.metricCount()) |column| {
+        const metric = node.metricAt(column);
         if (std.mem.eql(u8, metric.name, name)) return metric.score;
     }
     return null;
@@ -12288,8 +12290,10 @@ fn retainDistributedGraphProjectedMetrics(
     for (nodes.items) |*node| {
         if (metrics.len == 0) {
             for (node.metrics) |*value| value.deinit(alloc);
-            if (node.metrics.len > 0) alloc.free(node.metrics);
-            node.metrics = @constCast((&[_]graph_query_mod.GraphMetricValue{})[0..]);
+            if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
+            node.metrics = &.{};
+            node.metric_columns = null;
+            node.metrics_owned = true;
             continue;
         }
 
@@ -12308,8 +12312,10 @@ fn retainDistributedGraphProjectedMetrics(
         }
 
         for (node.metrics) |*value| value.deinit(alloc);
-        if (node.metrics.len > 0) alloc.free(node.metrics);
+        if (node.metrics_owned and node.metrics.len > 0) alloc.free(node.metrics);
         node.metrics = retained;
+        node.metric_columns = null;
+        node.metrics_owned = true;
     }
 }
 

@@ -2740,8 +2740,8 @@ test "graph metric maintenance service owners preserve degree freshness while re
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", traversal.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metrics[0].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metricAt(0).score orelse return error.TestUnexpectedResult, 0.001);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].metric_status.len);
     try std.testing.expectEqual(antfly.graph.GraphIndex.GraphMetricState.building, traversal.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(published_generation, traversal.graph_results[0].metric_status[0].published_generation);
@@ -3309,9 +3309,9 @@ test "graph metric maintenance service owners preserve pagerank freshness while 
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:b", traversal.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings("pagerank", traversal.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(traversal.graph_results[0].nodes[0].metrics[0].score != null);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings("pagerank", traversal.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(traversal.graph_results[0].nodes[0].metricAt(0).score != null);
     try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].metric_status.len);
     try std.testing.expectEqual(antfly.graph.GraphIndex.GraphMetricState.building, traversal.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(published_generation, traversal.graph_results[0].metric_status[0].published_generation);

@@ -1776,6 +1776,8 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
     errdefer types.freeGraphMetricStatuses(alloc, metric_status);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
+    const metric_columns = graph_result.metric_columns;
+    graph_result.metric_columns = null;
     const metric_values_slab = graph_result.metric_values_slab;
     graph_result.metric_values_slab = &.{};
     const metric_value_names = graph_result.metric_value_names;
@@ -1785,6 +1787,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
         .name = name,
         .nodes = nodes,
         .metric_values_slab = metric_values_slab,
+        .metric_columns = metric_columns,
         .metric_value_names = metric_value_names,
         .paths = &.{},
         .matches = &.{},

@@ -105,10 +105,17 @@ pub fn executeStorageKernelGraphExpand(
         defer local_graph.freeExpandSearchRequest(alloc, search_req);
         var result = try db.search(alloc, search_req);
         defer result.deinit();
-        var graph_result = if (result.graph_results.len > 0)
-            try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
-        else
-            try local_graph.emptyGraphSearchResult(alloc, req.name);
+        var graph_result = if (result.graph_results.len > 0) take: {
+            if (req.exclude_nodes.len == 0 and req.exclude_edges.len == 0) {
+                // Search and expansion share the allocator, and this result is
+                // consumed exclusively. Transfer all owners, including metric
+                // slabs and statuses, before retiring the source container.
+                const owned = result.graph_results[0];
+                result.graph_results[0] = .{ .name = &.{}, .hits = &.{}, .total_hits = 0 };
+                break :take owned;
+            }
+            break :take try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges);
+        } else try local_graph.emptyGraphSearchResult(alloc, req.name);
         errdefer graph_result.deinit(alloc);
         for (graph_result.hits) |*hit| hit.deinit(alloc);
         if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
