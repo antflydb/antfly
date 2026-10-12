@@ -22,6 +22,7 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 
 pub const DraftLogitSource = enum {
+    cached_target,
     linear_argmax,
     masked_embedding,
     backend_argmax,
@@ -29,6 +30,7 @@ pub const DraftLogitSource = enum {
 
     pub fn name(self: DraftLogitSource) []const u8 {
         return switch (self) {
+            .cached_target => "cached_target",
             .linear_argmax => "linear_argmax",
             .masked_embedding => "masked_embedding",
             .backend_argmax => "backend_argmax",

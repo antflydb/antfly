@@ -640,6 +640,7 @@ pub const MtpProfileStats = struct {
     enabled: bool = false,
     sync_enabled: bool = false,
     draft_steps: usize = 0,
+    cached_target_seeds: usize = 0,
     resident_draft_steps: usize = 0,
     host_draft_steps: usize = 0,
     target_verify_calls: usize = 0,
@@ -1773,6 +1774,12 @@ fn gemma4MtpCachedFirstChoiceAllowed(actual_k: usize, canonical_materialize_avai
     // through the canonical one-row target frame. Otherwise a short final
     // round can fall back to the older verifier and drift from target-only.
     return actual_k > 0 and canonical_materialize_available;
+}
+
+fn gemma4MtpCachedTargetSeedAllowed(actual_k: usize, trusted_activation: bool, resident: bool, deferred: bool) bool {
+    // Keep the existing K=2 verification shape and adaptive acceptance accounting
+    // unchanged. A seed is a target choice, not an assistant prediction.
+    return actual_k == 2 and trusted_activation and resident and !deferred;
 }
 
 fn shouldAcceptSpeculativeBonus(enabled: bool, draft_count: usize, remaining_generation_tokens: usize) bool {
@@ -5139,12 +5146,13 @@ pub const NativeGenerationPipeline = struct {
             const profile = speculative_stats.mtp_profile;
             // Report existing phase counters without inserting GPU fences.
             // These are wall times, not independent GPU kernel durations.
-            std.log.info("mtp_phase_profile: sync={any} draft_ns={d} verify_ns={d} materialize_ns={d} activation_ns={d} fallback_ns={d} draft_steps={d} verify_calls={d} verify_rows={d} materializations={d} corrections={d} bonus={d} deferred={d} runtime_hits={d} runtime_fallbacks={d}", .{
-                profile.sync_enabled,              profile.draft_token_ns,              profile.target_verify_ns,
-                profile.materialization_ns,        profile.activation_copy_ns,          profile.fallback_ns,
-                profile.draft_steps,               profile.target_verify_calls,         profile.target_verify_rows,
-                profile.materializations,          profile.correction_materializations, profile.bonus_materializations,
-                profile.deferred_materializations, profile.dedicated_runtime_hits,      profile.dedicated_runtime_fallbacks,
+            std.log.info("mtp_phase_profile: sync={any} draft_ns={d} verify_ns={d} materialize_ns={d} activation_ns={d} fallback_ns={d} draft_steps={d} cached_seeds={d} verify_calls={d} verify_rows={d} materializations={d} corrections={d} bonus={d} deferred={d} runtime_hits={d} runtime_fallbacks={d}", .{
+                profile.sync_enabled,                profile.draft_token_ns,            profile.target_verify_ns,
+                profile.materialization_ns,          profile.activation_copy_ns,        profile.fallback_ns,
+                profile.draft_steps,                 profile.cached_target_seeds,       profile.target_verify_calls,
+                profile.target_verify_rows,          profile.materializations,          profile.correction_materializations,
+                profile.bonus_materializations,      profile.deferred_materializations, profile.dedicated_runtime_hits,
+                profile.dedicated_runtime_fallbacks,
             });
             std.log.info("mtp_draft_profile: embedding_ns={d} concat_ns={d} preprojection_ns={d} assistant_ns={d} postprojection_ns={d} head_ns={d} selection_ns={d} argmax_ns={d} resident_steps={d} host_steps={d} cross_copies={d}", .{
                 profile.draft_target_embedding_ns, profile.draft_concat_ns,                     profile.draft_preprojection_ns,
@@ -7628,6 +7636,9 @@ pub const NativeGenerationPipeline = struct {
         host: ?[]f32 = null,
         device: ?ops.CT = null,
         cached_target_choice: ?u32 = null,
+        /// True only when the retained activation produced cached_target_choice.
+        /// Predictor activations and the initial prompt activation do not qualify.
+        cached_choice_matches_activation: bool = false,
         /// Defer-materialize fold: a committed token (already counted by
         /// seq_len and present in token_ids) whose target forward/KV write is
         /// deferred to the next verify round. Invariant at every round
@@ -7649,6 +7660,7 @@ pub const NativeGenerationPipeline = struct {
             self.host = activation;
             self.device = null;
             self.cached_target_choice = null;
+            self.cached_choice_matches_activation = false;
         }
 
         fn replaceDevice(self: *Gemma4MtpActivationState, tensor: ops.CT) void {
@@ -7657,6 +7669,7 @@ pub const NativeGenerationPipeline = struct {
             self.host = null;
             self.device = tensor;
             self.cached_target_choice = null;
+            self.cached_choice_matches_activation = false;
         }
 
         fn residentReady(self: *const Gemma4MtpActivationState) bool {
@@ -8801,6 +8814,11 @@ pub const NativeGenerationPipeline = struct {
             use_greedy_device_verifier and
             gemma4MtpResidentDraftBackendAllowed(draft_pipeline.cb.kind());
         if (!use_resident_draft and mtp_activation.host == null) return error.MissingGemma4MtpActivation;
+        const seed_requested = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET", false) and
+            !gemma4MtpAdaptiveKEnabled() and position_mode == .target_constant and
+            hidden_source == .final and mtp_top_k == 0 and canonical_materialize_available;
+        const seed_cached_target = seed_requested and cached_first_target_choice != null and
+            gemma4MtpCachedTargetSeedAllowed(actual_k, mtp_activation.cached_choice_matches_activation, use_resident_draft, defer_materialize);
 
         var host_chain_activation: ?[]f32 = null;
         defer if (!defer_materialize) {
@@ -8829,7 +8847,17 @@ pub const NativeGenerationPipeline = struct {
             profile: gemma4_mtp.DraftStageProfile = .{},
         };
 
-        for (0..actual_k) |_| {
+        if (seed_cached_target) {
+            const seed = cached_first_target_choice.?;
+            draft_tokens[0] = @intCast(seed);
+            token_ids[seq_len.*] = @intCast(seed);
+            draft_source_tokens[0] = token_ids[seq_len.* - 1];
+            assistant_total_sequence_lens[0] = gemma4MtpAssistantTotalSequenceLen(position_mode, seq_len.*, 0);
+            draft_logit_sources[0] = .cached_target;
+            draft_count = 1;
+            if (mtp_profile.enabled) mtp_profile.cached_target_seeds += 1;
+        }
+        for (0..actual_k - draft_count) |_| {
             const source_token = token_ids[seq_len.* + draft_count - 1];
             const assistant_total_sequence_len = gemma4MtpAssistantTotalSequenceLen(position_mode, seq_len.*, draft_count);
             const assistant_ctx = gemma4MtpAssistantDecodeContext(decode_state, position_mode, seq_len.*, draft_count);
@@ -8982,6 +9010,7 @@ pub const NativeGenerationPipeline = struct {
         var next_device_activation: ?ops.CT = null;
         errdefer if (next_device_activation) |activation| draft_pipeline.cb.free(activation);
         var next_cached_target_choice: ?u32 = null;
+        var next_cached_choice_matches_activation = false;
         const accept_bonus = shouldAcceptSpeculativeBonus(
             gemma4MtpAcceptBonusEnabled(self.cb.kind()),
             draft_count,
@@ -9584,7 +9613,7 @@ pub const NativeGenerationPipeline = struct {
                 const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                 const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
                 const have_predictor_activation = next_device_activation != null or next_host_activation != null;
-                if (have_predictor_activation) {
+                if (have_predictor_activation and !(seed_requested and use_resident_draft and !defer_materialize)) {
                     next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
                 } else {
                     if (use_resident_draft) {
@@ -9600,6 +9629,7 @@ pub const NativeGenerationPipeline = struct {
                         if (next_device_activation) |old| draft_pipeline.cb.free(old);
                         next_device_activation = materialized_hidden;
                         next_cached_target_choice = materialized.next_target_choice;
+                        next_cached_choice_matches_activation = next_cached_target_choice != null;
                         if (next_host_activation) |old| {
                             allocator.free(old);
                             next_host_activation = null;
@@ -9614,6 +9644,7 @@ pub const NativeGenerationPipeline = struct {
                         if (next_host_activation) |old| allocator.free(old);
                         next_host_activation = materialized.activation;
                         next_cached_target_choice = materialized.next_target_choice;
+                        next_cached_choice_matches_activation = next_cached_target_choice != null;
                     }
                 }
                 if (mtp_profile.enabled) {
@@ -9641,6 +9672,7 @@ pub const NativeGenerationPipeline = struct {
             next_host_activation = null;
         }
         mtp_activation.cached_target_choice = next_cached_target_choice;
+        mtp_activation.cached_choice_matches_activation = next_cached_choice_matches_activation;
         seq_len.* += accepted;
         try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
         try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
@@ -15809,4 +15841,14 @@ test "MTP canonical hidden falls back when the active backend route is unavailab
     try std.testing.expectEqual(@as(usize, 1), result.rows);
     try std.testing.expectEqual(@as(usize, 4), values.len);
     for (values, 1..) |value, index| try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index)) / @sqrt(@as(f32, 7.5) + pipeline.gpt_config.norm_eps), value, 1e-5);
+}
+
+test "Gemma4 MTP cached target seed requires paired activation and fixed two token shape" {
+    try std.testing.expect(gemma4MtpCachedTargetSeedAllowed(2, true, true, false));
+    for ([_]usize{ 0, 1, 3, 16 }) |k| {
+        try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(k, true, true, false));
+    }
+    try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, false, true, false));
+    try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, true, false, false));
+    try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, true, true, true));
 }
