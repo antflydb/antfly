@@ -3051,3 +3051,39 @@ also passed all 48 Debug build steps and three tests covering fresh control,
 reserved LSM recovery after restart, foreign namespaces and early cancellation.
 All have zero skips, failures or leaks. These component gates do not qualify
 automatic signing, enrollment, full activation or distributed faults.
+
+### Authenticated native fence/reserve transport
+
+Checkpoint `274203c6f6` mounts the internal logical-scope fence/reserve receiver
+beside the existing claims receiver. Both share explicit service-token checks,
+remaining-budget normalization, bounded strict decoding, callback validation
+and client transport. Tokenless migration mode is not authority for either
+operation. The control request is capped at 4 KiB and cannot carry a schema,
+physical allocation, cut, metadata decision or authority flag. The runtime
+rejects incompatible data-Raft authority before acquiring a native owner.
+
+The receiver still obtains fresh permission through its configured metadata
+source and executes at most one durable owner effect. Its owned response
+distinguishes admission from fresh/recovered control, preserves the applying
+root and pending error, and validates scope/cut before serialization. Admission
+cannot claim a receipt or a root. A remote progress response is unsigned and
+does not confer metadata publication authority. Neither the client nor handler
+automatically retries an owner effect.
+
+The final frozen Debug HTTP/publication gate passed all 113 build steps and
+37 component executions: 26 publication, one decoder-floor, two availability
+and the same four HTTP/client tests through two aggregate roots. Those repeated
+executions are not eight distinct contracts. The exact production runtime
+receiver gate passed all 91 build steps and its one selected test. All have
+zero skips, failures or leaks. Tests cover mounted routing, explicit service
+authentication even in migration mode, otherwise-valid unknown-field rejection,
+zero/over-limit budgets, oversized bodies, deadlines, wrong scope, cancellation,
+root retention and no client replay. An earlier combined command rejected an
+empty runtime filter; only the corrected non-empty final gates qualify this
+checkpoint. Optimized transport qualification is still pending.
+
+This connects native controls to serving, not to automatic root signing,
+enrollment/capability activation, a complete build worker or metadata ACK
+submission. Full lifecycle/cohort cancellation/retirement, restore/adoption and
+distributed integrity faults remain open. Public production stays disabled;
+original-case dispositions remain 478/136/73/899.
