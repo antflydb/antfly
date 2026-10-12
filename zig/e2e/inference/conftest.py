@@ -244,6 +244,13 @@ def _server_budget_args() -> list[str]:
     args: list[str] = []
     for env_name, flag in _SERVER_BUDGET_FLAGS:
         raw = env_first(env_name)
+        if raw is None and flag == "--scratch-budget-mb":
+            # The full suite includes Florence encoder output, decoder logits,
+            # KV and workspace. This stays inside the host/process envelopes;
+            # explicit values (including zero) keep their admission semantics.
+            # Keep the suite policy in checked-out code: PR CI uses main's
+            # reusable workflow and must exercise this default before merge.
+            raw = "2048"
         if raw is None:
             continue
         try:
