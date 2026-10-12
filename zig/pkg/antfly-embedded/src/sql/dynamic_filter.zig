@@ -23,7 +23,7 @@ pub const Column = struct {
     name: []const u8,
     type: @import("ast.zig").ColumnType,
     element_type: ?@import("array_value.zig").ElementType = null,
-    fn datum(self: Column, a: A, raw: Datum) !Datum {
+    pub fn datum(self: Column, a: A, raw: Datum) !Datum {
         if (raw.sql_null) return .{};
         if (self.element_type == .numeric) {
             if (raw.numeric != null) return raw;

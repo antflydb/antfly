@@ -359,13 +359,7 @@ const Owner = struct {
                 if (!keep) continue;
                 const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
                 if (self.dynamic) |filter| {
-                    const values = try a.alloc(local.sql_scalar.Datum, filter.columns.len);
-                    defer a.free(values);
-                    for (values, filter.columns) |*value, column| {
-                        const cell = try one.cell(a, 0, column.name);
-                        value.* = .{ .value = try local.sql_lake_values.comparisonValue(a, cell.value, column.type), .sql_null = cell.sql_null };
-                    }
-                    if (!try filter.contains(values)) continue;
+                    if (!try matchesDynamicCover(a, one, filter)) continue;
                 }
                 try selected.append(a, row);
             }
@@ -726,7 +720,7 @@ pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
 
 // Combine predicate and inclusive cursor bounds before access proof. Keeping a
 // weaker duplicate would either disable seeking or widen the physical walk.
-fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: catalog.Condition) !void {
+fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: catalog.Condition, column: catalog.Column) !void {
     const lower = next.op == .gt or next.op == .gte;
     const upper = next.op == .lt or next.op == .lte;
     for (conditions.items) |*previous| {
@@ -734,7 +728,7 @@ fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: 
         const previous_lower = previous.op == .gt or previous.op == .gte;
         const previous_upper = previous.op == .lt or previous.op == .lte;
         if (!(lower and previous_lower) and !(upper and previous_upper)) continue;
-        const order = try local.sql_scalar.compare(next.value, previous.value);
+        const order = try local.sql_scalar.compareDatums(try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(next.value), column), try local.sql_lake_values.comparisonDatum(a, local.sql_scalar.Datum.json(previous.value), column));
         if ((lower and order == .gt) or (upper and order == .lt) or
             (order == .eq and (next.op == .gt or next.op == .lt))) previous.* = next;
         return;
@@ -766,8 +760,8 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         for (request.conditions) |condition| for (index.keys) |key| {
             if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
                 var normalized = condition;
-                normalized.value = try local.sql_lake_values.comparisonValue(ca, condition.value, (try table.column(condition.column)).type);
-                try appendStrongBound(ca, &conditions, normalized);
+                normalized.value = try local.sql_lake_values.conditionValue(ca, condition.value, try table.column(condition.column));
+                try appendStrongBound(ca, &conditions, normalized, try table.column(condition.column));
                 break;
             }
         };
@@ -835,7 +829,7 @@ fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_re
             const wire = if (i < equal) for (request.conditions) |condition| {
                 if (condition.op == .eq and std.mem.eql(u8, condition.column, key.column)) break condition.value;
             } else return false else search_order.values[i - equal];
-            value.* = local.sql_lake_values.comparisonValue(ca, wire, (try owner.table.column(key.column)).type) catch |err| switch (err) {
+            value.* = local.sql_lake_values.conditionValue(ca, wire, try owner.table.column(key.column)) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return false,
             };
@@ -1428,7 +1422,6 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
             const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
             const cutoff = @min(scan_cost, cost_limit);
-            const probe_limit = @min(65536, cutoff);
             var probes: u64 = 0;
             var candidates: u64 = 0;
             if (!empty_range) {
@@ -1439,15 +1432,27 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
                     owner.reader.cursor = null;
                     owner.reader.window_upper = null;
                     try owner.rewindProbes();
-                    while (try owner.nextProbe()) |prefix| {
-                        try owner.read_context.ensureActive();
-                        probes += 1;
-                        // Planning is optional. Bound both zero-hit seeks and
-                        // monotonically increasing candidate/hydration work.
-                        if (probes > probe_limit or probes > cutoff) return null;
-                        candidates +|= try tree.countRange(a, owner.probeStore(), root.page, prefix, try prefixSuccessor(owner.probe_scratch.allocator(), prefix));
-                        if (estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups) +| probes > cutoff) return null;
-                    }
+                    const Cost = struct {
+                        owner: *Owner,
+                        cutoff: u64,
+                        goal: ?u64,
+                        ordered: bool,
+                        physical_bytes: u64,
+                        row_groups: u64,
+                        pub fn next(self: *@This()) !?tree.Range {
+                            try self.owner.read_context.ensureActive();
+                            const prefix = try self.owner.nextProbe() orelse return null;
+                            return .{ .lower = prefix, .upper = try prefixSuccessor(self.owner.probe_scratch.allocator(), prefix) };
+                        }
+                        pub fn admit(self: *@This(), counts: tree.RangeCounts) !bool {
+                            try self.owner.read_context.ensureActive();
+                            return estimatedAccessCost(counts.records, self.owner.covered, self.ordered, self.goal, self.physical_bytes, self.row_groups) +| counts.pages +| (counts.ranges / 64) <= self.cutoff;
+                        }
+                    };
+                    var costing: Cost = .{ .owner = owner, .cutoff = cutoff, .goal = goal, .ordered = order_satisfied, .physical_bytes = physical_bytes, .row_groups = row_groups };
+                    const counts = (try tree.countSortedRanges(a, owner.probeStore(), root.page, &costing)) orelse return null;
+                    candidates = counts.records;
+                    probes = counts.pages +| (counts.ranges / 64);
                     try owner.rewindProbes();
                     owner.reader.exhausted = false;
                     _ = try owner.advanceProbe();
@@ -1605,6 +1610,48 @@ test "external lake filtered row goals require every predicate to be enforced by
     try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
 }
 
+fn matchesDynamicCover(a: A, one: catalog.ColumnPage, filter: *const local.sql_dynamic_filter.Filter) !bool {
+    const values = try a.alloc(local.sql_scalar.Datum, filter.columns.len);
+    defer a.free(values);
+    for (values, filter.columns) |*value, column| value.* = try column.datum(a, try one.cell(a, 0, column.name));
+    return filter.contains(values);
+}
+
+test "external lake dynamic exact keys covering blocks preserve NUMERIC integer decimal and native payloads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Datum = local.sql_scalar.Datum;
+    var work: local.sql_array_value.Budget = .{};
+    const native = try local.sql_scalar.numericTextLeaky(ca, "9007199254740993.125", &work);
+    const filter = try local.sql_dynamic_filter.Filter.create(a, &.{.{ .name = "k", .type = .number, .element_type = .numeric }}, 256);
+    defer filter.close();
+    try filter.add(&.{try local.sql_scalar.numericTextLeaky(ca, "9007199254740993", &work)});
+    try filter.add(&.{native});
+    filter.sealed = true;
+    const cells = [_][1]Datum{
+        .{Datum.json(.{ .integer = 9007199254740993 })},
+        .{Datum.json(.{ .string = "9007199254740993.1250" })},
+        .{native},
+        .{Datum.json(.{ .integer = 9007199254740992 })},
+        .{.{}},
+    };
+    var rows: [cells.len]local.sql_operators.Row = undefined;
+    for (&rows, &cells, 0..) |*row, *cell, i| row.* = .{ .values = cell, .keys = &.{}, .ordinal = i };
+    const bytes = try local.sql_spill.encodeColumnarBlockAlloc(ca, &rows, 1024 * 1024);
+    const block = try local.sql_spill.decodeColumnarBlockInArena(ca, bytes, 1024 * 1024);
+    const positions = try ca.alloc(@typeInfo(@TypeOf(@as(Owner, undefined).covered_blocks)).pointer.child, cells.len);
+    for (positions, 0..) |*position, i| position.* = .{ .block = block, .row = @intCast(i) };
+    var owner: Owner = undefined;
+    owner.covered_blocks = positions;
+    const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &owner, .read = Owner.coveredCell, .count = cells.len, .width = 1 } };
+    for (0..cells.len) |i| {
+        const page: catalog.ColumnPage = .{ .native = .{ .values = &batch, .names = &.{"k"} }, .selection = &.{i} };
+        try std.testing.expectEqual(i < 3, try matchesDynamicCover(ca, page, filter));
+    }
+}
+
 test "external lake covering batch preserves dictionary identity across reordered candidates and null domains" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1663,12 +1710,20 @@ test "external lake ordered cursor bounds retain strongest direction and inclusi
         .{ .column = "amount", .op = .lte, .value = .{ .integer = 30 } },
         .{ .column = "amount", .op = .lt, .value = .{ .integer = 20 } },
         .{ .column = "amount", .op = .lte, .value = .{ .integer = 20 } },
-    }) |condition| try appendStrongBound(a, &conditions, condition);
+    }) |condition| try appendStrongBound(a, &conditions, condition, .{ .name = "amount", .path = "amount", .type = .integer });
     try std.testing.expectEqual(@as(usize, 2), conditions.items.len);
     try std.testing.expectEqual(catalog.Condition.Op.gt, conditions.items[0].op);
     try std.testing.expectEqual(@as(i64, 10), conditions.items[0].value.integer);
     try std.testing.expectEqual(catalog.Condition.Op.lt, conditions.items[1].op);
     try std.testing.expectEqual(@as(i64, 20), conditions.items[1].value.integer);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const numeric_column: catalog.Column = .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric };
+    var exact: std.ArrayList(catalog.Condition) = .empty;
+    for ([_][]const u8{ "10", "9", "9.9999999999999999999" }) |text| try appendStrongBound(ca, &exact, .{ .column = "amount", .op = .gte, .value = .{ .string = text } }, numeric_column);
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expectEqualStrings("10", exact.items[0].value.string);
 }
 
 test "external lake dynamic exact keys preserve NUMERIC payloads and decline cross type probes" {

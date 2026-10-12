@@ -889,7 +889,7 @@ pub const Stream = struct {
                 const leaf = leafFor(expected, footer.schema_columns);
                 if (leaf) |found| {
                     const actual_kind = try @import("lake_schema.zig").parquetKind(found);
-                    if (!std.mem.eql(u8, actual_kind, expected.kind) or (expected.required and found.nullable)) {
+                    if (!expected.accepts(actual_kind) or (expected.required and found.nullable)) {
                         std.log.warn("external lake column schema mismatch column={s} expected={s} actual={s} required={} nullable={}", .{ expected.name, expected.kind, actual_kind, expected.required, found.nullable });
                         return error.ExternalLakeSchemaMismatch;
                     }

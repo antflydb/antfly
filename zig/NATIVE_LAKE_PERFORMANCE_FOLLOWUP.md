@@ -2530,3 +2530,86 @@ license headers, and diff checks pass. The interrupted dense refresh regression
 also passes in isolation. The ten selected HTTP Parquet/Iceberg E2Es could not
 start under the unchanged disk-headroom safeguard; no successful E2E rerun or
 archive-scale performance measurement is claimed for this qualification.
+
+## Exact covering probes and bounded native metadata (October 2026)
+
+Covering dynamic filters now use the same typed column conversion as Parquet
+filters. NUMERIC values retain their canonical payload, including INT64 values
+above 2^53, decimal strings and already-native NUMERIC cells. Equality seeks,
+Bloom/domain membership and the authoritative join therefore compare the same
+value. Explicit NUMERIC source contracts admit exact physical integers and decimal
+strings, preserving the SQL type through footer validation and native index
+builds; physical floating-point inputs remain rejected. Ordered key binding converts
+external NUMERIC vectors explicitly into canonical payloads with bounded row
+scratch, while native batch binding keeps strict binary validation. Native scans, vector column
+evaluation and mapped batches retain full SQL type identity before coercion; lake
+predicate envelopes retain exact NUMERIC lexemes and compare typed operands.
+Regressions
+cover decoded columnar covering blocks and independent
+Parquet files, including cold queries with deliberately unreadable data pages.
+
+Native text now publishes metadata version 10 with reader protocol 34 and a v10
+binding identity. Earlier statements above about optional fields describe new
+readers accepting older roots, not older readers accepting new roots. Protocol
+33 workers cannot consume the paged inventory/statistics extensions and must
+be fenced before interpreting them. Reconciliation replaces older publications;
+the new reader and GC retain v9 recovery support, verifying the declared version
+against the authenticated body before normalizing the in-memory representation.
+Older GC formats continue through their historical traversal. There is no claim
+that rolling back to a protocol-33 worker can serve a protocol-34 publication.
+
+Broad text admission uses an additional authenticated compact routing tree,
+ordered by immutable file identity and segment ordinal. Its pages contain score
+navigation and descriptor references without physical row blocks or decoded
+admissions. This eliminates the archive-wide canonical-record sort and loading
+physical maps during cold corpus admission. Stable file/segment order preserves
+score ties. Actual admissions remain query-scoped segment leases; physical row
+maps load through the existing four-file LRU only when predicates or delivery
+need them. Selective proofs still seek canonical segment identities directly.
+The compact scoring navigation remains proportional to segment count and subject
+to cache admission; this change does not introduce a fully virtual snapshot or
+remove result, cache, or query-memory limits. GC and retained-closure audits mark
+the compact routing tree alongside the canonical directories.
+
+Term-directory construction no longer sorts a second archive-sized stream of
+bucket reductions. Initial leaf order produces each bucket once, directly into a
+bounded sorted page builder. Refreshes replay the ordered contribution delta,
+deduplicate adjacent affected buckets before reduction, and apply bounded COW
+batches. Durable leaf contribution forests continue to bound temporary disk;
+optional acceleration still declines completely if those resources are exhausted.
+
+Dynamic index costing merges the sorted exact-prefix stream with the verified
+index tree. Each visited page is decoded once; fully covered subtrees use their
+authenticated cardinalities. Missing domains skip together rather than performing
+one root seek per key. Cost admission bounds page/candidate work and amortized
+key comparisons; the former 65,536-probe cutoff is removed. A declined costing
+pass never makes partial membership authoritative. The chosen execution cursor
+rewinds the same projection and retains its authenticated forward path. Tests
+exercise more than 65,536 interleaved missing ranges and a cold covering join with
+more than 70,000 distinct build keys.
+
+Text builds retain only compact file identities and durable manifest references
+across files. Segment references, admissions and physical blocks live in a file
+arena, are uploaded and checkpointed, and are released before the next file.
+Changed/removed files, checkpoint recovery, collection totals, term contributions
+and canonical/compact directory construction consume manifests one at a time.
+The remaining archive-wide state consists of compact file references, bounded
+run forests and per-field collection counters, rather than all decoded metadata.
+Archive-scale throughput/RSS and provider-request benchmarks are still necessary
+to quantify these improvements; deterministic tests establish correctness and
+work bounds rather than a claimed speedup.
+
+
+Qualification for these refinements (Zig 0.17.0, Debug): all 368 lake integration
+checks pass (148 shared and 220 API), with no allocator leaks. All 39 focused
+SQL batch/vector/relation checks pass, including direct and computed NUMERIC
+hash joins. The production CLI builds, both native module-boundary audits pass,
+and changed-source formatting, Python syntax, license headers and diff checks
+pass. Twelve real-file E2Es pass: Parquet text ranking/filter/highlight/restart,
+incremental generation reuse, optional term-directory bootstrap, two joins with
+more than 70,000 build keys, two exact NUMERIC covering joins, real Iceberg
+snapshot/schema/partition/delete transitions, and four fragmented corpus shapes
+across Parquet and Iceberg. Cold covering queries succeed after source data pages
+are corrupted and range caches are removed. Disk admission safeguards remain
+unchanged. SQL NUMERIC comparisons retain typed residual enforcement; this
+qualification does not claim a new native SQL predicate pushdown capability.

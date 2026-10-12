@@ -1021,15 +1021,15 @@ fn Engine(comptime Context: type) type {
                     source.* = view.values();
                     if (!self.flipped_join) return source.*;
                     const ordinals = try a.alloc(usize, self.node.columns.len);
-                    const kinds = try a.alloc(@import("ast.zig").ColumnType, self.node.columns.len);
+                    const types = try a.alloc(scalar.Type, self.node.columns.len);
                     const selection = try a.alloc(usize, view.count);
                     const width = self.node.operation.join.left.columns.len;
-                    for (ordinals, kinds, self.node.columns, 0..) |*ordinal, *kind, column, index| {
+                    for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
                         ordinal.* = if (index < width) self.node.operation.join.right.columns.len + index else index - width;
-                        kind.* = column.type;
+                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
                     }
                     for (selection, 0..) |*index, i| index.* = i;
-                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .kinds = kinds, .selection = selection } };
+                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .types = types, .selection = selection } };
                 };
                 if (self.cached_reader == null and self.left != null and self.node.operation == .query) {
                     const query = self.node.operation.query;
@@ -1058,7 +1058,7 @@ fn Engine(comptime Context: type) type {
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
-                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type };
+                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }
@@ -1376,16 +1376,16 @@ fn Engine(comptime Context: type) type {
                         return .{ .rows = &.{} };
                     }
                     const ordinals = try a.alloc(usize, context.binding.scalars.columns.len);
-                    const kinds = try a.alloc(@import("ast.zig").ColumnType, ordinals.len);
-                    for (context.binding.scalars.columns, ordinals, kinds) |definition, *ordinal, *kind| {
+                    const types = try a.alloc(scalar.Type, ordinals.len);
+                    for (context.binding.scalars.columns, ordinals, types) |definition, *ordinal, *type_| {
                         ordinal.* = for (query.source.columns, 0..) |column, index| {
                             if (std.mem.eql(u8, column.internal, definition.name)) break index;
                         } else std.math.maxInt(usize);
-                        kind.* = definition.type;
+                        type_.* = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
                     }
                     const identity = try a.alloc(usize, input.len());
                     for (identity, 0..) |*index, value| index.* = value;
-                    var bound: Batch = .{ .mapped = .{ .source = input, .ordinals = ordinals, .kinds = kinds, .selection = identity } };
+                    var bound: Batch = .{ .mapped = .{ .source = input, .ordinals = ordinals, .types = types, .selection = identity } };
                     const predicates = if (context.binding.scalars.predicate) |*program| try self.batchProgram(a, context, program, bound, errors) else null;
                     var selected: std.ArrayList(usize) = .empty;
                     for (0..input.len()) |index| {
@@ -2200,4 +2200,43 @@ pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
     lowered.backend = owner.adapter.iface();
     lowered.binding.relation = null;
     return lowered.select(context.binding.relation.?.statement);
+}
+
+test "external lake native NUMERIC scan declarations survive exact hash joins" {
+    const Fixture = struct {
+        offset: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn columns(raw: *anyopaque, a: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(@as(usize, 3), self.offset + limit);
+            const selection = try a.alloc(usize, end - self.offset);
+            for (selection, 0..) |*value, index| value.* = self.offset + index;
+            self.offset = end;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" }, .{ .relational_key = "three" } }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 9007199254740993, 9007199254740992, 4095 } } }} }, .selection = selection, .after = if (end < 3) "more" else null };
+        }
+        fn rows(_: *anyopaque, _: Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowAdapter;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            @as(*@This(), @ptrCast(@alignCast(raw))).offset = 0;
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "p.n", "p.n+CAST('0' AS NUMERIC)" }) |operand| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_scan = Fixture.open } };
+        const sql = try std.fmt.allocPrint(a, "SELECT p.n FROM numeric_source p JOIN (VALUES(CAST('9007199254740993' AS NUMERIC)),(CAST('9007199254740993' AS NUMERIC))) b(n) ON {s}=b.n", .{operand});
+        defer a.free(sql);
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        for (result.output.rows) |row| try std.testing.expectEqualStrings("9007199254740993", if (row[0] == .number_string) row[0].number_string else row[0].string);
+    }
 }

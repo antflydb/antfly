@@ -333,6 +333,17 @@ pub const TuplePlan = struct {
     /// Reuses native expression bytecode and tuple encoding over typed scan
     /// vectors. Values borrow the retained Parquet batch, never JSON rows.
     pub fn bindBatch(self: TuplePlan, alloc: Allocator, batch: @import("../rowsource/types.zig").ColumnBatch) !BatchKeys {
+        return self.bindBatchMode(alloc, batch, false);
+    }
+
+    /// External vectors carry exact physical integers/decimal strings rather
+    /// than native NUMERIC storage bytes. Keep that conversion explicit so
+    /// native restore continues to reject corrupt canonical payloads.
+    pub fn bindExternalBatch(self: TuplePlan, alloc: Allocator, batch: @import("../rowsource/types.zig").ColumnBatch) !BatchKeys {
+        return self.bindBatchMode(alloc, batch, true);
+    }
+
+    fn bindBatchMode(self: TuplePlan, alloc: Allocator, batch: @import("../rowsource/types.zig").ColumnBatch, external_values: bool) !BatchKeys {
         try batch.validate();
         const inputs = try alloc.alloc(?usize, self.columns.len);
         errdefer alloc.free(inputs);
@@ -360,7 +371,7 @@ pub const TuplePlan = struct {
                 for (expression.plan.dependencies) |ordinal| if (inputs[ordinal] == null) return error.RowSourceMissingColumn;
             } else if (inputs[key.ordinal] == null) return error.RowSourceMissingColumn;
         }
-        return .{ .alloc = alloc, .plan = self, .batch = batch, .inputs = inputs, .values = values, .scratch = .init(alloc) };
+        return .{ .alloc = alloc, .plan = self, .batch = batch, .inputs = inputs, .values = values, .scratch = .init(alloc), .external_values = external_values };
     }
 
     /// Append into the transaction's region or a reusable scratch buffer.
@@ -469,6 +480,7 @@ pub const BatchKeys = struct {
     inputs: []?usize,
     values: []expressions.Value,
     scratch: std.heap.ArenaAllocator,
+    external_values: bool = false,
 
     pub fn deinit(self: *BatchKeys) void {
         self.alloc.free(self.inputs);
@@ -494,6 +506,15 @@ pub const BatchKeys = struct {
                     .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
                     .bytes = try vector.bytesAt(row),
                 } };
+                if (self.external_values and column.column_type == .numeric) {
+                    const raw: std.json.Value = switch (vector.values) {
+                        .i64, .dictionary_i64 => .{ .integer = try vector.integerAt(row) },
+                        .bytes, .dictionary_bytes => .{ .string = try vector.bytesAt(row) },
+                        else => return error.RowSourceColumnKindMismatch,
+                    };
+                    var context: NumericContext = .{ .alloc = self.scratch.allocator() };
+                    break :blk .{ .numeric = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, raw, null) };
+                }
                 break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row));
             } else .null;
         }
@@ -1195,4 +1216,55 @@ test "relational index system NUMERIC composite tuples match PostgreSQL ranks an
         try std.testing.expectError(error.InvalidSqlBinaryRepresentation, plan.appendValues(a, &out, &.{ .{ .integer = 7 }, .{ .numeric = &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 } } }));
         try std.testing.expectEqualStrings("keep", out.items);
     }
+}
+
+test "external lake NUMERIC physical batch keys share native canonical tuple encoding" {
+    const a = std.testing.allocator;
+    const source = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{.{ .column = "n" }});
+    defer plan.deinit();
+    const texts = [_][]const u8{ "9007199254740993", "9007199254740993.1250" };
+    for (texts, 0..) |text, index| {
+        const canonical = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = text });
+        defer a.free(canonical);
+        const vectors = [_]source.ColumnValues{
+            if (index == 0) .{ .i64 = &.{9007199254740993} } else .{ .bytes = &.{text} },
+            .{ .dictionary_bytes = .{ .values = &.{text}, .indices = &.{0} } },
+        };
+        for (vectors) |vector| {
+            const batch: source.ColumnBatch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{.{ .relational_key = "one" }}, .columns = &.{.{ .name = "n", .values = vector }} };
+            var bound = try plan.bindExternalBatch(a, batch);
+            defer bound.deinit();
+            var actual: std.ArrayList(u8) = .empty;
+            defer actual.deinit(a);
+            var expected: std.ArrayList(u8) = .empty;
+            defer expected.deinit(a);
+            try std.testing.expect(!try bound.append(a, &actual, 0));
+            try std.testing.expect(!try plan.appendValues(a, &expected, &.{.{ .numeric = canonical }}));
+            try std.testing.expectEqualStrings(expected.items, actual.items);
+        }
+    }
+    const null_batch: source.ColumnBatch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{.{ .relational_key = "one" }}, .columns = &.{.{ .name = "n", .nulls = .{ .bytes = &.{1} }, .values = .{ .dictionary_bytes = .{ .values = &.{"unused"}, .indices = &.{std.math.maxInt(u32)} } } }} };
+    var nullable = try plan.bindExternalBatch(a, null_batch);
+    defer nullable.deinit();
+    var null_key: std.ArrayList(u8) = .empty;
+    defer null_key.deinit(a);
+    try std.testing.expect(try nullable.append(a, &null_key, 0));
+    var expected_null: std.ArrayList(u8) = .empty;
+    defer expected_null.deinit(a);
+    try std.testing.expect(try plan.appendValues(a, &expected_null, &.{.null}));
+    try std.testing.expectEqualStrings(expected_null.items, null_key.items);
+    const floating: source.ColumnBatch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{.{ .relational_key = "one" }}, .columns = &.{.{ .name = "n", .values = .{ .f64 = &.{1.5} } }} };
+    var rejected = try plan.bindExternalBatch(a, floating);
+    defer rejected.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, "prefix");
+    try std.testing.expectError(error.RowSourceColumnKindMismatch, rejected.append(a, &out, 0));
+    try std.testing.expectEqualStrings("prefix", out.items);
 }

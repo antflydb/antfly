@@ -122,7 +122,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
-    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = @tagName(definition.type), .required = !definition.nullable };
+    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var input = provider.*;
     input.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
     // Publication normally supplies a replay shared with text/vector builders.
@@ -321,7 +321,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             while (try rows.next(a)) |batch| {
                 try cancellation.check();
                 for (entries.items) |*entry| {
-                    var bound = try entry.tuple.bindBatch(a, batch);
+                    var bound = try entry.tuple.bindExternalBatch(a, batch);
                     defer bound.deinit();
                     var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
                     defer {
@@ -329,7 +329,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         condition_batches.deinit(a);
                     }
                     if (entry.predicate) |plan| for (plan.conditions) |condition| {
-                        var selected = try condition.tuple.bindBatch(a, batch);
+                        var selected = try condition.tuple.bindExternalBatch(a, batch);
                         errdefer selected.deinit();
                         try condition_batches.append(a, selected);
                     };

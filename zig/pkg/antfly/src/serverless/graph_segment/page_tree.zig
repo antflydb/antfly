@@ -974,6 +974,60 @@ fn countInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper
     return count;
 }
 
+/// Merge a sorted stream of disjoint half-open ranges with the authenticated
+/// tree. Each visited page is decoded once, including for absent probe keys.
+/// Source.next lends bounds until its next call; Source.admit can stop optional
+/// costing without making a partial cardinality authoritative.
+pub const Range = struct { lower: []const u8, upper: ?[]const u8 };
+pub const RangeCounts = struct { records: u64 = 0, ranges: u64 = 0, pages: u64 = 0 };
+pub fn countSortedRanges(alloc: Allocator, store: Store, root: ?Ref, source: anytype) !?RangeCounts {
+    const Walker = struct {
+        a: Allocator,
+        store: Store,
+        source: @TypeOf(source),
+        range: ?Range = null,
+        counts: RangeCounts = .{},
+        fn advance(self: *@This()) !bool {
+            try self.store.check(self.store.ptr);
+            self.range = try self.source.next();
+            if (self.range) |range| {
+                if (range.upper) |upper| if (!less(range.lower, upper)) return error.InvalidGraphPage;
+                self.counts.ranges +|= 1;
+            }
+            return self.source.admit(self.counts);
+        }
+        fn visit(self: *@This(), ref: Ref, first: ?[]const u8, end: ?[]const u8) anyerror!bool {
+            if (self.range == null) return true;
+            var page = try load(self.a, self.store, ref);
+            defer page.deinit(self.a);
+            self.counts.pages +|= 1;
+            if (!try self.source.admit(self.counts)) return false;
+            if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+            if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+            for (page.entries, 0..) |entry, i| {
+                while (self.range) |range| {
+                    if (range.upper == null or less(entry.key, range.upper.?)) break;
+                    if (!try self.advance()) return false;
+                }
+                const range = self.range orelse return true;
+                const child_end = if (i + 1 < page.entries.len) page.entries[i + 1].key else end;
+                if (entry.child) |child| {
+                    if (child_end) |bound| if (!less(range.lower, bound)) continue;
+                    const covered = !less(entry.key, range.lower) and (range.upper == null or (child_end != null and !less(range.upper.?, child_end.?)));
+                    if (covered) self.counts.records +|= child.records else if (!try self.visit(child, entry.key, child_end)) return false;
+                } else if (!less(entry.key, range.lower)) self.counts.records +|= 1;
+                if (!try self.source.admit(self.counts)) return false;
+            }
+            return true;
+        }
+    };
+    var walker: Walker = .{ .a = alloc, .store = store, .source = source };
+    if (!try walker.advance()) return null;
+    if (root) |ref| if (!try walker.visit(ref, null, null)) return null;
+    // Keys beyond the last tree entry cannot match; no need to read them.
+    return walker.counts;
+}
+
 /// Fold a half-open range using authenticated reductions for wholly covered
 /// children. Only boundary paths need descendant reads. Legacy pages fall back
 /// to exact leaf records; the visitor owns the reduction's type and validation.
@@ -1672,4 +1726,48 @@ test "external lake text statistics page reductions reuse interior subtrees and 
     plain.reduce = null;
     try Check.run(a, plain, root, &key, &value);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ store, root, &key, &value });
+}
+
+test "external lake dynamic exact keys sorted range zipper skips absent prefixes beyond old probe cap" {
+    const a = std.testing.allocator;
+    var memory: testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Records = struct {
+        ordinal: u32 = 0,
+        key: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.ordinal == 3000) return null;
+            std.mem.writeInt(u32, self.key[0..4], (self.ordinal / 3) * 100, .big);
+            std.mem.writeInt(u32, self.key[4..8], self.ordinal % 3, .big);
+            self.ordinal += 1;
+            return .{ .key = &self.key, .value = "value" };
+        }
+    };
+    var records: Records = .{};
+    const root = try buildSorted(a, memory.store(), &records);
+    const Ranges = struct {
+        ordinal: u32 = 0,
+        lower: [4]u8 = undefined,
+        upper: [4]u8 = undefined,
+        limit: u64 = std.math.maxInt(u64),
+        pub fn next(self: *@This()) !?Range {
+            if (self.ordinal == 100000) return null;
+            std.mem.writeInt(u32, &self.lower, self.ordinal, .big);
+            std.mem.writeInt(u32, &self.upper, self.ordinal + 1, .big);
+            self.ordinal += 1;
+            return .{ .lower = &self.lower, .upper = &self.upper };
+        }
+        pub fn admit(self: *@This(), counts: RangeCounts) !bool {
+            return counts.records <= self.limit;
+        }
+    };
+    const before = memory.reads;
+    var ranges: Ranges = .{};
+    const counted = (try countSortedRanges(a, memory.store(), root, &ranges)).?;
+    try std.testing.expectEqual(@as(u64, 3000), counted.records);
+    try std.testing.expect(counted.ranges > 65536);
+    try std.testing.expectEqual(counted.pages, memory.reads - before);
+    try std.testing.expect(counted.pages < 100);
+    var bounded: Ranges = .{ .limit = 1 };
+    try std.testing.expect((try countSortedRanges(a, memory.store(), root, &bounded)) == null);
 }

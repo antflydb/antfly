@@ -112,14 +112,14 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
-    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = @tagName(definition.type), .required = !definition.nullable };
+    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var native_provider = provider.*;
     native_provider.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
     if (source.iceberg_schema) |selected| for (contract) |expected| {
         const actual = for (selected.columns) |column| {
             if (std.mem.eql(u8, column.name, expected.name)) break column;
         } else return error.ExternalLakeSchemaMismatch;
-        if (!std.mem.eql(u8, actual.kind, expected.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
+        if (!expected.accepts(actual.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
     };
     var old: ContributionIndex = .{};
     defer old.deinit(a);

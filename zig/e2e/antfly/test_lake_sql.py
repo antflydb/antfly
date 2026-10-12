@@ -4112,9 +4112,9 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
         )
         expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [[str(count - 1), str(count - 1)]]
         assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
-        # More than 4096 distinct build keys must remain a complete, bounded
-        # exact stream. Most keys miss; duplicates retain join multiplicity.
-        build_keys = list(range(count - 100, count)) + list(range(count + 1, count + 5001)) + [count - 1, None]
+        # Beyond the former 65536-probe cutoff, keys remain a complete bounded
+        # stream. Most miss; duplicates retain join multiplicity.
+        build_keys = list(range(count - 100, count)) + list(range(count + 1, count + 70001)) + [count - 1, None]
         build_root = tmp_path / "build-lake"
         build_objects = build_root / "buckets" / "antfly" / "objects"
         build_objects.mkdir(parents=True)
@@ -4129,7 +4129,7 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
                 "kind": "external", "table_id": "join-build", "format": "parquet", "uri": build_root.as_uri(),
             },
         }})
-        large_statement = "SELECT COUNT(*) FROM join_probe p JOIN join_build b ON p.k=b.k"
+        large_statement = "SELECT COUNT(*) FROM join_probe p JOIN (SELECT k FROM join_build) b ON p.k=b.k"
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
         server.pause()
         if covering:
@@ -4144,6 +4144,85 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
         server.resume()
         assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
         assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type):
+    """NUMERIC seeks and covering filters agree beyond f64 precision, cold too."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count = 4096
+    if physical_type == "integer":
+        keys = [9007199254740993, 9007199254740992] + list(range(2, count))
+        targets = ["9007199254740993", "4095"]
+        values = pa.array(keys, type=pa.int64())
+    else:
+        keys = ["9007199254740993.125", "9007199254740993.124"] + [f"{i}.125" for i in range(2, count)]
+        targets = ["9007199254740993.125", "4095.125"]
+        values = pa.array(keys, type=pa.string())
+    path = tmp_path / "numeric.parquet"
+    pq.write_table(pa.table({"k": values, "v": pa.array(range(count), type=pa.int64())}),
+        path, compression="snappy", use_dictionary=False, row_group_size=256)
+    payload = path.read_bytes()
+    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
+    )
+    failed = True
+    try:
+        def call(method, route, body=None):
+            response = requests.request(method, server.api_url + route, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call("POST", "/tables/numeric_probe", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "default_type": "row",
+            "base_source": {"kind": "external", "table_id": "numeric-probe",
+                "format": "parquet", "uri": root.as_uri()},
+            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
+                "k": {"type": "number", "x-antfly-sql-type": "numeric"},
+                "v": {"type": "integer"},
+            }, "additionalProperties": False}}},
+            "relational_indexes": [{"name": "k_idx", "keys": [{"column": "k"}], "include_columns": ["v"]}],
+        }})
+        deadline = time.monotonic() + 90
+        while True:
+            resources = call("GET", "/tables/numeric_probe/indexes")
+            assert all(r["status"]["readiness"]["state"] != "failed" for r in resources), str(resources) + server.debug_logs()
+            if resources and all(r["status"]["readiness"]["queryable"] for r in resources):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        terms = ",".join(f"(CAST('{key}' AS NUMERIC))" for key in targets + targets[:1])
+        statement = f"SELECT p.v FROM numeric_probe p JOIN (VALUES {terms}) b(k) ON p.k=b.k ORDER BY p.v"
+        expected = [["0"], ["0"], [str(count - 1)]]
+        predicate = f"SELECT v FROM numeric_probe WHERE k=CAST('{targets[0]}' AS NUMERIC)"
+        assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
+        assert call("POST", "/sql", {"statement": f"SELECT CAST('{targets[0]}' AS NUMERIC)"})["rows"] == [[targets[0]]]
+        assert call("POST", "/sql", {"statement": "SELECT k FROM numeric_probe WHERE v=0"})["rows"] == [[targets[0]]]
+        assert call("POST", "/sql", {"statement": f"SELECT k FROM (VALUES {terms}) b(k)"})["rows"] == [[key] for key in targets + targets[:1]]
+        residual = statement.replace("ON p.k=b.k", "ON p.k+CAST('0' AS NUMERIC)=b.k")
+        assert call("POST", "/sql", {"statement": residual})["rows"] == expected
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        server.pause()
+        # Keep identity/footer intact but remove usable data pages, then drop
+        # range caches. The repeated cold query must consume covering values.
+        footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+        object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+        for cached in server.root.rglob("lake-ranges"):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
         failed = False
     finally:
         server.stop(test_failed=failed)

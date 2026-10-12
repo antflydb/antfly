@@ -31,7 +31,12 @@ pub const statistics = @import("lake_index_text_statistics.zig");
 pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
-pub const metadata_version: u16 = 9;
+// Paged canonical inventories, term directories and pending DF runs require
+// a new wire identity. Catalog protocol 34 fences older workers before decode.
+pub const metadata_version: u16 = 10;
+pub fn supportsBuildMetadata(version: u16) bool {
+    return version == 9 or version == metadata_version;
+}
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
 /// Source duplication is an explicit per-index policy. The complete config
@@ -117,59 +122,52 @@ pub const Collection = struct {
         }
     }
 };
-fn collectionTotals(a: A, groups: []const FileGroup) !Collection {
-    var totals: std.StringHashMapUnmanaged(u64) = .empty;
-    defer totals.deinit(a);
-    var documents: u32 = 0;
-    for (groups) |group| for (group.admissions) |segment| {
-        documents = try std.math.add(u32, documents, segment.doc_count);
-        for (segment.fields) |field| if (field.stats) |stats| {
-            const entry = try totals.getOrPut(a, field.name);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* = try std.math.add(u64, entry.value_ptr.*, stats.total_field_len);
-        };
-    };
-    const fields = try a.alloc(Collection.Field, totals.count());
-    var iterator = totals.iterator();
-    for (fields) |*field| {
-        const entry = iterator.next().?;
-        field.* = .{ .name = entry.key_ptr.*, .total_length = entry.value_ptr.* };
+/// Collection state retains one counter per field, independently of the
+/// number of files/segments whose durable manifests have been consumed.
+const CollectionBuilder = struct {
+    a: A,
+    documents: u32 = 0,
+    segments: u32 = 0,
+    fields: std.StringHashMapUnmanaged(u64) = .empty,
+    fn deinit(self: *@This()) void {
+        var keys = self.fields.keyIterator();
+        while (keys.next()) |key| self.a.free(key.*);
+        self.fields.deinit(self.a);
     }
-    std.mem.sort(Collection.Field, fields, {}, struct {
-        fn less(_: void, left: Collection.Field, right: Collection.Field) bool {
-            return std.mem.order(u8, left.name, right.name) == .lt;
+    fn field(self: *@This(), name: []const u8, length: u64, subtract: bool) !void {
+        if (self.fields.getPtr(name)) |value| {
+            value.* = if (subtract) try std.math.sub(u64, value.*, length) else try std.math.add(u64, value.*, length);
+        } else {
+            if (subtract and length != 0) return error.InvalidNativeLakeTextCorpus;
+            const owned = try self.a.dupe(u8, name);
+            errdefer self.a.free(owned);
+            try self.fields.put(self.a, owned, length);
         }
-    }.less);
-    return .{ .documents = documents, .fields = fields };
-}
-fn collectionDelta(a: A, previous: Collection, removed: []const FileGroup, added: []const FileGroup) !Collection {
-    const before = try collectionTotals(a, removed);
-    const after = try collectionTotals(a, added);
-    var fields: std.StringHashMapUnmanaged(u64) = .empty;
-    defer fields.deinit(a);
-    for (previous.fields) |field| try fields.put(a, field.name, field.total_length);
-    for (before.fields) |field| {
-        const value = fields.getPtr(field.name) orelse return error.InvalidNativeLakeTextCorpus;
-        value.* = try std.math.sub(u64, value.*, field.total_length);
     }
-    for (after.fields) |field| {
-        const value = try fields.getOrPut(a, field.name);
-        if (!value.found_existing) value.value_ptr.* = 0;
-        value.value_ptr.* = try std.math.add(u64, value.value_ptr.*, field.total_length);
-    }
-    const result = try a.alloc(Collection.Field, fields.count());
-    var it = fields.iterator();
-    for (result) |*field| {
-        const entry = it.next().?;
-        field.* = .{ .name = entry.key_ptr.*, .total_length = entry.value_ptr.* };
-    }
-    std.mem.sort(Collection.Field, result, {}, struct {
-        fn less(_: void, l: Collection.Field, r: Collection.Field) bool {
-            return std.mem.order(u8, l.name, r.name) == .lt;
+    fn add(self: *@This(), group: FileGroup, subtract: bool) !void {
+        const count: u32 = @intCast(group.segments.len);
+        self.segments = if (subtract) try std.math.sub(u32, self.segments, count) else try std.math.add(u32, self.segments, count);
+        if (self.segments > max_segments) return error.NativeLakeTextCorpusTooLarge;
+        for (group.admissions) |segment| {
+            self.documents = if (subtract) try std.math.sub(u32, self.documents, segment.doc_count) else try std.math.add(u32, self.documents, segment.doc_count);
+            for (segment.fields) |f| if (f.stats) |stats| try self.field(f.name, stats.total_field_len, subtract);
         }
-    }.less);
-    return .{ .documents = try std.math.add(u32, try std.math.sub(u32, previous.documents, before.documents), after.documents), .fields = result };
-}
+    }
+    fn finish(self: *@This(), out: A) !Collection {
+        const fields = try out.alloc(Collection.Field, self.fields.count());
+        var it = self.fields.iterator();
+        for (fields) |*f| {
+            const entry = it.next().?;
+            f.* = .{ .name = try out.dupe(u8, entry.key_ptr.*), .total_length = entry.value_ptr.* };
+        }
+        std.mem.sort(Collection.Field, fields, {}, struct {
+            fn less(_: void, l: Collection.Field, r: Collection.Field) bool {
+                return std.mem.order(u8, l.name, r.name) == .lt;
+            }
+        }.less);
+        return .{ .documents = self.documents, .fields = fields };
+    }
+};
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
@@ -187,6 +185,7 @@ pub const Root = struct {
     serving_inventory: ?statistics.Ref = null,
     inventory_version: u8 = 1,
     file_count: u32 = 0,
+    segment_count: u32 = 0,
     directories: text_directory.Roots = .{},
     serving_routes: ?statistics.Ref = null,
     segment_files: ?statistics.Ref = null,
@@ -230,7 +229,7 @@ pub const Root = struct {
         if (self.segment_files) |ref| try ref.validate();
         if (self.collection) |collection| try collection.validate();
         try self.directories.validate();
-        if (self.file_count > 16384) return error.InvalidNativeLakeTextCorpus;
+        if (self.file_count > 16384 or self.segment_count > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.inventory_version < 1 or self.inventory_version > 3) return error.InvalidNativeLakeTextCorpus;
         if (self.term_statistics) |ref| try ref.validate();
         if (self.statistics_deltas.len != 0) {
@@ -278,10 +277,14 @@ pub const Root = struct {
 };
 /// Read only the authenticated root directory; callers own child admission.
 pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .text_segment or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    if (ref.kind != .text_segment or !supportsBuildMetadata(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
-    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    if (root.version != ref.metadata_version) return error.InvalidNativeLakeTextCorpus;
+    // Historical roots remain usable by recovery/retained readers. Reconciliation
+    // only advertises the new identity and upgrades protocol-33 publications.
+    root.version = metadata_version;
     try root.validate();
     if (root.inventory_version == 3 and (root.manifests.len != 0 or root.file_groups.len != 0 or root.segments.len != 0 or (root.file_count != 0 and root.directories.files == null))) return error.InvalidNativeLakeTextCorpus;
     if (root.routing.len != 0 or root.partial_inventory) return error.InvalidNativeLakeTextCorpus;
@@ -625,7 +628,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v9:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v10:{s}", .{want.binding.index_config_hash});
         const recipe = sourceRecipe(table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -634,7 +637,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var seed_artifact: ?[]const u8 = null;
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
-            const root = if (directory_root.inventory_version == 3 and directory_root.serving_routes == null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
@@ -652,19 +655,26 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
-            const root = if (directory_root.inventory_version == 3 and directory_root.serving_routes == null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
+            const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
             if (!root.seekable or root.statistics_version < 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
             try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
             seed_artifact = declaration.artifact.artifact_id;
             break root;
         } else null;
         const paged_seed = if (seed) |root| root.inventory_version == 3 and root.serving_routes == null else false;
+        const manifest_seed = if (seed) |root| !paged_seed and root.manifests.len != 0 and root.file_groups.len == 0 else false;
+        const reference_seed = paged_seed or manifest_seed;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
         defer previous_groups.deinit(a);
-        const records = if (paged_seed) try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation) else &.{};
-        const previous = try ca.alloc(state.File, if (paged_seed) records.len else if (seed) |root| root.file_groups.len else 0);
-        if (paged_seed) {
-            for (previous, records) |*file, record| file.* = record.file;
+        var previous_refs: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
+        defer previous_refs.deinit(a);
+        const records = if (paged_seed) try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, store.*, cancellation) else &.{};
+        const previous = try ca.alloc(state.File, if (reference_seed) records.len else if (seed) |root| root.file_groups.len else 0);
+        if (reference_seed) {
+            for (previous, records) |*file, record| {
+                file.* = record.file;
+                try previous_refs.put(a, record.file.id, record);
+            }
         } else if (seed) |root| for (previous, root.file_groups) |*file, group| {
             file.* = group.file;
             try previous_groups.put(a, group.file.id, group);
@@ -672,31 +682,20 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var plan = try state.Plan.init(a, ca, provider, previous);
         defer plan.deinit();
         if (paged_seed) {
-            var removed_groups: std.ArrayList(FileGroup) = .empty;
             var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-            for (records) |record| {
-                if (plan.unchanged(record.file)) continue;
-                try provider.context.ensureActive();
-                const group = try loadFileManifest(ca, store.*, record.manifest, seed.?.domain, cancellation, null);
-                if (!std.mem.eql(u8, group.file.id, record.file.id) or !std.mem.eql(u8, &group.file.digest, &record.file.digest)) return error.InvalidNativeLakeTextCorpus;
-                try previous_groups.put(a, group.file.id, group);
-                try removed_groups.append(ca, group);
-                try removed_refs.append(ca, record.manifest);
-            }
-            // The seed now describes only removed/replaced maintenance units;
-            // its immutable global roots and collection totals remain intact.
-            seed.?.file_groups = removed_groups.items;
+            for (records) |record| if (!plan.unchanged(record.file)) try removed_refs.append(ca, record.manifest);
+            // Keep only durable references. Removed/replaced admissions are
+            // decoded in a file arena when their contributions are subtracted.
+            seed.?.file_groups = &.{};
             seed.?.manifests = removed_refs.items;
         }
-        const groups = try ca.alloc(FileGroup, plan.files.len);
         const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(a, spec.config_json, runtime);
         defer local.introducer.freeTextAnalysisConfig(a, analysis);
         var batch_arena = std.heap.ArenaAllocator.init(a);
         defer batch_arena.deinit();
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
-        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
-        var summaries: std.ArrayList(?statistics.Ref) = .empty;
-        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var file_arena = std.heap.ArenaAllocator.init(a);
+        defer file_arena.deinit();
         var input_bytes: usize = 0;
         const file_manifests = try ca.alloc(?artifacts.ChunkRef, plan.files.len);
         @memset(file_manifests, null);
@@ -724,11 +723,23 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
         };
-        for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
-            group.* = .{ .file = file, .segments = &.{} };
+        if (reference_seed) for (records) |record| {
+            if (plan.by_id.contains(record.file.id)) continue;
+            _ = file_arena.reset(.free_all);
+            const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
+            for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
+        };
+        for (plan.files, plan.changed, 0..) |file, changed, file_ordinal| {
+            _ = file_arena.reset(.free_all);
+            const fa = file_arena.allocator();
+            var file_group: FileGroup = .{ .file = file, .segments = &.{} };
+            const group = &file_group;
+            var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+            var summaries: std.ArrayList(?statistics.Ref) = .empty;
+            var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
             if (!changed) {
                 if (paged_seed) continue;
-                const previous_group = previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
+                const previous_group = if (manifest_seed) try loadRecordedFile(fa, store.*, previous_refs.get(file.id) orelse return error.InvalidNativeLakeTextCorpus, seed.?.domain, cancellation) else previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
                 group.summaries = previous_group.summaries;
@@ -736,25 +747,22 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.descriptors = previous_group.descriptors;
                 group.physical_manifest = previous_group.physical_manifest;
                 if (group.admissions.len == 0 and group.segments.len != 0) {
-                    const upgraded = try ca.alloc(local.segment.SegmentReader.Admission, group.segments.len);
+                    const upgraded = try fa.alloc(local.segment.SegmentReader.Admission, group.segments.len);
                     for (group.segments, upgraded) |ref, *metadata| {
                         var data = try @import("lake_index_seekable_text.zig").load(a, .{ .store = store.*, .cache = null, .context = provider.context, .cancellation = cancellation }, ref);
                         defer data.deinit(a);
                         var reader = try data.initReader(a);
                         defer reader.deinit();
-                        metadata.* = try reader.admission(ca);
+                        metadata.* = try reader.admission(fa);
                     }
                     group.admissions = upgraded;
                 }
-                try admissions.appendSlice(ca, group.admissions);
+                if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
-                try summaries.appendSlice(ca, group.summaries);
-                try segments.appendSlice(ca, group.segments);
                 file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
                 continue;
             }
-            const first_segment = segments.items.len;
-            var ordinals = physical.Builder.init(a, ca, store, cancellation);
+            var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
             var previous_id: ?[96]u8 = null;
             var input = provider.*;
@@ -790,26 +798,29 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, &admissions, cancellation, store_source, file_ordinal);
+                        try flush(a, fa, store, builder.batch(), analysis, &segments, &summaries, &admissions, cancellation, store_source, file_ordinal);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, &admissions, cancellation, store_source, file_ordinal);
+            try flush(a, fa, store, builder.batch(), analysis, &segments, &summaries, &admissions, cancellation, store_source, file_ordinal);
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
             group.rows = ordinals.blocks.items;
-            group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
-            group.summaries = try ca.dupe(?statistics.Ref, summaries.items[first_segment..]);
-            group.admissions = try ca.dupe(local.segment.SegmentReader.Admission, admissions.items[first_segment..]);
+            group.segments = segments.items;
+            group.summaries = summaries.items;
+            group.admissions = admissions.items;
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
-            if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(ca, store, group, cancellation);
+            if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
             file_manifests[file_ordinal] = publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len);
-            if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
+            if (previous_refs.get(file.id)) |record| {
+                const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
+                for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
+            } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
             try df.flush();
             // Each file remains resumable without rewriting the global tree.
@@ -867,37 +878,36 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), -1, null, if (incremental_directory) &directory_builder else null);
             }
         };
-        for (groups, plan.changed) |group, changed| {
-            for (group.summaries, group.segments) |ref, segment| {
-                if (changed or !incremental_directory) try addStatisticsContribution(a, stats_pages.store(), ref, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+        var totals: CollectionBuilder = .{ .a = a };
+        defer totals.deinit();
+        if (paged_seed) {
+            totals.documents = seed.?.collection.?.documents;
+            totals.segments = seed.?.segment_count;
+            for (seed.?.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
+            for (seed.?.manifests) |ref| {
+                _ = file_arena.reset(.free_all);
+                const group = try loadFileManifest(file_arena.allocator(), store.*, ref, seed.?.domain, cancellation, null);
+                try totals.add(group, true);
+                if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
+                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
+                };
             }
+        }
+        var current_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+        for (file_manifests, plan.changed) |slot, changed| {
+            if (paged_seed and !changed) continue;
+            const ref = slot orelse return error.InvalidNativeLakeTextCorpus;
+            try current_refs.append(ca, ref);
+            _ = file_arena.reset(.free_all);
+            const group = try loadFileManifest(file_arena.allocator(), store.*, ref, store.upload_scope.?.domain, cancellation, null);
+            for (group.summaries, group.segments) |summary, segment| {
+                if (changed or !incremental_directory) try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+            }
+            try totals.add(group, false);
         }
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
-        var published_groups: std.ArrayList(FileGroup) = .empty;
-        for (groups, plan.changed) |group, changed| if (!paged_seed or changed) try published_groups.append(ca, group);
-        const current_groups = published_groups.items;
-        const manifests = try ca.alloc(artifacts.ChunkRef, current_groups.len);
-        for (current_groups, manifests) |*group, *manifest| {
-            try cancellation.check();
-            if (group.physical_manifest != null and group.descriptors.len == group.segments.len) {
-                const index = plan.by_id.get(group.file.id) orelse return error.InvalidNativeLakeTextCorpus;
-                if (file_manifests[index]) |ref| {
-                    manifest.* = ref;
-                    continue;
-                }
-            }
-            if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(ca, store, group, cancellation);
-            try group.validate(store.upload_scope.?.domain);
-            const page = try std.json.Stringify.valueAlloc(a, group.*, .{});
-            defer a.free(page);
-            if (page.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
-            var page_upload = store.*;
-            page_upload.allocator = ca;
-            const ref = try page_upload.putWithCancellation(page, cancellation);
-            manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-        }
-        const directories = try text_directory.publish(a, store, current_groups, manifests, if (paged_seed) seed.?.file_groups else &.{}, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
-        const root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .collection = if (paged_seed) try collectionDelta(ca, seed.?.collection.?, seed.?.file_groups, current_groups) else try collectionTotals(ca, current_groups) };
+        const directories = try text_directory.publishManifests(a, store, current_refs.items, if (paged_seed) seed.?.manifests else &.{}, if (paged_seed) seed.?.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+        const root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -1083,6 +1093,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     if (root.inventory_version == 3) {
         try validator.pages(root.directories.files);
         try validator.pages(root.directories.segments);
+        try validator.pages(root.directories.routing);
         try validator.pages(root.serving_inventory);
         try validator.pages(root.segment_files);
         try validator.pages(root.serving_routes);
@@ -1092,6 +1103,20 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
         try validator.certify(root_id);
         return;
     }
+    if (root.file_groups.len == 0 and root.manifests.len != 0) {
+        var file_arena = std.heap.ArenaAllocator.init(a);
+        defer file_arena.deinit();
+        for (root.manifests) |ref| {
+            _ = file_arena.reset(.free_all);
+            try validator.leaf(ref);
+            const group = try loadFileManifest(file_arena.allocator(), backend, ref, root.domain, cancellation, null);
+            for (group.summaries) |summary| try validator.pages(summary);
+            for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
+            for (group.descriptors) |descriptor| try validator.leaf(descriptor);
+            if (group.physical_manifest) |physical_ref| try validator.leaf(physical_ref);
+            for (group.segments) |segment| try validator.segment(segment, root.seekable);
+        }
+    }
     for (root.file_groups) |group| {
         for (group.summaries) |summary| try validator.pages(summary);
         for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
@@ -1099,6 +1124,25 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     for (root.segments) |ref| try validator.segment(ref, root.seekable);
     for (0..validator.pending.len) |i| try validator.finish(i, false);
     try validator.certify(root_id);
+}
+
+fn loadRecordedFile(a: A, store: stores.ArtifactStore, record: text_directory.FileRecord, domain: [32]u8, cancellation: Cancellation) !FileGroup {
+    const group = try loadFileManifest(a, store, record.manifest, domain, cancellation, null);
+    if (!std.mem.eql(u8, group.file.id, record.file.id) or !std.mem.eql(u8, &group.file.digest, &record.file.digest)) return error.InvalidNativeLakeTextCorpus;
+    return group;
+}
+
+fn checkpointFiles(a: A, out: A, root: Root, store: stores.ArtifactStore, cancellation: Cancellation) ![]const text_directory.FileRecord {
+    const records = try out.alloc(text_directory.FileRecord, root.manifests.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (root.manifests, records) |ref, *record| {
+        try cancellation.check();
+        _ = arena.reset(.free_all);
+        const group = try loadFileManifest(arena.allocator(), store, ref, root.domain, cancellation, null);
+        record.* = .{ .file = .{ .id = try out.dupe(u8, group.file.id), .digest = group.file.digest, .key_width = group.file.key_width }, .manifest = ref };
+    }
+    return records;
 }
 
 fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts.ChunkRef {
@@ -1187,4 +1231,34 @@ fn addStatisticsContribution(a: A, store: @import("../serverless/graph_segment/p
 fn buildFailure(err: anyerror, stage: []const u8, file_ordinal: usize, completed_segments: usize) anyerror {
     if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake text construction deferred stage={s} file_index={d} completed_segments={d} err={s}", .{ stage, file_ordinal, completed_segments, @errorName(err) });
     return err;
+}
+
+test "external lake text statistics wire upgrade fences new roots and admits historical v9 recovery" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("text-wire-upgrade");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const legacy: Root = .{ .version = 9, .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .seekable = true, .statistics_version = 1 };
+    // Reproduce a v9 root without extension fields introduced by this branch.
+    var wire = try std.json.parseFromSliceLeaky(std.json.Value, ca, try std.json.Stringify.valueAlloc(ca, legacy, .{}), .{});
+    for ([_][]const u8{ "term_directory", "directories", "collection", "file_count", "segment_count", "serving_routes", "segment_files", "partial_inventory", "routing" }) |field| _ = wire.object.swapRemove(field);
+    const bytes = try std.json.Stringify.valueAlloc(ca, wire, .{});
+    var upload = try store.putWithCancellation(bytes, .none);
+    defer upload.deinit(a);
+    var ref: Ref = .{ .kind = .text_segment, .metadata_version = 9, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
+    const recovered = try loadRootDirectory(ca, store, ref, .none, null);
+    try std.testing.expectEqual(metadata_version, recovered.version);
+    // Metadata identity is checked against the authenticated body before any
+    // normalization. Neither future formats nor a falsely advertised v10 pass.
+    ref.metadata_version = metadata_version;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    ref.metadata_version = metadata_version + 1;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, loadRootDirectory(ca, store, ref, .none, null));
+    try std.testing.expect(metadata_version > 9 and local.metadata_lake_index_catalog.native_reader_protocol > 33);
 }

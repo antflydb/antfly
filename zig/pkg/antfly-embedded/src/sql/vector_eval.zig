@@ -380,6 +380,7 @@ const ColumnInput = struct {
     pub fn fillTyped(self: ColumnInput, ordinal: u32, target: anytype) !bool {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const definition = self.columns[ordinal];
+        if (definition.element_type == .numeric) return false;
         const sql_floating = definition.element_type == .float32 or definition.element_type == .float64;
         if (self.page.native) |native| {
             const index = for (native.names, 0..) |name, i| {
@@ -467,7 +468,7 @@ const ColumnInput = struct {
                 }
                 const id = dictionary.indices[index];
                 if (id >= normalized.len) return error.InvalidSqlBackendResponse;
-                if (normalized[id] == null) normalized[id] = Datum.json(try @import("describe.zig").coerceAlloc(a, .{ .string = dictionary.values[id] }, definition.type));
+                if (normalized[id] == null) normalized[id] = try @import("describe.zig").coerceDatum(a, Datum.json(.{ .string = dictionary.values[id] }), definition.type, definition.element_type);
                 value.* = normalized[id].?;
             }
             return;
@@ -488,13 +489,13 @@ const ColumnInput = struct {
                 .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, a, values[index], .{ .parse_numbers = false }),
                 else => return error.UnsupportedSqlExecution,
             };
-            value.* = Datum.json(try @import("describe.zig").coerceAlloc(a, raw, definition.type));
+            value.* = try @import("describe.zig").coerceDatum(a, Datum.json(raw), definition.type, definition.element_type);
         }
     }
     pub fn cell(self: ColumnInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const value = try self.page.cell(a, index, self.columns[ordinal].name);
-        return .{ .value = try @import("describe.zig").coerceAlloc(a, value.value, self.columns[ordinal].type), .sql_null = value.sql_null };
+        return @import("describe.zig").coerceDatum(a, value, self.columns[ordinal].type, self.columns[ordinal].element_type);
     }
 };
 fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: anytype, parameters: []const std.json.Value) !?[]const Datum {
@@ -1019,4 +1020,33 @@ fn dictionaryTupleScenario(a: std.mem.Allocator) !void {
 }
 test "SQL multi-input dictionary kernels share tuples and preserve NULL and selected errors" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryTupleScenario, .{});
+}
+
+test "external lake NUMERIC column evaluation preserves physical and native exact operands" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .number, .element_type = .numeric }};
+    const physicals = [_]@import("../storage/rowsource/types.zig").ColumnValues{
+        .{ .i64 = &.{ 9007199254740993, 9007199254740992 } },
+        .{ .bytes = &.{ "9007199254740993.125", "9007199254740993.124" } },
+        .{ .dictionary_bytes = .{ .values = &.{ "9007199254740993.125", "9007199254740993.124" }, .indices = &.{ 0, 1 } } },
+    };
+    for (physicals) |physical| {
+        const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" } }, .columns = &.{.{ .name = "n", .values = physical }} }, .selection = &.{ 1, 0 } };
+        const input: ColumnInput = .{ .page = page, .columns = &columns, .count = 2 };
+        var values: [2]Datum = undefined;
+        try input.fillColumn(ca, 0, &values);
+        for (values, 0..) |value, i| {
+            try std.testing.expect(value.numeric != null);
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(value, try input.cell(ca, i, 0)));
+        }
+        try std.testing.expectEqual(std.math.Order.lt, try scalar.compareDatums(values[0], values[1]));
+    }
+    var work: @import("array_value.zig").Budget = .{};
+    const number = try scalar.numericTextLeaky(ca, "9007199254740993.125", &work);
+    const batch: @import("execution_batch.zig").Batch = .{ .rows = &.{&.{number}} };
+    const native: ColumnInput = .{ .page = .{ .native = .{ .values = &batch, .names = &.{"n"} }, .selection = &.{0} }, .columns = &columns, .count = 1 };
+    try std.testing.expect((try native.cell(ca, 0, 0)).numeric == number.numeric);
 }

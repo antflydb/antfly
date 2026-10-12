@@ -108,7 +108,6 @@ pub fn reduce(a: A, entries: []const tree.Entry, height: u8) ![]u8 {
 pub const Builder = struct {
     a: A,
     changes: local.sql_spill.Sort,
-    branches: local.sql_spill.Sort,
     ordinal: u64 = 0,
     disabled: bool = false,
     strategy: stats.Builder.Strategy = .auto,
@@ -116,14 +115,12 @@ pub const Builder = struct {
     distinct_changes: u64 = 0,
     reduced_records: u64 = 0,
     aggregate_nodes: u64 = 0,
-    track_branches: bool = false,
     durable: ?@import("lake_index_delta_runs.zig").Forest = null,
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
-        return .{ .a = a, .changes = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024), .branches = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
+        return .{ .a = a, .changes = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
     pub fn deinit(self: *Builder) void {
         self.changes.deinit();
-        self.branches.deinit();
     }
     pub fn add(self: *Builder, store: tree.Store, root: ?tree.Ref, segment: [32]u8, sign: i64) !void {
         if (sign != 1 and sign != -1) return error.InvalidNativeLakeTermDirectory;
@@ -160,10 +157,6 @@ pub const Builder = struct {
         };
     }
 
-    fn queueBranch(self: *Builder, key: []const u8, branch: ?Branch) !void {
-        var buffer: [Branch.max_bytes]u8 = undefined;
-        try self.branches.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{if (branch) |value| local.sql_scalar.Datum.fromJson(.{ .string = value.encode(&buffer) }) else local.sql_scalar.Datum.fromJson(.null)}, .ordinal = self.ordinal });
-    }
     const Changes = struct {
         owner: *Builder,
         scratch: std.heap.ArenaAllocator,
@@ -182,7 +175,6 @@ pub const Builder = struct {
                 if (record.value.len < 8) return error.InvalidNativeLakeTermDirectory;
                 self.sign = std.mem.readInt(i64, record.value[0..8], .big);
                 if (self.sign != 1 and self.sign != -1) return error.InvalidNativeLakeTermDirectory;
-                if (self.owner.track_branches) try self.owner.queueBranch(record.key[0 .. record.key.len - 31], null);
                 return .{ .key = record.key, .value = if (self.sign == 1) record.value[8..] else null };
             }
             while (true) {
@@ -205,7 +197,6 @@ pub const Builder = struct {
                 }
                 if (self.sign == 0) continue;
                 if (self.sign != 1 and self.sign != -1) return error.InvalidNativeLakeTermDirectory;
-                if (self.owner.track_branches) try self.owner.queueBranch(self.key.?[0 .. self.key.?.len - 31], null);
                 return .{ .key = self.key.?, .value = if (self.sign == 1) self.value[0..length] else null };
             }
         }
@@ -213,15 +204,12 @@ pub const Builder = struct {
     pub fn enableDurable(self: *Builder, store: tree.Store) void {
         self.durable = .{ .a = self.a, .store = store, .policy = .contribution };
         self.changes.shared_runs = true;
-        self.branches.shared_runs = true;
     }
     fn disable(self: *Builder) void {
         self.disabled = true;
         const manager = self.changes.manager;
         self.changes.deinit();
-        self.branches.deinit();
         self.changes = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, 4 * 1024 * 1024);
-        self.branches = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, 4 * 1024 * 1024);
         self.durable = null;
     }
     pub fn flush(self: *Builder) !void {
@@ -286,16 +274,17 @@ pub const Builder = struct {
                 value.deinit();
                 value.* = try tree.Cursor.init(self.a, store, run, "", null);
             } else try self.changes.rewind();
-            self.track_branches = true;
             self.selected = if (self.strategy == .auto) (if (self.distinct_changes >= @max(4096, prior.leaves.?.records / 4)) .merge else .cow) else self.strategy;
         }
         if (prior.leaves == null) {
             const Initial = struct {
                 changes: *Changes,
+                branches: *tree.SortedBuilder,
                 key: ?[]u8 = null,
                 branch: ?Branch = null,
                 fn flush(source: *@This()) !void {
-                    if (source.key) |key| try source.changes.owner.queueBranch(key, source.branch);
+                    var buffer: [Branch.max_bytes]u8 = undefined;
+                    if (source.key) |key| try source.branches.add(key, source.branch.?.encode(&buffer));
                 }
                 pub fn next(source: *@This()) !?tree.Cursor.Record {
                     const row = (try source.changes.next()) orelse {
@@ -320,9 +309,15 @@ pub const Builder = struct {
                     return .{ .key = row.key, .value = value };
                 }
             };
-            var initial: Initial = .{ .changes = &changes };
+            // Leaf order already groups each term/bucket. Emit reductions
+            // directly into a bounded page builder, with no second disk sort.
+            var branch_builder: tree.SortedBuilder = .{ .alloc = self.a, .store = store };
+            defer branch_builder.deinit();
+            var initial: Initial = .{ .changes = &changes, .branches = &branch_builder };
             defer if (initial.key) |key| self.a.free(key);
             roots.leaves = try tree.buildSorted(self.a, leaf_store, &initial);
+            roots.branches = try branch_builder.finish();
+            return roots;
         } else if (self.selected == .merge) {
             const Merge = struct {
                 old: *tree.Cursor,
@@ -370,7 +365,14 @@ pub const Builder = struct {
             }
             if (mutations.items.len != 0) roots.leaves = try tree.apply(self.a, leaf_store, roots.leaves, mutations.items);
         }
-        try self.branches.finish();
+        // Replay sorted changes after updating leaves. Adjacent segment IDs
+        // share a bucket, so deduplicate before reducing or allocating mutations.
+        changes.row = null;
+        _ = changes.scratch.reset(.free_all);
+        if (delta_cursor) |*value| {
+            value.deinit();
+            value.* = try tree.Cursor.init(self.a, store, run, "", null);
+        } else try self.changes.rewind();
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         var batch = std.heap.ArenaAllocator.init(self.a);
@@ -383,16 +385,14 @@ pub const Builder = struct {
         defer cache.deinit();
         while (true) {
             _ = arena.reset(.retain_capacity);
-            const row = (try self.branches.next(arena.allocator())) orelse break;
-            const key = row.keys[0].value.string;
+            const change = (try changes.next()) orelse break;
+            const key = change.key[0 .. change.key.len - 31];
             if (previous) |old| if (std.mem.eql(u8, old, key)) continue;
             if (previous) |old| self.a.free(old);
             previous = null;
             previous = try self.a.dupe(u8, key);
             var branch: ?Branch = null;
-            if (prior.leaves == null) {
-                branch = try Branch.decode(row.values[0].value.string);
-            } else {
+            {
                 const end = try arena.allocator().dupe(u8, key);
                 // Last byte is the bucket. 255 uses the term prefix's final
                 // zero terminator as carry; this is still below the next term.

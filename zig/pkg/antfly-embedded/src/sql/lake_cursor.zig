@@ -79,7 +79,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         if (condition.value == .integer or condition.value == .float) out.value = condition.value;
         if (condition.op == .is_null or condition.op == .is_not_null or std.mem.eql(u8, condition.column, "_id")) continue;
         const column = try table.column(condition.column);
-        out.value = try @import("lake_values.zig").comparisonValue(owned, out.value, column.type);
+        out.value = try @import("lake_values.zig").conditionValue(owned, out.value, column);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
         const value: @FieldType(Predicate, "value") = switch (out.value) {
             .integer => |v| if (column.type == .integer or column.type == .datetime) .{ .integer = v } else continue,
@@ -102,7 +102,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
             if (std.mem.eql(u8, column.name, "_id")) continue;
-            try contract.append(owned, .{ .name = column.path, .kind = @tagName(column.type), .required = !column.nullable });
+            try contract.append(owned, .{ .name = column.path, .kind = if (column.element_type == .numeric) "numeric" else @tagName(column.type), .required = !column.nullable });
         }
         stream.schema_contract = contract.items;
     }
@@ -111,7 +111,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
             const actual = for (selected.columns) |column| {
                 if (std.mem.eql(u8, column.name, expected.name)) break column;
             } else return error.ExternalLakeSchemaMismatch;
-            if (!std.mem.eql(u8, actual.kind, expected.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
+            if (!expected.accepts(actual.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
         }
         stream.schema_contract = selected.columns;
     }
@@ -562,9 +562,10 @@ pub fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog
             continue;
         }
         if (cell.sql_null or condition.value == .null) return false;
-        const kind = (try table.column(condition.column)).type;
-        const stored = try @import("lake_values.zig").comparisonValue(alloc, cell.value, kind);
-        const order = try scalar.compare(stored, condition.value);
+        const column = try table.column(condition.column);
+        const stored = try @import("lake_values.zig").comparisonDatum(alloc, cell, column);
+        const literal = try @import("lake_values.zig").comparisonDatum(alloc, scalar.Datum.json(condition.value), column);
+        const order = try scalar.compareDatums(stored, literal);
         const match = switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
