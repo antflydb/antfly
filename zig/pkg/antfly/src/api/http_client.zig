@@ -304,6 +304,7 @@ test "private index claim client requires service credentials preserves binary v
     const Fixture = struct {
         calls: usize = 0,
         status: u16 = 200,
+        failure: []const u8 = "UniqueConstraintViolation",
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -315,7 +316,7 @@ test "private index claim client requires service credentials preserves binary v
             var parsed = try std.json.parseFromSlice(execution.ClaimRequest, a, request.body, .{});
             defer parsed.deinit();
             try std.testing.expectEqualStrings("key\x00\xff", parsed.value.claims[0].tuple);
-            return .{ .status = self.status, .body = try a.dupe(u8, if (self.status == 200) "{\"acknowledged\":{}}" else "UniqueConstraintViolation") };
+            return .{ .status = self.status, .body = try a.dupe(u8, if (self.status == 200) "{\"acknowledged\":{}}" else self.failure) };
         }
     };
     var fixture: Fixture = .{};
@@ -332,8 +333,14 @@ test "private index claim client requires service credentials preserves binary v
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     fixture.status = 501;
     try std.testing.expectError(error.UnsupportedNativeIndexOwner, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    fixture.status = 503;
+    fixture.failure = "InvalidPrivateIndexClaimReceipt";
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
+    fixture.status = 409;
+    fixture.failure = "PrivateIndexOwnerJobChanged";
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, client.fetchRelationalIndexClaims("http://owner", 7, "docs", request, .{}));
     try std.testing.expectError(error.GenerationPublicationChanged, client.fetchRelationalIndexClaims("http://owner", 8, "docs", request, .{}));
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 5), fixture.calls);
 }
 
 pub const ApiHttpClient = struct {
@@ -899,15 +906,14 @@ pub const ApiHttpClient = struct {
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
         var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .headers = &.{.{ .name = execution.claim_remaining_ms_header, .value = budget }} });
         defer response.deinit(self.alloc);
+        if (response.body.len > 32 * 1024) return error.InvalidPrivateIndexClaimReceipt;
+        if (execution.claimHttpFailure(response.status, response.body)) |err| return err;
         switch (response.status) {
             200 => {},
             401, 403 => return error.Unauthorized,
             413 => return error.TransactionTooLarge,
             501 => return error.UnsupportedNativeIndexOwner,
-            409 => {
-                if (std.mem.eql(u8, response.body, "UniqueConstraintViolation")) return error.UniqueConstraintViolation;
-                return error.GenerationPublicationChanged;
-            },
+            409 => return error.GenerationPublicationChanged,
             400 => return error.InvalidGenerationPublication,
             408, 504 => return error.Timeout,
             404, 503 => return error.GenerationAdmissionPending,

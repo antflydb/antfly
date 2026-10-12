@@ -86,6 +86,25 @@ pub const CancellationRequest = struct { table_id: u64, group_id: u64, id: [16]u
 pub const claim_remaining_ms_header = "X-Antfly-Index-Claim-Remaining-Ms";
 pub const max_claim_budget_ms: u32 = 30_000;
 
+/// Exact private control failures, not arbitrary peer-selected error names.
+/// Corruption is not a pending build, and stale/canceled owners retain their
+/// identity so callers can recover metadata without replaying a new effect.
+pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
+    switch (status) {
+        409 => inline for (.{ error.UniqueConstraintViolation, error.GenerationPublicationChanged, error.PrivateIndexOwnerJobChanged, error.PrivateIndexPublicationCanceled }) |err| {
+            if (std.mem.eql(u8, body, @errorName(err))) return err;
+        },
+        408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
+            if (std.mem.eql(u8, body, @errorName(err))) return err;
+        },
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation }) |err| {
+            if (std.mem.eql(u8, body, @errorName(err))) return err;
+        },
+        else => {},
+    }
+    return null;
+}
+
 pub const ClaimRequest = struct {
     table_id: u64,
     group_id: u64,
@@ -720,6 +739,15 @@ test "relational index publication native cancellation receiver uses fixed permi
     driver.value.head = prepared.head;
     try std.testing.expectError(error.GenerationPublicationChanged, cancelIntentStep(alloc, &driver, &driver, plan.before.name, request, context));
     try std.testing.expectEqual(@as(usize, 0), driver.cancellations);
+}
+
+test "relational index publication claim HTTP errors preserve conflicts corruption and cancellation" {
+    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 408, error.DeadlineExceeded } }) |entry| {
+        try std.testing.expectEqual(entry[1], claimHttpFailure(entry[0], @errorName(entry[1])).?);
+    }
+    try std.testing.expect(claimHttpFailure(200, "PrivateIndexOwnerJobChanged") == null);
+    try std.testing.expect(claimHttpFailure(503, "UniqueConstraintViolation") == null);
+    try std.testing.expect(claimHttpFailure(503, "UnknownPeerError") == null);
 }
 
 test "relational index publication claim receiver binds fresh build permission without schema projections" {

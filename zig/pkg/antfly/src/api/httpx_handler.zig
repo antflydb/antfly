@@ -2524,6 +2524,7 @@ pub const AntflyApiHandler = struct {
         var context = operationContext(ctx, null).platformDeadline() catch return textResponse(ctx, 408, "private index claim deadline expired");
         const deadline = platform_time.monotonicNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
         context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        context.deadline_io = null;
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "private index claims required");
