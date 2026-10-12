@@ -165,19 +165,6 @@ pub fn require(identity: Identity) !QualifiedVariant {
     return qualifiedVariant(identity) orelse error.UnsupportedGlinerDecisionArtifact;
 }
 
-/// Historical 198-token diagnostic contract. Live serving uses
-/// requireRequestIdentity so FP32 and Q8 cannot borrow each other's limits.
-pub fn requireConservative198TokenGeometry(variant: QualifiedVariant, backend: Backend, request_items: usize, prepared_sequences: usize, prepared_sequence_tokens: usize) !void {
-    switch (variant) {
-        .decide_deberta => return,
-        .decide_1b => {
-            if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
-            if (request_items != 1 or prepared_sequences != 1 or prepared_sequence_tokens == 0 or prepared_sequence_tokens > 198)
-                return error.UnsupportedGlinerDecisionGeometry;
-        },
-    }
-}
-
 pub const RequestLimits = struct {
     request_items: usize = 1,
     prepared_sequences: usize = 1,
@@ -247,7 +234,7 @@ test "GLiNER Decide qualification binds exact loaded legacy identity" {
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
 }
 
-test "GLiNER Decide 1B qualification binds exact loaded identity" {
+pub const pinned_fp32_identity: Identity = blk: {
     var identity = legacyIdentity();
     identity.encoder_family = .modern_bert;
     identity.geometry = .{ .hidden_size = 1792, .intermediate_size = 3840, .num_hidden_layers = 28, .num_attention_heads = 28, .vocab_size = 50378, .max_position_embeddings = 7999 };
@@ -261,6 +248,11 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
         .tokenizer_config = digestFromPin(decide_1b_tokenizer_config),
         .special_tokens_map = null,
     };
+    break :blk identity;
+};
+
+test "GLiNER Decide 1B qualification binds exact loaded identity" {
+    var identity = pinned_fp32_identity;
     try std.testing.expect(isDecide1B(identity));
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
     try std.testing.expect(supportsSpanExtraction(identity));
@@ -303,16 +295,4 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     identity.weight = digestFromPin(decide_1b_weight);
     identity.inventory.all_f32 = true;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
-}
-
-test "GLiNER Decide 1B serving policy stays within measured backend and geometry" {
-    try requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 198);
-    try requireConservative198TokenGeometry(.decide_1b, .metal, 1, 1, 1);
-    try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireConservative198TokenGeometry(.decide_1b, .cuda, 1, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 2, 1, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 2, 198));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 199));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireConservative198TokenGeometry(.decide_1b, .native, 1, 1, 0));
-    // Existing qualified DeBERTa behavior is retained by this additive gate.
-    try requireConservative198TokenGeometry(.decide_deberta, .cuda, 2, 9, 513);
 }

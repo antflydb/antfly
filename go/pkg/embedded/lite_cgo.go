@@ -247,6 +247,8 @@ func OpenStatusOnly(path string) (*DB, error) {
 // maintenance mode. In this profile callers drive pending work explicitly with
 // RunUntilIdle.
 func OpenHosted(path string) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -264,6 +266,8 @@ func OpenHosted(path string) (*DB, error) {
 // CreateHosted creates a new Antfly Lite database in hosted/manual maintenance
 // mode. In this profile callers drive pending work explicitly with RunUntilIdle.
 func CreateHosted(path string) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -289,6 +293,8 @@ func CreateWithOptions(path string, opts OpenOptions) (*DB, error) {
 }
 
 func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -454,6 +460,8 @@ type RestoreOptions struct {
 }
 
 func restoreCOptions(storage Storage) (C.antfly_open_options, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	var cOpts C.antfly_open_options
 	if err := check(C.antfly_open_options_init(&cOpts)); err != nil {
 		return cOpts, err
@@ -467,6 +475,8 @@ func restoreCOptions(storage Storage) (C.antfly_open_options, error) {
 }
 
 func restoreBackupBytes(path string, backup []byte, opts RestoreOptions) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cOpts, err := restoreCOptions(opts.Storage)
 	if err != nil {
 		return err
@@ -485,6 +495,8 @@ func restoreBackupBytes(path string, backup []byte, opts RestoreOptions) error {
 }
 
 func restoreBackupFile(path, backupPath string, opts RestoreOptions) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	cOpts, err := restoreCOptions(opts.Storage)
 	if err != nil {
 		return err
@@ -512,6 +524,8 @@ func (db *DB) CheckJSON() ([]byte, error) {
 // CheckFileJSON runs Lite integrity checks for path without opening a database
 // handle and returns the JSON result.
 func CheckFileJSON(path string) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -542,6 +556,8 @@ func (db *DB) CompactJSON() ([]byte, error) {
 
 // CopyStableSnapshotJSON copies a stable Lite snapshot to destPath.
 func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if !strings.HasSuffix(destPath, ".aflite") {
 		return nil, InvalidArgument
 	}
@@ -564,6 +580,8 @@ func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, err
 // CopyStableSnapshotFileJSON opens srcPath read-only, copies a stable Lite
 // snapshot to destPath, and returns the JSON result.
 func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -581,6 +599,8 @@ func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte,
 
 // Batch applies write intents at timestampNS.
 func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -641,6 +661,8 @@ func (db *DB) SetSchemaJSON(schema []byte) error {
 
 // RunUntilIdle drains pending enrichment and index work.
 func (db *DB) RunUntilIdle() error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -681,6 +703,8 @@ func (db *DB) AddIndexJSON(config []byte) error {
 
 // DeleteIndex deletes an index by name and reports whether it existed.
 func (db *DB) DeleteIndex(name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
@@ -714,6 +738,8 @@ func (db *DB) AddEnrichmentJSON(config []byte) error {
 // DeleteEnrichment deletes an enrichment by kind and name and reports whether
 // it existed.
 func (db *DB) DeleteEnrichment(kind, name string) (bool, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
@@ -750,6 +776,8 @@ func (db *DB) StatsJSON() ([]byte, error) {
 // The request contains statement, parameters and an optional result limit.
 // The returned body includes SQLSTATE diagnostics on failure.
 func (db *DB) SQLJSON(request []byte) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -814,6 +842,8 @@ func (db *DB) LookupArtifactJSON(artifactIDBase64 string) ([]byte, error) {
 
 // DecodeArtifactIDJSON decodes a base64 artifact ID without opening a database.
 func DecodeArtifactIDJSON(artifactIDBase64 string) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	input, cleanup := makeCStringSlice([]byte(artifactIDBase64))
 	defer cleanup()
 
@@ -888,6 +918,8 @@ func (db *DB) MatchPatternJSON(request []byte) ([]byte, error) {
 }
 
 func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -902,6 +934,8 @@ func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_erro
 }
 
 func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.antfly_error_code) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return err
@@ -914,6 +948,8 @@ func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.
 }
 
 func (db *DB) withInputOutput(input []byte, fn func(unsafe.Pointer, C.antfly_slice, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -935,6 +971,8 @@ func (db *DB) withStringInputOutput(input string, fn func(unsafe.Pointer, C.antf
 }
 
 func (db *DB) graphLookup(indexName, key, edgeType string, direction uint8, fn func(unsafe.Pointer, C.antfly_slice, C.antfly_slice, C.antfly_slice, C.uint8_t, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
@@ -1013,6 +1051,11 @@ func takeBuffer(buffer C.antfly_buffer) []byte {
 func check(code C.antfly_error_code) error {
 	if code == C.ANTFLY_OK {
 		return nil
+	}
+	if C.antfly_last_error_code() == code {
+		if detail := C.GoString(C.antfly_last_error_detail()); detail != "" {
+			return &NativeError{Code: ErrorCode(code), Detail: detail}
+		}
 	}
 	return ErrorCode(code)
 }

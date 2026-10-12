@@ -269,10 +269,10 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
 
 pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) h.capi.ErrorCode {
     h.capi.clearLastError();
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     create(guard.handle, name.bytes(), schema.bytes(), false) catch |err| return h.capi.mapError(err);
@@ -280,10 +280,10 @@ pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, 
 }
 pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.ErrorCode {
     h.capi.clearLastError();
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     drop(guard.handle, name.bytes(), false) catch |err| return h.capi.mapError(err);
@@ -292,16 +292,16 @@ pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.
 pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) h.capi.ErrorCode {
     h.capi.clearLastError();
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const handle = guard.handle;
-    if (handle.parent_id != null) return h.capi.mapError(error.InvalidArgument);
+    if (handle.parent_id != null) return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": table catalog operations require a root database handle");
     load(handle) catch |err| return h.capi.mapError(err);
-    const names = handle.alloc.alloc([]const u8, handle.embedded_tables.count() + 1) catch return .internal;
+    const names = handle.alloc.alloc([]const u8, handle.embedded_tables.count() + 1) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     defer handle.alloc.free(names);
     names[0] = "default";
     var iterator = handle.embedded_tables.keyIterator();
@@ -311,7 +311,7 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
             return std.mem.lessThan(u8, a, b);
         }
     }.less);
-    out.* = api.stringifyJson(names) catch return .internal;
+    out.* = api.stringifyJson(names) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
 
@@ -320,10 +320,10 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
 pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) h.capi.ErrorCode {
     h.capi.clearLastError();
     out.* = null;
-    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapError(error.InvalidArgument);
+    const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
-        return code;
+        return h.capi.ensureError(code, @src().fn_name);
     }
     defer guard.leave();
     const root = guard.handle;
@@ -339,23 +339,23 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
             _ = root.table_handles.swapRemove(i);
         }
     }
-    if (root.table_handles.items.len >= 1024) return .busy;
+    if (root.table_handles.items.len >= 1024) return h.capi.recordError(.busy, @src().fn_name ++ ": if (root.table_handles.items.len >= 1024)");
     const db = get(root, name.bytes()) catch |err| return h.capi.mapError(err);
-    const child = root.alloc.create(h.Handle) catch return .internal;
+    const child = root.alloc.create(h.Handle) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     child.* = .{ .alloc = root.alloc, .db = undefined, .selected_db = db, .parent_id = ptr, .parent_handle = root, .open_mode = root.open_mode, .lite_profile = root.lite_profile, .lite_generated_enrichment_replay = root.lite_generated_enrichment_replay };
     child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch {
         root.alloc.destroy(child);
-        return .internal;
+        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     };
     child.selected_table_id = db.core.identity_namespace.table_id;
     const id = h.handle_registry.register(child) catch {
         root.alloc.free(child.selected_table_name.?);
         root.alloc.destroy(child);
-        return .internal;
+        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     };
     root.table_handles.append(root.alloc, id) catch {
         h.closeHandleId(id);
-        return .internal;
+        return h.capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     };
     out.* = id;
     return .ok;

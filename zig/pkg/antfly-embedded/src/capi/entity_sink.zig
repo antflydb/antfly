@@ -176,7 +176,28 @@ fn candidateNearest(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, que
     const db = try tables.get(handle, name);
     var result = try db.search(a, .{ .index_name = query.index_name, .query = .{ .dense_knn = .{ .vector = query.embedding, .k = @intCast(query.k) } }, .limit = @intCast(query.k), .include_stored = true, .include_all_fields = true });
     defer result.deinit();
-    for (result.hits) |hit| if (hit.stored_data) |json| try consume(ctx, hit.id, json);
+    const dense = db.core.index_manager.denseIndex(query.index_name) orelse return error.IndexNotFound;
+    var txn = try dense.index.beginReadTxn();
+    defer txn.abort();
+    const scratch = try a.alloc(f32, query.embedding.len);
+    defer a.free(scratch);
+    for (result.hits) |hit| if (hit.stored_data) |json| {
+        // Generated vectors live in the index, not in the primary JSON.
+        // The resolver's standard name_embedding comparison must receive the
+        // same canonical vector that ANN used, including after a reopen.
+        const vector_id = try db.core.index_manager.lookupDenseVectorId(db.core.store, query.index_name, hit.id) orelse return error.MissingCandidateEmbedding;
+        const vector = try dense.index.getVectorInto(&txn, vector_id, scratch);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidEntityPromotionDocument;
+        const arena = parsed.arena.allocator();
+        var values: std.array_list.Managed(std.json.Value) = .init(arena);
+        for (vector) |value| try values.append(.{ .float = value });
+        try parsed.value.object.put(arena, "name_embedding", .{ .array = values });
+        const candidate_json = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+        defer a.free(candidate_json);
+        try consume(ctx, hit.id, candidate_json);
+    };
 }
 
 test "capi Lite promotion atomically merges across tables and survives reopen" {
@@ -258,6 +279,29 @@ test "capi Lite promotion label routes extraction graphs into entity and event d
     const document_edges = try graph.getEdges(a, "doc:a", "uses", .out);
     defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, document_edges);
     try std.testing.expectEqual(@as(usize, 0), document_edges.len);
+    // Same numeric error code must never reuse another operation's detail.
+    var child: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(handle_id, .fromSlice("entities"), &child));
+    defer api.antfly_db_close(child);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"invalid\"}")));
+    try std.testing.expectEqualStrings("MissingIndexType", std.mem.span(api.antfly_last_error_detail()));
+    var session: u64 = 0;
+    const sessions = @import("sql_session.zig");
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, sessions.antfly_db_sql_session_open(child, &session));
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_last_error_code());
+    const detail = std.mem.span(api.antfly_last_error_detail());
+    try std.testing.expect(std.mem.indexOf(u8, detail, "antfly_db_sql_session_open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "MissingIndexType") == null);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(handle_id, &session));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_last_error_code());
+    try std.testing.expectEqualStrings("", std.mem.span(api.antfly_last_error_detail()));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_close(handle_id, session));
+    var named_response: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&named_response);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(child, .fromSlice("{\"full_text_search\":{\"match_all\":{}},\"limit\":10}"), &named_response));
+    const named_json = try std.json.parseFromSlice(std.json.Value, a, named_response.ptr.?[0..named_response.len], .{});
+    defer named_json.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, named_response.ptr.?[0..named_response.len], "\"table\":\"entities\"") != null);
 }
 
 test "capi Lite promotion graph metrics flow through shared concepts in both directions" {
@@ -273,8 +317,9 @@ test "capi Lite promotion graph metrics flow through shared concepts in both dir
     try handle.db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json =
         \\{"metrics":{"ppr":{"kind":"pagerank","enabled":true}},"edge_types":[{"name":"about","field":"about"}]}
     });
+    try handle.db.addIndex(.{ .name = "claim_text", .kind = .full_text, .config_json = "{\"field\":\"search_text\"}" });
     try handle.db.batch(.{ .writes = &.{
-        .{ .key = "claim:a", .value = "{\"about\":[\"concept/shared\"]}" },
+        .{ .key = "claim:a", .value = "{\"about\":[\"concept/shared\"],\"search_text\":\"embedder\"}" },
         .{ .key = "claim:b", .value = "{\"about\":[\"concept/shared\"]}" },
         .{ .key = "claim:unrelated", .value = "{\"about\":[\"concept/other\"]}" },
     }, .sync_level = .write });
@@ -298,7 +343,7 @@ test "capi Lite promotion graph metrics flow through shared concepts in both dir
     try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "claim:a") != null);
     api.antfly_buffer_free(&response);
     const traversal =
-        \\{"full_text_search":{"match_all":{}},"limit":5,"graph_queries":{"q":{"index":"knowledge","traverse":{"start":{"result_ref":"$query_results","limit":5},"direction":"both","edge_types":["about"],"max_depth":2,"include_documents":true,"include_paths":true,"deduplicate_nodes":false,"limit":20}}}}
+        \\{"full_text_search":{"match":{"field":"search_text","text":"embedder"}},"limit":5,"graph_queries":{"q":{"index":"knowledge","traverse":{"start":{"result_ref":"$query_results","limit":5},"direction":"both","edge_types":["about"],"max_depth":2,"include_documents":true,"include_paths":true,"deduplicate_nodes":false,"limit":20}}}}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_search_json(handle_id, .fromSlice(traversal), &response));
     try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "claim:b") != null);
@@ -315,7 +360,7 @@ test "capi Lite promotion graph metrics flow through shared concepts in both dir
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(handle_id, .fromSlice("{\"name\":\"success\",\"type\":\"graph\"}")));
     try std.testing.expectEqualStrings("", std.mem.span(api.antfly_last_error_detail()));
     try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_search_json(null, .fromSlice(body), &response));
-    try std.testing.expectEqualStrings("InvalidArgument", std.mem.span(api.antfly_last_error_detail()));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(api.antfly_last_error_detail()), "antfly_db_search_json") != null);
 }
 
 // The generator is deterministic so this exercises the full recursive replay
@@ -400,4 +445,93 @@ test "capi Lite promotion recursively generates a taxonomy in the destination ta
     try std.testing.expect(enrichment.get("enabled").?.bool);
     try std.testing.expect(enrichment.get("error_count").?.integer > 0);
     try std.testing.expectEqualStrings("UnsupportedGlinerBoundaryRuntime", enrichment.get("last_error_code").?.string);
+}
+
+test {
+    _ = @import("../storage/db/graph_endpoint_resolutions.zig");
+}
+
+test "capi Lite promotion resolves ANN and explicit aliases through stored entity tables" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("lite-ann-resolution");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_create_table_json(id, .fromSlice("entities"), .fromSlice("{}")));
+    const entities = try tables.get(handle, "entities");
+    try entities.addIndex(.{ .name = "names", .kind = .dense_vector, .config_json = "{\"field\":\"canonical_vector\",\"dims\":3,\"external\":true}" });
+    try entities.batch(.{ .writes = &.{.{ .key = "concept/canonical", .value = "{\"entity_type\":\"concept\",\"canonical_name\":\"Approval reviewer\",\"canonical_vector\":[1,0,0],\"_embeddings\":{\"names\":[1,0,0]}}" }}, .sync_level = .full_index });
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ slug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":1,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"name_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}]}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+    try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "claim:ann", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\",\"embedding\":[1,0,0]}]}}" }} });
+    try runUntilIdle(handle);
+    const graph = &@constCast(handle.db.core.graphIndex("knowledge").?).index;
+    const edges = try graph.getEdges(a, "claim:ann", "mentions", .out);
+    defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("concept/canonical", edges[0].target);
+    try std.testing.expect((try entities.lookup(a, "concept/laya_reviewer", .{})) == null);
+    // No vector on the alias row: ANN cannot return it as a candidate.
+    try handle.db.entity_sink.?.upsert(a, "entities", "concept/the_decider", "{\"entity_type\":\"concept\",\"canonical_name\":\"The decider\",\"merged_into\":\"concept/canonical\"}");
+    try handle.db.batch(.{ .writes = &.{.{ .key = "claim:alias", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"The decider\",\"embedding\":[0,1,0]}]}}" }} });
+    try runUntilIdle(handle);
+    const alias_edges = try graph.getEdges(a, "claim:alias", "mentions", .out);
+    defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, alias_edges);
+    try std.testing.expectEqual(@as(usize, 1), alias_edges.len);
+    try std.testing.expectEqualStrings("concept/canonical", alias_edges[0].target);
+}
+
+test "capi Lite models_dir loads a real extractor for graph enrichment" {
+    const api = @import("db.zig");
+    if (!api.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    const model_dir = std.mem.span(std.c.getenv("ANTFLY_LITE_EXTRACTOR_MODEL_DIR") orelse return error.SkipZigTest);
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("explicit-models-dir");
+    defer tmp.cleanup();
+    const models_dir = try std.fmt.allocPrint(a, "{s}/models", .{tmp.path()});
+    defer a.free(models_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, models_dir);
+    const link = try std.fmt.allocPrint(a, "{s}/explicit-base", .{models_dir});
+    defer a.free(link);
+    const encoder_dir = try std.fmt.allocPrint(a, "{s}/encoder_config", .{link});
+    defer a.free(encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, encoder_dir);
+    for ([_][]const u8{ "config.json", "model.safetensors", "model_manifest.json", "tokenizer.json", "tokenizer_config.json", "encoder_config/config.json" }) |file| {
+        const original = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, file });
+        defer a.free(original);
+        const destination = try std.fmt.allocPrint(a, "{s}/{s}", .{ link, file });
+        defer a.free(destination);
+        try std.Io.Dir.cwd().hardLink(original, .cwd(), destination, std.testing.io, .{});
+    }
+    const path = try std.fmt.allocPrint(a, "{s}/graph.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{
+        .profile = .native,
+        .externally_locked = true,
+        .inference = .{ .models_dir = models_dir, .local_runtime_configured = true, .host_budget_mb = 16384, .backend_budget_mb = 16384, .combined_budget_mb = 24576, .scratch_budget_mb = 16384, .process_memory_budget_mb = 32768 },
+    }, true, null, null);
+    defer h.closeHandle(handle);
+    try tables.create(handle, "entities", "{}", false);
+    try handle.db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{ uslug _entity.text }}", .config_generation = 1 });
+    try handle.db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"explicit-base\",\"schema\":{\"entities\":[\"company\",\"person\",\"product\",\"location\"]}}}" });
+    try handle.db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"kg\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"}],\"edge_types\":[{\"name\":\"mentions\"}],\"metrics\":{\"ppr\":{\"kind\":\"pagerank\",\"enabled\":true}}}" });
+    try api.refreshLiteManagedEmbeddingRuntime(handle);
+    try handle.db.batch(.{ .writes = &.{.{ .key = "claim:example", .value = "{\"body\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}" }}, .sync_level = .write });
+    try runUntilIdle(handle);
+    const graph = &@constCast(handle.db.core.graphIndex("knowledge").?).index;
+    const neighbors = try graph.getEdges(a, "claim:example", "mentions", .out);
+    defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, neighbors);
+    try std.testing.expect(neighbors.len > 0);
+    var entity = (try (try tables.get(handle, "entities")).lookup(a, neighbors[0].target, .{})) orelse return error.TestUnexpectedResult;
+    defer entity.deinit(a);
+    var scores: [2]?f64 = undefined;
+    _ = try graph.personalizedPageRankColumnIntoWithControls(a, "ppr", &.{neighbors[0].target}, null, &.{ "claim:example", neighbors[0].target }, &scores, .{ .direction = .both });
+    try std.testing.expect(scores[0].? > 0);
 }

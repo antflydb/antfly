@@ -61,7 +61,7 @@ pub export fn antfly_inference_options_size() u32 {
 
 pub export fn antfly_inference_options_init(options: ?*capi.InferenceOptions) capi.ErrorCode {
     capi.clearLastError();
-    const opts = options orelse return capi.mapError(error.InvalidArgument);
+    const opts = options orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const opts = options orelse");
     opts.* = .{};
     return .ok;
 }
@@ -129,7 +129,7 @@ pub export fn antfly_inference_open(
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = out_handle orelse return capi.mapError(error.InvalidArgument);
+    const out = out_handle orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = out_handle orelse");
     out.* = null;
     out.* = openInference(options) catch |err| return capi.mapError(err);
     return .ok;
@@ -144,6 +144,7 @@ pub export fn antfly_inference_close(handle_ptr: ?*anyopaque) void {
 }
 
 fn errorForStatus(status: u16) capi.ErrorCode {
+    capi.clearLastError();
     return switch (status) {
         200...299 => .ok,
         404 => .not_found,
@@ -175,8 +176,8 @@ fn invoke(
     request: []const u8,
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapError(error.InvalidArgument);
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
     defer @TypeOf(registry).leave(slot);
     const deadline_ns = handle.deadline();
     const response = inference_provider.invokeEmbeddedInferenceRoute(
@@ -216,11 +217,11 @@ pub export fn antfly_inference_generate_json(h: ?*anyopaque, request_json: capi.
     // There is no stream sink across the C ABI; without this check the
     // runtime fails a streaming request with an opaque internal error.
     if (requestsStreaming(request_json.bytes())) {
-        const buffer = db.resetOutBuffer(out) orelse return capi.mapError(error.InvalidArgument);
+        const buffer = db.resetOutBuffer(out) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const buffer = db.resetOutBuffer(out) orelse");
         const body = "{\"error\":\"STREAMING_UNSUPPORTED\",\"message\":\"use antfly_inference_generate_stream_json to stream\"}";
-        const owned = alloc.dupe(u8, body) catch return .internal;
+        const owned = alloc.dupe(u8, body) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         buffer.* = .{ .ptr = owned.ptr, .len = owned.len };
-        return capi.mapError(error.InvalidArgument);
+        return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": validation failed");
     }
     return invoke(h, .post, "generate", request_json.bytes(), out);
 }
@@ -430,6 +431,7 @@ fn sliceOf(bytes: []const u8) capi.Slice {
 
 /// Maps a failed pull, by the error name in its result JSON.
 fn pullErrorCode(name: []const u8) capi.ErrorCode {
+    capi.clearLastError();
     const table = [_]struct { []const u8, capi.ErrorCode }{
         .{ "HubModelNotFound", .not_found },
         .{ "NoModelFilesFound", .not_found },
@@ -459,7 +461,7 @@ fn pullErrorCode(name: []const u8) capi.ErrorCode {
         .{ "NetworkUnreachable", .busy },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], name)) return entry[1];
-    return .internal;
+    return capi.recordError(.internal, @src().fn_name ++ ": validation failed");
 }
 
 /// Downloads models into this handle's models directory, calling `progress`
@@ -472,8 +474,8 @@ pub export fn antfly_inference_pull_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapError(error.InvalidArgument);
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
     defer @TypeOf(registry).leave(slot);
     const io = handle.io.io();
     var call = PullCall{
@@ -490,7 +492,7 @@ pub export fn antfly_inference_pull_json(
     const result = call.result orelse return if (pulled) |_| .internal else |err| mapCallError(err);
     out.* = .{ .ptr = result.ptr, .len = result.len };
     _ = pulled catch {
-        const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch return .internal;
+        const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         defer parsed.deinit();
         return pullErrorCode(parsed.value.@"error");
     };
@@ -624,14 +626,14 @@ pub export fn antfly_inference_generate_stream_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     capi.clearLastError();
-    const out = db.resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
-    const callback = on_chunk orelse return capi.mapError(error.InvalidArgument);
+    const out = db.resetOutBuffer(out_buf) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const out = db.resetOutBuffer(out_buf) orelse");
+    const callback = on_chunk orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const callback = on_chunk orelse");
     const request = streamingRequest(request_json.bytes()) catch |err| switch (err) {
-        error.OutOfMemory => return .internal,
-        else => return capi.mapError(error.InvalidArgument),
+        error.OutOfMemory => return capi.mapError(err),
+        else => return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": else =>"),
     };
     defer alloc.free(request);
-    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapError(error.InvalidArgument);
+    const handle, const slot = registry.enter(handle_ptr) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": const handle, const slot = registry.enter(handle_ptr) orelse");
     defer @TypeOf(registry).leave(slot);
 
     var call = StreamCall{ .callback = callback, .callback_context = chunk_context };
@@ -645,13 +647,13 @@ pub export fn antfly_inference_generate_stream_json(
     if (call.relay.cancelled.load(.acquire)) return .cancelled;
     _ = call.outcome catch |err| return mapCallError(err);
     if (call.stream_error) |message| {
-        const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch return .internal;
+        const body = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{ .@"error" = "STREAM_FAILED", .message = message }, .{})}) catch |err| return capi.mapErrorContext(err, @src().fn_name);
         out.* = .{ .ptr = body.ptr, .len = body.len };
-        return .internal;
+        return capi.recordError(.internal, @src().fn_name ++ ": validation failed");
     }
     // A request rejected before streaming started gets an ordinary response.
     if (call.status == 0) {
-        const response = call.response orelse return .internal;
+        const response = call.response orelse return capi.recordError(.internal, @src().fn_name ++ ": const response = call.response orelse");
         call.response = null;
         out.* = .{ .ptr = response.body.ptr, .len = response.body.len };
         return errorForStatus(response.status);

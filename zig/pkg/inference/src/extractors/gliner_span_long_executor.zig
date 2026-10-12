@@ -13,6 +13,7 @@ const compute = @import("../ops/ops.zig");
 const wire = @import("extraction_v2.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const A = std.mem.Allocator;
+const window_limits = @import("../models/gliner_span_window_limits.zig").qualified;
 
 pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing: processor.Options, options: executor.Options) !executor.PreparedItem {
     const selected = item.options.long_document;
@@ -25,7 +26,9 @@ pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing
             .word_splitter = item.options.word_splitter,
             .max_window_body_words = body_words,
             .overlap_words = selected.overlap_words,
-            .max_windows = @min(selected.max_windows, @min(options.max_sequences_per_item, 64)),
+            .max_windows = @min(selected.max_windows, @min(options.max_sequences_per_item, window_limits.max_windows)),
+            .max_document_bytes = window_limits.max_document_bytes,
+            .max_document_words = window_limits.max_document_words,
             .control = options.control,
             .inference_fingerprint = @splat(0),
         });
@@ -46,7 +49,7 @@ pub fn prepare(a: A, tokenizer: Tokenizer, item: *const wire.Item, preprocessing
             };
             built += 1;
             total = try std.math.add(usize, total, batch.input_ids.len);
-            if (total > options.max_request_tokens) return error.ExtractionRequestLimitExceeded;
+            if (total > @min(options.max_request_tokens, window_limits.max_request_tokens)) return error.ExtractionRequestLimitExceeded;
         }
         if (too_long) {
             for (batches[0..built]) |*batch| batch.deinit();

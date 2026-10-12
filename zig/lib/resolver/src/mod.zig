@@ -551,6 +551,7 @@ fn renderKey(a: std.mem.Allocator, template: []const u8, entity: ExtractedEntity
             i += 1;
         }
     }
+    if (out.items.len == 0) return error.EmptyEntityKey;
     return out.toOwnedSlice(a);
 }
 
@@ -606,8 +607,14 @@ fn applyHelper(
         try out.appendSlice(a, std.mem.trim(u8, value, " \t\r\n"));
         return;
     }
+    if (std.mem.eql(u8, helper, "uslug")) {
+        try @import("unicode_slug.zig").append(a, out, value);
+        return;
+    }
     if (std.mem.eql(u8, helper, "slug")) {
+        const start = out.items.len;
         try appendSlug(a, out, value);
+        if (out.items.len == start) return error.EmptyEntityKey;
         return;
     }
     if (std.mem.eql(u8, helper, "hash")) {
@@ -2311,4 +2318,33 @@ test "resolution exact minted key aliases require no scorer" {
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
     try testing.expectEqualStrings("Augusta Ada King", ent.get("canonical_name").?.string);
     try testing.expectEqualStrings("Ada Lovelace", ent.get("surface_form").?.string);
+}
+
+test "uslug normalizes Unicode identities without changing legacy ASCII keys" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "Qwen3", "qwen3" }, .{ "qwen3", "qwen3" },
+        .{ "Ｑｗｅｎ３", "qwen3" },
+        .{ "Straße", "strasse" },
+        .{ "Σίσυφος", "σίσυφοσ" },
+        .{ "東京 大学", "東京_大学" },
+        .{ "CAFÉ", "café" },
+        .{ "Cafe\u{301}", "café" },
+        .{ "한글", "한글" },
+        .{ "ﬃ ①", "ffi_1" },
+    };
+    for (cases) |case| {
+        const key = try renderKey(a, "entity/{{ uslug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = case[0] });
+        defer a.free(key);
+        const expected = try std.fmt.allocPrint(a, "entity/{s}", .{case[1]});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+    const legacy = try renderKey(a, "entity/{{ slug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "Epstein's island" });
+    defer a.free(legacy);
+    try std.testing.expectEqualStrings("entity/epstein_island", legacy);
+    for ([_][]const u8{ "entity/{{ slug _entity.text }}", "entity/{{ uslug _entity.text }}" }) |template|
+        try std.testing.expectError(error.EmptyEntityKey, renderKey(a, template, .{ .local_id = "e0", .label = "concept", .text = "!!!" }));
+    try std.testing.expectError(error.EmptyEntityKey, renderKey(a, "entity/{{ slug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "東京" }));
+    try std.testing.expectError(error.InvalidUtf8, renderKey(a, "{{ uslug _entity.text }}", .{ .local_id = "e0", .label = "concept", .text = "\xff" }));
 }

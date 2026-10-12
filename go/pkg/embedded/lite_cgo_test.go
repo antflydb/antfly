@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -97,7 +98,7 @@ func TestLiteOpenReadOnlyMissingDoesNotCreate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), name+".aflite")
 			db, err := open(path)
-			if err != NotFound {
+			if !errors.Is(err, NotFound) {
 				if db != nil {
 					db.Close()
 				}
@@ -140,7 +141,7 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	if err := readonly.Batch([]WriteIntent{{
 		Key:   "doc:readonly-write",
 		Value: []byte(`{"title":"readonly write"}`),
-	}}, 2); err != InvalidArgument {
+	}}, 2); !errors.Is(err, InvalidArgument) {
 		readonly.Close()
 		t.Fatalf("readonly batch error = %v, want %v", err, InvalidArgument)
 	}
@@ -159,7 +160,7 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	if err := statusOnly.Batch([]WriteIntent{{
 		Key:   "doc:status-only-write",
 		Value: []byte(`{"title":"status only write"}`),
-	}}, 3); err != InvalidArgument {
+	}}, 3); !errors.Is(err, InvalidArgument) {
 		statusOnly.Close()
 		t.Fatalf("status-only batch error = %v, want %v", err, InvalidArgument)
 	}
@@ -791,7 +792,7 @@ func TestLiteCAPI(t *testing.T) {
 	if _, err := os.Stat(snapshotPath); err != nil {
 		t.Fatalf("snapshot file: %v", err)
 	}
-	if _, err := db.CopyStableSnapshot(filepath.Join(t.TempDir(), "go-snapshot.afb"), false); err != InvalidArgument {
+	if _, err := db.CopyStableSnapshot(filepath.Join(t.TempDir(), "go-snapshot.afb"), false); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("handle snapshot to .afb error = %v, want %v", err, InvalidArgument)
 	}
 
@@ -820,7 +821,7 @@ func TestLiteCAPI(t *testing.T) {
 	if _, err := CopyStableSnapshotFile(path, snapshotFilePath, false); err == nil {
 		t.Fatalf("snapshot file without replace unexpectedly overwrote target")
 	}
-	if _, err := CopyStableSnapshotFile(path, filepath.Join(t.TempDir(), "go-snapshot-file.afb"), false); err != InvalidArgument {
+	if _, err := CopyStableSnapshotFile(path, filepath.Join(t.TempDir(), "go-snapshot-file.afb"), false); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("snapshot file to .afb error = %v, want %v", err, InvalidArgument)
 	}
 
@@ -868,7 +869,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("open-transaction snapshot lookup JSON %q did not contain committed document", openTxnSnapshotCommittedLookup)
 	}
 	openTxnSnapshotPendingLookup, snapshotPendingErr := openTxnSnapshot.LookupJSON("doc:go-pending-backup")
-	if snapshotPendingErr != nil && snapshotPendingErr != NotFound {
+	if snapshotPendingErr != nil && !errors.Is(snapshotPendingErr, NotFound) {
 		openTxnSnapshot.Close()
 		t.Fatalf("lookup pending doc from open-transaction snapshot: %v", snapshotPendingErr)
 	}
@@ -900,7 +901,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("open-transaction backup lookup JSON %q did not contain committed document", openTxnCommittedLookup)
 	}
 	openTxnPendingLookup, pendingErr := openTxnRestored.LookupJSON("doc:go-pending-backup")
-	if pendingErr != nil && pendingErr != NotFound {
+	if pendingErr != nil && !errors.Is(pendingErr, NotFound) {
 		openTxnRestored.Close()
 		t.Fatalf("lookup pending doc from open-transaction backup: %v", pendingErr)
 	}
@@ -1005,12 +1006,12 @@ func TestLiteCAPI(t *testing.T) {
 		if err == nil {
 			break
 		}
-		if err != Busy || time.Now().After(deadline) {
+		if !errors.Is(err, Busy) || time.Now().After(deadline) {
 			t.Fatalf("restore between connection calls: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := openRestore.LookupJSON("doc:pre-restore-target"); err != NotFound {
+	if _, err := openRestore.LookupJSON("doc:pre-restore-target"); !errors.Is(err, NotFound) {
 		t.Fatalf("old document after replacement = %v, want %v", err, NotFound)
 	}
 	assertSearchContains(openRestore, "open connection restored full-text", fullTextQuery, "go binding full text search")
@@ -1160,7 +1161,7 @@ func TestLiteCAPI(t *testing.T) {
 		defer hostedWithTTL.Close()
 		t.Fatalf("hosted Lite database unexpectedly accepted TTL cleanup options")
 	}
-	if err != InvalidArgument {
+	if !errors.Is(err, InvalidArgument) {
 		t.Fatalf("hosted TTL open error = %v, want %v", err, InvalidArgument)
 	}
 }
@@ -2638,5 +2639,107 @@ func TestNamedTableReopensManagedEmbeddingProviders(t *testing.T) {
 				t.Fatalf("new document has no searchable generated vector: %s", result)
 			}
 		})
+	}
+}
+
+func TestNativeDiagnosticsOwnDetailsAndResetForSQL(t *testing.T) {
+	db, err := CreateHosted(filepath.Join(t.TempDir(), "db.aflite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateTableJSON("entities", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	table, err := db.OpenTable("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	indexErr := db.AddIndexJSON([]byte(`{"name":"invalid"}`))
+	if !errors.Is(indexErr, InvalidArgument) || !strings.Contains(indexErr.Error(), "MissingIndexType") {
+		t.Fatalf("index diagnostic: %v", indexErr)
+	}
+	_, sqlErr := table.NewSQLSession()
+	if !errors.Is(sqlErr, InvalidArgument) || strings.Contains(sqlErr.Error(), "MissingIndexType") || !strings.Contains(sqlErr.Error(), "root database handle") {
+		t.Fatalf("SQL diagnostic: %v", sqlErr)
+	}
+	if !strings.Contains(indexErr.Error(), "MissingIndexType") {
+		t.Fatal("earlier error detail changed")
+	}
+}
+
+func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testing.T) {
+	if !liteLocalEmbeddingModelAvailable() {
+		t.Skip("local Qwen embedding model is not installed")
+	}
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "resolver.aflite"), OpenOptions{Profile: ProfileNative, LocalRuntimeConfigured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	caps, err := db.Capabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps.LocalInferenceRuntime {
+		t.Skip("local inference runtime is unavailable")
+	}
+	if err := db.CreateTableJSON("entities", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	entities, err := db.OpenTable("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer entities.Close()
+	if err := entities.AddIndexJSON([]byte(`{"name":"names","type":"embeddings","dims":1024,"field":"canonical_name","metric":"cosine","embedder":{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entities.BatchJSON([]byte(`{"inserts":{"concept/canonical":{"entity_type":"concept","canonical_name":"The approval reviewer"}},"sync_level":"write"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatal(err)
+	}
+	scorer := `{"comparisons":[{"name":"embedding","left":"name_embedding","right":"name_embedding","levels":[{"when":"cosine > 0.5","weight":8.0},{"else":true,"weight":-6.0}]}],"combine":{"bias":-3.0},"decision":{"match":0.9}}`
+	config := map[string]any{"name": "knowledge", "type": "graph",
+		"source":     map[string]any{"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+		"artifact":   map[string]any{"name": "kg", "kind": "asset", "source": map[string]any{"type": "field", "value": "kg"}, "content_type": "application/json"},
+		"edge_types": []any{map[string]any{"name": "mentions"}},
+		"resolvers":  []any{map[string]any{"name": "concepts", "table": "entities", "source_artifact": "kg", "resolution_artifact": "resolved", "key_template": "concept/{{ uslug _entity.text }}", "candidate_search": "ann", "candidate_ann_index": "names", "candidate_limit": 1, "name_embedding": "names", "name_embedding_dims": 1024, "scorer_json": scorer, "config_generation": 1}},
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddIndexJSON(raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BatchJSON([]byte(`{"inserts":{"claim:reviewer":{"kg":{"entities":[{"id":"e0","label":"concept","text":"Approval reviewer"}]} }},"sync_level":"write"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatal(err)
+	}
+	edges, err := db.EdgesJSON("knowledge", "claim:reviewer", "mentions", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed []struct {
+		Target string `json:"target_b64"`
+	}
+	if err := json.Unmarshal(edges, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("mention edges = %s", edges)
+	}
+	key, err := base64.StdEncoding.DecodeString(parsed[0].Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(key) != "concept/canonical" {
+		t.Fatalf("generated embeddings failed to merge the mention: %s", key)
 	}
 }

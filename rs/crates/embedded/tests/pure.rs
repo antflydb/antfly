@@ -104,3 +104,16 @@ fn database_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<antfly_embedded::Database>();
 }
+
+#[test]
+fn owned_native_diagnostic_keeps_stable_error_category() {
+    let error = antfly_embedded::Error::Native {
+        code: 1,
+        detail: "sparse must be boolean".into(),
+    };
+    assert_eq!(error, antfly_embedded::Error::InvalidArgument);
+    assert_eq!(error.kind(), antfly_embedded::Error::InvalidArgument);
+    assert_eq!(error.detail(), Some("sparse must be boolean"));
+    assert!(error.to_string().contains("sparse must be boolean"));
+    assert_eq!(error.clone().detail(), error.detail());
+}

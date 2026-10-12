@@ -1,0 +1,1289 @@
+{
+  "format_version": 1,
+  "scope": "untouched_upstream_extraction_diagnostic_not_quality_qualification",
+  "runs": [
+    {
+      "model": {
+        "architecture": "span",
+        "files": {
+          "config.json": {
+            "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2",
+            "size_bytes": 464
+          },
+          "encoder_config/config.json": {
+            "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d",
+            "size_bytes": 2160
+          },
+          "model.safetensors": {
+            "sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3",
+            "size_bytes": 4755208228
+          },
+          "tokenizer.json": {
+            "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb",
+            "size_bytes": 3585055
+          },
+          "tokenizer_config.json": {
+            "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
+            "size_bytes": 559
+          }
+        },
+        "model_id": "fastino/GLiNER2.5-Decide-1B",
+        "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+        "tasks": [
+          "classification",
+          "typed_decisions"
+        ]
+      },
+      "upstream_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+      "probes": [
+        {
+          "id": "readme",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": [
+            "company",
+            "person",
+            "product",
+            "location"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -17.906383514404297,
+                0.8244727253913879,
+                -5.361642360687256,
+                -10.964140892028809,
+                -17.033584594726562,
+                -22.612102508544922,
+                -26.96354866027832,
+                -29.470645904541016,
+                -29.952411651611328,
+                -31.035566329956055,
+                -33.35251235961914,
+                -33.905948638916016,
+                -35.636539459228516,
+                -37.81951141357422,
+                -38.526763916015625,
+                -39.41227340698242,
+                -40.523345947265625,
+                -41.056129455566406,
+                -40.17224884033203,
+                -37.887939453125
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -18302.357421875,
+                -3188.688720703125
+              ],
+              "span_rep_range": [
+                -350.74163818359375,
+                402.6670837402344
+              ],
+              "projection_range": [
+                -1.1034812927246094,
+                1.0847269296646118
+              ]
+            }
+          ]
+        },
+        {
+          "id": "readme_low_threshold",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": [
+            "company",
+            "person",
+            "product",
+            "location"
+          ],
+          "threshold": 0.01,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -17.906383514404297,
+                0.8244727253913879,
+                -5.361642360687256,
+                -10.964140892028809,
+                -17.033584594726562,
+                -22.612102508544922,
+                -26.96354866027832,
+                -29.470645904541016,
+                -29.952411651611328,
+                -31.035566329956055,
+                -33.35251235961914,
+                -33.905948638916016,
+                -35.636539459228516,
+                -37.81951141357422,
+                -38.526763916015625,
+                -39.41227340698242,
+                -40.523345947265625,
+                -41.056129455566406,
+                -40.17224884033203,
+                -37.887939453125
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -18302.357421875,
+                -3188.688720703125
+              ],
+              "span_rep_range": [
+                -350.74163818359375,
+                402.6670837402344
+              ],
+              "projection_range": [
+                -1.1034812927246094,
+                1.0847269296646118
+              ]
+            }
+          ]
+        },
+        {
+          "id": "descriptions",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": {
+            "company": "A named company or organization",
+            "person": "A named person",
+            "product": "A named product",
+            "location": "A named place"
+          },
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities [DESCRIPTION] company: A named company or organization [DESCRIPTION] person: A named person [DESCRIPTION] product: A named product [DESCRIPTION] location: A named place",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -18.237689971923828,
+                0.4903710186481476,
+                -5.237549781799316,
+                -10.32603931427002,
+                -15.808691024780273,
+                -20.476699829101562,
+                -24.315963745117188,
+                -26.105331420898438,
+                -26.573457717895508,
+                -27.48736572265625,
+                -29.77545166015625,
+                -30.470447540283203,
+                -32.795623779296875,
+                -35.103607177734375,
+                -35.9442253112793,
+                -37.09600067138672,
+                -38.41862869262695,
+                -39.12678909301758,
+                -38.58245849609375,
+                -35.83303451538086
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -16153.3955078125,
+                -2976.96484375
+              ],
+              "span_rep_range": [
+                -348.9162902832031,
+                400.54840087890625
+              ],
+              "projection_range": [
+                -1.0308600664138794,
+                0.9661634564399719
+              ]
+            }
+          ]
+        },
+        {
+          "id": "conll_labels",
+          "text": "John Smith works at Microsoft in London.",
+          "labels": [
+            "PER",
+            "ORG",
+            "LOC"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "PER": [],
+              "ORG": [],
+              "LOC": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "PER",
+                "[E]",
+                "ORG",
+                "[E]",
+                "LOC",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -15.800370216369629,
+                0.6112561225891113,
+                -5.936026096343994,
+                -11.321084976196289,
+                -17.22700309753418,
+                -22.54753875732422,
+                -26.697750091552734,
+                -29.01547622680664,
+                -29.203807830810547,
+                -30.469545364379883,
+                -32.77096939086914,
+                -33.183067321777344,
+                -34.83781051635742,
+                -36.94102478027344,
+                -37.377628326416016,
+                -38.23665237426758,
+                -38.92654800415039,
+                -39.497581481933594,
+                -38.63885498046875,
+                -36.21883773803711
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -12518.2255859375,
+                -3488.149658203125
+              ],
+              "span_rep_range": [
+                -270.2454528808594,
+                310.275146484375
+              ],
+              "projection_range": [
+                -0.7823567390441895,
+                0.7973812818527222
+              ]
+            }
+          ]
+        },
+        {
+          "id": "single_label",
+          "text": "Barack Obama was born in Hawaii.",
+          "labels": [
+            "person"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "person": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "person",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -15.407502174377441,
+                0.6306862831115723,
+                -5.90226411819458,
+                -11.44005012512207,
+                -17.46708106994629,
+                -22.980403900146484,
+                -27.366792678833008,
+                -29.767194747924805,
+                -30.041025161743164,
+                -31.303861618041992,
+                -33.571754455566406,
+                -33.90363693237305,
+                -35.37442398071289,
+                -37.350337982177734,
+                -37.777984619140625,
+                -38.4976692199707,
+                -39.295738220214844,
+                -40.032711029052734,
+                -39.12299346923828,
+                -36.712646484375
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -12166.1201171875,
+                -5384.232421875
+              ],
+              "span_rep_range": [
+                -251.0428009033203,
+                285.9051513671875
+              ],
+              "projection_range": [
+                -0.7971855998039246,
+                0.8286752104759216
+              ]
+            }
+          ]
+        },
+        {
+          "id": "combined_relation",
+          "text": "Ada Lovelace works at Antfly in Paris.",
+          "labels": [
+            "person",
+            "organization",
+            "location"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "person": [],
+              "organization": [],
+              "location": []
+            },
+            "relation_extraction": {
+              "works_at": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "person",
+                "[E]",
+                "organization",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -19.37738609313965,
+                1.2312051057815552,
+                -5.921589374542236,
+                -12.369967460632324,
+                -19.45977020263672,
+                -25.76446533203125,
+                -30.62624740600586,
+                -33.2131233215332,
+                -33.608001708984375,
+                -34.389888763427734,
+                -36.67301940917969,
+                -36.82602310180664,
+                -38.53425979614258,
+                -40.549774169921875,
+                -41.190364837646484,
+                -42.11723327636719,
+                -43.41241455078125,
+                -43.98935317993164,
+                -42.956809997558594,
+                -40.77965545654297
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -13145.669921875,
+                -2749.774169921875
+              ],
+              "span_rep_range": [
+                -245.4849395751953,
+                282.97943115234375
+              ],
+              "projection_range": [
+                -1.0660902261734009,
+                1.07145357131958
+              ]
+            },
+            {
+              "task_type": "relations",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "works_at",
+                "(",
+                "[R]",
+                "head",
+                "[R]",
+                "tail",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -21.680795669555664,
+                1.4286648035049438,
+                -4.357641220092773,
+                -10.11872673034668,
+                -16.402612686157227,
+                -22.21686553955078,
+                -27.132633209228516,
+                -30.32025909423828,
+                -31.007198333740234,
+                -32.51447677612305,
+                -35.6123161315918,
+                -36.165340423583984,
+                -37.784019470214844,
+                -39.98562240600586,
+                -40.43645095825195,
+                -41.01297378540039,
+                -42.3092155456543,
+                -42.939414978027344,
+                -42.033203125,
+                -39.912811279296875
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -13309.625,
+                -3678.06103515625
+              ],
+              "span_rep_range": [
+                -245.4849395751953,
+                282.97943115234375
+              ],
+              "projection_range": [
+                -1.348117709159851,
+                1.291742205619812
+              ]
+            }
+          ]
+        }
+      ],
+      "classification_control": {
+        "intent": "refund"
+      },
+      "head_weights": {
+        "span_rep.span_rep_layer.project_start.0.weight": {
+          "shape": [
+            7168,
+            1792
+          ],
+          "minimum": -0.09455624222755432,
+          "maximum": 0.06653943657875061,
+          "mean": -4.939904101775028e-05
+        },
+        "span_rep.span_rep_layer.project_start.0.bias": {
+          "shape": [
+            7168
+          ],
+          "minimum": -0.040099672973155975,
+          "maximum": 0.029137300327420235,
+          "mean": -0.004977666772902012
+        },
+        "span_rep.span_rep_layer.project_start.3.weight": {
+          "shape": [
+            1792,
+            7168
+          ],
+          "minimum": -0.07854028791189194,
+          "maximum": 0.19567011296749115,
+          "mean": 0.0006727654836140573
+        },
+        "span_rep.span_rep_layer.project_start.3.bias": {
+          "shape": [
+            1792
+          ],
+          "minimum": -0.05466203764081001,
+          "maximum": 0.01923053339123726,
+          "mean": -0.005706131923943758
+        },
+        "span_rep.span_rep_layer.project_end.0.weight": {
+          "shape": [
+            7168,
+            1792
+          ],
+          "minimum": -0.0742867961525917,
+          "maximum": 0.06644219160079956,
+          "mean": -8.735906158108264e-05
+        },
+        "span_rep.span_rep_layer.project_end.0.bias": {
+          "shape": [
+            7168
+          ],
+          "minimum": -0.03802400082349777,
+          "maximum": 0.02846953272819519,
+          "mean": -0.00553062092512846
+        },
+        "span_rep.span_rep_layer.project_end.3.weight": {
+          "shape": [
+            1792,
+            7168
+          ],
+          "minimum": -0.08282241225242615,
+          "maximum": 0.16876919567584991,
+          "mean": 0.0007697334513068199
+        },
+        "span_rep.span_rep_layer.project_end.3.bias": {
+          "shape": [
+            1792
+          ],
+          "minimum": -0.04711572825908661,
+          "maximum": 0.02034066990017891,
+          "mean": -0.0058050090447068214
+        },
+        "span_rep.span_rep_layer.out_project.0.weight": {
+          "shape": [
+            7168,
+            3584
+          ],
+          "minimum": -0.09906633198261261,
+          "maximum": 0.10553422570228577,
+          "mean": 0.00019879806495737284
+        },
+        "span_rep.span_rep_layer.out_project.0.bias": {
+          "shape": [
+            7168
+          ],
+          "minimum": -0.029886677861213684,
+          "maximum": 0.02970569208264351,
+          "mean": -0.003177418140694499
+        },
+        "span_rep.span_rep_layer.out_project.3.weight": {
+          "shape": [
+            1792,
+            7168
+          ],
+          "minimum": -0.1640842854976654,
+          "maximum": 0.1781923770904541,
+          "mean": 1.2046462870785035e-05
+        },
+        "span_rep.span_rep_layer.out_project.3.bias": {
+          "shape": [
+            1792
+          ],
+          "minimum": -0.03744889795780182,
+          "maximum": 0.03699648007750511,
+          "mean": -0.0003424905298743397
+        },
+        "count_pred.0.weight": {
+          "shape": [
+            3584,
+            1792
+          ],
+          "minimum": -0.06682531535625458,
+          "maximum": 0.06788825243711472,
+          "mean": -7.548127905465662e-05
+        },
+        "count_pred.0.bias": {
+          "shape": [
+            3584
+          ],
+          "minimum": -0.03401556983590126,
+          "maximum": 0.02917223796248436,
+          "mean": -0.002719976007938385
+        },
+        "count_pred.2.weight": {
+          "shape": [
+            20,
+            3584
+          ],
+          "minimum": -0.46150851249694824,
+          "maximum": 0.08535771816968918,
+          "mean": -0.04974348843097687
+        },
+        "count_pred.2.bias": {
+          "shape": [
+            20
+          ],
+          "minimum": -0.022626226767897606,
+          "maximum": 0.014930515550076962,
+          "mean": -0.0052304924465715885
+        },
+        "count_embed.pos_embedding.weight": {
+          "shape": [
+            20,
+            1792
+          ],
+          "minimum": -3.9722001552581787,
+          "maximum": 3.8349781036376953,
+          "mean": 0.005915028043091297
+        },
+        "count_embed.gru.weight_ih_l0": {
+          "shape": [
+            5376,
+            1792
+          ],
+          "minimum": -0.06899500638246536,
+          "maximum": 0.06616494804620743,
+          "mean": 1.7026372006512247e-05
+        },
+        "count_embed.gru.weight_hh_l0": {
+          "shape": [
+            5376,
+            1792
+          ],
+          "minimum": -0.09354785084724426,
+          "maximum": 0.0964399203658104,
+          "mean": -9.193961159326136e-05
+        },
+        "count_embed.gru.bias_ih_l0": {
+          "shape": [
+            5376
+          ],
+          "minimum": -0.04306609183549881,
+          "maximum": 0.05919555574655533,
+          "mean": 0.0026698417495936155
+        },
+        "count_embed.gru.bias_hh_l0": {
+          "shape": [
+            5376
+          ],
+          "minimum": -0.040098365396261215,
+          "maximum": 0.05737406387925148,
+          "mean": 0.002784817246720195
+        },
+        "count_embed.projector.0.weight": {
+          "shape": [
+            7168,
+            3584
+          ],
+          "minimum": -0.06609942764043808,
+          "maximum": 0.07081403583288193,
+          "mean": 1.8925677068182267e-05
+        },
+        "count_embed.projector.0.bias": {
+          "shape": [
+            7168
+          ],
+          "minimum": -0.025492912158370018,
+          "maximum": 0.018412096425890923,
+          "mean": -0.004289744887501001
+        },
+        "count_embed.projector.2.weight": {
+          "shape": [
+            1792,
+            7168
+          ],
+          "minimum": -0.08344687521457672,
+          "maximum": 0.08045881241559982,
+          "mean": -5.823733317811275e-06
+        },
+        "count_embed.projector.2.bias": {
+          "shape": [
+            1792
+          ],
+          "minimum": -0.030311711132526398,
+          "maximum": 0.028561903163790703,
+          "mean": 0.00020482570107560605
+        }
+      },
+      "runtime": {
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "tokenizers": "0.21.4"
+      }
+    },
+    {
+      "model": {
+        "architecture": "span",
+        "files": {
+          "config.json": {
+            "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2",
+            "size_bytes": 464
+          },
+          "encoder_config/config.json": {
+            "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d",
+            "size_bytes": 2160
+          },
+          "model.safetensors": {
+            "sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3",
+            "size_bytes": 4755208228
+          },
+          "tokenizer.json": {
+            "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb",
+            "size_bytes": 3585055
+          },
+          "tokenizer_config.json": {
+            "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
+            "size_bytes": 559
+          }
+        },
+        "model_id": "fastino/GLiNER2.5-Decide-1B",
+        "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+        "tasks": [
+          "classification",
+          "typed_decisions"
+        ]
+      },
+      "upstream_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+      "probes": [
+        {
+          "id": "readme",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": [
+            "company",
+            "person",
+            "product",
+            "location"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -17.906383514404297,
+                0.8244727253913879,
+                -5.361642360687256,
+                -10.964140892028809,
+                -17.033584594726562,
+                -22.612102508544922,
+                -26.96354866027832,
+                -29.470645904541016,
+                -29.952411651611328,
+                -31.035566329956055,
+                -33.35251235961914,
+                -33.905948638916016,
+                -35.636539459228516,
+                -37.81951141357422,
+                -38.526763916015625,
+                -39.41227340698242,
+                -40.523345947265625,
+                -41.056129455566406,
+                -40.17224884033203,
+                -37.887939453125
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -18302.357421875,
+                -3188.688720703125
+              ],
+              "span_rep_range": [
+                -350.74163818359375,
+                402.6670837402344
+              ],
+              "projection_range": [
+                -1.1034812927246094,
+                1.0847269296646118
+              ]
+            }
+          ]
+        },
+        {
+          "id": "readme_low_threshold",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": [
+            "company",
+            "person",
+            "product",
+            "location"
+          ],
+          "threshold": 0.01,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -17.906383514404297,
+                0.8244727253913879,
+                -5.361642360687256,
+                -10.964140892028809,
+                -17.033584594726562,
+                -22.612102508544922,
+                -26.96354866027832,
+                -29.470645904541016,
+                -29.952411651611328,
+                -31.035566329956055,
+                -33.35251235961914,
+                -33.905948638916016,
+                -35.636539459228516,
+                -37.81951141357422,
+                -38.526763916015625,
+                -39.41227340698242,
+                -40.523345947265625,
+                -41.056129455566406,
+                -40.17224884033203,
+                -37.887939453125
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -18302.357421875,
+                -3188.688720703125
+              ],
+              "span_rep_range": [
+                -350.74163818359375,
+                402.6670837402344
+              ],
+              "projection_range": [
+                -1.1034812927246094,
+                1.0847269296646118
+              ]
+            }
+          ]
+        },
+        {
+          "id": "descriptions",
+          "text": "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.",
+          "labels": {
+            "company": "A named company or organization",
+            "person": "A named person",
+            "product": "A named product",
+            "location": "A named place"
+          },
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "company": [],
+              "person": [],
+              "product": [],
+              "location": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities [DESCRIPTION] company: A named company or organization [DESCRIPTION] person: A named person [DESCRIPTION] product: A named product [DESCRIPTION] location: A named place",
+                "(",
+                "[E]",
+                "company",
+                "[E]",
+                "person",
+                "[E]",
+                "product",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -18.237689971923828,
+                0.4903710186481476,
+                -5.237549781799316,
+                -10.32603931427002,
+                -15.808691024780273,
+                -20.476699829101562,
+                -24.315963745117188,
+                -26.105331420898438,
+                -26.573457717895508,
+                -27.48736572265625,
+                -29.77545166015625,
+                -30.470447540283203,
+                -32.795623779296875,
+                -35.103607177734375,
+                -35.9442253112793,
+                -37.09600067138672,
+                -38.41862869262695,
+                -39.12678909301758,
+                -38.58245849609375,
+                -35.83303451538086
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -16153.3955078125,
+                -2976.96484375
+              ],
+              "span_rep_range": [
+                -348.9162902832031,
+                400.54840087890625
+              ],
+              "projection_range": [
+                -1.0308600664138794,
+                0.9661634564399719
+              ]
+            }
+          ]
+        },
+        {
+          "id": "conll_labels",
+          "text": "John Smith works at Microsoft in London.",
+          "labels": [
+            "PER",
+            "ORG",
+            "LOC"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "PER": [],
+              "ORG": [],
+              "LOC": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "PER",
+                "[E]",
+                "ORG",
+                "[E]",
+                "LOC",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -15.800370216369629,
+                0.6112561225891113,
+                -5.936026096343994,
+                -11.321084976196289,
+                -17.22700309753418,
+                -22.54753875732422,
+                -26.697750091552734,
+                -29.01547622680664,
+                -29.203807830810547,
+                -30.469545364379883,
+                -32.77096939086914,
+                -33.183067321777344,
+                -34.83781051635742,
+                -36.94102478027344,
+                -37.377628326416016,
+                -38.23665237426758,
+                -38.92654800415039,
+                -39.497581481933594,
+                -38.63885498046875,
+                -36.21883773803711
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -12518.2255859375,
+                -3488.149658203125
+              ],
+              "span_rep_range": [
+                -270.2454528808594,
+                310.275146484375
+              ],
+              "projection_range": [
+                -0.7823567390441895,
+                0.7973812818527222
+              ]
+            }
+          ]
+        },
+        {
+          "id": "single_label",
+          "text": "Barack Obama was born in Hawaii.",
+          "labels": [
+            "person"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "person": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "person",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -15.407502174377441,
+                0.6306862831115723,
+                -5.90226411819458,
+                -11.44005012512207,
+                -17.46708106994629,
+                -22.980403900146484,
+                -27.366792678833008,
+                -29.767194747924805,
+                -30.041025161743164,
+                -31.303861618041992,
+                -33.571754455566406,
+                -33.90363693237305,
+                -35.37442398071289,
+                -37.350337982177734,
+                -37.777984619140625,
+                -38.4976692199707,
+                -39.295738220214844,
+                -40.032711029052734,
+                -39.12299346923828,
+                -36.712646484375
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -12166.1201171875,
+                -5384.232421875
+              ],
+              "span_rep_range": [
+                -251.0428009033203,
+                285.9051513671875
+              ],
+              "projection_range": [
+                -0.7971855998039246,
+                0.8286752104759216
+              ]
+            }
+          ]
+        },
+        {
+          "id": "combined_relation",
+          "text": "Ada Lovelace works at Antfly in Paris.",
+          "labels": [
+            "person",
+            "organization",
+            "location"
+          ],
+          "threshold": 0.5,
+          "output": {
+            "entities": {
+              "person": [],
+              "organization": [],
+              "location": []
+            },
+            "relation_extraction": {
+              "works_at": []
+            }
+          },
+          "heads": [
+            {
+              "task_type": "entities",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "entities",
+                "(",
+                "[E]",
+                "person",
+                "[E]",
+                "organization",
+                "[E]",
+                "location",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -19.37738609313965,
+                1.2312051057815552,
+                -5.921589374542236,
+                -12.369967460632324,
+                -19.45977020263672,
+                -25.76446533203125,
+                -30.62624740600586,
+                -33.2131233215332,
+                -33.608001708984375,
+                -34.389888763427734,
+                -36.67301940917969,
+                -36.82602310180664,
+                -38.53425979614258,
+                -40.549774169921875,
+                -41.190364837646484,
+                -42.11723327636719,
+                -43.41241455078125,
+                -43.98935317993164,
+                -42.956809997558594,
+                -40.77965545654297
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -13145.669921875,
+                -2749.774169921875
+              ],
+              "span_rep_range": [
+                -245.4849395751953,
+                282.97943115234375
+              ],
+              "projection_range": [
+                -1.0660902261734009,
+                1.07145357131958
+              ]
+            },
+            {
+              "task_type": "relations",
+              "schema_tokens": [
+                "(",
+                "[P]",
+                "works_at",
+                "(",
+                "[R]",
+                "head",
+                "[R]",
+                "tail",
+                ")",
+                ")"
+              ],
+              "count_logits": [
+                -21.680795669555664,
+                1.4286648035049438,
+                -4.357641220092773,
+                -10.11872673034668,
+                -16.402612686157227,
+                -22.21686553955078,
+                -27.132633209228516,
+                -30.32025909423828,
+                -31.007198333740234,
+                -32.51447677612305,
+                -35.6123161315918,
+                -36.165340423583984,
+                -37.784019470214844,
+                -39.98562240600586,
+                -40.43645095825195,
+                -41.01297378540039,
+                -42.3092155456543,
+                -42.939414978027344,
+                -42.033203125,
+                -39.912811279296875
+              ],
+              "predicted_count": 1,
+              "slot_zero_max_probability": 0.0,
+              "span_logits_range": [
+                -13309.625,
+                -3678.06103515625
+              ],
+              "span_rep_range": [
+                -245.4849395751953,
+                282.97943115234375
+              ],
+              "projection_range": [
+                -1.348117709159851,
+                1.291742205619812
+              ]
+            }
+          ]
+        }
+      ],
+      "classification_control": {
+        "intent": "refund"
+      },
+      "runtime": {
+        "torch": "2.9.1",
+        "transformers": "5.17.0",
+        "tokenizers": "0.23.3"
+      }
+    }
+  ]
+}

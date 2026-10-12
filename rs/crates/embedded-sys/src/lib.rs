@@ -451,6 +451,7 @@ unsafe extern "C" {
     pub fn antfly_abi_version() -> u32;
     pub fn antfly_open_options_size() -> u32;
     pub fn antfly_last_error_detail() -> *const c_char;
+    pub fn antfly_last_error_code() -> antfly_error_code;
     pub fn antfly_error_code_name(code: antfly_error_code) -> *const c_char;
     pub fn antfly_error_code_description(code: antfly_error_code) -> *const c_char;
     pub fn antfly_open_options_init(options: *mut antfly_open_options) -> antfly_error_code;

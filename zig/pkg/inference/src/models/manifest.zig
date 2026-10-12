@@ -1850,6 +1850,12 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    // No non-empty extraction evaluation qualifies the current ModernBERT
+    // span checkpoint. Apply to both live loading and discovery, including
+    // manifests synthesized by older versions or supplied by the caller.
+    if (manifest.gliner_span_declared and manifest.gliner_span_encoder_family == .modern_bert) {
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "named_entity_recognition", "relations", "extraction" });
+    }
     if (@import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch)) {
         if (manifest.model_type != .embedder or manifest.embedding_style != .embedding_gemma2 or
             manifest.pooling != .mean or !manifest.normalize) return error.InvalidEmbeddingTaskProfile;
@@ -8133,4 +8139,17 @@ test "span wrapper manifest rejects unknown and malformed nested encoder contrac
         \\{"model_type":"modernbert","attention_bias":false,"mlp_bias":false,"norm_bias":false,"tie_word_embeddings":true,"hidden_size":-1,"intermediate_size":3840,"num_hidden_layers":28,"num_attention_heads":28,"vocab_size":50378,"max_position_embeddings":7999,"global_attn_every_n_layers":3,"local_attention":128,"pad_token_id":50283}
     });
     try std.testing.expectError(error.InvalidGlinerSpanEncoderConfig, loadFromDir(allocator, model_path));
+}
+
+test "ModernBERT span discovery withholds unevaluated extraction capabilities" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a, .gliner_span_declared = true, .gliner_span_encoder_family = .modern_bert };
+    defer manifest.deinit();
+    try appendManifestStrings(a, &manifest.capabilities, &.{ "named_entity_recognition", "relations", "extraction", "classification", "typed_decisions" });
+    try applyImplicitModelTypeHints(&manifest, "decide-1b");
+    try std.testing.expect(!manifest.hasCapability("named_entity_recognition"));
+    try std.testing.expect(!manifest.hasCapability("relations"));
+    try std.testing.expect(!manifest.hasCapability("extraction"));
+    try std.testing.expect(manifest.hasCapability("classification"));
+    try std.testing.expect(manifest.hasCapability("typed_decisions"));
 }

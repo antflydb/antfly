@@ -596,9 +596,15 @@ redirects never authorize a match. This allows deterministic corrections such
 as `concept/qwen3` → `concept/qwen3_embedding` without embeddings.
 
 The `slug` template helper is ASCII-only for compatibility with existing keys.
-For multilingual mentions use `{{ hash _entity.text }}` in the key template;
-the hash preserves distinctions in UTF-8 names that an ASCII slug would lose.
-Keep the original name in `canonical_name` and `aliases` for display and search.
+Use the opt-in `{{ uslug _entity.text }}` helper for Unicode identities. It
+normalizes with NFKC, folds case, retains Unicode letters and numbers, and
+separates runs with `_`. `Qwen3`, `qwen3` and `Ｑｗｅｎ３` become `qwen3`;
+`Straße` becomes `strasse`; `東京 大学` becomes `東京_大学`. The Unicode 16.0.0
+normalization tables are checked in, independent of the host locale. Existing
+non-empty `slug` keys retain their spelling. Both helpers reject an empty
+result with `EmptyEntityKey`, including all-CJK inputs passed to ASCII `slug`,
+so a resolver cannot silently mint `entity/`. Keep the original mention in
+`canonical_name` and `aliases` for display and search.
 
 Resolution merges mentions that extraction found; it cannot recover a missing
 subject. For short claims, use specific labels and descriptions naming the

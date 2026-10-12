@@ -210,9 +210,23 @@ fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8,
     if (synthesize_manifest) {
         const manifest_json = try registry.synthesizePulledModelManifestJson(a, model_dir, null, null);
         defer a.free(manifest_json);
+        try expectSpanPublication(a, manifest_json);
         try temporary.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = manifest_json });
     }
     return root;
+}
+
+fn expectSpanPublication(a: Allocator, manifest_json: []const u8) !void {
+    const publication = try std.json.parseFromSlice(std.json.Value, a, manifest_json, .{});
+    defer publication.deinit();
+    const capabilities = publication.value.object.get("capabilities").?.array.items;
+    for (capabilities) |capability| {
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "named_entity_recognition"));
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "relations"));
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "extraction"));
+    }
+    const limits = publication.value.object.get("qualified_limits").?.object;
+    try std.testing.expectEqualStrings("parity_only_no_nonempty_eval", limits.get("span_extraction_status").?.string);
 }
 
 fn requestJson(a: Allocator, captured: []const u8) ![]u8 {
@@ -1186,6 +1200,9 @@ fn serviceParity(comptime backend: BackendType) !void {
     try std.testing.expectEqual(manifest_mod.GlinerSpanEncoderFamily.modern_bert, raw_listing.gliner_span_encoder_family);
     try std.testing.expectEqual(@as(usize, 0), raw_listing.tasks.len);
     try std.testing.expectEqual(@as(usize, 0), raw_listing.capabilities.len);
+    const publication = try registry.synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(publication);
+    try expectSpanPublication(a, publication);
     var node = try Node.init(a, .{
         .models_dir = models_dir,
         .max_loaded_models = 1,

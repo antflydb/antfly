@@ -1772,6 +1772,56 @@ fn synthesizePulledModelManifestJsonFromPlan(
 
 const PulledManifestSource = enum { published, staging_plan };
 
+fn qualifiedLimitsJsonAlloc(allocator: std.mem.Allocator, boundary_identity: ?@import("../models/gliner_boundary_bundle.zig").Identity, decide_identity: ?decide_qualification.Identity) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Profile = struct { backend: []const u8, features: []const []const u8, lengths: gliner_qualification.LengthContract };
+    var profiles: std.ArrayList(Profile) = .empty;
+    if (boundary_identity) |identity| for (gliner_qualification.publishedProfiles()) |entry| {
+        if (!std.meta.eql(identity, entry.identity)) continue;
+        var features: std.ArrayList([]const u8) = .empty;
+        var iterator = entry.features.iterator();
+        while (iterator.next()) |feature| try features.append(a, @tagName(feature));
+        try profiles.append(a, .{ .backend = @tagName(entry.backend), .features = features.items, .lengths = entry.lengths });
+    };
+    return try std.json.Stringify.valueAlloc(allocator, .{
+        .profiles = profiles.items,
+        .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
+        .span_extraction_status = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @as(?[]const u8, "parity_only_no_nonempty_eval") else null else null,
+        .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) @import("../models/gliner_span_window_limits.zig").qualified else null else null,
+        .runtime_revalidates_artifact = true,
+    }, .{});
+}
+
+test "qualified limits JSON shares serving geometry and window bounds" {
+    const a = std.testing.allocator;
+    const raw = try qualifiedLimitsJsonAlloc(a, gliner_qualification.fastino_gliner25_base_v1, decide_qualification.pinned_fp32_identity);
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("runtime_revalidates_artifact").?.bool);
+    try std.testing.expect(root.get("profiles").?.array.items.len > 0);
+    const published = root.get("decide").?.object;
+    const enforced = (try decide_qualification.requestLimits(decide_qualification.pinned_fp32_identity)).?;
+    try std.testing.expectEqual(@as(i64, @intCast(enforced.sequence_tokens)), published.get("sequence_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(enforced.prepared_sequences)), published.get("prepared_sequences").?.integer);
+    try std.testing.expectEqualStrings("parity_only_no_nonempty_eval", root.get("span_extraction_status").?.string);
+    const windows = root.get("span_windows").?.object;
+    const bounds = @import("../models/gliner_span_window_limits.zig").qualified;
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_windows)), windows.get("max_windows").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_request_tokens)), windows.get("max_request_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_bytes)), windows.get("max_document_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(bounds.max_document_words)), windows.get("max_document_words").?.integer);
+    const absent = try qualifiedLimitsJsonAlloc(a, null, null);
+    defer a.free(absent);
+    const none = try std.json.parseFromSlice(std.json.Value, a, absent, .{});
+    defer none.deinit();
+    try std.testing.expect(none.value.object.get("decide").? == .null);
+    try std.testing.expect(none.value.object.get("span_windows").? == .null);
+}
+
 fn synthesizePulledModelManifestJsonInternal(
     allocator: std.mem.Allocator,
     dest_dir: []const u8,
@@ -1793,7 +1843,6 @@ fn synthesizePulledModelManifestJsonInternal(
     const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
     const decide_identity = decideIdentity(allocator, &manifest);
     const qualified_decide = decide_identity != null;
-    const qualified_span_extraction = if (decide_identity) |identity| decide_qualification.supportsSpanExtraction(identity) else false;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
     const known_decide_source = source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir);
@@ -1853,13 +1902,20 @@ fn synthesizePulledModelManifestJsonInternal(
         if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
     }
     if (qualified_decide) {
-        try appendQualifiedDecisionCapabilities(allocator, true, &capabilities);
-        if (qualified_span_extraction) {
-            try appendUniqueOwnedString(allocator, &capabilities, "named_entity_recognition");
-            try appendUniqueOwnedString(allocator, &capabilities, "relations");
+        // A raw or old synthesized manifest may still claim NER/relations.
+        // Never carry those claims forward from the zero-output 1B checkpoint.
+        if (decide_identity.?.encoder_family == .modern_bert) {
+            var i: usize = 0;
+            while (i < capabilities.items.len) {
+                const capability = capabilities.items[i];
+                if (std.mem.eql(u8, capability, "named_entity_recognition") or std.mem.eql(u8, capability, "relations") or std.mem.eql(u8, capability, "extraction")) {
+                    allocator.free(capabilities.orderedRemove(i));
+                } else i += 1;
+            }
         }
+        try appendQualifiedDecisionCapabilities(allocator, true, &capabilities);
         for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
-        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions") and !(qualified_span_extraction and (std.mem.eql(u8, capability, "named_entity_recognition") or std.mem.eql(u8, capability, "relations")))) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
     // Reserved public capability: neither an alias nor a caller-supplied CSV
@@ -1893,24 +1949,8 @@ fn synthesizePulledModelManifestJsonInternal(
     if (qualified_decide)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
     if (qualified_boundary or qualified_decide) {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const Profile = struct { backend: []const u8, features: []const []const u8, lengths: gliner_qualification.LengthContract };
-        var profiles: std.ArrayList(Profile) = .empty;
-        if (boundary_identity) |identity| for (gliner_qualification.publishedProfiles()) |entry| {
-            if (!std.meta.eql(identity, entry.identity)) continue;
-            var features: std.ArrayList([]const u8) = .empty;
-            var iterator = entry.features.iterator();
-            while (iterator.next()) |feature| try features.append(a, @tagName(feature));
-            try profiles.append(a, .{ .backend = @tagName(entry.backend), .features = features.items, .lengths = entry.lengths });
-        };
-        const limits = try std.json.Stringify.valueAlloc(a, .{
-            .profiles = profiles.items,
-            .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
-            .span_windows = if (decide_identity) |identity| if (decide_qualification.supportsSpanExtraction(identity)) .{ .max_windows = @as(usize, 64), .max_document_bytes = @as(usize, 1024 * 1024), .max_document_words = @as(usize, 131072), .max_request_tokens = @as(usize, 65536) } else null else null,
-            .runtime_revalidates_artifact = true,
-        }, .{});
+        const limits = try qualifiedLimitsJsonAlloc(allocator, boundary_identity, decide_identity);
+        defer allocator.free(limits);
         try body.appendSlice(allocator, ",\"qualified_limits\":");
         try body.appendSlice(allocator, limits);
     }

@@ -22707,21 +22707,7 @@ fn runtimeGraphEndpointResolutionsAlloc(runtime: anytype, doc_key: []const u8, a
         else
             try storeGetOptionalAllocWithRetry(runtime, key);
         defer if (raw) |bytes| runtime.alloc.free(bytes);
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw orelse continue, .{}) catch continue;
-        if (parsed != .object) continue;
-        const entities = parsed.object.get("entities") orelse continue;
-        if (entities != .array) continue;
-        for (entities.array.items) |entity| {
-            if (entity != .object) continue;
-            const decision = entity.object.get("decision") orelse continue;
-            if (decision != .string or (!std.mem.eql(u8, decision.string, "new") and !std.mem.eql(u8, decision.string, "match"))) continue;
-            const local_id = entity.object.get("local_id") orelse continue;
-            const ref = entity.object.get("doc_ref") orelse continue;
-            if (local_id != .string or ref != .object) continue;
-            const target = ref.object.get("key") orelse continue;
-            if (target != .string or target.string.len == 0) continue;
-            try map.put(a, local_id.string, ref);
-        }
+        try @import("../graph_endpoint_resolutions.zig").append(a, &map, raw orelse continue);
     }
     if (!targeted) return null;
     return try std.json.Stringify.valueAlloc(runtime.alloc, std.json.Value{ .object = map }, .{});
@@ -22756,7 +22742,17 @@ fn runtimeGraphWritesWithResolutionsAlloc(
     if (endpoint_resolutions) |res_raw| {
         if (parsed.value == .object) {
             const a = parsed.arena.allocator();
-            const resolutions = try std.json.parseFromSliceLeaky(std.json.Value, a, res_raw, .{});
+            const resolutions = std.json.parseFromSliceLeaky(std.json.Value, a, res_raw, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidResolutionArtifact,
+            };
+            if (resolutions != .object) return error.InvalidResolutionArtifact;
+            var references = resolutions.object.iterator();
+            while (references.next()) |entry| {
+                if (entry.value_ptr.* != .object) return error.InvalidResolutionArtifact;
+                const key = entry.value_ptr.object.get("key") orelse return error.InvalidResolutionArtifact;
+                if (key != .string or key.string.len == 0) return error.InvalidResolutionArtifact;
+            }
             try parsed.value.object.put(a, "_entities", resolutions);
         }
     }
@@ -34748,4 +34744,16 @@ test "document extraction accepts validated reader no-text results without hidin
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "capi graph replay injects canonical endpoints and rejects malformed resolution JSON" {
+    const a = std.testing.allocator;
+    const raw = "{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Alias\"},{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Parent\"}],\"relations\":[{\"type\":\"is_a\",\"source\":\"e0\",\"target\":\"e1\"}]}";
+    const source = index_manager_mod.GraphArtifactSource{ .artifact_name = @constCast("kg"), .format = .extraction_graph, .mention_edge_type = @constCast("mentions") };
+    const writes = try runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{\"e0\":{\"key\":\"concept/canonical\",\"table\":\"entities\"},\"e1\":{\"key\":\"concept/parent\",\"table\":\"entities\"}}", 10);
+    defer runtimeFreeGraphWrites(a, writes);
+    try std.testing.expectEqual(@as(usize, 1), writes.len);
+    try std.testing.expectEqualStrings("concept/canonical", writes[0].source);
+    try std.testing.expectEqualStrings("concept/parent", writes[0].target);
+    try std.testing.expectError(error.InvalidResolutionArtifact, runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{", 10));
 }
