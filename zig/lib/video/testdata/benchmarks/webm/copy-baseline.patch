@@ -1,42 +1,23 @@
 --- a/zig/lib/image/src/webp.zig
 +++ b/zig/lib/image/src/webp.zig
-@@ -5528,8 +5528,6 @@
- /// after reconstruction, filtering and all retained allocations succeed. The
- /// allocator must remain valid until deinit; returned planes belong to caller.
- pub const Vp8Decoder = struct {
+@@ -5531,2 +5530,0 @@
 -    /// Decoder-owned immutable pictures; slots naming the same picture alias.
 -    /// Returned decode planes remain independently owned and may be mutated.
-     references: [3]?Vp8FramePlanes = .{ null, null, null },
-     segments: []u2 = &.{},
-     segmentation: Vp8SegmentationHeader = .{},
-@@ -5546,15 +5544,14 @@
-     split_shapes: [4]usize = @splat(0),
- 
-     pub fn deinit(self: *Vp8Decoder, a: Allocator) void {
+@@ -5549 +5547 @@
 -        vp8ReleaseReferences(a, self.references, .{ null, null, null });
 +        for (&self.references) |*p| if (p.*) |*planes| planes.deinit(a);
-         a.free(self.segments);
-         self.* = .{};
-     }
-     pub fn retainedBytes(self: *const Vp8Decoder) usize {
-         var total = self.segments.len;
+@@ -5555,3 +5553,2 @@
 -        for (self.references, 0..) |p, i| if (p) |planes| {
 -            if (!vp8ReferenceContains(self.references[0..i], planes))
 -                total += planes.y.len + planes.u.len + planes.v.len;
 +        for (self.references) |p| if (p) |planes| {
 +            total += planes.y.len + planes.u.len + planes.v.len;
-         };
-         return total;
-     }
-@@ -5663,27 +5660,14 @@
-         for (&sources, refresh) |*source, replace| if (replace) {
-             source.* = planes;
-         };
+@@ -5666,4 +5662,0 @@
 -        // Retained pictures are immutable: unchanged slots and reference-copy
 -        // commands reuse their existing allocation. Clone a refreshed picture
 -        // only once, even when all three slots refresh (including keyframes).
 -        // The caller's output stays separate from every decoder reference.
-         var retained: [3]?Vp8FramePlanes = .{ null, null, null };
+@@ -5671,14 +5664,3 @@
 -        var refreshed: ?Vp8FramePlanes = null;
 -        errdefer if (refreshed) |*owned| owned.deinit(a);
 -        for (&retained, sources) |*out, source| {
@@ -54,18 +35,12 @@
 +        errdefer for (&retained) |*p| if (p.*) |*owned| owned.deinit(a);
 +        for (&retained, sources) |*out, source| out.* = try vp8VideoClone(a, source orelse return error.MissingVp8Reference);
 +        for (&self.references) |*p| if (p.*) |*old| old.deinit(a);
-         a.free(self.segments);
+@@ -5686 +5668,3 @@
 -        if (refreshed) |picture| self.reference_copy_bytes +|= picture.y.len + picture.u.len + picture.v.len;
 +        for (retained) |reference| if (reference) |p| {
 +            self.reference_copy_bytes +|= p.y.len + p.u.len + p.v.len;
 +        };
-         self.references = retained;
-         self.segments = map;
-         self.segmentation = syntax.segmentation;
-@@ -5700,22 +5684,6 @@
-         return planes;
-     }
- };
+@@ -5703,16 +5686,0 @@
 -fn vp8ReferenceContains(references: []const ?Vp8FramePlanes, picture: Vp8FramePlanes) bool {
 -    for (references) |reference| if (reference) |p| {
 -        if (p.y.ptr == picture.y.ptr) return true;
@@ -82,6 +57,3 @@
 -    };
 -}
 -
- fn vp8VideoClone(a: Allocator, p: Vp8FramePlanes) !Vp8FramePlanes {
-     var out = p;
-     out.y = try a.dupe(u8, p.y);

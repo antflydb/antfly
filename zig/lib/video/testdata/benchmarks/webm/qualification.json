@@ -77,12 +77,12 @@
   "measurement_scope": "Sequential owned processes; no owned encode/build overlaps. Host background work uncontrolled. First pass is not an evicted OS file cache. Completed GPU preparation is fenced; no readback.",
   "linux_scope": "Actual offline ARM64 Docker execution, not bare-metal performance or x86 runtime qualification",
   "artifacts": {
-    "README.md": "3c5824ce6063d649b9e49b88b6aca7f0763220bb25cf309c1bd8fe29951499f3",
+    "README.md": "af7b51e698762a03ca7429895b50b91885d0cada4f19821b8e95de6f52cefe8a",
     "av1-1080p-shared-cpu.jsonl": "a32d6bc77014ac7dd1e35e281bdbff62bcb0df8b3931c8598a595534d844e45a",
     "av1-1080p-shared-metal.jsonl": "1ce155fc675f1a324c6deed8e725b51773d1212c47b9f74c5064534de32d653f",
     "av1-480p-shared-cpu.jsonl": "8023f064d3e19ebf2dc6e48ffa0e50515faa551aa0056b1933f0de5dbd99a9c3",
     "av1-480p-shared-metal.jsonl": "dfad9c679c6b6c816dc8f62cecb11d2bba21e6ca4a42f96a75a276251621b1b0",
-    "copy-baseline.patch": "9832666d136b91fc2a0d34ae6773ce213b01d5afff1f1eb9e0acc8f434212047",
+    "copy-baseline.patch": "0a3e735198ea0c0405b7abf4924668e25d7d4b6f14f15aa04c07f3de31daae46",
     "corpus/manifest.json": "df84e2e6445bacea605fc22a5b0422b7f5a4cfab2d6f4c96c770f10a80267ff3",
     "corpus/sintel-av1-1080p.webm": "970e71cfd7cc6d833ded90cd2e359d2e63a5cfda0d5fbfdf26e20b5bc3f281d8",
     "corpus/sintel-av1-480p.webm": "db6917f3a9d42ed3fce12384711d31f84ffd1aef682a2ea8f04d7815497ec187",
@@ -90,7 +90,7 @@
     "corpus/sintel-vp8-480p.webm": "696d5305cb89b7b7a0d23873ad13b39bba71fecf168c79316dc7eed9c661ce97",
     "corpus/sintel-vp9-1080p.webm": "dea43f81c8db1fe8f9316b1ea52074e9dc6f0efbdeebcab5a3e5cd23dcc7755f",
     "corpus/sintel-vp9-480p.webm": "ca6aeaac633a85d30808550a152d31ecf0cf376da1f2d202f42a2b728fb63338",
-    "corpus-regeneration.log": "6018945db816a07d333e6353393df2275616beb3f2819d2b4615a841e3981197",
+    "corpus-regeneration.log": "93c0fe77b8b68693a1dcc6814578decd6bc921198258433e2d1864811c75fc3a",
     "linux-arm64-corpus/report.json": "d2338904f0f02b9bc0c5a497c249f3db132a03f96b9793576435d48c5319ea90",
     "linux-arm64-corpus/sintel-av1-1080p.webm.native.jsonl": "09ebebd06c2851c85aae38acf4b5adecc6acab482b45884ffa0d5185d3f61766",
     "linux-arm64-corpus/sintel-av1-480p.webm.native.jsonl": "0de60883e02be82eae0a7c5ad7a0a19dc4409272517833bfd9f22b4bcf9ff18f",
@@ -136,5 +136,6 @@
     "Linux x86_64 runtime and current Linux pretrained model receipt after this library change",
     "Broader live/HLS and extended DASH requirements",
     "Other remaining non-CUDA goal requirements"
-  ]
+  ],
+  "log_normalization": "Trailing whitespace removed from saved logs; decoder/benchmark results unchanged."
 }

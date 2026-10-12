@@ -50,7 +50,8 @@ not deployment capacity estimates or stable population statistics.
 The source-pinned copy baseline includes the same true-motion edge correction
 as the sharing variant. Both agree with every independent VP8 picture hash.
 To reproduce it, copy the maintained image module to a temporary directory,
-apply `copy-baseline.patch` to its `src/webp.zig`, and pass that directory's
+apply `copy-baseline.patch` with `git apply --unidiff-zero -p4` from that
+image directory, and pass that directory's
 `src/mod.zig` with `-Dwebm-benchmark-image-source=ABSOLUTE_PATH`. This substitution
 is benchmark-only and adds no production decoder switch.
 
