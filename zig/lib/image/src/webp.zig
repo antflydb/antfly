@@ -1469,8 +1469,8 @@ fn vp8PredictAndApplyChroma(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, heade
         u_left = u_left_buf[0..];
         v_left = v_left_buf[0..];
     }
-    const u_top_left = if (has_top and has_left) planes.u[uv_start - planes.uv_stride - 1] else 0x80;
-    const v_top_left = if (has_top and has_left) planes.v[uv_start - planes.uv_stride - 1] else 0x80;
+    const u_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.u[uv_start - planes.uv_stride - 1];
+    const v_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.v[uv_start - planes.uv_stride - 1];
     try vp8PredictChroma(header.chroma_mode, planes.u[uv_start..], planes.uv_stride, uv_top_u, u_left, u_top_left);
     try vp8PredictChroma(header.chroma_mode, planes.v[uv_start..], planes.uv_stride, uv_top_v, v_left, v_top_left);
 
@@ -1627,7 +1627,7 @@ fn vp8PredictMacroblock16x16(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, head
         try vp8CollectLeftSamples(y_left_buf[0..], planes.y, planes.y_stride, y_start, 16);
         y_left = y_left_buf[0..];
     }
-    const y_top_left = if (has_top and has_left) planes.y[y_start - planes.y_stride - 1] else 0x80;
+    const y_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.y[y_start - planes.y_stride - 1];
     const luma_mode = try vp8NormalizeLuma16Mode(header.luma16_mode.?, has_top, has_left);
     try vp8PredictLuma16(luma_mode, planes.y[y_start..], planes.y_stride, y_top, y_left, y_top_left);
 
@@ -1651,8 +1651,8 @@ fn vp8PredictMacroblock16x16(planes: *Vp8FramePlanes, mb_x: u32, mb_y: u32, head
         u_left = u_left_buf[0..];
         v_left = v_left_buf[0..];
     }
-    const u_top_left = if (has_top and has_left) planes.u[uv_start - planes.uv_stride - 1] else 0x80;
-    const v_top_left = if (has_top and has_left) planes.v[uv_start - planes.uv_stride - 1] else 0x80;
+    const u_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.u[uv_start - planes.uv_stride - 1];
+    const v_top_left = if (!has_top) @as(u8, 127) else if (!has_left) @as(u8, 129) else planes.v[uv_start - planes.uv_stride - 1];
     try vp8PredictChroma(header.chroma_mode, planes.u[uv_start..], planes.uv_stride, uv_top_u, u_left, u_top_left);
     try vp8PredictChroma(header.chroma_mode, planes.v[uv_start..], planes.uv_stride, uv_top_v, v_left, v_top_left);
 }
@@ -5528,6 +5528,8 @@ test "probe rejects reserved vp8x feature bits" {
 /// after reconstruction, filtering and all retained allocations succeed. The
 /// allocator must remain valid until deinit; returned planes belong to caller.
 pub const Vp8Decoder = struct {
+    /// Decoder-owned immutable pictures; slots naming the same picture alias.
+    /// Returned decode planes remain independently owned and may be mutated.
     references: [3]?Vp8FramePlanes = .{ null, null, null },
     segments: []u2 = &.{},
     segmentation: Vp8SegmentationHeader = .{},
@@ -5537,19 +5539,22 @@ pub const Vp8Decoder = struct {
     y_probs: [4]u8 = .{ 112, 86, 140, 37 },
     uv_probs: [3]u8 = .{ 162, 101, 204 },
     decoded: usize = 0,
+    /// Successfully committed reference plane copies, including padded rows.
+    reference_copy_bytes: u64 = 0,
     /// Diagnostics count coded macroblocks, not a claimed coverage guarantee.
     modes: [5]usize = @splat(0),
     split_shapes: [4]usize = @splat(0),
 
     pub fn deinit(self: *Vp8Decoder, a: Allocator) void {
-        for (&self.references) |*p| if (p.*) |*planes| planes.deinit(a);
+        vp8ReleaseReferences(a, self.references, .{ null, null, null });
         a.free(self.segments);
         self.* = .{};
     }
     pub fn retainedBytes(self: *const Vp8Decoder) usize {
         var total = self.segments.len;
-        for (self.references) |p| if (p) |planes| {
-            total += planes.y.len + planes.u.len + planes.v.len;
+        for (self.references, 0..) |p, i| if (p) |planes| {
+            if (!vp8ReferenceContains(self.references[0..i], planes))
+                total += planes.y.len + planes.u.len + planes.v.len;
         };
         return total;
     }
@@ -5658,11 +5663,27 @@ pub const Vp8Decoder = struct {
         for (&sources, refresh) |*source, replace| if (replace) {
             source.* = planes;
         };
+        // Retained pictures are immutable: unchanged slots and reference-copy
+        // commands reuse their existing allocation. Clone a refreshed picture
+        // only once, even when all three slots refresh (including keyframes).
+        // The caller's output stays separate from every decoder reference.
         var retained: [3]?Vp8FramePlanes = .{ null, null, null };
-        errdefer for (&retained) |*p| if (p.*) |*owned| owned.deinit(a);
-        for (&retained, sources) |*out, source| out.* = try vp8VideoClone(a, source orelse return error.MissingVp8Reference);
-        for (&self.references) |*p| if (p.*) |*old| old.deinit(a);
+        var refreshed: ?Vp8FramePlanes = null;
+        errdefer if (refreshed) |*owned| owned.deinit(a);
+        for (&retained, sources) |*out, source| {
+            const picture = source orelse return error.MissingVp8Reference;
+            if (picture.y.ptr == planes.y.ptr) {
+                if (refreshed == null) refreshed = try vp8VideoClone(a, planes);
+                out.* = refreshed.?;
+            } else out.* = picture;
+        }
+        // No operation after this checkpoint may fail: references, entropy and
+        // segmentation commit together, preserving retry after allocation or
+        // cancellation failure even when several old slots share a picture.
+        try @import("work_control.zig").check();
+        vp8ReleaseReferences(a, self.references, retained);
         a.free(self.segments);
+        if (refreshed) |picture| self.reference_copy_bytes +|= picture.y.len + picture.u.len + picture.v.len;
         self.references = retained;
         self.segments = map;
         self.segmentation = syntax.segmentation;
@@ -5679,6 +5700,22 @@ pub const Vp8Decoder = struct {
         return planes;
     }
 };
+fn vp8ReferenceContains(references: []const ?Vp8FramePlanes, picture: Vp8FramePlanes) bool {
+    for (references) |reference| if (reference) |p| {
+        if (p.y.ptr == picture.y.ptr) return true;
+    };
+    return false;
+}
+/// Release each obsolete picture exactly once; aliases in retained slots keep
+/// the owner alive. No heap reference-count object or failure-prone retain step.
+fn vp8ReleaseReferences(a: Allocator, references: [3]?Vp8FramePlanes, retained: [3]?Vp8FramePlanes) void {
+    for (references, 0..) |reference, i| if (reference) |picture| {
+        if (vp8ReferenceContains(references[0..i], picture) or vp8ReferenceContains(&retained, picture)) continue;
+        var owned = picture;
+        owned.deinit(a);
+    };
+}
+
 fn vp8VideoClone(a: Allocator, p: Vp8FramePlanes) !Vp8FramePlanes {
     var out = p;
     out.y = try a.dupe(u8, p.y);

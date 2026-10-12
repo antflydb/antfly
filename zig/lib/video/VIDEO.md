@@ -1000,7 +1000,7 @@ Reference updates commit transactionally after successful reconstruction and
 retained allocations; malformed input, cancellation and allocation failures leave
 state available for retry. Packet/pixel/workspace limits and shared admission
 cover the session and separately owned outputs. The initial implementation keeps
-independent retained reference copies; reference sharing remains a performance
+immutable shared reference slots with independent returned output; further decoder optimization remains a performance
 optimization, not a decoding dependency.
 
 `testdata/vp8-interframes.json` pins seven independent FFmpeg/libvpx oracles:
@@ -1321,3 +1321,36 @@ measured scheduling/performance tuning and the broader non-CUDA scope remain
 active. Current Metal and actual Linux ARM64 binaries preserve six original
 cases, eight WebM vectors and ten timestamp/window vectors with exact rankings.
 See the [source-bound execution receipt](../../../tools/embeddinggemma2/testdata/pipeline-overlap/README.md).
+
+
+### Larger WebM streams, reference ownership and completed benchmarks
+
+The new WebM benchmark decodes VP8/VP9/AV1 and optionally prepares every Nth
+visible picture on CPU or Metal. It fences each GPU preparation and records
+completed wall time, command execution time, first/warm setup, decoder allocation
+high water, process RSS high water, device aggregate allocation and logical
+upload/copy bytes. Codec reconstruction stays in maintained Zig. Benchmark-only
+image-source substitution supports matched source-pinned experiments without
+adding a production decoder policy or runtime dependency.
+
+VP8 reference slots now alias immutable decoder-owned pictures instead of cloning
+all three slots every frame. Refresh allocates one reference copy; unchanged/copy
+commands retain existing owners. Obsolete owners are freed once, and failure or
+cancellation before commit leaves references and entropy unchanged. Returned
+planes remain independently owned and mutable. A broader real-stream campaign
+also found and corrected the 16x16/chroma true-motion corner sentinel at frame
+edges; the six-picture regression and independent hashes are in
+`testdata/vp8-true-motion-border.json`.
+
+The larger corpus contains full 52-second 854x480 Sintel derivatives and 12-second
+1920x1080 upscaled excerpts in all three codecs. All 4623 visible picture hashes
+match independent FFmpeg reconstruction, including SVT-AV1 encoder output.
+Inputs and hashes reproduce byte-for-byte. The matched copy baseline includes
+the same edge correction and also matches the VP8 goldens. Actual Linux ARM64 also matches all 4623 pictures and passes 137 portable tests
+with 25 skips. The full macOS suite passes 160 with two skips; 24 model tests and
+eight current CPU/Metal pretrained WebM vectors/rankings pass. Timings and exact
+source/binary/input/oracle scope are in the
+[WebM benchmark receipt](testdata/benchmarks/webm/README.md). These
+measurements cover decode/preparation, rather than model execution or deployment
+capacity; broader codec/display/streaming qualification and the full non-CUDA
+scope remain active.

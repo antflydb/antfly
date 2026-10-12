@@ -635,3 +635,15 @@ measured scheduling/performance tuning and the broader non-CUDA scope remain
 active. Current Metal and actual Linux ARM64 binaries preserve six original
 cases, eight WebM vectors and ten timestamp/window vectors with exact rankings.
 See the [source-bound execution receipt](../../../tools/embeddinggemma2/testdata/pipeline-overlap/README.md).
+
+
+### Larger WebM reconstruction benchmarks
+
+The video benchmark consumes the existing range-source/WebM packet contracts and
+reconstructs visible VP8/VP9/AV1 pictures without changing container indexing or
+transport semantics. Larger 480p/1080p Sintel-derived streams expose hidden coded
+work separately from displayed/prepared counts. Native codec output matches all
+4623 independent picture hashes; VP8 reference slots now share immutable owners,
+while outputs retain independent storage. Detailed source/measurement scope is
+recorded in the video design and benchmark receipts. Broader streaming/display
+qualification, replay/index costs and the full non-CUDA goal remain active.

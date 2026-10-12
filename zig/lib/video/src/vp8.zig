@@ -370,3 +370,107 @@ test "VP8 interframe cancellation preserves packet position and retained referen
     defer retried.deinit();
     try std.testing.expectEqual(@as(usize, 2), session.next_index);
 }
+
+test "VP8 shared keyframe references count one owner and preserve mutable output independence" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-reference-sharing", .storage = .{ .borrowed = @embedFile("../testdata/vp8-inter.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    const session = try Session.init(a, &reader, .{});
+    defer session.deinit();
+    var frame = (try session.next()).?;
+    const reference = session.decoder.references[0].?;
+    try std.testing.expectEqual(reference.y.ptr, session.decoder.references[1].?.y.ptr);
+    try std.testing.expectEqual(reference.y.ptr, session.decoder.references[2].?.y.ptr);
+    try std.testing.expect(frame.planes.y.ptr != reference.y.ptr);
+    const bytes = reference.y.len + reference.u.len + reference.v.len;
+    try std.testing.expectEqual(bytes + session.decoder.segments.len, session.decoder.retainedBytes());
+    try std.testing.expectEqual(session.decoder.retainedBytes(), session.budget.live);
+    try std.testing.expectEqual(@as(u64, bytes), session.decoder.reference_copy_bytes);
+    const first = reference.y[0];
+    frame.planes.y[0] ^= 255;
+    try std.testing.expectEqual(first, reference.y[0]);
+    frame.deinit();
+    while (session.next_index < reader.packets.len) {
+        var next = (try session.next()) orelse continue;
+        next.deinit();
+        try std.testing.expectEqual(session.decoder.retainedBytes(), session.budget.live);
+    }
+}
+
+test "VP8 shared reference commit cancellation reclaims candidate and preserves aliases" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-cancel-commit", .storage = .{ .borrowed = @embedFile("../testdata/vp8-inter.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    var key = try reader.readPacket(0);
+    defer key.deinit();
+    var inter = try reader.readPacket(1);
+    defer inter.deinit();
+    const Guard = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return error.Cancelled;
+        }
+    };
+    var count = Guard{};
+    var decoder = image.webp.Vp8Decoder{};
+    defer decoder.deinit(a);
+    var first = try decoder.decode(a, key.bytes, image.DecodeLimits.inference_default);
+    first.deinit(a);
+    {
+        const scope = image.work_control.Scope.enter(.{ .context = &count, .check_fn = Guard.check });
+        defer scope.deinit();
+        var second = try decoder.decode(a, inter.bytes, image.DecodeLimits.inference_default);
+        second.deinit(a);
+    }
+    // The final checkpoint occurs after candidate-reference allocation.
+    var retry = image.webp.Vp8Decoder{};
+    defer retry.deinit(a);
+    var initial = try retry.decode(a, key.bytes, image.DecodeLimits.inference_default);
+    initial.deinit(a);
+    const old = retry.references;
+    const copied = retry.reference_copy_bytes;
+    const retained = retry.retainedBytes();
+    var cancel = Guard{ .fail_at = count.checks };
+    const scope = image.work_control.Scope.enter(.{ .context = &cancel, .check_fn = Guard.check });
+    defer scope.deinit();
+    try std.testing.expectError(error.Cancelled, retry.decode(a, inter.bytes, image.DecodeLimits.inference_default));
+    try std.testing.expectEqual(@as(usize, 1), retry.decoded);
+    try std.testing.expectEqual(copied, retry.reference_copy_bytes);
+    try std.testing.expectEqual(retained, retry.retainedBytes());
+    for (old, retry.references) |before, after| try std.testing.expectEqual(before.?.y.ptr, after.?.y.ptr);
+    cancel.fail_at = std.math.maxInt(usize);
+    var completed = try retry.decode(a, inter.bytes, image.DecodeLimits.inference_default);
+    defer completed.deinit(a);
+    try std.testing.expectEqualSlices(u8, decoder.references[0].?.y, completed.y);
+}
+
+test "VP8 real true motion edge regression matches independent decoded pictures" {
+    const a = std.testing.allocator;
+    var input = media.source.Source{ .allocator = a, .identity = "vp8-true-motion-border", .storage = .{ .borrowed = @embedFile("../testdata/vp8-true-motion-border.webm") } };
+    var reader = try media.webm.Reader.init(a, &input, .{});
+    defer reader.deinit();
+    const manifest = try std.json.parseFromSlice(struct { picture_sha256: []const []const u8 }, a, @embedFile("../testdata/vp8-true-motion-border.json"), .{ .ignore_unknown_fields = true });
+    defer manifest.deinit();
+    const session = try Session.init(a, &reader, .{});
+    defer session.deinit();
+    var count: usize = 0;
+    while (session.next_index < reader.packets.len) {
+        var decoded = (try session.next()) orelse continue;
+        defer decoded.deinit();
+        const p = decoded.planes;
+        var native_frame = try @import("codecs/frame.zig").copy(a, null, p.width, p.height, 8, 1, .{ .matrix = 6 }, .{ p.y.ptr, p.u.ptr, p.v.ptr }, .{ p.y_stride, p.uv_stride, p.uv_stride }, 128 * 1024 * 1024);
+        defer native_frame.deinit();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(native_frame.bytes, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        try std.testing.expect(count < manifest.value.picture_sha256.len);
+        try std.testing.expectEqualStrings(manifest.value.picture_sha256[count], &hex);
+        count += 1;
+    }
+    try std.testing.expectEqual(manifest.value.picture_sha256.len, count);
+}

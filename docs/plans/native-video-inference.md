@@ -834,3 +834,33 @@ Measured overlap tuning, cross-group frame reuse, broader codec/display/live
 qualification and the other non-CUDA requirements remain active. Backbone
 execution still serializes by model; this continuation overlaps preparation
 with another request's execution rather than concurrently mutating model state.
+
+
+### Larger codec benchmarks and VP8 reference sharing (2026-10-11)
+
+A dedicated WebM benchmark now measures maintained native VP8/VP9/AV1 decode and
+CPU/Metal preparation on full-length 480p real clips and 1080p excerpts. Completed
+GPU fencing/time, first/warm setup, copy/upload counts and allocation/RSS/device
+observations are separate metrics. Timed processes run sequentially without owned
+encoders/builds overlapping; background host activity remains uncontrolled.
+
+VP8 immutable reference slots share owners, copy a refreshed picture once, and
+commit reference/entropy/segmentation state transactionally. Returned output stays
+independent. Full corpus differential testing found an existing true-motion edge
+sentinel defect, now corrected and retained as a small portable regression. All
+4623 pictures across six streams match independent reconstruction. A source-pinned
+copy baseline includes the same fix and matches every VP8 picture. Matched
+reference-copy volume falls by two-thirds and decoder allocation peak by 28.6%;
+six-sample warm medians improve about 3.4% at 480p and 4.2% at 1080p on this host.
+These observations do not establish production capacity or other architectures'
+performance. The full macOS suite passes 160 tests with two platform skips;
+actual Linux ARM64 passes 137 with 25 platform skips. All 4623 independent
+picture hashes agree on both platforms, and current CPU/Metal pretrained WebM
+parity preserves all eight vectors and three rankings/top-k sets, with concurrent
+and disconnect/retry checks. The focused model gate passes 24 tests. Source,
+binary, input, oracle and measurement fingerprints are recorded in
+`zig/lib/video/testdata/benchmarks/webm/qualification.json`.
+
+Measured SIMD work, H.264 reference copying, WebM indexing/replay costs and
+cross-group reuse remain performance work. The full codec/display/streaming and
+non-CUDA qualification requirements stay active.

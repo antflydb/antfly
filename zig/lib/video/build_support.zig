@@ -107,4 +107,22 @@ pub fn addBenchmarks(b: *std.Build, root: std.Build.LazyPath, target: std.Build.
     run.addArg(b.option([]const u8, "benchmark-size", "Square preparation size in pixels") orelse "48");
     b.step("bench-video", "Measure completed decode/preparation latency, GPU time and memory").dependOn(&run.step);
     b.step("check-video-benchmark", "Compile the native video benchmark").dependOn(&executable.step);
+    const webm_module = b.createModule(.{ .root_source_file = root.path(b, "webm_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    configure(b, webm_module, root, target, null);
+    // Benchmark-only source substitution permits matched experiments without
+    // changing production decoder policies or adding runtime codec dependencies.
+    if (b.option([]const u8, "webm-benchmark-image-source", "Alternate maintained image module root for a source-pinned comparison")) |source| {
+        webm_module.addImport("antfly_image", b.createModule(.{ .root_source_file = .{ .cwd_relative = source }, .target = target, .optimize = optimize }));
+    }
+    webm_module.addCSourceFile(.{ .file = root.path(b, "src/backends/benchmark_rss.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    if (target.result.os.tag == .macos) webm_module.addCSourceFile(.{ .file = root.path(b, "src/backends/benchmark_device.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+    const webm_executable = b.addExecutable(.{ .name = "webm-benchmark", .root_module = webm_module, .use_llvm = executable.use_llvm });
+    const webm_run = b.addRunArtifact(webm_executable);
+    webm_run.addArg(b.option([]const u8, "webm-benchmark-input", "VP8/VP9/AV1 WebM input") orelse "testdata/vp8-sintel.webm");
+    webm_run.addArg(b.option([]const u8, "webm-benchmark-backend", "decode, cpu, metal or hash") orelse "decode");
+    webm_run.addArg(b.option([]const u8, "webm-benchmark-iterations", "Completed samples (2..100); hash uses one pass") orelse "7");
+    webm_run.addArg(b.option([]const u8, "webm-benchmark-size", "Square preparation size") orelse "384");
+    webm_run.addArg(b.option([]const u8, "webm-benchmark-step", "Prepare every Nth visible picture") orelse "24");
+    b.step("bench-webm", "Measure completed native VP8/VP9/AV1 decode and preparation").dependOn(&webm_run.step);
+    b.step("install-webm-benchmark", "Install the WebM benchmark for external corpus or Linux execution").dependOn(&b.addInstallArtifact(webm_executable, .{}).step);
 }

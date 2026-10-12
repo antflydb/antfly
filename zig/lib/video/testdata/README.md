@@ -278,3 +278,13 @@ CPU and actual Metal preparation preserve RGB8 codes exactly; normalized
 Metal patch values allow only `1e-6` for float32 fused arithmetic. Metal
 also tests cache admission, warm reuse and in-flight buffer lifetime after owner
 teardown. Pretrained model oracles live in `tools/embeddinggemma2/testdata/render`.
+
+
+`vp8-true-motion-border.webm` is a six-picture stream-copy excerpt of the
+larger 480p VP8 Sintel benchmark transcode, starting at second 30. Sintel is
+copyright Blender Foundation / durian.blender.org, CC BY 3.0; the source URL and
+license above apply. It preserves the interframe true-motion edge case first
+observed at original picture 722. The JSON receipt pins coded bytes and every
+independent FFmpeg NV12 picture hash. FFmpeg and libvpx independently agree on
+the first failing original picture. The native regression hashes all six
+pictures and checks returned-output/reference ownership independently.
