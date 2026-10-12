@@ -8815,6 +8815,7 @@ pub const NativeGenerationPipeline = struct {
             gemma4MtpResidentDraftBackendAllowed(draft_pipeline.cb.kind());
         if (!use_resident_draft and mtp_activation.host == null) return error.MissingGemma4MtpActivation;
         const seed_requested = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_SEED_CACHED_TARGET", false) and
+            actual_k == 2 and use_resident_draft and !defer_materialize and
             !gemma4MtpAdaptiveKEnabled() and position_mode == .target_constant and
             hidden_source == .final and mtp_top_k == 0 and canonical_materialize_available;
         const seed_cached_target = seed_requested and cached_first_target_choice != null and
@@ -15851,4 +15852,23 @@ test "Gemma4 MTP cached target seed requires paired activation and fixed two tok
     try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, false, true, false));
     try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, true, false, false));
     try std.testing.expect(!gemma4MtpCachedTargetSeedAllowed(2, true, true, true));
+}
+
+test "Gemma4 MTP activation replacement invalidates cached target pairing" {
+    const allocator = std.testing.allocator;
+    // This host-only lifetime test never calls the backend; an empty cache and
+    // null device avoid introducing a fake GPU into the pairing contract.
+    const draft_cb: ComputeBackend = undefined;
+    var state = NativeGenerationPipeline.Gemma4MtpActivationState{
+        .allocator = allocator,
+        .draft_cb = &draft_cb,
+    };
+    defer state.deinit();
+    state.replaceHost(try allocator.alloc(f32, 2));
+    state.cached_target_choice = 42;
+    state.cached_choice_matches_activation = true;
+    state.replaceHost(try allocator.alloc(f32, 2));
+    try std.testing.expectEqual(@as(?u32, null), state.cached_target_choice);
+    try std.testing.expect(!state.cached_choice_matches_activation);
+    try std.testing.expect(!state.residentReady());
 }
