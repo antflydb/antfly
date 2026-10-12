@@ -2881,3 +2881,62 @@ This is internal receiver integration, not mounted transport authentication,
 root attestation, full build completion or distributed release qualification.
 The public producer stays disabled, the public failed-UNIQUE-build gate remains
 open, and the original inventory stays 478 / 136 / 73 / 899.
+
+### Authenticated bounded claim transport and callback error identity
+
+Checkpoints `8814b3446f`, `d78050a805`, `be79882bfc` and `ba72e9b356`
+mount private claim delivery through the existing internal group/table API.
+The receiver requires an explicit service credential even when legacy internal
+unauthenticated requests are allowed elsewhere. Logical requests carry only
+table/group/attempt identity and bounded claim values. The physical binding,
+allocation, fence and source cut still come from independently read metadata
+permission and the actual durable owner job, not incoming RPC authority.
+
+Both the decoder and direct-call admission enforce 128 claims and a 1-MiB
+paired-record budget. The JSON decoder rejects the next excess record before
+parsing or allocating it. Binary tuple values retain their bytes through JSON
+transport. Responses are owned until the consumer explicitly releases them;
+the handler serializes its borrowed view before releasing the source result.
+Native execution is rejected before acquiring an owner on a data-Raft server;
+the native ordered effect is not a substitute for a Raft proposal.
+
+The client transmits its capped remaining budget after serialization. The
+receiver normalizes its clock and captures a deadline before body decoding,
+then honors the earlier existing deadline. Neither side automatically retries
+an uncertain mutation. Typed conflicts, cancellation and known corruption
+errors retain their identity over HTTP and the actual callback status ABI.
+Error decoding uses an explicit status-specific whitelist, not arbitrary
+remote error-name conversion. Appended callback detail codes preserve existing
+ABI layout and identity assignments.
+
+Frozen-source HTTP qualification at `ba72e9b356` passed all 117 Debug build
+steps. The mounted route/client selection passed both tests, including actual
+localhost HTTP authentication, binary delivery, bounded ingress, exact typed
+failures and no client replay. Its companion selections also passed; these are
+overlapping component executions, not distinct original SQL cases. The separate
+publication gate passed all 59 Debug steps and 24 executions (23 publication
+components plus the decoder-floor test), including strict HTTP failure decoding.
+The callback status ABI's direct gate passed all 26 tests.
+
+The data-runtime qualification initially exposed a missing production facade
+export, then a multiply-owned callback regression. `be79882bfc` supplies the
+production export, and `a70bd32ab7` assigns the new callback regression to one
+explicit data consumer suite. The ownership audit remains strict; moving a test
+does not authorize ignoring duplicate or empty selections.
+
+The corrected data checkpoint passed all 91 Debug build steps and four tests,
+including the actual production data receiver, callback dispatch and mounted
+claim client/handler. The merged transport checkpoint `50b01750ca` passed the
+optimized publication gate (59/59 steps, 24 executions). Independent fresh
+PostgreSQL lifecycle qualification passed all 16 tests; the inventory audit's
+own 20 regression tests pass as well. The latter exercise the audit tooling,
+not all SQL evidence gates printed by their mocked test fixtures. Formatting,
+diff, control-catalog freshness and the 2,034-file Apache boundary pass.
+
+This qualifies private claim transport only. Service authentication does not
+prove root enrollment, placement, cohort coverage, build completeness or a
+signed publication receipt. Public native production remains disabled. Root
+attestation/capability integration, full build/validation/install/release,
+cohort cancellation/epoch retirement, native restore/adoption and authenticated
+distributed faults remain required; failed-UNIQUE-build atomicity remains open.
+No original SQL case is credited by these transport and callback components.
