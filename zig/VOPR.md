@@ -43,22 +43,18 @@ not a prerequisite for deterministic search. This differs deliberately from
 Antithesis's ability to run arbitrary containerized services inside a
 deterministic machine: VOPR obtains deeper application scheduling and durable-
 state visibility by requiring production code to cross explicit `std.Io` and
-ownership seams. A deployment-shaped `full-cluster-vopr-test` now composes a
-three-node metadata quorum, two-placement hosted data ranges on node-local
-replica roots, two tables, three production public API HTTP listeners, four
-concurrent clients, and a serverless workflow fixture with its own production
-public catalog listener on one
-`VoprIo`. The worker publishes into the same object-backed catalog served by
-that listener; the serverless object catalog and metadata placement catalog
-remain intentionally distinct production domains. Remaining distributed work
-no longer starts with that substitution: the production-owned v12 history now
-joins the real metadata quorum, three `DataServer`/data-Raft owners, public
-clients, two tables, serverless catalog, and a metadata-driven active split on
-one `VoprIo`, and its complete deep gate exact-replays. V14 now puts the v13
-graph under that split and exact-replays public work before, during, and after
-cutover. The next step is to put v9's nine-fault breadth on those production
-owners, then add co-resident standby, deeper fault overlap, joins/global queries,
-and workload breadth. This is a composition/fidelity gap, not a missing
+ownership seams.
+
+A deployment-shaped `full-cluster-vopr-test` composes a three-node metadata
+quorum, hosted data ranges on node-local replica roots, two tables, three
+production public API HTTP listeners, concurrent clients, and a serverless
+workflow with its own production public catalog listener on one `VoprIo`. The
+worker publishes into the same object-backed catalog that listener serves; the
+serverless object catalog and the metadata placement catalog remain
+intentionally distinct production domains. From v11 the production-owner modes
+replace the hosted data nodes with real `DataServer`/data-Raft owners (see
+[Full-Cluster Scenario Versions](#full-cluster-scenario-versions)). The
+remaining distributed work is composition and fidelity breadth, not a missing
 deterministic-distributed foundation.
 
 ## Conformance Status
@@ -93,13 +89,14 @@ following boundaries:
 
 | Claim family | Audit result | Important exclusion |
 | --- | --- | --- |
-| Reusable VOPR engine, `VoprIo`, replay, reduction, properties, saved cross-run event-set queries, bounded live event streaming, flight recording, local reports, debug recipes, fault/service-rate algebra, and search-quality fixtures | Implemented and exercised by the focused engine/meta gates named below; production query-cache operations, DataServer Raft and LSM-maintenance turns, distributed graph fanout, replication snapshot/stream steps, and serverless publish/compaction rounds are reviewed service-rate charge seams. V23 composes DataServer, graph, and serverless charging in one production-owner deployment history; v42 adds clean snapshot/stream work on the real public/DataServer/Raft path; v43 composes schema-change interruption, durable resume, and exact duplicate application; v44 composes target-owner restart and bounded client reconnect; v45 composes provider-session failure and replacement; v46 composes durable-checkpoint lease cancellation; v47 composes stale-owner rejection in the apply-to-checkpoint gap; v48 composes exact-cutover source-catalog and authority rotation through metadata Raft; v49 charges the actual node-owned `ApiHttpServer` cache and composes a logical deadline, exact owner reconstruction, empty-cache proof, recomputation, pooled reconnect, and durable read without disabling the other charged owners | Nightly sharding, retention, review, notifications, and broader production adoption and cross-domain combinations of service-rate charging are operational or ongoing work |
+| Reusable VOPR engine, `VoprIo`, replay, reduction, properties, saved cross-run event-set queries, bounded live event streaming, flight recording, local reports, debug recipes, fault/service-rate algebra, and search-quality fixtures | Implemented and exercised by the focused engine/meta gates named below. Query cache, DataServer Raft and LSM maintenance, distributed graph fanout, replication snapshot/stream steps, and serverless publish/compaction rounds are reviewed service-rate charge seams; full-cluster v23, v42–v48, and v49 compose them with production owners | Nightly sharding, retention, review, notifications, and broader production adoption and cross-domain combinations of service-rate charging are operational or ongoing work |
 | Metadata, Raft, standby, transaction, data-plane, storage, backfill, supervision, authentication, serverless, cache, provider, generation/reranking, and query suites | Implemented at each row's named production seam and fault vocabulary | The suites are not all co-resident in one deployment history |
-| Distributed graph | Focused production coordinator paths, the public hosted-source composition, v13's static production-owner graph, v14's production-owner graph during active split, v15's fail-closed owner-transport cut, v16's fail-closed remote-owner restart, v17's exactly observed recoverable next-owner short write, v18's three-owner memory denial/recovery, v21's simultaneous selected-link/all-owner-memory failure, v22's selected-listener socket denial/recovery during that split, v24's public production-owner document hydration, v25's public in-flight hydration cancellation/recovery, v27's public cross-table in-flight permission revocation/conceal/restore, v28's public stale-source-snapshot rejection/bounded retry exhaustion, and v29's cancellation with real outstanding hydration under a scoped transport outage are implemented | V9's remaining topology breadth, disk-capacity overlap at graph/cancellation boundaries, broader socket-pressure overlaps, broader partial-write surfaces, and storage/process/restart overlaps are not yet on the production owners; cancellation under resource/storage/process/restart and multi-fault combinations and global-query fault/recovery breadth are not complete. V19's narrow distributed join is audited separately below |
-| Distributed join | V19 implements one public inner `_id` join with two left rows and two independently owned right ranges, exact no-partial response validation, typed ownership retry, and before/active-split/post-publication observations. V20 forces a 64-row durable shuffle, fails the first finalizer after result persistence, and proves another owner imports the cached result and completes with an exact two-attempt ledger. Forward-only v30 cancels a public durable shuffle only after an internal partition worker starts with a real request token, requires that worker not to complete, and proves an exact clean retry with terminal worker accounting. Forward-only v31 injects one pre-publication partition-worker failure and proves exact same-partition failover to a different group with a one-retry ledger and all 64 rows. Forward-only v32 destroys the exact process that starts the partition, requires typed fail-closed exhaustion without partial rows, reconstructs its stable identity and endpoints, and proves an identical fresh 64-row join plus a direct rebuilt-endpoint read. Forward-only v33 exhausts the original operation while real resource saturation overlaps a matched exact-group network cut, requires typed no-partial rejection, heals both domains independently, and proves an identical complete retry. Forward-only v34 first matches a remote worker-link outage, then cancels the alternate worker while every production memory envelope is full, requires zero canceled-worker completion, heals both domains, and proves an identical complete retry. Forward-only v35 cancels at the real worker boundary, then destroys and reconstructs that exact production owner before proving an identical join and direct rebuilt-endpoint read | Cancellation under storage faults, disk pressure, simultaneous process loss before cancellation drain, or other fault combinations; authorization and generation mutation; right/nested/foreign joins; multi-range left inputs; overlapping owner faults beyond the v33/v34 resource-plus-link shapes; and global-query topology/storage/resource, coordinator or metadata process loss, multi-process loss, and broader transport/overlap composition beyond v40 is not complete |
-| Full-cluster v9 | The documented metadata/placement Raft, hosted data roots, public/serverless HTTP, graph-fanout, resource, merge-coordinator, replay, and cleanup behaviors are implemented | It is not yet a cluster of production `DataServer` owners. Data writes and merge structural actions are not proven through replicated DataServer apply on every replica |
-| Full-cluster v11-v53 production owners | **Integrated at the explicitly named production-owner seams through v52; v53 is bounded-lifecycle evidence only.** V11 joins the real metadata quorum, three production `DataServer`/data-Raft owners, real HTTP/Raft, two-table public clients, and the serverless catalog on one `VoprIo`. V12-v40 promote the cited active split, graph/join/global-query, transport, restart, short-write, resource, cancellation, authorization, durable-worker, reconstruction, and shared-cost seams. V42-v48 add the production replication runner through public routing, DataServer Raft/index visibility, schema interruption, target/source failure, cancellation, stale ownership, and metadata-backed exact-cutover authority rotation. V49 binds the actual node-1 `ApiHttpServer` cache to deadline/healing/reconstruction/recomputation evidence. V50 co-schedules real serverless candidate publication and a losing progress CAS with ordinary cluster work. V51 uses two valid disjoint table identities for concurrent cross-node writes/reads, requires exact bidirectional 403 read/write denials, and exact owning-identity 404 absence checks. V52 lowers one selected live DataServer capacity source to zero, drives the production persistent object-range cache's reservation path to an exact no-file denial, keeps public reads available, heals the same volume, and proves one reservation/write/release cycle plus public recovery. V53 reaches public managed-index pending readiness and production metadata reconciliation under a bounded exact-replayed lifecycle, but its full provider retry, coherent readiness, owner reconstruction, and semantic-query suffix is not promoted: the deep history currently exposes packet-level replay divergence around Raft status publication. The cited v42-v52 complete gates pass their documented Debug and ReleaseSafe runs 15/15. The focused LSM gate remains the exact LSM-maintenance witness | Complete and stabilize v53 record/fresh-world replay before promoting its readiness/reconstruction claim. Remaining breadth includes v9 topology combinations; managed-index inner-publication and disk-pressure faults plus graph/query cancellation under disk pressure; broader disk/socket/short-write and cache topology/link/storage/resource overlap; additional replication source-crash/cancellation and topology-change timings, metadata leadership loss during cutover, additional target-crash timings, and overlapping-fault variants in this deployment; row-level tenant scoping and identity mutation races; cancellation under storage/process and richer multi-fault combinations; arbitrary coordinator/metadata or multi-owner loss; disjoint placement; retained-history pressure; snapshot/derived-state rehydration; standby co-residency; broader join/global-query forms; serverless multi-worker placement and cross-domain object-store/process/resource overlap; and richer storage/process/link/resource overlap |
-| Replicated data-Raft merge/split protocols | **Integrated focused seam.** The current multi-owner checkpoint implements merge v3 capability/barrier activation, split-delta predecessor fencing behind durable protocol v4, source fencing, receiver checkpoints, catalog-independent replay identity, copied-document proposals, snapshot-carried controls, replicated observation, merge-to-split, post-bootstrap write, sparse delta catch-up, cutover, restart, routed terminal retry, and every-replica range/document/transition/watermark convergence. Its record and fresh-state replay pass | Disjoint replica sets, retained-history pressure, derived graph/index equivalence, snapshot-install rehydration, and co-resident standby/data-plane/serverless faults remain unproven |
+| Distributed graph | Focused production coordinator paths, v9's hosted public graph, and production-owner graph modes v13–v18, v21–v22, v24–v25, and v27–v29 | V9's remaining topology breadth, disk-capacity overlap, broader socket-pressure and partial-write surfaces, and storage/process/restart overlaps are not on the production owners; graph cancellation is composed only clean (v25) and under a scoped transport outage (v29), not under resource/storage/process/restart or multi-fault combinations |
+| Distributed join | V19–v20 and v30–v35: public inner `_id` join during a split, durable-finalizer takeover, worker cancellation, same-partition failover, partition-owner reconstruction, and cancellation or retry exhaustion under overlapping memory-plus-link faults | Cancellation under storage faults, disk pressure, or simultaneous process loss before cancellation drain; authorization and generation mutation; right/nested/foreign joins; multi-range left inputs; overlapping owner faults beyond the v33/v34 shapes |
+| Global query | V36–v40: ordered two-table NDJSON dispatch, then cancellation, authorization revocation, transport cut, and owner-process loss at the first-result boundary | Topology/storage/resource faults, coordinator or metadata process loss, multi-process loss, and broader transport/overlap composition |
+| Full-cluster v9 | The documented metadata/placement Raft, hosted data roots, public/serverless HTTP, graph-fanout, resource, merge-coordinator, replay, and cleanup behaviors are implemented | It is not a cluster of production `DataServer` owners. Data writes and merge structural actions are not proven through replicated DataServer apply on every replica |
+| Full-cluster v11–v53 production owners | **Integrated at the named seams through v52; v53 is bounded-lifecycle evidence only.** Each version's seam and gate is in [Full-Cluster Scenario Versions](#full-cluster-scenario-versions). The focused LSM gate remains the exact LSM-maintenance witness | Complete and stabilize v53 record/fresh-world replay before promoting its readiness/reconstruction claim; remaining breadth is listed in the [Distributed Completion Audit](#distributed-completion-audit) |
+| Replicated data-Raft merge/split protocols | **Integrated focused seam.** The multi-owner checkpoint implements merge v3 capability/barrier activation, split-delta predecessor fencing behind durable protocol v4, source fencing, receiver checkpoints, catalog-independent replay identity, copied-document proposals, snapshot-carried controls, replicated observation, merge-to-split, post-bootstrap write, sparse delta catch-up, cutover, restart, routed terminal retry, and every-replica range/document/transition/watermark convergence. Its record and fresh-state replay pass | Disjoint replica sets, retained-history pressure, derived graph/index equivalence, snapshot-install rehydration, and co-resident standby/data-plane/serverless faults remain unproven |
 | Antithesis-style distributed execution | Registered in-process node/process/storage/resource/link domains and exact replay are implemented | Arbitrary separate-address-space binaries, sidecars, DNS, kernels, and live mixed binaries require the conditional federated-agent or native differential modes described below |
 
 Therefore “integrated” must never be shortened in release notes or reviews to
@@ -165,7 +162,7 @@ writes.
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Integrated retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`, `debug_recipe.zig`; bounded recordings own structured fields and verbose text outside canonical bytes, support conjunctive field/text filters and before/after windows, and are populated directly by runner-backed and custom metadata/domain replay paths. Every retained/failing campaign writes `.flight.json`, while every debug recipe packages a filtered reduced-replay window | `zig build vopr-engine-test vopr-meta-test`; `vopr events` and `vopr recipe` are argument-taking commands, not standalone test gates |
 | Saved cross-run event sets, validation, counting, and live streams | `event_set.zig` validates a versioned forward-only query DAG and evaluates selection, union/intersection/difference/complement, distinct/first/last moment, previous/next, and bounded sequence operations across canonical histories. Its tests execute every operator and reject forward references, malformed operators, duplicate names, v0 formats, and the former ad-hoc selector shape. `vopr events` accepts only this saved-plan format and exact-replayed traces, with repeated `--trace`, `--validate`, and `--count`. Forward-only `vopr-event-stream-v2` serializes into a caller-owned fixed-slot SPSC queue: publication cannot allocate, block, or invoke external code, while one consumer may drain concurrently. Release/acquire publication prevents partial records; power-of-two capacity and wrapping monotonic positions preserve bounded operation across counter rollover. Drop-newest backpressure, oversize records, publication after close, delivery, and sink failures have separate atomically sampled saturating counters. Failed delivery retains the oldest record for retry, and close still permits draining. Tests cover invalid capacity, oversize rejection, concurrent producer/consumer accounting, retry, close, and pressure; runner pressure leaves canonical output byte-identical to an unobserved run. Custom observers remain an expert synchronous interface and must not block or panic | `zig build vopr-engine-test vopr-meta-test` |
-| Reversible node and operation service rates | `service_rate.zig` registers unambiguous stable node/operation identities, composes fully checked node/operation costs, charges logical time through borrowed `std.Io`, and heals individual effects by stable fault ID. Accounting distinguishes calls, work units, and logical nanoseconds. Six production-neutral boundaries are integrated: query cache, DataServer Raft and LSM maintenance, distributed graph, replication snapshot/stream, and serverless workflow work. Focused histories prove exact slowed/healed behavior. Full-cluster v23 installs one shared model into DataServer, graph, and serverless owners; v42 adds production replication work on the public/DataServer/Raft path; v43 proves pre-heal snapshot work survives a schema-change interruption and exact duplicate resume; v44 proves the same charged runner survives target-owner reconstruction and bounded reconnect; v45 proves it survives source-session failure and replacement; v46 proves outer lease cancellation composes with delegated charging; v47 adds ownership revalidation between target apply and checkpoint publication; v48 preserves charging while source-catalog and exact-cutover authority transitions cross metadata Raft; v49 installs the query-cache port on the actual node-owned `ApiHttpServer` across deadline expiry, healing, owner reconstruction, and exact recomputation | `zig build vopr-engine-test query-embedding-cache-vopr-test antfly-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test production-cluster-service-rate-vopr-test production-cluster-query-cache-deadline-restart-vopr-test production-cluster-replication-backfill-vopr-test production-cluster-replication-schema-change-vopr-test production-cluster-replication-owner-restart-vopr-test production-cluster-replication-source-crash-vopr-test production-cluster-replication-cancellation-vopr-test production-cluster-replication-stale-owner-vopr-test production-cluster-replication-topology-change-vopr-test`; cache topology/link/storage/resource overlap and remaining replication fault variants in the deployment remain roadmap breadth |
+| Reversible node and operation service rates | `service_rate.zig` registers unambiguous stable node/operation identities, composes fully checked node/operation costs (wide rounding, multipliers applied in canonical fault-ID order), charges logical time through borrowed `std.Io`, and heals individual effects by stable fault ID. Accounting distinguishes calls, work units, and logical nanoseconds. The generic fault and deployment registries type the effect separately from pause and terminal CPU budgets. Six production-neutral boundaries are integrated: query cache (request, hit-copy, coalesced-wait, producer-compute), DataServer Raft progress rounds and LSM maintenance, distributed graph (keyed by target group and expand/hydrate/get-edges), replication snapshot/stream permits, and serverless publish/enrichment/compaction/prune rounds. Focused histories prove exact slowed/healed behavior; full-cluster v23, v42–v48, and v49 compose them with production owners | `zig build vopr-engine-test query-embedding-cache-vopr-test antfly-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test` plus the full-cluster gates in [Full-Cluster Scenario Versions](#full-cluster-scenario-versions); cache topology/link/storage/resource overlap and remaining replication fault variants in the deployment remain roadmap breadth |
 | Integrated per-history and aggregate run/results API with phased health evidence | `runner.zig`, `report.zig`, `health.zig`, `vopr_io.zig`, `vopr-results`; every runner history samples continuous/recovery/final health without changing canonical trace bytes, exact replay rematerializes the evidence, `VoprIo.healthSnapshot` supplies task/descriptor/storage data, and mature P0/P1 adapters add domain progress, recovery, consistency, allocator/crash classification, and cleanup | `zig build vopr-engine-test vopr-contract-test vopr-registry-test vopr-results` |
 | Integrated persistent local run/results index and usage query API | `run_index.zig`, `vopr-index`; atomically persisted `vopr-run-index-v1` projects per-history and aggregate results into canonical run, revision, property, fingerprint, corpus/quarantine, artifact, and budget records. CLI predicates and `vopr-run-index-query-v1` cover every dimension, and the same query renders a static local HTML summary | `zig build vopr-engine-test vopr-meta-test vopr-index` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
@@ -193,9 +190,8 @@ writes.
 | Query embedding cache | Antfly `vopr/query_embedding_cache.zig`; production cache miss coalescing, cancellation, deadline, admission, TTL, LRU, pinned eviction, cleanup, and production-neutral service-rate charging on one `VoprIo`. V2 composes a node-wide slowdown with a hit-copy slowdown, crosses a real request deadline, heals each fault independently, resumes hits, and verifies exact logical usage | `zig build query-embedding-cache-vopr-test` |
 | Generation and reranking chains | Antfly `vopr/generation_reranking.zig`; production generation fallback/retry with borrowed `std.Io`, remote OpenAI-to-Antfly fallback, request-scoped remote-to-local generation and reranking replacement, malformed generation, truncated reranking, logical timeout, in-flight cancellation, local/remote routing, exact result validation, and cleanup in one composed trace. The production Antfly generator now honors its caller-owned HTTP timeout instead of overriding it, and HTTP task cancellation remains typed through narrowed transport errors | `zig build generation-reranking-vopr-test` |
 | Distributed graph-query execution | Antfly `vopr/distributed_query.zig`; production `executeCrossRange` planning, two-shard fanout, optional hydration, bounded topology retry, retry exhaustion, stale snapshot rejection, in-flight cancellation, cross-table authorization, and production-neutral per-group operation charging. V3 applies a four-times node-local slowdown to group 22 across expand/hydrate, verifies exact owner costs, heals explicitly, and repeats the production coordinator pass at baseline cost. This row does not claim distributed-join coverage | `zig build distributed-query-vopr-test` |
-| Public distributed join on production owners | Antfly `api/distributed_join.zig`, `api/internal_join_operations.zig`, `api/table_reads.zig`, `vopr/production_cluster.zig`, and `vopr/full_cluster.zig`; v19 executes a public inner `_id` join whose two right rows resolve through independently owned data-Raft groups before, during, and after an active split. V20 forces a 64-row durable shuffle, injects failure after the first finalizer persists its result, and proves a second owner imports that cached result and completes without repeated finalized work. Forward-only v30 cancels a public durable shuffle at its first internal partition-worker boundary, requires the worker token to observe cancellation and no canceled completion, then proves exact recovery and terminal worker accounting. Forward-only v31 fails the first partition worker before publication and requires exact same-partition failover to another group with one retry and all 64 rows. Forward-only v32 destroys the exact DataServer process that begins that partition, requires typed no-partial exhaustion, rebuilds its stable identity/listeners, and proves an identical fresh 64-row join plus a direct rebuilt-endpoint read. Forward-only v33 exhausts the original request under simultaneous real memory saturation and a matched exact-group link cut, heals both, and proves an identical complete retry. Forward-only v34 matches the remote link failure before canceling an alternate worker under the same all-owner memory pressure, heals both domains, and proves an identical complete retry. Forward-only v35 cancels the selected worker, reconstructs its exact production owner, and proves an identical join plus direct rebuilt-endpoint read | `zig build production-cluster-join-split-vopr-test production-cluster-durable-join-takeover-vopr-test production-cluster-durable-join-cancellation-vopr-test production-cluster-durable-join-worker-retry-vopr-test production-cluster-durable-join-owner-restart-vopr-test production-cluster-durable-join-retry-exhaustion-vopr-test production-cluster-durable-join-cancellation-overlap-vopr-test production-cluster-durable-join-cancellation-owner-restart-vopr-test -Doptimize=safe`; only these join shapes and lifecycles are claimed |
-| Deployment-shaped full cluster | Antfly `vopr/full_cluster.zig`, `vopr/production_cluster.zig`, `vopr/serverless_workflow.zig`, `metadata/vopr_harness.zig`, and the production HTTP/Raft runtimes share one `VoprIo`. V9 retains the hosted/public campaign. V11-v40 add the cited production metadata/DataServer/public/serverless, transition, graph/join/global-query, fault, durable-worker, and reconstruction seams. V42-v48 add the cited replication recovery path. V49-v52 add the production query-cache, serverless fencing, authenticated isolation, and disk-capacity compositions. Forward-only v53 currently supplies bounded exact-replayed public managed-index/pending/reconciliation lifecycle evidence only | Complete v53's provider-retry, coherent readiness, durable reconstruction, all-node semantic-query, and packet-level exact-replay gate; then add targeted timing and cross-domain fault breadth |
-| Production-owned full-cluster composition | Antfly `vopr/production_cluster.zig` plus `vopr/full_cluster.zig`; v11-v40 provide the detailed production-owner seams cataloged in Distributed Coverage. Public strong reads route to the current owner and require matching applied ReadState plus local derived-index visibility; remote work crosses typed internal HTTP while modeled time borrows the shared runtime. V42-v48 compose production replication and its named interruption/recovery/fencing modes; v49 runs deadline/coalescing/restart/recompute against the cache owned by node 1's real `ApiHttpServer`; v50 runs ordinary production work concurrently with a real serverless generation/progress conflict; v51 enables authentication on all three public servers and uses separate docs/tenant identities for ordinary work plus exact cross-table denial and absence proof; v52 attaches the production persistent-cache worker to node 2's live capacity source and proves denial/healing without breaking public reads; v53 begins the managed-index lifecycle on those same owners | The v11 smoke target passes 30/30; the cited v12-v40 gates use their documented budgets and fresh-world replay. V42-v52's named 120,000–260,000-transition Debug and ReleaseSafe gates pass 15/15. V53 is a 35,000-transition bounded-lifecycle exact-replay gate, not a completion claim; its deep completion/replay stabilization is roadmap work. Complete gates include named properties, record/fresh-world replay, cleanup, and leak checks; the 2,000-transition subprocess remains lifecycle-only evidence |
+| Public distributed join on production owners | Antfly `api/distributed_join.zig`, `api/internal_join_operations.zig`, `api/table_reads.zig`, `vopr/production_cluster.zig`, and `vopr/full_cluster.zig`; full-cluster v19, v20, and v30–v35 (see [Full-Cluster Scenario Versions](#full-cluster-scenario-versions)) | The eight `production-cluster-*join*-vopr-test` gates in that table, with `-Doptimize=safe`; only those join shapes and lifecycles are claimed |
+| Deployment-shaped full cluster | Antfly `vopr/full_cluster.zig`, `vopr/production_cluster.zig`, `vopr/serverless_workflow.zig`, `metadata/vopr_harness.zig`, and the production HTTP/Raft runtimes share one `VoprIo`. V9 retains the hosted/public campaign; v11–v53 add production-owner seams one version at a time. Public strong reads route to the current owner and require matching applied ReadState plus local derived-index visibility; remote work crosses typed internal HTTP while modeled time borrows the shared runtime | `zig build full-cluster-vopr-test production-cluster-vopr-test`. Complete gates include named properties, record/fresh-world replay, cleanup, and leak checks; the 2,000-transition subprocess and v53's 35,000-transition gate are bounded-lifecycle evidence only |
 | Parquet cache, provisioning/startup, external lake, and media providers | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/Iceberg-manifest/Parquet-query/provider-HTTP paths, injected I/O and object-store faults, provider retry/timeout/cancellation and active-request drain, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
 | Product upgrade and compatibility campaign | Antfly `vopr/upgrade_compatibility.zig`; current production readers open v1 standby golden records, v12 manifests, v14 external inventories, and legacy serverless heads; incompatible data directories and future product artifacts fail closed; atomic data-directory publication recovers after a crash-before-rename. VOPR-native traces, checkpoints, and fixtures are intentionally outside this campaign because their schemas are forward-only | `zig build upgrade-compatibility-vopr-test` |
 
@@ -250,7 +246,7 @@ runs registered production entrypoints in one virtual `std.Io` world.
 | Node lifecycle and pressure | Pause, stop/kill, restart, and throttling | Integrated at registered process/resource seams: pause, crash/restart, CPU-work exhaustion, descriptor, socket, allocator, and storage limits. Reversible logical per-node and per-operation slowdown/cost modeling is integrated through borrowed `std.Io`; arbitrary native CPU/thread throttling and native-thread pause are not implemented |
 | Deterministic replay and branching | Deterministic hypervisor execution | Exact choice/transition/observation replay plus reduction and multiverse branching |
 | Whole unmodified deployment | Arbitrary containerized binaries and sidecars | Deliberate non-goal; only registered in-process entrypoints are deterministic |
-| One full Antfly deployment history | Runs a supplied Docker Compose or Kubernetes topology | Integrated in-process at named complementary seams: v22 runs the real metadata quorum, three production DataServer/data-Raft owners and resource managers, public two-table I/O, serverless catalog, a metadata-driven active split, and public graph work before/during/after that split. Earlier modes add a fail-closed next-owner transport cut, stable-endpoint owner reconstruction, an exactly observed recoverable short write, all-owner memory denial, join recovery, and v21 overlaps the selected graph link cut with all-owner memory pressure; v22 adds exact selected-listener socket denial and recovery. V50 additionally overlaps ordinary public/DataServer/Raft work with a real serverless generation/progress conflict and public recovery on the same `VoprIo`; v52 adds selected-node disk-capacity denial and healing through a real persistent-cache reservation consumer while public reads continue; v53 adds bounded managed-index pending/reconciliation lifecycle evidence. V9 supplies the hosted public graph and broader nine-fault vocabulary. The promoted seams exact-replay, but v53 completion and packet-level replay stabilization, remaining topology breadth, managed-index and graph/query disk-pressure combinations, broader socket/short-write surfaces, and storage/process/restart fault overlaps are not yet on the production owners. Co-resident standby and richer cross-domain overlap remain ongoing. Separate address spaces, native sidecars, DNS, kernels, and live mixed binaries remain conditional/differential concerns |
+| One full Antfly deployment history | Runs a supplied Docker Compose or Kubernetes topology | Integrated in-process at named complementary seams: the production-owner full-cluster modes run the real metadata quorum, three production DataServer/data-Raft owners and resource managers, public two-table I/O, the serverless catalog, and an active split on one `VoprIo`, adding one fault or workflow seam per [scenario version](#full-cluster-scenario-versions); v9 supplies the hosted public graph and broader nine-fault vocabulary. Remaining topology, disk-pressure, socket/short-write, and storage/process/restart overlap, v53 completion, and co-resident standby are not yet on the production owners. Separate address spaces, native sidecars, DNS, kernels, and live mixed binaries remain conditional/differential concerns |
 
 Antithesis therefore does support distributed-system testing directly: its
 fault domains are containers or Kubernetes pods, including asymmetric network
@@ -475,6 +471,26 @@ receipt persistence onto borrowed I/O. Compatibility wrappers may use
 `std.Options.debug_io`, but they do not own another executor; new production
 callers should always pass their runtime lane explicitly.
 
+Deadlines and retry timing follow the same rule: a component that sleeps on
+borrowed I/O must also compute its deadlines from that I/O.
+
+- Raft HTTP frame-queue retry readiness and jitter, and snapshot-transfer
+  deadlines, use the owning I/O's monotonic clock. HTTP host construction
+  propagates that authority to route reconciliation, admission retries,
+  policy rechecks, and bootstrap status timestamps; snapshot staging names
+  draw entropy from the same I/O, not host time or a process-global counter.
+- Queued Raft delivery keeps the request's timeout when it takes ownership of
+  the copied payload, and a queued request does not retain the enqueuing
+  caller's borrowed cancellation or delivery-tracker pointers.
+- The DataServer maintenance worker computes vector-publication deadlines from
+  its borrowed monotonic clock. Every bounded attempt, including idle and
+  failed ones, sets a retry boundary and releases its reservation before
+  waiting; accepted wakes survive the backoff.
+
+Virtual-clock regressions cover retry readiness, repeatable jitter, transfer
+deadlines across realtime changes, a never-responding Raft peer, and
+far-future maintenance deadlines; the determinism audit covers these workers.
+
 ### Fail-Closed Capability Model
 
 Construction preflights declared capabilities. Unsupported operations return
@@ -496,30 +512,27 @@ futexes, queues, mutexes, and selection. Runnable-task selection, park, wake,
 cancel, spurious wake, eager completion, timer delivery, and futex waiter
 selection are scheduler-visible stable choices.
 
-Virtual-OS model v2 made readiness and active synchronization epochs explicit:
-futex pointer identities expire when the last waiter leaves; external-wake
-sequence numbers advance independently per logical resource; and an eager
-network producer still creates the same accept-readiness completion as a
-waiting consumer. Model v3 removed process-global allocation order from task
-and futex replay identities. Model v4 additionally scopes each fiber to its
-logical parent, an ASLR-independent callsite offset, and a callsite-local epoch;
-the raw process-global creation ordinal remains diagnostic metadata only. A
-task's first external block binds its scheduler identity to the logical
-resource and a resource-local waiter epoch, so unrelated sibling creation
-cannot rename an established owner.
+Scheduler-visible identity rules (virtual-OS model 8):
 
-Network identities follow the same rule: listeners are scoped to stable
-IP/Unix endpoints, provisional client/server pairs to the listener and
-connecting owner, and packets/FINs/datagrams to a source-socket-local sequence.
-Model v5 makes that steady-state connection identity a function of the logical
-connecting owner plus first stream payload, so distinct clients sending the
-same request cannot exchange a content-local occurrence. It migrates any
-parked read/write resource before
-delivery is selectable. Unrelated or reordered connections can no longer
-exchange their scheduler-visible steady-state identities. Packet transitions
-also carry a digest of their bytes, so equal-length payload changes fail exact
-replay instead of hiding behind the same packet identity and byte-count
-parameter.
+- Futex pointer identities expire when the last waiter leaves; external-wake
+  sequence numbers advance independently per logical resource; an eager
+  network producer creates the same accept-readiness completion as a waiting
+  consumer.
+- Task and futex identities exclude process-global allocation order. Each
+  fiber is scoped to its logical parent, an ASLR-independent callsite offset,
+  and a callsite-local epoch; the raw creation ordinal is diagnostic metadata
+  only. A task's first external block binds its scheduler identity to the
+  logical resource and a resource-local waiter epoch, so unrelated sibling
+  creation cannot rename an established owner.
+- Listeners are scoped to stable IP/Unix endpoints, provisional client/server
+  pairs to the listener and connecting owner, and packets/FINs/datagrams to a
+  source-socket-local sequence. Steady-state connection identity is a function
+  of the logical connecting owner plus first stream payload, and parked
+  read/write resources migrate before delivery is selectable, so distinct or
+  reordered connections cannot exchange identities.
+- Packet transitions carry a digest of their bytes, so equal-length payload
+  changes fail exact replay.
+
 Changing any of these rules requires a model-version bump because they are part
 of exact replay, not diagnostic presentation.
 
@@ -875,277 +888,119 @@ cross `DataServer` data Raft in that composition yet. Outside it,
 three-replica groups, real public HTTP and Raft listeners, routed forwarding,
 leader transfer, owner restart, every-replica transition/watermark convergence,
 document equality, exact terminal retry, and actor-owned teardown on one
-`VoprIo`. Full-cluster v11 now reuses those production owners behind the live
-metadata quorum for a static public/serverless baseline. V12 reaches the real
-hosted transition path and records destination bootstrap/apply convergence,
-finalization, publication, and a post-split public read; cancellation of an
-active hosted callback is covered by the bounded cutoff. After transition retry
-jitter became a stable per-node deterministic input, its complete
-320,000-transition history passes record, fresh-state exact replay, properties,
-cleanup, and leak checks. The active transition is integrated at this stated
-seam. V13 adds the production-owner graph, v14 overlaps it with that active
-split, v15 cuts the real next-owner graph stream, and v16 stops and reconstructs
-that next production owner and both stable-port service listeners before Raft
-and graph recovery. V17 limits one semantic-stream-selected request write on
-the actual registered coordinator-to-owner link and proves production stream
-resumption preserves the complete graph. V18 adds real all-owner memory
-pressure; v19/v20 add public cross-owner join and durable-finalizer takeover;
-v21/v22 add simultaneous link-plus-memory and selected-listener admission
-faults; and v23 proves reversible per-node/per-operation service rates across
-DataServer, graph, and serverless owners. V24-v29 promote public hydration,
-cancellation, in-flight authorization mutation, stale-snapshot retry
-exhaustion, and cancellation under a matched transport outage. Forward-only
-v30-v35 then promote durable-worker cancellation, same-partition group
-failover, actual partition-owner process destruction/reconstruction, retry
-exhaustion plus cancellation while a real resource domain overlaps one exact-
-group link cut, and cancellation followed by exact worker-owner
-reconstruction. V36 sends one two-line global NDJSON request through the real
-public `/db/v1/query` listener, production routing, and independently owned
-`docs` and `tenant_b_docs` tables. Its structural oracle requires exactly two
-flattened responses in request order and exact, disjoint ID sets for each
-table. Forward-only v37 cancels that public request after the first production
-table result is assembled, requires typed client cancellation, listener drain,
-and exactly one assembled result from the canceled operation, then proves an
-exact ordered two-table recovery on a fresh request. Forward-only v38 revokes
-the authenticated principal's `tenant_b_docs` read permission immediately
-after the first `docs` result is assembled. The same admitted NDJSON request
-must fail closed with an exact 403 body, exactly one assembled result, and no
-protected-table payload; the history then restores policy and proves the exact
-ordered two-table response on a fresh request. Forward-only v39 selects and
-registers the real directional public-coordinator-to-tenant-owner link, then
-cuts only the internal `tenant_b_docs/query` semantic stream after the first
-`docs` result is assembled. The request must discard that result and return
-the exact retryable distributed-query 503, with one matched outage and no
-second assembled result; the history explicitly heals the link and proves the
-exact ordered two-table response on a fresh request. Forward-only v40 reaches
-the same boundary, but destroys the exact process that owns `tenant_b_docs`
-instead of applying a link policy. A separate deterministic lifecycle owner
-tears down the DataServer and its public and Raft listeners, keeps that stable
-identity absent until the request returns the exact retryable 503 without a
-second result, then reconstructs the process with a fresh incarnation. The
-history does not call reconstruction complete until the exact rebound public
-endpoint serves the durable tenant document; it then proves the exact ordered
-two-table response on a fresh request. Every incomplete public
-graph, join, or global-query operation must fail closed without partial rows;
-each faulted history heals and proves a complete fresh request.
-Forward-only v49 composes the production query-embedding cache with the same
-deployment-shaped service-rate history instead of treating the cache as an
-isolated focused suite. The cache is the instance actually owned by node 1's
-live `ApiHttpServer`; its work port is reinstalled whenever that `DataServer`
-process is reconstructed. While the node-wide two-times slowdown is active,
-one same-key waiter must cross the real coalescing ledger and expire at its
-logical deadline while one producer remains in flight. After healing, one
-retained hit succeeds. The ordinary public workload then reaches an external
-completion fence, node 1 is destroyed and reconstructed from its stable roots,
-the replacement cache is proven empty, and the same key produces exactly one
-new computation plus one retained hit. The long-lived public client must fail
-exactly once on its stale pooled connection, reconnect, and read a pre-restart
-durable document through the rebound endpoint. The property requires exact
-pre/post-heal units, exact pre/post-restart cache ledgers and byte accounting,
-two computations, four owned results, zero in-flight work/effects, public
-visibility, quiet cleanup, and fresh-world replay. Its dedicated 120,000-
-transition Debug and ReleaseSafe gates pass 15/15.
-Forward-only v50 promotes serverless generation and publication-progress
-fencing into the production-owner cluster. The builder exposes one optional,
-production-neutral lifecycle hook after its immutable candidate manifest is
-durable and before the guarded progress CAS. The hook is unset in production
-and shared by every builder publication path. In the VOPR history, a stale
-enrichment mutation captured at head 1 produces candidate version 2; at that
-exact boundary an authoritative metadata publisher encounters the immutable
-version collision, persists generation 3, and advances HEAD from 1 to 3. The
-suspended publication path must then lose with `HeadChanged`, leaving version 2 as a
-lineage-tracked orphan without changing visible progress. A clean retry from
-head 3 consumes the stale WAL position without applying its full-body overwrite
-and publishes version 4. The public serverless HTTP client must observe only the
-authoritative document at version 4. Unlike the removed standalone full-cluster
-mode, v50 starts the ordinary two-table public/DataServer/Raft workload before
-the serverless history finishes, so both owner graphs make progress on the same
-`VoprIo`. The exact property requires one hook call, candidate 2, cutover 3,
-final head 4, one interrupted publication, generation-fenced data, successful
-public writes/reads and Raft wire traffic, cleanup, and fresh-world replay. Its
-dedicated 120,000-transition Debug and ReleaseSafe gates pass 15/15.
-Forward-only v51 promotes authenticated multi-tenant isolation on the same
-production owners. Two valid Basic identities have disjoint table-scoped
-read/write permissions: the docs identity owns only `docs`, while the tenant
-identity owns only `tenant_b_docs`. The ordinary three-ingress workload uses
-those clients concurrently for its acknowledged writes and strong reads. It
-then crosses different public nodes in both directions: each identity's read
-and write against the other table must return exact 403, and an owning-identity
-lookup must return exact 404 for each forbidden key. Response-body checks
-prevent protected document values from leaking through either denial. The
-property also retains the ordinary write/read/table-isolation, metadata
-topology, real Raft-wire, serverless publication, quiet cleanup, and fresh-
-world replay oracles. Its dedicated 120,000-transition Debug and ReleaseSafe
-gates pass 15/15.
-Forward-only v52 promotes one explicit per-node disk-capacity interference
-history into the production-owner cluster. Node 2's modeled volume now has a
-healthy 2 GiB baseline, above the production `ResourceManager`'s 1 GiB safety
-floor. The mode attaches the real durable persistent object-range cache worker
-to that live DataServer's capacity source, lowers only that source to zero,
-and requires the accepted cache task to increase capacity denials without
-creating a file, completing a write, or acquiring a reservation. A public
-document read through the pressured node must remain available. The history
-then restores the same volume, retries under a different cache key, requires
-one exact capacity reservation/write/release cycle, reads the checksum-
-protected payload back, and proves public data remains visible through another
-coordinator. The registered node resource fault, ordinary two-table
-DataServer/Raft workload, serverless publication, quiet cleanup, and fresh-
-world replay oracles remain active. Its dedicated 120,000-transition Debug
-and ReleaseSafe gates pass 15/15.
-This promotes the real persistent-cache reservation seam, not managed-index
-repair under disk pressure or disk overlap with link/storage/process faults.
-Forward-only v53 begins one managed-index publication and reconstruction
-seam through the same production owners. A public create-index request first
-publishes a fresh incarnation through metadata Raft while the managed provider
-admits its dimension probe but returns a retryable failure for document work.
-attempts before the provider is released. The current 35,000-transition gate
-exact-replays that bounded lifecycle and cleanup. The intended suffix requires
-coherent coverage and replay watermarks, three indexed documents, durable node
-1 reconstruction, and the same semantic query through all three public nodes.
-That suffix is not promoted: its current deep run exposes packet-level replay
-divergence around Raft status publication. Stabilize and complete that gate
-before adding crashes inside each candidate/catalog/alias publication gap or
-managed-index disk-pressure overlap.
-Forward-only v42 composes the production replication runner with that same
-deployment rather than copying its snapshot-to-stream state machine into the
-cluster harness. The fixture borrows the cluster `VoprIo`, uses the shared
-node-1 service-rate model, and targets a production adapter that serializes the
-canonical `BatchRequest` and alternates ordinary public coordinators. Two
-snapshot batches and one streaming upsert therefore cross public HTTP,
-routing, leader forwarding, `DataServer`, data Raft, and full-index visibility.
-A generic completion fence keeps listeners, Raft owners, and storage alive
-until the external runner finishes. Snapshot work and the first accepted
-public batch execute under the two-times node slowdown; healing then permits the remaining
-snapshot and stream work at baseline. The exact oracle requires three attempts
-and three accepted responses, every source document visible through every
-public coordinator, exact snapshot/stream accounting, the pre-existing
-DataServer/graph/serverless invariants, zero active effects, quiet cleanup, and
-fresh-world replay. Its dedicated 160,000-transition Debug and ReleaseSafe
-gates pass 15/15. This promotes the clean replication target path; focused
-fault modes remain in the focused suite at this checkpoint.
-Forward-only v43 promotes the schema-change and duplicate-resume boundary. The
-first snapshot batch is accepted through node 1 while slowed, after which the
-production lifecycle hook changes the source configuration and interrupts the
-attempt. The same runner resumes from its durable status under the new schema,
-and the source-boundary witness requires the resumed snapshot to query
-`users_v2`. It replays exactly one already-applied batch through the public
-target, completes the remaining snapshot and CDC stream, and preserves final
-idempotent state.
-The property requires an observed first-attempt failure, the schema switch,
-an observed `users_v2` query, exactly four accepted target batches, three final
-documents visible through every public coordinator, pre/post-heal work, the
-complete cluster oracle,
-cleanup, and fresh-world exact replay. Its dedicated 180,000-transition Debug
-and ReleaseSafe gates pass 15/15. Additional cancellation timings and cross-
-domain overlap remain separate future modes; v44 promotes one exact target-
-owner restart, v45 one exact source-session crash, v46 one durable-checkpoint
-cancellation, v47 one pre-checkpoint stale-owner rejection, and v48 one exact
-metadata source-catalog/authority rotation below.
-Forward-only v44 promotes one exact target-owner crash/reconstruction boundary.
-After the first snapshot batch is durably accepted, it waits for the ordinary
-public graph workload to reach its terminal boundary while the external
-completion fence keeps every production owner alive. It selects the current
-data-group leader, preserves its public URI, destroys that `DataServer` and
-both stable-port listeners, and sends the next canonical batch to the stopped
-endpoint. The production executor must report `SendFailed`; reconstruction
-then reuses the stable node/store IDs, rotates the reporter incarnation,
-rebinds public and Raft listeners, republishes metadata, and waits for leader
-and route recovery. A fresh bounded VOPR-backed public client must read an
-already-indexed durable document directly from the rebound endpoint, while a
-local exact-group read proves the first replicated `doc:d` survived the
-restart. The long-lived production client then exercises one stale pooled-
-connection failure before the durable runner resumes.
-The property requires exactly five target attempts, exactly three successes,
-the two bounded transport failures, no reconstruction error, durable local
-recovery, a direct 200 from the replacement process, all three replicated
-documents through every coordinator, exact pre/post-heal work, every existing
-cluster oracle, cleanup, and fresh-world replay. Its dedicated 220,000-
-transition Debug and ReleaseSafe gates pass 15/15. This promotes that exact
-post-first-batch target-leader restart; additional source-crash, cancellation,
-topology, and target-crash timings plus cross-domain overlap remain separate
-future modes.
-Forward-only v45 promotes one exact source-session crash boundary. After the
-runner durably records provider preparation but before any snapshot query or
-target batch, the first actual provider `query` callback returns
-`ConnectionResetByPeer`. The failed source object is then deinitialized; durable
-status drives a resumed snapshot through a strictly newer owned provider
-session, followed by a third independently owned streaming session. This is a
-provider-operation failure, not an exception thrown by the lifecycle hook.
-The property requires the exact typed query failure, exact source generations
-1/2 for failure/recovery, exactly three source sessions opened and closed, a
-peak of one live session and zero terminal sessions, one failed attempt,
-exactly three target attempts and successes,
-three final documents through every public coordinator, unchanged pre/post-
-heal work, every existing cluster oracle, cleanup, and fresh-world replay. Its
-dedicated 220,000-transition Debug and ReleaseSafe gates pass 15/15. Additional
-source-crash timings or source-process loss, additional cancellation timings,
-other topology/target-crash timings, metadata leadership loss during cutover,
-and cross-domain overlap remain separate modes.
-Forward-only v46 promotes one exact durable-cancellation boundary. After the
-first snapshot target batch succeeds and offset 1 is persisted, the fixture
-revokes its production work lease. The next work checkpoint must return
-`CdcWorkLeaseLost`, close source generation 1, and resume from durable status
-through generation 2; generation 3 independently owns streaming. The
-compositional permit wrapper validates the lease before delegating to the
-cluster service-rate permit, so installing production charging cannot disable
-fencing or cancellation. The property requires offset 1, the exact typed
-error, generations 1/2, exactly three opened/closed sessions with peak one and
-zero live at completion, exactly three target attempts and successes (no
-duplicate committed batch), unchanged charged work, all-node visibility,
-every cluster oracle, cleanup, and fresh-world replay. Its dedicated 220,000-
-transition Debug and ReleaseSafe gates pass 15/15. Earlier/later cancellation,
-other topology-change timings, metadata leadership loss during cutover,
-source/target process overlap, and other cross-domain fault shapes remain
-separate modes.
-Forward-only v47 promotes one exact stale-work-owner boundary. The first owner
-successfully applies `doc:d`, then loses its lease at the
-`snapshot_batch_applied` lifecycle boundary before offset 1 is durable. The
-production snapshot runner now revalidates `WorkPermit` ownership between
-target apply and checkpoint publication, so that owner must receive
-`CdcWorkLeaseLost` while durable offset remains 0. Source generation 1 closes;
-generation 2 resumes from offset 0 and idempotently reapplies `doc:d`; generation
-3 owns streaming. The property requires exact failure/recovery generations,
-three balanced non-overlapping source sessions, four target attempts and four
-successes, exactly one replayed batch, all-node final visibility, charged work,
-every cluster oracle, cleanup, and fresh-world replay. Its dedicated 240,000-
-transition Debug and ReleaseSafe gates pass 15/15. V48 promotes the exact
-metadata topology and cutover-authority rotation below; other ownership-loss
-timings and cross-domain overlap remain separate modes.
-Forward-only v48 promotes the source-catalog/authority boundary through the
-live metadata quorum. Before provider work begins, the fixture publishes an
-exact-cutover source definition for production table 6841 through metadata
-Raft and waits for all three projections. Provider generation 1 persists
-intent and authority A through the atomic cutover-claim command. After its
-first target batch succeeds, the lifecycle boundary publishes source config v2
-through metadata Raft without throwing a scripted failure. The runner's real
-post-apply authority check observes the byte-exact catalog mismatch and returns
-`ReplicationSourceConfigChanged` while durable offset remains 0. Generation 2
-then derives a new intent and authority B, atomically claims against A, carries
-and completes A's physical slot/publication retirement, and replays the
-undurable batch. Generation 3 independently owns streaming. The property
-requires two prepared snapshots, two durable claims, one retirement, distinct
-nonzero authorities, the exact typed failure, three balanced non-overlapping
-source sessions, four target attempts and successes, all-node visibility,
-charged work, every existing cluster oracle, cleanup, and fresh-world replay.
-Its dedicated 260,000-transition Debug and ReleaseSafe gates pass 15/15.
-Additional topology-change timings, metadata leader loss between claim/check/
-retirement, and link/storage/resource/process overlap remain separate modes.
-V42-v53 directly add their modes, properties, trace revisions,
-observations, and build targets; there are no legacy aliases, readers, or
-migration paths.
-V49 reaches the cache instance embedded inside the production `ApiHttpServer`
-through an owner-scoped keyed operation and the server's real ResourceManager
-budget. It does not claim that a complete public semantic HTTP request or an
-external inference provider executed; that end-to-end boundary remains
-distinct follow-up breadth.
-Each named complete gate exact-replays and passes 15/15 at its explicitly cited
-optimization checkpoint.
+`VoprIo`. Every incomplete public graph, join, or global-query operation in
+the production-owner modes must fail closed without partial rows; each faulted
+history heals and proves a complete fresh request.
+
+> **Relocated:** The per-version v11–v53 narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/full-cluster-scenario-narratives.md](../docs/design/vopr/history/full-cluster-scenario-narratives.md).
+
+#### Full-Cluster Scenario Versions
+
+Each version is a forward-only mode of the `full-cluster` scenario. V11 onward
+run on the real metadata quorum, three production `DataServer`/data-Raft
+owners, real public HTTP and Raft listeners, two tables, and the serverless
+catalog on one `VoprIo`; each later version adds one seam to that deployment.
+Gates are `zig build <gate>` steps; the number is the transition budget of the
+complete record/fresh-world exact-replay history. `production-cluster-vopr-test`
+runs every gate below from v11 through v53. Version numbers without a row are
+not current modes (v41's cache composition was replaced by v49).
+
+| Version | Seam / what it adds | Gate (budget) | Status |
+| --- | --- | --- | --- |
+| v9 | Hosted/public campaign: metadata/placement Raft, hosted data roots, public and serverless HTTP, cross-range graph, and nine faults (metadata partition, node restart, in-flight graph-leader restart, graph range-merge churn, graph transport failure, partial HTTP write, node-memory denial) | `full-cluster-vopr-test` | Integrated (hosted nodes, not `DataServer` owners) |
+| v11 | Static production-owner baseline: public/serverless work on the live metadata quorum and three `DataServer` owners | `production-cluster-baseline-vopr-test` (240,000; part of `production-cluster-vopr-smoke-test`) | Integrated |
+| v12 | Metadata-driven active split through the hosted transition path: destination bootstrap/apply, finalization, publication, post-split read | `production-cluster-vopr-deep-test` (320,000); 2,000-transition bounded cutoff in the smoke gate | Integrated |
+| v13 | Depth-two public graph on production owners with the strong-read/derived-visibility barrier | `production-cluster-graph-vopr-test` (35,000) | Integrated |
+| v14 | V13's graph before, during, and after the active split | `production-cluster-graph-split-vopr-test` (400,000) | Integrated |
+| v15 | Fail-closed cut of the real next-owner graph stream | `production-cluster-graph-split-transport-vopr-test` (450,000) | Integrated |
+| v16 | Next owner stopped and reconstructed with stable-port public/Raft listeners before Raft and graph recovery | `production-cluster-graph-split-owner-restart-vopr-test` (650,000) | Integrated |
+| v17 | One semantic-stream-selected short write on the registered coordinator-to-owner link; production stream resumption | `production-cluster-graph-split-partial-write-vopr-test` (500,000) | Integrated |
+| v18 | All-owner memory denial and recovery during the split | `production-cluster-graph-split-resource-pressure-vopr-test` (550,000) | Integrated |
+| v19 | Public inner `_id` join; two right rows on independently owned ranges; before/during/after the split | `production-cluster-join-split-vopr-test` (11,000 bounded + 420,000) | Integrated |
+| v20 | Forced 64-row durable shuffle; first finalizer fails after persisting; another owner imports the cached result (two-attempt ledger) | `production-cluster-durable-join-takeover-vopr-test` (300,000) | Integrated |
+| v21 | Selected graph link cut overlapped with all-owner memory pressure | `production-cluster-graph-split-overlapping-faults-vopr-test` (600,000) | Integrated |
+| v22 | Selected-listener connection-limit denial before handler ingress, then recovery | `production-cluster-graph-split-socket-pressure-vopr-test` (500,000) | Integrated |
+| v23 | One service-rate model across DataServer, graph, and serverless owners; exact two-times costs before healing, baseline after | `production-cluster-service-rate-vopr-test` (90,000) | Integrated |
+| v24 | Exact selected-field document hydration through the public graph response | `production-cluster-graph-hydration-vopr-test` (90,000) | Integrated |
+| v25 | Hydration fanout cancelled through the public HTTP disconnect path; one clean retry | `production-cluster-graph-cancellation-vopr-test` (110,000) | Integrated |
+| v27 | Authenticated workload; target-table read policy revoked at `target_authorization_started`; concealed no-leak output; restore and fresh retry | `production-cluster-graph-inflight-authorization-vopr-test` (120,000) | Integrated |
+| v28 | Split published after `source_snapshot_acquired`; exactly two `TopologyChanged` attempts and a typed no-partial 503 | `production-cluster-graph-stale-snapshot-vopr-test` (340,000) | Integrated |
+| v29 | Real `/graph-hydrate` traffic matches a scoped coordinator-to-owner outage before cancellation; heal and recover | `production-cluster-graph-cancellation-transport-fault-vopr-test` (140,000) | Integrated |
+| v30 | Durable shuffle cancelled at its first partition-worker boundary; worker token observes cancellation; no canceled completion | `production-cluster-durable-join-cancellation-vopr-test` (360,000) | Integrated |
+| v31 | Pre-publication partition-worker failure; same-partition failover to another group with one retry | `production-cluster-durable-join-worker-retry-vopr-test` (360,000) | Integrated |
+| v32 | Partition-owner process destroyed; typed no-partial exhaustion; stable identity rebuilt; direct rebuilt-endpoint read | `production-cluster-durable-join-owner-restart-vopr-test` (420,000) | Integrated |
+| v33 | Retry exhaustion under real memory saturation plus a matched exact-group link cut; both healed independently | `production-cluster-durable-join-retry-exhaustion-vopr-test` (420,000) | Integrated |
+| v34 | Remote worker-link outage, then alternate-worker cancellation with every memory envelope full | `production-cluster-durable-join-cancellation-overlap-vopr-test` (420,000) | Integrated |
+| v35 | Worker cancellation followed by exact worker-owner reconstruction | `production-cluster-durable-join-cancellation-owner-restart-vopr-test` (420,000) | Integrated |
+| v36 | Two-line global NDJSON request through `/db/v1/query` to `docs` and `tenant_b_docs`; ordered, exact, disjoint results | `production-cluster-global-query-vopr-test` (90,000) | Integrated |
+| v37 | Cancellation after the first table result; typed client cancellation, listener drain, exactly one assembled result | `production-cluster-global-query-cancellation-vopr-test` (110,000) | Integrated |
+| v38 | `tenant_b_docs` read permission revoked after the first result; exact 403 without protected payload | `production-cluster-global-query-authorization-vopr-test` (120,000) | Integrated |
+| v39 | Registered tenant-owner query stream cut after the first result; exact retryable 503 | `production-cluster-global-query-transport-vopr-test` (140,000) | Integrated |
+| v40 | Tenant-owner process destroyed at the same boundary; 503; reconstruction; direct durable read from the rebound endpoint | `production-cluster-global-query-owner-restart-vopr-test` (240,000) | Integrated |
+| v42 | Production replication runner through canonical public `BatchRequest` routing, leader forwarding, DataServer Raft, and full-index visibility; slowed, then healed | `production-cluster-replication-backfill-vopr-test` (160,000) | Integrated |
+| v43 | Source schema change after the first accepted batch; durable resume queries `users_v2`; exactly one duplicate batch | `production-cluster-replication-schema-change-vopr-test` (180,000) | Integrated |
+| v44 | Target leader destroyed and reconstructed before the next batch; `SendFailed` then one stale pooled-connection failure; five attempts, three successes | `production-cluster-replication-owner-restart-vopr-test` (220,000) | Integrated |
+| v45 | First provider `query` returns `ConnectionResetByPeer`; newer owned session resumes (source generations 1/2, three balanced sessions) | `production-cluster-replication-source-crash-vopr-test` (220,000) | Integrated |
+| v46 | Work lease revoked after durable offset 1; `CdcWorkLeaseLost`; no duplicate committed batch | `production-cluster-replication-cancellation-vopr-test` (220,000) | Integrated |
+| v47 | Lease lost between target apply and checkpoint; durable offset stays 0; one idempotent replay, four successes | `production-cluster-replication-stale-owner-vopr-test` (240,000) | Integrated |
+| v48 | Exact-cutover source catalog v2 and authorities published through metadata Raft; `ReplicationSourceConfigChanged`; authority A retired under B | `production-cluster-replication-topology-change-vopr-test` (260,000) | Integrated |
+| v49 | Node 1's real `ApiHttpServer` query cache: coalesced waiter expires at its logical deadline under slowdown; heal; owner reconstruction; empty-cache recompute; one stale pooled-connection reconnect | `production-cluster-query-cache-deadline-restart-vopr-test` (120,000) | Integrated |
+| v50 | Real serverless candidate (version 2) loses its progress CAS with `HeadChanged` after generation 3 cutover, beside ordinary cluster work; retry publishes version 4 | `production-cluster-serverless-fencing-vopr-test` (120,000) | Integrated |
+| v51 | Authentication on all three public servers; two disjoint table identities; exact bidirectional cross-node 403 read/write denials and owning-identity 404 absence | `production-cluster-authenticated-tenant-vopr-test` (120,000) | Integrated |
+| v52 | Node 2's live capacity source lowered to zero: persistent-cache reservation denied with public reads still available; heal; one reservation/write/release | `production-cluster-disk-capacity-vopr-test` (120,000) | Integrated |
+| v53 | Public create-index through metadata Raft; pending readiness while the provider fails document work; production reconciliation begins | `production-cluster-managed-index-vopr-test` (35,000, bounded lifecycle) | Bounded evidence only |
+| 54 | Current `Scenario.version`; closes the join/split packet-replay and replay-error teardown failures without adding a mode | (all of the above) | Current ABI |
+
+The complete v42–v52 gates passed 15/15 Debug and ReleaseSafe runs at their
+promotion checkpoint; a changed tree must rerun the named gate before carrying
+a claim forward. V53's intended suffix (coherent coverage and replay
+watermarks, three indexed documents, durable node-1 reconstruction, and the
+same semantic query through all three public nodes) is not promoted: its deep
+run exposes packet-level replay divergence around Raft status publication.
+Stabilize and complete it before adding crashes inside each
+candidate/catalog/alias publication gap or managed-index disk-pressure overlap.
+The `production-cluster-managed-index-vopr-test` step's filter (`…managed
+index publication recovery exact replay`) does not currently match the test
+name (`…managed index publication bounded lifecycle exact replay`), so that
+step selects no test until the two are reconciled.
+
+Contracts the production-owner modes rely on:
+
+- Transition retry jitter is a stable per-node deterministic input (v12).
+- A generic completion fence keeps listeners, Raft owners, and storage alive
+  until an external runner (replication, cache, serverless) finishes (v42+).
+- The replication permit wrapper validates the work lease before delegating to
+  the cluster service-rate permit, so charging cannot disable fencing or
+  cancellation (v46). The snapshot runner revalidates `WorkPermit` ownership
+  between target apply and checkpoint publication (v47).
+- The serverless builder exposes one optional production-neutral lifecycle
+  hook after the immutable candidate manifest is durable and before the
+  guarded progress CAS; it is unset in production and shared by every builder
+  publication path (v50).
+- V49 reaches the cache embedded in the production `ApiHttpServer` through an
+  owner-scoped keyed operation and the server's real ResourceManager budget;
+  it does not claim a complete public semantic HTTP request or an external
+  inference provider executed. The cache work port is reinstalled whenever
+  that `DataServer` is reconstructed.
+- Node 2's modeled volume has a healthy 2 GiB baseline, above the production
+  `ResourceManager`'s 1 GiB safety floor (v52). V52 promotes the persistent-cache
+  reservation seam, not managed-index repair under disk pressure or disk
+  overlap with link/storage/process faults.
+- V42 onward add modes, properties, trace revisions, observations, and build
+  targets directly; there are no legacy aliases, readers, or migration paths.
+- Gates are tiered by deterministic work, not by a weaker oracle: record and
+  fresh-state replay, properties, cleanup, and enabled-set equality are
+  identical in every tier. Each large subprocess uses exit-code-checked test
+  mode, serialized by the build graph's inherited stdio lock. Exact replay
+  compares canonical wire records structurally and renders only the first
+  mismatch.
+
 This is distributed process-lifecycle coverage at an application-owned
-`std.Io` boundary, but not an arbitrary process matrix: metadata/coordinator
+`std.Io` boundary, not an arbitrary process matrix: metadata/coordinator
 restart, multiple simultaneous owner failures, process loss composed with
 storage/resource/partition faults, disjoint placement, derived-state equality,
 bounded retained-history replay, snapshot-install rehydration, and co-resident
-v9 fault breadth remain the work below.
+v9 fault breadth remain open.
 
 ### Derived Workflows
 
@@ -1382,83 +1237,65 @@ budget; each retained history independently supports exact replay.
 
 The merged fault algebra supplies explicit overlap, precedence, exclusions,
 fault budgets, and healing. Those engine features are not evidence that every
-production ownership transition has been composed with every fault.
-The bounded `vopr-test` gate is also not evidence of a completed soak run.
+production ownership transition has been composed with every fault, and the
+bounded `vopr-test` gate is not evidence of a completed soak run.
 
-The standby lifecycle scenario now uses `VoprIo` files and monotonic time for the
-production primary log, replication slots, standby receive/progress WALs,
-and fencing receipts. Standby apply deadlines borrow the progress WAL clock,
-including deadlines constructed by the production DataServer caller.
-The scenario is version 2; version-1 native-storage traces must be regenerated,
-not silently replayed under different semantics. Its application callback
-still checks an ordered payload model; it does not yet apply into the
-production cluster's DB. Its restart actions close and reopen owners; they
-do not yet inject power loss between individual storage operations.
+The `standby` lifecycle scenario (version 2) uses `VoprIo` files and monotonic
+time for the production primary log, replication slots, standby
+receive/progress WALs, and fencing receipts; standby apply deadlines borrow the
+progress WAL clock, including deadlines built by the production DataServer
+caller. Version-1 native-storage traces must be regenerated. Its application
+callback checks an ordered payload model rather than applying into the
+production cluster's DB, and its restarts close and reopen owners rather than
+injecting power loss between storage operations. Campaign, scenario, property,
+and fixture names use `standby`/`standby-scaling` with no HA-named aliases;
+pre-rename corpora replay only with their retained original runner.
 
-The canonical campaign names are `standby` and `standby-scaling`; there are no
-HA-named aliases. Scenario, property, and fixture identities use `standby` too.
-Corpora created before this rename must be replayed with their retained original
-runner; the renamed campaigns start fresh corpora rather than rewriting traces.
+`standby-scaling` (`production-standby-scaling`, version 2) composes the
+production metadata quorum, three Raft-backed DataServers, and a separate
+production primary/standby DataServer pair on the shared scheduler. Hot
+standby is the documented single-primary mode: promotion does not replace a
+Raft voter. The standby owners use a fixed standalone table catalog; the Raft
+deployment uses its real metadata quorum. `standby-scaling-vopr-test` records
+and exactly replays one complete history that drains and restarts the third
+data owner, raises and lowers desired replicas, lets production status
+collection and median-key RPCs choose a split, fences and promotes the standby
+through the authenticated admin API during that active transition (with a
+metadata-leader restart), and then merges the split siblings back while
+public writes continue. `standby-production-vopr-test` isolates the production
+standby lifecycle and cancels right after promotion to verify task and
+network cleanup.
 
-The separate `standby-scaling` scenario (`production-standby-scaling`, version 2)
-composes the production metadata quorum, three Raft-backed DataServers, and
-separate production primary/standby DataServers on the shared VOPR scheduler.
-Hot standby is the documented single-primary mode: promotion does not replace a Raft
-voter. The standby owners use a fixed standalone table catalog with the current
-routing interface; the Raft deployment uses its real metadata quorum. Its
-bounded `standby-scaling-vopr-test` records and exactly replays one complete history:
+The oracles check acknowledged values, exact range coverage without gaps or
+overlap, standby safe-read/apply bounds, fencing, promotion identity, replica
+convergence, bounded completion, and owner cleanup. Contracts the history
+relies on:
 
-1. Drain the third data owner and establish two caught-up replicas. Start a
-   separate primary/standby pair, write through public HTTP, and apply the
-   actual replication log into real standby DBs. Verify a standby read and
-   reject promotion without a fencing receipt.
-2. Restart the third owner with a fresh registration incarnation and raise the
-   desired replica count to three. Wait for production placement and Raft apply.
-3. Set automatic sharding thresholds and let production status collection and
-   median-key RPCs choose a split. During the active transition, fence the old
-   standby writer at its durable tail after another public write, catch up the
-   standby, and restart the Raft deployment's metadata leader. Reopen the
-   durable fence store and promote through the authenticated admin API.
-4. Accept a public write on the promoted standby owner, verify pre/post-promotion
-   values, and finish the Raft deployment's split while public writes continue.
-   Require three published ranges and converged replicas before allowing
-   automatic merges. Reunite the split siblings, preserving the independent
-   document-ID namespaces of the two original ranges. Lower replication to two,
-   drain the third owner, verify every remaining replica, and stop the drained process.
+- Standby log/slot/progress and fencing writes borrow VOPR storage and clocks,
+  including after promotion. Standby replication uses its own internal bearer
+  credential, configured independently of the standby admin endpoint.
+- Automatic planning borrows the DataServer wall and monotonic clocks, so
+  shard cooldown is independent of host time; median keys come through the
+  production routed shard-DB adapter; disk-size collection uses the owner's
+  (possibly virtual) filesystem; disk-scan admission uses primary document
+  cardinality while derived indexes catch up.
+- Reconstructed metadata owners reinstall their shard RPC callbacks, and
+  restarted Raft owners keep the externally bound listener URL in their
+  registration. The maintenance coordinator closes admission and exits when
+  its borrowed lane is canceled.
+- Split finalization atomically persists the narrowed range and Raft entry
+  receipt through a metadata-only path, so a later merge validates the same
+  base in the Raft projection and document DB and replaying an older split
+  entry cannot narrow the merged range again. Merging split siblings preserves
+  the independent document-ID namespaces of the two original ranges.
 
-The oracles check acknowledged document values, exact range coverage without
-gaps or overlap, standby safe-read/apply bounds, fencing, promotion identity,
-replica convergence, bounded completion, and owner cleanup. standby log/slot/progress
-and fencing writes borrow VOPR storage and clocks, including after promotion.
-Automatic planning borrows the DataServer wall and monotonic clocks, so shard
-cooldown expiry is independent of host time and wall-clock corrections. It
-obtains median keys through the production routed shard-DB adapter. Disk-size collection uses the owner's
-filesystem, including virtual storage, rather than opening a private native
-filesystem. Disk-scan admission uses primary document cardinality while derived
-indexes catch up, so a populated split destination can supply merge evidence.
-Reconstructed metadata owners reinstall their shard RPC callbacks.
-Standby replication uses its separate internal bearer credential; the fixture
-configures that credential independently of the standby admin endpoint. Restarted
-Raft owners retain the externally bound listener URL in their registration.
-`standby-production-vopr-test` isolates the production standby lifecycle on `VoprIo` and
-cancels immediately after promotion to verify task and network cleanup;
-`standby-scaling-vopr-test` also checks the composed history and exact replay.
-The maintenance coordinator closes admission and exits when its borrowed lane
-is canceled, allowing the remaining registration owners to unwind.
-The composed split-to-merge history also covers unbounded range adjacency and
-source finalization on every document replica. Finalization atomically persists
-the narrowed range and Raft entry receipt through a metadata-only path. A later
-merge therefore validates the same base in the Raft projection and document DB;
-replaying an older split entry cannot narrow that merged range again.
-
-This is a bounded composition, not exhaustive fault coverage. The existing
-fixture retains a native temporary namespace for ancillary stores such as the
-unused API restore-job LMDB; that boundary is not a power-loss model. Torn standby
-writes, disjoint placement, broader link/disk/resource fault combinations,
-retention pressure, and the Kubernetes operator/cloud provisioning loop remain
-follow-up coverage. Threshold and desired-replica changes exercise the Zig
-controllers, not a simulated Kubernetes autoscaler.
-
+This is a bounded composition, not exhaustive fault coverage. The fixture keeps
+a native temporary namespace for ancillary stores such as the unused API
+restore-job LMDB; that boundary is not a power-loss model. Torn standby writes,
+disjoint placement, broader link/disk/resource fault combinations, retention
+pressure, and the Kubernetes operator/cloud provisioning loop remain follow-up
+coverage. Threshold and desired-replica changes exercise the Zig controllers,
+not a simulated Kubernetes autoscaler.
 ### Scheduled retained-corpus soaks
 
 [zig-vopr-soak.yml](../.github/workflows/zig-vopr-soak.yml) runs daily at 10:00
@@ -1576,35 +1413,10 @@ qualification requires two successful default-budget Linux workflow runs; the
 second dispatch must set `require_seed=true` and report nonzero consumed seeds
 for every shard. A local gate alone is not full-soak evidence.
 
-The same CI gate runs the production Raft transport tests and determinism
-audit. A bounded-fair standby/scaling history exposed a timer divergence: the HTTP
-frame queue calculated retry deadlines and jitter from host time while sleeping
-on borrowed I/O. Retry readiness and snapshot-transfer deadlines now use their
-owning I/O's monotonic clock throughout. HTTP host construction propagates
-that authority to route reconciliation, admission retries, policy rechecks,
-and bootstrap status timestamps. Snapshot staging names also obtain
-entropy from that I/O instead of host time and a process-global counter.
-Virtual-clock regressions cover retry readiness, repeatable jitter, and a
-transfer's remaining deadline across realtime clock changes.
+The same CI gate runs the production Raft transport tests and the determinism
+audit.
 
-Queued Raft delivery preserves the request's timeout when taking ownership of
-its copied payload. The original failed history's suspended stacks showed a
-node-status request waiting inside a queued Raft batch delivery; dropping that
-timeout made the nested request unbounded when socket timeouts were disabled.
-The transport gate exercises a real HTTP peer that never responds, verifies
-expiry on virtual time, and delivers a subsequent request to prove the
-serialized drain owner was released. Queued requests do not retain the enqueue
-caller's borrowed cancellation or delivery-tracker pointers.
-
-The DataServer maintenance worker also uses its borrowed monotonic clock for
-vector-publication deadlines. An adversarial history advanced virtual time past
-host uptime and exposed an outer-loop spin: readiness checked virtual time,
-but publication kept its deadline in host time. Every bounded maintenance
-attempt now establishes a retry boundary, including idle and failed attempts,
-and releases its reservation before waiting. Accepted wakes survive that
-backoff until the next eligible attempt. A far-future virtual-clock
-regression verifies independent task progress, reservation release, renewed
-deadlines, and worker cancellation; the determinism audit covers this worker.
+> **Relocated:** The timer/deadline defect narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/full-cluster-scenario-narratives.md](../docs/design/vopr/history/full-cluster-scenario-narratives.md#timer-and-deadline-defect-narrative-originally-lines-15791607). The resulting borrowed-clock rules are under [`VoprIo` Runtime](#voprio-runtime).
 
 The executable, run and merged-corpus artifacts are retained for 90 days.
 Fiber callsite identities are scoped to a pinned executable layout; keep the
@@ -1695,117 +1507,39 @@ dependencies of the already implemented domain suites.
 
 ### Current Answer: Coverage, Parity, and Completeness
 
-The short answer is **yes, there are still valuable VOPR tests and
-Antithesis-class features to add; no, the complete roadmap is not
-implemented**. The confirmed runtime and production findings above have fixes
-and focused regressions; that does not certify the remaining roadmap or every
-production callback boundary.
-The highest-value work is composing more production owners, workflows, and
-fault domains in the same replayable history.
+There are still valuable VOPR tests and Antithesis-class features to add; the
+complete roadmap is not implemented. Fixed findings have focused regressions,
+which does not certify the remaining roadmap or every production callback
+boundary. The highest-value work is composing more production owners,
+workflows, and fault domains in the same replayable history.
 
 | Question | Current answer | Highest-value next work |
 | --- | --- | --- |
-| Where should Antfly add VOPR testing? | At production orchestration boundaries that combine durable state, ownership, public visibility, and recovery | Deepen the v11-v53 production-owner cluster with managed-index inner-publication/disk-pressure faults and graph/query cancellation under disk pressure; cache topology/link/storage/resource overlap; serverless multi-worker placement and object-store/process/resource overlap; additional replication topology, cancellation, and source/target-crash timings; metadata leadership loss during cutover; row-level tenant scoping and identity mutation races; and cross-domain fault overlap. Add cancellation under storage faults, simultaneous process loss before cancellation drain, richer fault combinations, and broader socket/topology/short-write targets. Broaden the repository-wide strong-read and managed-index contracts; extend durable joins across authorization/generation and broader forms; extend global query across topology, storage, resource, coordinator/metadata and multi-process loss; then compose metadata administration, MCP/A2A, cloud authentication, extension invocation, and live credential/provider replacement |
-| Which Antithesis ideas remain worth porting locally? | The large engine features, saved cross-run event-set programs, non-blocking bounded live streams, and reversible logical service rates with per-node/per-operation evidence are implemented at the registered in-process boundary; query-cache, DataServer, graph, replication, and serverless work are production-charged seams, and v42-v52 add the cited production recovery/fencing/capacity compositions. V53 adds bounded managed-index lifecycle evidence, not completed publication/reconstruction; v54 closes the named join/split packet-replay and teardown failures | Transitive determinism auditing and broader packet-level replay coverage; v53 managed-publication completion; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable; broader service-rate fault combinations and production/search adoption |
-| Is distributed VOPR missing? | **Partly.** In-process application-level distributed VOPR exists: logical nodes, directional links, process/storage/resource domains, independent and overlapping link-plus-resource faults, selected-listener socket admission, one selected-node disk-capacity denial/recovery path, quiet suffixes, and exact replay are integrated | Antithesis-style separate-address-space orchestration is not implemented, and whole-deployment breadth is incomplete. Co-resident standby/data-plane/serverless ownership, managed-index and cross-domain disk-pressure combinations, broader socket/storage/process/restart overlap, federated process agents, and live mixed binaries remain future or conditional work |
-| Are the features called finished actually finished? | Only within each narrowly stated **integrated** seam and its named green replay gate | Do not infer current aggregate health, transitive call-graph determinism, every cross-domain combination, arbitrary native/container determinism, or Antithesis product parity. Partial, ongoing, conditional, and explicitly excluded work remains unfinished |
+| Where should Antfly add VOPR testing? | At production orchestration boundaries that combine durable state, ownership, public visibility, and recovery | Deepen the production-owner cluster along the [Distributed Completion Audit](#distributed-completion-audit) rows, then compose metadata administration, MCP/A2A, cloud authentication, extension invocation, and live credential/provider replacement |
+| Which Antithesis ideas remain worth porting locally? | The large engine features, saved event-set programs, bounded live streams, and reversible service rates are implemented at the registered in-process boundary | Transitive determinism auditing and broader packet-level replay coverage; v53 completion; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable |
+| Is distributed VOPR missing? | **Partly.** In-process application-level distributed VOPR (logical nodes, directional links, process/storage/resource domains, overlapping faults, quiet suffixes, exact replay) is integrated | Separate-address-space orchestration is not implemented, and whole-deployment breadth is incomplete (co-resident standby/data-plane/serverless, cross-domain disk pressure, broader socket/storage/process/restart overlap, live mixed binaries) |
+| Are the features called finished actually finished? | Only within each narrowly stated **integrated** seam and its named green replay gate | Do not infer aggregate health, transitive call-graph determinism, every cross-domain combination, arbitrary native/container determinism, or Antithesis product parity |
 
-The distinction between a green focused seam and a finished platform is
-material. At this checkpoint the reusable engine and registered-source audit
-are green, and the cited v13-v40 production-owner gates plus the v42-v52
-Debug and ReleaseSafe gates passed their complete record/fresh-world replay
-oracles. V53 currently uses only a bounded-lifecycle exact-replay gate; its
-deep completion oracle is not green. The
-repository-wide `vopr-test` aggregate is
-not currently cited as green, the dedicated v12 deep result is from its named
-earlier checkpoint, and a source-manifest audit is not a proof over every
-transitive production callee. These limitations are part of the completion
-claim, not footnotes to it.
+At the last checkpoint the reusable engine and registered-source audit were
+green, as were the cited v13–v40 and v42–v52 production-owner gates. V53 has
+only a bounded-lifecycle gate. The repository-wide `vopr-test` aggregate is not
+cited as green, the v12 deep result is from its own earlier checkpoint, and a
+source-manifest audit is not a proof over every transitive production callee.
+These limitations are part of the completion claim, not footnotes to it.
 
 ### Verification Audit and Meaning of "Finished"
 
 > **Relocated:** The dated 2026-08-26 verification-audit narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
-The production-owned gate is intentionally tiered by deterministic work, not
-by a weaker oracle. `production-cluster-vopr-smoke-test` runs v11 exact replay
-and v12's bounded lifecycle and is included by ordinary `vopr-test`;
-`production-cluster-vopr-deep-test` runs only the 320,000-transition complete
-v12 history; `production-cluster-graph-vopr-test` runs v13's complete
-production-owner graph; `production-cluster-graph-split-vopr-test` runs v14's
-400,000-transition graph-before/during/after-split history;
-`production-cluster-graph-split-transport-vopr-test` runs v15's 450,000-
-transition fail-closed owner-transport history;
-`production-cluster-graph-split-owner-restart-vopr-test` runs v16's 650,000-
-transition stable-endpoint owner-reconstruction history;
-`production-cluster-graph-split-partial-write-vopr-test` runs v17's 500,000-
-transition scoped short-write history;
-`production-cluster-graph-split-resource-pressure-vopr-test` runs v18's
-550,000-transition three-owner memory denial/recovery history. The later
-focused targets cover v19/v20 join and durable-finalizer takeover, v21/v22
-overlapping link-memory and listener-socket pressure, v23 service rates, v24
-hydration, v25 cancellation, v27 in-flight authorization revocation, and v28
-stale-snapshot retry exhaustion, plus v29 cancellation under a scoped
-hydration-transport outage, v30 cancellation, v31 partition failover, v32
-partition-owner reconstruction, v33 overlapping-fault retry exhaustion, and
-v34 cancellation under overlapping resource-plus-link faults, plus v35
-cancellation followed by exact worker-owner reconstruction, v36 ordered
-two-table global-query dispatch, and v37 fail-closed in-flight global-query
-cancellation plus exact recovery, and v38 live cross-table authorization
-revocation after the first result plus exact fail-closed recovery. V39 cuts the
-registered directional tenant-query stream after that result, requires the
-exact retryable 503 without partial output, heals it, and exactly recovers.
-V40 destroys that exact tenant-owner process after the first result, requires
-the same exact no-partial 503, reconstructs its stable identity and listeners,
-requires a direct durable read from the rebound endpoint, and exactly recovers.
-V49 composes one production `ApiHttpServer` cache flight and coalesced deadline
-before shared-node service-rate healing, one retained hit afterward, then exact
-owner reconstruction, empty-cache recomputation, bounded reconnect, durable
-read, exact accounting, and full cluster recovery.
-V42 composes production replication snapshot-to-stream work through public
-HTTP, routing, DataServer Raft, and index visibility before and after the same
-logical healing boundary, with exact accounting and full cluster recovery.
-V43 changes the source schema after the first accepted snapshot batch, requires
-durable resume with one exact duplicate application, and completes the same
-public visibility and cluster recovery oracle.
-V44 destroys the current target leader before the next snapshot batch,
-reconstructs its stable identity and listeners, proves bounded reconnect plus
-durable local/direct public recovery, and resumes to exact all-node visibility.
-V45 fails the first provider query after durable preparation, closes that
-source session, resumes through a newer session, and preserves the exact three
-target attempts/successes plus every cluster oracle.
-V46 revokes the work lease after durable snapshot offset 1, requires typed
-lease loss and sequential session replacement, and resumes without replaying
-the committed target batch while charged work remains active.
-V47 loses ownership after target apply but before checkpoint publication,
-keeps durable offset 0, and requires one exact idempotent replay for four
-target successes.
-V48 publishes an exact source-catalog replacement and both cutover authorities
-through metadata Raft, rejects authority A before checkpoint publication,
-retires it under authority B, and preserves four target successes.
-V50 suspends the real builder after immutable candidate persistence, advances
-the authoritative object-backed progress generation, requires the losing CAS
-to return `HeadChanged`, rejects the stale derived mutation on retry, and
-proves version-4 public visibility while the ordinary production public,
-DataServer, and Raft workload runs on the same `VoprIo`.
-V51 enables authentication on every production data-plane listener, uses
-disjoint docs and tenant identities for concurrent ordinary work, requires
-four exact cross-table 403 responses, and proves both denied fixed-ID writes
-remain absent through exact owning-identity 404 reads.
-`production-cluster-vopr-test` requires every focused production-owner gate
-through v51, including
-`production-cluster-query-cache-deadline-restart-vopr-test` and
-`production-cluster-serverless-fencing-vopr-test` plus
-`production-cluster-authenticated-tenant-vopr-test`; each large subprocess uses ordinary
-exit-code-checked test mode and is serialized by the build graph's inherited
-stdio lock.
-Record and
-fresh-state replay, properties, cleanup, and enabled-set equality remain
-identical in every tier. The split keeps a multi-gigabyte, tens-of-minutes
-witness out of the default edit loop without treating an early cutoff as
-active-reconfiguration completion evidence. Exact replay now compares
-canonical wire records structurally and renders only a first mismatch, so the
-deep gate no longer retains two complete JSONL artifacts merely to prove
-equality.
+Production-owner gates, budgets, and the aggregate
+`production-cluster-vopr-test` are listed once in
+[Full-Cluster Scenario Versions](#full-cluster-scenario-versions).
+`production-cluster-vopr-smoke-test` (v11 plus v12's bounded cutoff) is part of
+ordinary `vopr-test`; the deeper histories are named tiers so a
+multi-gigabyte, tens-of-minutes witness stays out of the default edit loop
+without treating an early cutoff as completion evidence.
+
+> **Relocated:** The per-version gate-tier narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/full-cluster-scenario-narratives.md](../docs/design/vopr/history/full-cluster-scenario-narratives.md#production-owner-gate-tiers-by-version-originally-lines-17291808).
 
 > **Relocated:** The dated checkpoint-recap narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
@@ -1848,7 +1582,7 @@ broader sentence must not erase those boundaries.
 
 > **Relocated:** The dated v13-v18 defect-and-repair narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
-standby, per-group Raft, LSM/WAL/LMDB/persistent/index-manager/DB-split, metadata
+Standby, per-group Raft, LSM/WAL/LMDB/persistent/index-manager/DB-split, metadata
 distributed data, the deployment-shaped full cluster, and the newer P0/P1/P2
 boundary suites are implemented at the exact production seams and modes stated
 in their conformance rows. “Integrated” is not upgraded to “fully implemented
@@ -1857,64 +1591,38 @@ downgraded or repaired rather than defended by this document.
 
 That does not make the roadmap empty or make the system equivalent to the
 Antithesis hypervisor. Items marked **ongoing** or **conditional**, and residual
-boundaries explicitly named in an integrated row, are not finished. In
-particular, one trace does not yet co-reside every standby/data-plane/serverless
-owner; v9's public graph covers an in-flight leader restart and a production-
-coordinator range merge across different leader roots, while v13 covers the
-static traversal on production `DataServer` owners, v14 composes that
-production traversal with a metadata-driven range split and replicated
-transition execution, and v15 adds one scoped next-owner graph-transport cut.
-V16 adds one scoped next-owner production-process restart with real listener,
-DataServer, and Raft-owner reconstruction.
-V17 adds one scoped, exactly observed next-owner request short write with
-transparent stream resumption.
-V18 adds one scoped all-production-owner memory-denial/recovery composition.
-V24 adds exact selected-field document hydration through the public graph
-response and proves one production hydration lifecycle.
-V25 cancels scheduled hydration fanout through the real public HTTP disconnect
-path and proves one clean retry. V27 mutates authorization inside the live
-request, and v28 rejects a retained stale source snapshot through both bounded
-topology attempts without partial output. V29 proves real outstanding hydration
-reaches one scoped transport outage before cancellation, then heals and
-recovers. Cancellation under resource, storage, process, restart, and
-overlapping faults is not yet composed into that production-owner history. V9's fail-
-closed topology/transport interruption and post-recovery complete retry,
-v13's strong-read/derived-visibility barrier, v14's graph-during-split
-contract, and v15's graph-stream failure during that split are integrated;
-v16's single stable-endpoint owner restart, v17's single graph-request short
-write, and v18's all-owner memory denial are integrated; broader restart,
-topology, managed-index and graph/query disk-pressure combinations, broader
-socket/partial-write, and fault-overlap breadth is not;
-live mixed-
-binary operation is not modeled; and arbitrary unmodified sidecars or process
-address spaces remain differential/integration concerns.
+boundaries named in an integrated row, are not finished; live mixed-binary
+operation is not modeled; and arbitrary unmodified sidecars or process address
+spaces remain differential/integration concerns.
+
+> **Relocated:** The superseded v13–v18 completion recap that previously lived here is preserved verbatim in [docs/design/vopr/history/full-cluster-scenario-narratives.md](../docs/design/vopr/history/full-cluster-scenario-narratives.md#v13v18-completion-recap-originally-lines-18581890).
 
 ### Distributed Completion Audit
 
-This audit prevents a focused seam from being mistaken for a finished whole-
-deployment campaign. It also answers the Antithesis comparison directly:
-Antithesis runs distributed Docker Compose or
+This audit keeps a focused seam from being mistaken for a finished
+whole-deployment campaign. Antithesis runs Docker Compose or
 [Kubernetes](https://antithesis.com/docs/setup/kubernetes/) topologies and
 [scopes faults to containers or
-pods](https://antithesis.com/docs/product/writing_tests/controlling_faults/fault_types/); VOPR
-implements the analogous application-level fault domains inside a registered
-`std.Io` world.
+pods](https://antithesis.com/docs/product/writing_tests/controlling_faults/fault_types/);
+VOPR implements the analogous application-level fault domains inside a
+registered `std.Io` world. Versions refer to
+[Full-Cluster Scenario Versions](#full-cluster-scenario-versions).
 
 | Requirement | Current status | Remaining work |
 | --- | --- | --- |
-| Deterministic multi-node runtime, clocks, links, storage, restart, resources, replay, and quiet suffix | **Integrated foundation.** The reusable deployment composer registers node/role/domain/fault/quiet obligations; metadata, Raft, standby, transaction, data-plane, and full-cluster gates exercise complementary real owners | Adopt the manifest in the remaining distributed suites and maintain fail-closed audits as new owners appear |
-| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Integrated at the named v11-v52 seams; v53 is bounded-lifecycle evidence.** Full-cluster v9 remains the complementary hosted/public campaign, and `data-server-transition-vopr-test` independently proves replicated merge-to-split behavior. V11-v40 provide the cited production-owner split, graph, join, fault, durable-worker, reconstruction, and global-query seams. V42-v48 add the production replication path and named schema, owner, source-session, cancellation, stale-owner, and metadata-authority recovery modes. V49 uses node 1's actual `ApiHttpServer` cache through deadline and owner reconstruction. V50 forces the real serverless builder to lose its progress CAS after authoritative generation cutover while ordinary cluster work runs. V51 uses two disjoint authenticated table identities for concurrent cross-node work, exact bidirectional 403 read/write denials, and exact owning-identity 404 absence proof. V52 lowers node 2's live capacity source to zero and proves denial/healing plus public recovery. V53 observes public managed-index pending readiness and begins production reconciliation in a 35,000-transition bounded exact-replay gate. The complete v42-v52 modes pass Debug and ReleaseSafe 15/15 at their documented 120,000–260,000-transition budgets | Complete v53's provider retry, coherent readiness, reconstruction, semantic recovery, and packet-level replay stabilization. Add remaining topology breadth, managed-index inner-publication and disk-pressure faults plus graph/query cancellation under disk pressure, broader disk/socket/short-write and cache topology/link/storage/resource overlap, serverless multi-worker/object-store/process/resource overlap, row-level tenant scoping and identity mutation races, additional replication topology/cancellation/source/target-crash timings, metadata leadership loss during cutover, and overlapping-fault variants, cancellation under storage/process and richer multi-fault combinations, disjoint placement, retained-history paging, snapshot/derived-state rehydration, partitions, and coordinator/metadata or multi-owner loss |
-| Serverless worker output through its production public catalog and ownership graph | **Integrated at the stated seam.** The production worker, durable lease, object stores, catalog service, HTTP handler/listener, and public client share one `VoprIo`. Every mode lists the worker-created table and queries the published head/documents; stale generation remains fenced. This correctly retains the distinct serverless object and metadata placement catalogs | Overlap serverless lease/object-store failures with metadata topology and node-resource faults, then add multi-worker placement when production owns that topology |
-| standby, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet all coexist in one history | Build one bounded deployment composition and cluster-wide recovery oracle without duplicating business logic |
-| Public distributed graph request from HTTP planning through fanout/hydration | **Partially integrated, with static, active-split, transport-fault, owner-restart, recoverable short-write, three-owner memory-pressure, one overlapping link-plus-memory path, selected-listener socket pressure, exact document hydration, clean and scoped-transport-fault cancellation/recovery shapes, in-flight cross-table permission revocation, and stale-source-snapshot retry exhaustion promoted.** Full-cluster v9 executes a public depth-two graph across hosted ranges. V13 executes it across real `DataServer`/data-Raft owners with current-owner routing and matching ReadState/derived-index visibility; v14 composes active split; v15 adds a next-owner transport cut; v16 adds owner reconstruction; v17 adds a one-byte request write; v18 adds all-owner memory denial/recovery; v21 overlaps that pressure with the selected graph link cut; v22 denies then heals new connections at one exact public listener; v24 validates exact hydrated titles plus one start/fanout/completion lifecycle; v25 cancels after multi-owner hydration tasks are scheduled, requires the listener cancellation token and no completion, then proves one exact clean retry; forward-only v27 authenticates the whole public workload, revokes the target-table read policy at `target_authorization_started` inside the live request, proves concealed no-leak output, restores permission, and requires exact cross-table hydration on a fresh request; forward-only v28 publishes a real split after `source_snapshot_acquired`, requires exactly two `TopologyChanged` attempts and a typed no-partial 503, then proves exact post-split hydration on a fresh request; forward-only v29 requires real `/graph-hydrate` traffic to match a scoped coordinator-to-owner outage before cancellation, then heals and exactly recovers | Add broader restart/topology and request/response/Raft short-write faults, disk-capacity pressure, broader socket-pressure and storage/process/restart overlaps, and cancellation under resource/storage/process/restart and multi-fault combinations to the production-owner history. Add global queries with the same fail-closed publication rule; v19/v20's join seams are audited separately |
-| Distributed joins and global-query orchestration | **Partially integrated.** V19-v35 provide the cited public join, durable worker, cancellation, retry, overlapping-fault, and owner-reconstruction seams. V36 adds the first production-owner global-query claim: one two-line NDJSON request reaches `docs` and `tenant_b_docs` through `/db/v1/query`, preserves line order while flattening, and returns exact disjoint ID sets. Forward-only v37 cancels after the first production result, requires typed client cancellation plus handler drain and no second partial result, then proves an exact two-result recovery. Forward-only v38 revokes the second table's live read authority after the first result, requires an exact 403 with no protected result, restores policy, and proves exact recovery. Forward-only v39 cuts the registered tenant-owner query stream after the first result, returns the exact retryable 503 without a partial response, heals, and proves exact recovery. Forward-only v40 destroys the exact tenant-owner process at the same first-result boundary, requires the same no-partial 503, reconstructs its stable DataServer and listeners, requires a direct durable read from the rebound endpoint, and proves exact recovery. Focused composed-query tests cover additional result assembly | Add join cancellation under storage faults, disk pressure, simultaneous process loss before cancellation drain, and other fault combinations; auth and stale-generation changes; right/nested/foreign and multi-range-left joins; overlapping owner faults; and global-query topology, storage, resource, coordinator or metadata process loss, multi-process loss, and broader transport/overlap-fault recovery histories |
-| Query cache, replication backfill, and service rates | **Integrated focused seams plus deployment composition.** Cache, DataServer Raft/LSM, distributed graph, replication snapshot/stream, and serverless workflow histories each prove exact slowed/healed production charging. V23 installs one shared model across DataServer, graph, and serverless owners. V42 adds clean production replication through the public/DataServer/Raft path. V43 keeps the same slowed first-batch boundary, changes schema, resumes from durable status with one exact duplicate batch, and completes baseline snapshot/stream work. V44 preserves the same accounting through target-owner teardown/reconstruction, bounded reconnect, durable resume, and direct/all-node recovery. V45 preserves it through actual provider-query failure, balanced session replacement, and resume without extra target work. V46 proves lease cancellation remains outermost while production checkpoint charging/deadlines are delegated and preserved. V47 adds charged ownership revalidation between target apply and checkpoint publication. V48 preserves the same accounting across metadata-Raft source publication, exact authority replacement, retirement, and replay. V49 installs cache charging on the actual ApiHttpServer owner and crosses a public logical deadline, explicit healing, DataServer reconstruction, exact recomputation, and bounded reconnect. All retain the complete cluster visibility, cleanup, and fresh-world replay oracle | Add cache topology/link/storage/resource overlap, additional replication topology/cancellation/source/target-crash timings, metadata leadership loss during cutover, and broader combinations of the existing link/storage/resource/restart algebra |
-| Generation/reranking provider replacement and fallback | **Integrated local and remote production seams.** `generation-reranking-vopr-test` exact-replays remote OpenAI-to-Antfly fallback, malformed generation, truncated reranking, generation/reranking deadlines and in-flight cancellation, and request-scoped replacement for both adapters: each established remote call completes on its captured backend while the next call routes locally. The same trace proves one exact local generation and reranking call, ten remote requests, result validation, cleanup, record, and fresh-world replay | Actual model execution and GPU kernels remain differential; compose provider faults into a deployment history only when a product workflow owns that routing |
-| Multi-table/tenant/resource/mixed-version breadth | **Partial/conditional.** Two-table cross-node isolation, forward-only v51's two disjoint authenticated table identities with exact bidirectional read/write denial and absence proof, in-cluster node-memory interference, one selected production-listener socket-denial history, forward-only v52's selected-node persistent-cache disk denial/healing history, and separate focused disk/socket quota and upgrade-artifact suites are integrated | Add row-level tenant scoping and identity mutation races, managed-index and cross-domain disk-pressure combinations, and broader socket interference/overlap; live mixed-version nodes remain conditional on runnable compatible binaries |
+| Deterministic multi-node runtime, clocks, links, storage, restart, resources, replay, and quiet suffix | **Integrated foundation.** The deployment composer registers node/role/domain/fault/quiet obligations; metadata, Raft, standby, transaction, data-plane, and full-cluster gates exercise complementary real owners | Adopt the manifest in the remaining distributed suites; keep fail-closed audits as owners appear |
+| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Integrated at v11–v52; v53 is bounded evidence.** V9 remains the hosted/public campaign, and `data-server-transition-vopr-test` independently proves replicated merge-to-split | Complete v53. Add remaining topology breadth; managed-index inner-publication and disk-pressure faults; graph/query cancellation under disk pressure; broader disk/socket/short-write and cache topology/link/storage/resource overlap; additional replication topology/cancellation/source/target-crash timings and metadata leadership loss during cutover; cancellation under storage/process and richer multi-fault combinations; disjoint placement; retained-history paging; snapshot/derived-state rehydration; partitions; coordinator/metadata or multi-owner loss |
+| Serverless worker output through its production public catalog | **Integrated at the stated seam** (worker, durable lease, object stores, catalog service, HTTP listener, public client on one `VoprIo`; v50 adds the progress-conflict race beside cluster work). The serverless object and metadata placement catalogs stay distinct | Overlap lease/object-store failures with metadata topology and node-resource faults; multi-worker placement when production owns that topology |
+| Standby, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet coexist in one history | One bounded deployment composition with a cluster-wide recovery oracle, without duplicating business logic |
+| Public distributed graph request | **Partially integrated:** v13–v18, v21–v22, v24–v25, v27–v29 | Broader restart/topology and request/response/Raft short-write faults, disk pressure, broader socket and storage/process/restart overlaps, cancellation under resource/storage/process/restart and multi-fault combinations |
+| Distributed joins and global queries | **Partially integrated:** joins v19–v20, v30–v35; global query v36–v40; focused composed-query tests cover more result assembly | Join cancellation under storage faults, disk pressure, or process loss before drain; auth and stale-generation changes; right/nested/foreign and multi-range-left joins; global-query topology, storage, resource, coordinator/metadata, and multi-process loss |
+| Query cache, replication backfill, and service rates | **Integrated focused seams plus deployment composition:** v23, v42–v48, v49 | Cache topology/link/storage/resource overlap; more replication timings; metadata leadership loss during cutover; broader link/storage/resource/restart combinations |
+| Generation/reranking provider replacement and fallback | **Integrated local and remote production seams** (`generation-reranking-vopr-test`) | Model execution and GPU kernels stay differential; compose provider faults into a deployment only when a product workflow owns that routing |
+| Multi-table/tenant/resource/mixed-version breadth | **Partial/conditional.** Two-table isolation, v51 authenticated table identities, node-memory interference, v22 listener-socket denial, v52 disk denial, and focused disk/socket quota and upgrade-artifact suites are integrated | Row-level tenant scoping and identity mutation races; managed-index and cross-domain disk pressure; broader socket interference; live mixed-version nodes remain conditional on runnable compatible binaries |
 
-Accordingly, “distributed VOPR is integrated” means the runtime foundation and
-named seams are real and replay-proven. It does **not** mean the roadmap's
-whole-deployment compositions are already complete.
+“Distributed VOPR is integrated” therefore means the runtime foundation and
+named seams are real and replay-proven, not that whole-deployment composition
+is complete.
 
 ### Implemented Extension Seams
 
@@ -2161,33 +1869,19 @@ ownership is released.
 
 #### Self-Contained Antithesis-Class Tooling and Search Quality
 
-- Persisted pointer-free multiverse nodes, ranked counterfactual experiments,
-  stable trial metadata, explicit total experiment budgets, cross-revision
-  property history, scheduler-controlled completion order, and bounded
-  systematic starvation are implemented in the self-contained repository.
-- Every generic explored history has a bounded structured flight recorder.
-  Parallel Antfly campaigns also exact-replay each candidate through a
-  recorder and materialize it only for corpus insertion or failure. Verbose
-  owned details and name/value fields are excluded from canonical trace bytes.
-  Runner-backed scenarios and the custom metadata/domain paths all populate
-  the recorder during exact replay. Conjunctive field/text predicates select
-  bounded before/after windows, and automatic debug recipes package the
-  selected reduced-replay window.
-- Fielded event queries support kind, name, actor, resource, fault phase,
-  transition and logical-time windows, `preceded_by`, `followed_by`, and
-  same-actor/resource correlation. Versioned `vopr-event-set-v1` plans compose
-  those selectors with union, intersection, difference, complement,
-  distinct/first/last-per-moment, previous, next, and bounded sequence
-  operators. Plans are forward-only validated DAGs with explicit result and
-  match limits. `vopr events` accepts the saved format, clean-replays one or
-  more histories, validates without running, or emits count-only/full results.
-  A forward-only v2 runner observer serializes canonical events into a
-  caller-owned fixed-slot NDJSON queue while a history is active. Publication
-  cannot allocate, call external code, or block. Drop-newest overflow and
-  publication after close are counted; a separate consumer drains complete
-  records, retains the oldest record after sink failure, and may retry or drain
-  the remaining queue after close. None of those diagnostics affect replay.
-  Saved plans require an explicit format and use prior-step indexes, for example:
+The capability table under Conformance Status names each module and gate. The
+contracts that matter to users of the tooling:
+
+- **Flight recording.** Every explored history has a bounded structured
+  recorder; parallel campaigns exact-replay each candidate through it and
+  materialize it only for corpus insertion or failure. Verbose details and
+  name/value fields never enter canonical trace bytes.
+- **Event queries and saved sets.** Fielded queries select kind, name, actor,
+  resource, fault phase, transition and logical-time windows, `preceded_by`,
+  `followed_by`, and same-actor/resource correlation. `vopr-event-set-v1`
+  plans compose those selectors with set algebra, distinct/first/last moment,
+  previous/next, and bounded sequence operators as a forward-only validated
+  DAG with explicit result and match limits:
 
   ```json
   {
@@ -2203,149 +1897,102 @@ ownership is released.
   }
   ```
 
-  `vopr events --query query.json --validate` performs schema and DAG
-  validation without requiring a trace. Repeated `--trace` arguments evaluate
-  one plan across runs; `--count` omits match materialization from the result
-  artifact. There is intentionally no compatibility parser for the earlier
-  ad-hoc single-selector command input because no released VOPR artifact
-  contract requires it.
-- `vopr-results` emits stable `vopr-results-v1` JSON and an optional static
-  local HTML report containing run metadata, budgets, property results,
-  first-failure and rare-success evidence, declared-but-never-encountered
-  properties, corpus entries, quarantine state, and artifact references.
-  Parallel campaigns additionally publish aggregate `vopr-run-results-v1`
-  JSON and static HTML after workers and quarantine export finish.
-- `vopr-index` transactionally merges either results form into an atomically
-  persisted canonical `vopr-run-index-v1`. It indexes runs and source
-  revisions, properties, fingerprints, retained and quarantined corpus state,
-  typed artifacts, and budget consumption. Stable CLI predicates emit
-  `vopr-run-index-query-v1` JSON and an optional static local HTML summary.
-- For every new failure fingerprint, campaigns write one automatic debug
-  recipe containing same-fingerprint reduction, causal-window extraction,
-  bounded counterfactual experiments, selected event queries, logical
-  before/after collectors, and the reduced exact-replay artifact.
-- `vopr-corpus-merge` exact-replays compatible local/CI/nightly candidates,
-  quarantines incompatible or divergent bytes, and publishes a deterministic
-  merged manifest after referenced artifacts are written.
-- Fault definitions explicitly encode precedence, overlap, and exclusion
-  groups. `fault_vopr_io.zig` applies the effective order to persistent and
-  one-shot virtual network/storage effects, and the Parquet-cache suite uses
-  it outside the algebra unit tests. `service_rate.zig` adds reversible,
-  composable node/operation logical cost through borrowed `std.Io`; deployment
-  and generic fault registries type the effect separately from pause and
-  terminal resource exhaustion. The production query-embedding cache now opts
-  in at request, hit-copy, coalesced-wait, and producer-compute boundaries;
-  other production loops must still opt in at reviewed boundaries. The runner
-  audits every choice record for typed, immediate scenario-level selection
-  instead of delayed seed interpretation.
-- The reusable command composer executes `first`, `parallel`, `serial`,
-  `singleton`, `anytime`, `eventually`, and `finally` roles. Commands declare
-  symmetric allow/deny compatibility, exclusion groups, active-fault policy,
-  and before/after quiescence requirements. Quiet-suffix entry snapshots
-  eventual obligations, waits for them and all active actors, then runs final
-  obligations before completion; a focused scenario exact-replays the entire
-  phase sequence.
-- The determinism source gate rejects direct host entropy, delayed private
-  PRNGs, host clocks, native threads/`Threaded` I/O, host filesystem access,
-  native libraries, unordered map iteration, and pointer-derived identities in
-  replayable adapters. Narrow native differential boundaries require a
-  line-local category allowance with a non-empty rationale. The checked
-  manifest must cover every exported Antfly VOPR source and explicitly audits
-  the two replay regions in the mixed legacy metadata harness. Runtime evidence
-  reports immediate structured choices and deterministic `std.Io` entropy
-  calls separately.
-- Default report health defines no progress/deadlock, unexpected crash, task
-  and descriptor leaks, allocator/storage exhaustion, eventual recovery, final
-  consistency, cleanup, replay divergence, and harness errors. The runner
-  automatically samples continuous, recovery/quiescent, and final phases;
-  generic scenarios receive progress/cleanup evidence, `VoprIo` scenarios use
-  a reusable resource adapter, and mature P0/P1 suites add domain recovery and
-  consistency evidence. These diagnostics are deliberately excluded from
-  canonical trace bytes and are rematerialized by exact replay for results.
-- `vopr-benchmark` runs intentionally injected scheduling-starvation,
-  unstable-publication, and cancellation/admission defects across random,
-  guided, spliced, starvation, and checkpoint-assisted exploration.
-  `vopr-search-quality-v2` reports repeated occurrences, empirical discovery
-  probability and rarity, Wilson 95% confidence bounds, executed-transition
-  and logical-search cost, first discovery cost, and the simplest witnesses by
-  transition count and retained canonical output bytes. Every retained
-  generated, mutated, spliced, or checkpoint-assisted history is exact-replayed
-  before corpus insertion.
-- `vopr-debug` supports replay-proven navigation, branch creation, logical
-  collectors, causal and bounded counterfactual windows, and child comparison
-  from command files or an interactive terminal.
-- The virtual filesystem supports one-shot read corruption, durable sector
-  corruption, clearing persistent corruption, and torn synchronization that
-  preserves only a selected durable prefix while retaining the prior tail.
-- The generic datagram model is ready, but this repository currently has no
-  production provider-specific datagram consumer to campaign. Add such a
-  campaign with the first real consumer rather than inventing a test-only one.
-- Add stable source/basic-block coverage as secondary guidance when the Zig
-  instrumentation surface can remain outside the replay ABI.
-
+  `vopr events --query query.json --validate` checks schema and DAG without a
+  trace; repeated `--trace` evaluates one plan across runs; `--count` omits
+  match materialization. There is no parser for the earlier ad-hoc
+  single-selector input.
+- **Results and index.** `vopr-results` emits `vopr-results-v1` JSON and an
+  optional static HTML report (run metadata, budgets, property results,
+  first-failure and rare-success evidence, never-encountered properties,
+  corpus, quarantine, artifacts); parallel campaigns add aggregate
+  `vopr-run-results-v1`. `vopr-index` merges either form into an atomically
+  persisted `vopr-run-index-v1` and answers `vopr-run-index-query-v1`.
+- **Debug recipes and corpus merge.** Every new failure fingerprint gets one
+  recipe: same-fingerprint reduction, causal window, bounded counterfactuals,
+  event queries, before/after collectors, and the reduced replay artifact.
+  `vopr-corpus-merge` exact-replays candidates, quarantines incompatible or
+  divergent bytes, and publishes a deterministic manifest only after
+  referenced artifacts are written.
+- **Faults and commands.** Fault definitions encode precedence, overlap, and
+  exclusion groups, applied to real `VoprIo` effects by `fault_vopr_io.zig`.
+  Production loops opt into service-rate charging only at reviewed
+  boundaries. The runner audits every choice record for typed, immediate
+  selection rather than delayed seed interpretation.
+- **Determinism gate.** Rejects host entropy, delayed private PRNGs, host
+  clocks, native threads/`Threaded` I/O, host filesystem access, native
+  libraries, unordered map iteration, and pointer-derived identities in
+  replayable adapters; narrow differential boundaries need a line-local
+  categorized rationale.
+- **Health.** Default report health covers no progress/deadlock, unexpected
+  crash, task and descriptor leaks, allocator/storage exhaustion, eventual
+  recovery, final consistency, cleanup, replay divergence, and harness errors,
+  sampled in continuous, recovery/quiescent, and final phases outside
+  canonical bytes.
+- **Search quality.** `vopr-benchmark` runs three injected defects under
+  random, guided, spliced, starvation, and checkpoint-assisted policies;
+  `vopr-search-quality-v2` reports recurrence, rarity, Wilson 95% bounds,
+  logical cost, and smallest witnesses.
+- **Storage faults.** The virtual filesystem supports one-shot read
+  corruption, durable sector corruption and clearing, and torn
+  synchronization that keeps only a selected durable prefix.
+- The generic datagram model has no production consumer yet; add a campaign
+  with the first real consumer rather than a test-only one. Add source/basic-
+  block coverage as secondary guidance only when Zig instrumentation can stay
+  outside the replay ABI.
 ### Priority Test Roadmap
 
-| Priority | Area | What to exercise |
-| --- | --- | --- |
-| P0 integrated | Replication backfill and rebalancing | `replication-backfill-vopr-test` covers snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, schema changes, and exact replay through the production runners. Its source-crash mode fails the actual provider query and proves exact session close/replacement. Its cancellation mode revokes the lease after durable offset 1 and proves replacement-session resume without duplicate target application. Its stale-owner mode revokes before checkpoint publication and proves exactly one safe replay. Its topology mode now uses prepared exact-cutover snapshots, rejects the old source catalog at offset 0, rotates nonzero authority, retires the predecessor, and replays exactly once instead of throwing from a fixture hook. The same gate proves typed snapshot/stream charging. Full-cluster v42 promotes the clean path through canonical public BatchRequest routing, leader forwarding, DataServer Raft, index visibility, and exact pre/post-heal work. Forward-only v43 changes schema after the first accepted batch, requires interruption and durable resume, accepts exactly one duplicate batch, completes CDC, and verifies all documents from every public node. Forward-only v44 destroys and reconstructs the current target leader before the next batch, requires one stopped-endpoint and one bounded pooled-reconnect failure, then proves stable-identity recovery, three exact successes, durable local/direct public reads, and all-node visibility. Forward-only v45 fails the prepared source session on its first real query, requires exact deinit and a newer recovery session, and preserves three target attempts/successes plus all-node visibility. Forward-only v46 cancels after the first durable checkpoint, requires exact lease loss and sequential session replacement, and preserves three target attempts/successes plus all-node visibility. Forward-only v47 rejects the stale owner before offset 1 publication and requires four target successes with one idempotent replay. Forward-only v48 publishes both source catalogs and exact authority transitions through the live metadata quorum, rotates and retires authority, and preserves four target successes plus every cluster oracle. Additional topology/cancellation/source/target-crash timings, metadata leadership loss during cutover, and overlapping-fault cases remain future breadth. |
-| P0 integrated | Standalone and serverless supervision | `supervision-vopr-test` covers partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, virtual watchdog expiry, and restart through the production supervisor. The serverless manager now owns a borrowed-`std.Io` Future instead of a native run-loop thread. |
-| P0 integrated | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
-| P1 integrated | Complete serverless workflow | Forward-only `serverless-workflow-vopr-test` v5 covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, and one combined stale-enricher/progress-conflict history. That history persists a real candidate manifest at version 2, advances authoritative HEAD to generation 3 through the production object-backed progress CAS, requires the candidate publisher to receive `HeadChanged`, and retries to version 4 while consuming but rejecting the stale full-body mutation. Typed runtime work rounds additionally prove overlapping node/publish slowdown, independent healing, baseline compaction, exact cost, and final fenced visibility. Full-cluster v50 uses the same fixture and object catalog beside the production metadata quorum, three DataServers, public clients, HTTP/Raft transports, and concurrent ordinary workload on one `VoprIo`; the production serverless HTTP client must observe only the authoritative version-4 document. Cross-domain object-store/process/resource overlap and multi-worker placement remain follow-up depth. |
-| P1 integrated | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
-| P1 partial selected seam / ongoing completion | Managed-index publication and public readiness | Full-cluster v53 sends public create-index through metadata Raft, observes pending readiness while document enrichment returns a retryable provider failure, and enters production reconciliation. Its 35,000-transition gate owns bounded-lifecycle record/fresh-world replay and cleanup. Complete coherent coverage/replay readiness, three indexed documents, durable DataServer reconstruction, all-node semantic queries, and packet-level replay stabilization before promoting the seam; atomic versus progressive publication policy, cancellation, disk/rate-limit overlap, and crashes inside each durable-generation/catalog/alias/readiness gap remain later breadth. |
-| P0 integrated combined active-transition/graph/resource/service-rate seam | Full-cluster distributed composition | Full-cluster v9 retains the registered hosted/public deployment. V11-v40 add the cited real metadata/DataServer/public/serverless, active-transition, graph/join/global-query, fault, cancellation, authorization, durable-worker, and reconstruction seams. V42-v48 add production replication through public coordinators and its named recovery/fencing modes. V49-v52 add the query-cache, serverless fencing, authenticated isolation, and disk-capacity compositions. The v42-v52 Debug and ReleaseSafe record/fresh-world gates pass 15/15 at their documented 120,000–260,000-transition budgets. V53 is bounded managed-index lifecycle evidence only. These promote only the named seams. Next complete v53 and stabilize packet-level replay; add managed-index and cache topology/link/storage/resource disk-pressure combinations; serverless multi-worker/object-store/process/resource overlap; row-level tenant scoping and identity mutation races; additional replication topology/cancellation/source/target-crash timings; metadata leadership loss during cutover; cross-domain fault variants; storage/process/multi-owner cancellation and recovery; global-query topology/storage/resource/coordinator/metadata loss; broader socket/short-write/restart targets; disjoint placement; retained-history and snapshot/derived-state recovery; standby/data-plane co-residency; and richer public queries. |
-| P0 ongoing | Repository-wide strong-read contract | V13 proves an owner-specific synchronous DataServer barrier: matching ReadState apply plus derived-state visibility, bounded by the request timeout/cancellation. V19 extends that barrier from graph callbacks to production Provisioned preflight, response-producing exact-group queries, and optimized `SearchResult` callbacks after reproducing acknowledged-but-empty full-text reads on both join sides. `ReadIndexRequester` is now an enqueue-only capability and `ReadSafetyBarrier` is a distinct synchronous capability; managed host services expose only the former, while public table-read sources require the latter. DataServer uses reusable `AppliedReadTracker` ownership for one canonical request context, matching-group ReadState observation, applied-index completion, cancellation, and group retirement. Replicated DataServer construction starts fail closed with `unavailableReadSafetyBarrier`; startup installs the real barrier after Raft wiring, while direct non-Raft ownership is explicitly marked `alreadyReadSafeBarrier`. The three-production-owner merge/split history now exact-replays the DataServer behavioral matrix: follower forwarding or typed `NotLeader` without retained ownership, leader-change completion-or-timeout plus replacement-leader retry, logical timeout, cancellation, state-machine group retirement, and post-split graph/full-index visibility. The old readable-lease types, service adapters, no-op API, and metric names were deleted rather than aliased. Remaining repository-wide work is to audit every custom callback barrier and add the same behavioral depth for each distinct production owner before another public source relies on it. |
-| P0 integrated | Query-embedding cache | `query-embedding-cache-vopr-test` exact-replays concurrent-miss coalescing, waiter cancellation, deadlines, in-flight admission, TTL, byte-budget/LRU eviction, pinned hits, and cleanup through the production cache on one `VoprIo`. V2 adds a production-neutral cost port at request, hit-copy, coalesced-wait, and producer-compute boundaries and proves baseline cost, overlapping node/hit slowdown, real deadline expiry, independent healing, resumed success, exact usage, and cleanup. Forward-only full-cluster v49 installs that port on node 1's actual production `ApiHttpServer` cache. One producer remains in flight while a slowed same-key waiter crosses its logical deadline; healing permits the producer and one retained hit to complete. After the ordinary public workload establishes durable state, the exact DataServer owner is reconstructed: its replacement cache must start empty, recompute the same key exactly once, retain the next hit, absorb exactly one stale pooled-connection failure, and serve a pre-restart durable document through the rebound endpoint. DataServer, graph, serverless, visibility, quiet cleanup, and fresh-world replay oracles remain active. Its 120,000-transition Debug and ReleaseSafe gate passes 15/15. Cache topology/link/storage/resource overlap remains future breadth. |
-| P1 partially integrated | Distributed graph/public-query boundaries | `distributed-query-vopr-test` exact-replays production cross-range planning, two-shard fanout/hydration, topology retry/exhaustion, stale generations, cancellation, cross-table authorization, and per-group charging. Full-cluster v9 and production-owner v22-v35 add the cited public HTTP, active split, transport, restart, short-write, memory/socket pressure, hydration, in-flight authorization, stale-snapshot, durable-join, overlapping-fault, and owner-reconstruction histories. V36 adds the production-owner global NDJSON baseline with exact response order and table isolation. Forward-only v37 cancels at the first production result boundary, requires typed cancellation, handler drain, and exactly one canceled-request result, then proves exact recovery. Forward-only v38 revokes live second-table authority at the same result boundary, requires an exact 403 without a protected result, restores policy, and proves exact recovery. Forward-only v39 cuts the registered tenant-owner query stream at that boundary, requires one matched outage and the exact retryable 503 without partial output, heals, and proves exact recovery. Forward-only v40 destroys the exact tenant-owner process at the same first-result boundary, requires the same no-partial 503, reconstructs its stable DataServer and listeners, requires a direct durable read from the rebound endpoint, and proves exact recovery. Cancellation under storage faults, disk pressure, simultaneous process loss before cancellation drain, and other fault combinations; broader join forms; additional overlapping-owner fault shapes; global-query topology/storage/resource faults, coordinator/metadata or multi-process loss, and broader transport/overlap shapes; broader restart/short-write/socket overlap; and storage/process/restart overlaps are not yet composed on the production owners. |
-| P1 integrated | Generation and reranking chains | `generation-reranking-vopr-test` exact-replays generation success, retry/backoff on borrowed `std.Io`, timeout and rate-limit fallback, cancellation, reranking success, malformed count/non-finite results, timeout, and cancellation through production chain and local-provider boundaries. Its v2 composed mode additionally sends ten requests through production remote OpenAI/Antfly generation and Antfly reranking adapters in one trace: fallback, malformed/truncated responses, logical deadlines, in-flight cancellation, and request-scoped replacement for both adapters while the next generation and reranking requests route locally. Record and fresh-world exact replay require exact remote/local call counts, result values, typed errors, cleanup, and no capability violation. Actual models and GPU kernels remain differential. |
-| P1 ongoing | Remote-content credential use boundary | Join the integrated live-reference configuration/store contract to a real scraping or object-fetch request. Resolve access key, secret, session token, and header references immediately before provider use; rotate while an old request is in flight; retry and cancel through borrowed `std.Io`; and prove that snapshots retain references while each new request observes one coherent secret generation. The current config lifecycle proves publication and the production resolver independently, while `lib/scraping` still copies credential strings at its lower request-construction seam. |
-| P2 integrated | Multi-table, authenticated-tenant, and cross-node workload dimensions | The full-cluster history provisions two independently replicated tables and drives concurrent clients through three public nodes. A tenant sentinel must remain visible in its table and absent from the other table while both share the same scheduler, HTTP transport, sockets, and node resources. Forward-only v51 enables authentication on every production `ApiHttpServer`, creates two valid identities with disjoint table read/write permissions, routes each table's ordinary write and strong read through its owning identity, requires exact bidirectional 403 read/write denials at different ingress nodes, and proves both forbidden keys remain exact 404 under the owning identities. This promotes authenticated table-level isolation and cross-node routing interference, not row-level multitenancy or identity mutation during the same request. |
-| P2 integrated selected seam / ongoing breadth | Resource-interference workload dimension | `admission-vopr-test` proves cross-service memory, disk, task, file, socket, and cancellation ownership. The full-cluster campaign composes explicit node-memory denial/recovery, one exact selected-listener socket denial/recovery, and forward-only v52's selected-node disk denial/healing through the production persistent-cache worker and its live DataServer `ResourceManager`. V52 proves no denied file or reservation, public-read continuity, one exact post-heal reservation/write/release, and cross-node recovery. Managed-index disk pressure, broader socket targets, and disk pressure overlapped with graph/query cancellation, link, storage, restart, or process faults remain future breadth. |
-| P2 conditional | Live mixed-version workload dimension | Add rolling old/new binary operation only when two compatible runnable versions and an upgrade contract exist. `upgrade-compatibility-vopr-test` currently proves artifact readers, migration, safe rejection, and crash recovery; it is not live mixed-version cluster coverage. |
-| P2 integrated | Provider boundaries | `provider-boundary-vopr-test` uses the real ManagedEmbedder and PostgreSQL Source boundaries for timeout, partial response, cancellation, retry, malformed data, SQL construction, and admission ownership. Actual models, GPU kernels, and libpq internals remain differential/integration concerns. |
-| P2 integrated | Composed query lifecycle | `composed-query-vopr-test` exact-replays vector, text, graph, and global-query completion under partial failure/retry, cancellation, resource pressure, and every result-assembly ordering through production merge and graph-union code. |
-| P1 integrated | Persistent Parquet cache | `parquet-cache-vopr-test` runs the real borrowed-I/O worker, bounded queue, duplicate-write coalescing, read/write faults, durable sync, crash, reopen, and checksum-protected reads. It is the first production consumer of the reusable fault-to-`VoprIo` adapter. |
-| P1 integrated | Provisioning and startup | `provisioning-startup-vopr-test` runs real format admission and replica-root reconciliation through a manual `BackendRuntime` borrowing `VoprIo`, including repeat startup, partial markers, legacy-store rejection, failed atomic-write retry, and crash/restart. |
-| P1 integrated | External lake | `external-lake-vopr-test` retains the focused range/cache histories and composes catalog binding, object-backed Iceberg metadata discovery, production Avro manifest decoding, schema evolution, pinned inventory, Parquet footer metadata, row-group cache, and query assembly. Twelve exact-replayed modes cover cache reuse, short responses, timeout/admission, stale object versions, deletion, ambiguous completed downloads with retry, bounded eviction, and durable persistent-cache crash/reopen without an object re-download. |
-| P2 integrated | Media-provider execution and runtime | `media-runtime-vopr-test` exact-replays production Antfly STT and OpenAI-compatible TTS HTTP success, malformed JSON, truncated bodies, logical timeout, POST retry, partial-startup rollback, nested and in-flight runtime replacement, and shutdown cancellation/drain on borrowed `VoprIo`. `httpx.Client` closes admission and drains committed requests before shared provider state is destroyed. Real codecs, models, and GPU execution remain differential/integration concerns. |
-| P2 integrated | Product upgrade and compatibility campaigns | `upgrade-compatibility-vopr-test` exact-replays ten histories covering v1 standby golden replication/checkpoint/backup bytes, legacy and future data-directory admission, crash-before-rename recovery, and legacy/future serverless head, v14 inventory, and v12 manifest artifacts. Outcomes are explicit forward completion, rollback/retry, or safe rejection. VOPR-native artifacts are excluded: traces, checkpoints, saved plans, run indexes, and fixtures have one current schema and no compatibility or migration path. |
+Integrated focused suites (each exact-replays its production seam; the
+capability table and the sections above give detail):
 
-The source-boundary audit also identifies four useful additions after the
-current P0 distributed composition. These are independent candidates, not
-prerequisites for the integrated rows above:
+| Priority | Area | Gate and remaining breadth |
+| --- | --- | --- |
+| P0 | Replication backfill and rebalancing | `replication-backfill-vopr-test`; deployment modes v42–v48. More topology/cancellation/source/target-crash timings, metadata leadership loss during cutover, overlapping faults |
+| P0 | Standalone and serverless supervision | `supervision-vopr-test` |
+| P0 | User and authentication lifecycle | `auth-lifecycle-vopr-test` |
+| P0 | Query-embedding cache | `query-embedding-cache-vopr-test` (v2 adds the cost port); deployment mode v49. Cache topology/link/storage/resource overlap |
+| P0 | Full-cluster distributed composition | `full-cluster-vopr-test`, `production-cluster-vopr-test`; see the [Distributed Completion Audit](#distributed-completion-audit) |
+| P1 | Complete serverless workflow | `serverless-workflow-vopr-test` (v5 adds the combined stale-enricher/progress-conflict history); deployment mode v50. Cross-domain object-store/process/resource overlap, multi-worker placement |
+| P1 | DB and index request races | `db-index-race-vopr-test` |
+| P1 | Generation and reranking chains | `generation-reranking-vopr-test` |
+| P1 | Persistent Parquet cache | `parquet-cache-vopr-test` |
+| P1 | Provisioning and startup | `provisioning-startup-vopr-test` |
+| P1 | External lake | `external-lake-vopr-test` (twelve modes) |
+| P2 | Multi-table and authenticated tenants | Full-cluster two-table workload and v51. Row-level multitenancy and identity mutation during a request |
+| P2 | Resource interference | `admission-vopr-test`; deployment modes v18, v22, v52. Managed-index disk pressure, broader socket targets, disk pressure overlapped with cancellation/link/storage/restart/process faults |
+| P2 | Provider boundaries, composed queries, media runtime, upgrade compatibility | `provider-boundary-vopr-test`, `composed-query-vopr-test`, `media-runtime-vopr-test`, `upgrade-compatibility-vopr-test` |
+
+Partial, ongoing, and conditional work:
+
+| Priority | Area | What remains |
+| --- | --- | --- |
+| P1 partial | Managed-index publication and public readiness | Complete v53 (see its row), then atomic versus progressive publication policy, cancellation, disk/rate-limit overlap, and crashes inside each durable-generation/catalog/alias/readiness gap |
+| P1 partial | Distributed graph/public-query boundaries | Rows in the Distributed Completion Audit |
+| P0 ongoing | Repository-wide strong-read contract | `ReadIndexRequester` (enqueue-only) and `ReadSafetyBarrier` (synchronous) are distinct capabilities; replicated DataServer starts with `unavailableReadSafetyBarrier`, installs the real barrier after Raft wiring, and marks direct non-Raft ownership `alreadyReadSafeBarrier`. Audit every custom callback barrier and add the same behavioral depth for each distinct production owner before another public source relies on it |
+| P1 ongoing | Remote-content credential use boundary | Resolve access key, secret, session token, and header references immediately before a real scraping or object-fetch request; rotate mid-request; retry and cancel on borrowed `std.Io`; prove each request observes one coherent secret generation. `lib/scraping` still copies credential strings at its request-construction seam |
+| P2 conditional | Live mixed-version workload | Only once two compatible runnable versions and an upgrade contract exist; `upgrade-compatibility-vopr-test` covers artifacts, not live mixed binaries |
+
+The source-boundary audit also identifies four independent candidates; they
+are not prerequisites for the integrated rows above:
 
 | Priority | Area | Why it is still useful |
 | --- | --- | --- |
-| P1 | Production metadata-admin/control path | Drive the actual `MetadataService`/`MetadataHttpService` mutation path—including reallocation timestamps, leadership change, ambiguous admission, status reporting, and split/merge requests—over borrowed clocks and real metadata HTTP. Current distributed histories prove the underlying quorum and workflows, while some HTTP simulations intentionally use a harness source instead of the complete production service owner. |
-| P1 | MCP and A2A session/task state machines | Compose production session expiry, event-id replay, task reservation/generation fencing, cancellation races, bounded capacity, SSE disconnect/reconnect, and shutdown on `VoprIo`. Both libraries already accept caller-owned `std.Io`; the missing value is an Antfly-level public orchestration history, not another runtime abstraction. |
-| P2 | Cloud authentication and signed object requests | Put Google token refresh and S3/GCS signing immediately in front of the existing deterministic object-store response adapters. Exercise credential rotation, refresh collapse, clock skew, timeout-after-send, retry, cancellation, and stale-token rejection without contacting a cloud service. |
-| P2 | Extension invocation lifecycle | Extend the integrated extension install/configuration/startup histories through a real bounded Wasm invocation: concurrent configuration replacement, host-call cancellation, fuel/memory admission, trap, shutdown, and durable restart. Keep the Wasmtime engine itself differential; schedule the Antfly ownership and publication boundaries. |
-
-Replication backfill and the standalone/serverless supervisor were the first
-targets because they have the richest combinations of durable state,
-ownership, concurrency, and recovery; both are now integrated. The complete
-serverless workflow and DB/index request-race compositions are also
-integrated, as are the P2 provider, query, media, and compatibility suites.
-The query-cache and generation/reranking focused campaigns are integrated.
-The full-cluster active-transition seam is integrated, while its broadest
-cross-composition roadmap and the distributed-query campaign remain partial at
-the boundaries described in their rows. Future test work is targeted
-composition, workload dimensions, and newly exposed safe suspension points
-rather than missing scheduler or replay foundations.
+| P1 | Production metadata-admin/control path | Drive the actual `MetadataService`/`MetadataHttpService` mutation path—including reallocation timestamps, leadership change, ambiguous admission, status reporting, and split/merge requests—over borrowed clocks and real metadata HTTP. Some HTTP simulations intentionally use a harness source instead of the complete production service owner. |
+| P1 | MCP and A2A session/task state machines | Compose production session expiry, event-id replay, task reservation/generation fencing, cancellation races, bounded capacity, SSE disconnect/reconnect, and shutdown on `VoprIo`. Both libraries already accept caller-owned `std.Io`; the missing value is an Antfly-level public orchestration history. |
+| P2 | Cloud authentication and signed object requests | Put Google token refresh and S3/GCS signing in front of the deterministic object-store response adapters: credential rotation, refresh collapse, clock skew, timeout-after-send, retry, cancellation, and stale-token rejection. |
+| P2 | Extension invocation lifecycle | Extend extension install/configuration/startup histories through a real bounded Wasm invocation: concurrent configuration replacement, host-call cancellation, fuel/memory admission, trap, shutdown, and durable restart. Keep Wasmtime itself differential. |
 
 ### Integrated Targeted Suites
 
 These are new suites or compositions, not retroactive dependencies of the
 integrated rows above.
 
-| Priority | Area | What to exercise |
+| Priority | Area | Gate and coverage |
 | --- | --- | --- |
-| P0 integrated | Generation publication and cleanup | `generation-lifecycle-vopr-test` drives the production transition manager with one borrowed `std.Io` through clean publication, prepared rollback, rename retry, uncertain directory sync and reconciliation, prepared crash recovery, shared-reader/exclusive-publisher locking, canonical aliases, and stale-generation cleanup. Restore and standby materialization now propagate the same I/O through transition locks and publication cleanup. |
-| P0 integrated | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test` drives the production scanner and cache on borrowed filesystem and monotonic-clock capabilities through absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, disappearance/rescan, and read-fault/restart histories. Metadata service and HTTP rounds use their backend runtime I/O for scans and rechecks. |
-| P0 integrated | Configuration, secrets, remote content, and extensions | `config-extension-lifecycle-vopr-test` exact-replays valid, malformed, and incomplete cold starts; secret rotation with retained readers; crash between durable secret and configuration publication; remote-content replacement, rejected-candidate rollback, and recovery; extension administrative install/dry-run, replacement, disable/enable, and configuration; malformed package recovery; and failed Wasm startup. The snapshot deliberately preserves live `${secret:...}` references and the scenario resolves them through the production store instead of falsely requiring eager substitution. The production secret store, remote-content runtime, extension lifecycle timestamping, package scanner, and Wasmtime artifact loader borrow `std.Io`; portable directory durability no longer escapes through POSIX. Resolving and rotating those references at an actual scraping/object-fetch request boundary remains an ongoing composition below. |
-| P1 integrated | Embedded, C API, and Lite lifecycle | `embedded-lite-lifecycle-vopr-test` exact-replays native Lite crash/reopen, overlapping Embedded writer/reader lifetimes, C API readable-lease callback install/remove, canceled restore, atomic replacement with a pinned old reader, and current-generation visibility. Native Lite, Embedded DB, opaque C API handles, and restore staging share caller-owned `std.Io`/`BackendRuntime`; a physical-versus-`VoprIo` differential compares logical values and checkpoint sequences. |
-| P1 integrated | Cross-service resource pressure | `admission-vopr-test` composes one production `ResourceManager`, request-admission controllers, and `VoprIo` envelope across query/write request ownership, a real Lite-backed DB write and lookup, the durable-job lane, a cancelable ManagedEmbedder provider call, and the persistent Parquet range cache. Eight schedules exact-replay aggregate and slice-memory denial, cache queue denial, capacity-domain denial before disk I/O, task/file/socket exhaustion, cancellation cleanup, and progress after pressure clears. `resource-budget-test` guards the named lake-queue default mapping. |
-| P1 integrated | Full external-lake composition | `external-lake-vopr-test` now traverses catalog binding, object-backed Iceberg metadata and manifest discovery, schema evolution, Parquet footer discovery, row-group caching, and production query assembly. It fails closed on stale versions and deleted objects, retries an ambiguous completed download through the reusable object-store fault adapter, proves bounded cache eviction, and reopens a durable cache after a `VoprIo` filesystem crash without downloading cached objects again. |
+| P0 | Generation publication and cleanup | `generation-lifecycle-vopr-test`: clean publication, prepared rollback, rename retry, uncertain directory sync, prepared crash recovery, reader/publisher locking, canonical aliases, stale-generation cleanup; restore and standby materialization propagate the same I/O |
+| P0 | Metadata backfill-marker discovery | `backfill-marker-discovery-vopr-test`: absent, legacy, valid-owned, corrupt, ownership-mismatch, throttled appearance, rescan, and read-fault/restart on borrowed filesystem and monotonic clock |
+| P0 | Configuration, secrets, remote content, and extensions | `config-extension-lifecycle-vopr-test`: cold starts, secret rotation with retained readers, crash between secret and configuration publication, remote-content replacement/rollback, extension install/replace/disable/configure, malformed packages, failed Wasm startup. Snapshots keep live `${secret:...}` references |
+| P1 | Embedded, C API, and Lite lifecycle | `embedded-lite-lifecycle-vopr-test`, including a physical-versus-`VoprIo` differential of logical values and checkpoint sequences |
+| P1 | Cross-service resource pressure | `admission-vopr-test` (eight schedules); `resource-budget-test` guards the lake-queue default mapping |
 
 ### Ported Antithesis-Class Features
 
@@ -2387,77 +2034,13 @@ local replacement are integrated:
 10. a registered deployment composer for roles, instances, readiness
     dependencies, directional links, typed process/storage/resource fault
     domains, measured node policy, and cluster-wide quiet suffixes;
-11. versioned saved event-set programs with fail-closed DAG validation,
-    selection and set algebra, distinct/first/last moment and
-    previous/next/sequence operators, bounded cross-history evaluation,
-    count-only CLI results, and repeated-run input. Operator-complete tests and
-    CLI meta coverage reject obsolete/ad-hoc schemas rather than adapting them;
-    a runner-owned live NDJSON observer publishes into a power-of-two,
-    fixed-slot SPSC queue with release/acquire record publication, explicit
-    drop-newest backpressure, atomic saturating telemetry, and close semantics.
-    One consumer may drain concurrently; sink delivery and retry remain outside
-    execution. Invalid capacity, oversize, concurrent accounting, retry, and
-    close have direct tests, while queue pressure has byte-equivalence against
-    an unobserved history;
+11. versioned saved event-set programs with fail-closed DAG validation and
+    bounded cross-history evaluation, plus a runner-owned bounded live NDJSON
+    stream that cannot block or perturb replay (see the capability table);
     and
-12. a reversible service-rate model with unambiguous stable node and operation
-    identities, fully checked base multiplication, wide rounding, and
-    compositional multipliers in canonical fault-ID order,
-    per-node and per-operation charge/unit/nanosecond accounting, and a
-    node-bound borrowed-`std.Io` charge port. The generic fault and deployment
-    registries recognize this effect independently from pause and terminal CPU budgets;
-    the production query-embedding cache supplies the first reviewed adapter
-    and exact-replay overlap/deadline/healing proof. DataServer supplies a
-    second adapter at each Raft progress round, with node-local slowdown,
-    leader transfer, exact accounting, healing, and a full recovery suffix.
-    The distributed graph coordinator supplies a third adapter keyed by target
-    group and expand/hydrate/get-edges operation, with slowed and healed
-    parallel-fanout passes and exact per-owner accounting. DataServer LSM
-    maintenance supplies a fourth reviewed operation class with a slowed real
-    attempt, explicit healing, a baseline retry, and exact logical usage.
-    Replication supplies the fifth boundary: typed snapshot and stream permit
-    checkpoints with overlapping node/snapshot slowdown, independent healing,
-    completed snapshot-to-stream cutover, and exact per-class accounting.
-    Serverless orchestration supplies the sixth boundary: publish, enrichment,
-    compaction, and prune rounds, with overlapping node/publish slowdown healed
-    across two publications before baseline compaction and fenced visibility.
-    Full-cluster v23 composes the DataServer, graph, and serverless adapters on
-    one model and clock: node-wide two-times costs are exact before healing,
-    baseline DataServer/graph costs are exact afterward, no effect survives,
-    and public visibility plus quiet cleanup exact-replay. Forward-only v49
-    installs the cache work port on the actual cache owned by node 1's public
-    `ApiHttpServer`/DataServer process. It proves exact slowed same-key
-    producer/coalesced-wait work with real deadline expiry before healing, an
-    exact baseline retained hit afterward, then destroys and reconstructs the
-    owner, proves the replacement cache is empty, recomputes once, retains one
-    hit, reconnects the long-lived client after one exact stale-pool failure,
-    and reads pre-restart durable data. Exact byte/cost accounting, zero
-    in-flight work/effects, full cluster visibility and cleanup, and fresh-
-    world replay remain required. Forward-only v42 adds the production replication
-    runner and public BatchRequest target to the same deployment: snapshot
-    work and the first accepted batch occur before healing, remaining snapshot
-    and stream work runs at baseline, and every replicated document is
-    Raft/index visible through all public coordinators with exact accounting
-    and fresh-world replay.
-    Forward-only v43 interrupts after the first accepted snapshot batch,
-    changes schema, resumes from durable status, and requires one exact
-    duplicate target batch before CDC completion and the same terminal oracle.
-    Forward-only v44 destroys and reconstructs the current target leader at
-    that boundary, preserves exact slowed/healed accounting across two bounded
-    transport failures, and resumes to three exact successes plus durable
-    local, direct public, and all-coordinator visibility.
-    Forward-only v45 fails the first actual source query after durable
-    preparation, closes that session, resumes through a strictly newer owned
-    session, and preserves exact target work and the same terminal oracle.
-    Forward-only v46 revokes the lease after durable snapshot offset 1,
-    composes outer fencing with delegated production charging, replaces the
-    source session, and resumes without a duplicate target batch.
-    Forward-only v47 revalidates ownership between target apply and checkpoint
-    publication, rejects the stale owner at offset 0, and resumes with one
-    exact idempotent replay.
-    Forward-only v48 keeps that charged path active while the exact source
-    catalog, authority claims, authority checks, and predecessor retirement
-    cross the live metadata quorum.
+12. a reversible service-rate model with stable node and operation identities
+    and per-node/per-operation accounting, adopted at six production
+    boundaries (see the capability table).
 
 These capabilities are local libraries, commands, reports, and CI gates. They
 do not require an Antithesis account or hosted runtime. This is not a claim of
@@ -2469,18 +2052,12 @@ explicitly unfinished or conditional.
 The remaining Antithesis-class opportunities are narrower than the engine
 work already completed:
 
-- extend the v11-v53 cluster compositions with search policies that overlap
-  node-wide and operation-class slowdowns
-  with remaining topology/ownership changes and the existing
-  link/storage/resource/restart algebra, additional replication topology/
-  cancellation/source/target-crash timings, metadata leadership loss during
-  cutover, and quiet recovery.
-  The reusable effect, clean backfill, schema-resume, exact target-owner-
-  restart, prepared-source-session-crash, durable-checkpoint-cancellation, and
-  pre-checkpoint stale-owner, metadata-backed exact-authority-rotation, and
-  cache deadline/owner-reconstruction compositions are complete;
-  arbitrary instruction-level native-thread throttling is still
-  a federated/native instrumentation concern rather than an in-process claim;
+- extend the v11–v53 cluster compositions with search policies that overlap
+  node-wide and operation-class slowdowns with remaining topology/ownership
+  changes, the existing link/storage/resource/restart algebra, additional
+  replication timings, metadata leadership loss during cutover, and quiet
+  recovery. Arbitrary instruction-level native-thread throttling remains a
+  federated/native instrumentation concern rather than an in-process claim;
 - grow the saved event-set expression vocabulary only in response to concrete
   debugger/report needs. The versioned plan deliberately provides typed set,
   moment, previous/next, and sequence operations instead of an embedded
@@ -2559,18 +2136,6 @@ Build the brokered mode only when an address-space-specific defect or live
 mixed-version requirement justifies its protocol and operational cost; until
 then, deepen the in-process registered-owner composition first.
 
-### Integrated Self-Contained Platform Work
-
-| Priority | Capability | Required work |
-| --- | --- | --- |
-| P0 integrated | Reusable command-template composer | `lib/vopr/command.zig` implements Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles. Commands declare symmetric compatibility/deny lists, exclusion groups, fault policy, and before/after quiescence requirements. The composer tracks stable active invocation identities, enforces singleton and serial admission, snapshots quiet-suffix obligations, and exact-replays eventual/final completion. |
-| P0 integrated | Registered deployment composer | `lib/vopr/deployment.zig` validates deployment roles and acyclic readiness dependencies, node and instance identities, directional links, globally disjoint process/storage/resource domains, typed fault/domain compatibility, node-local resource policies, and per-node quiet acknowledgments. Full-cluster v9 registers its four owners, seven role instances, six metadata links, and all infrastructure fault modes, then refuses completion until every fault is healed and every required node supplies bounded, task/socket-quiet evidence. |
-| P0 integrated | Registered-source entropy and determinism audit | `lib/vopr/determinism.zig` admits only immediate structured choices and borrowed-`std.Io` entropy as runtime evidence. `vopr-determinism-audit` fail-closes on host RNG, delayed private PRNGs, host clocks, native threads/I/O, filesystem escapes, native libraries, unordered iteration, and pointer-derived identity in sources explicitly listed in its manifest; reviewed differential boundaries require line-local categorized rationale. The manifest contains every exported VOPR scenario and both legacy metadata replay regions. This is an implemented registered-source gate, not proof over every transitive production callee, guest-kernel interception, an arbitrary unmodified C library, or a separate process. |
-| P1 integrated | Continuous and quiescent validation phases | The runner automatically samples every history in continuous, recovery/quiescent, and final phases, aggregates bounded no-progress and recovery evidence, classifies allocator and unexpected process/panic failures, and retains the pointer-free diagnostic outside canonical replay bytes. `VoprIo.healthSnapshot` automatically populates task, descriptor, and optional physical-storage evidence; the replication, supervision, auth, serverless-workflow, DB/index, provider, composed-query, resource-pressure, cache, startup, generation, configuration, Embedded/Lite, external-lake, media, and upgrade/compatibility suites add domain progress, consistency, exhaustion, and cleanup semantics. `vopr-results` uses exact-replayed evidence automatically. |
-| P1 integrated | Richer retroactive logging | `event.Event` and the bounded `flight_recorder` own diagnostic name/value fields and text independently of canonical replay fields. Filters combine event identity, kind, actor/resource, logical index, exact or substring field predicates, and text search; materialization adds bounded before/after context. Generic, domain, distributed-data, and custom metadata replays feed the recorder directly, and every automatic debug recipe exact-replays its reduced artifact into a configurable flight window. `vopr-recipe` exposes filter, window, capacity, and limit controls. |
-| P1 integrated | Local run index and usage API | `lib/vopr/run_index.zig` transactionally ingests canonical per-history, aggregate, and existing index JSON; requires an explicit stable run identity; validates referential integrity; deduplicates stable run/history keys; and canonically indexes source revision, properties, fingerprints, corpus/quarantine counts, typed artifacts, and transition/resource/history budgets. `vopr-index` atomically persists the index and exposes run/revision/scenario/property/fingerprint/corpus/artifact/budget predicates as deterministic JSON or a static local HTML summary. Parallel campaign results carry stable run identity, source/target/optimize metadata, and retained/quarantine artifact references. There is no legacy aggregate parser or synthesized fallback identity. |
-| P1 integrated | Search recurrence and rarity reporting | `benchmark.zig` owns three reviewable injected defects representing scheduler starvation, publication after unstable durability, and cancellation/admission leakage. Each runs under random, guided, spliced, starvation, and checkpoint-assisted policies. `vopr-search-quality-v2` reports repeated occurrences, discovery probability and complement rarity in ppm, Wilson 95% confidence bounds, total and per-occurrence executed transitions and logical work, first-discovery work, retained bytes, and independently minimal witnesses by transition count and canonical retained-output bytes. Explorer failure examples track these stable digests, and all retained paths now exact-replay before insertion. |
-
 ### Conditional Work
 
 Wait for a real product or toolchain requirement before adding:
@@ -2594,7 +2159,7 @@ Wait for a real product or toolchain requirement before adding:
 ### Ongoing Roadmap
 
 > **Relocated:** The version-by-version roadmap narrative that previously lived here (445 lines) is
-> preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md#ongoing-roadmap-narrative-relocated-from-vopr-md).
+> preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md#ongoing-roadmap-narrative-relocated-from-voprmd).
 > Durable decisions from it are folded into the compact roadmap below. The former "shortest current
 > summary" and "detailed backlog" lists narrated the same seams in the same order, so they are merged
 > into one list here.
@@ -2757,25 +2322,16 @@ retain the reduced case as a permanent reviewed regression.
 
 ## Conclusion
 
-Antfly already owns the hard self-contained foundation: explicit deterministic
-choices, one-transition scheduling, virtual tasks, files, sockets, processes,
-clocks and durability, guided exploration, exact replay, reduction, formal
-export, counterfactual analysis, and independent production-shaped scenarios.
-
-The P0, P1, and non-conditional P2 rows explicitly marked **integrated** are
-implemented at the production seams stated in their conformance rows; rows
-marked partial, ongoing, or conditional remain future work. Application-level,
-in-process distributed VOPR is integrated across metadata, transactions, Raft,
-standby, the data plane, distributed graph fanout, and a deployment-shaped
-full-cluster campaign; separate-address-space orchestration is not.
+Antfly owns the self-contained foundation: explicit deterministic choices,
+one-transition scheduling, a virtual OS behind `std.Io`, guided exploration,
+exact replay, reduction, formal export, counterfactual analysis, and
+production-shaped scenarios. Rows marked **integrated** hold at their stated
+seams; partial, ongoing, and conditional rows remain future work.
 
 > **Relocated:** The dated v11-v18 completion recap that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
-Compiler-guided coverage and provider-specific datagram campaigns remain
-conditional on stable instrumentation and real consumers. New product services
-should cross the existing `std.Io`, lifecycle-hook, admission, and owner seams
-rather than creating native-only loops, multiplying suite names, or weakening
+New product services should cross the existing `std.Io`, lifecycle-hook,
+admission, and owner seams rather than creating native-only loops or weakening
 production ownership contracts. If a future defect requires separate processes
-or live mixed binaries, the next fidelity step is the versioned federated VOPR
-agent/broker described above; unmodified container runs remain differential
-evidence rather than exact deterministic replay.
+or live mixed binaries, the next fidelity step is the federated VOPR
+agent/broker described above.
