@@ -51,11 +51,6 @@ let sab = null;   // SharedArrayBuffer
 let ctrl = null;  // Int32Array view of control region (first 16 ints)
 let extraction = null;
 
-// ONNX Runtime Web (lazy, optional)
-let ort = null;
-let onnxSessions = new Map();
-let onnxNextId = 1;
-
 const DATA_OFFSET = 64;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -2072,67 +2067,6 @@ self.onmessage = async (e) => {
 
         if (!output) throw new Error('Gemma4 cached multimodal forward failed');
         self.postMessage({ type: 'gpt-forward-cached-multimodal-gemma4-done', id, output }, [output.buffer]);
-        break;
-      }
-
-      // --- ONNX Runtime Web worker handlers ---
-
-      case 'onnx-init': {
-        const { wasmPaths, executionProviders } = e.data;
-        try {
-          ort = await import('onnxruntime-web');
-        } catch (_) {
-          throw new Error('onnxruntime-web not available in worker. Add it to your importmap or bundle.');
-        }
-        if (wasmPaths) {
-          ort.env.wasm.wasmPaths = wasmPaths;
-        }
-        self.postMessage({ type: 'onnx-init-done', id });
-        break;
-      }
-
-      case 'load-onnx-model': {
-        if (!ort) throw new Error('Call onnx-init first');
-        const { modelBytes, executionProviders } = e.data;
-        const session = await ort.InferenceSession.create(modelBytes.buffer, {
-          executionProviders: executionProviders || ['wasm'],
-        });
-        const handle = onnxNextId++;
-        onnxSessions.set(handle, session);
-        self.postMessage({ type: 'load-onnx-model-done', id, handle });
-        break;
-      }
-
-      case 'onnx-infer': {
-        if (!ort) throw new Error('Call onnx-init first');
-        const { sessionHandle, feeds } = e.data;
-        const session = onnxSessions.get(sessionHandle);
-        if (!session) throw new Error(`ONNX session ${sessionHandle} not found`);
-
-        // Convert serialized feeds to ORT Tensors
-        const ortFeeds = {};
-        for (const [name, tensor] of Object.entries(feeds)) {
-          ortFeeds[name] = new ort.Tensor(tensor.type, tensor.data, tensor.dims);
-        }
-
-        const results = await session.run(ortFeeds);
-
-        // Serialize outputs
-        const outputs = {};
-        for (const [name, tensor] of Object.entries(results)) {
-          outputs[name] = { data: tensor.data, dims: Array.from(tensor.dims), type: tensor.type };
-        }
-        self.postMessage({ type: 'onnx-infer-done', id, outputs });
-        break;
-      }
-
-      case 'unload-onnx-model': {
-        const session = onnxSessions.get(e.data.handle);
-        if (session) {
-          await session.release();
-          onnxSessions.delete(e.data.handle);
-        }
-        self.postMessage({ type: 'unload-onnx-model-done', id });
         break;
       }
     }
