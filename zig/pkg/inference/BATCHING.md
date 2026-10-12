@@ -371,6 +371,12 @@ from codec decoding; for example, [DALI mel filtering](https://docs.nvidia.com/d
 supports CPU and GPU execution. These are possible implementation references,
 not new runtime dependencies in the first phase.
 
+The shared CPU decoder also has a measured [WebP preparation optimization](../../../docs/design/inference/webp-preparation-performance.md):
+borrowed lossless prefix tables, short-code lookup and canonical long-code ranges.
+It covers VP8L and compressed alpha attached to VP8. Ordinary VP8 decoding and
+model resize semantics remain unchanged; codec measurements do not establish
+end-to-end embedding gains.
+
 ### Implemented first phase: CLIP eager vision residency
 
 `architectures/clip.zig` exposes `visionEncoderForwardTensor`, which borrows
