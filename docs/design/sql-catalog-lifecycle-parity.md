@@ -3461,3 +3461,27 @@ bytea-overload activation or a latency benchmark.
 
 The audited original inventory is now 479 implemented / 136 rejected /
 73 superseded / 898 unresolved. No other source cases received credit.
+
+### Typed temporal boundary and execution clock foundation
+
+Native date, time, timetz, timestamp, timestamptz and interval remain distinct
+typed domains. The allocation-free binary codec validates finite limits,
+infinity sentinels, exact framing, signed epoch conversion and precision before
+publishing bytes. Intervals retain month/day/microsecond components; 24:00 stays
+distinct from midnight. Execution-owned clock views pin statement time, accept
+transaction start from the authorized owner and sample wall time through std.Io.
+Child pages reuse the view; cached plans must never retain it.
+
+An independent PostgreSQL 18.6 oracle supplies 98 binary/type/precision contracts.
+Calendar fields retain exact boundary microseconds where EXTRACT(epoch) rounds;
+future SQL EXTRACT support must separately match that observable SQL behavior.
+Nine native tests and five oracle tests cover framing, boundaries, roundtrips,
+bounded-memory throughput and clock ownership. This is not PostgreSQL 19
+qualification or public SQL activation.
+
+Remaining activation requires typed Datum/schema/AROW and index-key integration,
+pgwire text/binary codecs, parser/scalar binding, timezone/calendar semantics,
+ingress/cursor clock capture from durable transaction ownership, and capability
+barriers before persisted/public type activation. No original case receives
+credit until its unchanged query passes public execution. Counts remain
+479 implemented / 136 rejected / 73 superseded / 898 unresolved.
