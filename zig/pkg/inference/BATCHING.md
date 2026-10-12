@@ -581,17 +581,20 @@ an explicit ceiling of eight images; this does not make eight the serving defaul
 EmbeddingGemma2's encoded-image and borrowed-PDF-raster paths now use vision
 batches before their existing embedding-encoder cohorts of up to four rows.
 CPU decode/resize and final token-array export/prompt upload remain. Raster
-admission reserves the estimated vision cohort scratch in addition to existing
-encoder workspace, capped at 2 GiB for accelerators and 512 MiB for CPU. Encoded
+admission reserves estimated vision cohort scratch, capped at 2 GiB for
+accelerators and 512 MiB for CPU. The lookahead path reserves the larger of
+vision and encoder phase workspace, with retained/output storage accounted
+separately; their temporary workspaces have disjoint lifetimes. Encoded
 images reserve host preprocessing before decoding, retain only encoded sources
 and normalized pixels while queued, then compose the run reservation under the
 model execution lock. GPU reservations are acquired after the lock, so queued
 requests do not occupy vision scratch. Native execution can split
 vision into smaller cohorts while still batching the downstream encoder. Indexed
 codec/validation failures retain original error slots; backend, memory and
-cancellation failures propagate. This phase adds no cross-request queue or
-batching delay. Existing server broker cohorts can use the new vision batching;
-client concurrency is measured separately from model batches.
+cancellation failures propagate. Image-only Gemma4 groups now use the geometry-
+qualified cross-request broker described in the follow-up below; mixed groups
+retain the compatibility executor. Client concurrency is measured separately
+from physical model batches.
 
 The new `bench-gemma4-image` executable loads a real HF EmbeddingGemma2 checkpoint
 once and supports three synchronized scopes: `projector` starts from prepared
@@ -726,8 +729,8 @@ fixtures, logs and measured-source snapshots are retained locally under
 not model memory or RSS; device-owned tensor peaks do not include every provider
 buffer. Unavailable internal embedding/HTTP counters are not total-memory
 measurements. Relative baseline parity does not replace an independent model
-quality oracle. GPU-assisted decode/resize and cross-request scheduling remain
-separate future work; this phase reuses existing broker cohorts.
+quality oracle. GPU-assisted decode/resize remains future work. Geometry-qualified
+cross-request image scheduling is implemented in the follow-up below.
 
 ### Gemma4 PDF measurement and resident embedding handoff
 
@@ -933,3 +936,17 @@ correctness path, not a claim of batched Qwen projector or decoder execution.
 Native Florence batching is throughput-oriented. A request batch is chunked by `ANTFLY_INFERENCE_READ_BATCH_SIZE` (default 8, clamped to 1..64), preprocessed into `[batch, 3, H, W]`, then run through the Florence encoder once for the chunk. CUDA and Metal use the incremental decoder KV cache in batch mode when available: self-attention keys/values are appended per row, cross-attention keys/values are precomputed for the whole encoder batch, and the LM head is applied over `[batch, hidden]` at each generated position. Metal exposes the generic eager backend hooks needed by the preallocated KV slab path (`allocUninitF32Shape`, `copyRows2D`, and device-backed row concat/slice) and has a batched device `attention_f32` entry that dispatches all `batch * q_len * heads` rows in one Metal command. The reader pipeline does not need a Florence-specific Metal API. Rows that emit EOS stop contributing new text tokens while the rest of the batch continues. If the batched KV path is unsupported by a backend shape or operator, native Florence falls back to the full batched decoder path; non-native and unsupported reader families keep the serial fallback behind the same `LoadedReader.readBatch` contract.
 
 The current `/read` HTTP response remains all-or-error at the envelope level, matching the existing API behavior. The future generic batch wrapper above should add per-item errors for bad image bytes, media fetch failures, and per-row inference failures without changing the `/read` response schema.
+
+
+### Gemma4 vision throughput follow-up
+
+[The design and qualification report](../../../docs/design/inference/gemma4-vision-throughput.md)
+covers model-scoped Flash attention, per-layer Metal command frames, image-only
+geometry buckets across requests and bounded CPU preparation lookahead. The
+serving ceiling remains four. Grid axes, model generation, task, dimensions and
+source/options must match; mixed groups retain their compatibility capability.
+Preparation holds a current wave and at most one future CPU wave, acquires no
+speculative GPU permit and drains workers on every exit. Diagnostic flags and
+A/B benchmark commands are in the report. `encoded-embedding` additionally
+measures an independent decode for every row; the existing `embedding` scope
+uses a shared borrowed raster after one decode.

@@ -7033,7 +7033,39 @@ pub const Node = struct {
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) !?[][]f32 {
-        if (model.manifest.embedding_style == .embedding_gemma2) return null;
+        if (model.manifest.embedding_style == .embedding_gemma2) {
+            if (instruction != null) return null;
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const n = if (rasters.len != 0) rasters.len else encoded.len;
+            if (n == 0 or (rasters.len != 0 and encoded.len != 0)) return null;
+            const parts = try allocator.alloc(grouped.Part, n);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, n);
+            defer allocator.free(groups);
+            for (parts, groups, 0..) |*part, *group, index| {
+                part.* = if (rasters.len != 0) .{ .raster = rasters[index] } else .{ .image = encoded[index].bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4ImageGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, n);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| allocator.free(vector);
+                allocator.free(vectors);
+            }
+            for (batch.items, vectors) |*item, *vector| switch (item.result) {
+                .value => |*value| {
+                    vector.* = value.vector;
+                    value.vector = &.{};
+                    initialized += 1;
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
+
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or !contract.accepts_image or model.manifest.hasCapability("sparse")) return null;
         const raw = rasters.len > 0;
@@ -20040,6 +20072,14 @@ pub const Node = struct {
         return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, admission.byte_cap);
     }
 
+    fn tryEmbedGemma4ImageGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
+        if (platform.env.getenvBool("ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER")) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(out, control.io, &owned_io);
+        return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
+    }
+
     fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, byte_cap: usize) ![][]f32 {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (manifest.embedding_style != .embedding_gemma2) return error.UnsupportedEmbeddingProvider;
@@ -20066,6 +20106,21 @@ pub const Node = struct {
         errdefer {
             for (vectors[0..count]) |vector| out.free(vector);
             out.free(vectors);
+        }
+        if (try self.tryEmbedGemma4ImageGroups(out, loaded, groups, options, control, contract)) |batch| {
+            defer batch.deinit();
+            for (batch.items, vectors) |*item, *vector| {
+                switch (item.result) {
+                    .value => |*value| {
+                        vector.* = value.vector;
+                        value.vector = &.{};
+                        count += 1;
+                    },
+                    .item_error => |failure| return failure.cause,
+                }
+            }
+            try loaded.verifyEmbeddingIdentity();
+            return vectors;
         }
         for (groups, vectors) |group, *vector| {
             const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control);
@@ -20120,15 +20175,36 @@ pub const Node = struct {
         const loaded = handle.get();
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         try loaded.verifyEmbeddingIdentity();
-        for (groups, 0..) |maybe_group, index| {
-            const group = maybe_group orelse continue;
-            const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
-                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
-                try errors.append(a, embedItemFailure(index, err, "embedding"));
-                continue;
+        const compact = try a.alloc(grouped.Group, groups.len);
+        var complete = true;
+        for (groups, compact) |maybe, *value| {
+            if (maybe) |group| value.* = group else complete = false;
+        }
+        var coalesced = if (complete) try self.tryEmbedGemma4ImageGroups(a, loaded, compact, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, control, contract) else null;
+        if (coalesced) |*batch| {
+            defer batch.deinit();
+            for (batch.items, 0..) |*item, index| switch (item.result) {
+                .value => |*value| {
+                    vectors[index] = value.vector;
+                    input_tokens += value.input_tokens;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(failure.cause)) return failure.cause;
+                    try errors.append(a, embedItemFailure(index, failure.cause, "embedding"));
+                },
             };
-            vectors[index] = result.vector;
-            input_tokens += result.input_tokens;
+        } else {
+            for (groups, 0..) |maybe_group, index| {
+                const group = maybe_group orelse continue;
+                const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                    try errors.append(a, embedItemFailure(index, err, "embedding"));
+                    continue;
+                };
+                vectors[index] = result.vector;
+                input_tokens += result.input_tokens;
+            }
         }
         try loaded.verifyEmbeddingIdentity();
         if (request.error_policy == .per_item) {

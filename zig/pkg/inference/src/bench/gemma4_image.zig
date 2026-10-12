@@ -21,7 +21,7 @@ const projector = internal.architectures.gemma4_projector;
 const pipeline = internal.pipelines.embedding_gemma2;
 const Bounded = internal.runtime.bounded_allocator.BoundedAllocator;
 const Memory = if (@import("build_options").enable_metal) internal.metal_runtime.RawRuntimeMemoryStats else struct {};
-const Sample = struct { seconds: f64, host_peak_bytes: usize, device_peak_bytes: u64, download_bytes: u64, device_readbacks: u64, memory: Memory };
+const Sample = struct { seconds: f64, host_peak_bytes: usize, device_peak_bytes: u64, download_bytes: u64, device_readbacks: u64, gpu_frame_ns: u128, frame_submits: u64, frame_wait_ns: u128, media: pipeline.MediaTimings, memory: Memory };
 const Report = struct { max_projector_batch: ?usize, image: []const u8, batch: usize, scope: []const u8, projected_tokens: usize, samples: []Sample, p50_seconds: f64, p95_seconds: f64, images_per_second: f64, output: []f32 };
 fn now() !u64 {
     var ts: std.posix.timespec = undefined;
@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
     var scope: []const u8 = "projector";
     var batch: usize = 1;
     var batching = false;
+    var prepare_ahead = true;
     var warmups: usize = 10;
     var iterations: usize = 100;
     var scratch_mib: usize = 4096;
@@ -55,10 +56,14 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, k, "--model")) model = v else if (std.mem.eql(u8, k, "--output")) output = v else if (std.mem.eql(u8, k, "--backend")) backend = v else if (std.mem.eql(u8, k, "--scope")) scope = v else if (std.mem.eql(u8, k, "--batching")) {
             if (!std.mem.eql(u8, v, "on") and !std.mem.eql(u8, v, "off")) return error.InvalidBatching;
             batching = std.mem.eql(u8, v, "on");
+        } else if (std.mem.eql(u8, k, "--prepare-ahead")) {
+            if (!std.mem.eql(u8, v, "on") and !std.mem.eql(u8, v, "off")) return error.InvalidPreparationMode;
+            prepare_ahead = std.mem.eql(u8, v, "on");
         } else if (std.mem.eql(u8, k, "--batch")) batch = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--warmups")) warmups = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--scratch-mib")) scratch_mib = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--iterations")) iterations = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--image")) try paths.append(out, v) else return error.UnknownArgument;
     }
     if (scratch_mib == 0 or scratch_mib > 8192 or paths.items.len == 0 or batch == 0 or batch > 8 or warmups > 100 or iterations == 0 or iterations > 10000) return error.InvalidBenchmark;
-    if (!std.mem.eql(u8, scope, "projector") and !std.mem.eql(u8, scope, "image") and !std.mem.eql(u8, scope, "embedding")) return error.InvalidScope;
+    if (!std.mem.eql(u8, scope, "projector") and !std.mem.eql(u8, scope, "image") and !std.mem.eql(u8, scope, "embedding") and !std.mem.eql(u8, scope, "encoded-embedding")) return error.InvalidScope;
+    const embedding_scope = std.mem.eql(u8, scope, "embedding") or std.mem.eql(u8, scope, "encoded-embedding");
     const metal = std.mem.eql(u8, backend, "metal");
     if (!metal and !std.mem.eql(u8, backend, "native")) return error.InvalidBackend;
     const load_started = try now();
@@ -85,16 +90,17 @@ pub fn main(init: std.process.Init) !void {
             var bounded = Bounded{ .backing = pipeline.workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 };
             const workspace = bounded.allocator();
             {
-                var permit: ?internal.RunPermit = if (std.mem.eql(u8, scope, "embedding")) null else try session.admit(.{ .batch = batch, .sequence = 2520, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = scratch_mib * 1024 * 1024, .output_bytes = batch * 280 * 512 * 4 });
+                var permit: ?internal.RunPermit = if (embedding_scope) null else try session.admit(.{ .batch = batch, .sequence = 2520, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = scratch_mib * 1024 * 1024, .output_bytes = batch * 280 * 512 * 4 });
                 defer if (permit) |*p| p.deinit();
-                var optional_cb: ?internal.ops.ComputeBackend = if (std.mem.eql(u8, scope, "embedding")) null else try factory.getComputeBackend(session, workspace);
+                var optional_cb: ?internal.ops.ComputeBackend = if (embedding_scope) null else try factory.getComputeBackend(session, workspace);
                 defer if (optional_cb) |*backend_cb| backend_cb.deinit();
                 const cb = if (optional_cb) |*backend_cb| backend_cb else null;
                 const before = if (cb) |backend_cb| backend_cb.debugTimingSnapshot().provider else internal.ops.NativeQuantTimingStats{};
                 var values = std.ArrayList(f32).empty;
                 defer values.deinit(workspace);
+                var media: pipeline.MediaTimings = .{};
                 const started = try now();
-                if (batching and !std.mem.eql(u8, scope, "embedding")) {
+                if (batching and !embedding_scope) {
                     var prepared_batch: [8]projector.PreparedImage = undefined;
                     var owned: [8]projector.PreparedImage = undefined;
                     var initialized: usize = 0;
@@ -110,6 +116,21 @@ pub fn main(init: std.process.Init) !void {
                     defer result.deinit();
                     executed_batch = result.max_batch_executed;
                     try values.appendSlice(workspace, result.embeddings);
+                } else if (std.mem.eql(u8, scope, "encoded-embedding")) {
+                    // Every row decodes independently through the production
+                    // encoded-image path, including bounded lookahead work.
+                    var images: [8][]const u8 = undefined;
+                    @memset(images[0..batch], bytes);
+                    if (batching) {
+                        const result = try pipeline.embedImages(workspace, session, tokenizer, images[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, null, null);
+                        defer workspace.free(result.vectors);
+                        defer for (result.vectors) |vector| workspace.free(vector);
+                        for (result.vectors) |vector| try values.appendSlice(workspace, vector);
+                    } else for (images[0..batch]) |encoded| {
+                        const result = try pipeline.embed(workspace, session, tokenizer, .{ .content = &.{.{ .image = encoded }} }, .{}, null, null);
+                        defer workspace.free(result.vector);
+                        try values.appendSlice(workspace, result.vector);
+                    }
                 } else if (std.mem.eql(u8, scope, "embedding")) {
                     // Use the PDF/raster production route for both A/B modes.
                     // Decode and RGBA packing are inside the timed boundary.
@@ -126,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
                     var rasters: [8]Raster = undefined;
                     for (rasters[0..batch]) |*raster| raster.* = .{ .bytes = rgba, .width = decoded.width, .height = decoded.height, .stride_bytes = @as(usize, decoded.width) * 4 };
                     if (batching) {
-                        const result = try pipeline.embedRasters(workspace, session, tokenizer, rasters[0..batch], .{}, null, null);
+                        const result = try pipeline.embedRasters(workspace, session, tokenizer, rasters[0..batch], .{ .prepare_ahead = prepare_ahead, .timings = &media }, null, null);
                         defer workspace.free(result.vectors);
                         defer for (result.vectors) |vector| workspace.free(vector);
                         for (result.vectors) |vector| try values.appendSlice(workspace, vector);
@@ -151,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
                         memory = internal.metal_runtime.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
                     }
                 }
-                if (iteration >= warmups) samples[iteration - warmups] = .{ .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s, .host_peak_bytes = bounded.peak, .device_peak_bytes = after.metal_tensor_device_owned_peak_live_bytes, .download_bytes = after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes, .device_readbacks = after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls, .memory = memory };
+                if (iteration >= warmups) samples[iteration - warmups] = .{ .seconds = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s, .host_peak_bytes = bounded.peak, .device_peak_bytes = after.metal_tensor_device_owned_peak_live_bytes, .download_bytes = after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes, .device_readbacks = after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls, .gpu_frame_ns = if (cb == null) media.gpu_frame_ns else after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos, .frame_submits = if (cb == null) media.frame_submits else after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits, .frame_wait_ns = if (cb == null) media.frame_wait_ns else after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos, .media = media, .memory = memory };
                 if (iteration + 1 == warmups + iterations) saved = try out.dupe(f32, values.items);
             }
             if (bounded.live != 0) return error.WorkspaceLeak;
@@ -164,8 +185,8 @@ pub fn main(init: std.process.Init) !void {
             sum += sample.seconds;
         }
         std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
-        try reports.append(out, .{ .max_projector_batch = if (std.mem.eql(u8, scope, "embedding")) null else executed_batch, .image = path, .batch = batch, .scope = scope, .projected_tokens = prepared.geometry.tokenCount(), .samples = samples, .p50_seconds = sorted[(iterations - 1) / 2], .p95_seconds = sorted[(iterations * 95 + 99) / 100 - 1], .images_per_second = @as(f64, @floatFromInt(batch * iterations)) / sum, .output = saved });
+        try reports.append(out, .{ .max_projector_batch = if (embedding_scope) null else executed_batch, .image = path, .batch = batch, .scope = scope, .projected_tokens = prepared.geometry.tokenCount(), .samples = samples, .p50_seconds = sorted[(iterations - 1) / 2], .p95_seconds = sorted[(iterations * 95 + 99) / 100 - 1], .images_per_second = @as(f64, @floatFromInt(batch * iterations)) / sum, .output = saved });
     }
-    const json = try std.json.Stringify.valueAlloc(out, .{ .version = 1, .model = model.?, .backend = backend, .load_seconds = load_seconds, .warmups = warmups, .execution = if (batching) "bounded same-shape batches" else "sequential", .transfer_and_workspace_counters_available = !std.mem.eql(u8, scope, "embedding"), .synchronized_readback = true, .cases = reports.items }, .{ .whitespace = .indent_2 });
+    const json = try std.json.Stringify.valueAlloc(out, .{ .version = 1, .model = model.?, .backend = backend, .load_seconds = load_seconds, .warmups = warmups, .execution = if (batching) "bounded same-shape batches" else "sequential", .transfer_and_workspace_counters_available = !embedding_scope, .synchronized_readback = true, .prepare_ahead = prepare_ahead, .cases = reports.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = json });
 }

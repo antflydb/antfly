@@ -33,12 +33,18 @@ fn partBytes(part: Part) []const u8 {
 pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
 pub const MediaTimings = struct {
     preprocess_ns: u64 = 0,
+    gpu_frame_ns: u128 = 0,
+    frame_submits: u64 = 0,
+    frame_wait_ns: u128 = 0,
     vision_ns: u64 = 0,
     pack_ns: u64 = 0,
     encoder_ns: u64 = 0,
     pool_readback_ns: u64 = 0,
     resident_cohorts: usize = 0,
     host_cohorts: usize = 0,
+    preparation_jobs: usize = 0,
+    preparation_backpressure_retries: usize = 0,
+    max_prepared_images: usize = 0,
     download_bytes: ?u64 = null,
     readbacks: ?u64 = null,
     device_owned_peak_bytes: ?u64 = null,
@@ -47,6 +53,8 @@ pub const Options = struct {
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     resident_images: bool = true,
+    /// At most one admitted CPU preparation wave ahead of accelerator work.
+    prepare_ahead: bool = true,
     /// Optional caller-owned observation for synchronous offline profiling.
     /// GPU stages enqueue asynchronously; only final readback is synchronized.
     timings: ?*MediaTimings = null,
@@ -270,6 +278,8 @@ pub fn embedRasters(out: std.mem.Allocator, session: Session, tokenizer: Tokeniz
     if (!cfg.vision) return error.NoVisionSession;
     if (!encoder.validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
     _ = try encoder.taskPrefix(options.task_type);
+    if (options.prepare_ahead and (session.backend() == .metal or session.backend() == .cuda))
+        return embedPreparedMedia(out, session, tokenizer, cfg, .{ .rasters = rasters }, options, lock, effective, null);
     const vectors = try out.alloc([]f32, rasters.len);
     var initialized: usize = 0;
     errdefer {
@@ -313,6 +323,8 @@ pub fn embedImages(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         if (errors.len != images.len) return error.InvalidInputShape;
         @memset(errors, null);
     }
+    if (options.prepare_ahead and (session.backend() == .metal or session.backend() == .cuda))
+        return embedPreparedMedia(out, session, tokenizer, cfg, .{ .images = images }, options, lock, effective, item_errors);
     const vectors = try out.alloc([]f32, images.len);
     var initialized: usize = 0;
     errdefer {
@@ -341,6 +353,292 @@ pub fn embedImages(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     }
     try effective.check();
     return .{ .vectors = vectors, .execution = observation.execution(observation.native_items + observation.serial_items) };
+}
+
+const MediaSource = union(enum) {
+    images: []const []const u8,
+    rasters: []const Raster,
+    fn len(self: MediaSource) usize {
+        return switch (self) {
+            inline else => |items| items.len,
+        };
+    }
+    fn slice(self: MediaSource, offset: usize, span: usize) MediaSource {
+        return switch (self) {
+            .images => |items| .{ .images = items[offset..][0..span] },
+            .rasters => |items| .{ .rasters = items[offset..][0..span] },
+        };
+    }
+    fn part(self: MediaSource, index: usize) Part {
+        return switch (self) {
+            .images => |items| .{ .image = items[index] },
+            .rasters => |items| .{ .raster = items[index] },
+        };
+    }
+    fn count(self: MediaSource, offset: usize) !usize {
+        const remaining = self.len() - offset;
+        if (self == .images) return @min(raster_max_batch, remaining);
+        var lengths: [raster_max_batch + 1]usize = undefined;
+        const candidates = @min(remaining, lengths.len);
+        for (self.rasters[offset..][0..candidates], lengths[0..candidates]) |raster, *length| length.* = try projector.embeddingGemma2RasterSequenceLength(raster);
+        return rasterBatchCount(lengths[0..candidates], remaining);
+    }
+};
+
+const PreparationSlot = struct {
+    session: Session,
+    source: MediaSource,
+    options: Options,
+    control: Control,
+    errors: ?[]?anyerror,
+    bounded: @import("../runtime/bounded_allocator.zig").BoundedAllocator,
+    permit: ?@import("../backends/session.zig").RunPermit = null,
+    pixels: [raster_max_batch]projector.PreparedImage = undefined,
+    indexes: [raster_max_batch]usize = undefined,
+    retained: usize = 0,
+    input_bytes: usize = 0,
+    retained_bytes: usize = 0,
+    prepare_ns: u64 = 0,
+    failure: ?anyerror = null,
+    thread: ?std.Thread = null,
+
+    fn init(session: Session, source: MediaSource, options: Options, control: Control, errors: ?[]?anyerror) PreparationSlot {
+        return .{ .session = session, .source = source, .options = options, .control = control, .errors = errors, .bounded = .{ .backing = workspaceBackingAllocator(session.backend()), .limit = 512 * 1024 * 1024 } };
+    }
+    fn allocator(self: *PreparationSlot) std.mem.Allocator {
+        return self.bounded.allocator();
+    }
+    fn run(self: *PreparationSlot) void {
+        self.prepare() catch |err| {
+            self.failure = if (err == error.OutOfMemory and self.bounded.denied) error.MemoryBudgetExceeded else err;
+        };
+    }
+    fn start(self: *PreparationSlot) bool {
+        if (comptime @import("builtin").single_threaded or @import("builtin").cpu.arch.isWasm() or @import("builtin").os.tag == .freestanding) {
+            self.run();
+            return false;
+        } else {
+            self.thread = std.Thread.spawn(.{}, PreparationSlot.run, .{self}) catch {
+                self.run();
+                return false;
+            };
+            return true;
+        }
+    }
+    fn join(self: *PreparationSlot) void {
+        if (comptime !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and @import("builtin").os.tag != .freestanding) {
+            if (self.thread) |thread| {
+                thread.join();
+                self.thread = null;
+            }
+        }
+    }
+    fn deinit(self: *PreparationSlot) void {
+        self.join();
+        self.releasePrepared();
+    }
+    fn releasePrepared(self: *PreparationSlot) void {
+        for (self.pixels[0..self.retained]) |image| image.deinit();
+        self.retained = 0;
+        if (self.permit) |*permit| {
+            permit.deinit();
+            self.permit = null;
+        }
+        std.debug.assert(self.bounded.live == 0);
+    }
+    fn prepare(self: *PreparationSlot) !void {
+        try self.control.check();
+        const started = mediaNow();
+        errdefer self.releasePrepared();
+        for (0..self.source.len()) |index| {
+            const part = self.source.part(index);
+            validateGroup(.{ .content = &.{part} }, self.options) catch |err| {
+                if (self.errors) |errors| errors[index] = err else return err;
+            };
+            self.input_bytes = std.math.add(usize, self.input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
+        }
+        self.permit = try self.session.admitHostPreprocess(std.math.add(usize, self.input_bytes, 512 * 1024 * 1024) catch return error.ResourceLimitExceeded);
+        const image_scope = @import("antfly_image").work_control.Scope.enter(self.control.imageWorkControl());
+        defer image_scope.deinit();
+        for (0..self.source.len()) |index| {
+            try self.control.check();
+            if (self.errors) |errors| if (errors[index] != null) continue;
+            self.pixels[self.retained] = switch (self.source.part(index)) {
+                .image => |bytes| projector.prepareEmbeddingGemma2Image(self.allocator(), bytes),
+                .raster => |raster| projector.prepareEmbeddingGemma2Raster(self.allocator(), raster),
+                else => unreachable,
+            } catch |err| {
+                if (self.errors) |errors| {
+                    if (err == error.OutOfMemory or err == error.Cancelled or err == error.Canceled or err == error.Timeout or err == error.DeadlineExceeded or err == error.MemoryBudgetExceeded) return err;
+                    errors[index] = err;
+                    continue;
+                }
+                return err;
+            };
+            self.indexes[self.retained] = index;
+            self.retained += 1;
+        }
+        self.retained_bytes = self.input_bytes;
+        for (self.pixels[0..self.retained]) |image| self.retained_bytes = std.math.add(usize, self.retained_bytes, image.pixels.len * 4) catch return error.ResourceLimitExceeded;
+        try self.permit.?.retainHostBytes(self.retained_bytes);
+        self.prepare_ns = mediaNow() - started;
+    }
+};
+
+/// Two stable slots: one consumer and at most one CPU producer. Every exit
+/// drains the producer before releasing borrowed sources or slot allocators.
+fn embedPreparedMedia(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, cfg: encoder.Config, source: MediaSource, options: Options, lock: ?*std.atomic.Mutex, control: Control, errors: ?[]?anyerror) !RasterBatchResult {
+    const vectors = try out.alloc([]f32, source.len());
+    var initialized: usize = 0;
+    errdefer {
+        for (vectors[0..initialized]) |vector| out.free(vector);
+        out.free(vectors);
+    }
+    if (source.len() == 0) return .{ .vectors = vectors, .execution = .serial };
+    // Only the active model caller owns preprocessing leases. Queued callers
+    // wait without reserving host memory; the active caller may still prepare
+    // its one future CPU wave while this gate protects current GPU execution.
+    if (lock) |mutex| try control.lock(mutex);
+    defer if (lock) |mutex| mutex.unlock();
+    var slots: [2]PreparationSlot = undefined;
+    var live: [2]bool = @splat(false);
+    defer for (&slots, live) |*slot, exists| if (exists) slot.deinit();
+    var current: usize = 0;
+    var count = try source.count(0);
+    slots[current] = PreparationSlot.init(session, source.slice(0, count), options, control, if (errors) |e| e[0..count] else null);
+    live[current] = true;
+    slots[current].run();
+    var observation = BatchExecution.Observation{};
+    while (initialized < source.len()) {
+        try control.check();
+        const slot = &slots[current];
+        slot.join();
+        if (slot.failure) |failure| return failure;
+        if (options.timings) |t| t.preprocess_ns += slot.prepare_ns;
+        const next = 1 - current;
+        const next_offset = initialized + count;
+        var next_count: usize = 0;
+        if (next_offset < source.len()) {
+            next_count = try source.count(next_offset);
+            slots[next] = PreparationSlot.init(session, source.slice(next_offset, next_count), options, control, if (errors) |e| e[next_offset..][0..next_count] else null);
+            live[next] = true;
+            const spawned = slots[next].start();
+            if (options.timings) |t| {
+                t.preparation_jobs += @intFromBool(spawned);
+                t.max_prepared_images = @max(t.max_prepared_images, count + next_count);
+            }
+        } else if (options.timings) |t| t.max_prepared_images = @max(t.max_prepared_images, count);
+        {
+            const temporary = try consumePreparedMedia(slot, tokenizer, cfg, if (next_count != 0) &slots[next] else null);
+            defer {
+                for (temporary) |vector| slot.allocator().free(vector);
+                slot.allocator().free(temporary);
+            }
+            var valid: usize = 0;
+            for (temporary) |vector| {
+                vectors[initialized] = try out.dupe(f32, vector);
+                initialized += 1;
+                valid += @intFromBool(vector.len != 0);
+            }
+            if (valid != 0) observation.record(valid);
+        }
+        slot.deinit();
+        live[current] = false;
+        if (next_count != 0) {
+            slots[next].join();
+            // Speculative host admission must not turn an otherwise-fitting
+            // sequential request into an error. Retry once after draining the
+            // previous wave; codec/control/runtime failures never retry.
+            if (slots[next].failure) |failure| if (isPreparationPressure(failure)) {
+                slots[next].deinit();
+                slots[next] = PreparationSlot.init(session, source.slice(next_offset, next_count), options, control, if (errors) |e| e[next_offset..][0..next_count] else null);
+                if (options.timings) |t| t.preparation_backpressure_retries += 1;
+                slots[next].run();
+            };
+            current = next;
+            count = next_count;
+        }
+    }
+    try control.check();
+    return .{ .vectors = vectors, .execution = observation.execution(observation.native_items + observation.serial_items) };
+}
+
+/// Vision intermediates drain before the embedding encoder starts. Projected
+/// rows stay resident across that boundary and are covered by output storage.
+/// Reserve the larger phase workspace rather than adding disjoint lifetimes.
+pub fn imageRunRequest(backend: @import("../backends/backends.zig").BackendType, input_bytes: usize, retained_bytes: usize, batch: usize, vision_scratch: usize) @import("../backends/session.zig").RunRequest {
+    return .{ .batch = batch, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = @max(vision_scratch, if (backend == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = batch * raster_max_sequence * 768 * 4 };
+}
+
+fn isPreparationPressure(failure: anyerror) bool {
+    return failure == error.MemoryBudgetExceeded or failure == error.ResourceLimitExceeded or failure == error.ResourceTemporarilyUnavailable;
+}
+
+fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encoder.Config, lookahead: ?*PreparationSlot) ![][]f32 {
+    const a = slot.allocator();
+    const session = slot.session;
+    const options = slot.options;
+    const control = slot.control;
+    const vectors = try a.alloc([]f32, slot.source.len());
+    @memset(vectors, &.{});
+    errdefer {
+        for (vectors) |vector| a.free(vector);
+        a.free(vectors);
+    }
+    if (slot.retained == 0) return vectors;
+    const vision_limit: usize = 2 * 1024 * 1024 * 1024;
+    const vision_scratch = try projector.embeddingGemma2PreparedScratch(slot.pixels[0..slot.retained], vision_limit);
+    const request = imageRunRequest(session.backend(), slot.input_bytes, slot.retained_bytes, slot.source.len(), vision_scratch);
+    var permit = session.admit(request) catch |err| blk: {
+        const future = lookahead orelse return err;
+        if (!isPreparationPressure(err)) return err;
+        // Speculation must not occupy the budget needed by the current wave.
+        // Drain/free it before retrying GPU admission; the owner will prepare
+        // that wave again after the current one has released its permit.
+        future.deinit();
+        future.failure = err;
+        break :blk try session.admit(request);
+    };
+    defer permit.deinit();
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    const transfer_before = managed.backend.debugTimingSnapshot().provider;
+    defer observeResidentTransfers(&managed.backend, transfer_before, options);
+    const vision_started = mediaNow();
+    if (residentImagesEnabled(&managed.backend, options)) {
+        if (options.timings) |t| t.resident_cohorts += 1;
+        var resident = try projector.encodePreparedEmbeddingGemma2ImagesResident(&managed.backend, a, slot.pixels[0..slot.retained], .{ .max_scratch_bytes = vision_scratch });
+        defer resident.deinit();
+        if (options.timings) |t| t.vision_ns += mediaNow() - vision_started;
+        const compact = try runResidentImageBatch(a, &managed.backend, cfg, tokenizer, &resident, options);
+        defer a.free(compact);
+        for (slot.indexes[0..slot.retained], compact) |index, vector| vectors[index] = vector;
+        try control.check();
+        return vectors;
+    }
+    if (options.timings) |t| t.host_cohorts += 1;
+    var projected = try projector.encodePreparedEmbeddingGemma2Images(&managed.backend, a, slot.pixels[0..slot.retained], .{ .max_scratch_bytes = vision_scratch });
+    defer projected.deinit();
+    const pack_started = mediaNow();
+    var groups: [raster_max_batch]PreparedGroup = undefined;
+    var initialized: usize = 0;
+    defer for (groups[0..initialized]) |group| group.deinit(a);
+    var offset: usize = 0;
+    for (slot.indexes[0..slot.retained], projected.tokens_per_image) |index, tokens| {
+        const count = tokens * projected.hidden_size;
+        groups[initialized] = try prepareGroupWithImage(a, &managed.backend, tokenizer, .{ .content = &.{slot.source.part(index)} }, options, control, .{ .id = 258880, .embeddings = projected.embeddings[offset..][0..count], .tokens = tokens });
+        offset += count;
+        initialized += 1;
+    }
+    if (options.timings) |t| {
+        t.vision_ns += pack_started - vision_started;
+        t.pack_ns += mediaNow() - pack_started;
+    }
+    const compact = try runPreparedBatchTimed(a, &managed.backend, cfg, groups[0..initialized], options);
+    defer a.free(compact);
+    for (slot.indexes[0..slot.retained], compact) |index, vector| vectors[index] = vector;
+    try control.check();
+    return vectors;
 }
 
 fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, cfg: encoder.Config, images: []const []const u8, options: Options, lock: ?*std.atomic.Mutex, control: Control, item_errors: ?[]?anyerror) ![][]f32 {
@@ -514,6 +812,9 @@ fn observeResidentTransfers(cb: *const ComputeBackend, before: @import("../ops/o
     if (options.timings) |t| {
         const after = cb.debugTimingSnapshot().provider;
         if (cb.kind() == .metal) {
+            t.gpu_frame_ns += after.decoder_runtime_frame_gpu_nanos -| before.decoder_runtime_frame_gpu_nanos;
+            t.frame_submits += after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits;
+            t.frame_wait_ns += after.decoder_runtime_frame_wait_nanos -| before.decoder_runtime_frame_wait_nanos;
             t.download_bytes = (t.download_bytes orelse 0) + after.metal_tensor_host_mirror_download_bytes - before.metal_tensor_host_mirror_download_bytes;
             t.readbacks = (t.readbacks orelse 0) + after.metal_tensor_to_host_device_calls - before.metal_tensor_to_host_device_calls;
             t.device_owned_peak_bytes = @max(t.device_owned_peak_bytes orelse 0, after.metal_tensor_device_owned_peak_live_bytes);
@@ -944,4 +1245,54 @@ test "embeddinggemma2 resident pooling downloads only final vectors on Metal" {
 }
 test "embeddinggemma2 resident pooling excludes NaN padding on CUDA" {
     try @import("../ops/media_residency_test.zig").onCuda(@import("../ops/media_residency_test.zig").noWeights, checkResidentPooling);
+}
+
+test "gemma4 preparation producer drains cancellation and allocation failures" {
+    const tensor = @import("../backends/tensor.zig");
+    const Mock = struct {
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.Unused;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn canceled(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+    };
+    var dummy: u8 = 0;
+    const session = Session{ .ptr = &dummy, .vtable = &.{ .run = Mock.run, .inputInfo = Mock.info, .outputInfo = Mock.info, .backend = Mock.backend, .close = Mock.close } };
+    const images = [_][]const u8{"bad"};
+    var canceled = PreparationSlot.init(session, .{ .images = &images }, .{}, .{ .check_fn = Mock.canceled }, null);
+    canceled.bounded.backing = std.testing.allocator;
+    _ = canceled.start();
+    canceled.join();
+    try std.testing.expectEqual(error.Cancelled, canceled.failure.?);
+    canceled.deinit();
+    try std.testing.expectEqual(@as(usize, 0), canceled.bounded.live);
+    try std.testing.expect(canceled.permit == null);
+
+    const bytes: [16]u8 = @splat(255);
+    const raster = Raster{ .bytes = &bytes, .width = 2, .height = 2, .stride_bytes = 8 };
+    var denied = PreparationSlot.init(session, .{ .rasters = &.{raster} }, .{}, .{}, null);
+    denied.bounded.backing = std.testing.allocator;
+    denied.bounded.limit = 4;
+    _ = denied.start();
+    denied.join();
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, denied.failure.?);
+    denied.deinit();
+    try std.testing.expectEqual(@as(usize, 0), denied.bounded.live);
+    try std.testing.expect(denied.permit == null);
+
+    // A caller waiting behind another GPU wave must not begin decoding or
+    // consume a preprocessing lease, and its deadline must stay observable.
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    defer gate.unlock();
+    try std.testing.expectError(error.Timeout, embedPreparedMedia(std.testing.allocator, session, undefined, .{ .vision = true }, .{ .images = &images }, .{}, &gate, .{ .deadline_ns = 0 }, null));
+    try std.testing.expect(!gate.tryLock());
 }

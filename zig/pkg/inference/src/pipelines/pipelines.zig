@@ -143,3 +143,7 @@ test {
     _ = @import("adapters.zig");
     _ = @import("onnx_decoder_only_vlm.zig");
 }
+
+test {
+    _ = @import("gemma4_image_broker.zig");
+}
