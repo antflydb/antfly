@@ -35,6 +35,9 @@ pub const PageStore = struct {
     remaining_read_bytes: *u64,
     remaining_write_bytes: *u64,
     read_cache: ?ReadCache = null,
+    /// Background streaming builders bound each page, rather than archive size.
+    /// Query stores retain cumulative request budgets by default.
+    streaming: bool = false,
 
     pub fn store(self: *PageStore) tree.Store {
         return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .check = check };
@@ -77,6 +80,7 @@ pub const PageStore = struct {
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.GraphPageDomainMismatch;
         const bytes = root.encode();
         _ = try graph.Root.decode(&bytes);
+        if (self.streaming) self.remaining_write_bytes.* = tree.max_page_bytes;
         if (bytes.len > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes.len;
         var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, &bytes, self.cancellation);
@@ -111,6 +115,7 @@ pub const PageStore = struct {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         try ref.validate();
         const id = try identity(self.domain, ref);
+        if (self.streaming) self.remaining_read_bytes.* = tree.max_page_bytes;
         if (self.read_cache) |cache| return cache.read(cache.ptr, alloc, self.artifacts, .{
             .kind = .graph_segment,
             .artifact_id = &id,
@@ -126,6 +131,8 @@ pub const PageStore = struct {
     fn put(ptr: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
         const self: *PageStore = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, &ref.attempt, &self.attempt)) return error.GraphPageAttemptMismatch;
+        try ref.validate();
+        if (self.streaming) self.remaining_write_bytes.* = tree.max_page_bytes;
         if (bytes.len > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes.len;
         var metadata = try self.artifacts.putScoped(.{ .domain = self.domain, .attempt = self.attempt }, bytes, self.cancellation);

@@ -147,7 +147,7 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             },
             .ordered_row_index => ordered: {
                 const native = @import("lake_index_ordered_rows.zig");
-                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                if (!native.supportsBuildMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_fingerprints.len != root.files.len) return null;
                 const files = try ca.alloc(state.File, root.files.len);

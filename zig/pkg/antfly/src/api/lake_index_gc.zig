@@ -165,7 +165,8 @@ pub const Collector = struct {
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
-        if (ref.metadata_version == native.metadata_version) {
+        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
+        if (current) {
             if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
             return native.loadRoot(a, self.store, ref, self.cancellation(), null);
         }
@@ -263,6 +264,7 @@ pub const Collector = struct {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                 const root = try self.retainedNativeRoot(a, @import("lake_index_ordered_rows.zig"), ref);
                 try self.markPages(a, root.domain, root.page, true);
+                for (root.build_runs) |build_run| try self.markPages(a, root.domain, build_run.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
                 try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
@@ -772,4 +774,71 @@ test "external lake native GC follows paged file catalogs and independent text d
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
     for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
+}
+
+test "external lake native GC marks checkpoint forests and their covering blocks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-checkpoint-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, null);
+    store.upload_scope = .{ .domain = domain, .attempt = @splat(2) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const ordered = @import("lake_index_ordered_rows.zig");
+    const page_store = @import("../serverless/graph_segment/page_store.zig");
+    const names: []const []const u8 = &.{ "first", "second", "third" };
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, names.len);
+    var hashes: [3][32]u8 = @splat(@splat(0));
+    var keep: [3]bool = @splat(true);
+    for (files, names) |*file, name| file.* = .{ .file_id = @constCast(name), .object_uri = @constCast("file://data"), .byte_len = 1, .row_count = 1, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var previous: ?ordered.Root = null;
+    var ref: local.serverless_manifest_artifact_ref.ArtifactRef = undefined;
+    for (names, 0..) |name, slot| {
+        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 16 * 1024);
+        defer sort.deinit();
+        sort.encoded_bytes = true;
+        const key = ordered.coordinate(@intCast(slot), .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = name, .row_group_ordinal = 0, .row_ordinal = 0 });
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = &key })}, .values = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(slot) })}, .ordinal = 0 });
+        hashes[slot] = @splat(1);
+        keep[slot] = false;
+        ref = try ordered.publishRunCheckpoint(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = if (previous == null) &.{} else &keep, .files = names, .fingerprints = &hashes });
+        keep[slot] = true;
+        previous = try ordered.loadRoot(ca, store, ref, .none, null);
+    }
+    const root = previous.?;
+    try std.testing.expectEqual(ordered.checkpoint_metadata_version, ref.metadata_version);
+    try std.testing.expectEqual(@as(usize, 1), root.build_runs.len);
+    // This graph-only mark does not read or mutate the catalog authority.
+    var collector: Collector = .{ .a = ca, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
+    try collector.markArtifact(ca, ref);
+    try std.testing.expect(collector.marked.contains(ref.artifact_id));
+    var count: usize = 0;
+    for ([_]@import("../serverless/graph_segment/page_tree.zig").Ref{ root.page.?, root.build_runs[0].page }) |page| {
+        try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, page)));
+        var run = root;
+        run.page = page;
+        run.build_runs = &.{};
+        run.build_level = 0;
+        var reader: ordered.Reader = undefined;
+        try reader.init(a, &store, run, root.fingerprint, "", null, .none);
+        defer reader.deinit();
+        const entries = try reader.nextEntries(ca, 4);
+        for (entries) |entry| {
+            try std.testing.expect(collector.marked.contains(entry.cover.?.block.artifact_id));
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
 }

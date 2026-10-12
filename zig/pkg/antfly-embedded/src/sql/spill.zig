@@ -1745,6 +1745,8 @@ pub const Sort = struct {
     orders: []const operators.Order,
     memory_bytes: usize,
     merge_fan_in: usize = 8,
+    /// One ascending, already memcomparable byte key (native index builders).
+    encoded_bytes: bool = false,
     arena: std.heap.ArenaAllocator,
     // Sorting moves only memcomparable prefixes, stable payload positions and
     // ordinals. Typed stores retain payloads and authoritative fallback keys.
@@ -1855,7 +1857,7 @@ pub const Sort = struct {
     }
     pub fn add(self: *Sort, input: Row) !void {
         var row = input;
-        row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
+        row.normalized = try self.normalize(row.keys);
         if (self.finished or row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
         for (row.keys) |key| if (!key.sql_null) {
             _ = try scalar.compareDatums(key, key);
@@ -1896,7 +1898,79 @@ pub const Sort = struct {
         self.estimated +|= retained;
         self.total += 1;
     }
+    fn normalize(self: *const Sort, keys: []const Datum) !?@import("sort_key.zig").Key {
+        if (!self.encoded_bytes) return @import("sort_key.zig").encode(keys, self.orders);
+        if (keys.len != 1 or self.orders.len != 1 or self.orders[0].descending or keys[0].sql_null or keys[0].numeric != null or keys[0].array != null or keys[0].value != .string) return error.InvalidSqlBackendResponse;
+        const bytes = keys[0].value.string;
+        var key: @import("sort_key.zig").Key = .{ .types = std.math.maxInt(u64), .len = @intCast(@min(32, bytes.len)), .complete = bytes.len <= 32 };
+        @memcpy(key.bytes[0..key.len], bytes[0..key.len]);
+        return key;
+    }
+    fn compare(self: *const Sort, left: Row, right: Row) !std.math.Order {
+        if (!self.encoded_bytes) return operators.compareRows(left, right, self.orders);
+        const order = std.mem.order(u8, left.keys[0].value.string, right.keys[0].value.string);
+        return if (order == .eq) std.math.order(left.ordinal, right.ordinal) else order;
+    }
+    fn lessEncoded(self: *Sort, left: Entry, right: Entry) bool {
+        // Typed byte columns return borrowed slices without row reconstruction.
+        const l = self.keys.cell(self.a, left.position, 0) catch unreachable;
+        const r = self.keys.cell(self.a, right.position, 0) catch unreachable;
+        const order = std.mem.order(u8, l.value.string, r.value.string);
+        return if (order == .eq) left.ordinal < right.ordinal else order == .lt;
+    }
+    fn radixEncoded(self: *Sort) !bool {
+        if (self.rows.items.len < 1024) return false;
+        const scratch = try self.a.alloc(Entry, self.rows.items.len);
+        defer self.a.free(scratch);
+        var source = self.rows.items;
+        var target = scratch;
+        // 0 is end-of-key, 1..256 are bytes. This preserves prefix ordering,
+        // embedded zeroes and variable lengths without re-escaping tuples.
+        var pass: usize = 40;
+        while (pass != 0) {
+            pass -= 1;
+            var counts: [257]usize = @splat(0);
+            for (source) |row| counts[encodedByte(row, pass)] += 1;
+            if (for (counts) |count| {
+                if (count == source.len) break true;
+            } else false) continue;
+            var offsets: [257]usize = undefined;
+            var offset: usize = 0;
+            for (counts, &offsets) |count, *start| {
+                start.* = offset;
+                offset += count;
+            }
+            for (source) |row| {
+                const byte = encodedByte(row, pass);
+                target[offsets[byte]] = row;
+                offsets[byte] += 1;
+            }
+            std.mem.swap([]Entry, &source, &target);
+        }
+        if (source.ptr != self.rows.items.ptr) @memcpy(self.rows.items, source);
+        // Only equal truncated prefixes need authoritative full-byte compares.
+        var begin: usize = 0;
+        while (begin < source.len) {
+            var end = begin + 1;
+            const first = self.rows.items[begin].normalized.?;
+            while (end < source.len) : (end += 1) {
+                const key = self.rows.items[end].normalized.?;
+                if (key.len != first.len or !std.mem.eql(u8, key.bytes[0..key.len], first.bytes[0..first.len])) break;
+            }
+            if (for (self.rows.items[begin..end]) |row| {
+                if (!row.normalized.?.complete) break true;
+            } else false) std.sort.pdq(Entry, self.rows.items[begin..end], self, lessEncoded);
+            begin = end;
+        }
+        self.radix_runs += 1;
+        return true;
+    }
+    fn encodedByte(row: Entry, pass: usize) usize {
+        const key = row.normalized.?;
+        return if (pass < 32) (if (pass < key.len) @as(usize, key.bytes[pass]) + 1 else 0) else @as(u8, @truncate(row.ordinal >> @as(u6, @intCast((39 - pass) * 8))));
+    }
     fn radixRows(self: *Sort) !bool {
+        if (self.encoded_bytes) return self.radixEncoded();
         if (self.rows.items.len < 1024) return false;
         const first = self.rows.items[0].normalized orelse return false;
         if (!first.complete) return false;
@@ -1943,6 +2017,10 @@ pub const Sort = struct {
     }
     fn sortRows(self: *Sort) !void {
         if (try self.radixRows()) return;
+        if (self.encoded_bytes) {
+            std.sort.pdq(Entry, self.rows.items, self, lessEncoded);
+            return;
+        }
         const Comparator = struct {
             sort: *Sort,
             scratch: std.heap.ArenaAllocator,
@@ -1992,7 +2070,7 @@ pub const Sort = struct {
         if (self.parallel_runs and self.memory_bytes >= 128 * 1024) {
             try self.ensureRunStore();
             const job = try self.a.create(RunJob);
-            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false, .shared_runs = self.shared_runs, .run_store = self.run_store, .owns_run_store = false } };
+            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .encoded_bytes = self.encoded_bytes, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false, .shared_runs = self.shared_runs, .run_store = self.run_store, .owns_run_store = false } };
             if (@import("parallel_scheduler.zig").global().submit(self.manager.io, self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
                 job.task = task;
                 self.pending_run = job;
@@ -2106,7 +2184,7 @@ pub const Sort = struct {
         if (offset == 0) try file.seal();
         _ = a;
         var decoded = try file.readBorrowed(offset);
-        decoded.row.normalized = @import("sort_key.zig").encode(decoded.row.keys, self.orders);
+        decoded.row.normalized = try self.normalize(decoded.row.keys);
         return decoded;
     }
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
@@ -2123,7 +2201,7 @@ pub const Sort = struct {
             try self.manager.check();
             var selected: ?usize = null;
             for (heads[0..inputs.len], 0..) |head, index| if (head) |value| {
-                if (selected == null or (try operators.compareRows(value.row, heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+                if (selected == null or (try self.compare(value.row, heads[selected.?].?.row)) == .lt) selected = index;
             };
             const index = selected orelse break;
             const head = heads[index].?;
@@ -2149,6 +2227,7 @@ pub const Sort = struct {
             var claimed: usize = 0;
             for (&jobs) |*slot| {
                 var local = Sort.init(self.a, self.manager, self.orders, self.memory_bytes / 2);
+                local.encoded_bytes = self.encoded_bytes;
                 local.max_row_bytes = self.max_row_bytes;
                 local.merge_fan_in = self.merge_fan_in;
                 local.parallel_runs = false;
@@ -2243,7 +2322,7 @@ pub const Sort = struct {
                 self.owned_heads[index] = block;
                 self.owned_positions[index] = 0;
                 var row = try block.keyRowAlloc(arena.allocator(), 0);
-                row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
+                row.normalized = try self.normalize(row.keys);
                 head.* = .{ .row = row, .next = none, .matched = false, .following = 1 };
             } else head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
         }
@@ -2302,7 +2381,7 @@ pub const Sort = struct {
         }
         var selected: ?usize = null;
         for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
-            if (selected == null or (try operators.compareRows(value.row, self.heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+            if (selected == null or (try self.compare(value.row, self.heads[selected.?].?.row)) == .lt) selected = index;
         };
         if (selected) |index| {
             const head = self.heads[index].?;
@@ -2322,7 +2401,7 @@ pub const Sort = struct {
             self.heads[index] = if (self.owned_heads[index]) |block| blk: {
                 _ = self.head_arenas[index].reset(.retain_capacity);
                 var row = try block.keyRowAlloc(self.head_arenas[index].allocator(), self.owned_positions[index]);
-                row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
+                row.normalized = try self.normalize(row.keys);
                 break :blk .{ .row = row, .next = none, .matched = false, .following = head.following + 1 };
             } else null;
             // A delivery lease exposes payload cells and ordinal. Merge keys
@@ -2357,7 +2436,7 @@ pub const Sort = struct {
         if (self.output_count != 0) {
             var selected: ?usize = null;
             for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
-                if (selected == null or (try operators.compareRows(value.row, self.heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+                if (selected == null or (try self.compare(value.row, self.heads[selected.?].?.row)) == .lt) selected = index;
             };
             const index = selected orelse return null;
             const head = self.heads[index].?;
@@ -3426,4 +3505,53 @@ test "SQL shared logical runs avoid repeatedly rewriting large retained runs" {
     }
     std.debug.print("Shared spill runs: legacy_written={d} balanced_written={d}\n", .{ written[0], written[1] });
     try std.testing.expect(written[1] < written[0]);
+}
+
+test "SQL dynamic exact keys native byte sort handles variable prefixes long ties and spill rewind" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    // Exercise the radix path in memory and the same order across run merges.
+    for ([_]usize{ 8 * 1024 * 1024, 16 * 1024 }) |memory_bytes| {
+        var sort = Sort.init(a, &manager, &.{.{}}, memory_bytes);
+        defer sort.deinit();
+        sort.encoded_bytes = true;
+        sort.parallel_runs = false;
+        sort.shared_runs = true;
+        const texts = [_][]const u8{ "", "a", "a\x00", "a\x00b", "a\xff", "abcdefghijklmnopqrstuvwx123456789", "abcdefghijklmnopqrstuvwx123456789\x00", "abcdefghijklmnopqrstuvwx1234567890" };
+        for (0..4096) |i| {
+            const ordinal = 4095 - i;
+            try sort.add(.{ .keys = &.{Datum.json(.{ .string = texts[ordinal % texts.len] })}, .values = &.{}, .ordinal = ordinal });
+        }
+        try sort.finish();
+        if (memory_bytes > 1024 * 1024) try std.testing.expect(sort.radix_runs != 0);
+        for (0..2) |_| {
+            var count: usize = 0;
+            var previous: ?[]u8 = null;
+            defer if (previous) |bytes| a.free(bytes);
+            var prior_ordinal: u64 = 0;
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            while (true) {
+                _ = scratch.reset(.retain_capacity);
+                const row = try sort.next(scratch.allocator()) orelse break;
+                const key = row.keys[0].value.string;
+                if (previous) |old| {
+                    const order = std.mem.order(u8, old, key);
+                    try std.testing.expect(order == .lt or (order == .eq and prior_ordinal < row.ordinal));
+                    a.free(old);
+                }
+                previous = null;
+                previous = try a.dupe(u8, key);
+                prior_ordinal = row.ordinal;
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 4096), count);
+            try sort.rewind();
+        }
+    }
 }

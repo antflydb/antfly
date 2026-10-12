@@ -4065,14 +4065,19 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
     objects.mkdir(parents=True)
     path = tmp_path / "probe.parquet"
     count, fanout = 8192, 600
-    pq.write_table(pa.table({
-        "k": pa.array([0 if i < fanout else i for i in range(count)], type=pa.int64()),
-        "v": pa.array(range(count), type=pa.int64()),
-    }), path, compression="snappy", use_dictionary=False, row_group_size=1024)
-    payload = path.read_bytes()
-    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
-    object_path = objects / "part.parquet"
-    object_path.write_bytes(header + payload)
+    # Nine real files exercise durable run compaction and final assembly.
+    physical_objects = []
+    for part, begin in enumerate(range(0, count, 1000)):
+        end = min(count, begin + 1000)
+        pq.write_table(pa.table({
+            "k": pa.array([0 if i < fanout else i for i in range(begin, end)], type=pa.int64()),
+            "v": pa.array(range(begin, end), type=pa.int64()),
+        }), path, compression="snappy", use_dictionary=False, row_group_size=256)
+        payload = path.read_bytes()
+        header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+        object_path = objects / f"part-{part}.parquet"
+        object_path.write_bytes(header + payload)
+        physical_objects.append((object_path, header, payload))
     server = StandaloneAntflyServer(
         resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0
     )
@@ -4107,17 +4112,38 @@ def test_dynamic_join_uses_bounded_native_index_seeks(tmp_path, covering):
         )
         expected = [[str(i), "0"] for i in range(fanout) for _ in range(2)] + [[str(count - 1), str(count - 1)]]
         assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        # More than 4096 distinct build keys must remain a complete, bounded
+        # exact stream. Most keys miss; duplicates retain join multiplicity.
+        build_keys = list(range(count - 100, count)) + list(range(count + 1, count + 5001)) + [count - 1, None]
+        build_root = tmp_path / "build-lake"
+        build_objects = build_root / "buckets" / "antfly" / "objects"
+        build_objects.mkdir(parents=True)
+        pq.write_table(pa.table({"k": pa.array(build_keys, type=pa.int64())}), path,
+            compression="snappy", row_group_size=512)
+        build_payload = path.read_bytes()
+        (build_objects / "part.parquet").write_bytes(
+            b"AFOBJ001" + struct.pack("<QI", len(build_payload), 0)
+            + hashlib.sha256(build_payload).hexdigest().encode() + build_payload)
+        call("POST", "/tables/join_build", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "join-build", "format": "parquet", "uri": build_root.as_uri(),
+            },
+        }})
+        large_statement = "SELECT COUNT(*) FROM join_probe p JOIN join_build b ON p.k=b.k"
+        assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
         server.pause()
         if covering:
             # Preserve object identity/footer while making every physical data
             # page unreadable. The leased covering index must satisfy the join.
-            footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
-            object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+            for object_path, header, payload in physical_objects:
+                footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+                object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
         for cached in list(server.root.rglob("lake-ranges")):
             if cached.is_dir():
                 shutil.rmtree(cached)
         server.resume()
         assert call("POST", "/sql", {"statement": statement, "limit": 2048})["rows"] == expected
+        assert call("POST", "/sql", {"statement": large_statement})["rows"] == [["101"]]
         failed = False
     finally:
         server.stop(test_failed=failed)

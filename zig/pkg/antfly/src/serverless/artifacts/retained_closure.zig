@@ -24,7 +24,7 @@ const Fs = @import("fs_store.zig").FsStore;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Certificate = struct { version: u8 = 1, root: []const u8, witnesses: []const api.RetentionWitness };
-const Pending = struct { arena: std.heap.ArenaAllocator, root: []const u8, witnesses: []const api.RetentionWitness, fresh: api.UploadScope };
+const Pending = struct { arena: std.heap.ArenaAllocator, root: []const u8, witnesses: []const api.RetentionWitness, fresh: api.UploadScope, epoch: ?[16]u8 };
 pending: std.ArrayList(Pending) = .empty,
 const Self = @This();
 
@@ -75,6 +75,20 @@ pub fn witness(fs: *Fs, scope: api.UploadScope, token: Token) !?api.RetentionWit
 }
 fn epochPath(fs: *Fs, a: A, scope: api.UploadScope) ![]u8 {
     return std.fs.path.join(a, &.{ fs.inventory_root, ".retention-epochs-v1", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
+}
+fn readEpoch(fs: *Fs, scope: api.UploadScope, token: Token) !?[16]u8 {
+    try token.check();
+    const path = try epochPath(fs, fs.alloc, scope);
+    defer fs.alloc.free(path);
+    var threaded = std.Io.Threaded.init(fs.alloc, .{});
+    defer threaded.deinit();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, fs.alloc, .limited(17)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer fs.alloc.free(bytes);
+    if (bytes.len != 16) return error.InvalidRetentionCertificate;
+    return bytes[0..16].*;
 }
 /// Restoration tooling must call this before changing immutable payloads in
 /// place. Ordinary uploads replace directory entries; their inode stamps also
@@ -175,8 +189,17 @@ pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness
     try @import("fs_store.zig").writeFileAtomicallyWithCancellation(path, framed, token);
 }
 pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope, token: Token) !void {
-    if (self.pending.items.len == 64) return;
     if (!std.meta.eql((try api.uploadScopeFromArtifactId(id)) orelse return error.InvalidRetentionCertificate, fresh)) return error.InvalidRetentionCertificate;
+    // Same-attempt descendants inherit an unsealed proof by construction.
+    // Replace the advisory ancestor entry so per-file checkpoints cannot fill
+    // the bounded directory and prevent certifying the final serving root.
+    if (previous) |old| for (self.pending.items) |*pending| {
+        if (std.mem.eql(u8, pending.root, old) and std.meta.eql(pending.fresh, fresh)) {
+            if (pending.root.len == id.len) @memcpy(@constCast(pending.root), id) else pending.root = try pending.arena.allocator().dupe(u8, id);
+            return;
+        }
+    };
+    if (self.pending.items.len == 64) return;
     var arena = std.heap.ArenaAllocator.init(fs.alloc);
     var keep = false;
     defer if (!keep) arena.deinit();
@@ -197,7 +220,7 @@ pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fres
     }
     if (witnesses.len == 4096) return;
     const owned = try a.dupe(u8, id);
-    try self.pending.append(fs.alloc, .{ .arena = arena, .root = owned, .witnesses = witnesses, .fresh = fresh });
+    try self.pending.append(fs.alloc, .{ .arena = arena, .root = owned, .witnesses = witnesses, .fresh = fresh, .epoch = try readEpoch(fs, fresh, token) });
     keep = true;
 }
 pub fn seal(self: *Self, fs: *Fs, token: Token) !void {
@@ -206,7 +229,9 @@ pub fn seal(self: *Self, fs: *Fs, token: Token) !void {
         self.pending.clearRetainingCapacity();
     }
     for (self.pending.items) |*pending| {
+        if (!std.meta.eql(pending.epoch, try readEpoch(fs, pending.fresh, token))) continue;
         const fresh = (try witness(fs, pending.fresh, token)) orelse continue;
+        if (!std.meta.eql(pending.epoch, try readEpoch(fs, pending.fresh, token))) continue;
         const a = pending.arena.allocator();
         const witnesses = try a.alloc(api.RetentionWitness, pending.witnesses.len + 1);
         @memcpy(witnesses[0..pending.witnesses.len], pending.witnesses);
@@ -262,4 +287,39 @@ test "external lake retained closure certificates survive reopen inherit deltas 
     defer a.free(path);
     try @import("fs_store.zig").writeFileAtomicallyWithCancellation(path, "corrupt certificate", .none);
     try std.testing.expect(!try fresh.retainedClosure(next.artifact_id, .none));
+}
+
+test "external lake retained closure pending descendants stay bounded and reject build time deletion" {
+    const a = std.testing.allocator;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("pending-closure-chain");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(2) };
+    var root = try store.put("first");
+    defer root.deinit(a);
+    try store.inheritClosure(root.artifact_id, null, .none);
+    for (0..100) |n| {
+        var bytes: [32]u8 = undefined;
+        var next = try store.put(try std.fmt.bufPrint(&bytes, "root-{d}", .{n}));
+        store.inheritClosure(next.artifact_id, root.artifact_id, .none) catch |err| {
+            next.deinit(a);
+            return err;
+        };
+        root.deinit(a);
+        root = next;
+        try std.testing.expectEqual(@as(usize, 1), fs.retention.pending.items.len);
+    }
+    try store.sealClosures(.none);
+    try std.testing.expect(try store.retainedClosure(root.artifact_id, .none));
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    var leaf = try store.put("referenced leaf");
+    defer leaf.deinit(a);
+    var next = try store.put("next root");
+    defer next.deinit(a);
+    try store.inheritClosure(next.artifact_id, root.artifact_id, .none);
+    try store.delete(leaf.artifact_id);
+    try store.sealClosures(.none);
+    try std.testing.expect(!try store.retainedClosure(next.artifact_id, .none));
 }

@@ -2370,3 +2370,81 @@ formats. The two native module-boundary audits, Apache product audit across
 2,026 sources, changed-source formatting/license headers, Python syntax and diff
 checks pass. Archive-scale throughput, RSS and provider-request benchmarks
 remain pending.
+
+### Ordered closure proofs, durable build runs, and large dynamic probes
+
+Ordered row indexes now use the artifact backend's retained-closure capability,
+matching native text indexes. An authenticated root carries its artifact identity
+only in memory. A valid backend certificate skips the four tree walks and covering
+block HEAD checks during reuse. A cold audit records witnesses before reading each
+scope and remembers a certificate only after all dependencies and active-reader
+checks pass. Unsupported backends continue to perform the complete audit. Deletion
+or destructive restoration invalidates witnesses before mutation; ordinary leased
+reads still authenticate data. Same-attempt checkpoint descendants replace their
+pending advisory ancestor proof, so thousands of checkpoints cannot crowd the
+final serving root out of the bounded proof directory. A pending fresh-scope
+destructive epoch is checked before sealing, so build-time deletion cannot be
+certified by taking a newer witness.
+
+An initial ordered build checkpoints durable, authenticated sorted runs instead
+of reconstructing the growing serving index after every source file. Equal run
+levels compact by binary carry, leaving at most one run per level. Checkpoints
+retain file fingerprints and stable slots, so a restart scans only unfinished
+files. Cover blocks remain referenced by the runs. GC walks those run trees and
+cover references, including checkpoints pinned by build authority. Final assembly
+merges the bounded forest once to construct forward, reverse, tie and predicate
+trees. Checkpoint forests use metadata version 6 and cannot be installed as
+serving roots; version-5 workers skip these derived checkpoint candidates and
+rebuild safely. Replaced or removed immutable file identities use the ordinary filtered merge rather than appending
+conflicting coordinates. Serving roots omit checkpoint-only fields and keep the
+existing ordered tuple encoding.
+
+For incremental serving roots, copy-on-write admission estimates touched page
+bytes per mutation batch, including repeated ancestor rewrites. It uses ordered
+seeks through sorted additions and a conservative deletion estimate, compared
+with a sampled streaming-rebuild estimate. Identical row counts with clustered
+and scattered tuples can therefore choose different strategies. Background
+streaming builders bound each authenticated page and covering block individually;
+query cursors retain their cumulative read budgets. Build cancellation and lease
+checks remain active throughout streaming and spill operations.
+
+Native tuple and tie builders explicitly select encoded-byte sort mode. Keys are
+already memcomparable, so normalization copies their leading bytes directly.
+A variable-length radix pass distinguishes end-of-key from every byte, including
+zero. Equal truncated prefixes compare borrowed full byte slices, without rebuilding
+Datum rows. Spill runs, parallel run jobs, merges, and replay use the same comparator
+and ordinal tie breaker. General SQL sorts keep their typed comparison semantics.
+
+Dynamic join filters retain their small in-memory exact tuple set and move it to
+a statement-owned sorted spill stream when its cardinality or memory allowance is
+exceeded. The 4,096-key threshold is a representation crossover, rather than a
+semantic cutoff when spill is available. Each native access candidate projects and
+sorts encoded leading-key prefixes using bounded spill storage, deduplicates those
+prefixes during replay, and costs the complete stream against a scan. Execution
+keeps the verified B+tree path between ascending probe windows. Join multiplicity
+still comes from the authoritative join state; duplicate projected prefixes do not
+rescan source rows. Disk or memory admission failure abandons the entire optional
+exact set and retains the Bloom/domain scan path. Cancellation and I/O failures
+propagate. No partial exact set can exclude rows.
+
+Exact NUMERIC values retain their typed payload at this boundary. A JSON-null
+placeholder is never encoded as an index NULL. Same-domain values use lossless
+numeric bounds; unsupported cross-domain conversion declines the optional access
+path. Numeric filter masks also preserve the numeric scalar identity.
+
+Validation covers variable-length and embedded-zero sort keys, long equal prefixes,
+spill replay, complete dynamic sets above 4,096 keys, admission fallback, seventy
+durable checkpoints, backend reopening, final closure proof reuse and invalidation,
+and a real-Parquet multi-file join with duplicate/NULL build keys. The covering E2E
+restarts after making source data pages unreadable, proving that the native index
+serves both small and spilled build sets. These checks establish semantics and
+bounded representations; archive-scale speedups still require workload benchmarks.
+
+Validation for this refinement (Zig 0.17.0, Debug): all 350 lake integration
+checks and 60 focused checks pass, with one optional benchmark skipped. Final
+regressions also verify checkpoint-format GC marks every run and cover dependency,
+and warm reverse cursors check cancellation before returning another row. All
+15 selected real Parquet/Iceberg E2Es pass, including exact ordered bounds and
+signed timestamp ordering. The production CLI builds. Formatting, Python syntax,
+module/product boundary audits (822 embedded and 2,027 Apache sources), and diff
+checks pass. No archive-scale throughput, RSS, or request-count claim is made.

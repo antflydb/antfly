@@ -1825,9 +1825,9 @@ fn Engine(comptime Context: type) type {
                         .integer, .number, .string, .boolean => {},
                         else => return,
                     }
-                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind };
+                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
                 }
-                self.scan_filter = try @import("dynamic_filter.zig").Filter.create(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32);
+                self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, self.engine.context.spill);
             }
             fn membershipCheckpoint(raw: *anyopaque) !void {
                 const engine: *Self = @ptrCast(@alignCast(raw));

@@ -63,6 +63,7 @@ const Entry = struct {
     changed: []const bool,
     slots: []const u32,
     delta: ordered.Delta,
+    initial_build: bool = false,
     reverse: ?*ordered.ReverseBuilder = null,
     built_hashes: [][32]u8,
     retained: []bool,
@@ -80,7 +81,7 @@ const Entry = struct {
 /// The same seed proof is used by shared replay planning and cohort execution.
 fn priorRoot(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !?ordered.Root {
     for (candidates) |decl| {
-        if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
+        if (decl.artifact.kind != .ordered_row_index or !ordered.supportsBuildMetadata(decl.artifact.metadata_version) or !std.mem.eql(u8, decl.name, name)) continue;
         var previous_binding = decl.binding;
         previous_binding.snapshot_id = binding.snapshot_id;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
@@ -250,8 +251,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
+            entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
         if (entries.items.len == 0) continue;
         for (entries.items) |*entry| entry.sort.memory_bytes = sort_workspace_bytes / entries.items.len;
@@ -270,8 +272,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             need.* = need.* or changed;
         };
         var ordinal: u64 = 0;
-        // Sort and publish one source file at a time. Neither the fused
-        // metadata sorts nor replay retain archive-sized local runs.
+        // Checkpoint one source file at a time into durable merge levels.
+        // Fused sorts and replay never retain archive-sized local runs.
         for (needed, 0..) |need, file_index| {
             if (!need) continue;
             input.only_files = null;
@@ -346,7 +348,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;
                 }
-                const ref = ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) catch |err| {
+                const ref = (if (entry.initial_build) ordered.publishRunCheckpoint(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) else ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta)) catch |err| {
                     if (err == error.SqlProgramLimitExceeded) {
                         const admission = manager.admissionStats();
                         std.log.warn("native ordered lake admission exhausted file_index={d} total_files={d} peak_spill_files={d} peak_spill_bytes={d} spill_byte_limit={d}", .{ file_index, needed.len, admission.peak_files, admission.peak_bytes, admission.max_bytes });
@@ -363,11 +365,13 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 // Retaining every prefix here would grow metadata quadratically.
                 _ = entry.root_arena.reset(.free_all);
                 entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+                entry.initial_build = entry.delta.previous.?.building;
                 @memset(entry.retained, true);
                 entry.delta.keep = entry.retained;
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
                 entry.sort.shared_runs = true;
+                entry.sort.encoded_bytes = true;
             }
         }
         for (entries.items) |*entry| {
@@ -377,7 +381,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
             // With no changed file, an empty incremental merge still retires
             // deleted source slots. Otherwise the last per-file root is final.
-            const root = entry.published orelse try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
+            const root = if (entry.initial_build) try ordered.finalizeRunCheckpoint(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta) else entry.published orelse try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
             var owned_binding = entry.binding;
             owned_binding.source_id = try out.dupe(u8, entry.binding.source_id);
             owned_binding.snapshot_id = try out.dupe(u8, entry.binding.snapshot_id);

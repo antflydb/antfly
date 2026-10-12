@@ -909,8 +909,20 @@ pub const Cursor = struct {
     }
 
     pub fn next(self: *Cursor) !?Record {
+        if (self.reverse) {
+            try self.store.check(self.store.ptr);
+            return self.previous();
+        }
+        return self.nextBounded(self.upper, false);
+    }
+    /// A sequence of disjoint ascending ranges can retain its verified path.
+    /// Reaching a window bound does not consume its first excluded record.
+    pub fn nextWindow(self: *Cursor, upper: ?[]const u8) !?Record {
+        if (self.reverse) return error.InvalidGraphPage;
+        return self.nextBounded(upper, true);
+    }
+    fn nextBounded(self: *Cursor, upper: ?[]const u8, retain_path: bool) !?Record {
         try self.store.check(self.store.ptr);
-        if (self.reverse) return self.previous();
         while (self.depth != 0) {
             const frame = &self.frames[self.depth - 1];
             if (frame.next == frame.page.entries.len) {
@@ -919,8 +931,8 @@ pub const Cursor = struct {
                 continue;
             }
             const entry = frame.page.entries[frame.next];
-            if (self.upper) |bound| if (!less(entry.key, bound)) {
-                self.deinit();
+            if (upper) |bound| if (!less(entry.key, bound)) {
+                if (!retain_path) self.deinit();
                 return null;
             };
             frame.next += 1;
@@ -1582,6 +1594,10 @@ test "external lake reverse tree seeks bounded ranges across leaves" {
     defer last.deinit();
     try std.testing.expectEqual(@as(u64, 9999), std.mem.readInt(u64, (try last.next()).?.key[0..8], .big));
     try std.testing.expect(backing.reads - before <= root.?.height + 1);
+    // Even a warm leaf must check cancellation before returning another row.
+    backing.canceled = true;
+    try std.testing.expectError(error.Canceled, last.next());
+    backing.canceled = false;
 }
 
 test "external lake text statistics page reductions reuse interior subtrees and survive COW allocation failures" {
