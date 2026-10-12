@@ -17,6 +17,7 @@ const std = @import("std");
 const backends = @import("../backends/backends.zig");
 const donut_mod = @import("donut.zig");
 const moondream_mod = @import("moondream.zig");
+const moondream_reader_mod = @import("moondream_reader.zig");
 const model_manager_mod = @import("../server/model_manager.zig");
 const generation = @import("../pipelines/generation.zig");
 const multistage_metadata = @import("multistage_metadata.zig");
@@ -202,25 +203,18 @@ const VisionLoadedReader = struct {
     }
 };
 
-/// Native Moondream reader seam.
+/// Native Moondream reader seam, backed by `moondream_reader.zig` (no ONNX
+/// Runtime). See models/moondream/MOONDREAM.md.
 ///
-/// Moondream used to read through ONNX Runtime (a decoder-only VLM session or an
-/// ORT GenAI package). Both paths were removed with ONNX Runtime. A native
-/// Moondream reader plugs in here:
-///
-/// 1. `probe` reports whether a model directory holds artifacts the native
-///    reader can load (no weights are loaded while probing).
-/// 2. `load` builds the reader. Add a `moondream` variant to `LoadedReader`
-///    holding it and return that variant from `load`.
-///
-/// Until then, Moondream model directories fail with
-/// `error.NativeMoondreamNotYetSupported`, which the HTTP read path reports as
-/// a 400 `INVALID_MODEL` response.
+/// 1. `probe` reports whether a model directory holds a `moondream1`
+///    config, tokenizer, and safetensors checkpoint (no weights are loaded).
+/// 2. `load` builds the `moondream` `LoadedReader` variant. Directories that
+///    look like Moondream by name but lack native artifacts (for example the
+///    removed ONNX exports) fail with `error.UnsupportedMoondreamArtifacts`,
+///    which the HTTP read path reports as a 400 `INVALID_MODEL` response.
 const native_moondream = struct {
     fn probe(allocator: std.mem.Allocator, model_path: []const u8) !bool {
-        _ = allocator;
-        _ = model_path;
-        return false;
+        return moondream_reader_mod.probeModelDir(allocator, model_path);
     }
 
     fn load(
@@ -230,12 +224,45 @@ const native_moondream = struct {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
-        _ = allocator;
-        _ = model_path;
-        _ = session_manager;
         _ = model_manager;
         if (control) |active| try active.check();
-        return error.NativeMoondreamNotYetSupported;
+        if (!try probe(allocator, model_path)) return error.UnsupportedMoondreamArtifacts;
+        return .{ .moondream = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, session_manager.io) };
+    }
+};
+
+const NativeMoondreamLoadedReader = struct {
+    allocator: std.mem.Allocator,
+    core: moondream_reader_mod.LoadedMoondreamReader,
+
+    pub fn loadFromDirWithControl(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        control: ?InferenceExecutionControl,
+        io: ?std.Io,
+    ) !NativeMoondreamLoadedReader {
+        return .{
+            .allocator = allocator,
+            .core = try moondream_reader_mod.LoadedMoondreamReader.loadFromDirWithControl(allocator, model_path, control, io),
+        };
+    }
+
+    pub fn deinit(self: *NativeMoondreamLoadedReader) void {
+        self.core.deinit();
+    }
+
+    pub fn read(self: *NativeMoondreamLoadedReader, image_data: []const u8, options: ReadOptions) !Result {
+        var raw = try self.core.readRaw(image_data, options);
+        defer raw.deinit();
+        return parseOutput(self.allocator, .moondream, raw.text, options.prompt);
+    }
+
+    pub fn readBatch(self: *NativeMoondreamLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return readBatchSerial(NativeMoondreamLoadedReader, self, image_datas, options);
+    }
+
+    pub fn inputTokenCount(self: *NativeMoondreamLoadedReader, options: ReadOptions) !usize {
+        return self.core.inputTokenCount(options);
     }
 };
 
@@ -265,6 +292,7 @@ pub const ExecutionFence = struct {
 
 pub const LoadedReader = union(enum) {
     vision: VisionLoadedReader,
+    moondream: NativeMoondreamLoadedReader,
     multistage: multistage_reader_mod.LoadedMultiStageReader,
 
     pub fn loadFromDir(
@@ -351,6 +379,7 @@ pub const LoadedReader = union(enum) {
     pub fn deinit(self: *LoadedReader) void {
         switch (self.*) {
             .vision => |*reader| reader.deinit(),
+            .moondream => |*reader| reader.deinit(),
             .multistage => |*reader| reader.deinit(),
         }
     }
@@ -359,6 +388,7 @@ pub const LoadedReader = union(enum) {
         try validateReadOptions(options);
         var result = try switch (self.*) {
             .vision => |*reader| reader.read(image_data, options),
+            .moondream => |*reader| reader.read(image_data, options),
             .multistage => |*reader| reader.read(image_data, options),
         };
         errdefer result.deinit();
@@ -369,7 +399,7 @@ pub const LoadedReader = union(enum) {
     pub fn snapshotMetalGeneratedQuantStats(self: *LoadedReader, allocator: std.mem.Allocator) metal_generated_quant_stats.Stats {
         return switch (self.*) {
             .vision => |*reader| reader.core.snapshotMetalGeneratedQuantStats(allocator),
-            .multistage => .{},
+            .moondream, .multistage => .{},
         };
     }
 
@@ -383,6 +413,7 @@ pub const LoadedReader = union(enum) {
         const allocator = self.resultAllocator();
         const batch = try switch (self.*) {
             .vision => |*reader| reader.readBatchReported(image_datas, options),
+            .moondream => |*reader| BatchResult{ .results = try reader.readBatch(image_datas, options), .mode = .serial },
             .multistage => |*reader| BatchResult{ .results = try readBatchSerial(@TypeOf(reader.*), reader, image_datas, options), .mode = .serial },
         };
         errdefer {
@@ -403,7 +434,7 @@ pub const LoadedReader = union(enum) {
         const allocator = self.resultAllocator();
         const batch = try switch (self.*) {
             .vision => |*reader| reader.readBorrowedRasterBatchReported(rasters, options),
-            .multistage => return error.BorrowedRasterUnsupported,
+            .moondream, .multistage => return error.BorrowedRasterUnsupported,
         };
         errdefer {
             for (batch.results) |*result| result.deinit();
@@ -421,6 +452,7 @@ pub const LoadedReader = union(enum) {
         try validateReadOptions(options);
         return switch (self.*) {
             .vision => |*reader| reader.inputTokenCount(options),
+            .moondream => |*reader| reader.inputTokenCount(options),
             .multistage => 0,
         };
     }
@@ -525,7 +557,7 @@ fn validateVisionReadOptions(parser_kind: ParserKind, options: ReadOptions) !voi
 }
 
 pub const ReaderKind = enum { multistage, moondream, encoder_decoder, native_vision };
-pub const UnsupportedReason = enum { no_reader_artifacts, invalid_metadata, native_moondream_not_supported };
+pub const UnsupportedReason = enum { no_reader_artifacts, invalid_metadata, unsupported_moondream_artifacts };
 pub const ReaderSupport = union(enum) {
     supported: ReaderKind,
     unsupported: UnsupportedReason,
@@ -558,7 +590,7 @@ pub fn probeManifest(
         return if (try native_moondream.probe(allocator, model_path))
             .{ .supported = .moondream }
         else
-            .{ .unsupported = .native_moondream_not_supported };
+            .{ .unsupported = .unsupported_moondream_artifacts };
     }
     if (try enc_dec_mod.hasEncoderDecoderPaths(allocator, model_path, man))
         return .{ .supported = .encoder_decoder };
@@ -1135,15 +1167,28 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
 }
 
-test "Moondream readers fail closed until the native reader lands" {
+test "Moondream readers route natively only with native checkpoint artifacts" {
     const allocator = std.testing.allocator;
     const man = manifest_mod.ModelManifest{ .allocator = allocator };
+    // Missing or ONNX-only Moondream directories stay unsupported and fail
+    // closed without loading anything.
     const support = try probeManifest(allocator, "models/readers/vikhyatk/moondream2", man);
-    try std.testing.expectEqual(UnsupportedReason.native_moondream_not_supported, support.unsupported);
-
+    try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, support.unsupported);
     var session_manager = backends.SessionManager.init(allocator);
     try std.testing.expectError(
-        error.NativeMoondreamNotYetSupported,
+        error.UnsupportedMoondreamArtifacts,
         LoadedReader.loadFromDirWithControl(allocator, "models/readers/vikhyatk/moondream2", &session_manager, undefined, null),
     );
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "moondream2");
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "moondream2" });
+    defer allocator.free(model_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/config.json", .data = "{\"model_type\":\"moondream1\"}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/decoder_model_merged.onnx", .data = "onnx" });
+    try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, (try probeManifest(allocator, model_dir, man)).unsupported);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/tokenizer.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "moondream2/model.safetensors", .data = "" });
+    try std.testing.expectEqual(ReaderKind.moondream, (try probeManifest(allocator, model_dir, man)).supported);
 }

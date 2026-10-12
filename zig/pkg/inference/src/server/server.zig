@@ -89,6 +89,7 @@ const rebel_mod = @import("../pipelines/rebel.zig");
 const resolver_mod = @import("../pipelines/resolver.zig");
 const cleanup_pipeline_mod = @import("../pipelines/entity_cleanup.zig");
 const cleanup_model_mod = @import("../finetune/entity_cleanup_model.zig");
+const moondream_pipeline = @import("../pipelines/moondream.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
@@ -12470,6 +12471,39 @@ pub const Node = struct {
             config.grammar = grammar;
         }
 
+        // Native Moondream2 (moondream1 checkpoints): one image plus the
+        // last user turn's question; no ONNX Runtime.
+        if (moondream_pipeline.isSupportedModelDir(ctx.allocator, model_path)) {
+            if (config.grammar != null or body.response_format != null) {
+                return ctx.status(400).json(.{
+                    .@"error" = "UNSUPPORTED_FEATURE",
+                    .message = "Moondream generation does not support grammar or response_format",
+                });
+            }
+            if (tool_parser != null) {
+                return ctx.status(400).json(.{
+                    .@"error" = "UNSUPPORTED_FEATURE",
+                    .message = "Moondream generation does not support tool calls",
+                });
+            }
+            var pipeline = moondream_pipeline.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control, ctx.io) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer pipeline.deinit();
+            pipeline.execution_control = execution_control;
+            if (want_stream) {
+                return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage);
+            }
+            var result = pipeline.generate(messages.items, config) catch |err| switch (err) {
+                error.NoImages, error.MultipleImagesUnsupported => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "Moondream generation requires exactly one image",
+                }),
+                else => return generationErrorResponse(ctx, err),
+            };
+            defer result.deinit();
+            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null);
+        }
+
         // Native generation (CPU/GPU GPT arch forward pass).
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
@@ -17359,9 +17393,9 @@ pub const Node = struct {
                 .@"error" = "INVALID_MODEL",
                 .message = "native Pix2Struct reader checkpoints are not supported yet",
             }),
-            error.NativeMoondreamNotYetSupported => return ctx.status(400).json(.{
+            error.UnsupportedMoondreamArtifacts => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
-                .message = "Moondream readers are not yet supported natively",
+                .message = "Moondream readers need the native vikhyatk/moondream2@2024-03-04 safetensors checkpoint (config.json, tokenizer.json, model.safetensors)",
             }),
             error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",

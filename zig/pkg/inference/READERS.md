@@ -16,10 +16,11 @@ is the working plan for `/api/read` and reader model support.
 
 **Status**: the reader layer (formerly "Phase 1") and metadata-driven reader
 dispatch (formerly "Phase 3") are implemented and described below in the
-present tense. Structured outputs, Pix2Struct, the shared multi-stage OCR
-infrastructure, PaddleOCR, Surya, and Moondream-style reading (Phases 2 and
-4-8) are still in progress; those sections keep their phase numbering,
-purpose, status, and "Still remaining" notes below.
+present tense. Moondream reading (formerly Phase 8) runs natively and is
+described in present tense below. Structured outputs, Pix2Struct, the shared
+multi-stage OCR infrastructure, PaddleOCR, and Surya (Phases 2 and 4-7) are
+still in progress; those sections keep their phase numbering, purpose,
+status, and "Still remaining" notes below.
 
 ## Current State
 
@@ -105,7 +106,6 @@ Impact:
 Missing or incomplete in Zig:
 
 - Pix2Struct
-- Moondream-style decoder-only reading
 - Donut structured output handling
 - multi-stage OCR families
 
@@ -401,44 +401,37 @@ Verified in this pass:
 - `zig build` still passes after the shared Vision2Seq refactor and multistage `vision2seq` recognizer wiring
 - the existing model-backed `monkt/paddleocr-onnx` `/api/read` e2e still passes after adding the new recognizer type, confirming the CTC path still works
 
-## Phase 8: Moondream-style reader parity
+## Moondream Reader
 
-Purpose:
+Moondream2 (`vikhyatk/moondream2@2024-03-04`, `model_type: "moondream1"`)
+runs natively from its safetensors checkpoint, with no ONNX Runtime. The
+design, prompt contract, parity qualification, performance, and limits are in
+[models/moondream/MOONDREAM.md](models/moondream/MOONDREAM.md).
 
-- close the remaining non-classical OCR reader gap
+- `src/readers/reader.zig` routes Moondream directories (path name contains
+  `moondream`) through the `native_moondream` seam to the native reader
+  (`src/readers/moondream_reader.zig`) when the directory has a `moondream1`
+  `config.json`, `tokenizer.json`, and `model.safetensors`; other Moondream
+  directories (such as the removed ONNX exports) still fail with
+  `UnsupportedMoondreamArtifacts` (HTTP 400 `INVALID_MODEL`). `probeManifest` reports native
+  directories as `moondream`, and the manifest classifies `moondream1`
+  configs as readers.
+- The `/read` prompt is the question in upstream's
+  `<image>...Question: {q}\n\nAnswer: ` template; an empty prompt asks
+  `Describe this image.`. Answers go through the existing Moondream parser:
+  `text` always, `fields` and the structured payload when the answer is JSON.
+- The model-gated `/api/read` e2e
+  (`test_read_moondream_model_exposes_optional_fields`) runs without any
+  ONNX Runtime gate.
+- The pipeline matches the upstream float32 reference token-for-token on the
+  e2e HELLO fixture (`src/pipelines/moondream_parity_test.zig`).
 
-Concrete work:
+Still remaining:
 
-- support decoder-only VLM reading behavior
-- parse structured JSON-like output into `fields` where applicable
-
-Why last:
-
-- useful, but not blocking classical OCR parity
-- architecturally distinct from the main OCR gap
-
-Acceptance criteria:
-
-- Moondream-style readers work through the reader layer
-- structured fields can be surfaced from model output
-
-Status:
-
-- in progress
-
-Implemented in this pass:
-
-- Moondream readers previously loaded through ONNX Runtime (a decoder-only VLM session or an ORT GenAI package). Both paths were removed with ONNX Runtime. Moondream model directories now fail with `NativeMoondreamNotYetSupported` (HTTP 400 `INVALID_MODEL`) until a native reader plugs into the `native_moondream` seam in `src/readers/reader.zig`
-- Moondream JSON-like outputs are parsed into text, optional flattened `fields`, and an internal structured payload used by `/extract`
-- the `/api/read` boundary still accepts ordinary natural-language prompts, but the Moondream reader now restores the Go-style internal JSON-guided prompt wrapper for better local-model behavior
-- the model-gated Moondream `/api/read` e2e now uses a simple generated bitmap-text image aligned with Go's reader test instead of treating document-page OCR as the baseline regression
-- the same Moondream e2e now supports env-driven phrase and field assertions, so a local installed model can promote the current smoke check into a stronger regression
-
-Still remaining in this phase:
-
-- land a native Moondream reader behind the `native_moondream` seam
-- improve Moondream output quality beyond the current non-empty simple-image regression, especially on document-style fixtures like `sample-page-1.png`
-- decide whether any additional model-specific fields beyond the current `mood` / `possible_source` / `tags` projection should be surfaced publicly
+- CPU only; Metal/CUDA need device rotary and KV seeding.
+- One 378x378 crop per image, so document-page OCR quality is limited, as it
+  is upstream at this revision; newer multi-crop moondream2 revisions are not
+  supported.
 
 ## Verification Plan
 

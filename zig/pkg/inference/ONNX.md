@@ -107,9 +107,9 @@ Runtime and ONNX Runtime GenAI. Release builds never enabled it. It provided:
   decoder-only ONNX VLM exports
 - Moondream reading through those two paths
 
-All of it was removed with ONNX Runtime. Moondream reading has a native seam in
-`src/readers/reader.zig` (`native_moondream`) and fails with
-`NativeMoondreamNotYetSupported` until a native reader lands. Compiled
+All of it was removed with ONNX Runtime. Moondream now reads natively from the
+upstream safetensors checkpoint ([models/moondream/MOONDREAM.md](models/moondream/MOONDREAM.md));
+ONNX-only Moondream exports fail with `UnsupportedMoondreamArtifacts`. Compiled
 whole-model artifacts remain available through the PJRT/XLA backend
 ([PJRT.md](PJRT.md)) and the Metal whole-model executor ([METAL.md](METAL.md)).
 The ONNX quantized-export campaign is preserved in

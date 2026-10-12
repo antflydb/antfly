@@ -253,6 +253,10 @@ test {
     _ = @import("metal_generated_quant_stats.zig");
     _ = @import("readers/reader.zig");
     _ = @import("readers/multistage_reader.zig");
+    _ = @import("readers/moondream_reader.zig");
+    _ = @import("pipelines/moondream.zig");
+    _ = @import("pipelines/moondream_parity_test.zig");
+    _ = @import("architectures/moondream.zig");
     _ = native_extract;
     _ = compare_generate;
     _ = run_options;
