@@ -2940,8 +2940,10 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
     metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
     metric_value_names: [][]u8 = &.{},
+    metric_owners: []graph_query_mod.GraphMetricOwner = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2982,9 +2984,12 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |columns| columns.deinit(alloc);
         if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
         for (self.metric_value_names) |name| alloc.free(name);
         if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.metric_owners) |*owner| owner.deinit(alloc);
+        alloc.free(self.metric_owners);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
