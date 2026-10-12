@@ -2166,7 +2166,9 @@ document. They are architectural requirements, not Florence-specific cleanup:
     while malformed payloads that fit the limit still receive the precise
     syntax error. Direct and batch generation now apply the same ordering.
 110. **Implemented after codec-admission performance review:** image embedding
-    no longer reserves the configured 128-MiB codec ceiling for every request.
+    no longer reserves the configured 128-MiB codec ceiling for every request
+    (`BatchPreprocessOptions.max_inflight_decoded_bytes` in
+    `zig/pkg/inference/src/pipelines/image.zig`).
     The shared preprocessing slab asks the backend session for exact physical
     growth deltas before its initial allocation and each between-wave resize,
     retains those permits while the slab exists, and releases them immediately
