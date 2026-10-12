@@ -10183,7 +10183,7 @@ test "lite prepared fresh review transaction wrapper address reuse" {
     return error.WrapperAddressWasNotReused;
 }
 
-fn testProductionMetricStages(limit: usize, runs: usize) !void {
+fn testProductionMetricStages(limit: usize, runs: usize, unlimited: bool) !void {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10227,8 +10227,9 @@ fn testProductionMetricStages(limit: usize, runs: usize) !void {
             var random = std.Random.DefaultPrng.init(0x1080);
             random.random().shuffle(query.GraphResultNode, nodes);
         }
-        const filters = [_]query.GraphMetricFilter{ .{ .name = "m0", .op = .gte, .value = 50 }, .{ .name = "m1", .op = .gte, .value = 50 }, .{ .name = "m2", .op = .gte, .value = 50 }, .{ .name = "m3", .op = .gte, .value = 50 } };
-        const request = query.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = 1000 }, .metrics = &.{ .{ .name = "m0" }, .{ .name = "m1" }, .{ .name = "m2" }, .{ .name = "m3" } }, .order_by = &.{.{ .name = "m0" }}, .where_metric = filters[0..if (mode % 2 == 0) 1 else cols] };
+        const threshold: f64 = if (unlimited) 98 else 50;
+        const filters = [_]query.GraphMetricFilter{ .{ .name = "m0", .op = .gte, .value = threshold }, .{ .name = "m1", .op = .gte, .value = threshold }, .{ .name = "m2", .op = .gte, .value = threshold }, .{ .name = "m3", .op = .gte, .value = threshold } };
+        const request = query.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = if (unlimited) 0 else 1000 }, .metrics = &.{ .{ .name = "m0" }, .{ .name = "m1" }, .{ .name = "m2" }, .{ .name = "m3" } }, .order_by = if (unlimited and mode % 2 == 0) &.{} else &.{.{ .name = "m0" }}, .where_metric = filters[0..if (mode % 2 == 0) 1 else cols] };
         const plan = try query.MetricReadPlan.init(request);
         var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = limit };
         const alloc = counter.allocator();
@@ -10262,7 +10263,7 @@ fn testProductionMetricStages(limit: usize, runs: usize) !void {
             var columns: [cols]Column = undefined;
             work.columnsFor(plan.projections.slice(), &columns);
             for (columns) |column| for (0..1000) |row| {
-                const expected: f64 = if (row < 500) 99 else 98;
+                const expected: f64 = if (request.order_by.len == 0) @floatFromInt((try std.fmt.parseInt(usize, nodes[work.rows[row]].key, 10)) % 100) else if (row < 500) 99 else 98;
                 const value = (if (@hasDecl(Engine, "MetricColumn")) column.at(row) else column[row]).?;
                 try std.testing.expectEqual(expected, value);
                 checksum += value;
@@ -10272,16 +10273,20 @@ fn testProductionMetricStages(limit: usize, runs: usize) !void {
         const cpu = (ended.utime.sec - started.utime.sec + ended.stime.sec - started.stime.sec) * 1000000 + ended.utime.usec - started.utime.usec + ended.stime.usec - started.stime.usec;
         try std.testing.expectEqual(@as(f64, @floatFromInt(runs)) * 394000, checksum);
         try std.testing.expectEqual(@as(usize, 0), counter.live);
-        std.debug.print("PRODUCTION_STAGES mode={d} rows={d} columns={d} cpu_us={d} peak_bytes={d} allocations={d} retained_bytes={d}\n", .{ mode, rows, cols, cpu, counter.peak, counter.alloc_calls, retained_bytes });
+        std.debug.print("PRODUCTION_STAGES unlimited={} mode={d} rows={d} columns={d} cpu_us={d} peak_bytes={d} allocations={d} retained_bytes={d}\n", .{ unlimited, mode, rows, cols, cpu, counter.peak, counter.alloc_calls, retained_bytes });
     }
 }
 
 test "lite prepared production staged decoded measurement" {
-    try testProductionMetricStages(std.math.maxInt(usize), 5);
+    try testProductionMetricStages(std.math.maxInt(usize), 5, false);
 }
 
 test "lite prepared fused native stages fit one MiB working budget" {
-    try testProductionMetricStages(1024 * 1024, 1);
+    try testProductionMetricStages(1024 * 1024, 1, false);
+}
+
+test "lite prepared unlimited native filters fit one MiB working budget" {
+    try testProductionMetricStages(1024 * 1024, 1, true);
 }
 
 test "lite prepared bounded topk measurement" {
@@ -10431,4 +10436,132 @@ test "lite prepared decoded stream fences replaced transactions and bounds scrat
     try std.testing.expectError(error.InvalidBatch, stream.populate(&.{""}, &.{"a"}, &.{&column}));
     _ = try @import("../../graph/score_read.zig").populateFloatColumns(a, &txn, &.{""}, &.{"a"}, &.{&column});
     try std.testing.expectEqual(@as(f64, 9), column[0]);
+}
+
+test "lite prepared sparse compaction falls back within original working budget" {
+    const a = std.testing.allocator;
+    const q = @import("../../graph/query.zig");
+    const n = 16000;
+    const nodes = try a.alloc(q.GraphResultNode, n);
+    defer a.free(nodes);
+    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0 };
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p" };
+    var metrics: [16]q.GraphMetricRead = undefined;
+    for (&metrics, names) |*metric, name| metric.* = .{ .name = name };
+    var filters: [16]q.GraphMetricFilter = undefined;
+    for (&filters, names) |*filter, name| filter.* = .{ .name = name, .op = .gte, .value = 12000 };
+    const request = q.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = 0 }, .metrics = &metrics, .where_metric = &filters };
+    const plan = try q.MetricReadPlan.init(request);
+    const Reader = struct {
+        pub fn readDecodedColumns(_: *@This(), _: std.mem.Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
+            for (columns) |column| {
+                for (keys, column, 0..) |_, *value, i| value.* = @floatFromInt(i);
+            }
+        }
+    };
+    for (0..2) |mode| {
+        var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var work = try q.GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), plan, n);
+        var reader = Reader{};
+        try work.ensure(&reader, plan.projections.slice(), nodes);
+        const before = counter.live;
+        counter.peak = before;
+        if (mode == 1) counter.limit = before + n * 16;
+        try work.select(request, true, plan.projections.slice(), plan.projections.slice(), &.{});
+        try std.testing.expectEqual(@as(usize, 4000), work.rows.len);
+        var columns: [16]q.GraphQueryEngine.MetricColumn = undefined;
+        work.columnsFor(plan.projections.slice(), &columns);
+        for (columns) |column| for (0..4000) |row| {
+            try std.testing.expectEqual(@as(?f64, @floatFromInt(12000 + row)), column.at(row));
+        };
+        if (mode == 1) {
+            try std.testing.expect(counter.peak <= counter.limit);
+            for (work.columns) |slot| try std.testing.expectEqual(@as(usize, n), slot.?.source.decoded.len);
+        } else {
+            for (work.columns) |slot| try std.testing.expectEqual(@as(usize, 4000), slot.?.source.decoded.len);
+        }
+        std.debug.print("COMPACTION_BUDGET mode={d} before={d} peak={d} after={d}\n", .{ mode, before, counter.peak, counter.live });
+        work.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "lite prepared filter limits stop IO and discard predicate-only heap scores" {
+    const a = std.testing.allocator;
+    const q = @import("../../graph/query.zig");
+    const n = 50000;
+    const storage = try a.alloc([5]u8, n);
+    defer a.free(storage);
+    const nodes = try a.alloc(q.GraphResultNode, n);
+    defer a.free(nodes);
+    for (storage, nodes, 0..) |*key, *node, i| node.* = .{ .key = try std.fmt.bufPrint(key, "{d:0>5}", .{i}), .depth = 0, .distance = 0 };
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p" };
+    var filters: [16]q.GraphMetricFilter = undefined;
+    for (&filters, names) |*filter, name| filter.* = .{ .name = name, .op = .gte, .value = 0 };
+    const Reader = struct {
+        reads: usize = 0,
+        calls: usize = 0,
+        pub fn readDecodedColumns(self: *@This(), _: std.mem.Allocator, selected: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
+            self.reads += selected.len * keys.len;
+            self.calls += 1;
+            for (columns) |column| @memset(column, 1);
+        }
+    };
+    for (0..2) |mode| {
+        const request = q.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = 1000 }, .where_metric = &filters, .order_by = if (mode == 0) &.{} else &.{.{ .name = "a" }} };
+        const plan = try q.MetricReadPlan.init(request);
+        var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var work = try q.GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), plan, n);
+        var reader = Reader{};
+        try std.testing.expect(try work.selectReading(&reader, request, true, nodes));
+        try std.testing.expectEqual(@as(usize, 1000), work.rows.len);
+        for (work.rows, 0..) |row, i| try std.testing.expectEqual(i, row);
+        for (work.columns) |col| try std.testing.expect(col == null);
+        if (mode == 0) {
+            try std.testing.expectEqual(@as(usize, 4), reader.calls);
+            try std.testing.expectEqual(@as(usize, 16384), reader.reads);
+        } else {
+            try std.testing.expectEqual(@as(usize, 800000), reader.reads);
+        }
+        try std.testing.expect(counter.peak < 500000);
+        std.debug.print("FILTER_HEAP mode={d} reads={d} calls={d} peak={d} after={d}\n", .{ mode, reader.reads, reader.calls, counter.peak, counter.live });
+        work.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "lite prepared compaction reserves all group fallbacks before copying" {
+    const a = std.testing.allocator;
+    const q = @import("../../graph/query.zig");
+    const n = 4097;
+    const nodes = try a.alloc(q.GraphResultNode, n);
+    defer a.free(nodes);
+    for (nodes) |*node| node.* = .{ .key = "node", .depth = 0, .distance = 0 };
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l" };
+    var metrics: [12]q.GraphMetricRead = undefined;
+    for (&metrics, names) |*metric, name| metric.* = .{ .name = name };
+    const request = q.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .params = .{ .max_results = 1000 }, .metrics = &metrics, .order_by = &.{.{ .name = "a" }} };
+    const plan = try q.MetricReadPlan.init(request);
+    const Reader = struct {
+        pub fn readDecodedColumns(_: *@This(), _: std.mem.Allocator, _: []const []const u8, keys: []const []const u8, columns: []const []f64) !void {
+            for (columns) |column| {
+                for (keys, column, 0..) |_, *value, i| value.* = @floatFromInt(i);
+            }
+        }
+    };
+    var counter = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var work = try q.GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), plan, n);
+    var reader = Reader{};
+    for (0..3) |i| try work.ensure(&reader, plan.projections.slice()[i * 4 ..][0..4], nodes);
+    counter.peak = counter.live;
+    counter.limit = counter.live + 56000;
+    try work.select(request, true, plan.projections.slice(), plan.projections.slice(), &.{});
+    var columns: [12]q.GraphQueryEngine.MetricColumn = undefined;
+    work.columnsFor(plan.projections.slice(), &columns);
+    for (columns) |column| for (0..1000) |row| {
+        try std.testing.expectEqual(@as(?f64, @floatFromInt(n - 1 - row)), column.at(row));
+    };
+    try std.testing.expect(counter.peak <= counter.limit);
+    work.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
 }
