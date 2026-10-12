@@ -3375,3 +3375,67 @@ baseline/GC steps. Do not introduce a parallel observation registry, preserve
 old reports under a new reporter, or silently drop incomplete uploads. These
 startup, bounded retirement, reporting, worker and distributed-fault obligations
 remain open; public native production stays disabled.
+
+### Report retirement safety qualification and staged turnover
+
+The existing baseline GC now rejects an active/garbage generation alias and
+invalid fragment/page cursors, failing closed instead of deleting live reports
+or leaving an impossible cursor silently stuck. This is a deletion-prevention
+guard, not a new namespace, retirement protocol or automatic producer activation.
+
+An isolated temporary-store regression seeds 130 retired reports, a distinct
+serving generation, incomplete upload bytes/metadata, another store and an
+unrelated user-row sentinel. It commits one fragment retirement, reopens the
+actual store and resumes three page steps. Transaction mutation capture checks
+every touched key against an independently constructed retired-only allowlist
+and enforces a maximum of 76 touched keys per step. Each committed cut preserves
+the serving report, pending upload state/bytes, other store and user sentinel.
+Active-alias and corrupt cursor faults must fail before touching any key. This
+is bounded mutation/scope evidence, not an elapsed-time benchmark or complete
+distributed fault qualification. The initial regression-only Debug gate passed
+59/59 steps, including 31 publication tests and one decoder-floor test, without
+skips, failures or leaks. The final guard/authority Debug gate passed all 76
+build steps and 68 component executions (31 publication, one decoder-floor,
+19 plus 13 split-owner status/report tests and four service authority tests),
+without skips, failures or leaks. The broader catalog/baseline Debug gate passed
+47/47 steps and 205/205 tracked tests, plus its separate 25-test owner slice.
+These overlapping selections are not original SQL-case dispositions. License
+boundary (2,035 files), inventory integrity, Zig 0.17 formatting and diff checks
+passed. The optimized registration checkpoint `49ded4183d` independently
+passed 59/59 steps (30 publication and one floor), also without skips, failures
+or leaks; it predates this guard and cannot certify it.
+
+Auto-review rejected the proposed production namespace/generation-switch and
+new cleanup patch because incorrect retirement could lose durable metadata.
+That patch was not applied, and no workaround is authorized. The isolated
+safety regression and the narrower deletion-prevention guard were approved.
+Production turnover remains unchanged pending explicit approval or sufficient
+additional evidence for a narrower validated rollout. Required stages are:
+
+1. Keep automatic production disabled. Add a read-only turnover plan bound to
+   the durable native binding, exact reporter CAS and actual exclusive startup
+   lease. Reject active/upload/garbage aliases and generation-address reuse.
+2. Introduce a coordinated decoder floor for the new baseline address/state
+   semantics. Existing all-zero legacy addresses and published nonzero sequences
+   must retain their current key mappings. A startup empty generation must never
+   be interpreted as legacy by any allowed reader, standby or restore decoder.
+   Merely reusing root-signing floor 19 is insufficient for this format change.
+3. Reuse the one shared baseline state: active, pending upload and one retired
+   generation. Signed startup requests distinguish admission from bounded
+   collection. Preserve uncertain-commit identities and never report a committed
+   collection step as a failed admission or silently discard pending frames.
+4. Atomically switch the header and empty active generation with revision and
+   standby outbox. Admit only after prior garbage/pending-upload retirement can
+   proceed without an unbounded loop. New reporters receive no predecessor
+   observations; fresh reports must establish their source/root cuts.
+5. Retire only the proven non-live report namespace, one page/frame per step,
+   retaining durable restart cursors. Test crashes at every cut, stale reporters,
+   root/key replacement, snapshot/reopen, incomplete uploads, legacy reports,
+   standby outage and lost replies before wiring automatic startup/worker use.
+6. Benchmark admission with increasing old-report cardinality and capture point
+   reads, bytes, allocations and apply-lock time. Admission must be independent
+   of old membership size; collection keeps the deterministic mutation budget.
+   Mutation counts alone cannot establish constant elapsed time or read cost.
+
+None of these remaining stages earns original SQL-case completion by design
+intent alone. The 899 unresolved originals and public activation gates remain.

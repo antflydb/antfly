@@ -18534,6 +18534,10 @@ pub const RaftApplyStore = struct {
     /// store owns at most its active, pending and one retired generation.
     fn collectBaselinePageTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, state: *BaselineState) !void {
         const generation = state.garbage orelse return;
+        // A corrupt retirement cursor must never authorize deletion of the
+        // serving generation, even when it also advertises old fragments.
+        if (std.meta.eql(generation, state.active) or state.gc_fragment > state.gc_fragment_end)
+            return error.InvalidCatalogRecord;
         const address: ReportAddress = .{ .store_id = store_id, .generation = generation };
         if (state.gc_fragment < state.gc_fragment_end) {
             try txn.delete(try address.key(a, group_id, "fragment", state.gc_fragment));
@@ -18549,6 +18553,7 @@ pub const RaftApplyStore = struct {
         };
         if (!std.mem.startsWith(u8, directory, report_members_magic) or (directory.len - report_members_magic.len) % 8 != 0) return error.InvalidCatalogRecord;
         const pages = (directory.len - report_members_magic.len) / 8;
+        if (state.gc_page > pages) return error.InvalidCatalogRecord;
         if (state.gc_page < pages) {
             const page = std.mem.readInt(u64, directory[report_members_magic.len + state.gc_page * 8 ..][0..8], .little);
             const key = try reportMemberPageKey(a, group_id, address, page);
@@ -40331,6 +40336,135 @@ fn applyTestBaseline(store: *RaftApplyStore, alloc: std.mem.Allocator, request: 
     _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
     try store.applyTransitionCommandTxn(&txn, 21, command);
     try txn.commit();
+}
+
+test "relational index publication runtime status report GC resumes with bounded mutations and isolates live and pending generations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/report-gc-safety", .{tmp.sub_path});
+    defer a.free(root);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const group: u64 = 21;
+    const store_id: u64 = 20;
+    const retired: RaftApplyStore.ReportAddress = .{ .store_id = store_id, .generation = .{ .incarnation = 77, .sequence = 1 } };
+    const active: RaftApplyStore.ReportAddress = .{ .store_id = store_id, .generation = .{ .incarnation = 77, .sequence = 2 } };
+    const pending: RaftApplyStore.ReportAddress = .{ .store_id = store_id, .generation = .{ .incarnation = 77, .sequence = 3 } };
+    const foreign: RaftApplyStore.ReportAddress = .{ .store_id = 99, .generation = retired.generation };
+    const baseline_key = try RaftApplyStore.baselineKey(scratch, group, store_id);
+    var old_groups: [130]metadata.GroupStatusReport = undefined;
+    for (&old_groups, 0..) |*item, i| item.* = .{ .group_id = i + 100, .raft_term = i + 1 };
+    var live_groups = [_]metadata.GroupStatusReport{.{ .group_id = 999, .raft_term = 999 }};
+    const old_record: metadata.StoreRecord = .{ .store_id = store_id, .node_id = 30, .reporter_incarnation = 77, .group_statuses = &old_groups };
+    var live_record = old_record;
+    live_record.group_statuses = &live_groups;
+    const upload: RaftApplyStore.BaselineUpload = .{
+        .cursor = .{ .reporter_incarnation = 77, .sequence = 3, .digest = @splat(7) },
+        .chunk_count = 2,
+        .total_bytes = 64,
+        .fragment_count = 1,
+        .fragment_received = "preserve-incomplete-upload".len,
+        .fragment_total = 2 * "preserve-incomplete-upload".len,
+        .fragment_group_id = 888,
+        .fragment_digest = @splat(8),
+        .expected_header = @splat(1),
+        .admission_cursor = null,
+        .report_header_digest = @splat(2),
+    };
+    // Explicit deletion allowlist is independent of the GC's own decisions.
+    // It includes only retired report metadata and the retirement cursor.
+    var allowed: std.StringHashMapUnmanaged(void) = .empty;
+    try allowed.put(scratch, baseline_key, {});
+    for (old_groups) |report| try allowed.put(scratch, try RaftApplyStore.listingReportKey(scratch, group, retired, report.group_id), {});
+    for (0..3) |page| {
+        try allowed.put(scratch, try RaftApplyStore.reportMemberPageKey(scratch, group, retired, page), {});
+        for (0..4) |component| try allowed.put(scratch, try RaftApplyStore.reportComponentKey(scratch, group, retired, page, component), {});
+    }
+    try allowed.put(scratch, try RaftApplyStore.reportMembershipKey(scratch, group, retired), {});
+    try allowed.put(scratch, try RaftApplyStore.reportSlotsKey(scratch, group, retired), {});
+    try allowed.put(scratch, try retired.key(scratch, group, "header", 0), {});
+    for (0..2) |fragment| try allowed.put(scratch, try retired.key(scratch, group, "fragment", fragment), {});
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.writeStoreGenerationTxn(&txn, group, store_id, old_record, false, null, null, retired.generation);
+        _ = try store.writeStoreGenerationTxn(&txn, group, store_id, live_record, false, null, null, active.generation);
+        var buf: [160]u8 = undefined;
+        try txn.put(try storeKeyForGroup(&buf, group, store_id), try txn.get(try active.key(scratch, group, "header", 0)));
+        try txn.put("unrelated:user:row", "preserve-user-data");
+        try txn.put(try foreign.key(scratch, group, "header", 0), "preserve-other-store");
+        try txn.put(try pending.key(scratch, group, "fragment", 0), "preserve-incomplete-upload");
+        for (0..2) |fragment| try txn.put(try retired.key(scratch, group, "fragment", fragment), "old-report-fragment");
+        var state: RaftApplyStore.BaselineState = .{ .active = active.generation, .garbage = retired.generation, .gc_fragment_end = 2, .upload = upload };
+        // Crash/reopen after a committed fragment-retirement cut.
+        try RaftApplyStore.collectBaselinePageTxn(scratch, &txn, group, store_id, &state);
+        try std.testing.expectEqual(@as(u32, 1), state.gc_fragment);
+        try std.testing.expectEqual(@as(usize, 0), state.gc_page);
+        try txn.put(baseline_key, try std.json.Stringify.valueAlloc(scratch, state, .{}));
+        try txn.commit();
+    }
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    inline for (.{ "active_alias", "fragment_cursor", "page_cursor" }) |fault| {
+        var capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture.init(a);
+        defer capture.deinit();
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        txn.mutation_capture = &capture;
+        var state = try RaftApplyStore.baselineStateTxn(scratch, &txn, group, store_id);
+        if (comptime std.mem.eql(u8, fault, "active_alias")) {
+            state.garbage = state.active;
+        } else if (comptime std.mem.eql(u8, fault, "fragment_cursor")) {
+            state.gc_fragment = state.gc_fragment_end + 1;
+        } else {
+            state.gc_fragment = 0;
+            state.gc_fragment_end = 0;
+            state.gc_page = 4;
+        }
+        try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.collectBaselinePageTxn(scratch, &txn, group, store_id, &state));
+        try std.testing.expectEqual(@as(usize, 0), capture.keys.count());
+    }
+    var steps: usize = 0;
+    while (true) {
+        var capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture.init(a);
+        defer capture.deinit();
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        txn.mutation_capture = &capture;
+        var state = try RaftApplyStore.baselineStateTxn(scratch, &txn, group, store_id);
+        try std.testing.expectEqualDeep(upload, state.upload.?);
+        if (state.garbage == null) {
+            txn.abort();
+            break;
+        }
+        const previous_page = state.gc_page;
+        try RaftApplyStore.collectBaselinePageTxn(scratch, &txn, group, store_id, &state);
+        try std.testing.expectEqualDeep(upload, state.upload.?);
+        if (state.garbage != null) try std.testing.expect(state.gc_page <= previous_page + 1);
+        try txn.put(baseline_key, try std.json.Stringify.valueAlloc(scratch, state, .{}));
+        try std.testing.expect(capture.keys.count() <= RaftApplyStore.report_page_slots + 12);
+        var keys = capture.keys.keyIterator();
+        while (keys.next()) |key| try std.testing.expect(allowed.contains(key.*));
+        try std.testing.expectEqualStrings("preserve-user-data", try txn.get("unrelated:user:row"));
+        try std.testing.expectEqualStrings("preserve-other-store", try txn.get(try foreign.key(scratch, group, "header", 0)));
+        try std.testing.expectEqualStrings("preserve-incomplete-upload", try txn.get(try pending.key(scratch, group, "fragment", 0)));
+        try txn.commit();
+        const visible = (try store.readStore(a, group, store_id, true)).?;
+        defer metadata_table_manager.freeStore(a, visible);
+        try std.testing.expectEqual(@as(usize, 1), visible.group_statuses.len);
+        try std.testing.expectEqual(@as(u64, 999), visible.group_statuses[0].group_id);
+        steps += 1;
+        try std.testing.expect(steps <= 3);
+    }
+    try std.testing.expectEqual(@as(usize, 3), steps);
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(try retired.key(scratch, group, "header", 0)));
+    try std.testing.expectError(error.NotFound, read.get(try RaftApplyStore.reportMembershipKey(scratch, group, retired)));
 }
 
 test "system catalog baseline resumes after snapshot and activates atomically before sparse updates" {
