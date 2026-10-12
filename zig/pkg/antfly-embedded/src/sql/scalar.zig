@@ -285,6 +285,8 @@ pub const BindLimits = struct {
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
 pub const EvalLimits = struct {
+    /// Invocation-owned immutable clock cut; never attached to Program.
+    statement_clock: ?@import("statement_clock.zig").View = null,
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,

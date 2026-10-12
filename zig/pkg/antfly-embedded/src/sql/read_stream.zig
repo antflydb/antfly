@@ -119,6 +119,111 @@ const Fixture = struct {
     }
 };
 
+test "SQL statement clock admission pins runtime cursors fallback and child views" {
+    const Clock = catalog.Clock;
+    const Fake = struct {
+        calls: usize = 0,
+        nanos: i128 = 20_000_000_123,
+        failed: bool = false,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.failed) return error.TestClockUnavailable;
+            const value = self.nanos;
+            self.nanos += 1_000_000_000;
+            return value;
+        }
+        fn source(self: *@This()) Clock.Source {
+            return .{ .callback = .{ .ptr = self, .now = sample } };
+        }
+    };
+    const Run = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fake: Fake = .{};
+            var fixture: Fixture = .{ .count = 21 };
+            var backend = fixture.backend();
+            backend.clock_source = fake.source();
+            backend.transaction_start = try Clock.Instant.fromUnixMicroseconds(10_000_000);
+            var compiled = try compiler.compile(a, "SELECT n + 1 FROM docs", .{});
+            defer compiled.deinit();
+            var binding_arena = std.heap.ArenaAllocator.init(a);
+            defer binding_arena.deinit();
+            _ = try describe.bind(binding_arena.allocator(), backend, &compiled, &.{});
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            const pinned = try backend.pinStatementClock();
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const view = pinned.statement_clock.?;
+            try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
+            try std.testing.expectEqual(backend.transaction_start.?.micros, view.transaction.micros);
+            for (0..1000) |_| {
+                const inherited = try pinned.pinStatementClock();
+                const limits = @import("decision_eval.zig").limitsFor(inherited);
+                try std.testing.expectEqual(view.statement.micros, limits.statement_clock.?.statement.micros);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const stream = (try Stream.open(a, pinned, &compiled, &.{}, .{ .page_rows = 3, .result_rows = 32 })).?;
+            defer stream.close();
+            var seen: usize = 0;
+            while (true) {
+                var page = try stream.next(2);
+                defer page.deinit();
+                seen += page.output.rows.len;
+                try std.testing.expectEqual(view.statement.micros, stream.context.backend.statement_clock.?.statement.micros);
+                try std.testing.expectEqual(view.transaction.micros, stream.context.backend.statement_clock.?.transaction.micros);
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(@as(usize, 21), seen);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            fixture.offset = 0;
+            var derived = try compiler.compile(a, "SELECT n FROM (SELECT n FROM docs) AS q", .{});
+            defer derived.deinit();
+            var result = try runtime.execute(a, pinned, &derived, &.{}, .{ .result_rows = 32, .page_rows = 3 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 21), result.output.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            fixture.offset = 0;
+            // An unsupported blocking stream declines before row reads. Its
+            // materializing fallback must retain the ingress statement cut.
+            var ordered = try compiler.compile(a, "SELECT n FROM docs ORDER BY n DESC", .{});
+            defer ordered.deinit();
+            try std.testing.expect((try Stream.open(a, pinned, &ordered, &.{}, .{ .result_rows = 32 })) == null);
+            var fallback = try runtime.execute(a, pinned, &ordered, &.{}, .{ .result_rows = 32 });
+            defer fallback.deinit();
+            try std.testing.expectEqual(@as(usize, 21), fallback.output.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            const next_statement = try backend.pinStatementClock();
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            try std.testing.expect(next_statement.statement_clock.?.statement.micros != view.statement.micros);
+            try std.testing.expectEqual(view.transaction.micros, next_statement.statement_clock.?.transaction.micros);
+            // Realtime is not monotonic, but an existing statement cut is.
+            fake.nanos = -1;
+            try std.testing.expectEqual(@as(?i128, -1000), (try view.value(.wall, 6)).unixNanoseconds());
+            try std.testing.expectEqual(@as(?i128, 20_000_000_000), view.statement.unixNanoseconds());
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    var fake: Fake = .{ .failed = true };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    backend.clock_source = fake.source();
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.TestClockUnavailable, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectError(error.TestClockUnavailable, Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    backend.clock_source = null;
+    backend.transaction_start = try Clock.Instant.fromUnixMicroseconds(0);
+    try std.testing.expectError(error.SqlClockUnavailable, backend.pinStatementClock());
+    backend.statement_clock = .{ .source = fake.source(), .transaction = try Clock.Instant.fromUnixMicroseconds(1), .statement = try Clock.Instant.fromUnixMicroseconds(2) };
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    backend.transaction_start = null;
+    backend.statement_clock.?.statement = try Clock.Instant.init(std.math.maxInt(i64));
+    try std.testing.expectError(error.InvalidTransactionClock, backend.pinStatementClock());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
 test "SQL regex materialized statements retain one owner through derived source lowering" {
     const a = std.testing.allocator;
     var compiled = try compiler.compile(a, "SELECT regexp_count(CAST(n AS text),'[0-9]') AS digits FROM (SELECT n FROM docs) AS q", .{});
@@ -769,7 +874,7 @@ pub const Stream = struct {
         errdefer if (self.settings) |view| view.deinit();
         errdefer if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         const arena = self.arena.allocator();
-        var statement_backend = backend;
+        var statement_backend = try backend.pinStatementClock();
         statement_backend.regex_execution = &self.regex_execution;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
         if (backend.setting_capture) |capture| {

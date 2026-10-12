@@ -274,6 +274,10 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        // One statement cut precedes cursor selection, snapshot admission and
+        // materializing fallback. The source remains borrowed from this owner.
+        const statement_source: catalog.Clock.Source = .{ .io = self.server.embedding_provider_runtime.io };
+        const statement_instant = try statement_source.sample();
         const previous_receipt_wait_budget = self.receipt_wait_budget;
         self.receipt_wait_budget = .{};
         defer self.receipt_wait_budget = previous_receipt_wait_budget;
@@ -577,6 +581,13 @@ pub const Adapter = struct {
                     self.dynamic_table = table.physical_name;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                // Internal guarded autocommit is still one implicit SQL
+                // transaction. Explicit sessions retain their durable start.
+                active_backend.transaction_start = if (implicit_guarded) statement_instant else transaction.started_at orelse return zig017_failure: {
+                    zig017_return_error = error.InvalidTransactionClock;
+                    break :zig017_failure error.InvalidTransactionClock;
+                };
+                active_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = active_backend.transaction_start.? };
                 active_backend.decision_provider = self.decision_provider;
                 if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
@@ -633,6 +644,8 @@ pub const Adapter = struct {
             return result;
         }
         var statement_backend = guarded_backend orelse self.backend();
+        statement_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = statement_instant };
+        statement_backend.transaction_start = statement_instant;
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {

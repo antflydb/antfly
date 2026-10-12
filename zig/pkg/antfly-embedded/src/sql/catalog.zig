@@ -531,7 +531,14 @@ pub const AggregatePartialCursor = struct {
     close: *const fn (*anyopaque) void,
 };
 
+pub const Clock = @import("statement_clock.zig");
 pub const Backend = struct {
+    /// Trusted execution source and authorized durable transaction start.
+    /// Neither is populated from SQL parameters, request JSON or cached plans.
+    clock_source: ?Clock.Source = null,
+    transaction_start: ?Clock.Instant = null,
+    /// Value-owned by this statement/cursor. Child adapters copy it unchanged.
+    statement_clock: ?Clock.View = null,
     error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
@@ -587,6 +594,25 @@ pub const Backend = struct {
     /// Every later scan can fork the same owner-issued cut and retain its
     /// route/range proof in the mutation's atomic commit read set.
     dynamic_statement_read_set: bool = false,
+
+    /// Capture once at execution admission. Describe never calls this method.
+    /// Ingress pins before selecting a cursor or materializing fallback.
+    pub fn pinStatementClock(self: Backend) !Backend {
+        var pinned = self;
+        if (self.statement_clock) |view| {
+            try view.validate();
+            if (self.transaction_start) |start| {
+                if (start.micros != view.transaction.micros) return error.InvalidTransactionClock;
+            }
+            return pinned;
+        }
+        const source = self.clock_source orelse if (self.execution_io) |io| Clock.Source{ .io = io } else {
+            if (self.transaction_start != null) return error.SqlClockUnavailable;
+            return pinned;
+        };
+        pinned.statement_clock = try Clock.View.capture(source, self.transaction_start);
+        return pinned;
+    }
 
     pub const VTable = struct {
         /// Native opaque identity, generated once before mutation admission.

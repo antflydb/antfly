@@ -26,6 +26,45 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const describe_sql = @import("antfly_local_sources").sql_describe;
 const native = @import("antfly_local_sources").sql_runtime;
 const catalog = @import("antfly_local_sources").sql_catalog;
+// Called only after principal/session ownership checks. The raw begin time
+// belongs to durable metadata, never to the request's SQL parameter envelope.
+fn cursorStatementClock(source: catalog.Clock.Source, statement: catalog.Clock.Instant, transaction_start_ns: ?u64) !catalog.Clock.View {
+    const view: catalog.Clock.View = .{
+        .source = source,
+        .statement = statement,
+        .transaction = if (transaction_start_ns) |ns| try catalog.Clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, ns), 1000)) else statement,
+    };
+    try view.validate();
+    return view;
+}
+
+test "SQL statement clock pgwire portals retain owner time without resampling on pages" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn sample(raw: ?*anyopaque) !i128 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return if (self.calls == 1) 20_000_000_123 else -1;
+        }
+    };
+    var fake: Fake = .{};
+    const source: catalog.Clock.Source = .{ .callback = .{ .ptr = &fake, .now = Fake.sample } };
+    const statement = try source.sample();
+    const explicit = try cursorStatementClock(source, statement, 10_000_000_999);
+    const implicit = try cursorStatementClock(source, statement, null);
+    for (0..1000) |_| {
+        const page = explicit;
+        try std.testing.expectEqual(@as(?i128, 10_000_000_000), (try page.value(.transaction, 6)).unixNanoseconds());
+        try std.testing.expectEqual(@as(?i128, 20_000_000_000), (try page.value(.statement, 6)).unixNanoseconds());
+    }
+    try std.testing.expectEqual(statement.micros, implicit.transaction.micros);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(?i128, -1000), (try explicit.value(.wall, 6)).unixNanoseconds());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectError(error.InvalidTransactionClock, cursorStatementClock(source, try catalog.Clock.Instant.init(std.math.maxInt(i64)), null));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
 const ast = @import("antfly_local_sources").sql_ast;
 const operation = @import("antfly_local_sources").api_operation;
 const usermgr = @import("../usermgr/mod.zig");
@@ -358,6 +397,9 @@ const OwnedRead = struct {
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
+        const statement_source: catalog.Clock.Source = .{ .io = server.embedding_provider_runtime.io };
+        const statement_instant = try statement_source.sample();
+        var transaction_start_ns: ?u64 = null;
         var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
         var diagnostic: compiler.Diagnostic = .{};
@@ -408,6 +450,7 @@ const OwnedRead = struct {
             defer state.deinit(server.alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
             if (!std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.session_namespace orelse request.namespace orelse "public")) return error.SqlTransactionNotActive;
+            transaction_start_ns = state.begin_timestamp;
             self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
             if (state.metadata.accepted_lake_reads) {
                 if (request.read_requirements.visibility == .committed) return error.ReadSnapshotTooOld;
@@ -423,6 +466,8 @@ const OwnedRead = struct {
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
+        stream_backend.statement_clock = try cursorStatementClock(statement_source, statement_instant, transaction_start_ns);
+        stream_backend.transaction_start = stream_backend.statement_clock.?.transaction;
         stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the

@@ -26,7 +26,15 @@ pub const State = enum { active, failed, committing, uncertain, committed, abort
 pub const Status = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 pub const Scope = struct { principal: []const u8, database: []const u8 = "default", namespace: []const u8 = "public" };
 pub const Begin = struct { isolation: Isolation = .serializable, mode: ReadMode = .read_write };
-pub const Transaction = struct { id: Id, state: State, isolation: Isolation, mode: ReadMode, savepoints: usize = 0 };
+pub const Transaction = struct {
+    id: Id,
+    state: State,
+    isolation: Isolation,
+    mode: ReadMode,
+    savepoints: usize = 0,
+    /// Authorized durable owner time, not a client-supplied session option.
+    started_at: ?@import("statement_clock.zig").Instant = null,
+};
 pub const CommitOutcome = enum { committed, committed_pending, committed_repair_required, aborted, unknown };
 pub const CommitResult = struct { outcome: CommitOutcome, reconciliation_id: Id };
 pub const Control = union(enum) { begin: Begin, commit, rollback, savepoint: []const u8, rollback_to: []const u8, release: []const u8 };

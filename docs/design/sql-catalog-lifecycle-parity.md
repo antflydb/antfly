@@ -3548,6 +3548,57 @@ payloads. Formatting, the 2,038-file Apache boundary, inventory integrity and
 all 20 inventory-verifier tests pass. These overlapping gates are not additional
 original-case qualifications or a CI-green claim.
 
+### Execution admission and durable SQL clocks
+
+The production runtime and pull cursor now pin an immutable clock view before
+execution binding; derived sources and scalar evaluation inherit it. Describe
+does not capture time, and cached programs contain no clock source or cut.
+Views are value-owned by statement/cursor contexts, with their live source
+borrowed from the backend owner. Pinning and child-page reuse allocate no clock
+objects or perform repeated source reads. Source failures precede row access;
+invalid inherited cuts and mismatched transaction starts fail closed.
+
+The HTTP executor samples one statement cut before choosing delivery/fallback.
+Its internal guarded autocommit retains implicit SQL transaction semantics even
+when the implementation's durable wrapper begins later. Explicit sessions obtain
+their transaction instant from the authenticated owner, not parameters or JSON.
+The existing durable begin timestamp now survives both cached and cold SqlState
+reads and the native Session owner contract. Savepoints/failure recovery do not
+reset it. Conversion floors signed nanoseconds to microseconds without floating
+point.
+
+Pgwire's direct portal path bypasses the main execution method, so it pins its
+own statement cut and attaches the durable transaction time only after principal
+and session-scope checks. The retained stream keeps this view across FETCH pages.
+Wall time remains separately sampled and may move backwards; statement and
+transaction values remain unchanged.
+
+Native regressions cover clock-free Describe, 1,000 inherited views without
+resampling, released cursor pages, derived execution, materializing fallback,
+new statement cuts, backward wall time, source failures and allocation faults.
+The full Debug SQL gate passes 21/21 build steps: 732 main-owner tests and 226
+additional-owner tests passed, with three main-owner skips and no failures/leaks.
+All four focused native clock tests pass in Debug and ReleaseFast. These totals
+overlap and do not qualify additional original SQL cases.
+
+The final public API gate passes 80/80 steps and nine selected executions
+(four native clock tests plus five API/session/pgwire tests), without skips,
+failures or leaks. The direct portal helper's deterministic test verifies
+durable/implicit transaction cuts, microsecond quantization, backward wall time
+and unchanged values across 1,000 page views. It is not an end-to-end SQL time
+function test. All six independent PostgreSQL oracle tests and temporal fixture
+reproducibility pass. Formatting, diff checks, the 2,039-file Apache boundary
+and original inventory integrity pass.
+
+Public now/CURRENT_TIMESTAMP/statement_timestamp/clock_timestamp activation is
+still open. It requires exact temporal type/result identities and pgwire codecs,
+volatility-aware binding, session timezone rules, native typed result ownership
+and protocol-message receive cuts (earlier than execution admission where
+applicable). The clock contract is not a sampled deterministic golden, an
+alias for a document-datetime string, or completion of temporal SQL parity.
+The original inventory remains 479 implemented / 136 rejected / 73 superseded /
+898 unresolved.
+
 Public result and storage boundaries continue to reject these new payloads
 explicitly until exact schema/type identities, AROW/index capability versions,
 pgwire codecs, temporal arrays, parser/binder rules and execution-owned clock

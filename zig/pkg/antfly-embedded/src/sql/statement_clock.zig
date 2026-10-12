@@ -37,6 +37,14 @@ pub const View = struct {
     source: Source,
     transaction: Instant,
     statement: Instant,
+    /// Validate inherited views without sampling the source. A copied view
+    /// may cross child-plan boundaries, never a new statement/transaction.
+    pub fn validate(self: View) !void {
+        for ([_]Instant{ self.transaction, self.statement }) |instant| {
+            _ = try Instant.init(instant.micros);
+            if (instant.infinity() != 0) return error.InvalidTransactionClock;
+        }
+    }
     pub fn capture(source: Source, transaction: ?Instant) !View {
         if (transaction) |start| {
             _ = try Instant.init(start.micros);

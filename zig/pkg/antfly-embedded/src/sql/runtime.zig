@@ -124,7 +124,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     try backend.vtable.checkpoint(backend.ptr);
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
     defer if (pinned_settings) |*view| view.deinit();
-    var statement_backend = backend;
+    var statement_backend = try backend.pinStatementClock();
     if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
