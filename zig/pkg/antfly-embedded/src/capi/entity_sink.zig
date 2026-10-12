@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Cross-table promotion under the embedded database's writer fence. Resolver
 //! workers are driven by the connection owner, so catalog access and the local
@@ -13,8 +25,13 @@ const callbacks = @import("../storage/db/runtime_callbacks.zig");
 
 pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return;
-    db.setResolutionCandidateSource(.{ .ptr = handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention } });
+    db.setResolutionCandidateSource(candidateSource(handle));
     db.setEntitySink(.{ .ptr = handle, .vtable = &.{ .upsert = upsert, .upsert_batch = upsertBatch } });
+}
+
+/// Read-only candidate seam also used by ephemeral query resolution.
+pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention } };
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
@@ -517,6 +534,30 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("concept/canonical", edges[0].target);
     try std.testing.expect((try entities.lookup(a, "concept/laya_reviewer", .{})) == null);
+    // Public query resolution uses the stored ANN index and custom scorer
+    // vector field, but must not publish a query document or any derived work.
+    const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    var query_result: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&query_result);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice(
+        "{\"extraction\":{\"entities\":[{\"id\":\"q0\",\"label\":\"concept\",\"text\":\"Laya reviewer\",\"embedding\":[1,0,0]},{\"id\":\"bad\",\"label\":\"concept\",\"text\":\"!!!\"}]}}",
+    ), &query_result));
+    const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
+    defer query_json.deinit();
+    const query_resolution = query_json.value.object.get("resolution").?.object;
+    const resolved = query_resolution.get("entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("concept/canonical", resolved[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("entities", resolved[0].object.get("doc_ref").?.object.get("table").?.string);
+    try std.testing.expectEqualStrings("match", resolved[0].object.get("decision").?.string);
+    try std.testing.expectEqual(@as(i64, 1), query_resolution.get("skipped_mentions").?.integer);
+    try std.testing.expectEqual(sequence, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    // A copy-only artifact cannot silently masquerade as a text extractor.
+    var invalid_result: h.capi.Buffer = .{};
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"A reviewer\"}"), &invalid_result));
+    try std.testing.expectEqual(@as(usize, 0), invalid_result.len);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"x\",\"extraction\":{\"entities\":[]}}"), &invalid_result));
+    try std.testing.expectEqual(h.capi.ErrorCode.not_found, api.antfly_db_resolve_query_json(id, .fromSlice("missing"), .fromSlice("{\"extraction\":{\"entities\":[]}}"), &invalid_result));
     // No vector on the alias row: ANN cannot return it as a candidate.
     try handle.db.entity_sink.?.upsert(a, "entities", "concept/the_decider", "{\"entity_type\":\"concept\",\"canonical_name\":\"The decider\",\"merged_into\":\"concept/canonical\"}");
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:alias", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"The decider\",\"embedding\":[0,1,0]}]}}" }} });
@@ -609,6 +650,43 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         found = true;
     };
     try std.testing.expect(found);
+    // The ad-hoc text route runs the configured extractor and resolves its
+    // real, non-empty mentions against the entities promoted above.
+    var query_result: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&query_result);
+    const before = api.enterHandle(id, .read).?;
+    const sequence = before.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    before.leave();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
+    const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
+    defer query_json.deinit();
+    const resolved = query_json.value.object.get("resolution").?.object.get("entities").?.array.items;
+    try std.testing.expect(resolved.len > 0);
+    for (resolved) |entity| {
+        try std.testing.expectEqualStrings("entities", entity.object.get("doc_ref").?.object.get("table").?.string);
+        // A scorer-free resolver deterministically renders keys and reports
+        // `new` on ingestion too, even when those keys already exist.
+        try std.testing.expectEqualStrings("new", entity.object.get("decision").?.string);
+        api.antfly_buffer_free(&entity_response);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(entities, .fromSlice(entity.object.get("doc_ref").?.object.get("key").?.string), &entity_response));
+    }
+    const after = api.enterHandle(id, .read).?;
+    try std.testing.expectEqual(sequence, after.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    after.leave();
+    api.antfly_db_close(entities);
+    entities = null;
+    api.antfly_db_close(id);
+    id = null;
+    var readonly = options;
+    readonly.open_mode = h.capi.open_mode_readonly;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &id));
+    api.antfly_buffer_free(&query_result);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
+    const readonly_query = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
+    defer readonly_query.deinit();
+    const readonly_entities = readonly_query.value.object.get("resolution").?.object.get("entities").?.array.items;
+    try std.testing.expectEqual(resolved.len, readonly_entities.len);
+    for (readonly_entities) |entity| try std.testing.expectEqualStrings("new", entity.object.get("decision").?.string);
 }
 
 test "capi resolver render and merge rekey existing edges without entity promotion" {
@@ -658,4 +736,19 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     defer rendered.deinit();
     try std.testing.expectEqualStrings("concept/qwen", rendered.value.object.get("key").?.string);
     try std.testing.expectEqual(@as(i64, 2), rendered.value.object.get("config_generation").?.integer);
+    // Read-only handles can query aliases without canonical documents and
+    // observe the same durable generation after reopening.
+    api.antfly_db_close(id);
+    id = null;
+    var readonly = options;
+    readonly.open_mode = h.capi.open_mode_readonly;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &id));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"extraction\":{\"entities\":[{\"id\":\"q0\",\"label\":\"concept\",\"text\":\"Qwen3\"}]}}"), &out));
+    const queried = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer queried.deinit();
+    const resolution = queried.value.object.get("resolution").?.object;
+    try std.testing.expectEqualStrings("concept/qwen", resolution.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("match", resolution.get("entities").?.array.items[0].object.get("decision").?.string);
+    try std.testing.expectEqual(@as(i64, 2), resolution.get("config_generation").?.integer);
 }

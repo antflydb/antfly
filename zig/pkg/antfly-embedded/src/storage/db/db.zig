@@ -28705,6 +28705,36 @@ pub const DB = struct {
         return try self.core.listEnrichments(alloc);
     }
 
+    /// Run only this resolver's configured text extractor, without scheduling
+    /// enrichments or publishing a synthetic document. Producer invocation
+    /// retains the runtime's memory plan, cancellation and transport controls.
+    pub fn extractResolverQueryAlloc(self: *DB, alloc: Allocator, cfg: index_manager_mod.ResolverConfig, text: []const u8, producer_override: ?asset_producer_mod.Producer) ![]u8 {
+        if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
+        const enrichments = try self.listEnrichments(alloc);
+        defer {
+            for (enrichments) |*enrichment| enrichment.deinit(alloc);
+            alloc.free(enrichments);
+        }
+        for (enrichments) |enrichment| {
+            if (enrichment.kind != .asset or !std.mem.eql(u8, enrichment.name, cfg.source_artifact)) continue;
+            var config = try asset_producer_mod.parseProducerConfig(alloc, enrichment.producer_json);
+            defer config.deinit(alloc);
+            if (config.type != .extractor) return error.InvalidArgument;
+            const producer = producer_override orelse if (self.enrichment_runtime) |runtime|
+                if (runtime.config.asset_producer) |configured| configured.withInvocationContext(.{ .io = runtime.config.io, .cancellation = runtime.config.cancellation }) else return error.SqlFeatureNotSupported
+            else
+                return error.SqlFeatureNotSupported;
+            return try producer.produce(alloc, .{
+                .producer_type = .extractor,
+                .config_json = config.config_json,
+                .source_text = text,
+                .content_type = enrichment.content_type,
+                .item_id = "query",
+            });
+        }
+        return error.InvalidArgument;
+    }
+
     pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();

@@ -4588,6 +4588,8 @@ pub fn antflyDbComputeEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
+    capi.clearLastError();
+    out_buf.* = .{};
     const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
         guard.leave();
@@ -6884,6 +6886,65 @@ pub export fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolv
         defer handle.alloc.free(minted);
         const key = resolver_lib.canonicalAliasKey(cfg.aliases, minted) catch |err| return capi.mapError(err);
         out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.config_generation }) catch |err| return capi.mapError(err);
+        return .ok;
+    }
+    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+}
+
+/// Extract ad-hoc text (or accept extraction JSON) and resolve against the
+/// durable resolver, including aliases and ANN. Never publishes query artifacts.
+pub export fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buffer: ?*capi.Buffer) capi.ErrorCode {
+    capi.clearLastError();
+    const out = out_buffer orelse return capi.mapErrorContext(error.InvalidArgument, "query resolution output pointer must not be null");
+    out.* = .{};
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
+    defer guard.leave();
+    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+    const handle = guard.handle;
+    var request = std.json.parseFromSlice(std.json.Value, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid query resolution JSON");
+    defer request.deinit();
+    if (request.value != .object) return capi.mapErrorContext(error.InvalidArgument, "query request must be an object containing text or extraction");
+    const text = request.value.object.get("text");
+    const extraction = request.value.object.get("extraction");
+    if ((text == null) == (extraction == null)) return capi.mapErrorContext(error.InvalidArgument, "supply exactly one of text or extraction");
+    if (text) |value| {
+        if (value != .string) return capi.mapErrorContext(error.InvalidArgument, "query text must be a string");
+    }
+    if (extraction) |value| {
+        if (value != .object or value.object.get("entities") == null or value.object.get("entities").? != .array) return capi.mapErrorContext(error.InvalidArgument, "extraction must contain an entities array");
+    }
+    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
+    defer {
+        for (configs) |*cfg| cfg.deinit(handle.alloc);
+        handle.alloc.free(configs);
+    }
+    for (configs) |*cfg| {
+        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        if (cfg.source_artifact_kind == .chunk) return capi.mapErrorContext(error.InvalidArgument, "query resolution requires an asset-scoped resolver");
+        // Read-only databases deliberately have no enrichment worker. Scope a
+        // producer to this query instead of reconfiguring a writable runtime.
+        const QueryProducer = @import("../asset_producer_runtime.zig").Runtime;
+        var query_producer: ?*QueryProducer = null;
+        defer if (query_producer) |producer| {
+            producer.deinit();
+            handle.alloc.destroy(producer);
+        };
+        if (text != null and handle.database().enrichment_runtime == null) {
+            const io = handle.database().backend_runtime.io() orelse return capi.mapErrorContext(error.SqlFeatureNotSupported, "query extraction requires a backend IO runtime");
+            query_producer = QueryProducer.createOwned(handle.alloc, io, .{ .antfly_provider = handle.liteAntflyProvider() }) catch |err| return capi.mapErrorContext(err, "creating query extractor runtime");
+        }
+        const extracted = if (text) |value|
+            handle.database().extractResolverQueryAlloc(handle.alloc, cfg.*, value.string, if (query_producer) |producer| producer.producer() else null) catch |err| return capi.mapErrorContext(err, "query text requires the resolver's configured asset extractor and an available inference runtime")
+        else
+            std.json.Stringify.valueAlloc(handle.alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
+        defer handle.alloc.free(extracted);
+        const resolution = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(handle.alloc, configs, cfg, extracted, @import("entity_sink.zig").candidateSource(handle), handle.database().resolution_embedder) catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
+        defer handle.alloc.free(resolution);
+        var parsed_extraction = std.json.parseFromSlice(std.json.Value, handle.alloc, extracted, .{}) catch |err| return capi.mapError(err);
+        defer parsed_extraction.deinit();
+        var parsed_resolution = std.json.parseFromSlice(std.json.Value, handle.alloc, resolution, .{}) catch |err| return capi.mapError(err);
+        defer parsed_resolution.deinit();
+        out.* = stringifyJson(.{ .extraction = parsed_extraction.value, .resolution = parsed_resolution.value }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");

@@ -439,6 +439,25 @@ class Database:
         finally:
             self._release()
 
+    def resolve_query(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Extract {"text": "..."}, or resolve {"extraction": {"entities": [...]}}.
+
+        Uses the durable extractor and resolver, including alias/ANN matching.
+        Returns extraction and resolution (canonical doc_refs and decisions),
+        without publishing documents, resolution artifacts or graph edges.
+        """
+        handle = self._acquire()
+        try:
+            name, keep_name = _ffi.make_slice(encode_text(resolver))
+            data, keep_data = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolve_query_json(ctypes.c_void_p(handle), name, data, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
     def merge_resolver_keys(self, resolver: str, key: str, target: str) -> None:
         """Persist a key redirect; run_until_idle re-keys existing resolution edges."""
         handle = self._acquire()

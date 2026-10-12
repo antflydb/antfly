@@ -319,6 +319,61 @@ fn siblingResolutionsJsonAlloc(
     return try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = map }, .{});
 }
 
+/// Resolve ephemeral mentions with the same candidates, embeddings and scorer as
+/// ingestion. The store has no writable backing and cannot publish artifacts.
+pub fn resolveQueryExtractionAlloc(
+    gpa: Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    extraction: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+) ![]u8 {
+    if (cfg.source_artifact_kind == .chunk) return error.InvalidArgument;
+    const key = try internal_keys.artifactNamedPrefixAlloc(gpa, "query", "asset", cfg.source_artifact);
+    defer gpa.free(key);
+    const QueryStore = struct {
+        key: []const u8,
+        value: []const u8,
+        fn get(ptr: *anyopaque, a: Allocator, requested: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (std.mem.eql(u8, requested, self.key)) try a.dupe(u8, self.value) else null;
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.QueryResolutionWriteAttempt;
+        }
+        fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+            return error.QueryResolutionWriteAttempt;
+        }
+    };
+    var memory = QueryStore{ .key = key, .value = extraction };
+    const store: resolver_lib.ArtifactStore = .{ .ptr = &memory, .vtable = &.{ .get = QueryStore.get, .put = QueryStore.put, .delete = QueryStore.delete } };
+    var overlay: std.ArrayList(ArtifactWrite) = .empty;
+    defer {
+        for (overlay.items) |write| {
+            gpa.free(write.key);
+            gpa.free(write.value);
+        }
+        overlay.deinit(gpa);
+    }
+    // Resolve siblings first so identity templates can refer to their entities,
+    // while retaining the durable catalog's label-routing rules.
+    for (resolvers) |*sibling| {
+        if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse continue;
+        if (outcome.resolution_value) |value| {
+            overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
+                gpa.free(outcome.resolution_key);
+                gpa.free(value);
+                return err;
+            };
+        } else gpa.free(outcome.resolution_key);
+    }
+    const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse return error.InvalidArgument;
+    defer gpa.free(outcome.resolution_key);
+    return outcome.resolution_value orelse error.InvalidArgument;
+}
+
 pub fn processChangedExtractionWithConfig(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,

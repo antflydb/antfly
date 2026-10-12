@@ -446,6 +446,13 @@ antfly_error_code antfly_db_list_indexes_json(antfly_db *db, antfly_buffer *out)
  * Returns {"minted_key","key","table","config_generation"}; key follows configured aliases.
  * Free output with antfly_buffer_free. ANN matching is not performed. */
 antfly_error_code antfly_db_render_resolver_key_json(antfly_db *db, antfly_slice resolver_name, antfly_slice mention_json, antfly_buffer *out_json);
+
+/* Resolve {"text":"..."} through the resolver's configured asset extractor, or
+ * {"extraction":{"entities":[...]}} through the same resolver. Includes aliases,
+ * mention embeddings, ANN candidates and scoring. Returns {extraction,resolution}
+ * with canonical doc_refs and decisions. Does not write documents or artifacts.
+ * Requires an asset-scoped resolver; text requires an extractor producer. */
+antfly_error_code antfly_db_resolve_query_json(antfly_db *db, antfly_slice resolver_name, antfly_slice request_json, antfly_buffer *out_json);
 /** Merge fully rendered keys: {"key":"concept/old","target":"concept/new"}.
  * Durable and idempotent. Cycles/redirect replacement are rejected. Drain with
  * antfly_db_run_until_idle to re-resolve existing artifacts and replace mention edges.

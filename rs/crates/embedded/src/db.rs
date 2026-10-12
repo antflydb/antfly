@@ -529,6 +529,13 @@ impl Database {
         })
     }
 
+    /// Resolve text or extraction mentions, including aliases and ANN, without writes.
+    pub fn resolve_query_json(&self, resolver: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_resolve_query_json(h, borrow_slice(resolver.as_bytes()), input, out)
+        })
+    }
+
     /// Persist a {"key","target"} redirect. Drain to re-key existing resolution edges.
     pub fn merge_resolver_keys_json(
         &self,

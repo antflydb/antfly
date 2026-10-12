@@ -220,3 +220,51 @@ def test_public_traversal_retains_each_seed_path(aflite_path) -> None:
         nodes = response["responses"][0]["graph_results"]["q"]["nodes"]
         assert [node["key"] for node in nodes] == ["claim:a", "claim:a"]
         assert {node["path"][0]["key"] for node in nodes} == {"concept:a", "concept:b"}
+
+
+def test_query_resolution_uses_durable_aliases_without_promotion(aflite_path) -> None:
+    options = antfly_embedded.OpenOptions(profile=antfly_embedded.Profile.NATIVE)
+    with antfly_embedded.create_with_options(aflite_path, options) as db:
+        db.add_index(
+            {
+                "name": "knowledge",
+                "type": "graph",
+                "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": "default",
+                        "promote": False,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{ uslug _entity.text }}",
+                        "aliases": [{"key": "concept/qwen3", "target": "concept/qwen"}],
+                        "config_generation": 1,
+                    }
+                ],
+            }
+        )
+        request = {"extraction": {"entities": [{"id": "q0", "label": "concept", "text": "QWEN3"}]}}
+        result = db.resolve_query("concepts", request)
+        assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen"
+        assert result["resolution"]["entities"][0]["decision"] == "match"
+        with pytest.raises(antfly_embedded.NotFoundError):
+            db.lookup("concept/qwen")
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="exactly one"):
+            db.resolve_query("concepts", {**request, "text": "Qwen3"})
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="configured asset extractor"):
+            db.resolve_query("concepts", {"text": "Qwen3"})
+        db.merge_resolver_keys("concepts", "concept/qwen", "concept/qwen_embedding")
+        db.run_until_idle()
+    with antfly_embedded.open_readonly(aflite_path) as db:
+        result = db.resolve_query("concepts", request)
+        assert result["resolution"]["config_generation"] == 2
+        assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
+        assert json.loads(db.resolve_query("concepts", request, raw=True)) == result

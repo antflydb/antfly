@@ -688,10 +688,9 @@ attached combining marks), and returns `minted_key`, alias-canonical `key`,
 Python exposes `db.render_resolver_key("concepts", mention)`; Go exposes
 `db.RenderResolverKeyJSON("concepts", mentionJSON)`. This is a read-only render
 operation: it does not extract text, run ANN, or create documents. Extract
-mentions using `Inference.extract` first if needed. This API implements the
-render-key option in #1109; ANN resolution of ad-hoc query text remains a
-separate extension. Query callers must use the configured resolver name, not
-copy its template into application code.
+mentions using `Inference.extract` first if needed, or use `resolve_query` below
+to run the configured extractor and ANN resolution together. Query callers must
+use the configured resolver name, not copy its template into application code.
 
 Inline resolvers accept aliases between **fully rendered keys**, for example:
 
@@ -815,3 +814,42 @@ are unsupported and **not planned for this implementation**. Its measured Metal
 throughput is worse than FP32, and FP32 remains the recommended bundle. A future
 fp16 description qualification requires pinned upstream non-empty fixtures and
 reviewed parity tolerances; this change does not widen its advertised capabilities.
+
+### Resolve ad-hoc query text and mentions
+
+`antfly_db_resolve_query_json(db, resolver_name, request, out)` (Go
+`ResolveQueryJSON`, Python `Database.resolve_query`, Rust `resolve_query_json`)
+accepts exactly one of:
+
+```json
+{"text":"What did Apple announce in Cupertino?"}
+```
+
+```json
+{"extraction":{"entities":[{"id":"q0","label":"company","text":"Apple"}]}}
+```
+
+The text form invokes the extractor producer on the resolver's source asset,
+with its durable model, schema, descriptions and thresholds. The extraction form
+lets callers keep their own GLiNER extraction and still use Antfly's full
+resolution pipeline. Both return `{extraction, resolution}`; `resolution.entities`
+contains canonical `doc_ref` (table/key), decision, confidence, and mention
+identity. Empty or unkeyable mentions are reflected in `skipped_mentions`.
+
+Resolution uses the same label routing, sibling identities, explicit aliases,
+exact/prefix/ANN candidates, configured mention embeddings, and scorer as
+write-time resolution. Configure `candidate_search:"ann"`, `candidate_ann_index`,
+`name_embedding`, dimensions and the scorer as in the embedding-merge recipe
+above. Supplied mention vectors are accepted too. Existing embeddings must be
+visible before querying; drain the root after writing candidate documents.
+Explicit aliases do not require canonical documents or embedding IO.
+
+Query extraction and resolution never publish a synthetic document, resolution
+artifact, promotion, graph edge, or replay record. They also work on read-only
+handles. They use resolver-level aliases and ignore document-specific curation
+since the query has no stored document identity. Queries currently require an
+asset-scoped resolver (including `source_artifact_kind:"any"`); a chunk-scoped
+resolver is rejected rather than inventing chunk context. The text form requires
+an extractor producer; copy-only or missing source assets fail with a diagnostic.
+For callers that only need template/alias rendering, `render_resolver_key` stays
+available and avoids extraction, embeddings and candidate search.

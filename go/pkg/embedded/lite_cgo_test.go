@@ -2743,4 +2743,25 @@ func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testi
 	if string(key) != "concept/canonical" {
 		t.Fatalf("generated embeddings failed to merge the mention: %s", key)
 	}
+	query, err := db.ResolveQueryJSON("concepts", []byte(`{"extraction":{"entities":[{"id":"q0","label":"concept","text":"Approval reviewer"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Resolution struct {
+			Entities []struct {
+				DocRef struct {
+					Key   string `json:"key"`
+					Table string `json:"table"`
+				} `json:"doc_ref"`
+				Decision string `json:"decision"`
+			} `json:"entities"`
+		} `json:"resolution"`
+	}
+	if err := json.Unmarshal(query, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resolution.Entities) != 1 || result.Resolution.Entities[0].DocRef.Key != "concept/canonical" || result.Resolution.Entities[0].DocRef.Table != "entities" || result.Resolution.Entities[0].Decision != "match" {
+		t.Fatalf("query embedding/ANN resolution = %s", query)
+	}
 }

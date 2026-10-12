@@ -705,6 +705,17 @@ func (db *DB) RenderResolverKeyJSON(resolver string, mention []byte) ([]byte, er
 	})
 }
 
+// ResolveQueryJSON extracts text or resolves supplied extraction mentions, including ANN, without writes.
+func (db *DB) ResolveQueryJSON(resolver string, mention []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(mention)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolve_query_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
 // MergeResolverKeysJSON persists {"key","target"}; RunUntilIdle re-keys existing resolution edges.
 func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
 	name, cleanup := makeCStringSlice([]byte(resolver))
