@@ -34584,6 +34584,56 @@ pub const DB = struct {
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 
+    /// A table restore reassigns canonical document identities after native
+    /// validation creates selective repair debt. That debt is still unstarted
+    /// and belongs to this unpublished candidate, so bind fresh replica-local
+    /// repair identities to the destination group before running any quantum.
+    /// Calling again after a crash between namespace publication and this
+    /// checkpoint write completes the same transition without losing debt.
+    pub fn rebindUnstartedNativeRestoreRepairIdentity(
+        self: *DB,
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+    ) !void {
+        try staged_generation.validatePath(self.core.path);
+        if (self.open_mode != .writer_no_replay) return error.InvalidNativeRestoreOpenMode;
+        const location = try self.indexRepairStateLocation();
+        var state = index_repair_state.loadAt(self.alloc, location) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer state.deinit(self.alloc);
+        const group_id = self.localRepairGroupId();
+        const needs_rebind = for (state.entries.items) |entry| {
+            if (entry.intent.group_id != group_id) break true;
+        } else false;
+        if (!needs_rebind) return;
+        var restore = (try readRestoreStateForPathAlloc(self.alloc, self.core.path)) orelse
+            return error.InvalidRestoreImportMarker;
+        defer restore.deinit(self.alloc);
+        if (!restore.primary_restored or !std.mem.eql(u8, restore.phase, "repair_indexes"))
+            return error.InvalidRestoreImportMarker;
+        const intents = try self.alloc.alloc(index_repair_state.IndexRepairIntent, state.entries.items.len);
+        defer self.alloc.free(intents);
+        for (state.entries.items, intents) |entry, *intent| {
+            if (entry.intent.trigger != .projection_generation_invalid or
+                entry.intent.phase != .detected or entry.intent.owner_epoch != 0 or
+                entry.intent.source_replay_state != .not_required or
+                entry.intent.candidate_relative_path != null or entry.pin != null or
+                entry.intent.root_generation != self.core.root_generation)
+                return error.InvalidIndexRepairTransition;
+            intent.* = entry.intent;
+            intent.group_id = group_id;
+        }
+        var rebound = try index_repair_state.resetForRootGenerationWithIntentsAt(
+            self.alloc,
+            location,
+            state.identity,
+            self.core.root_generation,
+            intents,
+        );
+        rebound.deinit(self.alloc);
+    }
+
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
@@ -134087,6 +134137,11 @@ test "db v02 native restore repairs released projections" {
         .start_optional_runtime_workers = false,
     });
     defer db.close();
+    // Match the public restore: the source snapshot keeps its old group, then
+    // the hidden destination receives a fresh table/replica namespace.
+    try db.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 123, .shard_id = 456, .range_id = 456 });
+    try db.rebindUnstartedNativeRestoreRepairIdentity(&staged);
+    try db.rebindUnstartedNativeRestoreRepairIdentity(&staged);
     const row = (try db.get(alloc, "a")) orelse return error.TestUnexpectedResult;
     defer alloc.free(row);
     _ = try db.rehydrateSchemaJson(@embedFile("../testdata/v02-server/schema.json"));
