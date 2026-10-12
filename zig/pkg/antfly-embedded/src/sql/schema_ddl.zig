@@ -177,13 +177,19 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
 }
 
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    return applyWithLimits(alloc, schema, ddl, .{});
+}
+
+pub fn applyWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl, limits: @import("immutable_plan.zig").Limits) !bool {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     var staging = std.heap.ArenaAllocator.init(alloc);
     defer staging.deinit();
     var candidate = try value(staging.allocator(), schema.*);
-    const changed = try applyCandidate(staging.allocator(), &candidate, ddl);
+    const changed = try applyCandidateWithLimits(staging.allocator(), &candidate, ddl, limits);
     // Candidate allocations, including failed binding scratch, are never
     // retained by the caller. Successful result storage belongs to its schema
     // arena, as do the other JSON schema-builder operations in this module.
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (changed) schema.* = try value(alloc, candidate);
     return changed;
 }
@@ -361,6 +367,11 @@ test "generated addition bounds schema seeding and rejects malformed ownership" 
 /// In-place builder for an already unpublished schema, allowing CREATE's
 /// constraint batch to avoid cloning the entire schema for every constraint.
 pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    return applyCandidateWithLimits(alloc, schema, ddl, .{});
+}
+
+pub fn applyCandidateWithLimits(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl, limits: @import("immutable_plan.zig").Limits) !bool {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (ddl.kind == .index and ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
@@ -469,12 +480,12 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
                 }
                 if (column.default_expression) |expression| {
                     const defaults = try list(schema, alloc, "column_defaults");
-                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, false);
+                    const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(alloc, schema.*, expression, column, false, limits);
                     try defaults.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
                 }
                 if (column.generated_expression) |expression| {
                     const generated = try list(schema, alloc, "generated_columns");
-                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, true);
+                    const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(alloc, schema.*, expression, column, true, limits);
                     try generated.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
                 }
             } else {
@@ -500,7 +511,7 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
                     const column = try @import("schema_columns.zig").column(column_name, property);
                     const element = column.element_type;
                     const column_type = column.type;
-                    const expression = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, change.set_default.expression, .{ .name = column_name, .type = column_type, .element_type = element }, false);
+                    const expression = try @import("schema_expression.zig").lowerAssignmentWithLimits(alloc, schema.*, change.set_default.expression, .{ .name = column_name, .type = column_type, .element_type = element }, false, limits);
                     replacement = try value(alloc, .{ .column = column_name, .expression = expression });
                 }
                 const defaults = try list(schema, alloc, "column_defaults");

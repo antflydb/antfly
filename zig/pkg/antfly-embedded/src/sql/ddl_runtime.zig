@@ -46,10 +46,11 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     const alloc = allocators.scratch;
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
+    const preparation: @import("immutable_plan.zig").Limits = if (backend.scalar_control) |control| .{ .checkpoint = control.checkpoint, .checkpoint_context = control.ptr } else .{};
     const generated_names = if (statement == .create_table) try generatedConstraintNamesAlloc(alloc, statement.create_table) else &.{};
     defer alloc.free(generated_names);
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAllocWithLimits(alloc, create, preparation), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = generated_names } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },
@@ -59,6 +60,7 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
     defer if (request == .create_table) {
         alloc.free(request.create_table.schema_json);
     };
+    try backend.vtable.checkpoint(backend.ptr);
     const outcome = try dispatch(backend.ptr, allocators, request);
     return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready)) "DDL PENDING" else switch (request) {
         .create_table => "CREATE TABLE",
@@ -105,6 +107,11 @@ pub fn execute(allocators: catalog.DdlAllocators, backend: catalog.Backend, stat
 /// Result belongs to the caller; temporary objects are bounded by the caller's
 /// SQL statement budget. No caller-selected schema generation is introduced.
 pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anyerror![]u8 {
+    return createSchemaAllocWithLimits(alloc, create, .{});
+}
+
+pub fn createSchemaAllocWithLimits(alloc: std.mem.Allocator, create: ast.CreateTable, limits: @import("immutable_plan.zig").Limits) anyerror![]u8 {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (create.columns.len == 0 or create.columns.len > 256) return error.SqlLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -113,6 +120,7 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     var required: std.ArrayList([]const u8) = .empty;
     var generated: std.ArrayList(std.json.Value) = .empty;
     for (create.columns) |column| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
         const primary = primary: {
             for (create.constraints) |constraint| {
                 if (constraint != .add_unique or !constraint.add_unique.primary) continue;
@@ -142,12 +150,13 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     // base references work; any generated-to-generated reference is rejected.
     var generated_index: usize = 0;
     for (create.columns) |column| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
         if (column.default_expression) |expression| {
-            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, false);
+            const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(a, schema, expression, column, false, limits);
             try schema.object.getPtr("column_defaults").?.array.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = lowered }, .{}), .{ .parse_numbers = false }));
         }
         if (column.generated_expression) |expression| {
-            const lowered = try @import("schema_expression.zig").lowerAssignment(a, schema, expression, column, true);
+            const lowered = try @import("schema_expression.zig").lowerAssignmentWithLimits(a, schema, expression, column, true, limits);
             try schema.object.getPtr("generated_columns").?.array.items[generated_index].object.put(a, "expression", lowered);
             generated_index += 1;
         }
@@ -157,7 +166,7 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
             .add_unique, .add_check, .add_foreign_key => {},
             else => return error.InvalidSqlSyntax,
         }
-        _ = try @import("schema_ddl.zig").applyCandidate(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint });
+        _ = try @import("schema_ddl.zig").applyCandidateWithLimits(a, &schema, .{ .name = create.table, .kind = .table, .action = .alter_schema, .schema_change = constraint }, limits);
     }
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
 }
@@ -346,6 +355,68 @@ test "SQL DDL duplicate explicit constraint names remain definite rejection" {
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT UNIQUE, CONSTRAINT repeated CHECK (id > 0), CONSTRAINT repeated CHECK (id < 100))", .{});
     defer compiled.deinit();
     try std.testing.expectError(error.SqlConstraintAlreadyExists, createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
+}
+
+test "SQL generated immutable planning cancellation never dispatches CREATE or publishes ALTER candidates" {
+    const Control = struct {
+        calls: usize = 0,
+        dispatches: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const current = self.calls;
+            self.calls += 1;
+            if (current == self.cancel_at) return error.Cancelled;
+        }
+        fn checkpoint(raw: *anyopaque) anyerror!void {
+            try check(raw);
+        }
+        fn dispatch(raw: *anyopaque, _: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.dispatches += 1;
+            return .{ .mutation_outcome = .committed };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .scalar_control = .{ .ptr = self, .checkpoint = check }, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = dispatch, .checkpoint = checkpoint } };
+        }
+    };
+    const a = std.testing.allocator;
+    var created = try @import("compiler.zig").compile(a, "CREATE TABLE t (s TEXT, g TEXT GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN lower('OK') ELSE lower(s) END) STORED)", .{});
+    defer created.deinit();
+    var control: Control = .{};
+    _ = try execute(.{ .result = a, .scratch = a }, control.backend(), created.statement);
+    try std.testing.expectEqual(@as(usize, 1), control.dispatches);
+    const create_calls = control.calls;
+    for (0..create_calls) |cut| {
+        control = .{ .cancel_at = cut };
+        try std.testing.expectError(error.Cancelled, execute(.{ .result = a, .scratch = a }, control.backend(), created.statement));
+        try std.testing.expectEqual(@as(usize, 0), control.dispatches);
+        try std.testing.expectEqual(cut + 1, control.calls);
+    }
+    var base = try @import("compiler.zig").compile(a, "CREATE TABLE t (s TEXT)", .{});
+    defer base.deinit();
+    const baseline = try createSchemaAlloc(a, base.statement.create_table);
+    defer a.free(baseline);
+    var added = try @import("compiler.zig").compile(a, "ALTER TABLE t ADD COLUMN g TEXT GENERATED ALWAYS AS (CASE WHEN s IS NULL THEN lower('OK') ELSE lower(s) END) STORED", .{});
+    defer added.deinit();
+    var alter_calls: usize = 0;
+    var cut: usize = 0;
+    while (cut == 0 or cut <= alter_calls) : (cut += 1) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var schema = try std.json.parseFromSliceLeaky(std.json.Value, owned, baseline, .{ .parse_numbers = false });
+        control = .{ .cancel_at = if (cut == 0) std.math.maxInt(usize) else cut - 1 };
+        const limits: @import("immutable_plan.zig").Limits = .{ .checkpoint = Control.check, .checkpoint_context = &control };
+        if (cut == 0) {
+            try std.testing.expect(try @import("schema_ddl.zig").applyWithLimits(owned, &schema, added.statement.catalog_ddl, limits));
+            alter_calls = control.calls;
+        } else {
+            try std.testing.expectError(error.Cancelled, @import("schema_ddl.zig").applyWithLimits(owned, &schema, added.statement.catalog_ddl, limits));
+            try std.testing.expectEqualStrings(baseline, try std.json.Stringify.valueAlloc(owned, schema, .{}));
+            try std.testing.expectEqual(cut, control.calls);
+        }
+    }
 }
 
 test "SQL DDL normalizes equivalent index constraints without merging different policies" {

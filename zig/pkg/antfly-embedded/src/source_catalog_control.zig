@@ -192,6 +192,7 @@ pub const sql_scalar = @import("sql/scalar.zig");
 pub const sql_temporal_value = @import("sql/temporal_value.zig");
 pub const sql_temporal_text = @import("sql/temporal_text.zig");
 pub const sql_temporal_reference = @embedFile("sql/fixtures/sql_temporal_reference.json");
+pub const sql_generated_reference = @embedFile("sql/fixtures/sql_generated_expression_reference.json");
 pub const sql_parameter_frame = @import("sql/parameter_frame.zig");
 pub const sql_bound_scalars = @import("sql/bound_scalars.zig");
 pub const sql_replay_rows = @import("sql/replay_rows.zig");

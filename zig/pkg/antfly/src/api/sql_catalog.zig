@@ -213,7 +213,16 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var guard = captured.guard;
     if (try prepareGeneratedAddition(server, context, a, schema, ddl, &guard)) |candidate| {
         schema = candidate;
-    } else if (!try @import("antfly_local_sources").sql_schema_ddl.apply(a, &schema, ddl)) return .{};
+    } else {
+        var preparation_context = context;
+        const Checkpoint = struct {
+            fn check(raw: ?*anyopaque) anyerror!void {
+                const request: *const operation.RequestContext = @ptrCast(@alignCast(raw.?));
+                try request.ensureActive();
+            }
+        };
+        if (!try @import("antfly_local_sources").sql_schema_ddl.applyWithLimits(a, &schema, ddl, .{ .checkpoint = Checkpoint.check, .checkpoint_context = &preparation_context })) return .{};
+    }
     _ = schema.object.swapRemove("version");
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);

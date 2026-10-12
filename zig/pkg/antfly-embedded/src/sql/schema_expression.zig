@@ -66,6 +66,7 @@ fn json(alloc: std.mem.Allocator, input: anytype) !Json {
 }
 
 fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Datum) !Json {
+    if (value.temporal() != null) return error.UnsupportedSqlShape;
     const kind = result.kind orelse return error.SqlTypeMismatch;
     const identity = result.element_type;
     if (kind == .array) return json(alloc, .{
@@ -107,21 +108,48 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
 const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
+    return lowerTypedPolicy(alloc, schema, expression, expected, false, .{});
+}
+
+fn lowerTypedPolicy(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: bool, limits: @import("immutable_plan.zig").Limits) !Lowered {
     const properties = try @import("schema_columns.zig").properties(schema);
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
         const column = try @import("schema_columns.zig").column(name, property);
         try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
     }
-    return lowerColumns(alloc, columns.items, expression, expected);
+    return lowerColumnsPolicy(alloc, columns.items, expression, expected, immutable, limits);
 }
 
 pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
+    return lowerColumnsPolicy(alloc, columns, expression, expected, false, .{});
+}
+
+fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: bool, limits: @import("immutable_plan.zig").Limits) !Lowered {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     var program = try scalar.bindExpected(alloc, expression, columns, &.{}, expected, .{});
     defer program.deinit();
     if (program.parameter_types.len != 0) return error.InvalidSqlParameters;
+    var plan: ?@import("immutable_plan.zig") = if (immutable) try .initWithLimits(alloc, &program, limits) else null;
+    defer if (plan) |*value| value.deinit();
+    if (plan) |*value| if (value.nodes[program.root].volatility != .immutable) return error.SqlMutableGenerationExpression;
     const values = try alloc.alloc(Json, program.instructions.len);
-    for (program.instructions, values, 0..) |instruction, *out, instruction_index| {
+    for (program.instructions, values, 0..) |original, *out, instruction_index| {
+        if (limits.checkpoint) |check| try check(limits.checkpoint_context);
+        var instruction = original;
+        if (plan) |*value| {
+            const node = value.nodes[instruction_index];
+            if (!node.reachable) continue;
+            if (node.alias) |target| {
+                out.* = try promoteNumeric(alloc, values[target], program.instructions[target].type, instruction.type);
+                continue;
+            }
+            if (value.constants[instruction_index]) |known| {
+                out.* = try inputLiteral(alloc, instruction.type, known);
+                continue;
+            }
+            instruction.operation = node.operation;
+        }
         // Unknown NULL acquires its precise domain from its consumer below.
         const kind = instruction.type.kind orelse if (nullLiteral(instruction)) .string else return error.SqlTypeMismatch;
         // Explicit builtin identities survive the physical result domain.
@@ -356,17 +384,22 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
 }
 
-/// Persist an assignment program, not its current result. Arithmetic and casts
-/// retain write-time failures, while literal input coercion uses the same
-/// declared-type admission as existing defaults. Callers provide the complete
-/// candidate schema so forward base-column references bind deterministically.
+/// DEFAULT retains arithmetic failures until write time. Stored generation
+/// first simplifies demanded immutable constants, matching PostgreSQL DDL
+/// failure timing, then persists only the live assignment program. Callers
+/// provide the complete candidate schema so forward base references bind.
 pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool) !Json {
+    return lowerAssignmentWithLimits(alloc, schema, expression, column, generated, .{});
+}
+
+pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool, limits: @import("immutable_plan.zig").Limits) !Json {
+    if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     if (generated) try rejectGeneratedReferences(schema, column.name, expression);
     if (expression.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, expression.literal, column.type, column.element_type);
     const lowered = (if (generated)
-        lowerTyped(alloc, schema, expression, column.type)
+        lowerTypedPolicy(alloc, schema, expression, column.type, true, limits)
     else
-        lowerColumns(alloc, &.{}, expression, column.type)) catch |err| switch (err) {
+        lowerColumnsPolicy(alloc, &.{}, expression, column.type, false, limits)) catch |err| switch (err) {
         error.UnknownColumn => return error.UndefinedColumn,
         else => return err,
     };
@@ -381,6 +414,102 @@ pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *cons
     if (lowered.type != column.type) return error.SqlAssignmentTypeMismatch;
     if (column.type == .array and lowered.element_type != column.element_type) return error.UnsupportedSqlShape;
     return lowered.expression;
+}
+
+test "SQL generated immutable planning prunes dead stable calls and preserves PostgreSQL admission" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try json(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .s = .{ .type = "keyword" }, .t = .{ .type = "datetime" } } } } } });
+    for ([_]struct { sql: []const u8, kind: ast.ColumnType }{
+        .{ .sql = "concat(s, 'x')", .kind = .string },
+        .{ .sql = "concat_ws('-', s, 'x')", .kind = .string },
+        .{ .sql = "now()", .kind = .datetime },
+        .{ .sql = "CURRENT_TIMESTAMP", .kind = .datetime },
+        .{ .sql = "s::timestamptz", .kind = .datetime },
+        .{ .sql = "t::text", .kind = .string },
+    }) |case| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, case.sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlMutableGenerationExpression, lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = case.kind }, true));
+    }
+    for ([_][]const u8{
+        "CASE WHEN false THEN concat(s, 'x') ELSE 'ok' END",
+        "coalesce('ok', concat(s, 'x'))",
+        "coalesce(NULL::text, 'ok', concat(s, 'x'))",
+    }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .string }, true);
+        try std.testing.expectEqualStrings("literal", lowered.object.get("op").?.string);
+        try std.testing.expectEqualStrings("ok", lowered.object.get("value").?.string);
+    }
+    for ([_][]const u8{ "coalesce(s, 'ok', concat(s, 'x'))", "CASE WHEN s IS NULL THEN 'ok' WHEN true THEN 'yes' ELSE concat(s, 'x') END" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .string }, true);
+        const encoded = try std.json.Stringify.valueAlloc(a, lowered, .{});
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "concat") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "column") != null);
+    }
+    var absorbed = try compiler.compileScalar(std.testing.allocator, "s IS NULL OR concat(s, 'x') IS NULL OR true", .{});
+    defer absorbed.deinit();
+    const folded = try lowerAssignment(a, schema, absorbed.expression, .{ .name = "g", .type = .boolean }, true);
+    try std.testing.expectEqual(true, folded.object.get("value").?.bool);
+}
+
+test "SQL generated immutable planning matches independent PostgreSQL DDL contracts" {
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, std.testing.allocator, @embedFile("fixtures/sql_generated_expression_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 34), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        var parsed = try @import("compiler.zig").compile(std.testing.allocator, entry.sql, .{});
+        defer parsed.deinit();
+        const schema = @import("ddl_runtime.zig").createSchemaAlloc(std.testing.allocator, parsed.statement.create_table) catch |err| {
+            if (entry.sqlstate) |state| {
+                try std.testing.expectEqualStrings(state, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("generated expression rejected: {s}: {t}\n", .{ entry.sql, err });
+            return err;
+        };
+        defer std.testing.allocator.free(schema);
+        try std.testing.expect(entry.sqlstate == null);
+    }
+}
+
+test "SQL generated immutable planning retains binding errors and PostgreSQL constant failure timing" {
+    const compiler = @import("compiler.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try json(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .s = .{ .type = "keyword" } } } } } });
+    for ([_][]const u8{ "1 / 0", "CASE WHEN s IS NULL THEN 1 ELSE 1 / 0 END" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlDivisionByZero, lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .integer }, true));
+    }
+    for ([_][]const u8{ "CASE WHEN false THEN 1 / 0 ELSE 1 END", "coalesce(1, 1 / 0)" }) |sql| {
+        var parsed = try compiler.compileScalar(std.testing.allocator, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerAssignment(a, schema, parsed.expression, .{ .name = "g", .type = .integer }, true);
+        try std.testing.expectEqualStrings("cast", lowered.object.get("op").?.string);
+        try std.testing.expectEqualStrings("int64", lowered.object.get("sql_type").?.string);
+        try std.testing.expectEqualStrings("1", lowered.object.get("args").?.array.items[0].object.get("value").?.number_string);
+    }
+    var unknown = try compiler.compileScalar(std.testing.allocator, "CASE WHEN false THEN missing ELSE 'ok' END", .{});
+    defer unknown.deinit();
+    try std.testing.expectError(error.UndefinedColumn, lowerAssignment(a, schema, unknown.expression, .{ .name = "g", .type = .string }, true));
+    var self_reference = try compiler.compileScalar(std.testing.allocator, "CASE WHEN false THEN g ELSE 'ok' END", .{});
+    defer self_reference.deinit();
+    try std.testing.expectError(error.SqlInvalidGenerationExpression, lowerAssignment(a, schema, self_reference.expression, .{ .name = "g", .type = .string }, true));
+    var ordinary_default = try compiler.compileScalar(std.testing.allocator, "1 / 0", .{});
+    defer ordinary_default.deinit();
+    _ = try lowerAssignment(a, schema, ordinary_default.expression, .{ .name = "g", .type = .integer }, false);
+    try std.testing.expectEqual(scalar.Volatility.immutable, scalar.Function.to_timestamp.volatility());
 }
 
 fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const ast.Scalar) anyerror!void {

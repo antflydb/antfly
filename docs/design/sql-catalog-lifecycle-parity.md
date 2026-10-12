@@ -1,21 +1,21 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `b9feda47fb` (including #1079), with merge checkpoint `9a8b2b0ffa`.
+at `b467a7f19f` (including #1093), with merge checkpoint `ebe475bccb`.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Baseline and priorities
 
 The [original inventory](../sql-parity-inventory.md) remains authoritative:
-478 implemented / 136 rejected / 73 superseded / 899 unresolved. Counts below
+479 implemented / 136 rejected / 73 superseded / 898 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
 | 1 | DDL, catalog and sessions | 340 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
-| 2 | Source/joined mutations and MERGE/recursion | 126 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
-| 3 | Read and query | 132 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
+| 2 | Source/joined mutations and MERGE/recursion | 131 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
+| 3 | Read and query | 131 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
 
@@ -3732,3 +3732,55 @@ PostgreSQL 18 oracle tests and reproducibility of all 174 temporal contracts
 pass. The control-only source catalog now exposes the same native temporal
 contracts as the physical consumer, preserving linked test ownership rather
 than dropping the failing control-boundary compilation check.
+
+### Demand-aware immutable generated expressions
+
+Stored generated expressions now use a bounded immutable planning pass after
+complete binding, type/input validation and generated-reference checks. The
+pass simplifies constant CASE, COALESCE and Boolean demand before checking
+volatility. Stable or volatile functions are never sampled to prove a constant;
+dead stable calls do not make an otherwise immutable expression inadmissible.
+Reachable mutable expressions return PostgreSQL SQLSTATE 42P17. Formatting
+casts between row text and timestamptz are stable, while resolved literal input
+functions retain their binding-time identity. The supported numeric-only
+`to_timestamp(double precision)` overload is immutable; it must not inherit
+the distinct text-format overload's stable classification.
+
+The plan retains one bounded arena, memoized typed constants and a shared
+scalar evaluator with aggregate work/output admission. Child constants are
+borrowed instead of recursively reevaluated for each parent. A second reachability
+walk lowers only the rewritten live DAG, so pruned calls cannot leak into the
+durable expression VM. Generated expressions fold demanded immutable failures
+at DDL planning time; ordinary DEFAULT expressions retain write-time arithmetic
+failure semantics. Existing temporal/schema capability guards are not bypassed.
+
+CREATE carries the backend's non-suspending scalar cancellation/deadline control
+through schema construction and planning, with a final checkpoint before DDL
+dispatch. ALTER uses the same planning limits with its request context and
+publishes only a fully prepared candidate. Exhaustive cancellation cuts cover
+planner traversal, reachability and lowering: canceled CREATE never
+dispatches, and canceled ALTER leaves the original schema byte-for-byte intact.
+Malformed root and cyclic/forward dependencies fail as invalid programs rather
+than escaping the bound topological DAG contract.
+
+The independent PostgreSQL fixture records 34 complete CREATE TABLE admission
+contracts and full stored generated-row results for 19 admitted shapes. Seven
+oracle tests cover stable calls/casts, dead branches, binding-before-pruning,
+Boolean order/NULLs, overload volatility and generated-versus-default failure
+timing. Native schema admission matches all 34 contracts. Fault injection covers
+every plan allocation cut. All seven focused native planning regressions pass
+in Debug and ReleaseFast. Deterministic scaling uses 255, 1,023 and 4,095 bound
+nodes with exactly 509, 2,045 and 8,189 scalar fold steps; only the folded root
+remains reachable. This proves linear fold work for that balanced-DAG campaign,
+not universal query speed or complete DDL activation.
+
+The native HTTP regression writes all 19 admitted shapes, closes and reopens
+each database, and checks base fields, generated results, types and SQL NULLs
+against the oracle. SQL integer transport is deliberately lossless text, not a
+JSON number. This exercises native schema preparation, storage and public reads;
+it is not public CREATE/ALTER catalog lifecycle or distributed-fault evidence.
+
+Original-case accounting remains unchanged. General generated-expression VM
+coverage, partial/expression-index admission and distributed catalog lifecycle
+qualification remain required; these component contracts do not certify all
+340 unresolved DDL originals or complete native-index production activation.

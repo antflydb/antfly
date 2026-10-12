@@ -396,7 +396,7 @@ pub const Function = enum {
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
             .ai_decide, .ai_choice, .ai_score, .ai_probability => .@"volatile",
-            .now, .transaction_timestamp, .@"$current_timestamp", .current_setting, .date_part, .date_trunc, .to_timestamp, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
+            .now, .transaction_timestamp, .@"$current_timestamp", .current_setting, .date_part, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
     }
@@ -712,6 +712,21 @@ pub const Program = struct {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = .{} };
         return context.runDatum(index, 0);
     }
+
+    /// One preparation owner supplies only proven immutable constants. Its
+    /// shared evaluator retains work and byte admission across all folds.
+    pub const ConstantEvaluation = struct {
+        context: Evaluator,
+        pub fn init(program: *const Program, alloc: Allocator, constants: []const ?Datum, limits: EvalLimits) ConstantEvaluation {
+            return .{ .context = .{ .program = program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits, .folded_values = constants } };
+        }
+        pub fn evaluate(self: *ConstantEvaluation, index: u32) !Datum {
+            return self.context.runDatum(index, 0);
+        }
+        pub fn usedSteps(self: *ConstantEvaluation) usize {
+            return self.context.usedSteps();
+        }
+    };
 
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
@@ -3344,6 +3359,7 @@ const Evaluator = struct {
     cells: []const Datum,
     parameters: []const Json,
     typed_parameters: ?[]const Datum = null,
+    folded_values: ?[]const ?Datum = null,
     limits: EvalLimits,
     work_owner: ?@import("numeric_value.zig").Context = null,
     pattern_steps: usize = 0,
@@ -3412,6 +3428,7 @@ const Evaluator = struct {
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth) return self.workOwner().limit();
         try self.workOwner().charge(1);
+        if (self.folded_values) |values| if (index < values.len) if (values[index]) |value| return value;
         const instruction = self.program.instructions[index];
         if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
         var result: Datum = switch (instruction.operation) {

@@ -13734,6 +13734,124 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
 }
 
+test "httpx SQL generated immutable planning preserves PostgreSQL stored rows after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        inputs: []const struct { s: ?[]const u8, n: ?i64 },
+        entries: []const struct { sql: []const u8, type: []const u8, sqlstate: ?[]const u8, rows: []const ?[]const u8 = &.{} },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var admitted: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (entry.sqlstate != null) continue;
+        admitted += 1;
+        var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-immutable");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try local.sql_compiler.compile(alloc, entry.sql, .{});
+        defer compiled.deinit();
+        const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+        {
+            var seed = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer seed.close();
+            try seed.setSchemaJson(alloc, schema);
+            const writes = try a.alloc(db_mod.types.BatchWrite, fixture.value.inputs.len);
+            for (fixture.value.inputs, writes, 0..) |input, *write, i| write.* = .{
+                .key = try std.fmt.allocPrint(a, "r{d}", .{i}),
+                .value = try std.json.Stringify.valueAlloc(a, .{ .s = input.s, .n = input.n, .t = "2026-01-01T00:00:00Z" }, .{}),
+            };
+            try seed.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        }
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const Source = @import("sql_parity_sources.zig").Tables(1);
+        var source: Source = .{
+            .records = .{.{ .table_id = 7, .name = "generated_probe", .schema_json = schema }},
+            .reads = .{table_reads.BoundTableReadSource.init("generated_probe", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+        };
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT s, n, g, CAST(g AS text) AS generated_value FROM generated_probe ORDER BY n NULLS FIRST\"}";
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("generated row read rejected: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        try std.testing.expectEqual(entry.rows.len, result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 4), result.value.columns.len);
+        const expected_type: sql_wire.SQLColumnType = if (std.mem.eql(u8, entry.type, "text")) .string else if (std.mem.eql(u8, entry.type, "int")) .integer else .boolean;
+        try std.testing.expectEqual(expected_type, result.value.columns[2].type);
+        for (result.value.rows, result.value.sql_nulls.?, entry.rows, fixture.value.inputs) |row, flags, expected, input| {
+            try std.testing.expectEqual(input.s == null, flags[0]);
+            if (input.s) |text| try std.testing.expectEqualStrings(text, row[0].string);
+            try std.testing.expectEqual(input.n == null, flags[1]);
+            if (input.n) |number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, row[1].string, 10));
+            try std.testing.expectEqual(expected == null, flags[2]);
+            try std.testing.expectEqual(expected == null, flags[3]);
+            if (expected) |text| try std.testing.expectEqualStrings(text, row[3].string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 19), admitted);
+}
+
+test "httpx SQL generated immutable planning preserves PostgreSQL rejection diagnostics" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { sql: []const u8, sqlstate: ?[]const u8 },
+    }, alloc, local.sql_generated_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-sql-generated-rejections");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try db.setSchemaJson(alloc, schema);
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "generated_input", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("generated_input", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var rejected: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const expected = entry.sqlstate orelse continue;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = entry.sql }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 400) std.debug.print("generated rejection diagnostic: {s}: {s}\n", .{ entry.sql, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(expected, diagnostic.value.code);
+        rejected += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 15), rejected);
+    try std.testing.expectEqual(@as(usize, 0), source.captures);
+}
+
 test "httpx SQL transaction timestamp results retain typed values through public streaming" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");
