@@ -95,7 +95,9 @@ pub const OpenOptions = extern struct {
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,
-    reserved: [8]u64 = @splat(0),
+    reserved: [6]u64 = @splat(0),
+    /// Base directory for models used by database enrichments.
+    models_dir: Slice = .{},
 };
 
 /// Options for `antfly_inference_open`. Same prefix-compatible contract as
@@ -291,7 +293,16 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
     };
 }
 
+// Thread-local borrowed detail. Error names have static storage, so callers
+// can copy this immediately without allocation or lifetime races with peers.
+threadlocal var last_error_detail: [:0]const u8 = "";
+
+pub fn lastErrorDetail() [*:0]const u8 {
+    return last_error_detail.ptr;
+}
+
 pub fn mapError(err: anyerror) ErrorCode {
+    last_error_detail = @errorName(err);
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
@@ -299,6 +310,13 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
+        error.InvalidGraphMetricDirection,
+        error.GraphMetricDirectionRequiresSeeds,
+        error.SyntaxError,
+        error.UnexpectedToken,
+        error.UnknownField,
+        error.MissingField,
+        error.InvalidEnumTag,
         error.InvalidArgument,
         error.SqlArraySubscriptError,
         error.RelationalExpressionOverflow,
@@ -378,6 +396,11 @@ pub fn mapError(err: anyerror) ErrorCode {
         // actual bug from the caller's side of the C ABI.
         error.InvalidCreateTableRequest,
         error.UnsupportedCreateTableRequest,
+        error.InvalidIndexRequest,
+        error.InvalidIndexName,
+        error.MissingIndexName,
+        error.InvalidIndexType,
+        error.MissingIndexType,
         error.InvalidIndexConfig,
         error.InvalidEnrichmentConfig,
         error.ConflictingEnrichmentConfig,

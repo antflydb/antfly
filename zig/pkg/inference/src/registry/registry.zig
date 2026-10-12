@@ -1203,10 +1203,10 @@ test "boundary typed decisions require exact multi-Decide identity independent o
 /// The published Decide contract is granted only to the reviewed checkpoint
 /// bytes. Repository/path spelling is intentionally irrelevant: local copies
 /// of the same immutable artifact qualify, while changed weights fail closed.
-fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
-    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return false;
-    const weight_path = manifest.safetensors_path orelse return false;
-    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
+fn decideIdentity(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) ?decide_qualification.Identity {
+    if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or manifest.gliner_architecture != .span or !manifest.gliner_span_declared) return null;
+    const weight_path = manifest.safetensors_path orelse return null;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return null;
     defer reader.deinit();
     var all_f32 = true;
     var tensors = reader.header.tensors.iterator();
@@ -1218,7 +1218,7 @@ fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const mani
         .encoder_family = switch (manifest.gliner_span_encoder_family) {
             .deberta => .deberta,
             .modern_bert => .modern_bert,
-            .unknown => return false,
+            .unknown => return null,
         },
         .geometry = .{
             .hidden_size = manifest.hidden_size,
@@ -1240,14 +1240,19 @@ fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const mani
         .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
         .weight = decide_qualification.Digest.of(reader.file_bytes),
         .sidecars = .{
-            .config = manifest.gliner_span_config_digest orelse return false,
-            .encoder_config = manifest.gliner_span_encoder_digest orelse return false,
-            .tokenizer = manifest.gliner_span_tokenizer_digest orelse return false,
-            .tokenizer_config = manifest.gliner_span_tokenizer_config_digest orelse return false,
+            .config = manifest.gliner_span_config_digest orelse return null,
+            .encoder_config = manifest.gliner_span_encoder_digest orelse return null,
+            .tokenizer = manifest.gliner_span_tokenizer_digest orelse return null,
+            .tokenizer_config = manifest.gliner_span_tokenizer_config_digest orelse return null,
             .special_tokens_map = manifest.gliner_span_special_tokens_digest,
         },
     };
-    return decide_qualification.qualifiedVariant(identity) != null;
+    if (decide_qualification.qualifiedVariant(identity) == null) return null;
+    return identity;
+}
+
+fn decideIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    return decideIdentity(allocator, manifest) != null;
 }
 
 fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
@@ -1763,8 +1768,11 @@ fn synthesizePulledModelManifestJsonInternal(
     // and compare it against the reviewed production table. This must never
     // run on the per-request listing path (loadListingFromDir), only here,
     // where the artifact was just staged to disk.
-    const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
-    const qualified_decide = decideIdentityIsQualified(allocator, &manifest);
+    const boundary_identity = boundaryIdentity(allocator, &manifest);
+    const qualified_boundary = if (boundary_identity) |identity| gliner_qualification.hasQualifiedIdentity(identity) else false;
+    const decide_identity = decideIdentity(allocator, &manifest);
+    const qualified_decide = decide_identity != null;
+    const qualified_span_extraction = qualified_decide and manifest.gliner_span_encoder_family == .modern_bert and manifest.gguf_path == null;
     const qualified_boundary_decide = boundaryDecisionIdentityIsQualified(allocator, &manifest);
     const decision_candidate = isGlinerDecisionCandidate(&manifest);
     const known_decide_source = source == .staging_plan and try isKnownDecideStagingSource(allocator, dest_dir);
@@ -1825,8 +1833,12 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (qualified_decide) {
         try appendQualifiedDecisionCapabilities(allocator, true, &capabilities);
+        if (qualified_span_extraction) {
+            try appendUniqueOwnedString(allocator, &capabilities, "named_entity_recognition");
+            try appendUniqueOwnedString(allocator, &capabilities, "relations");
+        }
         for (tasks.items) |task| if (!std.mem.eql(u8, task, "extract") and !std.mem.eql(u8, task, "decide")) return error.InvalidModelManifest;
-        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions")) return error.InvalidModelManifest;
+        for (capabilities.items) |capability| if (!std.mem.eql(u8, capability, "classification") and !std.mem.eql(u8, capability, "typed_decisions") and !(qualified_span_extraction and (std.mem.eql(u8, capability, "named_entity_recognition") or std.mem.eql(u8, capability, "relations")))) return error.InvalidModelManifest;
     }
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
     // Reserved public capability: neither an alias nor a caller-supplied CSV
@@ -1859,6 +1871,27 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (qualified_decide)
         try body.appendSlice(allocator, ",\"gliner_classification_head\":\"label_marker_mlp\"");
+    if (qualified_boundary or qualified_decide) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Profile = struct { backend: []const u8, features: []const []const u8, lengths: gliner_qualification.LengthContract };
+        var profiles: std.ArrayList(Profile) = .empty;
+        if (boundary_identity) |identity| for (gliner_qualification.publishedProfiles()) |entry| {
+            if (!std.meta.eql(identity, entry.identity)) continue;
+            var features: std.ArrayList([]const u8) = .empty;
+            var iterator = entry.features.iterator();
+            while (iterator.next()) |feature| try features.append(a, @tagName(feature));
+            try profiles.append(a, .{ .backend = @tagName(entry.backend), .features = features.items, .lengths = entry.lengths });
+        };
+        const limits = try std.json.Stringify.valueAlloc(a, .{
+            .profiles = profiles.items,
+            .decide = if (decide_identity) |identity| try decide_qualification.requestLimits(identity) else null,
+            .runtime_revalidates_artifact = true,
+        }, .{});
+        try body.appendSlice(allocator, ",\"qualified_limits\":");
+        try body.appendSlice(allocator, limits);
+    }
     if (sparse_3d_output_layout) |layout| {
         try body.appendSlice(allocator, ",\"sparse_3d_output_layout\":");
         try appendJsonString(&body, allocator, sparse3DOutputLayoutName(layout));

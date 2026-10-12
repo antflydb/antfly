@@ -579,17 +579,36 @@ and both are served by the same seam:
    query can hydrate promoted entity docs across shards. Verified by db-tests and
    the live multi-node e2e.
 
-Embedding generation for ANN blocking and entity+edge atomicity are not yet
-built; see "Open work" below.
+Lite supports candidate reads and atomic promotion across named tables. A
+configured `name_embedding` is generated from each mention using the destination
+table's dense embedding index configuration, before ANN candidate blocking.
+Configure `candidate_search: "ann"`, `candidate_ann_index`, `name_embedding`,
+and `name_embedding_dims` to match that index. The entity table needs a dense
+index over its canonical name; its embeddings and the query mention must use
+the same model and dimensions. `run_until_idle_json` drains destination tables
+as well as source tables, including recursive generator/resolver pipelines.
+
+For known synonyms, write an entity document at the exact minted alias key
+with `merged_into` set to the surviving canonical key (and `merged_into_table`
+for a different table). The survivor must exist. Exact aliases are followed
+before statistical scoring, even when no scorer is configured; dangling
+redirects never authorize a match. This allows deterministic corrections such
+as `concept/qwen3` → `concept/qwen3_embedding` without embeddings.
+
+The `slug` template helper is ASCII-only for compatibility with existing keys.
+For multilingual mentions use `{{ hash _entity.text }}` in the key template;
+the hash preserves distinctions in UTF-8 names that an ASCII slug would lose.
+Keep the original name in `canonical_name` and `aliases` for display and search.
+
+Resolution merges mentions that extraction found; it cannot recover a missing
+subject. For short claims, use specific labels and descriptions naming the
+expected domain (for example, model or software component), and measure recall
+on representative claims while lowering the extraction threshold. Lower
+thresholds also increase false positives. Track missing main subjects separately
+from synonym resolution and keep an application-supplied subject when available.
 
 ## Open work
 
-- **Name-embedding generation for ANN blocking.** ANN candidate search needs
-  the mention `name_embedding` to be produced -- a name-embedding enrichment
-  over the extraction entities (an `embedding` artifact the resolver reads),
-  reusing the dense-embedding producer already in the enrichment runtime. This
-  is the recommended next step, since it unblocks the `ann` candidate source
-  end to end.
 - **Entity + edge atomicity.** Entity promotion is transactional across entity
   shards, but atomically coupling the entity upsert with graph-edge artifacts
   needs a graph-edge participant in `TableCommitRequest`. Until then, entity

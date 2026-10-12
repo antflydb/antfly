@@ -322,6 +322,7 @@ pub const ModelManifest = struct {
     preprocessor_config_path: ?[]const u8 = null,
     processor_config_path: ?[]const u8 = null,
     inference_bundle_family: []const u8 = "",
+    qualified_limits_json: []const u8 = "",
     gliner_boundary_bundle: ?boundary_bundle.Parsed = null,
     gliner_boundary_config_digest: ?boundary_bundle.Digest = null,
     gliner_boundary_encoder_digest: ?boundary_bundle.Digest = null,
@@ -504,6 +505,7 @@ pub const ModelManifest = struct {
         if (self.preprocessor_config_path) |p| self.allocator.free(p);
         if (self.processor_config_path) |p| self.allocator.free(p);
         if (self.inference_bundle_family.len > 0) self.allocator.free(self.inference_bundle_family);
+        if (self.qualified_limits_json.len > 0) self.allocator.free(self.qualified_limits_json);
         if (self.visual_model_path) |p| self.allocator.free(p);
         if (self.audio_model_path) |p| self.allocator.free(p);
         if (self.text_projection_path) |p| self.allocator.free(p);
@@ -3176,6 +3178,14 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         .object => |object| object,
         else => return error.InvalidModelManifest,
     };
+
+    // Discovery metadata only. Runtime admission always binds actual bytes.
+    if (obj.get("qualified_limits")) |value| {
+        if (value != .object) return error.InvalidModelManifest;
+        const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        if (manifest.qualified_limits_json.len > 0) allocator.free(manifest.qualified_limits_json);
+        manifest.qualified_limits_json = json;
+    }
 
     if (obj.get("type")) |v| {
         manifest.model_type = try parseManifestModelTypeJson(v);
@@ -8015,6 +8025,7 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
         .id2label = &strings,
         .gliner_default_labels = &strings,
         .gliner_relation_labels = &strings,
+        .qualified_limits_json = "{\"runtime_revalidates_artifact\":true}",
         .chat_template = "{{ message }}",
         .eos_token = "<eos>",
         .gliner_boundary_bundle = parsed,

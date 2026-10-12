@@ -180,6 +180,34 @@ pub fn requireRequest(variant: QualifiedVariant, backend: Backend, request_items
     }
 }
 
+pub const RequestLimits = struct {
+    request_items: usize = 1,
+    prepared_sequences: usize = 1,
+    sequence_tokens: usize = 198,
+};
+
+/// Precision-specific admission: the FP32 extraction/context proof cannot be
+/// borrowed by the separately pinned Q8 encoder/head bundle.
+pub fn requestLimits(identity: Identity) !RequestLimits {
+    const variant = try require(identity);
+    if (variant == .decide_1b and identity.weight_companion == null)
+        return .{ .prepared_sequences = 64, .sequence_tokens = 1024 };
+    return .{};
+}
+
+pub fn supportsSpanExtraction(identity: Identity) bool {
+    return qualifiedVariant(identity) == .decide_1b and identity.weight_companion == null;
+}
+
+pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize, sequences: usize, tokens: usize) !void {
+    const variant = try require(identity);
+    if (variant != .decide_1b) return;
+    if (backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
+    const limits = try requestLimits(identity);
+    if (items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
+        return error.UnsupportedGlinerDecisionGeometry;
+}
+
 fn digestFromPin(pin: FilePin) Digest {
     return .{ .size_bytes = pin.size_bytes, .sha256 = pin.sha256[0..64].* };
 }
@@ -236,6 +264,13 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     };
     try std.testing.expect(isDecide1B(identity));
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
+    try std.testing.expect(supportsSpanExtraction(identity));
+    try requireRequestIdentity(identity, .native, 1, 1, 1024);
+    try requireRequestIdentity(identity, .metal, 1, 64, 1024);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 1, 1, 1025));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .native, 2, 1, 700));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 65, 700));
+
     identity.inventory.all_f32 = false;
     try std.testing.expect(!isDecide1B(identity));
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
@@ -244,6 +279,10 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     identity.weight_companion = digestFromPin(decide_1b_q8_head);
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
     const quantized = identity;
+    try std.testing.expect(!supportsSpanExtraction(identity));
+    try requireRequestIdentity(identity, .metal, 1, 1, 198);
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .metal, 1, 1, 199));
+
     identity.weight_companion = null;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
     identity = quantized;

@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.edge_direction import EdgeDirection
 from ..models.graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
 from ..types import UNSET, Unset
 
@@ -20,6 +21,10 @@ class GraphMetricRerank:
         Attributes:
             index (str): Graph index that owns the published metric.
             metric (str): Graph metric name to blend into the search hit score.
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
             candidate_count (int | Unset): Bounded retrieval window scored by the graph metric before offset and limit are
                 applied. When omitted, Antfly uses an adaptive four-times page window, capped at 10,000 candidates. An explicit
                 value must cover offset plus limit. Larger windows improve promotion recall at predictable linear score-read
@@ -47,6 +52,7 @@ class GraphMetricRerank:
 
     index: str
     metric: str
+    direction: EdgeDirection | Unset = UNSET
     candidate_count: int | Unset = UNSET
     base_weight: float | Unset = 1.0
     weight: float | Unset = 1.0
@@ -61,6 +67,10 @@ class GraphMetricRerank:
         index = self.index
 
         metric = self.metric
+
+        direction: str | Unset = UNSET
+        if not isinstance(self.direction, Unset):
+            direction = self.direction.value
 
         candidate_count = self.candidate_count
 
@@ -90,6 +100,8 @@ class GraphMetricRerank:
                 "metric": metric,
             }
         )
+        if direction is not UNSET:
+            field_dict["direction"] = direction
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
         if base_weight is not UNSET:
@@ -116,6 +128,13 @@ class GraphMetricRerank:
 
         metric = d.pop("metric")
 
+        _direction = d.pop("direction", UNSET)
+        direction: EdgeDirection | Unset
+        if isinstance(_direction, Unset):
+            direction = UNSET
+        else:
+            direction = EdgeDirection(_direction)
+
         candidate_count = d.pop("candidate_count", UNSET)
 
         base_weight = d.pop("base_weight", UNSET)
@@ -140,6 +159,7 @@ class GraphMetricRerank:
         graph_metric_rerank = cls(
             index=index,
             metric=metric,
+            direction=direction,
             candidate_count=candidate_count,
             base_weight=base_weight,
             weight=weight,

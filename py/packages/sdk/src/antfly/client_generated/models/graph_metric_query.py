@@ -6,6 +6,7 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.edge_direction import EdgeDirection
 from ..models.graph_metric_query_metric_freshness import GraphMetricQueryMetricFreshness
 from ..types import UNSET, Unset
 
@@ -21,6 +22,10 @@ class GraphMetricQuery:
         Attributes:
             index (str): Graph index that owns the published metric.
             metric (str): Graph metric to read.
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
             name (str | Unset): Optional result key. Defaults to the metric name.
             top_k (int | Unset): Maximum ranked metric scores to return. Multi-shard tables require a globally coordinated
                 metric snapshot. Default: 10.
@@ -37,6 +42,7 @@ class GraphMetricQuery:
 
     index: str
     metric: str
+    direction: EdgeDirection | Unset = UNSET
     name: str | Unset = UNSET
     top_k: int | Unset = 10
     metric_freshness: GraphMetricQueryMetricFreshness | Unset = GraphMetricQueryMetricFreshness.PUBLISHED
@@ -48,6 +54,10 @@ class GraphMetricQuery:
         index = self.index
 
         metric = self.metric
+
+        direction: str | Unset = UNSET
+        if not isinstance(self.direction, Unset):
+            direction = self.direction.value
 
         name = self.name
 
@@ -71,6 +81,8 @@ class GraphMetricQuery:
                 "metric": metric,
             }
         )
+        if direction is not UNSET:
+            field_dict["direction"] = direction
         if name is not UNSET:
             field_dict["name"] = name
         if top_k is not UNSET:
@@ -91,6 +103,13 @@ class GraphMetricQuery:
 
         metric = d.pop("metric")
 
+        _direction = d.pop("direction", UNSET)
+        direction: EdgeDirection | Unset
+        if isinstance(_direction, Unset):
+            direction = UNSET
+        else:
+            direction = EdgeDirection(_direction)
+
         name = d.pop("name", UNSET)
 
         top_k = d.pop("top_k", UNSET)
@@ -109,6 +128,7 @@ class GraphMetricQuery:
         graph_metric_query = cls(
             index=index,
             metric=metric,
+            direction=direction,
             name=name,
             top_k=top_k,
             metric_freshness=metric_freshness,

@@ -32774,7 +32774,6 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         } else graph_mod.TopologyMode.graph;
 
         const field_name = if (item.object.get("field")) |value| blk: {
-            if (artifact_sources.len > 0) return error.InvalidIndexConfig;
             if (value != .string) return error.InvalidIndexConfig;
             break :blk try alloc.dupe(u8, value.string);
         } else null;
@@ -33447,11 +33446,14 @@ test "graph config rejects source mappings without ids undeclared doc fields and
     ));
 }
 
-test "graph config rejects artifact source combined with document field edge types" {
+test "graph config accepts artifact and document field contributors" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+    var config = try parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
-    ));
+    );
+    defer config.deinit(alloc);
+    try std.testing.expectEqualStrings("edges", config.edge_type_configs[0].field_name.?);
+    try std.testing.expectEqual(@as(usize, 1), config.artifact_sources.len);
 }
 
 test "graph edge type config rejects unsupported constraints" {

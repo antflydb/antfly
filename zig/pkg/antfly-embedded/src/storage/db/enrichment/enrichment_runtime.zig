@@ -2966,6 +2966,7 @@ fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
 
 fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeStatus {
     return .{
+        .last_error_code = runtime.last_error_code,
         .target_sequence = runtime.target_sequence,
         .error_count = runtime.error_count,
         .retryable_error_count = runtime.retryable_error_count,
@@ -2989,6 +2990,7 @@ fn runtimeProjectionStatus(retrying: bool, worker_failed: bool) enrichment_state
 }
 
 fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
+    if (@hasField(@TypeOf(runtime.*), "last_error_code")) runtime.last_error_code = persisted_status.last_error_code;
     runtime.error_count = persisted_status.error_count;
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
@@ -4319,6 +4321,7 @@ fn getOrCreateRequestChunks(
 fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
     runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
     runtime.error_count = @max(runtime.error_count, previous.error_count);
+    if (@hasField(@TypeOf(runtime.*), "last_error_code") and previous.last_error_code.len > 0) runtime.last_error_code = previous.last_error_code;
     runtime.retryable_error_count = @max(runtime.retryable_error_count, previous.retryable_error_count);
     runtime.fatal_error_count = @max(runtime.fatal_error_count, previous.fatal_error_count);
     runtime.skip_by_hash_count = @max(runtime.skip_by_hash_count, previous.skip_by_hash_count);
@@ -4774,6 +4777,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .projection_checkpoint_config_hash = config_hash,
             .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
+            .last_error_code = if (@hasField(@TypeOf(self.*), "last_error_code")) self.last_error_code else .{},
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
@@ -4961,6 +4965,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
     index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
+    last_error_code: types.RuntimeErrorName = .{},
     last_error_name: ?[]const u8 = null,
     /// Guards the three string sets below. They are read and written from
     /// the scanner thread and from both concurrently running execution
@@ -5553,6 +5558,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .projection_checkpoint_config_hash = config_hash,
             .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
+            .last_error_code = if (@hasField(@TypeOf(self.*), "last_error_code")) self.last_error_code else .{},
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
@@ -5636,6 +5642,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
+        self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
         self.error_count += 1;
         self.fatal_error_count += 1;
         self.retrying = false;
@@ -5663,6 +5670,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
         if (!awaiting_publication) {
+            self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
             self.error_count += 1;
             self.retryable_error_count += 1;
             if (scope == .pipeline) self.consecutive_retry_count +|= 1;
@@ -5698,6 +5706,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         std.log.warn("enrichment provider transient failure, retrying inline: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
+        self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
         self.error_count += 1;
         self.retryable_error_count += 1;
         status = runtimeStatusSnapshot(self);
@@ -6419,6 +6428,7 @@ fn noteTerminalRequestFailure(
     indexes: []const []const u8,
     artifact_name: []const u8,
     completed_failure_fingerprint: u64,
+    failure: anyerror,
 ) !void {
     const maybe_io = lockRuntime(runtime);
     const interval = mergedTerminalFailureInterval(
@@ -6440,6 +6450,7 @@ fn noteTerminalRequestFailure(
         runtime.retry_failure_fingerprint = 0;
         runtime.retry_failure_count = 0;
     }
+    runtime.last_error_code = types.RuntimeErrorName.init(@errorName(failure));
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
@@ -6573,6 +6584,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
             .asset, .chunk_text => requestArtifactName(request),
         },
         requestFailureFingerprint(request),
+        err,
     );
     runtime.notifyStatusHook();
 }
@@ -30529,14 +30541,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, error.TestFailure);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, error.TestFailure);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);

@@ -70,10 +70,15 @@ fn open_options_builder_sets_fields() {
         .mode(OpenMode::Readonly)
         .profile(Profile::Hosted)
         .no_sync(true)
+        .models_dir("/tmp/antfly-models")
         .busy_timeout(Duration::from_millis(150));
     assert_eq!(opts.mode, OpenMode::Readonly);
     assert_eq!(opts.profile, Profile::Hosted);
     assert!(opts.no_sync);
+    assert_eq!(
+        opts.models_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/antfly-models"))
+    );
     assert_eq!(opts.busy_timeout, Some(Duration::from_millis(150)));
 }
 

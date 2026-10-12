@@ -218,4 +218,8 @@ def raise_for_code(code: int) -> None:
     for ANTFLY_OK."""
     if code == OK:
         return
-    raise error_class_for_code(code)(code)
+    from . import _ffi
+
+    detail = _ffi._lib.antfly_last_error_detail() if _ffi._lib is not None else None
+    message = detail.decode("utf-8", errors="replace") if detail else None
+    raise error_class_for_code(code)(code, message)

@@ -21,7 +21,7 @@ const std = h.std;
 const catalog_key = "\x00antfly/embedded/tables/v1";
 const Record = struct { name: []const u8, id: u64 };
 const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{} };
-pub const Table = struct { name: []u8, id: u64, db: h.db_mod.DB };
+pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
 
 fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const alloc = handle.alloc;
@@ -30,7 +30,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     const owned_name = try alloc.dupe(u8, name);
     errdefer alloc.free(owned_name);
     const namespace = try std.fmt.allocPrint(alloc, "embedded/tables/{d}", .{id});
-    defer alloc.free(namespace);
+    errdefer alloc.free(namespace);
     const path = if (handle.owned_lite_backend != null)
         try alloc.dupe(u8, handle.embedded_path orelse return error.UnsupportedSqlExecution)
     else
@@ -43,8 +43,9 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.prefer_existing_identity_namespace = false;
     options.online_source_authority = .native;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
-    table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
+    table.* = .{ .name = owned_name, .id = id, .namespace = namespace, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
+    @import("entity_sink.zig").attach(handle, &table.db);
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
     return table;
@@ -53,6 +54,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
 fn destroy(handle: *h.Handle, table: *Table) void {
     if (handle.lease_snapshot) table.db.closeImmutableSnapshot() else table.db.close();
     handle.alloc.free(table.name);
+    handle.alloc.free(table.namespace);
     handle.alloc.destroy(table);
 }
 

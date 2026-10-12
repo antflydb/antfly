@@ -11750,7 +11750,14 @@ pub const GraphIndex = struct {
             const target_idx = try self.getOrPutPageRankNode(&map, nodes, parsed.target.bytes);
             if (source_idx > std.math.maxInt(u32) or target_idx > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
             if (nodes.items.len > controls.max_nodes) return error.GraphMetricBuildBudgetExceeded;
-            try edges.append(self.alloc, .{ .source = @intCast(source_idx), .target = @intCast(target_idx) });
+            if (controls.direction != .in) {
+                if (edges.items.len >= controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
+                try edges.append(self.alloc, .{ .source = @intCast(source_idx), .target = @intCast(target_idx) });
+            }
+            if (controls.direction == .in or (controls.direction == .both and source_idx != target_idx)) {
+                if (edges.items.len >= controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
+                try edges.append(self.alloc, .{ .source = @intCast(target_idx), .target = @intCast(source_idx) });
+            }
             if (edges.items.len > controls.max_edges) return error.GraphMetricBuildBudgetExceeded;
         }
         try controls.cancellation.check();
@@ -20175,6 +20182,7 @@ pub const GraphIndex = struct {
     /// caller's limits and cancellation must bound the scan itself — the
     /// kernel's own work ceiling cannot.
     pub const PersonalizedReadControls = struct {
+        direction: enum { out, in, both } = .out,
         max_nodes: usize = default_personalized_read_max_nodes,
         max_edges: usize = default_personalized_read_max_edges,
         cancellation: cancellation_mod.CancellationToken = .none,

@@ -163,3 +163,14 @@ impl std::error::Error for Error {}
 
 /// A `Result` whose error type is [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Copy the most recent native failure detail on the current thread.
+/// Call immediately after a failed operation; later failures replace it.
+#[cfg(feature = "libantfly")]
+pub fn last_error_detail() -> String {
+    unsafe {
+        std::ffi::CStr::from_ptr(antfly_embedded_sys::antfly_last_error_detail())
+            .to_string_lossy()
+            .into_owned()
+    }
+}

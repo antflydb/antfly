@@ -128,7 +128,12 @@ pub fn startLiteEmbeddedInference(
     io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
     errdefer io_impl.deinit();
     const data_dir = std.fs.path.dirname(path) orelse ".";
-    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), budget_options);
+    var owned_options = budget_options;
+    const models_dir = if (budget_options.models_dir) |directory| try alloc.dupe(u8, directory) else null;
+    errdefer if (models_dir) |directory| alloc.free(directory);
+    owned_options.models_dir = models_dir;
+    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), owned_options);
+    handle.lite_inference_models_dir = models_dir;
     handle.lite_inference_io = io_impl;
     handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
     // Report the policy the node actually resolved (host-detected by
@@ -481,7 +486,7 @@ pub fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
     return liteMergedIndexesForDatabaseJsonAlloc(handle.alloc, handle.database());
 }
 
-fn liteMergedIndexesForDatabaseJsonAlloc(alloc: Allocator, database: *db_mod.DB) ![]u8 {
+pub fn liteMergedIndexesForDatabaseJsonAlloc(alloc: Allocator, database: *db_mod.DB) ![]u8 {
     const configs = try database.listIndexes(alloc);
     defer db_mod.types.freeIndexConfigs(alloc, configs);
     const enrichments = try database.listEnrichments(alloc);
@@ -595,6 +600,7 @@ pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: 
     var cfg = enrichments.takeConfig();
     cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
     try database.reconfigureEnrichmentRuntime(cfg);
+    database.setResolutionEmbedder(if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null);
 }
 
 pub const stamped_generation_optimistic_attempts = 4;
@@ -1217,6 +1223,7 @@ pub const JsonDBIndexStats = struct {
 };
 
 pub const JsonEnrichmentStats = struct {
+    last_error_code: db_mod.types.RuntimeErrorName = .{},
     enabled: bool,
     lease_owned: bool,
     has_lease: bool,
@@ -2269,6 +2276,11 @@ pub export fn antfly_open_options_size() u32 {
     return @intCast(@sizeOf(capi.OpenOptions));
 }
 
+/// Most recent mapped failure on this thread; copy before another failing call.
+pub export fn antfly_last_error_detail() [*:0]const u8 {
+    return capi.lastErrorDetail();
+}
+
 pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
     return capi.errorCodeName(code);
 }
@@ -2416,6 +2428,7 @@ pub fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOp
         .inference = .{
             .remote_provider_configured = (flags & capi.open_flag_remote_provider_configured) != 0,
             .local_runtime_configured = (flags & capi.open_flag_local_runtime_configured) != 0,
+            .models_dir = if (readOptionField(capi.OpenOptions, options, abi_size, "models_dir")) |directory| if (directory.len > 0) directory.bytes() else null else null,
             .host_budget_mb = readOptionField(capi.OpenOptions, options, abi_size, "inference_host_budget_mb") orelse 0,
             .backend_budget_mb = readOptionField(capi.OpenOptions, options, abi_size, "inference_backend_budget_mb") orelse 0,
             .combined_budget_mb = readOptionField(capi.OpenOptions, options, abi_size, "inference_combined_budget_mb") orelse 0,
@@ -2558,6 +2571,7 @@ pub fn openLiteHandleAllocWithRuntime(
         opts.sparse_compaction = .{ .enabled = false };
         opts.graph_metric_maintenance = .{ .start_background_loop = false };
     }
+    opts.start_resolver_workers = false;
     if (resolved.externally_locked) {
         // The connection worker drives maintenance while holding its path lease.
         opts.executor = .{ .backend = .manual };
@@ -2613,6 +2627,7 @@ pub fn openLiteHandleAllocWithRuntime(
         // adding any of that cleanup here too would run it twice on this
         // error path. Only unwind the state this function itself owns.
         try startLiteEmbeddedInference(handle, alloc, path, .{
+            .models_dir = resolved.inference.models_dir,
             .host_budget_mb = resolved.inference.host_budget_mb,
             .backend_budget_mb = resolved.inference.backend_budget_mb,
             .combined_budget_mb = resolved.inference.combined_budget_mb,
@@ -2630,6 +2645,7 @@ pub fn openLiteHandleAllocWithRuntime(
         stopLiteEmbeddedInference(handle);
         return err;
     };
+    @import("entity_sink.zig").attach(handle, &handle.db);
     if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
@@ -4412,8 +4428,34 @@ pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.runUntilIdle() catch |err| return capi.mapError(err);
+    @import("entity_sink.zig").runUntilIdle(handle) catch |err| return capi.mapError(err);
     return .ok;
+}
+
+/// A root Lite connection drains every namespace. Report that same scope,
+/// retaining per-table snapshots so callers can identify failed producers.
+pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
+    var stats = handle.database().pendingWorkStats();
+    if (handle.selected_table_name != null or handle.embedded_tables.count() == 0) return stringifyJson(stats);
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var snapshots: std.json.ObjectMap = .empty;
+    var iterator = handle.embedded_tables.iterator();
+    while (iterator.next()) |entry| {
+        const child = entry.value_ptr.*.db.pendingWorkStats();
+        const bytes = try std.json.Stringify.valueAlloc(a, child, .{});
+        try snapshots.put(a, entry.key_ptr.*, try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}));
+        stats.enrichment.enabled = stats.enrichment.enabled or child.enrichment.enabled;
+        stats.enrichment.error_count +|= child.enrichment.error_count;
+        stats.enrichment.retryable_error_count +|= child.enrichment.retryable_error_count;
+        stats.enrichment.fatal_error_count +|= child.enrichment.fatal_error_count;
+        if (child.enrichment.last_error_code.len > 0) stats.enrichment.last_error_code = child.enrichment.last_error_code;
+    }
+    const bytes = try std.json.Stringify.valueAlloc(a, stats, .{});
+    var output = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    try output.object.put(a, "tables", .{ .object = snapshots });
+    return stringifyJson(output);
 }
 
 pub export fn antfly_db_run_until_idle_json(
@@ -4428,11 +4470,12 @@ pub export fn antfly_db_run_until_idle_json(
     }
     defer guard.leave();
     const handle = guard.handle;
-    handle.database().*.runUntilIdle() catch |err| {
+    @import("entity_sink.zig").runUntilIdle(handle) catch |err| {
         writeRunUntilIdleNoProgressDiagnosticIfAny(handle.database(), out_buf, err);
+        if (out_buf.len == 0) out_buf.* = pendingWorkStatsJson(handle) catch .{};
         return capi.mapError(err);
     };
-    out_buf.* = stringifyJson(handle.database().*.pendingWorkStats()) catch return .internal;
+    out_buf.* = pendingWorkStatsJson(handle) catch return .internal;
     return .ok;
 }
 
@@ -4464,7 +4507,7 @@ pub export fn antfly_db_pending_work_stats_json(
     }
     defer guard.leave();
     const handle = guard.handle;
-    out_buf.* = stringifyJson(handle.database().*.pendingWorkStats()) catch return .internal;
+    out_buf.* = pendingWorkStatsJson(handle) catch return .internal;
     return .ok;
 }
 
@@ -4976,6 +5019,7 @@ pub fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndex
         .repair_summary_ready = stats.repair_summary_ready,
         .repair_issue_count_estimated = stats.repair_issue_count_estimated,
         .enrichment = .{
+            .last_error_code = stats.enrichment.last_error_code,
             .enabled = stats.enrichment.enabled,
             .lease_owned = stats.enrichment.lease_owned,
             .has_lease = stats.enrichment.has_lease,
@@ -5066,6 +5110,9 @@ pub fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "\"full_text_search\"") != null or
         std.mem.indexOf(u8, bytes, "\"embeddings\"") != null or
         std.mem.indexOf(u8, bytes, "\"graph_queries\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_metric\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_metric_rerank\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_metric_seed\"") != null or
         std.mem.indexOf(u8, bytes, "\"merge_config\"") != null or
         std.mem.indexOf(u8, bytes, "\"indexes\"") != null or
         std.mem.indexOf(u8, bytes, "\"query\"") != null;
@@ -5345,7 +5392,7 @@ pub export fn antfly_db_search_json(
     defer guard.leave();
     const handle = guard.handle;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
-        return searchPublicQueryJson(handle, "docs", request_json, out_buf);
+        return searchPublicQueryJson(handle, handle.selected_table_name orelse "docs", request_json, out_buf);
     }
     const Request = struct {
         mode: []const u8,
@@ -5372,8 +5419,7 @@ pub export fn antfly_db_search_json(
         aggregations: []const JsonSearchAggregationRequest = &.{},
     };
     var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| {
-        std.debug.print("pattern parse error={s}\n", .{@errorName(err)});
-        return .invalid_argument;
+        return capi.mapError(err);
     };
     defer parsed.deinit();
 
@@ -6743,25 +6789,24 @@ pub export fn antfly_db_add_index_json(
     }
     defer guard.leave();
     const handle = guard.handle;
-    const Request = struct {
-        name: []const u8,
-        kind: []const u8,
-        config_json: []const u8,
-    };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, config_json.bytes(), .{}) catch return .invalid_argument;
-    defer parsed.deinit();
-    const kind: db_mod.types.IndexKind = if (std.mem.eql(u8, parsed.value.kind, "full_text"))
-        .full_text
-    else if (std.mem.eql(u8, parsed.value.kind, "graph"))
-        .graph
-    else if (std.mem.eql(u8, parsed.value.kind, "dense_vector"))
-        .dense_vector
-    else if (std.mem.eql(u8, parsed.value.kind, "sparse_vector"))
-        .sparse_vector
-    else if (std.mem.eql(u8, parsed.value.kind, "algebraic"))
-        .algebraic
-    else
-        return .invalid_argument;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, config_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    if (value != .object) return capi.mapError(error.InvalidIndexRequest);
+    const name = value.object.get("name") orelse return capi.mapError(error.MissingIndexName);
+    if (name != .string or name.string.len == 0) return capi.mapError(error.InvalidIndexName);
+    const discriminator = value.object.get("kind") orelse value.object.get("type") orelse return capi.mapError(error.MissingIndexType);
+    if (discriminator != .string) return capi.mapError(error.InvalidIndexType);
+    const kind: db_mod.types.IndexKind = if (std.mem.eql(u8, discriminator.string, "embeddings")) .dense_vector else std.meta.stringToEnum(db_mod.types.IndexKind, discriminator.string) orelse
+        return capi.mapError(error.InvalidIndexType);
+    const config_value = value.object.get("config_json");
+    const normalized_config = if (config_value) |config| switch (config) {
+        .string => config.string,
+        .object => std.json.Stringify.valueAlloc(a, config, .{}) catch |err| return capi.mapError(err),
+        else => return capi.mapError(error.InvalidIndexConfig),
+    } else std.json.Stringify.valueAlloc(a, value, .{}) catch |err| return capi.mapError(err);
+    const parsed = .{ .value = .{ .name = name.string, .config_json = normalized_config } };
     // A native Lite handle also accepts the server's nested "enrichments"
     // shape on this index's own config (see `registerLiteIndexEnrichments`),
     // registering every declared producer before the index below is admitted

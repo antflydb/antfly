@@ -103,6 +103,8 @@ const (
 // --inference-kv-budget-mb/--inference-scratch-budget-mb/
 // --process-memory-budget-mb flags.
 type OpenOptions struct {
+	// ModelsDir selects models used by database enrichments. Empty uses default.
+	ModelsDir string
 	// Storage selects a .aflite file (the default) or a directory. Directory
 	// storage is created by opening a missing path; CreateWithOptions only
 	// creates .aflite files.
@@ -192,6 +194,13 @@ func ValidateABI() error {
 		return fmt.Errorf("lite: C ABI open options size %d, compiled header size %d", got, want)
 	}
 	return nil
+}
+
+// LastErrorDetail returns the native validation error for the current OS thread.
+// Call immediately after failure while runtime.LockOSThread is held across
+// both the operation and this accessor.
+func LastErrorDetail() string {
+	return C.GoString(C.antfly_last_error_detail())
 }
 
 func cABIErrorCodeName(code ErrorCode) string {
@@ -307,6 +316,11 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	}
 	if opts.LocalRuntimeConfigured {
 		cOpts.flags |= C.ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED
+	}
+	if opts.ModelsDir != "" {
+		directory := C.CBytes([]byte(opts.ModelsDir))
+		defer C.free(directory)
+		cOpts.models_dir = C.antfly_slice{ptr: (*C.uint8_t)(directory), len: C.size_t(len(opts.ModelsDir))}
 	}
 	cOpts.inference_host_budget_mb = C.uint32_t(opts.HostBudgetMB)
 	cOpts.inference_backend_budget_mb = C.uint32_t(opts.BackendBudgetMB)

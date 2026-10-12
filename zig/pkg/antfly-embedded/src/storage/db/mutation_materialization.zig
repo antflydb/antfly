@@ -3957,6 +3957,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer if (graph_writes.len > 0) ctx.alloc.free(graph_writes);
                         try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_writes, graph_deletes);
                     }
+                    // A field replacement clears the document's serving edges.
+                    // Restore every committed contributor, including unchanged
+                    // extraction artifacts whose producer hash is still current.
+                    for (batch.graph_doc_clears) |clear| {
+                        if (!containsDeleteKey(clear.index_names, index_ref.name)) continue;
+                        const surviving = try collectGraphArtifactsForDocIndex(ctx.alloc, ctx.store, clear.key, index_ref.name);
+                        defer docstore_mod.DocStore.freeResults(ctx.alloc, surviving);
+                        const keys = try ctx.alloc.alloc([]const u8, surviving.len);
+                        defer ctx.alloc.free(keys);
+                        for (surviving, keys) |entry, *key| key.* = entry.key;
+                        try applyGraphArtifactMutationPages(ctx, index_ref.name, keys, &.{}, batch.sequence);
+                    }
                     if (batch.changed_artifact_keys.len > 0 or materialized_artifact_keys.len > 0) {
                         try applyGraphArtifactMutationPages(
                             ctx,
