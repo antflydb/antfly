@@ -420,9 +420,12 @@ module's own tests in `models/gliner_boundary_qualification.zig` enforce.
 The exact pinned FP32 `GLiNER2.5-Decide-1B` artifact now qualifies native and
 Metal entity/relation extraction using its ModernBERT encoder, marker span
 representations, learned GRU count slots and span scoring heads. Its qualified
-complete prompt ceiling is 1024 tokens, with one item per invocation. This
-supersedes the earlier 198-token FP32 limit; the converted Q8 decision artifact
-retains its separate 198-token qualification and does not advertise extraction.
+complete prompt ceiling is 1024 tokens per prepared sequence, with one item
+and at most 64 prepared sequences per invocation (`requestLimits` in
+`src/models/gliner_decide_qualification.zig`). This supersedes the earlier
+198-token FP32 limit; the converted Q8 decision artifact retains its separate
+one-sequence, 198-token qualification and does not advertise extraction. The
+family limits are in [GLINER25_FAMILY.md](GLINER25_FAMILY.md).
 Configure decision enrichments with `batch_size: 1`. Model execution still
 requires memory admission, including resident weights and bounded head scratch.
 

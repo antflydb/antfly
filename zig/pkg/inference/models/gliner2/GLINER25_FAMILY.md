@@ -14,7 +14,7 @@ an encoder, head, tokenizer, or converter.
 | --- | --- | --- |
 | multi-v1 | native, Metal | measured single-window entity, classification, structure, and relation profiles |
 | multi-Decide | native, Metal | the multilingual boundary profiles, plus typed Decide |
-| Decide-1B | native, Metal | typed classification/Decide; one item and one prepared sequence, at most 198 tokens |
+| Decide-1B | native, Metal | typed classification/Decide and entity/relation extraction; one item, at most 64 prepared sequences of at most 1024 tokens each (Q8 bundle: one sequence, 198 tokens, no extraction) |
 
 The multilingual checkpoints have the same 334-tensor schema and the same
 16 MB Unigram tokenizer, but different learned weights. They share boundary
@@ -179,15 +179,22 @@ current CUDA attention kernel has a 512-token limit, which is enforced in
 planning and execution. A config accepting 7999 positions does not establish
 measured maximum-length performance or device qualification.
 
-The supported ModernBERT span path is typed classification. Its entity and
-relation heads differ from the older DeBERTa CountLSTM implementation; those
-tasks are rejected until their own head implementation and parity checks
-exist. Pulling an unqualified decision artifact installs its bytes while
+The ModernBERT span path serves typed classification/Decide and, for the
+exact pinned FP32 artifact only, entity/relation extraction through its own
+marker span representations, GRU count slots, and span scoring heads (not the
+older DeBERTa CountLSTM implementation); see
+[GLINER25.md](GLINER25.md#embedded-knowledge-graph-extraction-and-bounded-windows).
+The converted Q8 bundle does not advertise extraction. Pulling an unqualified decision artifact installs its bytes while
 withholding executable tasks and capabilities.
 
 The public 1B decision contract is separate from the encoder's saved position
-budget. It permits native or Metal, one request item, one prepared sequence,
-and at most 198 prepared tokens. The planner rejects larger requests without
+budget. For the exact pinned FP32 artifact it permits native or Metal, one
+request item, at most 64 prepared sequences, and at most 1024 prepared tokens
+per sequence. The separately pinned Q8 encoder/head bundle keeps one prepared
+sequence and at most 198 tokens; it cannot borrow the FP32 proof. These limits
+are `requestLimits` in `src/models/gliner_decide_qualification.zig`, enforced
+by `requireRequestIdentity` and applied to the span planner in
+`src/server/server.zig`. The planner rejects larger requests without
 truncating them. The live session must match the full weight digest, tensor
 inventory, geometry, marker IDs, and every sidecar digest. Its tokenizer is
 sealed only after the exact consumed bytes have been verified. Registry
