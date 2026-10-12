@@ -2040,9 +2040,11 @@ const QueryState = struct {
         if (same_names) for (reads, source.names) |read, name| {
             same_names = same_names and std.mem.eql(u8, read.name, name);
         };
-        if (same_names and source.backingBytes() <= dense_bytes +| (256 * 1024)) {
-            var identity = self.nodes.items.len == source.rows;
-            for (self.nodes.items, 0..) |node, row| identity = identity and node.metric_row == row;
+        var identity = self.nodes.items.len == source.rows;
+        for (self.nodes.items, 0..) |node, row| identity = identity and node.metric_row == row;
+        const mapping_bytes = if (identity) 0 else try std.math.mul(usize, self.nodes.items.len, @sizeOf(usize));
+        const retained_bytes = try std.math.add(usize, source.backingBytes(), mapping_bytes);
+        if (same_names and retained_bytes <= dense_bytes +| (256 * 1024)) {
             if (identity) return;
             const mapping = try a.alloc(usize, self.nodes.items.len);
             for (self.nodes.items, mapping) |node, *row| row.* = node.metric_row;
@@ -2065,7 +2067,7 @@ const QueryState = struct {
             name.* = try a.dupe(u8, read.name);
             initialized += 1;
         }
-        if (source.backingBytes() > dense_bytes +| (256 * 1024)) {
+        if (retained_bytes > dense_bytes +| (256 * 1024)) {
             const owner = try a.create(graph_query_mod.GraphMetricColumns);
             errdefer a.destroy(owner);
             const scores = try a.alloc(f64, dense_bytes / @sizeOf(f64));
@@ -2081,8 +2083,6 @@ const QueryState = struct {
             self.metric_columns = owner;
             return;
         }
-        var identity = self.nodes.items.len == source.rows;
-        for (self.nodes.items, 0..) |node, row| identity = identity and node.metric_row == row;
         const mapping: ?[]usize = if (identity) null else try a.alloc(usize, self.nodes.items.len);
         if (mapping) |rows| for (self.nodes.items, rows) |node, *row| {
             row.* = node.metric_row;
@@ -3489,6 +3489,108 @@ fn canonicalGraphStepAlloc(
     return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
 }
 
+// Edge scans and discovery stay serial. Only admitted returned rows enter this
+// buffer; frontier/path state never depends on their scores. Borrow keys from
+// QueryState (stable allocations), and address results by index across growth.
+const CanonicalMetricBatch = struct {
+    alloc: std.mem.Allocator,
+    worker: Worker,
+    admission: *GraphNodeAdmissionContext,
+    state: *QueryState,
+    index_name: []const u8,
+    reads: []const graph_query_mod.GraphMetricRead,
+    consistency: raft_mod.ReadConsistency,
+    work_budget: *graph_pattern_mod.WorkBudget,
+    status_seen: *std.AutoHashMapUnmanaged(u64, void),
+    row_limit: usize = 256,
+    table: ?[]const u8 = null,
+    nodes: []graph_query_mod.GraphResultNode = &.{},
+    groups: []u64 = &.{},
+    indexes: []usize = &.{},
+    count: usize = 0,
+    dirty: bool = false,
+    lease: graph_work_budget.RetainedLease = .{},
+
+    fn deinit(self: *@This()) void {
+        self.alloc.free(self.nodes);
+        self.alloc.free(self.groups);
+        self.alloc.free(self.indexes);
+        self.lease.deinit();
+    }
+
+    fn prepareTable(self: *@This(), table: []const u8) !void {
+        if (self.reads.len == 0) return;
+        if (self.table) |previous| {
+            if (std.mem.eql(u8, previous, table)) return;
+            try self.flush();
+        }
+        self.table = table;
+        self.dirty = true;
+    }
+
+    fn append(self: *@This(), index: usize, group: u64) !void {
+        if (self.reads.len == 0) return;
+        if (self.nodes.len == 0) {
+            // Bound both score cells and node descriptors, independently of
+            // frontier size. Allocate lazily so metadata-only rounds stay small.
+            const capacity = @max(@as(usize, 1), @min(self.row_limit, 4096 / self.reads.len));
+            const bytes = capacity * (@sizeOf(graph_query_mod.GraphResultNode) + @sizeOf(u64) + @sizeOf(usize));
+            var lease = try graph_work_budget.RetainedLease.init(self.work_budget, bytes);
+            errdefer lease.deinit();
+            const nodes = try self.alloc.alloc(graph_query_mod.GraphResultNode, capacity);
+            errdefer self.alloc.free(nodes);
+            const groups = try self.alloc.alloc(u64, capacity);
+            errdefer self.alloc.free(groups);
+            const indexes = try self.alloc.alloc(usize, capacity);
+            self.nodes = nodes;
+            self.groups = groups;
+            self.indexes = indexes;
+            self.lease = lease;
+        }
+        var node = self.state.nodes.items[index];
+        node.metrics = &.{};
+        node.metric_columns = null;
+        self.nodes[self.count] = node;
+        self.groups[self.count] = group;
+        self.indexes[self.count] = index;
+        self.count += 1;
+        self.dirty = true;
+        if (self.count == self.nodes.len) try self.flush();
+    }
+
+    fn flush(self: *@This()) !void {
+        const table = self.table orelse return;
+        if (!self.dirty) return;
+        var step = CanonicalGraphStep{
+            .edges = &.{},
+            .nodes = self.nodes,
+            .path_edges = &.{},
+            .group_ids = self.groups,
+            .node_count = self.count,
+            .array_lease = .{},
+            .table_scratch = graph_traversal_mod.MetadataScratch.init(self.alloc, self.work_budget),
+        };
+        // Descriptors borrow result ownership: release only hydration storage.
+        defer {
+            if (step.metric_columns) |owner| owner.deinit(self.alloc);
+            step.metrics_lease.deinit();
+            step.table_scratch.deinit();
+        }
+        // Empty flushes still collect required group metadata. A denied or
+        // deduplicated candidate must not suppress freshness validation.
+        try attachCanonicalGraphStepMetrics(self.alloc, self.worker, self.admission, table, self.index_name, self.reads, self.consistency, self.work_budget, &self.state.metric_status, self.status_seen, &step);
+        if (step.metric_columns) |source| {
+            const target = self.state.metric_columns orelse return error.InvalidRemoteResponse;
+            for (self.indexes[0..self.count], 0..) |index, row| {
+                const node = self.state.nodes.items[index];
+                for (0..self.reads.len) |column| target.pages.?.set(column, node.metric_row, source.scores[column * self.count + row]);
+            }
+        }
+        self.count = 0;
+        self.dirty = false;
+    }
+};
+
 fn attachCanonicalGraphStepMetrics(
     alloc: std.mem.Allocator,
     worker: Worker,
@@ -4446,6 +4548,8 @@ fn executeDistributedTraverse(
         );
     }
 
+    var metric_batch = CanonicalMetricBatch{ .alloc = alloc, .worker = worker, .admission = admission, .state = &state, .index_name = graph_query.query.index_name, .reads = metric_reads, .consistency = consistency, .work_budget = request_work_budget, .status_seen = &metric_status_seen_groups, .row_limit = @min(@as(usize, 256), collection_limit) };
+    defer metric_batch.deinit();
     while (frontier.len > 0 and state.nodes.items.len < collection_limit) {
         var completed_depth: u32 = 0;
         for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
@@ -4483,6 +4587,7 @@ fn executeDistributedTraverse(
                 const tables = [_][]const u8{ tagged_table, table_name };
                 const table_count: usize = if (std.mem.eql(u8, tagged_table, table_name)) 1 else 2;
                 for (tables[0..table_count]) |expansion_table| {
+                    try metric_batch.prepareTable(expansion_table);
                     var step = try canonicalGraphStepAlloc(
                         alloc,
                         reader,
@@ -4493,19 +4598,6 @@ fn executeDistributedTraverse(
                         request_work_budget,
                     );
                     defer step.deinit(alloc);
-                    try attachCanonicalGraphStepMetrics(
-                        alloc,
-                        worker,
-                        admission,
-                        expansion_table,
-                        graph_query.query.index_name,
-                        metric_reads,
-                        consistency,
-                        request_work_budget,
-                        &state.metric_status,
-                        &metric_status_seen_groups,
-                        &step,
-                    );
                     const admitted = try graphResultNodeAdmissionMaskAlloc(
                         alloc,
                         admission,
@@ -4514,7 +4606,7 @@ fn executeDistributedTraverse(
                         step.visibleNodes(),
                     );
                     defer alloc.free(admitted);
-                    for (step.visibleNodes(), admitted) |node, allowed| {
+                    for (step.visibleNodes(), admitted, 0..) |node, allowed, step_row| {
                         if (!allowed) continue;
                         const node_table = canonicalExpandedNodeTable(table_name, expansion_table, node.table);
                         if (!try state.putSeenIfAbsent(alloc, .{ .table = node_table, .key = node.key })) continue;
@@ -4547,6 +4639,7 @@ fn executeDistributedTraverse(
                             try state.nodes.append(alloc, merged);
                             merged_owned = false;
                             budget_owned = false;
+                            try metric_batch.append(state.nodes.items.len - 1, step.group_ids[step_row]);
                             if (state.nodes.items.len >= collection_limit) break;
                         } else {
                             state.rollbackMetrics(merged);
@@ -4560,6 +4653,10 @@ fn executeDistributedTraverse(
                 }
                 if (state.nodes.items.len >= collection_limit) break;
             }
+            try metric_batch.flush();
+            // Frontier-owned table strings are retired below; scratch survives
+            // for reuse at the next depth.
+            metric_batch.table = null;
             worker.reachLifecycle(.{
                 .phase = .expand_round_completed,
                 .query_name = graph_query.name,
@@ -10972,14 +11069,8 @@ pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !Gra
         alloc.free(expansions);
     }
     for (parsed.value.expansions, 0..) |expansion, i| {
-        const nodes = if (expansion.nodes.len > 0)
-            try cloneGraphNodes(alloc, expansion.nodes)
-        else
-            @constCast((&[_]graph_query_mod.GraphResultNode{})[0..]);
-        errdefer if (nodes.len > 0) {
-            for (nodes) |*node| node.deinit(alloc);
-            alloc.free(nodes);
-        };
+        var owned_nodes = try @import("antfly_local_sources").api_local_graph.cloneGraphNodesWithMetrics(alloc, expansion.nodes);
+        errdefer owned_nodes.deinit(alloc);
 
         const hits = if (expansion.hits.len > 0)
             try cloneSearchHits(alloc, expansion.hits)
@@ -10999,7 +11090,10 @@ pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !Gra
             .frontier_key = frontier_key,
             .graph_result = .{
                 .name = name,
-                .nodes = nodes,
+                .nodes = owned_nodes.nodes,
+                .metric_columns = owned_nodes.metrics.columns,
+                .metric_values_slab = owned_nodes.metrics.values,
+                .metric_value_names = owned_nodes.metrics.names,
                 .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
                 .hits = hits,
                 .total_hits = expansion.total,
@@ -16348,4 +16442,342 @@ test "distributed graph metric post processing applies max results after filter 
     };
     try Runner.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "distributed graph metric post processing applies max results after filter and order followup mapping cap" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |reorder_names| {
+        const n = 10_000;
+        const c = 16;
+        var buffers: [c][8]u8 = undefined;
+        var reads: [c]graph_query_mod.GraphMetricRead = undefined;
+        var values: [c]graph_query_mod.GraphMetricValue = undefined;
+        for (&buffers, &reads, &values, 0..) |*buffer, *read, *value, col| {
+            const name = try std.fmt.bufPrint(buffer, "m{d}", .{col});
+            read.* = .{ .name = name };
+            value.* = .{ .name = name, .score = 1, .name_owned = false };
+        }
+        var state = QueryState{ .name = try a.dupe(u8, "g") };
+        defer state.deinit(a);
+        try state.initMetrics(a, &reads);
+        try state.nodes.ensureTotalCapacityPrecise(a, n);
+        const source = graph_query_mod.GraphResultNode{ .key = "", .depth = 0, .distance = 0, .metrics = &values, .metrics_owned = false };
+        for (0..n) |row| {
+            for (&values) |*value| value.score = @floatFromInt(row);
+            var node = graph_query_mod.GraphResultNode{ .key = "", .depth = 0, .distance = 0 };
+            node.key = try std.fmt.allocPrint(a, "n{d}", .{row});
+            try state.attachMetrics(source, &node);
+            state.nodes.appendAssumeCapacity(node);
+        }
+        std.mem.reverse(graph_query_mod.GraphResultNode, state.nodes.items);
+        const before = state.metric_columns.?.backingBytes();
+        if (reorder_names) std.mem.reverse(graph_query_mod.GraphMetricRead, &reads);
+        try state.projectMetrics(&reads);
+        const after = state.metric_columns.?.backingBytes();
+        try std.testing.expectEqual(@as(?f64, 9_999), state.nodes.items[0].metricAt(0).score);
+        try std.testing.expect(after <= n * c * @sizeOf(f64) + 256 * 1024);
+        std.debug.print("FRESH_MAP_CAP rows={d} dense_bytes={d} before={d} after={d} excess={d}\n", .{ n, n * c * @sizeOf(f64), before, after, after - n * c * @sizeOf(f64) });
+    }
+}
+
+test "distributed graph metric post processing applies max results after filter and order followup remote decoder" {
+    const a = std.testing.allocator;
+    const n = 10_000;
+    var names = [_][]u8{ @constCast("rank"), @constCast("degree"), @constCast("hub"), @constCast("missing") };
+    var scores = [_]f64{ 3.5, 2, 1, std.math.nan(f64) };
+    var owner = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    const nodes = try a.alloc(graph_query_mod.GraphResultNode, n);
+    defer a.free(nodes);
+    for (nodes) |*node| node.* = .{ .key = "n", .depth = 0, .distance = 0, .metric_columns = &owner };
+    const wire = try std.json.Stringify.valueAlloc(a, GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "root", .name = "g", .total = n, .nodes = nodes }}, .scanned_rows = n }, .{});
+    defer a.free(wire);
+    var counter = std.testing.FailingAllocator.init(a, .{});
+    var parsed = try parseGraphExpandResponse(counter.allocator(), wire);
+    try std.testing.expectEqual(@as(?f64, 3.5), parsed.expansions[0].graph_result.nodes[n - 1].metricAt(0).score);
+    const result = parsed.expansions[0].graph_result;
+    try std.testing.expect(result.metric_columns != null);
+    var metric_bytes: usize = if (result.metric_columns) |columns| columns.backingBytes() else 0;
+    for (result.nodes) |node| {
+        metric_bytes += node.metrics.len * @sizeOf(graph_query_mod.GraphMetricValue);
+        for (node.metrics) |value| metric_bytes += value.name.len;
+    }
+    std.debug.print("FRESH_REMOTE_DECODE nodes={d} columns=4 allocations={d} retained_bytes={d} metric_bytes={d} dense_score_bytes={d}\n", .{ n, counter.allocations, counter.allocated_bytes - counter.freed_bytes, metric_bytes, n * 4 * @sizeOf(f64) });
+    parsed.deinit(counter.allocator());
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+}
+
+test "distributed graph metric post processing applies max results after filter and order bounded canonical hydration" {
+    const alloc = std.testing.allocator;
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"source\":{\"artifact\":\"facts\",\"nodes\":{\"source\":\"{{ _item.source }}\"},\"edge\":{\"edge_id\":\"{{ _doc.key }}\"}}}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "doc:m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "doc:m", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    const TestState = struct { graph: *graph_mod.GraphIndex, score_calls: usize = 0, status_calls: usize = 0, score_keys: usize = 0, largest_cells: usize = 0, fail_scores: bool = false };
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges } };
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn edges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            if (group == 11) return .{ .edges = &.{} };
+            const result = try state.graph.getEdgesByTypesBounded(a, request.key, request.edge_types, request.direction, request.max_edges, request.max_owned_bytes);
+            return .{ .edges = result, .scanned_rows = @intCast(result.len) };
+        }
+        fn hydrate(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!request.include_hits);
+            if (state.fail_scores and request.keys.len != 0) return error.TopologyChanged;
+            if (request.keys.len == 0) state.status_calls += 1 else state.score_calls += 1;
+            state.score_keys += request.keys.len;
+            state.largest_cells = @max(state.largest_cells, request.keys.len * request.metric_reads.len);
+            try std.testing.expect(request.keys.len <= 256);
+            try std.testing.expect(request.keys.len * request.metric_reads.len <= 4096);
+            try std.testing.expectEqual(@as(?u64, 12345), request.identity_read_generation);
+            const scores = try a.alloc(?f64, request.keys.len * request.metric_reads.len);
+            errdefer a.free(scores);
+            for (request.keys, 0..) |key, row| {
+                try std.testing.expectEqual(@as(u64, 22), group);
+                scores[row] = if (std.mem.eql(u8, key, "nonreturn")) -1 else @floatFromInt(try std.fmt.parseInt(usize, key[5..], 10));
+            }
+            const statuses = try a.alloc(db_mod.types.GraphMetricStatus, request.metric_reads.len);
+            errdefer a.free(statuses);
+            // Fixture has one projected metric; ownership matches worker transport.
+            statuses[0] = .{ .name = try a.dupe(u8, "rank"), .state = .fresh, .published_generation = 1, .edge_generation = 1, .target_edge_generation = 1 };
+            return .{ .metric_scores = scores, .metric_status = statuses };
+        }
+    };
+    const n = 300;
+    const roots = try alloc.alloc([]const u8, n);
+    defer alloc.free(roots);
+    const targets = try alloc.alloc([]const u8, n);
+    defer alloc.free(targets);
+    var initialized: usize = 0;
+    defer for (roots[0..initialized], targets[0..initialized]) |root, target| {
+        alloc.free(root);
+        alloc.free(target);
+    };
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    for (roots, targets, 0..) |*root, *target, row| {
+        root.* = try std.fmt.allocPrint(alloc, "root{d}", .{row});
+        target.* = try std.fmt.allocPrint(alloc, "doc:z{d}", .{row});
+        initialized += 1;
+        try graph.batchApply(&.{
+            .{ .source = root.*, .target = target.*, .edge_type = "R", .edge_id = target.*, .owner_document = target.*, .weight = 1 },
+            .{ .source = root.*, .target = "nonreturn", .edge_type = "R", .edge_id = root.*, .owner_document = root.*, .weight = 1 },
+        }, &.{});
+    }
+    var test_state = TestState{ .graph = &graph };
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    const query = db_mod.types.NamedGraphQuery{ .name = "facts", .query = .{
+        .query_type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = roots },
+        .target_nodes = .{ .keys = targets },
+        .metrics = &.{.{ .name = "rank" }},
+        .include_metric_status = true,
+        .params = .{ .max_depth = 1, .max_results = 1000 },
+    } };
+    const epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
+    var admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    // Compare with the former per-frontier hydration using the same source,
+    // pinned reader, and transport fixture, excluding graph construction.
+    {
+        var legacy_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var statuses = std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus).empty;
+        defer {
+            for (statuses.items) |*status| status.deinit(alloc);
+            statuses.deinit(alloc);
+        }
+        var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer seen.deinit(alloc);
+        const reader = DistributedEdgeReader{
+            .catalog = FakeCatalog.iface(),
+            .worker = FakeWorker.iface(&test_state),
+            .source_table = "docs",
+            .index_name = "graph_idx",
+            .ttl_now_ns = req.graph_ttl_now_ns,
+            .consistency = .read_index,
+            .admission = &admission,
+            .physical_work_budget = &legacy_budget,
+        };
+        for (roots) |root| {
+            var step = try canonicalGraphStepAlloc(alloc, reader, "docs", "docs", root, query.query.params, &legacy_budget);
+            defer step.deinit(alloc);
+            try attachCanonicalGraphStepMetrics(alloc, FakeWorker.iface(&test_state), &admission, "docs", "graph_idx", query.query.metrics, .read_index, &legacy_budget, &statuses, &seen, &step);
+        }
+        try std.testing.expectEqual(@as(usize, n), test_state.score_calls);
+        try std.testing.expectEqual(@as(usize, 2 * n), test_state.score_keys);
+        std.debug.print("CANONICAL_BASELINE frontier={d} score_calls={d} metadata_calls={d} score_keys={d}\n", .{ n, test_state.score_calls, test_state.status_calls, test_state.score_keys });
+        test_state = .{ .graph = &graph };
+    }
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var result = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, n), result.nodes.len);
+    for (result.nodes, 0..) |node, row| {
+        try std.testing.expectEqualStrings(targets[row], node.key);
+        try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
+    }
+    try std.testing.expectEqual(@as(usize, n), test_state.score_keys);
+    try std.testing.expectEqual(@as(usize, 2), test_state.score_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_state.status_calls);
+    std.debug.print("CANONICAL_BATCH frontier={d} returned={d} score_calls={d} metadata_calls={d} largest_cells={d}\n", .{ n, result.nodes.len, test_state.score_calls, test_state.status_calls, test_state.largest_cells });
+    // No selected targets: preserve metadata without fetching any score cells.
+    test_state = .{ .graph = &graph };
+    var empty_query = query;
+    empty_query.query.target_nodes = .{ .keys = &.{"absent"} };
+    var empty_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var empty_result = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, empty_query, .read_index, &admission, &empty_budget);
+    defer empty_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_result.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), empty_result.metric_status.len);
+    try std.testing.expectEqual(@as(usize, 0), test_state.score_calls);
+    try std.testing.expectEqual(@as(usize, 2), test_state.status_calls);
+
+    // Hydration failure after discovery must discard the pending result safely.
+    test_state = .{ .graph = &graph, .fail_scores = true };
+    var failed_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    try std.testing.expectError(error.TopologyChanged, executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &failed_budget));
+
+    // Path ownership and frontier order survive deferred score hydration.
+    test_state = .{ .graph = &graph };
+    var path_query = query;
+    path_query.query.params.include_paths = true;
+    var path_budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+    var path_result = try executeDistributedTraverse(alloc, FakeCatalog.iface(), FakeWorker.iface(&test_state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, path_query, .read_index, &admission, &path_budget);
+    defer path_result.deinit(alloc);
+    for (path_result.nodes, 0..) |node, row| {
+        try std.testing.expectEqualStrings(roots[row], node.path.?[0]);
+        try std.testing.expectEqualStrings(targets[row], node.path.?[1]);
+        try std.testing.expectEqual(@as(?f64, @floatFromInt(row)), node.metricAt(0).score);
+    }
+}
+
+test "distributed graph metric post processing applies max results after filter and order decoder ownership failures" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, uniform: bool) !void {
+            const input = if (uniform)
+                "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"root\",\"name\":\"g\",\"total\":2,\"nodes\":[{\"key\":\"a\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":3}]},{\"key\":\"b\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":null}]}]}]}"
+            else
+                "{\"expansions\":[{\"frontier_id\":0,\"frontier_key\":\"root\",\"name\":\"g\",\"total\":2,\"nodes\":[{\"key\":\"a\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"rank\",\"score\":3}]},{\"key\":\"b\",\"depth\":1,\"distance\":1,\"metrics\":[{\"name\":\"degree\",\"score\":null}]}]}]}";
+            const wire = try a.dupe(u8, input);
+            var wire_owned = true;
+            defer if (wire_owned) a.free(wire);
+            var result = try parseGraphExpandResponse(a, wire);
+            defer result.deinit(a);
+            a.free(wire);
+            wire_owned = false;
+            const graph = result.expansions[0].graph_result;
+            try std.testing.expectEqualStrings("a", graph.nodes[0].key);
+            try std.testing.expectEqualStrings(if (uniform) "rank" else "degree", graph.nodes[1].metricAt(0).name);
+            try std.testing.expectEqual(@as(?f64, null), graph.nodes[1].metricAt(0).score);
+            try std.testing.expectEqual(uniform, graph.metric_columns != null);
+            try std.testing.expectEqual(@as(u32, @intCast(graph_pattern_mod.default_max_explored_edges)), result.scanned_rows);
+        }
+    };
+    for ([_]bool{ true, false }) |uniform| {
+        try Runner.run(std.testing.allocator, uniform);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{uniform});
+    }
+}
+
+test "distributed graph metric post processing applies max results after filter and order batch scratch failures" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, deny: bool) !void {
+            var state = QueryState{ .name = try a.dupe(u8, "g") };
+            defer state.deinit(a);
+            try state.initMetrics(a, &.{.{ .name = "rank" }});
+            var node = try initGraphResultNode(a, "n", null, 1, 1, null, null, null);
+            var node_owned = true;
+            errdefer if (node_owned) node.deinit(a);
+            try state.attachMetrics(.{ .key = "n", .depth = 1, .distance = 1 }, &node);
+            try state.nodes.append(a, node);
+            node_owned = false;
+            var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+            if (deny) budget.max_retained_state_bytes = 1;
+            {
+                var batch = CanonicalMetricBatch{
+                    .alloc = a,
+                    .worker = undefined,
+                    .admission = undefined,
+                    .state = &state,
+                    .index_name = "g",
+                    .reads = &.{.{ .name = "rank" }},
+                    .consistency = .read_index,
+                    .work_budget = &budget,
+                    .status_seen = undefined,
+                };
+                defer batch.deinit();
+                if (deny) {
+                    try std.testing.expectError(error.GraphWorkBudgetExceeded, batch.append(0, 1));
+                    try std.testing.expectEqual(@as(usize, 0), batch.nodes.len);
+                } else {
+                    try batch.append(0, 1);
+                    const storage = batch.nodes.ptr;
+                    try batch.append(0, 1);
+                    try std.testing.expectEqual(storage, batch.nodes.ptr);
+                    try std.testing.expectEqual(@as(usize, 2), batch.count);
+                    try std.testing.expect(budget.retained_state_bytes > 0);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+        }
+    };
+    try Runner.run(std.testing.allocator, false);
+    try Runner.run(std.testing.allocator, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{false});
 }

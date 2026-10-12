@@ -2528,12 +2528,16 @@ pub const GraphQueryEngine = struct {
             self.columnsFor(names, columns[0..names.len]);
             const selected = try selectMetricCandidateIndexesAlloc(self.alloc, names, columns[0..names.len], query, apply_limit, self.rowCount());
             defer self.alloc.free(selected);
-            const rows = try self.alloc.alloc(usize, selected.len);
-            errdefer self.alloc.free(rows);
-            for (selected, rows) |parent, *row| row.* = self.rowAt(parent);
+            var unchanged = selected.len == self.rowCount();
+            for (selected, 0..) |parent, row| unchanged = unchanged and parent == row;
+            const rows = if (unchanged) self.row_storage else try self.alloc.alloc(usize, selected.len);
+            errdefer if (!unchanged) self.alloc.free(rows);
+            if (!unchanged) for (selected, rows) |parent, *row| {
+                row.* = self.rowAt(parent);
+            };
             var keep: [graph_metric_dependency_limit]bool = @splat(false);
             var groups: [graph_metric_dependency_limit]u8 = undefined;
-            var mappings: [graph_metric_dependency_limit][]usize = undefined;
+            var mappings: [graph_metric_dependency_limit]?[]usize = undefined;
             var count: usize = 0;
             var compacted: [graph_metric_dependency_limit]?MetricColumn.Source = @splat(null);
             errdefer for (compacted) |maybe| if (maybe) |source| switch (source) {
@@ -2541,7 +2545,7 @@ pub const GraphQueryEngine = struct {
                 .decoded => |values| self.alloc.free(values),
                 .paged => {},
             };
-            errdefer for (mappings[0..count]) |mapping| self.alloc.free(mapping);
+            errdefer for (mappings[0..count]) |mapping| if (mapping) |values| self.alloc.free(values);
             for (self.plan.dependencies.slice(), 0..) |name, i| keep[i] = metricColumnNameIndex(future, name) != null or metricColumnNameIndex(later, name) != null;
             var visited: [graph_metric_dependency_limit]bool = @splat(false);
             var sparse_groups: [graph_metric_dependency_limit]bool = @splat(false);
@@ -2549,10 +2553,16 @@ pub const GraphQueryEngine = struct {
                 const slot = maybe orelse continue;
                 if (!keep[i] or visited[slot.group]) continue;
                 visited[slot.group] = true;
+                if (unchanged) continue;
+                var identity = true;
+                for (selected, 0..) |parent, row| {
+                    const physical = if (self.groups[slot.group].mapping) |previous| previous[parent] else parent;
+                    identity = identity and physical == row;
+                }
                 // Reserve the fallback before attempting optional compaction.
                 // Partial copied groups are discarded together on allocation
                 // denial, preserving the original minimum working budget.
-                const mapping = try self.alloc.alloc(usize, selected.len);
+                const mapping: ?[]usize = if (identity) null else try self.alloc.alloc(usize, selected.len);
                 const source_len = switch (slot.source) {
                     .nullable => |values| values.len,
                     .decoded => |values| values.len,
@@ -2564,7 +2574,9 @@ pub const GraphQueryEngine = struct {
                 };
                 const sparse = selected.len == 0 or (selected.len <= source_len / 4 and (source_len - selected.len) * item_size >= 16 * 1024);
                 sparse_groups[slot.group] = sparse;
-                for (selected, mapping) |parent, *row| row.* = if (self.groups[slot.group].mapping) |previous| previous[parent] else parent;
+                if (mapping) |values| for (selected, values) |parent, *row| {
+                    row.* = if (self.groups[slot.group].mapping) |previous| previous[parent] else parent;
+                };
                 groups[count] = slot.group;
                 mappings[count] = mapping;
                 count += 1;
@@ -2573,8 +2585,8 @@ pub const GraphQueryEngine = struct {
             // a compacted group must not starve another group's fallback.
             for (groups[0..count], mappings[0..count]) |group, *mapping| {
                 if (sparse_groups[group] and self.tryCompactGroup(group, selected, &keep, &compacted)) {
-                    self.alloc.free(mapping.*);
-                    mapping.* = &.{};
+                    if (mapping.*) |values| self.alloc.free(values);
+                    mapping.* = null;
                 } else sparse_groups[group] = false;
             }
             // Every retained column in a read group has the same source length,
@@ -2608,10 +2620,12 @@ pub const GraphQueryEngine = struct {
                 if (self.groups[group].paged) |owner| owner.destroy();
                 self.groups[group].paged = null;
             };
-            self.alloc.free(self.row_storage);
-            self.rows = rows;
-            self.row_storage = rows;
-            self.identity_count = null;
+            if (!unchanged) {
+                self.alloc.free(self.row_storage);
+                self.rows = rows;
+                self.row_storage = rows;
+                self.identity_count = null;
+            }
         }
     };
 
@@ -7038,4 +7052,49 @@ test "graph metric native response adoption multiple group allocation measuremen
         result.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), counter.live);
     }
+}
+
+test "graph metric native response adoption followup staged identity maps" {
+    const a = std.testing.allocator;
+    const n = 50_000;
+    const query = GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .metrics = &.{ .{ .name = "rank", .freshness = .fresh, .seed_nodes = &.{"s"} }, .{ .name = "degree" } }, .where_metric = &.{.{ .name = "rank", .op = .gte, .value = 0, .freshness = .fresh }}, .params = .{ .max_results = 0 } };
+    const plan = try MetricReadPlan.init(query);
+    var source_budget = work_budget_mod.RetainedAllocator{ .backing = a, .budget = null };
+    var target_budget = work_budget_mod.RetainedAllocator{ .backing = a, .budget = null };
+    var result = GraphQueryResult{ .nodes = try a.alloc(GraphResultNode, n) };
+    defer result.deinit(a);
+    for (result.nodes) |*node| node.* = .{ .key = "", .depth = 0, .distance = 0 };
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(source_budget.allocator(), plan, n);
+    defer work.deinit();
+    for ([_][]const u8{ "rank", "degree" }, 0..) |name, column| {
+        if (column != 0) continue;
+        const values = try source_budget.allocator().alloc(f64, n);
+        @memset(values, @floatFromInt(column + 1));
+        work.groups[column] = .{ .references = 1 };
+        work.columns[work.index(name)] = .{ .source = .{ .decoded = values }, .group = @intCast(column) };
+    }
+    try work.select(query, false, &.{"rank"}, &.{ "rank", "degree" }, &.{});
+    const degree = try source_budget.allocator().alloc(f64, n);
+    @memset(degree, 2);
+    work.groups[1] = .{ .references = 1 };
+    work.columns[work.index("degree")] = .{ .source = .{ .decoded = degree }, .group = 1 };
+    var map_bytes: usize = 0;
+    for (work.groups) |group| if (group.mapping) |mapping| {
+        map_bytes += mapping.len * @sizeOf(usize);
+    };
+    const names = try target_budget.allocator().alloc([]u8, 2);
+    names[0] = try target_budget.allocator().dupe(u8, "rank");
+    names[1] = try target_budget.allocator().dupe(u8, "degree");
+    const selected = try work.explicitRows();
+    var views: [2]GraphQueryEngine.MetricColumn = undefined;
+    work.columnsFor(&.{ "rank", "degree" }, &views);
+    result.metric_columns = try work.adoptProjectionColumns(a, target_budget.allocator(), source_budget.allocator(), &source_budget, &target_budget, names, selected, &result.nodes);
+    const adopted = result.metric_columns != null;
+    if (!adopted) result.metric_columns = try GraphQueryEngine.materializeSelectedMetricColumnsCompact(a, target_budget.allocator(), source_budget.allocator(), names, &views, selected, &result.nodes);
+    target_budget.detach();
+    try std.testing.expectEqual(@as(usize, 0), map_bytes);
+    try std.testing.expect(adopted);
+    try std.testing.expectEqual(@as(usize, 0), result.metric_columns.?.scores.len);
+    try std.testing.expectEqual(@as(?f64, 2), result.nodes[n - 1].metricAt(1).score);
+    std.debug.print("FRESH_IDENTITY_MAP rows={d} map_bytes={d} adopted={} copied_scores={d}\n", .{ n, map_bytes, adopted, result.metric_columns.?.scores.len * @sizeOf(f64) });
 }
