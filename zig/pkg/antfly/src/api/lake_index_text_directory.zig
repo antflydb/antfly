@@ -723,6 +723,32 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     try std.testing.expectError(error.DeadlineExceeded, loadSelected(ca, a, root, store, expired, .none, &.{}));
     try std.testing.expectError(error.DeadlineExceeded, fileRecords(ca, root, store, expired, .none));
     try std.testing.expectError(error.DeadlineExceeded, lookupFile(ca, root, store, expired, .none, group.file.id));
+    // Windowing never needs canonical descriptors or physical row manifests.
+    var window_root = root;
+    window_root.segment_count = 9;
+    const navigation = @import("lake_index_navigation_warming.zig");
+    const warmed = try navigation.warmRoots(store, cached, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none);
+    try std.testing.expect(warmed > 0 and warmed <= navigation.max_pages);
+    try std.testing.expectError(error.DeadlineExceeded, navigation.warmRoots(store, expired, &.{.{ .domain = root.domain, .ref = roots.routing.? }}, .none));
+    var windows = try RoutingCursor.create(a, window_root, store, cached, .none);
+    defer windows.deinit();
+    var window_ids: [2]Id = undefined;
+    var visited: usize = 0;
+    while (try windows.next(&window_ids)) |window| {
+        try std.testing.expectEqual(@as(u64, visited), window.doc_offset);
+        for (window.identities) |id| {
+            try std.testing.expectEqualDeep(corpus.term_directory.identity(segments[visited].artifact_id), id);
+            visited += 1;
+        }
+    }
+    try std.testing.expectEqual(segments.len, visited);
+    try std.testing.expect(try windows.next(&window_ids) == null);
+    var invalid_root = window_root;
+    invalid_root.collection.?.documents += 1;
+    var invalid_cursor = try RoutingCursor.create(a, invalid_root, store, cached, .none);
+    defer invalid_cursor.deinit();
+    for (0..4) |_| _ = try invalid_cursor.next(&window_ids);
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, invalid_cursor.next(&window_ids));
     // Broad admission reads only the compact routing tree. Physical metadata
     // and admissions stay behind authenticated references until consumed.
     var routing_only = root;
@@ -832,3 +858,96 @@ test "external lake segment span routing advances linearly across fragmented phy
     try std.testing.expectEqual(routes.len, count);
     try std.testing.expect(records.blocks_examined < 6 * (blocks.len + routes.len));
 }
+
+/// Streaming compact navigation for broad queries. Only the authenticated tree
+/// path, one fragmented routing record and the caller's segment window survive
+/// a pull. The ordinal base preserves full-corpus score ties across windows.
+pub const RoutingCursor = struct {
+    a: A,
+    scratch: std.heap.ArenaAllocator,
+    reader: Reader,
+    cursor: tree.Cursor = undefined,
+    open: bool = false,
+    previous: ?[36]u8 = null,
+    bytes: std.ArrayList(u8) = .empty,
+    root: corpus.Root,
+    emitted: u32 = 0,
+    documents: u64 = 0,
+    last_file: ?Id = null,
+    last_digest: Id = undefined,
+    last_manifest: Id = undefined,
+    last_physical: Id = undefined,
+    last_ordinal: u32 = 0,
+    last_upper: u32 = 0,
+    done: bool = false,
+    pub const Window = struct { identities: []const Id, doc_offset: u64 };
+    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation) !*RoutingCursor {
+        if (root.inventory_version != 3 or root.directories.routing == null or root.collection == null) return error.InvalidNativeLakeTextCorpus;
+        const self = try a.create(RoutingCursor);
+        self.* = .{ .a = a, .scratch = .init(a), .reader = .{ .store = store, .cached = cached, .token = token }, .root = root };
+        errdefer self.deinit();
+        self.reader.init(root.domain);
+        self.reader.pages.streaming = true;
+        self.cursor = try tree.Cursor.init(a, self.reader.pages.store(), root.directories.routing, "", null);
+        self.open = true;
+        return self;
+    }
+    pub fn deinit(self: *RoutingCursor) void {
+        if (self.open) self.cursor.deinit();
+        self.bytes.deinit(self.a);
+        self.scratch.deinit();
+        self.a.destroy(self);
+    }
+    fn emit(self: *RoutingCursor, key_: [36]u8) !Id {
+        _ = self.scratch.reset(.free_all);
+        const record = try std.json.parseFromSliceLeaky(SegmentRecord, self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
+        const file = corpus.term_directory.identity(record.file.id);
+        if (!std.mem.eql(u8, key_[0..32], &file) or std.mem.readInt(u32, key_[32..36], .big) != record.ordinal) return error.InvalidNativeLakeTextCorpus;
+        if (record.rows.len != 0 or record.physical == null) return error.InvalidNativeLakeTextCorpus;
+        try validateRouting(record, self.root.domain);
+        const manifest_id = corpus.term_directory.identity(record.manifest.artifact_id);
+        const physical_id = corpus.term_directory.identity(record.physical.?.artifact_id);
+        const same_file = if (self.last_file) |last| std.mem.eql(u8, &file, &last) else false;
+        if (record.ordinal != (if (same_file) std.math.add(u32, self.last_ordinal, 1) catch return error.InvalidNativeLakeTextCorpus else @as(u32, 0)) or
+            record.interval.lower != (if (same_file) self.last_upper else @as(u32, 0))) return error.InvalidNativeLakeTextCorpus;
+        if (same_file and (!std.mem.eql(u8, &record.file.digest, &self.last_digest) or
+            !std.mem.eql(u8, &manifest_id, &self.last_manifest) or !std.mem.eql(u8, &physical_id, &self.last_physical))) return error.InvalidNativeLakeTextCorpus;
+        self.last_file = file;
+        self.last_digest = record.file.digest;
+        self.last_manifest = manifest_id;
+        self.last_physical = physical_id;
+        self.last_ordinal = record.ordinal;
+        self.last_upper = try std.math.add(u32, record.interval.lower, record.interval.count);
+        self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
+        self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
+        if (self.emitted > self.root.segment_count) return error.InvalidNativeLakeTextCorpus;
+        return corpus.term_directory.identity(record.route.ref.artifact_id);
+    }
+    pub fn next(self: *RoutingCursor, output: []Id) !?Window {
+        if (output.len == 0) return error.InvalidNativeLakeTextCorpus;
+        try self.reader.check();
+        if (self.done) return null;
+        const offset = self.documents;
+        var count: usize = 0;
+        while (try self.cursor.next()) |entry| {
+            if (entry.key.len != 40) return error.InvalidNativeLakeTextCorpus;
+            const current: [36]u8 = entry.key[0..36].*;
+            if (self.previous) |previous| if (!std.mem.eql(u8, &previous, &current)) {
+                output[count] = try self.emit(previous);
+                count += 1;
+                self.bytes.clearRetainingCapacity();
+            };
+            self.previous = current;
+            if (std.mem.readInt(u32, entry.key[36..40], .big) != self.bytes.items.len or entry.value.len == 0 or entry.value.len > chunk_bytes or entry.value.len > corpus.max_root_bytes -| self.bytes.items.len) return error.InvalidNativeLakeTextCorpus;
+            try self.bytes.appendSlice(self.a, entry.value);
+            if (count == output.len) return .{ .identities = output[0..count], .doc_offset = offset };
+        }
+        if (self.previous) |last| {
+            output[count] = try self.emit(last);
+            count += 1;
+        }
+        if (self.emitted != self.root.segment_count or self.documents != self.root.collection.?.documents) return error.InvalidNativeLakeTextCorpus;
+        self.done = true;
+        return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = offset };
+    }
+};

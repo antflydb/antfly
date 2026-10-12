@@ -71,15 +71,15 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     if (groups) |value| for (keys, value.array.items) |*key, name| {
         if (name != .string) return error.InvalidAlgebraicConfig;
         const column = try field(table, config, name.string, true);
-        key.* = .{ .path = column.path, .type = column.type, .nullable = column.nullable };
+        key.* = recipes.Key.fromColumn(column);
     };
     const inputs = try a.alloc(recipes.Input, 1);
-    inputs[0] = .{ .spec = spec, .column = if (input) |column| .{ .path = column.path, .type = column.type, .nullable = column.nullable } else null };
+    inputs[0] = .{ .spec = spec, .column = if (input) |column| recipes.Key.fromColumn(column) else null };
     return .{ .keys = keys, .inputs = inputs };
 }
 
 pub fn recipeIdentity(a: A, recipe: recipes.Recipe) ![]const u8 {
-    return std.fmt.allocPrint(a, "native-sql-aggregate-v1:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
+    return std.fmt.allocPrint(a, "native-sql-aggregate-v2:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
 }
 
 /// The publication arena owns declarations; each reducer and output chunk
@@ -721,9 +721,9 @@ fn consumeCohort(a: A, provider: *@import("lake_index_row_source.zig").Provider,
         const selection = try pa.alloc(usize, batch.rowCount());
         for (selection, 0..) |*selected, i| selected.* = i;
         const keys = try pa.alloc(local.sql_execution_batch.Batch, recipe.keys.len);
-        for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = definition.path, .type = definition.type, .nullable = definition.nullable }}) } };
+        for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{definition.definition()}) } };
         const input_batches = try pa.alloc(local.sql_execution_batch.Batch, recipe.inputs.len);
-        for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
+        for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{column.definition()}) } } else constant: {
             const ids = try pa.alloc(u32, batch.rowCount());
             @memset(ids, 0);
             break :constant .{ .dictionary = .{ .values = &.{local.sql_scalar.Datum.fromJson(.{ .integer = 1 })}, .indices = ids } };
@@ -831,7 +831,7 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(usize, 2), built.contributions.len);
     try std.testing.expectEqual(@as(usize, 2), declarations.len);
     const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer, .input_element = .int64 };
-    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true } }} };
+    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true, .element_type = .int64 } }} };
     const sum_identity = try recipeIdentity(a, recipe);
     defer a.free(sum_identity);
     const sum_declaration = for (declarations) |declaration| {

@@ -289,6 +289,9 @@ pub const Stream = struct {
             const max = page.max orelse continue;
             const matches = switch (predicate.value) {
                 .integer => |value| blk: {
+                    // Byte-array page bounds are byte strings, even when their
+                    // length happens to be 4/8. Never reinterpret them as ints.
+                    if (!std.mem.eql(u8, chunk.physical_type, "int32") and !std.mem.eql(u8, chunk.physical_type, "int64")) continue;
                     const low = metricInteger(min) orelse continue;
                     const high = metricInteger(max) orelse continue;
                     if (low > high) continue;

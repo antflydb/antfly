@@ -27,6 +27,16 @@ pub const Key = struct {
     path: []const u8,
     type: @import("ast.zig").ColumnType,
     nullable: bool,
+    element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+
+    pub fn fromColumn(column: catalog.Column) Key {
+        const descriptor = scalar.columnType(column);
+        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier };
+    }
+    pub fn definition(self: Key) scalar.Column {
+        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier };
+    }
 };
 pub const Input = struct {
     spec: operators.AggregateSpec,
@@ -40,7 +50,7 @@ pub const Recipe = struct {
 
     pub fn fingerprint(self: Recipe) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("native-sql-aggregate-recipe-v1");
+        hash.update("native-sql-aggregate-recipe-v2");
         word(&hash, self.keys.len);
         for (self.keys) |key| keyHash(&hash, key);
         word(&hash, self.inputs.len);
@@ -64,7 +74,7 @@ pub const Recipe = struct {
     }
 };
 fn keyEql(left: Key, right: Key) bool {
-    return left.type == right.type and left.nullable == right.nullable and std.mem.eql(u8, left.path, right.path);
+    return left.type == right.type and left.nullable == right.nullable and left.element_type == right.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and std.mem.eql(u8, left.path, right.path);
 }
 fn word(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
     var bytes: [8]u8 = undefined;
@@ -79,6 +89,13 @@ fn keyHash(hash: *std.crypto.hash.sha2.Sha256, key: Key) void {
     part(hash, key.path);
     part(hash, @tagName(key.type));
     hash.update(&.{@intFromBool(key.nullable)});
+    if (key.element_type) |identity| part(hash, @tagName(identity)) else part(hash, "*");
+    if (key.numeric_modifier) |modifier| {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], modifier.precision, .little);
+        std.mem.writeInt(i16, bytes[2..4], modifier.scale, .little);
+        part(hash, &bytes);
+    } else part(hash, "*");
 }
 fn direct(table: catalog.Table, columns: []const scalar.Column, program: scalar.Program) !?Key {
     if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return null;
@@ -86,7 +103,7 @@ fn direct(table: catalog.Table, columns: []const scalar.Column, program: scalar.
     if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
     const column = table.column(columns[ordinal].name) catch return null;
     if (std.mem.eql(u8, column.name, "_id") or program.output_type.kind != column.type) return null;
-    return .{ .path = column.path, .type = column.type, .nullable = column.nullable };
+    return Key.fromColumn(column);
 }
 
 /// The result borrows column names from the request-owned table. Arrays belong
@@ -279,4 +296,22 @@ test "SQL native materialization recipe proves bound columns and null semantics"
             try std.testing.expect(!std.mem.eql(u8, &count_star.?, &fingerprint));
         } else try std.testing.expect(!std.mem.eql(u8, &count_column.?, &fingerprint));
     }
+}
+
+test "external lake aggregate identity preserves exact scalar types and numeric modifiers" {
+    const base: catalog.Column = .{ .name = "k", .path = "k", .type = .number, .element_type = .numeric };
+    const exact = Key.fromColumn(base);
+    var approximate = base;
+    approximate.element_type = .float64;
+    var constrained = base;
+    constrained.numeric_modifier = .{ .precision = 20, .scale = 3 };
+    const count: Input = .{ .spec = .{ .kind = .count }, .column = null };
+    const recipe: Recipe = .{ .keys = &.{exact}, .inputs = &.{count} };
+    for ([_]Key{ Key.fromColumn(approximate), Key.fromColumn(constrained), .{ .path = "k", .type = .number, .nullable = true } }) |other| {
+        const changed: Recipe = .{ .keys = &.{other}, .inputs = &.{count} };
+        try std.testing.expect(!recipe.eql(changed));
+        try std.testing.expect(!std.mem.eql(u8, &recipe.fingerprint(), &changed.fingerprint()));
+    }
+    try std.testing.expectEqual(.numeric, exact.definition().element_type.?);
+    try std.testing.expectEqual(@as(i16, 3), Key.fromColumn(constrained).definition().numeric_modifier.?.scale);
 }

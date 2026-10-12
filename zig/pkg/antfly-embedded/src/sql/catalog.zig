@@ -157,6 +157,12 @@ pub const Condition = struct {
     column: []const u8,
     op: Op,
     value: std.json.Value = .null,
+    /// Exact statement-owned operand. `value` is its lossless compatibility
+    /// encoding for tuple bounds; typed consumers must retain this identity.
+    operand: ?@import("scalar.zig").Datum = null,
+    pub fn datum(self: Condition) @import("scalar.zig").Datum {
+        return self.operand orelse @import("scalar.zig").Datum.fromJson(self.value);
+    }
 };
 pub const Scan = struct {
     pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };

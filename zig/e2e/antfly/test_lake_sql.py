@@ -4232,6 +4232,211 @@ def test_numeric_dynamic_join_uses_exact_covering_index(tmp_path, physical_type)
                 shutil.rmtree(cached)
         server.resume()
         assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        # Exact standalone equality/range predicates must seek the same native
+        # covering index; a residual scan cannot read the damaged data pages.
+        assert call("POST", "/sql", {"statement": predicate})["rows"] == [["0"]]
+        assert call("POST", "/sql", {"statement": f"SELECT v FROM numeric_probe WHERE k>CAST('{targets[0]}' AS NUMERIC)"})["rows"] == []
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(tmp_path, physical_type):
+    """Independent Parquet values retain NUMERIC identity through publication and restart."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    keys = (["9007199254740992", "9007199254740993"] if physical_type == "integer"
+            else ["9007199254740993.124", "9007199254740993.125"])
+    values = pa.array([int(k) for k in keys] + [None], type=pa.int64()) if physical_type == "integer" else pa.array(keys + [None])
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "numeric.parquet"
+    pq.write_table(pa.table({"k": values}), path, compression="snappy", use_dictionary=False)
+    payload = path.read_bytes()
+    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(method, route, body=None):
+            response = requests.request(method, server.api_url + route, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            return response.json() if response.content else None
+
+        call("POST", "/tables/numeric_groups", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "default_type": "row",
+            "base_source": {"kind": "external", "table_id": "numeric-groups", "format": "parquet", "uri": root.as_uri()},
+            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
+                "k": {"type": "number", "x-antfly-sql-type": "numeric"}
+            }, "additionalProperties": False}}},
+        }, "indexes": {"stats": {"type": "algebraic", "derive_from_schema": True, "aggregates": [
+            {"name": "counts", "op": "count", "group_by": ["k"]},
+            *[{"name": op, "op": op, "measure": "k", "group_by": ["k"]} for op in ("sum", "min", "max")],
+        ]}}})
+        deadline = time.monotonic() + 90
+        while True:
+            resource = call("GET", "/tables/numeric_groups/indexes/stats")
+            assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        statement = "SELECT k, COUNT(*), SUM(k), MIN(k), MAX(k) FROM numeric_groups GROUP BY k ORDER BY k"
+        expected = [[k, "1", k, k, k] for k in keys] + [[None, "1", None, None, None]]
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        residual = statement.replace("GROUP BY k", "GROUP BY k+CAST('0' AS NUMERIC)").replace("SELECT k,", "SELECT k+CAST('0' AS NUMERIC),").replace("ORDER BY k", "ORDER BY k+CAST('0' AS NUMERIC)")
+        assert call("POST", "/sql", {"statement": residual})["rows"] == expected
+        server.pause()
+        footer = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+        object_path.write_bytes(header + payload[:4] + b"\xff" * (footer - 4) + payload[footer:])
+        for cached in server.root.rglob("lake-ranges"):
+            if cached.is_dir():
+                shutil.rmtree(cached)
+        server.resume()
+        assert call("POST", "/sql", {"statement": statement})["rows"] == expected
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(tmp_path):
+    """More than 64 independent Parquet segments match the full-corpus path exactly."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    for part in range(67):
+        path = tmp_path / "part.parquet"
+        rows = [{"body": "quasar " * (i % 4 + 1) + "common " * (i % 3), "amount": i}
+                for i in range(part * 3, part * 3 + 3)]
+        pq.write_table(pa.Table.from_pylist(rows), path, compression="snappy", row_group_size=2)
+        payload = path.read_bytes()
+        (objects / f"part-{part:03}.parquet").write_bytes(
+            b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode() + payload
+        )
+    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(method, route, body=None):
+            response = requests.request(method, server.api_url + route, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json() if response.content else None
+            return value["responses"][0] if isinstance(value, dict) and "responses" in value else value
+
+        call("POST", "/tables/paged_text", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "paged-text", "format": "parquet", "uri": root.as_uri(),
+            }}, "indexes": {"body_text": {"type": "full_text", "field": "body"}}})
+        deadline = time.monotonic() + 120
+        while True:
+            resource = call("GET", "/tables/paged_text/indexes/body_text")
+            assert resource["status"]["readiness"]["state"] != "failed", str(resource) + server.debug_logs()
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        request = {"full_text_search": {"match": "quasar", "field": "body"},
+                   "full_text_index": "body_text", "fields": ["amount"], "limit": 201}
+        # Highlighting uses the existing full-admission path, providing a score
+        # and stable tie oracle independent of the window collector.
+        oracle = call("POST", "/tables/paged_text/query", dict(request, highlight={"fields": ["body"]}))
+        expected = [(h["_id"], h["_score"], h["_source"]["amount"]) for h in oracle["hits"]["hits"]]
+        assert len(expected) == 201
+
+        def check():
+            result = call("POST", "/tables/paged_text/query", dict(request, limit=19, offset=61))
+            assert [(h["_id"], h["_score"], h["_source"]["amount"]) for h in result["hits"]["hits"]] == expected[61:80]
+            total = result["hits"]["total"]
+            assert total["relation"] in ("exact", "gte")
+            assert total["value"] <= 201
+            if total["relation"] == "exact":
+                assert total["value"] == 201
+            counted = call("POST", "/tables/paged_text/query", dict(request, limit=0))
+            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+            assert counted["hits"]["hits"] == []
+        check()
+        server.restart()
+        check()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("physical_type", ["integer", "decimal_string"])
+def test_numeric_predicates_use_only_compatible_parquet_pruning(tmp_path, physical_type):
+    """Exact integer stats prune; eight-byte decimal strings never become int stats."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    keys = [9007199254740992, 9007199254740993] if physical_type == "integer" else [10000000, 99999999]
+    values = pa.array(keys, type=pa.int64()) if physical_type == "integer" else pa.array([str(k) for k in keys])
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "numbers.parquet"
+    pq.write_table(pa.table({"k": values}), path, compression=None, use_dictionary=False,
+                   write_page_index=True, data_page_version="2.0")
+    payload = path.read_bytes()
+    header = b"AFOBJ001" + struct.pack("<QI", len(payload), 0) + hashlib.sha256(payload).hexdigest().encode()
+    object_path = objects / "part.parquet"
+    object_path.write_bytes(header + payload)
+    server = StandaloneAntflyServer(resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))), "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(route, body):
+            response = requests.post(server.api_url + route, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+        call("/tables/numeric_pruning", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "default_type": "row",
+            "base_source": {"kind": "external", "table_id": "numeric-pruning", "format": "parquet", "uri": root.as_uri()},
+            "document_schemas": {"row": {"schema": {"type": "object", "properties": {
+                "k": {"type": "number", "x-antfly-sql-type": "numeric"}
+            }, "additionalProperties": False}}},
+        }, "indexes": {}})
+        for key in keys:
+            assert call("/sql", {"statement": f"SELECT k FROM numeric_pruning WHERE k=CAST('{key}' AS NUMERIC)"})["rows"] == [[str(key)]]
+        if physical_type == "integer":
+            server.pause()
+            # Column/offset indexes lie between data pages and the footer.
+            # Keep those authenticated planning structures readable as well.
+            damaged = bytearray(payload)
+            metadata = pq.ParquetFile(path).metadata
+            for group in range(metadata.num_row_groups):
+                for column in range(metadata.row_group(group).num_columns):
+                    chunk = metadata.row_group(group).column(column)
+                    start = chunk.dictionary_page_offset if chunk.has_dictionary_page else chunk.data_page_offset
+                    end = start + chunk.total_compressed_size
+                    damaged[start:end] = b"\xff" * (end - start)
+            unreadable_root = tmp_path / "unreadable"
+            unreadable_objects = unreadable_root / "buckets" / "antfly" / "objects"
+            unreadable_objects.mkdir(parents=True)
+            # Authenticate the deliberately unreadable source as a distinct
+            # current snapshot, as the independent Bloom regression does.
+            unreadable_objects.joinpath("part.parquet").write_bytes(
+                b"AFOBJ001" + struct.pack("<QI", len(damaged), 0)
+                + hashlib.sha256(damaged).hexdigest().encode() + damaged
+            )
+            for cached in server.root.rglob("lake-ranges"):
+                if cached.is_dir():
+                    shutil.rmtree(cached)
+            server.resume()
+            call("/tables/numeric_pruning_unreadable", {"num_shards": 1, "schema": {
+                "storage_mode": "relational", "default_type": "row",
+                "base_source": {"kind": "external", "table_id": "numeric-pruning-unreadable", "format": "parquet", "uri": unreadable_root.as_uri()},
+                "document_schemas": {"row": {"schema": {"type": "object", "properties": {
+                    "k": {"type": "number", "x-antfly-sql-type": "numeric"}
+                }, "additionalProperties": False}}},
+            }, "indexes": {}})
+            for op, bound in ((">", "9007199254740993.125"), ("=", "9007199254740994"), ("<", "9007199254740991.875")):
+                assert call("/sql", {"statement": f"SELECT COUNT(*) FROM numeric_pruning_unreadable WHERE k{op}CAST('{bound}' AS NUMERIC)"})["rows"] == [["0"]]
         failed = False
     finally:
         server.stop(test_failed=failed)

@@ -167,6 +167,36 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             self.arena.deinit();
             self.a.destroy(self);
         }
+        fn collectLane(group: *operators.Grouped, keys: []const Batch, inputs: []const Batch, first: usize, end: usize, ordinal: u64) anyerror!void {
+            var scratch = std.heap.ArenaAllocator.init(group.backing);
+            defer scratch.deinit();
+            const lane_alloc = scratch.allocator();
+            const selection = try lane_alloc.alloc(usize, end - first);
+            for (selection, first..) |*index, position| index.* = position;
+            const local_keys = try lane_alloc.alloc(Batch, keys.len);
+            const local_inputs = try lane_alloc.alloc(Batch, inputs.len);
+            for (keys, local_keys) |*column, *out| out.* = try column.select(lane_alloc, selection);
+            for (inputs, local_inputs) |*column, *out| out.* = try column.select(lane_alloc, selection);
+            // Preserve source ordinals across lanes and successive batches.
+            group.rows_seen = ordinal + first;
+            try group.addEncodedColumns(local_keys, local_inputs, end - first);
+        }
+        fn parallelReducers(specs: []const operators.AggregateSpec) bool {
+            for (specs) |spec| {
+                if (spec.distinct or spec.kind == .pattern_set) return false;
+                // Preserve ordered floating SUM/AVG behavior. Exact integer
+                // and NUMERIC states can be merged without rounding changes.
+                if ((spec.kind == .sum or spec.kind == .avg) and spec.input_type != .integer and spec.input_element != .numeric) return false;
+                // Equal NUMERIC values can carry different display scales;
+                // floating extrema can carry signed zero. Preserve their
+                // ordered representative until typed states retain tie ordinals.
+                if (spec.kind == .min or spec.kind == .max) switch (spec.input_type orelse return false) {
+                    .integer, .string, .boolean, .datetime => {},
+                    else => return false,
+                };
+            }
+            return true;
+        }
         fn collect(self: *@This(), side: u1) !*operators.Grouped {
             const context = self.engine.context;
             const owned = self.arena.allocator();
@@ -178,6 +208,17 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
             const child = if ((side == 0) != self.iterator.flipped_join) self.iterator.left.? else self.iterator.right.?;
             var scratch = std.heap.ArenaAllocator.init(self.a);
             defer scratch.deinit();
+            const scheduler = @import("parallel_scheduler.zig");
+            var locked: scheduler.LockedAllocator = .{ .backing = self.a };
+            var lanes: [4]?*operators.Grouped = @splat(null);
+            var lane_count: usize = 0;
+            defer for (lanes) |lane| if (lane) |group| group.deinit();
+            var parallel_keys = true;
+            for (self.plan.keys[side]) |column| switch (child.node.columns[column].type) {
+                .integer, .string, .boolean, .datetime => {},
+                else => parallel_keys = false,
+            };
+            var ordinal: u64 = 0;
             while (true) {
                 _ = scratch.reset(.free_all);
                 const temporary = scratch.allocator();
@@ -195,8 +236,45 @@ pub fn open(a: A, engine: anytype, iterator: anytype, plan: Plan) !catalog.Aggre
                 const inputs = try temporary.alloc(Batch, specs.len);
                 @memset(inputs, .{ .dictionary = .{ .values = one, .indices = ones } });
                 for (self.side_inputs[side], inputs[1..]) |input, *value| value.* = try source.project(temporary, self.plan.inputs[input].?.column);
-                try grouped.addEncodedColumns(keys, inputs, batch.len());
+                const io = context.backend.execution_io;
+                if (lane_count == 0 and io != null and batch.len() >= 256 and parallel_keys and parallelReducers(specs)) {
+                    const requested = @min(4, scheduler.global().fanout(@min(4, batch.len() / 128), context.limits.retained_bytes / 4, 1024 * 1024));
+                    if (requested > 1) {
+                        for (lanes[0..requested]) |*lane| lane.* = try operators.Grouped.create(locked.allocator(), specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 4 / (requested + 1), .spill = context.spill });
+                        lane_count = requested;
+                    }
+                }
+                if (lane_count == 0) {
+                    try grouped.addEncodedColumns(keys, inputs, batch.len());
+                } else {
+                    var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
+                    // Join every lane while the borrowed input page is alive,
+                    // including submission failures and canceled/error paths.
+                    defer for (&tasks) |*slot| if (slot.*) |*task| {
+                        task.cancel(io.?) catch {};
+                    };
+                    for (1..lane_count) |lane| {
+                        const first = batch.len() * lane / lane_count;
+                        const end = batch.len() * (lane + 1) / lane_count;
+                        tasks[lane - 1] = scheduler.global().submit(io.?, lanes[lane].?.limits.bytes, collectLane, .{ lanes[lane].?, keys, inputs, first, end, ordinal });
+                        if (tasks[lane - 1] == null) try collectLane(lanes[lane].?, keys, inputs, first, end, ordinal);
+                    }
+                    try collectLane(lanes[0].?, keys, inputs, 0, batch.len() / lane_count, ordinal);
+                    for (&tasks) |*slot| if (slot.*) |*task| {
+                        var owned_task = task.*;
+                        slot.* = null;
+                        try owned_task.await(io.?);
+                    };
+                }
+                ordinal += batch.len();
             }
+            // Lanes retain compact typed state across pages, then merge once.
+            // Importing directly supports the target's ordinary spill path.
+            for (lanes[0..lane_count]) |lane| while (true) {
+                _ = scratch.reset(.free_all);
+                const partial = try lane.?.nextTypedPartialResult(scratch.allocator()) orelse break;
+                try grouped.importTypedPartialMapped(partial.keys, partial.typed_states.?, null, partial.ordinal);
+            };
             return grouped;
         }
         fn prepare(self: *@This()) !void {

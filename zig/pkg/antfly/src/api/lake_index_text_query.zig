@@ -302,6 +302,7 @@ const Execution = struct {
     private_files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
     active_text: ?types.TextQuery = null,
+    forced_selection: ?[]const [32]u8 = null,
     text_identities: std.AutoHashMapUnmanaged(usize, @import("lake_index_text_predicate.zig").Identities) = .empty,
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
@@ -581,8 +582,8 @@ const Execution = struct {
         const source_recipe = corpus.sourceRecipe(.{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true);
         const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &source_recipe, &root.recipe);
         try self.text_stores_source.put(self.arena, selected.name, stores_source);
-        var selection: ?[]const [32]u8 = null;
-        if (self.overlay == null) if (self.active_text) |text| {
+        var selection = self.forced_selection;
+        if (selection == null and self.overlay == null) if (self.active_text) |text| {
             selection = self.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
                 error.OutOfMemory => null, // optional proof; full admission remains authoritative
                 else => return err,
@@ -592,7 +593,7 @@ const Execution = struct {
             // Exact segment routing is an optional admission optimization. Its
             // detailed metadata can cost more than compact full-inventory
             // routes; retry full admission when that optional budget is tight.
-            error.NativeLakeTextCacheBusy, error.NativeLakeTextCorpusTooLarge, error.ArtifactReadBudgetExceeded => if (selection != null)
+            error.NativeLakeTextCacheBusy, error.NativeLakeTextCorpusTooLarge, error.ArtifactReadBudgetExceeded => if (selection != null and self.forced_selection == null)
                 try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation)
             else
                 return err,
@@ -1062,8 +1063,85 @@ const Execution = struct {
         }
         return pin;
     }
+    // Broad score queries stream immutable routing windows. Every window uses
+    // the publication's collection statistics and global term frequencies;
+    // only admission/doc ordinals are local. Source hydration remains after
+    // final top-K movement. Other request shapes retain their existing planner.
+    fn pagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery) anyerror!?types.SearchResult {
+        if (self.forced_selection != null or !self.typed_delivery or self.overlay != null or
+            req.profile or req.highlight != null or req.order_by.len != 0 or
+            req.search_after.len != 0 or req.search_before.len != 0 or
+            req.filter_text != null or req.exclusion_text != null or requiresEncodedSource(req) or
+            req.filter_prefix.len != 0 or req.filter_ids.len != 0 or req.exclude_ids.len != 0 or
+            req.filter_doc_ids.len != 0 or req.filter_doc_ids_positive or req.exclude_doc_ids.len != 0 or
+            req.resolved_doc_filter != null or req.resolved_text_doc_filter != null or req.native_key_predicate != null or
+            req.full_text_queries.len > 1 or req.dense != null or req.sparse != null or
+            req.dense_queries.len != 0 or req.sparse_queries.len != 0 or
+            req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
+            req.aggregations_json.len != 0 or req.pruner != null or req.reranker != null or
+            (!req.count_only and req.limit == 0)) return null;
+        switch (text) {
+            .term, .match, .phrase, .bool_query => {},
+            else => return null,
+        }
+        var indexes: usize = 0;
+        for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version) {
+            indexes += 1;
+        };
+        const selected = for (self.declarations) |declaration| {
+            if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version and
+                (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
+        } else return null;
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+        const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
+        defer metadata.release();
+        const root = metadata.value.root;
+        if (root.inventory_version != 3 or root.collection == null or root.statistics_version < 1 or root.term_statistics == null or root.segment_count <= 64) return null;
+        if (!std.mem.eql(u8, &root.domain, &self.domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
+        // Preserve the exact selective route when the query has few segments.
+        var plan_budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+        var plan = std.heap.ArenaAllocator.init(plan_budget.allocator());
+        defer plan.deinit();
+        var planning = self.*;
+        planning.arena = plan.allocator();
+        const subset = planning.selectFiles(text, root, cached, cancellation) catch |err| switch (err) {
+            error.OutOfMemory => null,
+            else => return err,
+        };
+        if (subset) |ids| if (ids.len <= 64 or ids.len < root.segment_count / 2) return null;
+        var reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(a, root, self.store.artifactStore(), cached, cancellation);
+        defer reader.deinit();
+        var winners = PagedWinners.init(a, if (req.count_only) 0 else @as(usize, req.offset) + req.limit);
+        defer winners.deinit();
+        var total: u32 = 0;
+        var relation: types.TotalHitsRelation = .exact;
+        var ids: [64][32]u8 = undefined;
+        while (try reader.next(&ids)) |window| {
+            try self.context.ensureActive();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const wa = scratch.allocator();
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities };
+            defer child.deinit();
+            var request = req;
+            request.offset = 0;
+            request.limit = if (req.count_only) req.limit else std.math.cast(u32, winners.limit) orelse return error.QueryCandidateBudgetExceeded;
+            request.include_stored = false;
+            var page = try searchText(&child, wa, request, text);
+            defer page.deinit();
+            if (page.total_hits_relation == .gte or page.total_hits > std.math.maxInt(u32) - total) relation = .gte;
+            total +|= page.total_hits;
+            for (page.hits) |hit| {
+                const ordinal = std.math.add(u64, window.doc_offset, hit.native_text_doc_id orelse return error.InvalidNativeLakeTextCorpus) catch return error.InvalidNativeLakeTextCorpus;
+                try winners.add(hit, ordinal);
+            }
+        }
+        return .{ .alloc = a, .hits = try winners.finish(req.offset), .total_hits = total, .total_hits_relation = relation };
+    }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
+        if (try self.pagedText(a, req, text)) |result| return result;
         const previous_text = self.active_text;
         self.active_text = text;
         defer self.active_text = previous_text;
@@ -2196,4 +2274,86 @@ test "external lake sparse predicate planning preflights effective windows and p
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &execution, native });
+}
+
+/// Global score ties use the immutable corpus ordinal, never the physical file
+/// name or a window-local doc number. Retains only offset + limit owned hits.
+const PagedWinners = struct {
+    const Winner = struct {
+        hit: types.SearchHit,
+        ordinal: u64,
+        fn worst(_: void, l: Winner, r: Winner) std.math.Order {
+            const order = std.math.order(l.hit.score orelse 0, r.hit.score orelse 0);
+            return if (order == .eq) std.math.order(r.ordinal, l.ordinal) else order;
+        }
+    };
+    a: A,
+    limit: usize,
+    heap: std.PriorityQueue(Winner, void, Winner.worst) = .initContext({}),
+    fn init(a: A, limit: usize) PagedWinners {
+        return .{ .a = a, .limit = limit };
+    }
+    fn deinit(self: *PagedWinners) void {
+        while (self.heap.pop()) |entry| {
+            var hit = entry.hit;
+            hit.deinit(self.a);
+        }
+        self.heap.deinit(self.a);
+    }
+    fn add(self: *PagedWinners, hit: types.SearchHit, ordinal: u64) !void {
+        if (self.limit == 0) return;
+        if (!std.math.isFinite(hit.score orelse 0)) return error.InvalidNativeLakeTextCorpus;
+        const candidate: Winner = .{ .hit = hit, .ordinal = ordinal };
+        if (self.heap.items.len == self.limit and Winner.worst({}, candidate, self.heap.peek().?) != .gt) return;
+        var owned = try hit.clone(self.a);
+        errdefer owned.deinit(self.a);
+        // Window-local identities cannot outlive the admission pin. Final
+        // physical hydration uses the public key and the leased publication.
+        owned.doc_ordinal = null;
+        owned.native_text_doc_id = null;
+        try self.heap.ensureUnusedCapacity(self.a, 1);
+        if (self.heap.items.len == self.limit) {
+            var removed = self.heap.pop().?.hit;
+            removed.deinit(self.a);
+        }
+        try self.heap.push(self.a, .{ .hit = owned, .ordinal = ordinal });
+    }
+    fn finish(self: *PagedWinners, offset: usize) ![]types.SearchHit {
+        const count = self.heap.items.len;
+        const skip = @min(offset, count);
+        const hits = try self.a.alloc(types.SearchHit, count - skip);
+        var remaining = count;
+        while (self.heap.pop()) |entry| {
+            remaining -= 1;
+            if (remaining < skip) {
+                var hit = entry.hit;
+                hit.deinit(self.a);
+            } else hits[remaining - skip] = entry.hit;
+        }
+        return hits;
+    }
+};
+
+test "external lake paged native text winners retain global ties and offset across windows" {
+    const a = std.testing.allocator;
+    var heap = PagedWinners.init(a, 3);
+    defer heap.deinit();
+    var id = [_]u8{'x'};
+    // Reversed arrival and deliberately conflicting local doc IDs.
+    try heap.add(.{ .id = &id, .score = 2, .native_text_doc_id = 0 }, 90);
+    try heap.add(.{ .id = &id, .score = 2, .native_text_doc_id = 1 }, 50);
+    id[0] = 'a';
+    try heap.add(.{ .id = &id, .score = 2, .native_text_doc_id = 5 }, 5);
+    id[0] = 'b';
+    try heap.add(.{ .id = &id, .score = 3, .native_text_doc_id = 10 }, 100);
+    id[0] = 'c';
+    try heap.add(.{ .id = &id, .score = 1 }, 1);
+    const hits = try heap.finish(1);
+    defer a.free(hits);
+    defer for (hits) |*hit| hit.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqualStrings("a", hits[0].id);
+    try std.testing.expectEqualStrings("x", hits[1].id);
+    try std.testing.expect(hits[0].native_text_doc_id == null);
+    try std.testing.expectEqual(@as(usize, 0), heap.heap.items.len);
 }

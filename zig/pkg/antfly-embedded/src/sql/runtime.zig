@@ -459,7 +459,72 @@ pub const Context = struct {
     pub fn conditions(self: Context, table_def: catalog.Table, predicate: ?*const ast.Predicate) !BoundPredicates {
         var conditions_out: BoundPredicates = .{};
         try self.bindConditions(table_def, predicate, &conditions_out);
+        // The bound program, including casts and parameter identities, is the
+        // authority for exact operands. JSON-only AST lowering cannot prove
+        // the comparison domain of NUMERIC versus floating-point values.
+        if (table_def.external_base_source != null) if (self.binding.scalars.predicate) |*program| {
+            try self.bindNumericConditions(table_def, program, program.root, &conditions_out, 0);
+        };
         return conditions_out;
+    }
+
+    fn constantOperand(program: *const @import("scalar.zig").Program, index: u32, depth: usize) bool {
+        if (depth >= 128 or index >= program.instructions.len) return false;
+        return switch (program.instructions[index].operation) {
+            .literal, .parameter => true,
+            .cast => |cast| constantOperand(program, cast.operand, depth + 1),
+            .unary => |unary| (unary.op == .positive or unary.op == .negative) and constantOperand(program, unary.operand, depth + 1),
+            else => false,
+        };
+    }
+    fn bindNumericConditions(self: Context, table: catalog.Table, program: *const @import("scalar.zig").Program, index: u32, output: *BoundPredicates, depth: usize) anyerror!void {
+        if (depth >= 128 or index >= program.instructions.len) return error.InvalidSqlProgram;
+        const instruction = program.instructions[index];
+        if (instruction.operation != .binary) return;
+        const binary = instruction.operation.binary;
+        if (binary.op == .@"and") {
+            try self.bindNumericConditions(table, program, binary.left, output, depth + 1);
+            return self.bindNumericConditions(table, program, binary.right, output, depth + 1);
+        }
+        var op: catalog.Condition.Op = switch (binary.op) {
+            .eq => .eq,
+            .neq => .neq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            else => return,
+        };
+        var col = binary.left;
+        var value_index = binary.right;
+        if (program.instructions[col].operation != .column) {
+            col = binary.right;
+            value_index = binary.left;
+            op = switch (op) {
+                .lt => .gt,
+                .lte => .gte,
+                .gt => .lt,
+                .gte => .lte,
+                else => op,
+            };
+        }
+        if (program.instructions[col].operation != .column or !constantOperand(program, value_index, 0)) return;
+        const ordinal = program.instructions[col].operation.column;
+        if (ordinal >= self.binding.scalars.columns.len) return error.InvalidSqlProgram;
+        const column = try table.column(self.binding.scalars.columns[ordinal].name);
+        if (column.element_type != .numeric) return;
+        const descriptor = program.instructions[value_index].type;
+        // Mixed floating comparisons intentionally use SQL's floating domain;
+        // an exact NUMERIC tuple seek would not implement that equivalence.
+        if (descriptor.kind != .integer and !(descriptor.kind == .number and descriptor.element_type == .numeric)) return;
+        const raw = try program.evaluateInstruction(self.arena, value_index, self.parameters);
+        if (raw.sql_null) {
+            output.empty = true;
+            return;
+        }
+        const value_ = try describe.coerceDatum(self.arena, raw, column.type, column.element_type);
+        try output.terms.append(self.arena, .{ .column = column.path, .op = op, .value = try self.outputDatum(value_, column.type, column.element_type), .operand = value_ });
+        if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
 
     fn bindConditions(self: Context, table_def: catalog.Table, predicate: ?*const ast.Predicate, output: *BoundPredicates) anyerror!void {
@@ -5441,4 +5506,34 @@ test "SQL DDL scratch is reclaimable under the statement cap while receipts surv
     try std.testing.expect(result.peakMemoryBytes() < 2 * 1024 * 1024);
     try std.testing.expectEqualStrings("child", result.output.ddl_receipt.?.table);
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", result.output.ddl_receipt.?.fk_generation_publication_id.?);
+}
+
+test "external lake SQL parallel partition reducers preserve spilled count sum and groups" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |parallel| {
+        var source: TestBackend = .{ .row_count = 32768, .group_every = 2 };
+        var backend = source.coordinated();
+        backend.execution_io = if (parallel) std.testing.io else null;
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &source, .checkpoint = backend.vtable.checkpoint, .async_writes = false };
+        defer manager.deinit();
+        backend.spill_manager = &manager;
+        var compiled = try compiler.compile(a, "SELECT l.id, COUNT(*), SUM(l.id), MIN(l.id), MAX(r.id) FROM things l JOIN things r ON l.id=r.id GROUP BY l.id ORDER BY l.id DESC LIMIT 3", .{});
+        defer compiled.deinit();
+        var result = try execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 16 * 1024 * 1024, .page_rows = 1024, .scan_rows = 200000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, 0..) |row, index| {
+            const id = 16383 - index;
+            const key = try std.fmt.allocPrint(a, "{d}", .{id});
+            defer a.free(key);
+            const sum = try std.fmt.allocPrint(a, "{d}", .{id * 4});
+            defer a.free(sum);
+            try std.testing.expectEqualStrings(key, row[0].string);
+            try std.testing.expectEqualStrings("4", row[1].string);
+            try std.testing.expectEqualStrings(sum, row[2].string);
+            try std.testing.expectEqualStrings(key, row[3].string);
+            try std.testing.expectEqualStrings(key, row[4].string);
+        }
+        try std.testing.expect(result.state.budget.peak <= 16 * 1024 * 1024);
+    }
 }

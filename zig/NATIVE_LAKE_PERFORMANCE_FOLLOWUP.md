@@ -2613,3 +2613,113 @@ across Parquet and Iceberg. Cold covering queries succeed after source data page
 are corrupted and range caches are removed. Disk admission safeguards remain
 unchanged. SQL NUMERIC comparisons retain typed residual enforcement; this
 qualification does not claim a new native SQL predicate pushdown capability.
+
+### Typed materialization, bounded broad admission, and startup navigation
+
+Reader protocol 35 and `native-sql-aggregate-recipe-v2` fence the earlier loss of
+NUMERIC type information in materialization batches. Recipe keys and measures
+now carry the normalized scalar element type and NUMERIC modifier all the way
+from the catalog to typed batch decoding. Both recipe identity and declaration
+identity change, so a previously rounded materialization cannot satisfy a new
+request or be inherited as an unchanged file contribution. This applies to
+COUNT grouping as well as SUM/MIN/MAX inputs.
+
+Standalone SQL comparisons against a direct NUMERIC column now derive native
+index bounds from the bound scalar program and invocation parameters. Only
+constant/parameter operands, casts, signs, and conjunctions in the exact
+integer/NUMERIC comparison domain qualify. Mixed floating comparisons remain
+residual. Conditions carry an exact typed operand alongside a lossless wire
+encoding for tuple bounds; typed scan filtering never reconstructs that operand
+through floating point. This uses the existing persistent ordered/predicate
+indexes, costing, covering projection, reader leases, and spillable candidate
+streams rather than introducing an independent metadata index.
+
+Compatible Parquet integer statistics, page indexes, and equality Bloom filters
+can also consume these predicates. Fractional range operands produce exact
+floor/ceiling integer bounds with a typed residual. Non-finite or out-of-range
+operands decline optional integer pruning, as do negative-scale column modifiers.
+Text-backed decimals cannot use lexical min/max as numeric bounds. In particular,
+an eight-byte string page bound must never be reinterpreted as an integer.
+Annotated decimal/timestamp statistics retain the existing conservative checks.
+
+Broad, ordinary term/match/phrase/Boolean score queries over more than 64 segments
+now stream the authenticated routing tree and admit one 64-segment window at a
+time. Window snapshots use publication-wide collection lengths and global term
+frequencies. A bounded heap retains `offset + limit` winners, compares score ties
+using the original corpus ordinal, and releases each window before advancing.
+Final winners hydrate from physical keys under the existing leased publication.
+Count-only requests sum exact counts or preserve lower-bound relations. The
+cursor validates complete segment/document totals and per-file interval,
+manifest, physical-map and digest continuity without retaining the inventory.
+A bounded optional selection probe preserves the existing selective route for
+small candidate sets.
+
+This is the broad score-query consumer of paged navigation. Sorted/cursor,
+highlight, metadata-filtered, overlay, multi-source composed/vector and early-source request
+shapes retain their existing planners. A fully virtual snapshot for all those
+shapes remains additional work; this change does not claim constant navigation
+memory for every search API combination. Compact source-file proof maps also
+remain separate from the bounded segment window.
+
+New text-file builds compact eight adjacent small runs when their combined input
+fits 16 MiB. Optional merge work has a 64 MiB ceiling and the ordinary publication
+allocator remains authoritative. A compacted artifact must fit the existing
+32 MiB serving limit and avoid significant size expansion. Exhausting merge
+workspace preserves the original runs. Input order and physical row keys remain
+unchanged. Compaction is per changed file: immutable historical file artifacts
+and their publication/GC closure are reused when a small current file arrives.
+This avoids rewriting historical postings on every update. Background compaction
+across source files would require a separate physical-span ownership design and
+is not introduced here.
+
+Index reconciliation and readiness attempt planning warmup once per immutable
+publication, with concurrent attempts coalesced. A fixed 256-entry completion
+ring bounds the memo; evicted publications may warm again. At most four publications warm
+concurrently; each uses at most four shared I/O lanes, 4 MiB workspace per lane,
+64 authenticated planning pages, two interior navigation levels, and a two-second
+deadline. Shutdown and the caller's cancellation/deadline are propagated, and
+all tasks join before the reader lease is released. Postings and source rows are
+not warmed. Readiness waits for the bounded attempt; a cache miss or warming
+failure does not replace ordinary source/publication proof or indefinitely block
+queryability. Catalog build-progress updates do not repeat the same warmup.
+
+`antfly_lake_navigation_warming_{attempts,failures,pages,nanoseconds}_total` report
+warmup separately from query phases. Benchmark reports must distinguish a fresh
+RAM/disk cache with no warming from restart-after-warmup and repeated-query cases;
+removing disk entries before a restart alone does not establish an empty planning
+cache after readiness. Unit/benchmark harnesses can use fresh serving-cache
+instances to measure the genuinely cold path independently.
+
+Join preaggregation can now retain up to four partition-local typed reducers
+across native batches, subject to shared CPU/memory admission. They merge typed
+partial states once at the end through the ordinary grouped spill path. Declined
+scheduler submissions run inline. Borrowed source batches remain alive until all
+workers join, including errors and cancellation. Lane and group budgets are
+fractions of the statement allowance; no larger statement or response limit is
+introduced. Canonical integer/string/Boolean/datetime group keys qualify. Floating
+SUM/AVG, DISTINCT/pattern sets, noncanonical group representatives, and extrema
+whose equal values can have different display representations retain ordered
+reduction. Broader parallelism requires explicit representative/tie ordinals in
+those typed states rather than changing observable results incidentally.
+
+The main merge includes `origin/main` through `1a0e150bf9` and preserves both
+the shared spill run store and main's presorted-run collection. Final Zig 0.17.0
+Debug qualification passes all 92 combined CLI/integration/boundary build steps,
+374 lake integration tests (151 shared, 223 API), and both embedded boundary
+audits without allocator leaks. Changed-source Zig formatting, Python syntax,
+and diff checks pass.
+
+All 18 selected real Parquet/Iceberg E2Es pass against the final rebuilt CLI:
+remote text ranking/filter/highlight/restart, incremental artifact reuse,
+optional-directory bootstrap, wide partial join delivery, two native joins with
+more than 70,000 distinct build keys, two exact NUMERIC covering joins, two exact
+NUMERIC aggregate materializations, the 67-file broad-window score/tie/count/
+hydration comparison, two physical-type pruning regressions, real Iceberg
+snapshot/schema/partition/delete transitions, and four fragmented corpus shapes.
+Cold covering/materialized queries succeed with unreadable source data pages and
+cleared range caches. A distinct authenticated Parquet source with unreadable
+data pages verifies compatible integer pruning; eight-byte decimal strings
+remain exact residual comparisons. Disk admission safeguards remain intact.
+These regressions establish correctness and bounded execution contracts;
+representative archive-scale throughput/RSS/provider-request measurements remain
+pending.
