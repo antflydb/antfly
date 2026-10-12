@@ -20,7 +20,7 @@ const video = @import("mod.zig");
 extern fn av_benchmark_device_create() ?*anyopaque;
 extern fn av_benchmark_device_destroy(*anyopaque) void;
 extern fn av_benchmark_peak_rss() u64;
-const Mode = enum { decode, cpu, metal, hash, dump };
+const Mode = enum { decode, cpu, metal, hash, dump, index, index_reconstruct, index_compare };
 const Context = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -144,6 +144,10 @@ pub fn main(init: std.process.Init) !void {
     var reader = try media.webm.Reader.init(a, &input, .{});
     defer reader.deinit();
     const index_ns = now(init.io) - index_start;
+    if (mode == .index or mode == .index_reconstruct or mode == .index_compare) {
+        try benchmarkIndex(a, init.io, &writer.interface, &reader, &pool, mode, iterations, index_ns);
+        return;
+    }
     var device: ?*anyopaque = null;
     var metal: ?video.preparation.Metal = null;
     const setup_start = now(init.io);
@@ -184,4 +188,34 @@ pub fn main(init: std.process.Init) !void {
 }
 fn now(io: std.Io) u64 {
     return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+}
+
+fn benchmarkIndex(a: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, reader: *media.webm.Reader, pool: *media.admission.Pool, mode: Mode, iterations: usize, container_ns: u64) !void {
+    const options = video.webm_pictures.Options{ .decoder = .{ .admission_pool = pool }, .strategy = if (mode == .index_reconstruct) .reconstruct else .headers };
+    for (0..iterations) |iteration| {
+        const start = now(io);
+        var index = try video.webm_pictures.index(a, reader, options);
+        defer index.deinit();
+        const completed_ns = now(io) - start;
+        const selected = try index.select();
+        defer a.free(selected);
+        var oracle_ns: u64 = 0;
+        if (mode == .index_compare) {
+            const oracle_start = now(io);
+            var oracle_options = options;
+            oracle_options.strategy = .reconstruct;
+            var oracle = try video.webm_pictures.index(a, reader, oracle_options);
+            defer oracle.deinit();
+            oracle_ns = now(io) - oracle_start;
+            if (index.pictures.len != oracle.pictures.len) return error.IndexParityMismatch;
+            for (index.pictures, oracle.pictures) |metadata, reconstructed| {
+                if (!std.meta.eql(metadata, reconstructed)) return error.IndexParityMismatch;
+            }
+            const oracle_selected = try oracle.select();
+            defer a.free(oracle_selected);
+            if (!std.mem.eql(usize, selected, oracle_selected)) return error.IndexSamplingMismatch;
+        }
+        try out.print("{{\"kind\":\"index\",\"codec\":\"{s}\",\"mode\":\"{s}\",\"iteration\":{d},\"container_ns\":{d},\"completed_ns\":{d},\"reconstruction_ns\":{d},\"visible_pictures\":{d},\"selected_pictures\":{d},\"retained_metadata_bytes\":{d},\"process_peak_rss_bytes\":{d},\"parity_checked\":{s}}}\n", .{ @tagName(reader.track.codec), @tagName(mode), iteration, container_ns, completed_ns, oracle_ns, index.pictures.len, selected.len, index.pictures.len * @sizeOf(video.webm_pictures.Picture), av_benchmark_peak_rss(), if (mode == .index_compare) "true" else "false" });
+        try out.flush();
+    }
 }

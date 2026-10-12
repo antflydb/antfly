@@ -16,4 +16,11 @@
 test {
     _ = @import("src/h264_fuzz_test.zig");
     _ = @import("src/codecs/fuzz_test.zig");
+    _ = @import("src/codecs/av1_headers.zig");
+}
+
+// Fuzz instrumentation retains exported OBU functions as coverage roots.
+// Link their owned helpers even when only metadata parsing is selected.
+comptime {
+    _ = @import("src/codecs/av1/root.zig");
 }

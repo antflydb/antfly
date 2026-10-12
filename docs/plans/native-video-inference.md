@@ -864,3 +864,8 @@ binary, input, oracle and measurement fingerprints are recorded in
 Measured SIMD work, H.264 reference copying, WebM indexing/replay costs and
 cross-group reuse remain performance work. The full codec/display/streaming and
 non-CUDA qualification requirements stay active.
+
+
+### Header-only WebM planning continuation
+
+Header-only displayed-picture indexing is implemented for VP8/VP9/AV1, with an explicit full-reconstruction oracle and index comparison benchmark. This removes reconstruction from the default model preflight/planning indexes while retaining reconstruction for selected replay. Focused tests compare metadata against decoded output across VP9 profiles and AV1 depth/chroma/grain/scalable policies. The full macOS gate passes 168 tests with two platform skips; actual Linux ARM64 passes 145 with 25 skips. All 4,623 unique larger-corpus picture records and sampled IDs match full reconstruction on both platforms. The metadata campaign passes 101,937 runs with correctly Smith-serialized seeds; separate acceptance gates prove 13 decoder and five metadata seeds reach valid output. Metal preserves all eight pretrained vectors and three exact rankings/top-k sets, but four of five concurrent load requests receive retryable admission denials under shared-host pressure. Current CPU/Linux pretrained and corruption/retry follow-ups remain in progress. `zig/lib/video/testdata/header-index-validation` records the gates and diagnostic timing limits; the broader non-CUDA scope above remains active.

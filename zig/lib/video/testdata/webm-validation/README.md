@@ -78,3 +78,10 @@ Expanded AV1 profiles, Annex B and layer selection have subsequent
 [qualification receipts](../av1-extended/README.md). Field/partition and
 timestamp/window model policies, device normalization, cross-request scheduling,
 isolated performance and DASH/HLS expansion remain work in the active plan.
+
+
+The `codec fuzz seed` gate exercises all 13 VP9/AV1/Annex B seeds through
+`Smith.sliceWithHash`, then requires successful pixel reconstruction under the
+campaign's actual byte, pixel, allocation and control limits. Smith's seed
+serialization includes a four-byte length prefix; the decoder receives only
+the raw coded payload. The metadata AV1 target uses the same serialization.

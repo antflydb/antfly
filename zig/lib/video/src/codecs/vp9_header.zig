@@ -17,6 +17,7 @@
 const std = @import("std");
 pub const Geometry = struct { width: u32, height: u32 };
 pub const References = [8]?Geometry;
+pub const Picture = struct { geometry: Geometry, visible: bool, show_existing: bool = false };
 pub const Parts = struct { packets: [8][]const u8 = undefined, len: usize = 0 };
 const Bits = struct {
     bytes: []const u8,
@@ -94,7 +95,7 @@ fn render(bits: *Bits) !void {
 fn sync(bits: *Bits) !void {
     if (try bits.read(24) != 0x498342) return error.InvalidVideoData;
 }
-pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) !void {
+pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !Picture {
     var bits: Bits = .{ .bytes = bytes };
     if (try bits.read(2) != 2) return error.InvalidVideoData;
     const low = try bits.read(1);
@@ -103,7 +104,7 @@ pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) 
     if (try bits.flag()) {
         const geometry = references[try bits.read(3)] orelse return error.InvalidVideoData;
         try validate(geometry, max_pixels);
-        return;
+        return .{ .geometry = geometry, .visible = true, .show_existing = true };
     }
     const inter = try bits.flag();
     const show = try bits.flag();
@@ -146,7 +147,42 @@ pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) 
     for (0..8) |i| {
         if (refresh & (@as(u32, 1) << @intCast(i)) != 0) references[i] = geometry;
     }
+    return .{ .geometry = geometry, .visible = show };
+}
+pub fn preflight(bytes: []const u8, references: *References, max_pixels: usize) !void {
+    _ = try inspect(bytes, references, max_pixels);
 }
 fn validate(geometry: Geometry, max_pixels: usize) !void {
     if (geometry.width > 16_384 or geometry.height > 16_384 or @as(u64, geometry.width) * geometry.height > max_pixels) return error.ResourceLimitExceeded;
+}
+
+test "VP9 metadata visibility and geometry match reconstruction across profiles" {
+    const a = std.testing.allocator;
+    const decoder = @import("decoder.zig");
+    inline for (.{ "../../testdata/vpx-av1/vp9.ivf", "../../testdata/vpx-av1/vp9-yuv420p.ivf", "../../testdata/vpx-av1/vp9-yuv420p10le.ivf", "../../testdata/vpx-av1/vp9-yuv420p12le.ivf", "../../testdata/vpx-av1/vp9-yuv422p.ivf", "../../testdata/vpx-av1/vp9-yuv422p12le.ivf", "../../testdata/vpx-av1/vp9-yuv444p.ivf", "../../testdata/vpx-av1/vp9-yuv444p10le.ivf" }) |path| {
+        const bytes = @embedFile(path);
+        const pixels = try decoder.Session.create(a, .vp9, .{});
+        defer pixels.destroy();
+        var references: References = @splat(null);
+        var position: usize = 32;
+        while (position < bytes.len) {
+            const length = std.mem.readInt(u32, bytes[position..][0..4], .little);
+            position += 12;
+            const packet = bytes[position..][0..length];
+            position += length;
+            var batch = try pixels.decode(packet, 0, null);
+            defer batch.deinit();
+            const parts = try split(packet);
+            var displayed: usize = 0;
+            for (parts.packets[0..parts.len]) |part| {
+                const metadata = try inspect(part, &references, 16 * 1024 * 1024);
+                if (!metadata.visible) continue;
+                try std.testing.expect(displayed < batch.frames.len);
+                try std.testing.expectEqual(batch.frames[displayed].width, metadata.geometry.width);
+                try std.testing.expectEqual(batch.frames[displayed].height, metadata.geometry.height);
+                displayed += 1;
+            }
+            try std.testing.expectEqual(batch.frames.len, displayed);
+        }
+    }
 }

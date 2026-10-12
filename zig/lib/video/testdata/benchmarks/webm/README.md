@@ -80,3 +80,12 @@ Twenty-four model tests and all eight CPU/Metal pretrained WebM vectors and
 three rankings/top-k sets pass, including concurrent and disconnect/retry checks. General codec conformance, continuing fuzzing/recovery, measured
 SIMD, H.264 reference copies, index/replay costs, cross-group reuse and the other
 non-CUDA requirements remain active.
+
+
+Header-only planning can be measured separately with `webm-benchmark INPUT index 7`
+or `index_reconstruct 7`. `index_compare 2` checks every picture's PTS, duration
+and geometry, plus sampled IDs, against full reconstruction on each iteration.
+`completed_ns` measures logical-picture indexing alone; selection/comparison is
+outside that interval. `container_ns` records initial container parsing. In
+comparison mode RSS includes reconstruction and is not a header-only memory
+measurement. These modes perform no model inference or GPU preparation.

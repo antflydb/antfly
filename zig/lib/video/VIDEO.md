@@ -1354,3 +1354,8 @@ source/binary/input/oracle scope are in the
 measurements cover decode/preparation, rather than model execution or deployment
 capacity; broader codec/display/streaming qualification and the full non-CUDA
 scope remain active.
+
+
+### Header-only WebM logical-picture indexing
+
+Model planning now indexes VP8/VP9/AV1 displayed-picture headers without reconstructing pixel planes. Hidden pictures still update reference geometry; VP9 superframes and AV1 operating-point filtering preserve displayed output ordinals. AV1 uses the owned frame-header grammar with header-only reference slots and validates tile-group framing. Entropy and pixel correctness remain replay responsibilities. An explicit `strategy = .reconstruct` index provides the qualification oracle. Metadata allocations use shared admission and bounded capacity; the returned index retains its reservation until deinitialization. All 4,623 larger-corpus picture records and sampled IDs match reconstruction on macOS and actual Linux ARM64. The metadata fuzz campaign passes 101,937 runs, and seed acceptance checks exercise Smith serialization before parsing. Shared-host timings are diagnostic. Current pretrained CPU/Linux and corruption/retry follow-ups remain in progress; this change does not establish general codec conformance. Receipts are in `testdata/header-index-validation`.

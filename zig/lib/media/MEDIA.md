@@ -647,3 +647,8 @@ work separately from displayed/prepared counts. Native codec output matches all
 while outputs retain independent storage. Detailed source/measurement scope is
 recorded in the video design and benchmark receipts. Broader streaming/display
 qualification, replay/index costs and the full non-CUDA goal remain active.
+
+
+### WebM planning boundary
+
+The model-facing video layer can derive logical displayed-picture timelines from VP8/VP9/AV1 headers rather than repeatedly reconstructing the clip during admission and sampling. Container packet PTS/duration remain attached to each displayed output, including multiple visible pictures from one packet. Header validation is a planning boundary; selected replay validates compressed entropy and pixels. Packet reads retain source controls and byte limits, while metadata capacity is admitted separately.

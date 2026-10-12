@@ -48,6 +48,7 @@ fn seed(comptime name: []const u8) []const u8 {
         @setEvalBranchQuota(1_000_000);
         const ivf = @embedFile("../../testdata/vpx-av1/" ++ name ++ ".ivf");
         const size = std.mem.readInt(u32, ivf[32..36], .little);
+        // Smith consumes the serialized length before supplying raw payload.
         var encoded: [4 + size]u8 = undefined;
         std.mem.writeInt(u32, encoded[0..4], size, .little);
         @memcpy(encoded[4..], ivf[44..][0..size]);
@@ -81,6 +82,7 @@ fn extendedSeed(comptime name: []const u8) []const u8 {
         @setEvalBranchQuota(1_000_000);
         const ivf = @embedFile("../../testdata/av1-extended/" ++ name ++ ".ivf");
         const size = std.mem.readInt(u32, ivf[32..36], .little);
+        // Smith consumes the serialized length before supplying raw payload.
         var encoded: [4 + size]u8 = undefined;
         std.mem.writeInt(u32, encoded[0..4], size, .little);
         @memcpy(encoded[4..], ivf[44..][0..size]);
@@ -97,4 +99,37 @@ test "video fuzz AV1 Annex B framing reconstruction and cleanup" {
         }
     };
     try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{extendedSeed("av1-annex-b")} });
+}
+
+test "codec fuzz seed packets reach reconstruction successfully" {
+    const Case = struct { codec: decoder.Codec, framing: decoder.Av1Framing = .low_overhead, bytes: []const u8 };
+    const cases = [_]Case{
+        .{ .codec = .vp9, .bytes = seed("vp9") },
+        .{ .codec = .vp9, .bytes = seed("vp9-yuv420p12le") },
+        .{ .codec = .vp9, .bytes = seed("vp9-yuv444p10le") },
+        .{ .codec = .vp9, .bytes = seed("vp9-yuv422p12le") },
+        .{ .codec = .av1, .bytes = seed("av1") },
+        .{ .codec = .av1, .bytes = seed("av1-10") },
+        .{ .codec = .av1, .bytes = seed("av1-grain") },
+        .{ .codec = .av1, .bytes = seed("av1-odd") },
+        .{ .codec = .av1, .bytes = extendedSeed("av1-c0-12") },
+        .{ .codec = .av1, .bytes = extendedSeed("av1-c2-12") },
+        .{ .codec = .av1, .bytes = extendedSeed("av1-c3-12") },
+        .{ .codec = .av1, .bytes = extendedSeed("av1-svc") },
+        .{ .codec = .av1, .framing = .annex_b, .bytes = extendedSeed("av1-annex-b") },
+    };
+    for (cases) |case| {
+        var guard = Guard{};
+        var smith = std.testing.Smith{ .in = case.bytes };
+        var payload: [128 * 1024]u8 = undefined;
+        const length = smith.sliceWithHash(&payload, 0xA17F9001);
+        try std.testing.expectEqual(case.bytes.len - 4, length);
+        try std.testing.expectEqualSlices(u8, case.bytes[4..], payload[0..length]);
+        const session = try decoder.Session.create(std.testing.allocator, case.codec, .{ .av1_framing = case.framing, .max_pixels = 512 * 512, .max_packet_bytes = 128 * 1024, .max_decode_bytes = 32 * 1024 * 1024, .max_output_bytes = 4 * 1024 * 1024, .control = .{ .context = &guard, .check_fn = Guard.check } });
+        defer session.destroy();
+        var batch = try session.decode(payload[0..length], 0, null);
+        defer batch.deinit();
+        try std.testing.expect(batch.frames.len != 0);
+        for (batch.frames) |frame| try frame.host().validate();
+    }
 }
