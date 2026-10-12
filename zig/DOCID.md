@@ -115,48 +115,67 @@ ordering of raw components.
 ## Key Layout
 
 `antfly-zig` moved away from "raw doc ID followed by textual suffixes" to
-explicit binary records.
+explicit binary records. Constructors and parsers live in
+`pkg/antfly-embedded/src/storage/internal_keys.zig`; the artifact contract
+built on them is in [DB.md](DB.md#derived-artifact-contract).
 
-High-level layout:
+Document-owned records (all under the user namespace byte `0x01`):
 
 ```text
 primary document
-  D | enc(doc_id) | 00 00 | P
+  0x01 | enc(doc_id) | 0x10
 
 ttl timestamp
-  D | enc(doc_id) | 00 00 | T
+  0x01 | enc(doc_id) | 0x11
 
-summary
-  D | enc(doc_id) | 00 00 | S | enc(index_name) | 00 00
+relational row
+  0x01 | enc(doc_id) | 0x12
 
-embedding
-  D | enc(doc_id) | 00 00 | E | enc(index_name) | 00 00
+artifact (common prefix)
+  0x01 | enc(doc_id) | 0x20 | enc(type) | enc(name) | <record suffix>
+
+embedding / asset / resolution artifact
+  0x01 | enc(doc_id) | 0x20 | enc("embedding" | "asset" | "resolution") | enc(name)
 
 chunk
-  D | enc(doc_id) | 00 00 | C | enc(index_name) | 00 00 | u32be(chunk_id)
+  0x01 | enc(doc_id) | 0x20 | enc("chunk") | enc(name) | 0x30 | u32be(chunk_id)
 
-enrichment artifact
-  D | enc(doc_id) | 00 00 | A | enc(kind) | 00 00 | enc(name) | 00 00 | ...
+document unit (asset, or chunk within a unit)
+  0x01 | enc(doc_id) | 0x20 | enc("asset") | enc(name) | 0x35 | enc(unit_id)
+  0x01 | enc(doc_id) | 0x20 | enc("chunk") | enc(name) | 0x35 | enc(unit_id) | 0x30 | u32be(chunk_id)
 
-outgoing edge
-  G | enc(source_doc_id) | 00 00 | enc(index_name) | 00 00 | enc(edge_type) | 00 00 | enc(target_doc_id) | 00 00 | O
+derived embedding of another artifact
+  <base artifact key> | 0x31 | enc(name)
 
-incoming edge
-  G | enc(target_doc_id) | 00 00 | enc(index_name) | 00 00 | enc(edge_type) | 00 00 | enc(source_doc_id) | 00 00 | I
+graph edge (owned by the source document)
+  0x01 | enc(doc_id) | 0x20 | enc("graph") | enc(index_name) | 0x32 | enc(edge_type) | enc(target_doc_id) [| relationship suffix]
 ```
 
 Notes:
 
-- `D` and `G` are top-level namespaces, not literal strings.
-- `P`, `T`, `S`, `E`, `C`, `A`, `O`, and `I` are single-byte record kinds.
-- fixed-width integers are big-endian so numeric order is preserved
-  lexicographically
-- internal metadata remains under a separate reserved prefix outside user
-  document namespaces
+- `enc(x)` is the [component codec](#component-codec) and always ends with
+  the `00 00` terminator, so `0x01 | enc(doc_id) | 0x10` is
+  `01 | <escaped doc_id> | 00 00 | 10`. This matches the
+  `user_ns | enc(doc) | 00 00 | 0x20 | ...` notation in DB.md, which writes the
+  terminator out.
+- `0x10`, `0x11`, `0x12`, and `0x20` are single-byte record kinds after the
+  document component; `0x30`, `0x31`, `0x32`, and `0x35` are record suffix
+  kinds inside an artifact. Other per-document state (asset state `0x33`,
+  graph asset state `0x34`, coverage `0x36`, unit navigation `0x37`/`0x38`,
+  and so on) uses further kind bytes defined in `internal_keys.zig`.
+- The optional graph relationship suffix is either the encoded logical source
+  (when it differs from the owning document) or a versioned extension
+  `0x01 | enc(edge_id) | enc(owner_document) | enc(logical_source)`.
+  Incoming-edge lookup uses the graph index's incoming directory, not a
+  second document-keyed record (see [GRAPH.md](GRAPH.md)).
+- Replay/derived-work state (`0x02`) and identity state (`0x03`) are separate
+  reserved namespaces outside user document keys.
+- Fixed-width integers are big-endian so numeric order is preserved
+  lexicographically.
 
 ## Ordering Properties
 
-Within the `D` namespace:
+Within the user namespace (`0x01`):
 
 - all records for a document are adjacent
 - documents are ordered by raw `doc_id`
@@ -175,7 +194,7 @@ documents whose ID starts with prefix `p`".
 For document ID prefix `p`, scan:
 
 ```text
-lower = D | enc_prefix(p)
+lower = 0x01 | enc_prefix(p)
 upper = next_prefix(lower)
 ```
 
