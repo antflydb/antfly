@@ -2538,6 +2538,7 @@ const LocalStandaloneMetadata = struct {
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
         if (call == .lake_index_lifecycle_work) {
             try context.ensureActive();
@@ -2551,20 +2552,15 @@ const LocalStandaloneMetadata = struct {
             try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
             return alloc.dupe(u8, "{}");
         }
-        if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        const shared_catalog_mutation = call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
-        {
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack;
+        if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
-        var lease = if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
-            call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
+        var lease = if (shared_catalog_mutation) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
         defer if (lease) |*value| value.release();
-        if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
-            call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
-        {
+        if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
         if (!lockAtomicUntil(&self.mutex, (try context.platformDeadline()).deadline_ns)) return error.DeadlineExceeded;
@@ -2583,6 +2579,43 @@ const LocalStandaloneMetadata = struct {
         }
         switch (call) {
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .relational_index_owner_decision => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexOwnerDecisionJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .relational_index_owner_ack_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexOwnerAckStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .relational_index_owner_ack => |request| {
+                const publication = @import("../metadata/relational_index_publication.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try request.validate();
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > publication.max_ack_bytes) return error.InvalidIndexOwnerReceipt;
+                // Preflight is not a lease: durable apply repeats enrolled-root,
+                // reporter, placement, observed cut and progress-CAS validation.
+                try store.validateRelationalIndexOwnerAck(group_ids.main_metadata_group_id, bytes);
+                try context.ensureActive();
+                const prior_revision = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .ack_relational_index_publication = bytes }) catch
+                    return error.MetadataMutationOutcomeUnknown;
+                // Owner progress does not alter visible schema or bindings.
+                // Refresh the full projection only if another catalog writer
+                // advanced beyond the one revision attributable to this ACK.
+                const observed_revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (prior_revision != 0 and prior_revision != std.math.maxInt(u64) and observed_revision == prior_revision + 1) {
+                    self.epoch = observed_revision;
+                    self.durable_revision = observed_revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.relationalIndexOwnerAckStatusJson(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                var parsed = std.json.parseFromSlice(publication.AckStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!(parsed.value.isAcknowledged(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -13010,6 +13043,46 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
     }
 }
 
+test "standalone native index owner catalog calls preserve authority and capability barriers" {
+    const alloc = std.testing.allocator;
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const ack = try publication.testing.fencedAck();
+    const calls = [_]Call{
+        .{ .relational_index_owner_decision = .{ .table_id = ack.table_id, .group_id = ack.signed.receipt.owner.group_id, .id = ack.signed.receipt.owner.plan_id, .operation = .fence } },
+        .{ .relational_index_owner_ack = ack },
+        .{ .relational_index_owner_ack_status = ack },
+    };
+    var unavailable: LocalStandaloneMetadata = undefined;
+    for (calls) |call| {
+        try std.testing.expectError(error.Forbidden, LocalStandaloneMetadata.systemCatalogAdmitted(&unavailable, alloc, .{}, call));
+        try std.testing.expectError(error.DeadlineExceeded, LocalStandaloneMetadata.systemCatalog(&unavailable, alloc, .{ .index_publication_authority = true, .deadline_ns = 0 }, call));
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
+    defer alloc.free(path);
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
+    defer metadata.deinit();
+    const revision = metadata.durable_revision;
+    const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
+    for (calls) |call| {
+        // A valid signature and an internal caller do not activate a protocol
+        // or enroll an owner. These are real durable-store preflight failures.
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, call));
+        try std.testing.expectEqual(revision, metadata.durable_revision);
+        try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+    }
+    var corrupt = ack;
+    corrupt.signed.proof.signature[0] ^= 1;
+    try std.testing.expectError(error.InvalidIndexOwnerReceipt, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, context, .{ .relational_index_owner_ack = corrupt }));
+    try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+}
+
 test "standalone shared mutation refreshes a committed catalog before retry" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -13205,6 +13278,9 @@ test "standalone standby catalog create rejects before contended locks" {
         try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{}, .{
             .mutate = .{ .mutation = .{ .kind = .table, .action = .create, .name = name } },
         }));
+        // A receipt is also a durable catalog mutation, not a status read.
+        // Reject the standby before inspecting its body or either held lock.
+        try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .index_publication_authority = true }, .{ .relational_index_owner_ack = undefined }));
     }
 }
 

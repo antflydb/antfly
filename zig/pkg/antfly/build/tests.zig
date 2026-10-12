@@ -4947,6 +4947,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone native index owner catalog calls",
             "standalone shared catalog resumes private restore and publishes atomically",
             "standalone standby catalog create rejects before contended locks",
             "offline migration rejects authoritative metadata",

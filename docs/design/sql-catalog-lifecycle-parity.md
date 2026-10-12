@@ -3087,3 +3087,32 @@ enrollment/capability activation, a complete build worker or metadata ACK
 submission. Full lifecycle/cohort cancellation/retirement, restore/adoption and
 distributed integrity faults remain open. Public production stays disabled;
 original-case dispositions remain 478/136/73/899.
+
+### Standalone owner catalog dispatch and durable ACK boundary
+
+The standalone catalog dispatcher now handles owner decisions, signed ACKs and
+exact ACK status instead of leaving the new call variants out of its exhaustive
+switch. Internal owner authority is required before catalog access; decision
+and status use the same bounded durable projections as clustered metadata.
+An ACK joins the existing shared catalog-mutation/standby barrier before taking
+the catalog lock. Signature and complete store preflight precede durable apply;
+the existing transactional transition independently repeats receipt authority
+and CAS checks. No root or capability is implicitly enrolled or activated.
+
+The durable standalone apply/outbox machinery owns the commit. Once dispatched,
+an unproved outcome remains unknown, and success requires the exact point-read
+receipt digest rather than a revision increment. A normal owner-only increment
+advances the local projection epoch without decoding the whole visible catalog;
+unexpected concurrent revisions use the existing reconciliation path.
+
+The frozen Debug standalone gate passed all 82 build steps and both selected
+tests, with zero skips, failures or leaks. The actual durable-store fixture
+proves authority/deadline checks, decoder-floor rejection, corrupt-signature
+rejection and unchanged revisions for all rejected operations. The role test
+holds catalog and standby locks and proves a standby ACK rejects before either
+lock or its undefined request body is inspected. Companion linked inference
+checks also passed; they are not index-publication evidence. Successful enrolled
+native ACKs through this dispatcher, HA post-commit faults and the shared
+standalone commit/post-publication lock split still need activation work and
+qualification. Optimized standalone qualification is pending. Public producer
+activation and original-case dispositions remain unchanged.
