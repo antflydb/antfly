@@ -50,7 +50,8 @@
       "clean_retries": "reference agreement",
       "scope": "zeroed first coded packet; broader corruption recovery remains active"
     },
-    "vp9_fuzz_followup": "100K campaign with verified Smith-serialized seeds; exact counters in vp9-fuzz.log"
+    "vp9_fuzz_followup": "100K campaign with verified Smith-serialized seeds; exact counters in vp9-fuzz.log",
+    "av1_fuzz_followup": "Three matching AV1 reconstruction, Annex B and metadata targets pass with verified Smith-serialized seeds; aggregate counters in av1-fuzz.log"
   },
   "pending": [
     "current Linux pretrained model qualification"
@@ -96,7 +97,8 @@
     "metal-webm.json": "9a14b43af6cda4a75661ece16273264337dc3d79d03ed9acf081aa68a03e5856",
     "model-tests.log": "9ba5f99c2741b65946645e1d9e70b9375ab70f5ddce2fa18dc1ee12237e4647d",
     "native-webm.json": "212f9e28fb4f76a8aaf52fbed1fd51e3d9fbdb68bb931d7ed513ca86a21455a8",
-    "vp9-fuzz.log": "63319ce09789fc4847699f195599e7237250f03b20535902c1e5541a8cb2ddba"
+    "vp9-fuzz.log": "63319ce09789fc4847699f195599e7237250f03b20535902c1e5541a8cb2ddba",
+    "av1-fuzz.log": "e59af6b7dcbc3bba8f4f7e58f64abd4b0e3e6260ef3b63fa35892b0fe6630bac"
   },
   "toolchain": {
     "zig": "0.17.0",
