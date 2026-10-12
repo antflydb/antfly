@@ -42,7 +42,9 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
         .name = "antfly-inference-bench-server",
         // The production server plus owned codec reconstruction reached 6.65 GB
         // on Linux; Metal builds reached 7.96 GB. Reserve 8 GiB for compilation.
-        .max_rss = @as(usize, 8) * 1024 * 1024 * 1024,
+        // The all-backend server build peaked at 10 GiB with current sources.
+        // This is compiler scheduling capacity, independent of runtime limits.
+        .max_rss = @as(usize, 12) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

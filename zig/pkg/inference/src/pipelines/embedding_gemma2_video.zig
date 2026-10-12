@@ -158,41 +158,82 @@ pub fn inspectPixels(bytes: []const u8, control: Control) !u64 {
     return inspectPixelsWithSampling(bytes, control, .reference);
 }
 pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: Sampling) !u64 {
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.page_allocator, .limit = 512 * 1024 * 1024 };
+    defer std.debug.assert(bounded.live == 0);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    return plan.pixels;
+}
+
+/// Geometry-derived share of a prepaid execution reservation. Counts maximum
+/// concurrent preparations rather than every sampled frame retained by the model.
+pub const Plan = struct {
+    pixels: u64 = 0,
+    preparation_bytes: usize = 0,
+    apple_surface_bytes: usize = 0,
+    commands: u64 = 0,
+    pub fn deviceBytes(self: Plan) !usize {
+        return std.math.add(usize, 16 * 1024 * 1024, try std.math.add(usize, self.apple_surface_bytes, try std.math.mul(usize, self.preparation_bytes, @intCast(self.commands))));
+    }
+    fn picture(self: *Plan, width: u32, height: u32, options: video.preparation.Options) !void {
+        const geometry = try video.preparation.geometry(width, height, options);
+        // All native outputs are tightly packed; extra 64-pixel row/height
+        // padding also covers the imported/copy paths without guessing depth.
+        const staging = try std.math.mul(usize, try std.math.mul(usize, std.mem.alignForward(usize, width, 64), std.mem.alignForward(usize, height, 64)), 6);
+        if (staging > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
+        self.preparation_bytes = @max(self.preparation_bytes, try std.math.add(usize, geometry.scratch_bytes, staging));
+        self.pixels = try std.math.add(u64, self.pixels, try std.math.mul(u64, width, height));
+    }
+};
+fn preparationSlots(selected: []const usize) u64 {
+    var unique: u64 = 0;
+    for (selected, 0..) |id, index| {
+        if (std.mem.indexOfScalar(usize, selected[0..index], id) == null) unique += 1;
+    }
+    return @min(unique, 5);
+}
+pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
+    if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = std.heap.page_allocator, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
     if (isWebm(bytes)) {
-        var reader = try media.webm.Reader.init(std.heap.page_allocator, &source, .{});
+        var reader = try media.webm.Reader.init(a, &source, .{});
         defer reader.deinit();
-        var index = try video.webm_pictures.index(std.heap.page_allocator, &reader, .{ .decoder = .{ .control = source.control } });
+        var index = try video.webm_pictures.index(a, &reader, .{ .decoder = .{ .control = source.control, .admission_pool = pool } });
         defer index.deinit();
-        const selected = try selectWebm(std.heap.page_allocator, index, sampling, source.control);
-        defer std.heap.page_allocator.free(selected);
-        var pixels: u64 = 0;
+        const selected = try selectWebm(a, index, sampling, source.control);
+        defer a.free(selected);
+        var plan = Plan{ .commands = preparationSlots(selected) };
         for (selected) |id| {
             const picture = index.pictures[id];
-            pixels = try std.math.add(u64, pixels, try std.math.mul(u64, picture.width, picture.height));
+            try plan.picture(picture.width, picture.height, try policy(try webmTrack(reader.track), picture.width, picture.height));
         }
-        return pixels;
+        return plan;
     }
-    var reader = try media.mp4.Reader.init(std.heap.page_allocator, &source, .{});
+    var reader = try media.mp4.Reader.init(a, &source, .{});
     defer reader.deinit();
     // AVC combines VUI and container declarations in parameterSession below.
     if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
-    const selected = try selectWithSampling(std.heap.page_allocator, &reader, sampling);
-    defer std.heap.page_allocator.free(selected);
-    const configurations = try parameterSession(std.heap.page_allocator, &reader);
+    const selected = try selectWithSampling(a, &reader, sampling);
+    defer a.free(selected);
+    const configurations = try parameterSession(a, &reader);
     defer if (configurations) |session| session.deinit();
-    const static_config = if (reader.track.codec == .avc and configurations == null) try video.h264.configParse(std.heap.page_allocator, reader.track.avcc) else null;
-    defer if (static_config) |cfg| cfg.groups.deinit(std.heap.page_allocator);
-    var pixels: u64 = 0;
+    const static_config = if (reader.track.codec == .avc and configurations == null) try video.h264.configParse(a, reader.track.avcc) else null;
+    defer if (static_config) |cfg| cfg.groups.deinit(a);
+    var plan = Plan{ .commands = preparationSlots(selected) };
+    if (metal and reader.track.codec == .avc and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
+        plan.apple_surface_bytes = std.math.cast(usize, try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len)) orelse return error.ResourceLimitExceeded;
+        if (plan.apple_surface_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+    }
     for (selected) |index| {
         try control.check();
         const cfg = if (configurations) |session| try session.configAt(index) else static_config;
         const width = if (cfg) |value| value.width else reader.track.width;
         const height = if (cfg) |value| value.height else reader.track.height;
-        pixels = try std.math.add(u64, pixels, try std.math.mul(u64, width, height));
+        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else try policy(reader.track, @intCast(width), @intCast(height)));
     }
-    return pixels;
+    return plan;
 }
 
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control) ![]usize {
@@ -325,10 +366,11 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             defer a.free(patches);
             try capture.project(slot, patches, options);
         }
-    } else if (capture.metal != null and !reader.track.inband_parameter_sets and compatibleApple(reader.track.avcc)) {
+    } else if (capture.metal != null and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
         // VideoToolbox's bounded decoder surface working set shares the same
         // prepaid device budget as queued preparation commands.
-        var surfaces = if (capture.pool) |pool| try pool.acquire(.{ .device_bytes = 512 * 1024 * 1024 }) else media.admission.Token{};
+        const surface_bytes = try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len);
+        var surfaces = if (capture.pool) |pool| try pool.acquire(.{ .device_bytes = surface_bytes }) else media.admission.Token{};
         defer surfaces.deinit();
         var batch = try video.apple.decodeTo(a, reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = capture, .accept = Capture.publishApple });
         defer batch.deinit();
@@ -338,10 +380,10 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     }
 }
 
-fn compatibleApple(avcc: []const u8) bool {
+fn compatibleApple(a: std.mem.Allocator, avcc: []const u8) !bool {
     video.avc.validateConfig(avcc) catch return false;
-    const cfg = video.h264.configParse(std.heap.page_allocator, avcc) catch return false;
-    defer cfg.groups.deinit(std.heap.page_allocator);
+    const cfg = video.h264.configParse(a, avcc) catch |err| return if (err == error.OutOfMemory) err else false;
+    defer cfg.groups.deinit(a);
     return cfg.frame_only and cfg.profile != 88 and !cfg.separate_planes;
 }
 const ProjectionJob = struct { slot: usize, prepared: video.preparation.Prepared, options: video.preparation.Options };
@@ -780,4 +822,41 @@ test "embeddinggemma2 video admission rejects all container paths before model e
         try std.testing.expectError(error.SharedAdmissionExceeded, encodeWithBudget(a, &unopened, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool));
         try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     }
+}
+
+test "embeddinggemma2 video preflight bounds temporary owners and plans geometry instead of maximum slots" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/mjpeg.mov");
+    var denied = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, inspectPlan(a, bytes, .{}, .reference, &denied, true));
+    try std.testing.expectEqual(media.admission.Resources{}, denied.snapshot());
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const plan = try inspectPlan(a, bytes, .{}, .{ .timestamps = .{ .max_frames = 1 } }, &pool, true);
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(@as(u64, 1), plan.commands);
+    try std.testing.expect(plan.preparation_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 0), plan.apple_surface_bytes);
+    try std.testing.expect(try plan.deviceBytes() < 64 * 1024 * 1024);
+    var src = media.source.Source{ .allocator = a, .identity = "preflight-bound", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const options = try policy(reader.track, reader.track.width, reader.track.height);
+    const geometry = try video.preparation.geometry(reader.track.width, reader.track.height, options);
+    try std.testing.expect(plan.preparation_bytes >= geometry.scratch_bytes + @as(usize, reader.track.width) * reader.track.height * 4);
+    try std.testing.expectEqual(@as(u64, 1), preparationSlots(&.{ 2, 2, 2 }));
+    try std.testing.expectEqual(@as(u64, 5), preparationSlots(&.{ 0, 1, 2, 3, 4, 5 }));
+}
+
+fn preflightAllocationRun(backing: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    inline for (.{ "mjpeg.mov", "vp9.webm", "h264-paff-adaptive-packets-8-1.mp4" }) |name| {
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+        const plan = try inspectPlan(a, @embedFile("../testdata/video/" ++ name), .{}, .reference, &pool, true);
+        try std.testing.expect(plan.pixels > 0);
+    }
+}
+test "embeddinggemma2 video preflight allocation failures release metadata decoder and admission owners" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preflightAllocationRun, .{});
 }

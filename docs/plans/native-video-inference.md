@@ -768,3 +768,30 @@ pretrained reports are in
 `tools/embeddinggemma2/testdata/pipeline-admission/qualification.json`. The current
 Linux pretrained binary still needs its own execution receipt after these
 admission changes; the older Linux pretrained results retain their prior scope.
+
+
+### Shared preflight and geometry-derived admission (2026-10-11)
+
+Grouped HTTP/direct video validation now reserves bounded host inspection work
+against the ModelManager's shared physical domain before loading a model. The
+inspector uses a reclaiming bounded allocator and media sub-ledger, releases
+metadata/decoder ownership before returning, and preserves backing OOM versus
+budget-denial attribution. Transient preflight admission denial aborts the
+request rather than becoming a per-item partial response.
+
+The model pipeline separately admits host-only planning before acquiring model
+execution capacity. Preparation reservations derive from selected geometry,
+unique pictures (up to five simultaneous owners), copied source-plane bounds
+and native decoder surface estimates. Sequential video parts take a maximum
+rather than summing transient peaks. The model's 1536 MiB Metal execution bound
+and 16 MiB coefficient ceiling remain separate. CPU inspection does not require
+Apple surface capacity. Unsupported hardware configurations can fall back to
+software; allocation failure during that probe propagates.
+
+Nineteen model tests pass, including exhaustive allocation-failure cleanup.
+The substantive shared-capacity/denial/retry test and its 33 import gates pass.
+The production CPU/Metal server passes six original cases, reduced dimensions
+and admission/decode retries; eight WebM vectors preserve all reference
+rankings/top-k and concurrent/sustained/disconnect retry checks. Evidence is
+in `tools/embeddinggemma2/testdata/preflight-admission/qualification.json`. Cross-request stage overlap and the broader
+non-CUDA qualification/performance/streaming work remain active.

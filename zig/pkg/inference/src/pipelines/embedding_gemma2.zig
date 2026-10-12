@@ -88,17 +88,35 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
     }
     const effective = control orelse Control{};
     try effective.check();
-    // Reserve the maximum encoder sequence and a bounded media preprocessing
-    // working set before decoding or allocating any projected soft tokens.
-    // Two queued preparations, two consumer jobs and one producer may coexist.
-    // Each slot admits scratch plus copied source planes, up to 256 MiB;
-    // persistent resize coefficients have a separate 16 MiB ceiling. Native
-    // decoder surfaces add a 512 MiB bound to the 1536 MiB model workspace.
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = if (session.backend() == .metal) (if (has_video) @as(usize, 3344) else 768) * 1024 * 1024 else 512 * 1024 * 1024, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    // Inspect under a shared host-only permit before reserving model/device
+    // execution. Temporary metadata is freed before that permit is returned.
+    var device_bytes: usize = 0;
+    var command_slots: u64 = 0;
+    if (has_video) {
+        var preflight = try session.admitHostPreprocess(512 * 1024 * 1024);
+        defer preflight.deinit();
+        var host_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        defer std.debug.assert(std.meta.eql(host_budget.snapshot(), media_admission.Resources{}));
+        for (group.content) |part| switch (part) {
+            inline .video, .sampled_video => |payload| {
+                const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
+                const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
+                const plan = try @import("embedding_gemma2_video.zig").inspectPlan(a, bytes, effective, sampling, &host_budget, session.backend() == .metal);
+                device_bytes = @max(device_bytes, try plan.deviceBytes());
+                command_slots = @max(command_slots, plan.commands);
+            },
+            else => {},
+        };
+    }
+    const workspace = if (session.backend() == .metal)
+        try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
+    else
+        512 * 1024 * 1024;
+    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) });
     defer permit.deinit();
-    // This sub-ledger is backed by the already-acquired process-wide permit.
-    // Decoders/preparers cannot grow beyond its reserved preprocessing share.
-    var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = if (session.backend() == .metal) 1808 * 1024 * 1024 else 0, .commands = if (session.backend() == .metal) 5 else 0 } };
+    // Video parts execute sequentially; their transient preparation shares use
+    // a maximum, while projected tokens stay in the model workspace.
+    var video_budget = media_admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024, .device_bytes = if (session.backend() == .metal) device_bytes else 0, .commands = if (session.backend() == .metal) command_slots else 0 } };
     defer std.debug.assert(std.meta.eql(video_budget.snapshot(), media_admission.Resources{}));
     if (lock) |mutex| try effective.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();

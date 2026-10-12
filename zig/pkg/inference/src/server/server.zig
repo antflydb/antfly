@@ -19945,7 +19945,7 @@ pub const Node = struct {
         for (input.array.items, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
-            try validateEmbeddingGroupContract(contract, group.*, groups.len, control);
+            try validateEmbeddingGroupContract(self, contract, group.*, groups.len, control);
         }
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
@@ -19995,8 +19995,8 @@ pub const Node = struct {
                     groups[index] = null;
                     break :preflight;
                 };
-                validateEmbeddingGroupContract(contract, groups[index].?, groups.len, control) catch |err| {
-                    if (request.error_policy == .fail_fast) return err;
+                validateEmbeddingGroupContract(self, contract, groups[index].?, groups.len, control) catch |err| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err) or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
                 };
@@ -31804,7 +31804,7 @@ fn hasGroupedEmbeddingInput(input: std.json.Value) bool {
     return false;
 }
 
-fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !void {
+fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !void {
     var text_bytes: usize = if (group.title) |title| title.len else 0;
     var media_bytes: usize = 0;
     var pixels: u64 = 0;
@@ -31831,6 +31831,9 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
             pixels += try raster.pixels();
         },
         inline .video, .sampled_video => |payload| {
+            try control.check();
+            var preflight = try node.model_manager.admitHostPreflight(512 * 1024 * 1024);
+            defer preflight.release();
             const bytes = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.bytes else payload;
             const sampling: @import("../pipelines/embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == @import("../pipelines/embedding_gemma2.zig").SampledVideo) payload.sampling else .reference;
             media_parts += 1;

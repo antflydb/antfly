@@ -1275,9 +1275,29 @@ execution, five 256 MiB preparation bounds, 16 MiB coefficient storage and
 has the corresponding 1808 MiB preprocessing share and five command slots.
 The parent shared controller gates concurrent requests before decode. This
 closes the missing reservation hooks, but does not yet move decode/preparation
-ahead of the shared model execution gate or cover HTTP preflight with the same
-reservation. Those scheduling changes remain implementation work. The current server passes the six original pretrained video/mixed cases on CPU
+ahead of the shared model execution gate or overlap work across requests ahead of the model gate. HTTP preflight now
+has a separate shared host reservation. Cross-request overlap remains work. The current server passes the six original pretrained video/mixed cases on CPU
 and Metal, including admission/decode retry and reduced dimensions. Eight WebM
 vectors (five clips and three queries) preserve all reference rankings/top-k;
 concurrent/sustained and disconnect/retry checks pass. These are correctness and
 ownership checks on a shared host, not isolated throughput measurements.
+
+
+### Shared preflight and geometry planning
+
+Video inspection before model loading now acquires shared host capacity and
+uses bounded/reclaiming allocation. Temporary metadata/decoder ownership is
+released before execution admission. The model acquires host-only planning
+capacity, then reserves device preparation bytes from selected geometry, unique
+pictures (up to five live owners) and native decoder surface estimates.
+Sequential video parts use a maximum transient share. The blanket 3344 MiB
+Metal video estimate is superseded by 1536 MiB model workspace plus the planned
+preprocessing share. CPU inspection does not require Apple surface capacity.
+Shared denials retain existing leases and propagate through the request retry
+contract rather than a per-item partial response. Allocation failures during
+hardware probing propagate instead of choosing a different budget.
+
+Current macOS CPU/Metal pretrained reports and source hashes are in
+[preflight qualification](../../../tools/embeddinggemma2/testdata/preflight-admission/README.md).
+Cross-request stage overlap, current Linux pretrained execution, measured tuning
+and the other non-CUDA goal requirements remain active.

@@ -4256,6 +4256,17 @@ pub const ModelManager = struct {
         return &self.resource_domain.?.admission;
     }
 
+    /// Account bounded metadata/codec inspection before a model is loaded.
+    /// Uses the same physical host domain as loaded models and execution.
+    pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightChecked(bytes, true);
+    }
+    fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
+        try self.ensureResourceOwnerReady();
+        const domain = self.resource_domain.?;
+        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+    }
+
     /// Exact admission ownership held by the live Hugging Face tokenizer
     /// caches. Cache growth is charged in independent quantum leases owned by
     /// ResourceDomain records, rather than by LoadedModel.tokenizer_resource_lease.
@@ -13435,4 +13446,21 @@ test "ONNX export tokenizer format takes precedence over root JSON" {
         defer a.free(ids);
         try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
     }
+}
+
+test "embeddinggemma2 preflight shares host capacity before model load and preserves denied leases" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128, .scratch_limit_bytes = 128 });
+    var first = try manager.admitHostPreflightChecked(128, false);
+    defer first.release();
+    try std.testing.expectEqual(@as(usize, 128), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(1, false));
+    try std.testing.expectEqual(@as(usize, 128), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    first.release();
+    var retry = try manager.admitHostPreflightChecked(128, false);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().host_scratch_bytes);
 }
