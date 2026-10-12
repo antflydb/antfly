@@ -584,8 +584,6 @@ fn longContextParity(metal: bool) !void {
         }
         if (max_tokens) |limit| if (request.encoded.input_ids.len > limit) continue;
         if (request.encoded.input_ids.len <= 198 or request.encoded.input_ids.len > 7999) return error.InvalidFamilyReference;
-        const qualified_backend: qualification.Backend = if (metal) .metal else .native;
-        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, qualification.requireRequest(.decide_1b, qualified_backend, 1, 1, request.encoded.input_ids.len));
         errdefer std.debug.print("Decide-1B long-context {s}/{s}\n", .{ if (metal) "metal" else "native", request.id });
         const control = @import("../execution_control.zig").InferenceExecutionControl{
             .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
@@ -651,4 +649,123 @@ test "GLiNER2.5 Decide 1B long context native oracle parity" {
 test "GLiNER2.5 Decide 1B long context Metal oracle parity" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     try longContextParity(true);
+}
+
+const HeadReference = struct { counts: []const f32, projected: []const f32, scores: []const f32, span_prefix: []const f32 = &.{} };
+
+fn extractionParity(metal: bool) !void {
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const capture = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_EXTRACTION_CAPTURE");
+    const a = std.testing.allocator;
+    try service.verifyFiles(a, directory, files);
+    const bytes = if (capture) |path| try @import("../util/c_file.zig").readFileMax(a, path, 16 * 1024 * 1024) else try a.dupe(u8, @import("gliner_graph_qualification_fixtures.zig").decide_1b_spans);
+    defer a.free(bytes);
+    const Cases = struct { cases: []const struct { id: []const u8, text: []const u8, native_schema_json: []const u8, input_ids: []const i64, heads: []const HeadReference = &.{}, expected: pipeline.ExpectedSample } };
+    const parsed = try std.json.parseFromSlice(Cases, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerSpanConfig(session);
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    defer if (watchdog) |owner| owner.destroy();
+    if (watchdog) |owner| try owner.start(std.testing.io);
+    const control = @import("../execution_control.zig").InferenceExecutionControl{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s };
+    for (parsed.value.cases) |case| {
+        errdefer std.debug.print("span extraction parity {s} {s}\n", .{ if (metal) "Metal" else "native", case.id });
+        var compiled = try schema_mod.compile(a, case.native_schema_json, .{});
+        defer compiled.deinit();
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 7999, .max_batch_tokens = 7999 });
+        defer prepared.deinit();
+        try std.testing.expectEqualSlices(i64, case.input_ids, prepared.input_ids);
+        var managed = try factory.getManagedComputeBackend(session, a, null, control);
+        defer managed.deinit();
+        if (case.heads.len > 0) try expectSpanHeads(&managed.backend, a, config.modern_bert, prepared.samples[0], case.heads);
+        var result = try @import("gliner_span_extraction.zig").run(&managed.backend, a, config.modern_bert, prepared.samples[0], &compiled, .{ .offset_unit = .unicode_codepoints, .control = control });
+        defer result.deinit();
+        try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
+        if (case.text.len < 128) {
+            const envelope = try std.fmt.allocPrint(a, "{{\"schema_version\":2,\"model\":\"span\",\"schema\":{s},\"options\":{{\"long_document\":{{\"mode\":\"window\",\"window_words\":64,\"overlap_words\":8}}}},\"inputs\":[{{\"content\":{f}}}]}}", .{ case.native_schema_json, std.json.fmt(case.text, .{}) });
+            defer a.free(envelope);
+            var request = try @import("extraction_v2.zig").parseJson(a, envelope, .{});
+            defer request.deinit();
+            var windowed = try executor.prepareItem(a, tok.tokenizer(), &request.items[0], .{ .max_sequence_tokens = 1024, .max_batch_tokens = 1024 }, .{ .modern_span_extraction = true, .control = control });
+            defer windowed.deinit(a);
+            var merged = try @import("gliner_span_long_executor.zig").extract(&managed.backend, a, config.modern_bert, &request.items[0], &windowed, .{ .offset_unit = .unicode_codepoints, .control = control });
+            defer merged.deinit();
+            try pipeline.expectSample(case.expected, merged.samples[0], pipeline.fp32_confidence_tolerance);
+        }
+    }
+}
+
+test "ModernBERT span extraction pinned native" {
+    try extractionParity(false);
+}
+
+test "ModernBERT span extraction pinned Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try extractionParity(true);
+}
+
+// Count gates can legitimately suppress every span in a checkpoint. Compare
+// learned GRU slots and unactivated span scores independently of that gate.
+fn expectSpanHeads(cb: *const @import("../ops/ops.zig").ComputeBackend, backing: std.mem.Allocator, config: @import("../architectures/modern_bert.zig").Config, sample: processor.Sample, references: []const HeadReference) !void {
+    const core = @import("gliner_span_extraction.zig");
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const H = config.hidden_size;
+    const mask = try a.alloc(i64, sample.input_ids.len);
+    @memset(mask, 1);
+    const hidden = try @import("../architectures/modern_bert.zig").forwardCT(cb, a, config, sample.input_ids, mask, 1, sample.input_ids.len);
+    defer cb.free(hidden);
+    const spans = try core.spanRepresentations(cb, a, hidden, sample, H);
+    defer cb.free(spans);
+    var index: usize = 0;
+    for (sample.groups) |group| {
+        if (group.kind == .classification) continue;
+        const ref = references[index];
+        if (ref.span_prefix.len != 0) {
+            const raw_spans = try cb.toFloat32(spans, a);
+            for (ref.span_prefix, raw_spans[0..ref.span_prefix.len]) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3 + 2e-6 * @abs(want));
+        }
+
+        index += 1;
+        const parent = try core.gather(cb, a, hidden, &.{group.parent_marker}, H);
+        defer cb.free(parent);
+        const counts = try core.mlp(cb, a, parent, H, 20, "count_pred");
+        defer cb.free(counts);
+        const raw_counts = try cb.toFloat32(counts, a);
+        try std.testing.expectEqual(ref.counts.len, raw_counts.len);
+        for (ref.counts, raw_counts) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+        const labels = try core.gather(cb, a, hidden, group.child_markers, H);
+        defer cb.free(labels);
+        const columns = group.child_markers.len;
+        const span_count = sample.words.len * 8;
+        try std.testing.expectEqual(3 * columns * H, ref.projected.len);
+        try std.testing.expectEqual(3 * columns * span_count, ref.scores.len);
+        for (0..3) |step| {
+            const projected = try @import("../architectures/gliner_head.zig").countLstmV1AtStep(cb, a, labels, columns, H, step);
+            defer cb.free(projected);
+            const raw_projected = try cb.toFloat32(projected, a);
+            for (ref.projected[step * columns * H ..][0 .. columns * H], raw_projected) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+            const scores = if (cb.kind() == .native) try cb.linearNoBias(spans, projected, span_count, H, columns) else try cb.primDotGeneral(spans, projected, &.{ @intCast(span_count), @intCast(H) }, &.{ @intCast(columns), @intCast(H) }, &.{1}, &.{1}, &.{}, &.{});
+            defer cb.free(scores);
+            const raw_scores = try cb.toFloat32(scores, a);
+            for (0..sample.words.len) |start| for (0..@min(8, sample.words.len - start)) |width| for (0..columns) |column| {
+                const want = ref.scores[((step * columns + column) * sample.words.len + start) * 8 + width];
+                const got = raw_scores[(start * 8 + width) * columns + column];
+                // FP32 dot products can be thousands in magnitude. Bound
+                // both accumulation-relative error and decoded probability.
+                try std.testing.expectApproxEqAbs(want, got, 2e-3 + 1e-5 * @abs(want));
+                try std.testing.expectApproxEqAbs(1 / (1 + @exp(-want)), 1 / (1 + @exp(-got)), 5e-4);
+            };
+        }
+    }
+    try std.testing.expectEqual(references.len, index);
 }

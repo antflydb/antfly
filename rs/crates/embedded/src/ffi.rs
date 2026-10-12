@@ -96,7 +96,7 @@ pub(crate) fn check(code: antfly_error_code) -> Result<()> {
     if code == ANTFLY_OK {
         Ok(())
     } else {
-        Err(Error::from_code(code))
+        Err(Error::from_native(code))
     }
 }
 

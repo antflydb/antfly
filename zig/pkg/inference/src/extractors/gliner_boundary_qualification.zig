@@ -225,6 +225,8 @@ pub fn lengths(request_items: usize, document_bytes: usize, document_words: usiz
 
 pub const Gate = struct {
     candidates: policy.Candidates,
+    single_window_candidates: ?policy.Candidates = null,
+    long_document_qualified: bool = true,
     request_items: usize,
     control: ?Control,
 
@@ -237,12 +239,42 @@ pub const Gate = struct {
         // The current closed production policy performs no tokenizer work.
         if (!policy.hasPublishedProfiles()) return error.UnsupportedGlinerBoundaryRuntime;
         const features = try requiredFeaturesResolved(request, common, control);
-        return .{ .candidates = try policy.start(consumed, backend, features), .request_items = request.items.len, .control = control };
+        // One-window execution uses the same encoder/head and decoding path.
+        // Admit it under the exact single-window feature/geometry contract,
+        // rather than inheriting a long-corpus schema's artificial floor.
+        var equivalent = features;
+        equivalent.remove(.long_document);
+        equivalent.remove(.record_identity_occurrence);
+        equivalent.remove(.record_identity_semantic);
+        equivalent.insert(.single_window);
+        const single: ?policy.Candidates = if (features.contains(.long_document) and !features.contains(.single_window))
+            policy.start(consumed, backend, equivalent) catch null
+        else
+            null;
+        const long: ?policy.Candidates = policy.start(consumed, backend, features) catch null;
+        return .{ .candidates = long orelse single orelse return error.UnsupportedGlinerBoundaryRuntime, .single_window_candidates = single, .long_document_qualified = long != null, .request_items = request.items.len, .control = control };
     }
 
     pub fn observe(self: *Gate, document_bytes: usize, document_words: usize, window_count: usize, prepared: *const processor.PreparedBatch) !void {
         try check(self.control);
-        try self.candidates.narrow(try lengths(self.request_items, document_bytes, document_words, window_count, prepared));
+        const observed = try lengths(self.request_items, document_bytes, document_words, window_count, prepared);
+        var failure: anyerror = error.UnsupportedGlinerBoundaryRuntime;
+        // Every surviving profile must cover the entire request observed so far.
+        if (window_count != 1) self.single_window_candidates = null;
+        if (self.single_window_candidates) |*single| {
+            single.narrow(observed) catch |err| {
+                self.single_window_candidates = null;
+                failure = err;
+            };
+        }
+        if (self.long_document_qualified) {
+            self.candidates.narrow(observed) catch |err| {
+                self.long_document_qualified = false;
+                failure = err;
+            };
+        }
+        if (!self.long_document_qualified and self.single_window_candidates == null)
+            return failure;
     }
 
     pub fn observeSingle(self: *Gate, allocator: Allocator, text: []const u8, prepared: *const processor.PreparedBatch, options: processor.Options) !void {
@@ -1485,4 +1517,26 @@ test "gliner boundary qualification measures pinned base checkpoint long-documen
     // ratio (~3.125%).
     _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 1024, 32, "candidate default");
     _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 4096, 128, "prior default, for comparison");
+}
+
+test "boundary qualification Gate accepts short window prompts and composed windows" {
+    var request = try wire.parseJson(std.testing.allocator,
+        \\{"schema_version":2,"model":"boundary","schema":{"entities":["person","org","model","component","decision","concept"],"relations":[{"type":"uses"},{"type":"replaces"},{"type":"about"}]},"options":{"long_document":{"mode":"window"}},"inputs":[{"content":"Use EmbeddingGemma instead of Qwen."}]}
+    , .{});
+    defer request.deinit();
+    const sample = processor.Sample{ .original_text = request.items[0].text, .schema_fingerprint = @splat(0), .input_ids = &.{ 1, 2, 3 }, .words = &.{}, .groups = &.{}, .queries = &.{}, .classification_labels = &.{}, .enum_choices = &.{}, .prefix_word_count = 7, .body_word_count = 6, .terminal_period_added = true, .is_joint_ie = false };
+    var prepared: processor.PreparedBatch = undefined;
+    prepared.samples = &.{sample};
+    prepared.sequence_length = 40;
+    for ([_]artifact.Identity{ policy.fastino_gliner25_base_v1, policy.fastino_gliner25_multi_decide }) |identity| {
+        for ([_]policy.Backend{ .native, .metal }) |backend| {
+            var gate = try Gate.init(identity, backend, &request, null);
+            try std.testing.expect(gate.single_window_candidates != null);
+            try gate.observe(sample.original_text.len, 6, 1, &prepared);
+            var windows = try Gate.init(identity, backend, &request, null);
+            try windows.observe(2048, 300, 3, &prepared);
+            try std.testing.expect(windows.single_window_candidates == null);
+            try std.testing.expect(windows.long_document_qualified);
+        }
+    }
 }

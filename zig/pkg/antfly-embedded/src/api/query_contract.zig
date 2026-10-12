@@ -9431,6 +9431,7 @@ fn parseGraphMetricQueriesAlloc(
                     .freshness = freshness,
                     .seed_nodes = personalization.seed_nodes,
                     .damping = personalization.damping,
+                    .direction = personalization.direction,
                 },
             };
             initialized += 1;
@@ -9475,12 +9476,14 @@ fn parseGraphMetricQueriesAlloc(
             .freshness = freshness,
             .seed_nodes = personalization.seed_nodes,
             .damping = personalization.damping,
+            .direction = personalization.direction,
         },
     };
     return items;
 }
 
 const ParsedGraphMetricPersonalization = struct {
+    direction: db_mod.types.GraphMetricDirection = .out,
     seed_nodes: []const []const u8 = &.{},
     damping: ?f64 = null,
 };
@@ -9497,7 +9500,8 @@ fn parseGraphMetricPersonalizationAlloc(
 ) !ParsedGraphMetricPersonalization {
     const seeds_value = object.get("seed_nodes");
     const damping_value = object.get("damping");
-    if (seeds_value == null and damping_value == null) return .{};
+    const direction_value = object.get("direction");
+    if (seeds_value == null and damping_value == null and direction_value == null) return .{};
 
     var parsed = ParsedGraphMetricPersonalization{};
     errdefer freeOwnedStringSlice(alloc, parsed.seed_nodes);
@@ -9526,6 +9530,11 @@ fn parseGraphMetricPersonalizationAlloc(
         if (parsed.seed_nodes.len == 0 or !std.math.isFinite(damping) or damping <= 0 or damping >= 1)
             return error.InvalidQueryRequest;
         parsed.damping = damping;
+    }
+    if (direction_value) |value| {
+        if (value != .string) return error.InvalidGraphMetricDirection;
+        parsed.direction = std.meta.stringToEnum(db_mod.types.GraphMetricDirection, value.string) orelse return error.InvalidGraphMetricDirection;
+        if (parsed.direction != .out and parsed.seed_nodes.len == 0) return error.GraphMetricDirectionRequiresSeeds;
     }
     // Published generations are global-only; a seeded read against one would
     // silently return unpersonalized scores. Fail closed instead.
@@ -9565,6 +9574,7 @@ fn parseGraphMetricRerankAlloc(
         .missing_score = missing_score,
         .seed_nodes = personalization.seed_nodes,
         .damping = personalization.damping,
+        .direction = personalization.direction,
     };
 }
 
@@ -9863,7 +9873,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
             .min_weight = weight_bounds.min,
             .max_weight = weight_bounds.max,
-            .deduplicate = true,
+            .deduplicate = traversal.deduplicate_nodes orelse true,
             .include_paths = traversal.include_paths orelse false,
             .node_filter = filter,
         },

@@ -151,7 +151,8 @@ class AntflyOpenOptions(ctypes.Structure):
         ("inference_kv_budget_mb", ctypes.c_uint32),
         ("inference_scratch_budget_mb", ctypes.c_uint32),
         ("busy_timeout_ms", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 8),
+        ("reserved", ctypes.c_uint64 * 6),
+        ("models_dir", AntflySlice),
     ]
 
 
@@ -247,6 +248,8 @@ _ERR = ctypes.c_int  # antfly_error_code (C enum, backed by `int`)
 _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_abi_version", [], ctypes.c_uint32),
     ("antfly_open_options_size", [], ctypes.c_uint32),
+    ("antfly_last_error_detail", [], ctypes.c_char_p),
+    ("antfly_last_error_code", [], _ERR),
     ("antfly_error_code_name", [_ERR], ctypes.c_char_p),
     ("antfly_error_code_description", [_ERR], ctypes.c_char_p),
     ("antfly_open_options_init", [_OPTS_P], _ERR),
