@@ -1,3 +1,6 @@
+# Graph edge identity investigation (2026-09-30)
+
+```text
 Historical investigation captured before implementation.
 The implemented contract and example are in docs/guides/artifact-indexes.mdx.
 Statements about unchanged production behavior and a separate future phase below
@@ -192,3 +195,4 @@ Then design fact-document projection with arbitrary endpoints and explicit
 algorithm projection policies. Test same-type parallel edges across reopen,
 replay, delete-one/delete-last, self-loops, reciprocal edges, source precedence,
 distributed range splits, budgets, K-paths, counts, and temporal predicates.
+```
