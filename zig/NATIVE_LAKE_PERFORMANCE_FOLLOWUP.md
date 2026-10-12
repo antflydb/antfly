@@ -2844,3 +2844,117 @@ conservative query bounds attached to authenticated routing subtrees and a bound
 frontier that can descend promising subtrees before opening their inventories.
 The current cross-window score cutoff is implemented; it does not eliminate the
 initial routing walk or turn sequential windows into global best-first traversal.
+
+### Follow-up after PR #1063: implementation and qualification scope
+
+PR #1063 merged as `68eece3fd6240f844cca890de36b9d1238084428`. The next
+follow-up starts from that main commit, including the main changes which arrived
+after the earlier `d1182ab89d` qualification. This section defines the pending
+implementation; it does not claim that the following capabilities have shipped.
+The follow-up remains a draft until the relevant correctness and work-count
+gates pass against its final code and merged base.
+
+| Workstream | Existing behavior | Required outcome |
+| --- | --- | --- |
+| Global search frontier | Routing windows follow immutable file order; score-bound planning is local to each admitted window. | Visit promising authenticated routing subtrees first and prune uncompetitive subtrees before inventory admission. |
+| Historical serving compaction | Small fresh runs compact within a changed source file. | Compact across source files with authenticated physical spans, bounded maintenance work, and cheap appends. |
+| Cloud retained closures | Unsupported provider evidence requires complete retained-artifact audits. | Reuse closure proofs backed by durable object generations and provider-enforced retention, without trusting mutable live names. |
+| Broader bounded admission | Profiling, overlays, composed/vector retrieval, and early-source shapes keep their existing planners. | Carry bounded admission and ownership through those shapes while preserving their existing result contracts. |
+
+#### Global search frontier
+
+Attach conservative query-independent term envelopes to authenticated routing
+subtrees, then derive query bounds using the pinned publication's global DF,
+collection lengths, BM25 configuration, and supported Boolean semantics. A
+bounded frontier must identify a subtree without opening every segment below it.
+Missing or unsupported bounds remain unknown/infinite and require traversal.
+
+Keep navigation, candidate preparation, and result collection separate. Reuse
+query analysis and global statistics across subtree admission. Prioritize the
+highest conservative bound, feed admitted leaves through the shared native
+search path, and propagate the final heap's competitive cutoff back to the
+frontier. Prune only strictly lower scores; equality remains eligible until the
+existing global tie comparator proves otherwise. Frontier memory pressure must
+use bounded spill or a complete traversal fallback, never truncate candidates.
+
+Preserve exact count-only execution and truthful hit-count relations when
+ranking skips matches. Typed field sorts and ordered-index prefix seeks keep
+their own admissible ordering contracts. Qualification must compare scores,
+ties, filters, exclusions, highlights and cursor pages with full admission, and
+prove that a competitive late-file subtree can be reached without admitting all
+earlier windows. Include equal-bound, unknown-bound, cancellation, and frontier
+pressure cases.
+
+#### Historical serving packs
+
+Implement the physical-span format described above before allowing cross-file
+merges. Make pack identity independent of source-file maintenance identity.
+Preserve the existing logical corpus tie order across repacking; a new pack's
+local document number must not become the public ranking tie breaker. Physical
+predicate translation, inverse hydration, hidden stored-source highlights, and
+delete-hole rank/select must all consume the same authenticated span mapping.
+
+Use bounded size-tiered maintenance under the existing leader, source snapshot,
+publication lease and shared scheduling rules. Keep stable historical packs
+separate from recent runs. A source replacement/removal identifies affected
+packs through indexed span ownership; unrelated historical payloads must remain
+unread and unwritten. File-level signed DF contributions remain independent of
+packing. Publication must atomically install matching routing, statistics,
+physical maps and pack references, with crash-replay checkpoints protecting all
+unfinished inputs.
+
+Advance the reader protocol for the new representation and teach GC to retain
+both supported older generations and new packs at every live reader/builder
+boundary. Differential real Parquet/Iceberg tests must cover append, replacement,
+removal, schema/snapshot transitions, old-reader GC, restart, partial compaction
+recovery, sorted cursors and hidden highlights. Work-count tests must demonstrate
+lower serving fan-out and bounded publication work for a small append.
+
+#### Durable cloud generations and retention evidence
+
+The optional `immutable_prefix_until` and `validate_immutable_until` callbacks
+currently have no production provider implementation. In particular, GCS
+generation retention cannot certify reads through a mutable live object name.
+Complete auditing remains the correct fallback until a stronger artifact
+reference and provider proof are available.
+
+Persist the exact provider object generation/version in authenticated artifact
+references and use it for required reads, metadata probes, verified caches and
+retirement. An in-process version cache is insufficient after restart. Fence
+this representation through the relevant metadata/reader versions and continue
+to admit legacy references through full auditing.
+
+A reusable certificate must bind backend identity, namespace, artifact closure,
+exact protected generations and a conservative expiry. Establish from provider
+evidence that those generations cannot be replaced or removed before expiry;
+versioning alone does not supply that guarantee. Changes in bucket policy, live
+names, authorization, retention validity, or restoration must never silently
+extend the proof. Unsupported or expired evidence falls back to the existing
+complete audit. Local filesystem namespace epochs retain their own semantics.
+
+Test restart, live-name replacement, retained old generations, policy changes,
+expiry, missing objects, certificate tampering, provider failures, cancellation,
+cross-namespace replay and GC with pinned readers. Add provider-request counters
+which prove an unchanged cloud refresh avoids per-artifact probes only while a
+valid proof is present. Qualify actual provider behavior separately from mock
+contract tests before enabling a production certificate implementation.
+
+#### Broader admission and measurement gates
+
+Move remaining request shapes onto bounded inventory ownership incrementally.
+Profiling must observe the bounded execution path; overlay visibility and
+multi-source/vector composition must preserve shared source/publication leases
+and their exact existing ranking contracts. Audit compact file-proof maps and
+repeated planning costs as file count grows. Keep existing final response-size,
+statement-memory and temporary-disk safeguards.
+
+Measure the merged baseline before making speedup claims. Use both many-small-
+file and many-segment-in-one-file layouts, selective and broad terms, conjunctions
+and phrases, top-K and exact counts, metadata filters, typed cursor pages, and
+small appends/replacements. Report result equivalence, latency distributions,
+peak RSS, provider requests/bytes, admitted inventories/readers, spill bytes,
+publication reads/writes and GC work. Separate genuinely empty-cache execution,
+restart after bounded readiness warming, and repeated warm queries. Record the
+commit, build mode, dataset shape, cache policy and resource limits with each
+measurement. Deterministic work-count regressions remain required even when
+wall-clock benchmarks improve.
