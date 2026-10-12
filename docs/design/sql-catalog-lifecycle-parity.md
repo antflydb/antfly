@@ -4157,3 +4157,31 @@ channel instead of inventing an envelope or flattening JSON null into SQL NULL.
 The mapper currently filters submitted generated-field null metadata, so the
 derived expression owner must return authoritative replacement provenance.
 Original sql-0671 and all 898 unresolved original dispositions remain open.
+
+Pre-merge owner qualification: full SQL Debug passed 771 main-owner and 226
+linked tests, with three existing skips and no failures/leaks (21/21 steps).
+Full native lifecycle Debug passed 219 tests plus one linked test (50/50 steps),
+including exact JSON comparison, output lifetime, memory admission and work
+exhaustion during allocator rehoming. An earlier inline-layout run exposed an
+existing rewrite sweep's address-dependent allocation count; both the compact
+layout's full run and a direct focused sweep passed without changing that test.
+Formatting, source-catalog freshness, inventory integrity and the Apache
+boundary passed. No new public contract requires generation in this checkpoint.
+
+Merge 7a724db894 incorporates origin/main 553e58317f and 54 upstream commits.
+The mapped-batch conflict retains main's complete type identity and delegates
+to coerceDatum, which already validates this branch's temporal extension.
+The relation adapter retains statement/transaction clocks and main's aggregate
+partial cursor together. Two Python E2E files arriving from main required only
+formatter cleanup. Post-merge Debug qualification is separate from the
+pre-merge results above.
+
+Post-merge qualification: the unchanged merged Zig sources passed full SQL
+Debug with 792 main-owner and 226 linked tests, three existing skips and no
+failures/leaks (21/21 steps). Full native lifecycle Debug passed 219 tests plus
+one linked test (50/50 steps), without failures/leaks. Source-catalog freshness,
+inventory integrity and the 2,053-file Apache boundary passed. make fmt and the
+subsequent complete fmt-check passed; the two incoming Python formatter diffs
+were independently verified to preserve their ASTs. Cache GC was previewed only
+while unrelated worktrees had active builds; nothing was deleted. These are
+local correctness results, not remote CI or public durable JSON activation.
