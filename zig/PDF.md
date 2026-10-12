@@ -56,6 +56,9 @@ ones.
 | OCR `max_rendered_pixels` / `max_rendered_dimension` | 40,000,000 / 4096 | Per-page spatial caps |
 | Read endpoint images per request (inference) | 64 | Aggregate downloaded input is capped by `ANTFLY_INFERENCE_READ_BATCH_BYTES` (default 256 MiB); decoded-pixel admission also applies. See [`pkg/inference/BATCHING.md`](pkg/inference/BATCHING.md#readerocr-batching) |
 | PDF render lane (`threaded_io_limits.zig`) | 4 workers, queue 8 | 512 MiB window scratch, 2 MiB retained scratch per worker |
+| Lazy PNG representation encode (`encodeParallel`) | 8 jobs | Also capped by the PDF render lane's concurrent capacity; each job holds an admitted scratch grant |
+| Concurrent window inference jobs (`WindowJobs.jobs`) | 4 | Embedding and controlled read/generation jobs share the slots; also capped by the inference lane's concurrent capacity and admitted memory |
+| Image-embedding codec slab (`BatchPreprocessOptions` in `pkg/inference/src/pipelines/image.zig`) | 128 MiB, 8 preprocess workers | Physical ceiling for all codec scratch in a wave; the slab grows from wave demand and each growth delta is admitted first. Workers are also capped by CPU count |
 | Per-document scratch hint | measured peak + 12.5% | Reservation hint only; never changes quality |
 | Remote capability cache (`remote_capabilities.zig`) | 30 s fresh, 5 min stale-if-error | 64 entries, 30 s discovery timeout, 4 MiB catalog response |
 | Go inference proxy request body (`Config.MaxRequestBodyBytes`) | 256 MiB | Reduced if needed to fit the retained budget |
@@ -379,7 +382,7 @@ stay reserved. A separate bounded, non-reclaiming consumer lease accounts for
 compression growth and retention alongside the pinned raster. Cancellation and
 deadlines bound compression work. No representation survives the window.
 Demanded pages may encode concurrently on the BackendRuntime-owned PDF CPU
-lane (at most eight jobs and no more than the lane capacity). The coordinator
+lane (at most eight jobs and no more than the lane capacity; `encodeParallel`). The coordinator
 admits every codec peak before launching a wave, joins it, then releases unused
 scratch credit. A narrow byte grant reduces concurrency without reducing image
 quality. There is no additional encoder pool.
@@ -389,7 +392,7 @@ OCR or embedding invocation, as well as later text consumers. A structured
 window group returns pending work to the owner instead of joining inside the
 fan-out callback. The owner joins before releasing or transferring away any
 borrowed media; rejected pages and early exits cancel and join first. At most
-four embedding invocations are retained, further bounded
+four embedding invocations are retained (`WindowJobs.jobs`), further bounded
 by the lazy inference lane and jointly admitted memory. Each job owns its
 allocator, cancellation/deadline, descriptors and result; image bytes remain
 borrowed. Embedding jobs launch before text consumers, independent of their

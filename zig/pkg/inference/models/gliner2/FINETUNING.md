@@ -80,8 +80,15 @@ full-step fallback fails the gate.
 The CUDA training executor caches a single-device partition and buffer plan,
 keeps graph constants and runtime placeholders resident, uses page-locked
 asynchronous input staging, and applies clipping plus AdamW as batched device
-operations. Step metrics expose CUDA allocation/free counts, H2D/D2H bytes,
-stream and upload synchronizations, cache hits/misses, launches, packed
+operations. Resident training retains idle exact-size temporary buffers across
+accumulation/update boundaries: up to 2 GiB and 4096 buffers, versus 1 GiB and
+256 for other CUDA owners (`cudaTempCacheBudgetBytes` and
+`cudaTempCacheMaxBuffers` in `zig/pkg/inference/src/ops/cuda/cuda_compute.zig`;
+`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB` and
+`ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS` override them). Retained buffers
+stay charged to the owner's physical ceiling and are reclaimed before a bounded
+allocation miss retries. Step metrics expose CUDA allocation/free counts,
+H2D/D2H bytes, stream and upload synchronizations, cache hits/misses, launches, packed
 attention calls, exact-GELU calls, and the count and byte volume of runtime-input
 uploads. CUDA telemetry spans the complete trainer step, beginning before input
 staging and ending after the resident optimizer update. Strict comparisons
